@@ -57,6 +57,14 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 | NFR-PRF-03 | watcher event dequeued to the row being visible to a reader |
 | NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
 
+**F-10 and NFR-PRF-04: the aggregate is asserted, the breakdown is recorded.** NFR-PRF-04 is a wall-clock requirement and the budget still asserts one number. But one number cannot answer architecture.md's **open design question 1** — *does the parse pool or the index writer dominate rebuild time?* — and §1.2 says the parse pool exists precisely because that assumption is unmeasured. Reported as a single figure, "the index writer dominates" and "reading 39.4 MiB off disk dominates" are indistinguishable, and they imply completely different fixes.
+
+So the job records four phases beside the total — **walk, read+hash, parse, write** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
+
+The phases are allowed to sum to *less* than the wall clock. That is concurrency between the parse pool and the writer, not an error, and the report says so rather than leaving a reader to wonder — a sum that exceeded the total would be the thing worth investigating.
+
+When T2 reports, this breakdown is not decoration. It is the evidence that closes the oldest open question in the design document.
+
 **F-03 and NFR-PRF-03.** "Save→index" has two defensible readings that differ by more than the budget itself:
 
 - **End to end**, from the file being written. Includes the 150 ms per-path coalescing window of architecture §3.1 step 1, so it cannot fit inside 50 ms by construction — 150 > 50.
@@ -114,7 +122,7 @@ The entry points the harness is waiting on:
 
 | Budget | Needs | From |
 |---|---|---|
-| NFR-PRF-04 | `rebuild(vault, index_dir) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained | task I4, `serat-index` |
+| NFR-PRF-04 | `rebuild(source: &dyn NoteSource, parser: &dyn NoteParser, index_dir: &Path) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained — plus the four F-10 phase durations on `RebuildReport` | task I4, `serat-index` |
 | NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change — **and** the moment the watcher event left the queue, so F-03's two intervals can be reported separately | task I5, `serat-index` / `serat-vault` |
 | NFR-PRF-01 | `SERAT_STARTUP_TRACE=<file>` writing `{"t0_to_window_visible_ms":…, "t0_to_vault_usable_ms":…}` and exiting; t0 is process spawn measured by the harness, not an `Instant::now()` inside `main` | task D2 (definition), task S1 (`serat-app`) |
 
@@ -122,7 +130,9 @@ The entry points the harness is waiting on:
 
 ## Why the harness may link the product
 
-Architecture §2.1's dependency rule governs the *product* graph. A harness that may not link the thing it measures cannot measure anything. `crates/serat-core/tests/dependency_rule.rs` encodes the rule that actually applies: bench crates may depend on product crates; **nothing under `crates/` may depend on anything under `bench/`.** The direction of the arrow is the whole point, and it is asserted rather than remembered.
+Architecture §2.1's dependency rule governs the *product* graph. A harness that may not link the thing it measures cannot measure anything. `crates/serat-core/tests/dependency_rule.rs` encodes the rule that actually applies, in the `BUDGET_MAY_LINK` allow-list: bench crates may depend on product crates; **nothing under `crates/` may depend on anything under `bench/`.** The direction of the arrow is the whole point, and it is asserted rather than remembered.
+
+The rebuild signature is shaped by the same rule. A rebuild walks, parses and writes, and no product crate may depend on two of those — so the dependencies arrive as `serat-core` traits (`NoteSource`, `NoteParser`) that the harness constructs and hands in, which is the mechanism §2.1 prescribes. `NoteSource` is new in I4 and its home is architect's to ratify; the *shape* cannot change without a new crate and an ADR.
 
 ## Traceability
 
@@ -139,3 +149,4 @@ Architecture §2.1's dependency rule governs the *product* graph. A harness that
 | TC-040 | NFR-PRF-04 — a scanner-disabled Windows run is not gate eligible | `bench/budget/src/env.rs::a_scanner_disabled_windows_run_is_not_gate_eligible` | pass |
 | TC-041 | NFR-PRF-01/03/04 — the measurement environment is detected and recorded | `bench/budget/src/env.rs::detection_reports_something_about_this_machine` | pass |
 | TC-042 | F-03 — every budget declares the interval it times | `bench/budget/src/lib.rs::every_p0_budget_matches_the_number_in_the_prd` | pass |
+| TC-043 | F-10 — the rebuild seam asks for the four phases and they sum coherently | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |

@@ -72,7 +72,7 @@ const POLICY: &[(&str, &[&str])] = &[
     // measure a rebuild without linking the crates that perform one. That is not a
     // hole in the rule. The rule exists to keep the product graph acyclic, and a
     // crate nothing in the product depends on cannot put a cycle in it.
-    ("budget", BENCH_MAY_MEASURE),
+    ("budget", BUDGET_MAY_LINK),
 ];
 
 /// What the budget harness may link.
@@ -87,7 +87,7 @@ const POLICY: &[(&str, &[&str])] = &[
 /// into the harness so the graph looks tidier would be the tail wagging the dog. The
 /// invariant the rule exists to protect is untouched: nothing under `crates/` depends
 /// on either of them (`nothing_in_the_product_depends_on_a_bench_crate`).
-const BENCH_MAY_MEASURE: &[&str] = &[
+const BUDGET_MAY_LINK: &[&str] = &[
     "serat-core",
     "serat-vault",
     "serat-parse",

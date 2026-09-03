@@ -292,6 +292,13 @@ pub struct Outcome {
     pub environment: Environment,
     /// The timings.
     pub samples: Samples,
+    /// Where the time went, for budgets that can say. P0 finding F-10.
+    ///
+    /// The budget still asserts the aggregate — NFR-PRF-04 is a wall-clock
+    /// requirement. This is reported beside it, because a single number cannot
+    /// answer architecture.md's open design question 1, and that question is
+    /// what §1.2 says the parse pool exists to settle.
+    pub phases: Option<subject::RebuildPhases>,
 }
 
 impl Outcome {
@@ -356,6 +363,29 @@ impl Outcome {
         );
         let _ = writeln!(s, "  digest      {}", self.vault.digest);
         let _ = writeln!(s, "  machine     {}", self.environment.summary());
+        if let Some(p) = self.phases {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            let total = self.value_ms().max(f64::MIN_POSITIVE);
+            let share = |d: std::time::Duration| ms(d) / total * 100.0;
+            let _ = writeln!(
+                s,
+                "  phases      walk {:.0} ms ({:.0}%) · read+hash {:.0} ms ({:.0}%) · parse {:.0} ms ({:.0}%) · write {:.0} ms ({:.0}%)",
+                ms(p.walk),
+                share(p.walk),
+                ms(p.read_hash),
+                share(p.read_hash),
+                ms(p.parse),
+                share(p.parse),
+                ms(p.write),
+                share(p.write)
+            );
+            let _ = writeln!(
+                s,
+                "  F-10        phases sum to {:.0} ms against a {:.0} ms wall clock; a sum below the total is concurrency, not error",
+                ms(p.sum()),
+                total
+            );
+        }
         if let Some(reason) = self.environment.ineligibility_reason() {
             let _ = writeln!(s, "  NOT A GATE NUMBER: {reason}");
         }
@@ -409,6 +439,15 @@ impl Outcome {
             self.environment.power_plan.as_deref().unwrap_or("unknown")
         );
         let _ = writeln!(s, "  \"gate_eligible\": {},", self.gate_eligible());
+        if let Some(p) = self.phases {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            let _ = writeln!(s, "  \"phases_ms\": {{");
+            let _ = writeln!(s, "    \"walk\": {:.3},", ms(p.walk));
+            let _ = writeln!(s, "    \"read_hash\": {:.3},", ms(p.read_hash));
+            let _ = writeln!(s, "    \"parse\": {:.3},", ms(p.parse));
+            let _ = writeln!(s, "    \"write\": {:.3}", ms(p.write));
+            let _ = writeln!(s, "  }},");
+        }
         let _ = write!(s, "  \"samples_ms\": [");
         for (i, v) in self.samples.values().iter().enumerate() {
             if i > 0 {
@@ -569,6 +608,24 @@ pub fn run_job<F>(budget: &Budget, args: &[String], measure: F) -> std::process:
 where
     F: FnOnce(&VaultUnderTest, usize) -> Result<Samples, String>,
 {
+    run_job_with_phases(budget, args, |vault, iterations| {
+        measure(vault, iterations).map(|s| (s, None))
+    })
+}
+
+/// As [`run_job`], for a budget whose measurement can also say where the time
+/// went (P0 finding F-10).
+///
+/// # Panics
+/// Never; the signature mirrors [`run_job`].
+pub fn run_job_with_phases<F>(
+    budget: &Budget,
+    args: &[String],
+    measure: F,
+) -> std::process::ExitCode
+where
+    F: FnOnce(&VaultUnderTest, usize) -> Result<(Samples, Option<subject::RebuildPhases>), String>,
+{
     let profile = match args.iter().position(|a| a == "--profile") {
         Some(i) => match args.get(i + 1).map(|s| Profile::parse(s)) {
             Some(Ok(p)) => p,
@@ -609,8 +666,12 @@ where
         }
     };
 
+    let mut phases;
     let samples = match measure(&vault, iterations) {
-        Ok(s) if !s.is_empty() => s,
+        Ok((s, p)) if !s.is_empty() => {
+            phases = p;
+            s
+        }
         Ok(_) => {
             eprintln!("budget: the measurement produced no samples");
             return std::process::ExitCode::FAILURE;
@@ -627,6 +688,7 @@ where
         vault,
         environment: Environment::detect(),
         samples,
+        phases: phases.take(),
     };
     print!("{}", outcome.to_report());
     match write_result(&outcome) {
@@ -694,6 +756,7 @@ mod tests {
             vault: vault.clone(),
             environment: Environment::default(),
             samples: samples(&[30_000.0]),
+            phases: None,
         };
         assert!(
             at_limit.passed(),
@@ -706,6 +769,7 @@ mod tests {
             vault,
             environment: Environment::default(),
             samples: samples(&[30_001.0]),
+            phases: None,
         };
         assert!(!over.passed());
         assert!(over.to_report().starts_with("FAIL"));

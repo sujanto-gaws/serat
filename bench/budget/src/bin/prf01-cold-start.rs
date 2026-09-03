@@ -64,6 +64,9 @@ fn main() -> ExitCode {
             vault: vault.clone(),
             environment: environment.clone(),
             samples,
+            // Cold start has no phase breakdown until D2 defines the marks
+            // between t0 and "usable"; when it does, they belong here.
+            phases: None,
         };
         print!("{}", outcome.to_report());
         match write_result(&outcome) {

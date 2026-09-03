@@ -18,20 +18,87 @@ use std::time::Duration;
 
 use crate::Samples;
 
+/// How a rebuild's cost splits. P0 finding **F-10**.
+///
+/// NFR-PRF-04 is a wall-clock requirement and the budget still asserts the
+/// aggregate. But a single number cannot answer architecture.md's open design
+/// question 1 — *does the parse pool or the index writer dominate rebuild
+/// time?* — and that question is what §1.2 says the parse pool exists to
+/// settle. Reported as one figure, "the writer dominates" and "reading 39.4 MiB
+/// off disk dominates" are indistinguishable, and they imply completely
+/// different fixes.
+///
+/// The walk enumerates without hashing, so the split is real rather than
+/// notional: four phases, four durations, reported beside the total.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RebuildPhases {
+    /// Enumerating the vault. No file contents read.
+    pub walk: Duration,
+    /// Reading bytes and hashing them for the change gate (§3.1 step 3).
+    pub read_hash: Duration,
+    /// Markdown to blocks, fields, links, tasks, on the rayon pool.
+    pub parse: Duration,
+    /// Everything the single-writer actor did, including the final ANALYZE.
+    pub write: Duration,
+}
+
+impl RebuildPhases {
+    /// The four phases summed. Not the same as the wall clock, and deliberately
+    /// so: phases overlap when the parse pool and the writer run concurrently,
+    /// and a sum that exceeded the total would be the first evidence of that.
+    pub fn sum(&self) -> Duration {
+        self.walk + self.read_hash + self.parse + self.write
+    }
+}
+
+/// One rebuild: the wall clock the budget asserts, and the breakdown F-10 asks
+/// for.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RebuildTiming {
+    /// Entry to `rebuild()` until it returns, writer drained and ANALYZE run.
+    /// This is the number NFR-PRF-04 is judged on.
+    pub total: Duration,
+    /// Where the time went.
+    pub phases: RebuildPhases,
+    /// Notes the rebuild says it indexed, asserted against the vault manifest.
+    pub notes: usize,
+}
+
 /// What the harness needs from `serat-index` before NFR-PRF-04 is measurable.
-pub const REBUILD_ENTRY_POINT: &str = "\
-NFR-PRF-04 needs, from serat-index (task I4):
+pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task I4):
 
-    // Walk `vault`, parse every note, populate a fresh index at `index_dir`,
-    // and return only when the writer has drained and ANALYZE has run.
-    pub fn rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildReport, IndexError>;
+    // Dependencies injected as serat-core traits, because a rebuild walks,
+    // parses and writes, and no product crate may depend on two of those
+    // (architecture 2.1). Shape confirmed by rust-core-dev; the exact spelling
+    // is provisional until architect rules on where rebuild orchestration
+    // lives. NoteSource is new in I4; NoteParser already exists.
+    pub fn rebuild(
+        source: &dyn NoteSource,
+        parser: &dyn NoteParser,
+        index_dir: &Path,
+    ) -> Result<RebuildReport, IndexError>;
 
-    pub struct RebuildReport { pub notes: usize, pub blocks: usize, pub links: usize, ... }
+    pub struct RebuildReport {
+        pub notes: usize, pub blocks: usize, pub links: usize, // ...
+        // F-10: the four phases, so open design question 1 can be answered.
+        pub walk: Duration, pub read_hash: Duration,
+        pub parse: Duration, pub write: Duration,
+    }
 
-Callable from a plain binary with no Tauri app running. The harness times the
-call with a monotonic clock, does not time the vault generation, and asserts the
-returned note count against the vault manifest so a rebuild that quietly indexed
-half the vault cannot post a fast number.";
+Call site:
+
+    let vault  = serat_vault::Vault::open(vault_path)?;
+    let parser = serat_parse::CommonMarkParser::new();
+    let report = serat_index::rebuild(&vault, &parser, index_dir)?;
+
+Callable from a plain binary with no Tauri app running, returning only after the
+writer has drained and ANALYZE has run. The harness times the call with a
+monotonic clock, does not time the vault generation, and asserts the returned
+note count against the vault manifest -- a rebuild that indexed half the vault
+quickly is the failure a wall-clock number cannot see on its own.
+
+The four phase durations are the whole content of open design question 1. The
+budget still asserts the total; the phases are recorded beside it.";
 
 /// Two intervals, because P0 finding F-03 showed that "save to index" has two
 /// defensible readings that differ by more than the budget itself.
@@ -66,10 +133,22 @@ NFR-PRF-03 needs, from serat-index / serat-vault (task I5):
     // 150 ms coalescing window is reported separately from the work:
     pub fn last_dequeued_at(&self) -> Instant;   // or a timestamped event
 
-The harness edits 1,000 distinct notes drawn across the vault, one at a time,
-and reports BOTH intervals: file-written-to-visible, and dequeued-to-visible.
-It needs distinct notes rather than one note a thousand times, because
-re-saving one note measures a warm row and not the budget.
+The harness edits 1,000 distinct notes, one at a time, and reports BOTH
+intervals: file-written-to-visible, and dequeued-to-visible. Distinct notes
+rather than one note a thousand times, because re-saving one note measures a
+warm row and not the budget -- and the sample deliberately includes hub notes.
+With 25% of inbound links held by 1% of notes and a max in-degree of 679, a save
+that touches a hub does far more link-table work than the median, so a sample
+that misses the hubs posts a p95 the real vault does not honour.
+(rust-core-dev's point, and a good one.)
+
+apply_and_wait bypasses the watcher by design, and that is the honest way to
+measure this: no external change can reach the index in under the 150 ms
+coalescing window, so the 50 ms budget can only mean Serat's own save path,
+where the app submits directly rather than waiting to be told about its own
+write. flush() means every operation submitted before the call is committed;
+under WAL that is visible to a reader beginning a transaction afterwards, which
+is the guarantee worth measuring.
 
 F-03: end to end, the design misses 50 ms by construction, because the
 coalescing window alone is 150 ms. Until the architect rules on which interval
@@ -92,11 +171,12 @@ be the first painted frame, not window creation. `vault usable` is D2's to
 define, and the harness asserts whatever D2 says. Until D2 lands this job is
 blocked rather than guessed at.";
 
-/// Time one full rebuild of the vault into a throwaway index directory.
+/// Time one full rebuild of the vault into a throwaway index directory,
+/// including the phase breakdown F-10 asks for.
 ///
 /// # Errors
 /// Today: always, because `serat-index` has no rebuild entry point yet.
-pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<Duration, String> {
+pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, String> {
     let _ = (vault, index_dir);
     // Touching the crates keeps the dependency edge real, so the day the entry
     // point lands there is nothing to wire up but the call itself.
@@ -156,6 +236,19 @@ mod tests {
         let e = full_rebuild(vault, index).expect_err("must not silently pass");
         assert!(e.contains("task I4"), "{e}");
         assert!(e.contains("rebuild("), "{e}");
+        // F-10: the request for the four phases must survive edits to this text,
+        // because they are what closes open design question 1.
+        assert!(e.contains("F-10"), "{e}");
+        assert!(e.contains("NoteSource"), "{e}");
+
+        // And the phases must sum to something a reader can interpret.
+        let phases = RebuildPhases {
+            walk: Duration::from_millis(100),
+            read_hash: Duration::from_millis(200),
+            parse: Duration::from_millis(300),
+            write: Duration::from_millis(400),
+        };
+        assert_eq!(phases.sum(), Duration::from_millis(1_000));
 
         let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
         assert!(e.contains("task I5"), "{e}");

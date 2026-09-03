@@ -82,7 +82,7 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 
 | Test ID | Verifies | Type | Location | Status |
 |---|---|---|---|---|
-| TC-020 | NFR-PRF-04, NFR-PRF-08 — full rebuild of 20,000 notes < 30 s | bench | `bench/budget/src/bin/prf04-full-rebuild.rs` | harness landed, **red** pending I4 |
+| TC-020 | NFR-PRF-04, NFR-PRF-08 — full rebuild of 20,000 notes < 30 s, with the F-10 phase breakdown beside it | bench | `bench/budget/src/bin/prf04-full-rebuild.rs` | harness landed, **red** pending I4; asserts the aggregate, records walk / read+hash / parse / write |
 | TC-021 | NFR-PRF-03, NFR-PRF-08 — save→index < 50 ms p95 over 1,000 saves, on both of F-03's intervals | bench | `bench/budget/src/bin/prf03-save-to-index.rs` | harness landed, **red** pending I5; asserts the pipeline interval, reports end-to-end, pending the F-03 ruling |
 | TC-022 | NFR-PRF-01, NFR-PRF-08 — cold start: window visible < 400 ms, usable < 1 s, p95 over 20 runs | bench | `bench/budget/src/bin/prf01-cold-start.rs` | harness landed, **red** pending D2 + S1 |
 | TC-023 | NFR-PRF-08, US-35 — every budget has an asserting job; a breach fails the build | CI | `.github/workflows/budgets.yml` | pass |
@@ -93,6 +93,7 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-040 | NFR-PRF-04 — a virus-scanner-disabled Windows run is recorded as not gate eligible | unit | `bench/budget/src/env.rs` | pass |
 | TC-041 | NFR-PRF-01, NFR-PRF-03, NFR-PRF-04 — the measurement environment is detected and stamped on every result | unit | `bench/budget/src/env.rs` | pass |
 | TC-042 | F-03 — every budget declares the exact interval it times | unit | `bench/budget/src/lib.rs` | pass |
+| TC-043 | F-10 — the rebuild reports walk / read+hash / parse / write beside the aggregate | unit | `bench/budget/src/subject.rs` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a truncated index is detected and rebuilt on start | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 
