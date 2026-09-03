@@ -144,7 +144,8 @@ CREATE TABLE blocks (
                  -- and serat-parse emits none. Frontmatter is likewise not a
                  -- block: its fields carry their own byte ranges, and the CHECK
                  -- on fields already says a frontmatter field has no block.
-                 -- Raised by rust-core-dev before I3 emitted a single row.
+                 -- Finding F-20, raised by rust-core-dev before I3 emitted a
+                 -- single row.
     block_ref    TEXT,                     -- author-supplied ^id
     heading_path TEXT,                     -- breadcrumb of enclosing headings (§8.1)
     text         TEXT,                     -- plain text; the FTS content column
@@ -216,8 +217,9 @@ CREATE TABLE links (
 -- every pass, forever. Tags live in this table on purpose — tag search and the
 -- link graph are then one mechanism rather than two, which is the same reasoning
 -- that makes a task a block — and the CHECK above is what keeps the longer
--- predicate honest instead of merely documented. Caught by rust-core-dev reading
--- the DDL against its own comment before any code depended on it.
+-- predicate honest instead of merely documented. Finding F-22, caught by
+-- rust-core-dev reading the DDL against its own comment before any code
+-- depended on it.
 --
 -- P1 adds the index that makes the predicate cheap and keeps it in one place,
 -- which is where the re-resolution pass must read it from:

@@ -11,7 +11,7 @@ Metadata in the index only; extended attributes; one manifest per folder.
 ## Decision
 A binary's frontmatter, tags, links and annotations live in a companion Markdown file.
 
-**The name is the binary's full filename with `.md` appended** — `contracts/lease.pdf` pairs with `contracts/lease.pdf.md`, in the same directory, always. Pinned 2026-09-04 at test-engineer's request, having previously been left to convention.
+**The name is the binary's full filename with `.md` appended** — `contracts/lease.pdf` pairs with `contracts/lease.pdf.md`, in the same directory, always. Pinned 2026-09-04 at test-engineer's request (finding F-23), having previously been left to convention.
 
 Replacing the extension rather than appending to it — `lease.md` — was rejected because it collides. `lease.pdf` and `lease.png` would share one sidecar, and worse, a vault that already contains a genuine note called `lease.md` would have it silently adopted as an asset's metadata. Appending cannot collide: the only file that can claim `lease.pdf.md` is a note someone deliberately named that.
 

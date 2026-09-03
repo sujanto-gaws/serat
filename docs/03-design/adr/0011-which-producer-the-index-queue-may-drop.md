@@ -42,6 +42,8 @@ Negative: correctness now depends on the rescan actually happening. The risk mov
 
 The risk this ADR exists to close was measured, not imagined. With every producer dropping, capacity 8,192, a 20,200-file vault, `walk()` returning sorted paths and a FIFO queue, the same 8,192 paths win the slots on every rescan: **12,008 files had never once reached the consumer after five rescans.** A stable loop rather than a slow one. It also meant the *first* index of a 20k vault silently dropped about 12,000 paths unless the consumer outpaced the walk, which a cold start cannot promise. That is the defect option 3 produces, and it is invisible without a test that counts what arrived.
 
+The asymmetry then turned up a second time, independently, before this ADR was written. F-19: the *rebuild* dropped files under the same policy, and would have reported a fast benchmark number for a partly indexed vault — the same root cause in a second place, one queue policy serving two producers with opposite recovery properties. It was fixed the way this ADR requires, with a blocking submit kept deliberately off the `IndexWriter` trait so the save path cannot reach for it. Two independent occurrences in one spike is the evidence that the asymmetry is the decision and the policy is only its consequence.
+
 This sharpens ADR-0001 rather than amending it: the single-writer actor's queue is not a uniform pipe, and which side of it a producer sits on is a property of the producer, not of the queue.
 
 ## Objections recorded
