@@ -75,11 +75,25 @@ const POLICY: &[(&str, &[&str])] = &[
     ("budget", BENCH_MAY_MEASURE),
 ];
 
-/// Product crates the budget harness may link in order to measure them.
+/// What the budget harness may link.
 ///
-/// `serat-app` is absent deliberately: measuring the shell means driving it as a
-/// process, which is what the cold-start budget (NFR-PRF-01) times anyway.
-const BENCH_MAY_MEASURE: &[&str] = &["serat-core", "serat-vault", "serat-parse", "serat-index"];
+/// The product crates it measures, plus `vaultgen`. `serat-app` is absent
+/// deliberately: measuring the shell means driving it as a process, which is what
+/// the cold-start budget (NFR-PRF-01) times anyway.
+///
+/// `vaultgen` is a bench-to-bench edge, added by test-engineer in task B2. Every job
+/// verifies the vault against its manifest before it starts the clock, and there must
+/// be exactly one definition of the tree digest doing that — duplicating a SHA-256
+/// into the harness so the graph looks tidier would be the tail wagging the dog. The
+/// invariant the rule exists to protect is untouched: nothing under `crates/` depends
+/// on either of them (`nothing_in_the_product_depends_on_a_bench_crate`).
+const BENCH_MAY_MEASURE: &[&str] = &[
+    "serat-core",
+    "serat-vault",
+    "serat-parse",
+    "serat-index",
+    "vaultgen",
+];
 
 /// Workspace members that are tools rather than product.
 ///
