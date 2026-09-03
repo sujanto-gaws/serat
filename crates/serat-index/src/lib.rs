@@ -11,9 +11,14 @@
 //! I4; the incremental save path in I5; corruption detection and automatic rebuild
 //! in I6.
 
+mod apply;
+pub mod rebuild;
 pub mod schema;
+pub mod writer;
 
+pub use rebuild::{RebuildReport, index_path, rebuild};
 pub use schema::{DDL, IndexState, SCHEMA_VERSION, UnusableReason, bootstrap, inspect, open};
+pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
 /// The version of SQLite compiled into this binary.
 ///

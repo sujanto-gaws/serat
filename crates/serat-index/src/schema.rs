@@ -105,6 +105,27 @@ pub fn bootstrap(conn: &Connection) -> Result<(), IndexError> {
     conn.execute_batch(DDL).map_err(sqlite)
 }
 
+/// Create the schema if this database is empty.
+///
+/// Idempotent, so opening an existing index is not a special case for the caller.
+///
+/// # Errors
+///
+/// [`IndexError::Sqlite`] if the check or the DDL fails.
+pub fn bootstrap_if_empty(conn: &Connection) -> Result<(), IndexError> {
+    let has_tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'notes'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite)?;
+    if has_tables == 0 {
+        bootstrap(conn)?;
+    }
+    Ok(())
+}
+
 /// Decide whether an existing database can be used.
 ///
 /// Everything that is not `Ready` leads to the same action — delete and rebuild — so
