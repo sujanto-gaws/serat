@@ -32,6 +32,8 @@ When the queue is full and the producer is a bulk enumeration, the push blocks u
 
 The flag is latched rather than counted, because the response to one drop and to four thousand is identical. It is cleared **on completion of the rescan, not on read**, so a consumer that observes the flag and then dies mid-walk re-triggers the rescan instead of forgetting it.
 
+Clear-on-completion needs one more turn of the screw, because the obvious implementation of it is also wrong: an overflow that happens *during* the rescan must not be cleared by that rescan finishing, or the walk that was supposed to recover the drops swallows a newer set of them. So the latch carries a generation counter. The consumer reads the generation when it starts walking, and at the end clears the flag only if the generation is unchanged; if it moved, the flag stays set and the consumer walks again. The counter is not a count of dropped paths — the response to one drop and to four thousand is still identical — it exists solely so that "the state I recovered from" and "the state now" can be told apart.
+
 The default bound is 8,192 distinct paths.
 
 ## Consequences
