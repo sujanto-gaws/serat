@@ -30,12 +30,13 @@ Six kinds of test, chosen because six different kinds of thing can be wrong.
 | **Conformance** | Does the query language mean what the grammar says? | `grammar/conformance.md` + a runner | P2 onward |
 | **Hostile** | Does it survive the world being unfriendly — concurrent edit, undo/redo, crash mid-write? | `crates/<crate>/tests/` | Every `cargo test` |
 
-Four rules that follow from the constraints rather than from taste:
+Five rules that follow from the constraints rather than from taste:
 
 1. **Every budget has exactly one asserting job** (NFR-PRF-08, C-06). A budget with no job is not a budget, it is an aspiration. A job that measures something other than what the requirement says is worse than none, because it produces a number people trust.
-2. **The gate number is measured in the environment a user has.** Filesystem-bound budgets are measured on the reference machine both with the on-access virus scanner enabled and disabled, and the *enabled* figure is what the gate is judged on. The harness detects the scanner state and marks a disabled run as not gate eligible, so a best case cannot be filed as a verdict. See `reference-machine.md`.
-3. **A threshold is never weakened to make a build pass.** If a budget is genuinely wrong, it is re-baselined by product-analyst in the PRD with the measurement attached (task Q1), and the change is visible in the requirements history. Editing a number in a CI file is not that.
-4. **The write-back patcher is property-tested against a corpus of real notes** (NFR-MNT-03) — that no byte outside the target field's range changes. Architecture §10.3 calls it "the single most important test in the suite" and P2 does not close without it.
+2. **A measurement names the interval it times.** Every budget carries the interval as data, printed and recorded, and a test fails a budget that leaves it blank. P0 finding F-03 — that NFR-PRF-03's 50 ms and §3.1's 150 ms coalescing window cannot both be about the same interval — is what happens when nobody writes it down. Where a requirement is genuinely ambiguous, the harness measures both readings and says which one it asserted.
+3. **The gate number is measured in the environment a user has.** Filesystem-bound budgets are measured on the reference machine both with the on-access virus scanner enabled and disabled, and the *enabled* figure is what the gate is judged on. The harness detects the scanner state and marks a disabled run as not gate eligible, so a best case cannot be filed as a verdict. See `reference-machine.md`.
+4. **A threshold is never weakened to make a build pass.** If a budget is genuinely wrong, it is re-baselined by product-analyst in the PRD with the measurement attached (task Q1), and the change is visible in the requirements history. Editing a number in a CI file is not that.
+5. **The write-back patcher is property-tested against a corpus of real notes** (NFR-MNT-03) — that no byte outside the target field's range changes. Architecture §10.3 calls it "the single most important test in the suite" and P2 does not close without it.
 
 ## The verification artefact
 
@@ -82,7 +83,7 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | Test ID | Verifies | Type | Location | Status |
 |---|---|---|---|---|
 | TC-020 | NFR-PRF-04, NFR-PRF-08 — full rebuild of 20,000 notes < 30 s | bench | `bench/budget/src/bin/prf04-full-rebuild.rs` | harness landed, **red** pending I4 |
-| TC-021 | NFR-PRF-03, NFR-PRF-08 — save→index < 50 ms p95 over 1,000 saves | bench | `bench/budget/src/bin/prf03-save-to-index.rs` | harness landed, **red** pending I5 |
+| TC-021 | NFR-PRF-03, NFR-PRF-08 — save→index < 50 ms p95 over 1,000 saves, on both of F-03's intervals | bench | `bench/budget/src/bin/prf03-save-to-index.rs` | harness landed, **red** pending I5; asserts the pipeline interval, reports end-to-end, pending the F-03 ruling |
 | TC-022 | NFR-PRF-01, NFR-PRF-08 — cold start: window visible < 400 ms, usable < 1 s, p95 over 20 runs | bench | `bench/budget/src/bin/prf01-cold-start.rs` | harness landed, **red** pending D2 + S1 |
 | TC-023 | NFR-PRF-08, US-35 — every budget has an asserting job; a breach fails the build | CI | `.github/workflows/budgets.yml` | pass |
 | TC-026 | NFR-PRF-08 — the budget table matches the numbers in the PRD | unit | `bench/budget/src/lib.rs` | pass |
@@ -91,6 +92,7 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-029 | NFR-PRF-08 — a missing subject fails loudly and names the task that unblocks it | unit | `bench/budget/src/subject.rs` | pass |
 | TC-040 | NFR-PRF-04 — a virus-scanner-disabled Windows run is recorded as not gate eligible | unit | `bench/budget/src/env.rs` | pass |
 | TC-041 | NFR-PRF-01, NFR-PRF-03, NFR-PRF-04 — the measurement environment is detected and stamped on every result | unit | `bench/budget/src/env.rs` | pass |
+| TC-042 | F-03 — every budget declares the exact interval it times | unit | `bench/budget/src/lib.rs` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a truncated index is detected and rebuilt on start | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 

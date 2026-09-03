@@ -46,6 +46,26 @@ The product budget belongs to the reference machine (`reference-machine.md`). A 
 
 `ci_limit_ms` is `None` for all four budgets, because there has been no CI run to set it from and a placeholder invented at a desk is worse than an honest red. Until it is set, the CI job asserts the product limit. **The ceilings are set from the first green CI run and recorded here with the run they came from** — not by lowering a bar to make a build pass.
 
+### Every budget names the interval it times
+
+Each budget carries an `interval` string saying exactly what is timed, printed in the report and recorded in the result JSON, and a test fails any budget that leaves it empty. This is not bureaucracy: P0 finding **F-03** is precisely what happens when nobody writes it down.
+
+| Budget | Interval |
+|---|---|
+| NFR-PRF-01 window visible | process spawn to the first painted frame |
+| NFR-PRF-01 vault usable | process spawn to the vault-usable mark, as task D2 defines it |
+| NFR-PRF-03 | watcher event dequeued to the row being visible to a reader |
+| NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
+
+**F-03 and NFR-PRF-03.** "Save→index" has two defensible readings that differ by more than the budget itself:
+
+- **End to end**, from the file being written. Includes the 150 ms per-path coalescing window of architecture §3.1 step 1, so it cannot fit inside 50 ms by construction — 150 > 50.
+- **Pipeline**, from the watcher event being dequeued. The only reading the current design can satisfy.
+
+The job measures **both** and asserts the pipeline interval, printing the end-to-end figure beside it as `F-03 … reported, not asserted`. That way the gate report states which number the 50 ms claim rests on instead of implying there was only ever one, and if the architect rules the other way the assertion moves one line. The seam asks I5 for a dequeue timestamp for exactly this reason.
+
+This is a measurement decision, not a ruling: F-03 is the architect's to close and product-analyst's to re-baseline at Q1.
+
 ### p95 is nearest-rank
 
 NFR-PRF-01 says "over 20 runs; p95 within budget", and at n = 20 the choice of percentile definition changes the answer. Nearest rank at q = 0.95, n = 20 is the 19th of 20 sorted samples: **one slow run out of twenty is inside the budget; two are not.** An interpolating percentile would let two through, which is not what the requirement means. A unit test asserts exactly that boundary.
@@ -79,7 +99,7 @@ A number without its conditions is not comparable with another number, so each r
 
 - the vault's `tree_digest_sha256`, recomputed from disk, not copied from the manifest;
 - the generator's `VAULT_FORMAT_VERSION` and the vault's note count;
-- the machine profile and the limit that was applied;
+- the machine profile, the limit that was applied, and the interval that was timed;
 - the operating system, core count, real-time scanner state and power plan;
 - whether the result is gate eligible;
 - every raw sample, not just the statistic.
@@ -95,7 +115,7 @@ The entry points the harness is waiting on:
 | Budget | Needs | From |
 |---|---|---|
 | NFR-PRF-04 | `rebuild(vault, index_dir) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained | task I4, `serat-index` |
-| NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change | task I5, `serat-index` / `serat-vault` |
+| NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change — **and** the moment the watcher event left the queue, so F-03's two intervals can be reported separately | task I5, `serat-index` / `serat-vault` |
 | NFR-PRF-01 | `SERAT_STARTUP_TRACE=<file>` writing `{"t0_to_window_visible_ms":…, "t0_to_vault_usable_ms":…}` and exiting; t0 is process spawn measured by the harness, not an `Instant::now()` inside `main` | task D2 (definition), task S1 (`serat-app`) |
 
 **NFR-PRF-01 is blocked on D2, not on effort.** The architect has been asked to define t0, "window visible" (first painted frame, not window creation — measuring window creation would pass 400 ms and ship a blank rectangle) and "vault usable", plus which integrity check runs on the warm start path, since whatever it is sits inside the 1 s budget. The harness measures what D2 defines and does not guess.
@@ -118,3 +138,4 @@ Architecture §2.1's dependency rule governs the *product* graph. A harness that
 | TC-029 | NFR-PRF-08 — a missing subject fails loudly and names the task | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
 | TC-040 | NFR-PRF-04 — a scanner-disabled Windows run is not gate eligible | `bench/budget/src/env.rs::a_scanner_disabled_windows_run_is_not_gate_eligible` | pass |
 | TC-041 | NFR-PRF-01/03/04 — the measurement environment is detected and recorded | `bench/budget/src/env.rs::detection_reports_something_about_this_machine` | pass |
+| TC-042 | F-03 — every budget declares the interval it times | `bench/budget/src/lib.rs::every_p0_budget_matches_the_number_in_the_prd` | pass |

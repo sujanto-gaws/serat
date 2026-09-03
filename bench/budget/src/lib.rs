@@ -107,6 +107,16 @@ pub struct Budget {
     pub ci_limit_ms: Option<f64>,
     /// Which preset vault it is measured against.
     pub vault: &'static str,
+    /// **Exactly which interval is timed.**
+    ///
+    /// Named on the budget rather than left to the job, because P0 finding F-03
+    /// showed that "save→index" has two defensible readings that differ by more
+    /// than the budget itself: end-to-end from the file being written (which
+    /// includes the 150 ms per-path coalescing window of architecture §3.1
+    /// step 1, and so cannot fit 50 ms by construction) and the pipeline's own
+    /// cost from the event being dequeued. A number reported without saying
+    /// which one it is is not a measurement, it is a rumour.
+    pub interval: &'static str,
 }
 
 impl Budget {
@@ -129,6 +139,7 @@ pub const PRF01_WINDOW_VISIBLE: Budget = Budget {
     product_limit_ms: 400.0,
     ci_limit_ms: None,
     vault: "20k",
+    interval: "process spawn to the first painted frame",
 };
 
 /// NFR-PRF-01, the second mark.
@@ -141,6 +152,7 @@ pub const PRF01_VAULT_USABLE: Budget = Budget {
     product_limit_ms: 1_000.0,
     ci_limit_ms: None,
     vault: "20k",
+    interval: "process spawn to the vault-usable mark, as task D2 defines it",
 };
 
 /// NFR-PRF-03.
@@ -153,6 +165,7 @@ pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
     product_limit_ms: 50.0,
     ci_limit_ms: None,
     vault: "20k",
+    interval: "watcher event dequeued to the row being visible to a reader (see F-03)",
 };
 
 /// NFR-PRF-04.
@@ -165,6 +178,7 @@ pub const PRF04_FULL_REBUILD: Budget = Budget {
     product_limit_ms: 30_000.0,
     ci_limit_ms: None,
     vault: "20k",
+    interval: "entry to rebuild() until it returns, writer drained and ANALYZE run",
 };
 
 /// Every P0 budget, so a CI configuration review (NFR-PRF-08's acceptance
@@ -316,6 +330,7 @@ impl Outcome {
             self.budget.requirement, self.budget.id
         );
         let _ = writeln!(s, "  budget      {}", self.budget.statement);
+        let _ = writeln!(s, "  interval    {}", self.budget.interval);
         let _ = writeln!(
             s,
             "  measured    {} = {:.1} ms   limit {:.1} ms ({} profile)",
@@ -360,6 +375,7 @@ impl Outcome {
         let _ = writeln!(s, "{{");
         let _ = writeln!(s, "  \"budget_id\": \"{}\",", self.budget.id);
         let _ = writeln!(s, "  \"requirement\": \"{}\",", self.budget.requirement);
+        let _ = writeln!(s, "  \"interval\": \"{}\",", self.budget.interval);
         let _ = writeln!(s, "  \"profile\": \"{}\",", self.profile.label());
         let _ = writeln!(s, "  \"statistic\": \"{}\",", self.budget.statistic.label());
         let _ = writeln!(s, "  \"value_ms\": {:.3},", self.value_ms());
@@ -712,6 +728,11 @@ mod tests {
         for b in P0_BUDGETS {
             assert!(b.requirement.starts_with("NFR-PRF-"));
             assert_eq!(b.vault, "20k", "{} measures the wrong vault", b.id);
+            assert!(
+                !b.interval.is_empty(),
+                "{} does not say which interval it times, and P0 finding F-03 is what happens when nobody writes that down",
+                b.id
+            );
         }
     }
 

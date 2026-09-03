@@ -33,6 +33,22 @@ call with a monotonic clock, does not time the vault generation, and asserts the
 returned note count against the vault manifest so a rebuild that quietly indexed
 half the vault cannot post a fast number.";
 
+/// Two intervals, because P0 finding F-03 showed that "save to index" has two
+/// defensible readings that differ by more than the budget itself.
+#[derive(Clone, Debug, Default)]
+pub struct SaveSamples {
+    /// File written to row visible. What a user experiences, and what includes
+    /// the 150 ms per-path coalescing window of architecture section 3.1 step 1.
+    /// This reading cannot fit inside 50 ms by construction; measuring it anyway
+    /// is how the gate report shows *why*, rather than asserting it is impossible.
+    pub end_to_end: Samples,
+    /// Watcher event dequeued to row visible. The pipeline's own cost, with the
+    /// debounce excluded. The only reading of NFR-PRF-03 that is satisfiable under
+    /// the current design, and therefore the one asserted -- pending the
+    /// architect's ruling on F-03.
+    pub pipeline: Samples,
+}
+
 /// What the harness needs before NFR-PRF-03 is measurable.
 pub const SAVE_ENTRY_POINT: &str = "\
 NFR-PRF-03 needs, from serat-index / serat-vault (task I5):
@@ -46,10 +62,20 @@ NFR-PRF-03 needs, from serat-index / serat-vault (task I5):
     // index.changed notification carrying the same guarantee).
     pub fn apply_and_wait(&self, path: &VaultPath, bytes: &[u8]) -> Result<(), IndexError>;
 
+    // And, for F-03, the moment the watcher event left the queue, so the
+    // 150 ms coalescing window is reported separately from the work:
+    pub fn last_dequeued_at(&self) -> Instant;   // or a timestamped event
+
 The harness edits 1,000 distinct notes drawn across the vault, one at a time,
-timing each write-to-visible round trip. It needs distinct notes rather than one
-note a thousand times, because re-saving one note measures a warm row and not
-the budget.";
+and reports BOTH intervals: file-written-to-visible, and dequeued-to-visible.
+It needs distinct notes rather than one note a thousand times, because
+re-saving one note measures a warm row and not the budget.
+
+F-03: end to end, the design misses 50 ms by construction, because the
+coalescing window alone is 150 ms. Until the architect rules on which interval
+the requirement means, the harness asserts the pipeline interval and prints the
+end-to-end figure beside it, so the gate report states which number the claim
+rests on instead of implying there was only ever one.";
 
 /// What the harness needs before NFR-PRF-01 is measurable.
 pub const COLD_START_ENTRY_POINT: &str = "\
@@ -82,11 +108,16 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<Duration, String> 
     ))
 }
 
-/// Time `iterations` single-note saves through to being visible in the index.
+/// Time `iterations` single-note saves through to being visible in the index,
+/// on both of F-03's intervals.
 ///
 /// # Errors
 /// Today: always, because the incremental save path does not exist yet.
-pub fn save_to_index(vault: &Path, index_dir: &Path, iterations: usize) -> Result<Samples, String> {
+pub fn save_to_index(
+    vault: &Path,
+    index_dir: &Path,
+    iterations: usize,
+) -> Result<SaveSamples, String> {
     let _ = (vault, index_dir, iterations);
     // serat-vault's hash gate is the first step of the path being measured
     // (architecture §3.1 step 3); calling it here proves the link, and the
