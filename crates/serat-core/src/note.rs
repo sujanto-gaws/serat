@@ -112,3 +112,17 @@ impl IndexOp {
         }
     }
 }
+
+/// A file's bytes together with the identity of exactly those bytes.
+///
+/// The pair travels together because a byte range is only meaningful against the
+/// bytes it was computed from: handing a caller bytes without the hash is how a parse
+/// result ends up attributed to a file that has since changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedNote {
+    /// Identity, hash and stat data.
+    pub meta: NoteMeta,
+    /// The bytes, exactly as they are on disk. No decoding and no line-ending
+    /// translation: the parser records byte offsets into this.
+    pub bytes: Vec<u8>,
+}
