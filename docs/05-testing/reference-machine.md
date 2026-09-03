@@ -37,16 +37,39 @@ Measured 2026-09-03, the machine this repository is developed on.
 
 Both are recorded here rather than quietly enjoyed, because a number is only useful with its conditions attached.
 
-**1. Defender real-time protection is off.** Every file this machine writes and reads skips the on-access scanner. A full rebuild of 20,000 notes reads 20,000 files, and on a stock Windows machine with Defender enabled that is materially slower — this is the single largest environmental difference between RM-1 and a default Windows installation, and between RM-1 and a GitHub-hosted Windows runner (where Defender *is* enabled). **Any NFR-PRF-04 number taken on RM-1 is a best case for Windows.** The report for T2 must say so, and the CI budget job (B2) must carry a separate, looser CI threshold or an explicit exclusion, decided when the first CI numbers land — not by weakening the product budget.
+**1. Defender real-time protection is off.** Every file this machine writes and reads skips the on-access scanner. A full rebuild of 20,000 notes reads 20,000 files, and on a stock Windows machine with Defender enabled that is materially slower — this is the single largest environmental difference between RM-1 and a default Windows installation, and between RM-1 and a GitHub-hosted Windows runner (where Defender *is* enabled). **Any NFR-PRF-04 number taken on RM-1 with the scanner off is a best case for Windows.**
 
 **2. The active power plan is "Energy Star", not "High performance".** Boost behaviour and therefore single-thread throughput vary with it, and on a laptop they also vary with thermals. Cold-start (NFR-PRF-01) is largely single-threaded and is the measurement most exposed to this.
 
+## The gate number is the scanner-enabled number
+
+Instruction from the lead, task B2, and it is a rule rather than a caveat:
+
+- **Every filesystem-bound budget is measured on RM-1 both ways** — real-time protection off (the comparable best case, stable across runs) and on (what a user actually gets).
+- **The scanner-enabled figure is the one the charter's "< 30 s" gate is judged against.** A number taken with the scanner off is a diagnostic, not a verdict.
+- **Real-time protection is never disabled to make a budget pass.** If the honest number breaches 30 s, the P0 gate is NO-GO and the architecture changes — architecture §1.2 says P0 may invalidate the parse-pool assumption, and I/O rather than parsing turning out to be the bottleneck is exactly such a result, not an environment footnote. Carried in the risk register.
+
+This does not depend on anyone remembering it. The harness detects the scanner state itself, stamps it on every result, and marks a scanner-disabled run `"gate_eligible": false` with a `NOT A GATE NUMBER` line in its report — so a best-case figure cannot be filed as the gate figure by omission. The harness never changes the scanner state: toggling real-time protection is an administrator action with consequences outside this repository, and a benchmark tool that disables your antivirus to look good is not a thing this project should contain. Toggling is a manual step in the protocol below.
+
 **Benchmark protocol on RM-1**, to keep runs comparable:
 
-- Mains power connected, lid open, no other build running.
-- The same power plan for every run in a series; the plan in force is recorded in the report.
-- Discard the first run of a series (page cache is cold in a way the budget does not describe — NFR-PRF-01 specifies a *warm* index) and report p95 over the remaining runs.
-- Record the vault's `tree_digest_sha256` from its manifest in every report, so the number and the vault it was taken against travel together.
+1. Mains power connected, lid open, no other build running.
+2. Record the environment before the series and after it:
+   ```
+   cargo run --release -p budget --bin environment
+   ```
+   It prints the scanner state, the power plan and the core count, and exits non-zero when the environment cannot produce a gate number.
+3. Run the series with real-time protection **enabled** — this is the gate number.
+4. Disable real-time protection, re-run, and record that figure beside it as the comparable best case. Re-enable it afterwards.
+5. The same power plan for every run in a series; the plan in force is recorded automatically in each result and quoted in the report.
+6. Discard the first run of a series (page cache is cold in a way the budget does not describe — NFR-PRF-01 specifies a *warm* index) and report p95 over the remaining runs.
+7. Record the vault's `tree_digest_sha256` in every report, so the number and the vault it was taken against travel together. The harness does this for you and refuses to run against a vault that disagrees with its manifest.
+
+A gate report therefore carries two rows per filesystem-bound budget, and says which is which:
+
+| Budget | Scanner on (gate) | Scanner off (best case) | Power plan |
+|---|---|---|---|
+| NFR-PRF-04 full rebuild | *pending I4* | *pending I4* | *recorded per run* |
 
 ### Machine fingerprint
 
@@ -62,6 +85,9 @@ target/release/vaultgen --preset 20k --force
 | vaultgen 20k wall clock | 4.71 s, 5.19 s, 5.46 s (three consecutive runs) |
 | vaultgen 50k wall clock | 6.84 s |
 | Vault size, 20k | 39.4 MiB across 20,205 files |
+| Environment at the time | `windows · 16 cores · realtime scanner OFF · power plan Energy Star` |
+
+Those generation figures were taken with the scanner **off**, and are recorded as such. They are a machine fingerprint, not a budget, so they are not subject to the gate rule above — but they will move when the scanner is on, and a fingerprint compared across different scanner states means nothing.
 
 If this drifts by more than ~30% the machine, its power plan or its scanner configuration has changed, and previously recorded budget numbers are no longer directly comparable.
 
@@ -69,13 +95,15 @@ If this drifts by more than ~30% the machine, its power plan or its scanner conf
 
 CI runners are not RM-1 and never will be. NFR-PRF-08 requires every budget to be asserted in CI and a regression to fail the build; that is a *regression gate*, and its thresholds are a property of the runner. The product budgets in NFR-PRF-01/03/04 are the numbers RM-1 must meet. Both are real, they are not the same number, and B2 keeps them in separate columns.
 
+A GitHub-hosted Windows runner does have real-time protection enabled, so a CI number is gate eligible in the sense this document means — it is simply measured on the wrong machine, which the `ci` profile's separate threshold accounts for.
+
 ## Traceability
 
 | ID | How this file serves it |
 |---|---|
 | NFR-PRF-01 | Names the "reference machine" the acceptance criterion refers to. |
 | NFR-PRF-03 | Same, for save→index p95. |
-| NFR-PRF-04 | Same, for full rebuild wall clock; records the Defender caveat that bounds it. |
+| NFR-PRF-04 | Same, for full rebuild wall clock; sets the rule that the gate figure is the scanner-enabled one. |
 | NFR-PRF-08 | Separates product budgets on RM-1 from regression thresholds in CI. |
 | US-35 | Makes "stay fast as the vault grows" measurable against a fixed baseline. |
 | C-06 | Budgets are enforced against the synthetic vault *on a named machine*. |

@@ -1,0 +1,124 @@
+# Performance budgets — NFR-PRF-08, US-35, C-06.
+#
+# "Every performance budget shall be asserted in continuous integration; a
+# regression shall fail the build." One job per budget, so a failure names the
+# requirement it broke instead of saying "benchmarks failed".
+#
+# These jobs are RED today, on purpose. serat-index has no rebuild entry point
+# (task I4), no incremental save path (I5), and there is no application to start
+# (D2, S1). A budget job that skips when the thing it measures is absent is worse
+# than no job at all: the build goes green and nobody notices the budget is
+# unasserted. Each job prints exactly which task unblocks it.
+#
+# Owner: test-engineer. Thresholds live in bench/budget/src/lib.rs next to the
+# requirement they come from, and are never weakened to make a build pass — a
+# budget that is genuinely wrong is re-baselined in the PRD (task Q1) with the
+# measurement attached.
+
+name: budgets
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A budget measured in a debug build is not a measurement.
+  CARGO_PROFILE: release
+
+jobs:
+  # NFR-MNT-02: the vault is generated from one command and is byte-identical.
+  # Everything below is measured against it, so if this fails the other jobs
+  # are measuring something unknown and are not worth running.
+  vault:
+    name: "NFR-MNT-02 · benchmark vault is deterministic"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the 20k vault
+        run: cargo run --release -p vaultgen -- --preset 20k --force
+      - name: Regenerate and assert the digest is unchanged
+        run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
+      - name: Generator tests
+        run: cargo test --release -p vaultgen
+
+  prf04-full-rebuild:
+    name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p budget --bin prf04-full-rebuild -- --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf04-full-rebuild
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  prf03-save-to-index:
+    name: "NFR-PRF-03 · save to index < 50 ms p95 over 1000 saves"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p budget --bin prf03-save-to-index -- --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf03-save-to-index
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  prf01-cold-start:
+    name: "NFR-PRF-01 · window < 400 ms, usable < 1 s, p95 over 20 runs"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p budget --bin prf01-cold-start -- --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf01-cold-start
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  # NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
+  # confirms each budget has an asserting job". This job is that review, run
+  # automatically, so a budget added to the PRD without a job fails the build
+  # rather than waiting for someone to notice.
+  every-budget-has-a-job:
+    name: "NFR-PRF-08 · every budget has an asserting job"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Budget table matches the PRD
+        run: cargo test -p budget --lib
+      - name: Every budget id in the table has a job in this file
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for id in $(grep -o 'id: "[a-z0-9-]*"' bench/budget/src/lib.rs | sed 's/id: "//; s/"//'); do
+            # prf01 is one requirement with two marks measured by one job.
+            job="${id/prf01-window-visible/prf01-cold-start}"
+            job="${job/prf01-vault-usable/prf01-cold-start}"
+            if ! grep -q "^  ${job}:" .github/workflows/budgets.yml; then
+              echo "NFR-PRF-08: budget '${id}' has no asserting job in budgets.yml"
+              missing=1
+            fi
+          done
+          exit $missing
