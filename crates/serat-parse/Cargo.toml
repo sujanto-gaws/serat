@@ -1,0 +1,15 @@
+[package]
+name = "serat-parse"
+description = "Markdown bytes in, blocks/fields/links/tasks out. No file access of any kind."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serat-core = { workspace = true }
+comrak = { workspace = true }
+
+[lints]
+workspace = true
