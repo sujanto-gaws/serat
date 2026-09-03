@@ -77,6 +77,16 @@ Why one writer, not a mutex
 
 A shared connection behind a mutex has the same throughput and worse failure modes: lock ordering becomes a thing anyone touching the index has to think about, and a panic while holding it poisons the database handle. A channel to one owner has a single queue to reason about, natural backpressure, and a crash that takes down one thread rather than corrupting shared state. See ADR-01.
 
+The channel is not the whole interface
+
+Anything that must observe its own write needs a barrier, so the writer handle also exposes `flush()`, which blocks until the queue has drained. The rebuild uses it before `ANALYZE`; tests use it for read-after-write. It had to exist on the first day the writer existed.
+
+This is the design's real shape: **one writer, asynchronous, with an explicit and expensive barrier** — not an interface with no synchronisation left in it, which is how the paragraph above reads on its own. The barrier must never appear on the save path, where blocking would put the index back on the keystroke path (goal 2). A caller there reads the pre-write snapshot and is corrected by `index.changed`; a caller that cannot tolerate that is telling you it belongs on the writer's thread, not that it needs a longer lock.
+
+The test that keeps this honest: **if a message needs a reply, the channel is a lie and you have a mutex with extra steps.** `IndexOp`'s variants need none, which is why the shape holds. A variant that did would be the signal to redesign rather than to add a return channel — which is also why callers get no per-operation completion handle. Per-op completion tracking is how an actor turns back into a request/response API, and then into a mutex.
+
+The queue's other under-specified half — what happens when it is full — is ADR-11. The short version is that the answer is different for each producer: the watcher may be dropped because it cannot be blocked without losing OS events silently, and the bulk producer may not be dropped because it can be blocked at no cost. Routing both through one policy is a measured defect, not a theoretical one.
+
 ## Data model
 
 The full DDL is schema/001_init.sql and runs as delivered. This section records why it is shaped that way.
@@ -164,7 +174,7 @@ Two consequences, stated because each looks like a bug otherwise. If another pro
 ##### 3.1.2 The watcher path
 
 1.  The watcher coalesces events per path over a 150ms window. Editors that save via temp-and-rename emit several events per save; they collapse to one.
-2.  The work queue deduplicates by path and is bounded. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses.
+2.  The work queue deduplicates by path and is bounded, and when it is full the watcher's push is refused, a rescan flag latches, and the consumer reconciles by walking. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses. The bulk producer is never dropped this way — see ADR-11, which is about which producer may be dropped rather than about whether dropping is allowed.
 3.  The hash check reads the file and compares blake3 against notes.hash. Sync tools touch mtime constantly without changing content; this discards those for the cost of a hash.
 4.  Changed files go to the parse pool, which is pure: bytes in, structures out, no I/O, so it parallelises across cores without coordination.
 5.  Rows go to the index writer on a channel. It batches within a transaction, and runs ANALYZE when a batch touched more than 5% of notes. A full rebuild takes the bulk path instead — triggers dropped, FTS index built once at the end, triggers restored from their own definitions; see §4.4.
@@ -479,6 +489,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0008 — Byte-range patching, never round-tripping (serves FR-VIW-06, FR-VIW-08, NFR-MNT-03)
 - ADR-0009 — Brute-force vector search in v1 (serves FR-AIX-03, NFR-PRF-07)
 - ADR-0010 — One SQL statement per query (serves FR-STR-08, FR-STR-09, NFR-PRF-05)
+- ADR-0011 — Which producer the index queue may drop (serves FR-VLT-04, NFR-PRF-03, NFR-REL-01)
 
 ## Traceability
 
@@ -488,6 +499,7 @@ Each design element and the requirements it satisfies. Every requirement of prio
 |-----------------------------------------|----------------------------|-------------------------------------------------------------------------------|
 | Crate decomposition and dependency rule | §2, Fig. 1                 | NFR-MNT-01, and the testability every verification method assumes             |
 | Single-writer index actor               | §2.2, ADR-01               | NFR-PRF-03, NFR-REL-01                                                        |
+| Queue overflow policy                   | §3.1.2 step 2, ADR-11      | FR-VLT-04, NFR-REL-01                                                         |
 | Indexing pipeline                       | §3, Fig. 2                 | FR-VLT-04, FR-VLT-07, NFR-PRF-02, NFR-PRF-03, NFR-PRF-04                      |
 | Echo suppression                        | §3.2                       | FR-VLT-06                                                                     |
 | Diff-based reconciliation               | §3.3                       | FR-VLT-05                                                                     |
