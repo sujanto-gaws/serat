@@ -1,0 +1,1146 @@
+<!doctype html><html><head><!-- frame-runtime --><script>window.__FRAME_PREAMBLE={"v":1,"capabilities":{"artifact":"artifact.0kpk9vgi.js","assets":"assets.8Gk803W0.js","comments":"comments.vw5vQdGA.js","db":"db.h-3sndFg.js","downloads":"downloads.C3GSvEDP.js","embed":"embed.CxGAyc-v.js","mcp":"mcp.Bvma3qD7.js","network":"network.B5UA9Su4.js","notifications":"notifications.ssU4jy7G.js","permissions":"permissions.BNySkLV5.js","room":"room.VSdFwTE9.js","sample":"sample.BW2Uysoh.js","self":"artifact.0kpk9vgi.js","user":"user.BpKav-Rf.js"},"transforms":"_transforms.DSB5x63f.js","comments":"_comments.C6E0cR5g.js","translate":"_translate.5HCW4BJh.js"}</script><script>(function(){"use strict";var te=["light","dark","system"],re=/^[A-Za-z0-9_-]{1,64}$/,$=/^[a-zA-Z_:][a-zA-Z0-9_:.-]{0,127}$/,ne=new Set(["class","hidden","value","checked","style","title","alt","placeholder","lang","dir","role","tabindex","disabled","readonly","contenteditable","open","colspan","rowspan"]);function oe(e){const t=e.toLowerCase();return t.startsWith("data-")||t.startsWith("aria-")||ne.has(t)}var Be="http://www.w3.org/1999/xhtml",se="http://www.w3.org/2000/svg",ae=new Set(["script","style","iframe","noscript","noframes","noembed","xmp","plaintext","template","title","textarea","object","embed"]),ie=new Set(["script","style"]);function ce(e){const t=e.localName.toLowerCase();return e.namespaceURI==="http://www.w3.org/1999/xhtml"?!ae.has(t):e.namespaceURI===se?!ie.has(t):!1}function M(e,t){return e===t||(e===160||e===32)&&(t===160||t===32)}function le(e,t){const r=e.length,n=t.length;let s=0;for(;s<r&&s<n&&M(e.charCodeAt(s),t.charCodeAt(s));)s++;let o=0;for(;o<r-s&&o<n-s&&M(e.charCodeAt(r-1-o),t.charCodeAt(n-1-o));)o++;return{p:s,s:o}}function ue(e,t){const r=e.firstChild;if(e.childNodes.length!==1||r===null||r.nodeType!==Node.TEXT_NODE){e.textContent=t;return}const n=r.data,s=n.length,o=t.length,{p:i,s:c}=le(n,t);i===s&&c===0&&s===o||r.replaceData(i,s-i-c,t.slice(i,o-c));const h=r.data,p=e.ownerDocument.getSelection?.()??null,w=p!==null&&p.rangeCount>0&&(p.anchorNode===r||p.focusNode===r)?{anchor:p.anchorNode,anchorOffset:p.anchorOffset,focus:p.focusNode,focusOffset:p.focusOffset}:null;let m=-1,g=-1;for(let f=0;f<h.length&&f<t.length;f++){const v=h.charCodeAt(f),b=t.charCodeAt(f);v!==b&&M(v,b)&&(m<0&&(m=f),g=f)}const a=m>=0;if(a&&r.replaceData(m,g-m+1,t.slice(m,g+1)),a&&w!==null&&w.anchor!==null&&w.focus!==null)try{p.setBaseAndExtent(w.anchor,w.anchorOffset,w.focus,w.focusOffset)}catch{}}var fe=new Set(["html","head","body","frameset"]);function de(e){return e.namespaceURI==="http://www.w3.org/1999/xhtml"&&fe.has(e.localName)}function pe(e){if(e===null||typeof e!="object")return!1;const t=e;if(typeof t.target!="string"||!re.test(t.target)||t.text!==void 0&&typeof t.text!="string")return!1;if(t.attrsSet!==void 0){if(t.attrsSet===null||typeof t.attrsSet!="object")return!1;for(const[r,n]of Object.entries(t.attrsSet))if(!$.test(r)||typeof n!="string")return!1}if(t.attrsRemoved!==void 0){if(!Array.isArray(t.attrsRemoved))return!1;for(const r of t.attrsRemoved)if(typeof r!="string"||!$.test(r))return!1}return!0}function me(e,t){if(e===null||typeof e!="object")return!1;const{seq:r,elements:n}=e;if(typeof r!="number"||!Number.isSafeInteger(r)||!Array.isArray(n)||n.length===0||n.length>64)return!1;for(let s=0;s<n.length;s++)if(!t(n[s]))return!1;return!0}function he(e){return e===null||typeof e!="object"?!1:me(e.__frame_patch,pe)}function _e(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function ve(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function ye(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const r=t.theme;return typeof r=="string"&&te.includes(r)}var A=/^[\w.-]+\.js$/;function we(e,t,r){return r?"inert":typeof t=="string"&&A.test(t)?e?[t]:"inert":e?"inert":"framed"}function ge(){return{post(e,t){parent.postMessage(e,t)},on(e){const t=r=>{r.source===parent&&e(r.data,r.origin,r.isTrusted)};return addEventListener("message",t),()=>removeEventListener("message",t)}}}function be(){return{post:()=>{},on:()=>()=>{}}}var j="__frame_scroll",Ee=150,Ae=310,Se=160,Te=3e4;function ke(){let e=0,t=!1,r=!1,n=!1,s=0,o=null;const i=l=>{try{sessionStorage.setItem(j,JSON.stringify({y:l}))}catch{}},c=()=>{if(clearTimeout(e),o===null)return;const l=o;o=null,i(l)},h=()=>{if(t){t=!1;return}r=!0,o=scrollY,clearTimeout(e),e=setTimeout(c,Ee)};try{addEventListener("scroll",h,{passive:!0}),addEventListener("pagehide",c)}catch{}const p=()=>{let l;try{l=sessionStorage.getItem(j)}catch{return null}if(l===null)return null;let _;try{_=JSON.parse(l)}catch{_=null}const d=_?.y;if(!(typeof d=="number"&&Number.isFinite(d)&&d>=0)){try{sessionStorage.removeItem(j)}catch{}return null}return d};let w=!1;const m=l=>{try{const _=scrollY;scrollTo({top:l,left:0,behavior:"instant"}),s=l,n=!0,clearTimeout(e),o=null,i(l);const d=scrollY;d!==_&&(t=!0),d!==l&&!w&&(w=!0,addEventListener("load",()=>{try{if(scrollY===d){const T=p();m(T!==null?T:s)}}catch{}},{once:!0}))}catch{}},g=()=>{try{return!!location.hash}catch{return!0}};let a=!1;const f=()=>{try{if(a||innerWidth>Ae||innerHeight>Se)return;a=!0;const l=Date.now(),_=()=>{try{removeEventListener("resize",_)}catch{}if(Date.now()-l>Te||r||g())return;const d=p();m(d!==null?d:s)};addEventListener("resize",_)}catch{}};let v=!1,b=!1;return{restore(){if(v||(v=!0,g()))return;const l=p();l!==null&&(m(l),f())},promoted(){if(b||(b=!0,g()))return;const l=p();l!==null?(m(l),f()):n&&m(s)}}}function Re(e,t,r,n){let s=null;try{s=window.trustedTypes?.createPolicy("frame-runtime",{createScriptURL:h=>h})??null}catch{}const o=window.Worker,i=o?.prototype,c=Object.freeze({Worker:o,workerOn:i?.addEventListener,workerPost:i?.postMessage,workerTerminate:i?.terminate,fetch:window.fetch.bind(window),preventDefault:Event.prototype.preventDefault,policy:s,origins:t});r(e).then(h=>h?.bootTopLevel?h.bootTopLevel(c,n):n.settle()).catch(()=>n.settle())}var De="modulepreload",Ie=function(e){return"/"+e},Ue={},Le=function(t,r,n){let s=Promise.resolve();function o(i){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=i,window.dispatchEvent(c),!c.defaultPrevented)throw i}return s.then(i=>{for(const c of i||[])c.status==="rejected"&&o(c.reason);return t().catch(o)})},Oe=window===top,q=Object.getOwnPropertyDescriptor(window,"claude"),k=we(Oe,window.__FRAME_PREAMBLE?.topLevel,q?.writable===!1),N=typeof k=="object"&&k[0],y=N?be():ge();(function(){const e=Object.defineProperty,t=globalThis,r=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let n=0;for(let s=0;s<r.length;s++){const o=r[s];try{e(t,o,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[o]}catch{}try{e(t,o,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[o]=="function"&&n++}if(n&&k==="framed")try{y.post({__frame_rtc_lockdown_failed:n},"*")}catch{}})();var Pe=1e4,Y=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function X(e){for(const t of Y)if(t.endsWith(":*"))try{const r=new URL(e);if(`${r.protocol}//${r.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}var R=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),B=window.__FRAME_PREAMBLE?.transforms,D=window.__FRAME_PREAMBLE?.comments,I=window.__FRAME_PREAMBLE?.translate;function S(e){return Le(()=>import("/_runtime/"+e),void 0)}function G(e,t){return{contract:e.contract,changes:new Set(e.changes??[]),flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:new Map,shellOrigin:t,mount:x,hooks:O,pipe:()=>({wrap:(r,n)=>(...s)=>{try{return n(...s)}catch(o){return Promise.reject(o)}}})}}var L=null,E=null;function V(e,t,r){try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!0,enumerable:!0})}catch{}}}var U=!1,O={editBefore:null,edit:null};function Ce(e,t,r=!1){const n=[];let s;if(r)try{O.editBefore?.(e)}catch{}for(const o of e.elements){const i=document.querySelector(`[data-id="${o.target}"]`);if(!i){s=o.target;break}if([...Object.keys(o.attrsSet??{}),...o.attrsRemoved??[]].some(c=>!oe(c))){s=o.target;break}if(o.text!==void 0&&(!ce(i)||de(i))){s=o.target;break}for(const[c,h]of Object.entries(o.attrsSet??{}))if(!J(i,c)){try{i.setAttribute(c,h)}catch{}Z(i,c,h)}for(const c of o.attrsRemoved??[])J(i,c)||(i.removeAttribute(c),Z(i,c,null));typeof o.text=="string"&&ue(i,o.text),n.push(o.target)}if(r)try{O.edit?.(e.seq,n,s)}catch{}if(s!==void 0){y.post({__frame_patch_miss:{seq:e.seq}},t);return}try{document.dispatchEvent(new CustomEvent("claude:edit",{detail:{seq:e.seq,targets:n}}))}catch{}}function Z(e,t,r){if(!(e instanceof HTMLInputElement))return;const n=t.toLowerCase();n==="checked"?e.checked=r!==null:n==="value"&&e.type!=="file"&&(e.value=r??"")}function J(e,t){const r=t.toLowerCase(),n=e;return r==="data-id"||(r==="value"||r==="checked")&&(n.__artifactSecret===!0||/^(password|hidden|file)$/.test(n.type??"")||/(^|\s)(cc-|one-time-code|current-password|new-password)/i.test(`${e.getAttribute("autocomplete")??""} ${n.autocomplete??""}`))}function Q(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,U=!0):U&&(delete t.dataset.theme,t.style.colorScheme="",U=!1)}var P=new Map;function Me(){let e;const t={u:new Promise(r=>{e=r}),r:r=>{t.done=!0,e(r)},done:!1,nulled:!1};return t}function F(){for(const e of P.values())e.done||(e.nulled=!0,e.r(null))}var je=Object.freeze(Object.assign(Object.create(null),{call:Function.prototype.call,apply:Function.prototype.apply,bind:Function.prototype.bind})),x=(e,t)=>{const r=P.get(e);if(!r||r.done){r?.nulled&&E&&y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:e}},E);return}const n=typeof t=="function"?Object.setPrototypeOf(t,je):Object.assign(Object.create(null),t);typeof n.then=="function"&&delete n.then,r.r(Object.freeze(n))};function ee(){const e=q?.value??{};V(window,"claude",e);for(const t of Object.keys(R)){if(e[t]!==void 0){V(e,t,e[t]);continue}P.set(t,Me())}if(e.use===void 0){const t=r=>{if(typeof r!="string"||!Object.hasOwn(R,r))return Promise.resolve(null);const n=P.get(r);return n?n.u:Promise.resolve(e[r]??null)};try{Object.defineProperty(e,"use",{value:t,writable:!0,configurable:!0,enumerable:!1})}catch{}}}if(k==="framed"){const e=B&&A.test(B)?S(B).catch(()=>{}):Promise.resolve(void 0),t=a=>{if(a.type==="auxclick"&&a.button!==1)return;const f=a.target,v=f&&f.closest?f.closest("a[href],area[href]"):null;if(!v)return;const b=v.getAttribute("href");if(!b)return;let l;try{l=new URL(b,document.baseURI)}catch{return}if((l.protocol==="http:"||l.protocol==="https:")&&l.origin!==location.origin){a.preventDefault();const _=(v.getAttribute("target")??"").toLowerCase(),d=a.type==="auxclick"||a.metaKey||a.ctrlKey||a.shiftKey||a.altKey||!["","_self","_top","_parent"].includes(_);y.post({__frame_nav:!0,url:l.href,newTab:d},"*")}};addEventListener("click",t,!0),addEventListener("auxclick",t,!0);const r={},n=a=>{a.isTrusted&&(r.pointer=!0)},s=a=>{a.isTrusted&&(r.click=!0)};addEventListener("pointermove",n,{capture:!0,passive:!0}),addEventListener("click",s,{capture:!0,passive:!0}),e.then(a=>{a?.wireNav&&(a.wireNav(),removeEventListener("click",t,!0),removeEventListener("auxclick",t,!0),removeEventListener("pointermove",n,!0),removeEventListener("click",s,!0),a.wireEngagement?.(r))});let o=null;try{o=ke()}catch{}ee();let i=null,c=null,h=0;const p=y.on((a,f)=>{X(f)&&_e(a)&&(i=a.__frame_init,E=f,p(),clearTimeout(h),c?.())});y.post({__frame_connect:!0},"*");const w=new Promise(a=>{c=a,h=setTimeout(()=>{p(),a()},Pe)}),m=document.readyState==="loading"?new Promise(a=>document.addEventListener("DOMContentLoaded",()=>a(),{once:!0})):Promise.resolve();m.then(()=>{try{o?.restore()}catch{}});const g={cb:null};y.on((a,f)=>{if(X(f)&&ve(a)){try{o?.promoted()}catch{}g.cb?.()}}),w.then(async()=>{if(!i||!E){F();return}Q(i.theme);const a=E;let f=!1,v=!1;y.on((u,z,C)=>{if(z!==a)return;ye(u)&&Q(u.__frame_theme.theme),he(u)&&Ce(u.__frame_patch,a,C);const H=u?.__fc_mode;H&&typeof H=="object"&&!f&&D&&A.test(D)&&(f=!0,S(D).then(K=>K.install?.(a,H.on===!0)).catch(()=>{}));const W=u?.__ft_cmd;W&&typeof W=="object"&&!v&&I&&A.test(I)&&(v=!0,S(I).then(K=>K.install?.(a,W)).catch(()=>{}))});const b=Object.keys(i.capabilities??{}).filter(u=>Object.hasOwn(R,u)).map(u=>[u,R[u]]).filter(u=>typeof u[1]=="string"&&A.test(u[1])),l=await Promise.allSettled(b.map(([,u])=>S(u))),_=await e,d=E;if(_?.buildBoot||y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},d),_?.buildBoot)try{L=_.buildBoot(i,_.TRANSFORMS??{},{shellOrigin:d,mount:x,hooks:O},u=>y.post({__frame_cap_telemetry:u},d))}catch{y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},d),L=G(i,d)}else L=G(i,d);const T=u=>y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:u}},d),Ne=L;l.forEach((u,z)=>{const C=b[z][0];if(u.status!=="fulfilled"){T(C);return}try{u.value?.install?.(Ne)}catch{T(C)}}),F(),await m,y.post({__frame_ready:!0},E),e.then(u=>u?.installSizeReporter?.(d,g))})}else N&&(ee(),Re(N,Y,S,{settle:F,mount:x}))})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<title>Serat Blueprint</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;600&display=swap">
+
+<style>
+  :root {
+    --ground:      #F3F4F1;
+    --surface:     #FFFFFF;
+    --surface-2:   #EBEDE8;
+    --ink:         #16191B;
+    --ink-2:       #454C52;
+    --muted:       #737C83;
+    --rule:        #D8DBD4;
+    --rule-soft:   #E6E8E2;
+    --indigo:      #24457E;
+    --indigo-soft: #E2E8F3;
+    --brass:       #8E5F26;
+    --brass-soft:  #F0E7D7;
+    --good:        #2A6349;
+    --warn:        #85571A;
+    --crit:        #92332F;
+
+    --f-display: "Bricolage Grotesque", "Helvetica Neue", Arial, sans-serif;
+    --f-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --f-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --step-0: 1rem;
+    --step-1: 1.1875rem;
+    --step-2: 1.5rem;
+    --step-3: 2rem;
+    --step-4: 2.9rem;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #121517;
+      --surface:     #191D20;
+      --surface-2:   #21262A;
+      --ink:         #E5E8E9;
+      --ink-2:       #B0B7BC;
+      --muted:       #828B92;
+      --rule:        #2C3237;
+      --rule-soft:   #232A2E;
+      --indigo:      #8FABE8;
+      --indigo-soft: #1B2740;
+      --brass:       #D2A468;
+      --brass-soft:  #2C2417;
+      --good:        #6CBE95;
+      --warn:        #D6A452;
+      --crit:        #E08682;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #121517;
+    --surface:     #191D20;
+    --surface-2:   #21262A;
+    --ink:         #E5E8E9;
+    --ink-2:       #B0B7BC;
+    --muted:       #828B92;
+    --rule:        #2C3237;
+    --rule-soft:   #232A2E;
+    --indigo:      #8FABE8;
+    --indigo-soft: #1B2740;
+    --brass:       #D2A468;
+    --brass-soft:  #2C2417;
+    --good:        #6CBE95;
+    --warn:        #D6A452;
+    --crit:        #E08682;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: var(--step-0);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 1220px;
+    margin: 0 auto;
+    padding: 0 clamp(20px, 4vw, 56px) 100px;
+    display: grid;
+    grid-template-columns: 1fr;
+    column-gap: 56px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    grid-column: 1 / -1;
+    padding: clamp(48px, 8vw, 96px) 0 40px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 22px;
+  }
+
+  .masthead h1 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: var(--step-4);
+    line-height: 1.02;
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+    margin: 0 0 6px;
+    max-width: 16ch;
+  }
+
+  .masthead .pronounce {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    color: var(--brass);
+    margin: 0 0 26px;
+  }
+
+  .thesis {
+    font-size: var(--step-1);
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0 0 34px;
+  }
+
+  .thesis strong { color: var(--ink); font-weight: 600; }
+
+  .factbar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+  }
+
+  .fact {
+    background: var(--ground);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .fact dt {
+    font-family: var(--f-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .fact dd {
+    margin: 0;
+    font-family: var(--f-display);
+    font-weight: 500;
+    font-size: 0.95rem;
+    color: var(--ink);
+  }
+
+  /* ---------- nav rail ---------- */
+
+  .rail { display: none; }
+
+  @media (min-width: 1060px) {
+    .page { grid-template-columns: 200px minmax(0, 1fr); }
+    .rail {
+      display: block;
+      position: sticky;
+      top: 0;
+      align-self: start;
+      padding-top: 56px;
+      max-height: 100vh;
+      overflow-y: auto;
+    }
+    .rail ol {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      border-left: 1px solid var(--rule);
+    }
+    .rail a {
+      display: block;
+      padding-left: 14px;
+      font-family: var(--f-mono);
+      font-size: 0.72rem;
+      line-height: 1.4;
+      color: var(--muted);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+      margin-left: -1px;
+    }
+    .rail a:hover, .rail a:focus-visible { color: var(--indigo); border-left-color: var(--indigo); }
+    .rail .num { color: var(--rule); margin-right: 6px; }
+  }
+
+  main { min-width: 0; }
+
+  /* ---------- sections ---------- */
+
+  section {
+    padding-top: 66px;
+    scroll-margin-top: 24px;
+  }
+
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sec-num {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    color: var(--brass);
+    letter-spacing: 0.08em;
+    flex: none;
+  }
+
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: var(--step-3);
+    line-height: 1.12;
+    letter-spacing: -0.02em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: var(--step-1);
+    letter-spacing: -0.01em;
+    margin: 34px 0 8px;
+  }
+
+  h4 {
+    font-family: var(--f-mono);
+    font-weight: 600;
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 26px 0 8px;
+  }
+
+  p { max-width: 68ch; margin: 0 0 14px; }
+  .lede { color: var(--ink-2); font-size: var(--step-1); max-width: 64ch; margin-bottom: 22px; }
+
+  a { color: var(--indigo); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  :focus-visible { outline: 2px solid var(--indigo); outline-offset: 3px; }
+
+  ul.plain { max-width: 68ch; padding-left: 20px; margin: 0 0 16px; }
+  ul.plain li { margin-bottom: 7px; }
+
+  code {
+    font-family: var(--f-mono);
+    font-size: 0.85em;
+    background: var(--surface-2);
+    padding: 0.1em 0.35em;
+    border-radius: 2px;
+  }
+
+  pre {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    line-height: 1.6;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--indigo);
+    padding: 18px 20px;
+    overflow-x: auto;
+    margin: 0 0 18px;
+  }
+
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .cm { color: var(--muted); }
+  .kw { color: var(--indigo); font-weight: 600; }
+  .st { color: var(--brass); }
+
+  /* ---------- tables ---------- */
+
+  .scroll { overflow-x: auto; margin: 0 0 20px; border: 1px solid var(--rule); background: var(--surface); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+
+  thead th {
+    font-family: var(--f-mono);
+    font-weight: 600;
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  td.name { font-family: var(--f-display); font-weight: 500; white-space: nowrap; }
+  td.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  /* ---------- pillar cards ---------- */
+
+  .pillars { display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+
+  .pillar { background: var(--surface); padding: 22px 24px; }
+
+  .pillar-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+
+  .pillar-head h3 { margin: 0; font-size: 1.12rem; }
+
+  .pillar-why { color: var(--ink-2); font-size: 0.92rem; max-width: 66ch; margin: 0 0 14px; }
+
+  .feat { display: grid; grid-template-columns: 62px 1fr; gap: 4px 14px; align-items: baseline; }
+  .feat > div { padding: 5px 0; border-top: 1px solid var(--rule-soft); font-size: 0.88rem; }
+  .feat > div:first-child, .feat > div:nth-child(2) { border-top: none; }
+  .feat .f-name { font-weight: 600; }
+  .feat .f-note { color: var(--ink-2); }
+
+  .chip {
+    font-family: var(--f-mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .p0 { color: var(--muted); }
+  .p1 { color: var(--indigo); }
+  .p2 { color: var(--brass); }
+  .p3 { color: var(--good); }
+  .p4 { color: var(--crit); }
+
+  .tag {
+    font-family: var(--f-mono);
+    font-size: 0.62rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--brass);
+    background: var(--brass-soft);
+    padding: 3px 7px;
+  }
+
+  /* ---------- callout ---------- */
+
+  .note {
+    background: var(--indigo-soft);
+    border-left: 2px solid var(--indigo);
+    padding: 16px 20px;
+    margin: 0 0 20px;
+    max-width: 68ch;
+  }
+  .note p:last-child { margin-bottom: 0; }
+  .note .label {
+    font-family: var(--f-mono);
+    font-size: 0.64rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--indigo);
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  /* ---------- figures ---------- */
+
+  figure { margin: 26px 0 24px; }
+  figure svg { width: 100%; height: auto; display: block; color: var(--ink-2); }
+  .figwrap { background: var(--surface); border: 1px solid var(--rule); padding: 22px 20px 12px; overflow-x: auto; }
+  figcaption {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    line-height: 1.55;
+    color: var(--muted);
+    margin-top: 12px;
+    max-width: 74ch;
+  }
+  .svg-box { fill: var(--surface); stroke: currentColor; stroke-width: 1; }
+  .svg-box-accent { fill: var(--indigo-soft); stroke: var(--indigo); stroke-width: 1.5; }
+  .svg-box-dash { fill: none; stroke: currentColor; stroke-width: 1; stroke-dasharray: 4 3; }
+  .svg-t { font-family: var(--f-display); font-size: 13px; font-weight: 500; fill: var(--ink); }
+  .svg-s { font-family: var(--f-mono); font-size: 10px; fill: var(--muted); }
+  .svg-l { font-family: var(--f-mono); font-size: 10px; fill: var(--indigo); }
+  .svg-line { stroke: currentColor; stroke-width: 1.2; fill: none; }
+
+  /* ---------- roadmap ---------- */
+
+  .phases { display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .phase { background: var(--surface); display: grid; grid-template-columns: 92px 1fr; gap: 18px; padding: 18px 22px; }
+  .phase-id { font-family: var(--f-mono); font-size: 0.72rem; color: var(--brass); line-height: 1.5; }
+  .phase-id .wk { display: block; color: var(--muted); font-size: 0.68rem; margin-top: 3px; }
+  .phase h3 { margin: 0 0 4px; font-size: 1.02rem; }
+  .phase p { margin: 0 0 8px; font-size: 0.9rem; color: var(--ink-2); }
+  .gate { font-family: var(--f-mono); font-size: 0.72rem; color: var(--ink); }
+  .gate span { color: var(--good); }
+
+  /* ---------- next moves ---------- */
+
+  .moves { counter-reset: mv; list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .moves li { counter-increment: mv; background: var(--surface); padding: 16px 22px 16px 56px; position: relative; font-size: 0.92rem; }
+  .moves li::before {
+    content: counter(mv);
+    position: absolute; left: 22px; top: 16px;
+    font-family: var(--f-mono); font-size: 0.78rem; color: var(--brass);
+  }
+  .moves strong { font-family: var(--f-display); font-weight: 700; }
+
+  .closer {
+    margin-top: 70px;
+    padding-top: 26px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    max-width: 70ch;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    a { transition: color 120ms ease, border-color 120ms ease; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Product blueprint · draft v0.1 · August 2026</p>
+    <h1>Serat</h1>
+    <p class="pronounce">/ˈse.rat/ — Javanese: a written work; also, fibre. Name confirmed.</p>
+    <p class="thesis">A local-first knowledge app for people whose notes are a <strong>system</strong>, not a diary. Obsidian treats structure and AI as plugins bolted onto a Markdown editor. Serat treats the vault as a <strong>typed, indexed knowledge base that happens to serialise as Markdown files on disk</strong> — and ships the query engine, the role lenses, and the AI in the core, where they can be fast and correct.</p>
+    <dl class="factbar">
+      <div class="fact"><dt>Shell</dt><dd>Tauri v2 (Rust)</dd></div>
+      <div class="fact"><dt>Frontend</dt><dd>Vue 3 · Vite · TS</dd></div>
+      <div class="fact"><dt>Store</dt><dd>Plain .md + SQLite</dd></div>
+      <div class="fact"><dt>Target</dt><dd>50k notes, 1 laptop</dd></div>
+      <div class="fact"><dt>To v1</dt><dd>~30 weeks</dd></div>
+    </dl>
+  </header>
+
+  <nav class="rail" aria-label="Sections">
+    <ol>
+      <li><a href="#wedge"><span class="num">01</span>The wedge</a></li>
+      <li><a href="#principles"><span class="num">02</span>Principles</a></li>
+      <li><a href="#features"><span class="num">03</span>Feature set</a></li>
+      <li><a href="#architecture"><span class="num">04</span>Architecture</a></li>
+      <li><a href="#data"><span class="num">05</span>Data model</a></li>
+      <li><a href="#query"><span class="num">06</span>Query language</a></li>
+      <li><a href="#writeback"><span class="num">07</span>Write-back</a></li>
+      <li><a href="#binaries"><span class="num">08</span>Binaries</a></li>
+      <li><a href="#ai"><span class="num">09</span>AI layer</a></li>
+      <li><a href="#sync"><span class="num">10</span>Sync &amp; history</a></li>
+      <li><a href="#roadmap"><span class="num">11</span>Roadmap</a></li>
+      <li><a href="#risks"><span class="num">12</span>Risks</a></li>
+      <li><a href="#notbuilding"><span class="num">13</span>Not building</a></li>
+      <li><a href="#next"><span class="num">14</span>Next moves</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <!-- 01 -->
+    <section id="wedge">
+      <div class="sec-head"><span class="sec-num">01</span><h2>The wedge</h2></div>
+      <p class="lede">There are a dozen Obsidian alternatives. Almost all of them compete on being a nicer editor. That is the one place Obsidian is already good.</p>
+
+      <p>The interesting gap is downstream of editing. A vault that has grown past a few thousand notes stops being a pile of prose and becomes a small, badly-typed database — and the tools for interrogating it are all bolt-ons. Obsidian shipped <strong>Bases</strong> (a core plugin storing view definitions in <code>.base</code> files) to close part of that gap, but it still reads only YAML frontmatter, offers table and card views only, and cannot be embedded mid-note. Dataview, the community answer, is more powerful but is JavaScript evaluated per-render, read-only, and slows to a crawl on a large vault.</p>
+
+      <p>There is a second gap, and it is arguably worse because nobody even argues about it: <strong>everything in an Obsidian vault that is not Markdown is a second-class citizen by construction.</strong> A PDF, a deck, a spreadsheet, a screenshot — you can link to it and preview some of them, but you cannot search inside it, cannot query it, and cannot give it a single field of metadata, because the data model has nowhere to put YAML on a binary. Core search does not read PDF text (that needs a plugin); Office documents are not searched at all, and the request has sat on the forum for years. For anyone whose actual work arrives as contracts, reports, exports and screenshots, that is most of the archive sitting outside the system.</p>
+
+      <p>Nobody is shipping the combination: <strong>typed schemas over plain Markdown, a real declarative query engine, writable views, binaries extracted into the same index as notes, and AI that reads the graph rather than the current buffer</strong> — in one fast local binary.</p>
+
+      <h4>Competitive read</h4>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>Tool</th><th>Storage</th><th>Structured query</th><th>Non-.md files</th><th>AI posture</th><th>Where it leaves room</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="name">Obsidian</td><td>Plain .md, local</td><td>Bases (frontmatter, read-only) + Dataview plugin</td><td>Opaque attachments. PDF text needs a plugin; Office never searchable</td><td>Plugin-mediated, per-note context</td><td>No typing, no write-back, JS query perf, plugin sprawl</td></tr>
+            <tr><td class="name">Logseq</td><td>.md/.org, outliner</td><td>Datalog queries (steep)</td><td>Assets + PDF annotation; no Office, no extraction</td><td>Plugins</td><td>Outliner-first model, long DB-rewrite churn, perf</td></tr>
+            <tr><td class="name">Anytype</td><td>Proprietary local DB</td><td>Typed objects, good</td><td>Files are objects, but no text extraction</td><td>Limited</td><td>Not plain files — no git, no grep, no Claude Code on the folder</td></tr>
+            <tr><td class="name">SilverBullet</td><td>Plain .md, server</td><td>Space-script queries</td><td>Attachments only</td><td>Minimal</td><td>Browser-hosted, small ecosystem, no native perf story</td></tr>
+            <tr><td class="name">Notion</td><td>Cloud</td><td>Excellent databases</td><td>Uploads indexed — cloud-side, not yours</td><td>Strong, cloud-only</td><td>Not local, not yours, not fast offline</td></tr>
+            <tr><td class="name">Serat</td><td>Plain .md + rebuildable index</td><td>Typed schemas, SQ language, writable views</td><td>Extracted to blocks; typed via sidecar notes</td><td>Core: local embeddings, graph retrieval, MCP server</td><td>—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <span class="label">Strategy: zero switching cost</span>
+        <p>Serat reads an existing Obsidian vault unmodified — wikilinks, embeds, block refs, <code>key:: value</code> inline fields, the <code>.obsidian/</code> folder ignored but preserved. Day one you can point it at your own vault and keep Obsidian installed as the fallback. That removes the single biggest reason people never try an alternative, and it makes dogfooding possible before the app is good.</p>
+      </div>
+    </section>
+
+    <!-- 02 -->
+    <section id="principles">
+      <div class="sec-head"><span class="sec-num">02</span><h2>Five principles that decide arguments</h2></div>
+      <p class="lede">Every later trade-off in this document falls out of these. When a feature fights one of them, the feature loses.</p>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Principle</th><th>What it forbids</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Files are truth</td><td>No state that exists only in the index. Delete <code>.serat/</code> and the app rebuilds losslessly — so nothing may live there that the Markdown does not encode.</td></tr>
+            <tr><td class="name">Structure is opt-in, then enforced</td><td>An untyped note is always valid. But once a note declares <code>type: project</code>, its schema is checked and violations surface — no silent half-typed data.</td></tr>
+            <tr><td class="name">Queries are a language, not JavaScript</td><td>No arbitrary JS in the render path. Queries are parsed, type-checked against schemas, and compiled to one SQL statement. Predictable cost, no sandbox.</td></tr>
+            <tr><td class="name">AI reads the graph</td><td>No "send the current file and hope". Retrieval is hybrid over the whole vault, and every AI write lands as a reviewable diff, never a silent edit.</td></tr>
+            <tr><td class="name">Fast is a feature with numbers</td><td>No feature ships that pushes cold start past 1s or keystroke latency past one frame at 50k notes. Budgets are in CI, not in the README.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 03 -->
+    <section id="features">
+      <div class="sec-head"><span class="sec-num">03</span><h2>Feature set</h2></div>
+      <p class="lede">Six pillars. Phase chips map to the roadmap in §11 — <span class="chip p1">P1</span> is the MVP you can live in, <span class="chip p4">P4</span> is the last thing before v1.</p>
+
+      <div class="pillars">
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>A. Vault &amp; editing core</h3><span class="tag">table stakes</span></div>
+          <p class="pillar-why">Nothing here is a differentiator; all of it is disqualifying if missing. Build it once, boringly, and stop.</p>
+          <div class="feat">
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">CommonMark + GFM + wikilinks</span> <span class="f-note">— <code>[[link]]</code>, <code>![[embed]]</code>, <code>^block-id</code>, tags, footnotes, callouts.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">CodeMirror 6 hybrid editor</span> <span class="f-note">— live preview that renders everything except the line under the cursor. Not a block WYSIWYG.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Filesystem reconciliation</span> <span class="f-note">— external edits (git pull, Claude Code, Syncthing) land in an open buffer without clobbering.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Backlinks &amp; outgoing links</span> <span class="f-note">— block-precise, with unlinked mentions.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Quick switcher &amp; command palette</span> <span class="f-note">— fuzzy over title, path, alias, heading; recency-weighted.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Panes, tabs, saved workspaces</span> <span class="f-note">— split editing, one workspace per lens.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Templates &amp; daily notes</span> <span class="f-note">— templates are typed: a template declares the type it instantiates.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Local graph view</span> <span class="f-note">— scoped to a note or a query result. No global hairball.</span></div>
+          </div>
+        </div>
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>B. Structured data</h3><span class="tag">pillar 1 of 5</span></div>
+          <p class="pillar-why">The answer to Dataview and Bases. A note is a row; a type is a schema; a view is a query you can edit through.</p>
+          <div class="feat">
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Type notes</span> <span class="f-note">— a schema is itself a Markdown note in <code>20-systems/types/</code> declaring fields, kinds, enums, required-ness, defaults. Version-controlled with everything else.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Frontmatter <em>and</em> inline fields</span> <span class="f-note">— <code>key:: value</code> anywhere in the body is indexed and queryable, which Bases cannot do.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">SQ query language</span> <span class="f-note">— declarative, statically type-checked against the schema registry, compiled to one SQL statement (§06).</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Queries anywhere</span> <span class="f-note">— in a fenced block mid-note, or saved as a standalone view. Same engine, same syntax.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Writable views</span> <span class="f-note">— edit a cell in a table or drag a card between board columns; the change is patched back into the source note's field (§07). This is the feature Dataview structurally cannot have.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">View kinds</span> <span class="f-note">— table, board, calendar, timeline, gallery, list. Each is a rendering of the same row set.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Rollups across links</span> <span class="f-note">— <code>sum(outgoing.tasks.est)</code>: aggregate over linked notes, not just the current one.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Schema migrations</span> <span class="f-note">— rename or retype a field across 400 notes as one reviewable, revertible operation.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Validation surface</span> <span class="f-note">— a standing "schema violations" view; typed notes that drifted show up instead of rotting.</span></div>
+          </div>
+        </div>
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>C. Binaries as first-class citizens</h3><span class="tag">pillar 2 of 5</span></div>
+          <p class="pillar-why">The blind spot in every plain-file notes app. A PDF, deck, spreadsheet or screenshot gets extracted into the same block rows a note produces — so search, backlinks, queries and AI citations work on it unchanged, with no new machinery.</p>
+          <div class="feat">
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Sidecar notes</span> <span class="f-note">— <code>contract.pdf</code> gets <code>contract.pdf.md</code> holding its frontmatter, type, tags, links and annotations. That one move makes a binary a typed, queryable row. The file browser folds the pair into a single entry.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Text extraction into blocks</span> <span class="f-note">— PDF, DOCX, PPTX, XLSX, CSV, EPUB, EML. Every extracted block carries a locator (page, slide, cell range) so a search hit or an AI citation points <em>inside</em> the file, not just at it.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">Spreadsheets as data</span> <span class="f-note">— a sheet or CSV becomes a queryable table: <code>from sheet:"budget.xlsx#Q3"</code> joins against your notes.</span></div>
+            <div><span class="chip p2">P2</span></div><div><span class="f-name">In-app viewers</span> <span class="f-note">— PDF, images, and read-only Office renders built from the extracted structure. "Open in Word" stays available; it stops being the only option.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Annotation as blocks</span> <span class="f-note">— highlight a PDF passage and get a real block you can <code>[[link]]</code> to and quote. Replaces a three-plugin stack.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">OCR and image understanding</span> <span class="f-note">— scanned PDFs and screenshots become searchable; EXIF lands as queryable fields. Models download on demand, never at install.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Extracted text is embedded</span> <span class="f-note">— "which contracts mention arbitration" searches the PDFs themselves, not their filenames.</span></div>
+          </div>
+        </div>
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>D. Lenses &amp; lifecycle</h3><span class="tag">pillar 3 of 5</span></div>
+          <p class="pillar-why">Built around the working model you already use: folders by artifact lifespan, roles as lenses over the same vault.</p>
+          <div class="feat">
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Lens as a top-level mode</span> <span class="f-note">— PM / analyst / engineer. One keystroke re-skins the sidebar, the default dashboard, quick-switcher ranking, and which templates are offered.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Lens definitions are notes</span> <span class="f-note">— a lens declares its filter, its home dashboard, its pinned views. Same pattern as types.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Lifespan folders, first class</span> <span class="f-note">— <code>00-inbox → 10-projects → 20-systems → 30-notes → 40-refs</code>. "Promote" moves the file, rewrites frontmatter, and repairs every inbound link atomically.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Task model</span> <span class="f-note">— checkboxes with inline fields (<code>due::</code>, <code>owner::</code>, <code>est::</code>) become first-class rows; tickable from any view.</span></div>
+            <div><span class="chip p3">P3</span></div><div><span class="f-name">Dashboard notes</span> <span class="f-note">— a note whose body is a grid of query blocks. Your dashboards stay portable Markdown.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Review queues</span> <span class="f-note">— inbox triage, orphaned notes, stale <code>20-systems</code> entries whose projects moved on.</span></div>
+          </div>
+        </div>
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>E. AI layer</h3><span class="tag">pillar 4 of 5</span></div>
+          <p class="pillar-why">Detailed in §09. The short version: retrieval is local and hybrid, generation is provider-agnostic, and the vault is exposed outward over MCP so Claude Code can operate on it as a first-class client.</p>
+          <div class="feat">
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Local embedding index</span> <span class="f-note">— ONNX model in-process; incremental on save. No cloud call to search your own notes.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Hybrid retrieval</span> <span class="f-note">— BM25 (FTS5) + vector + graph proximity, fused and reranked.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Vault as MCP server</span> <span class="f-note">— <code>search</code>, <code>read</code>, <code>query</code>, <code>propose_edit</code>. Your existing Claude Code subagents get a typed interface to the vault instead of grepping it.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Diff-reviewed writes</span> <span class="f-note">— every agent edit arrives as a patch you accept, edit, or reject. No silent mutation, ever.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Capture agent</span> <span class="f-note">— drop anything into the inbox; it proposes type, frontmatter, links, and destination folder.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Synthesis with citations</span> <span class="f-note">— "draft the systems note for auth from these nine project notes", every claim linked to its source block.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Scoped AI</span> <span class="f-note">— per-folder network scope; <code>ai: false</code> in frontmatter is absolute. Embeddings stay local by default.</span></div>
+          </div>
+        </div>
+
+        <div class="pillar">
+          <div class="pillar-head"><h3>F. Performance &amp; restraint</h3><span class="tag">pillar 5 of 5</span></div>
+          <p class="pillar-why">Speed here is not an optimisation pass at the end; it is the reason the architecture looks the way it does. Restraint is the other half: no plugin API in v1, and the ecosystem is not the product.</p>
+          <div class="feat">
+            <div><span class="chip p0">P0</span></div><div><span class="f-name">Budgets in CI</span> <span class="f-note">— a synthetic 50k-note vault in the test suite; a PR that regresses a budget fails.</span></div>
+            <div><span class="chip p0">P0</span></div><div><span class="f-name">Cold start &lt; 1s</span> <span class="f-note">— at 20k notes, index already warm. Window visible in &lt; 400ms.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Keystroke → paint &lt; 16ms</span> <span class="f-note">— editing never blocks on the indexer; indexing is a background job with a debounce.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Save → index &lt; 50ms</span> <span class="f-note">— single-note incremental reindex, not a vault sweep.</span></div>
+            <div><span class="chip p1">P1</span></div><div><span class="f-name">Full rebuild &lt; 30s / 20k notes</span> <span class="f-note">— parallel parse across cores; the index is disposable, so rebuilding must be cheap.</span></div>
+            <div><span class="chip p4">P4</span></div><div><span class="f-name">Resident memory &lt; 400MB</span> <span class="f-note">— with the embedding model loaded. Below 200MB without.</span></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- 04 -->
+    <section id="architecture">
+      <div class="sec-head"><span class="sec-num">04</span><h2>Architecture</h2></div>
+      <p class="lede">One Rust process owns the vault, the index, and the query engine. The Vue frontend owns nothing but presentation and the editor buffer. The boundary is deliberately narrow and deliberately typed.</p>
+
+      <figure>
+        <div class="figwrap">
+          <svg viewBox="0 0 880 440" role="img" aria-label="Read path: vault files feed a watcher and parser, which upsert rows into a SQLite index; the query engine, AI service and MCP server all read from that same index, and the Vue UI talks to them over Tauri IPC.">
+            <defs>
+              <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+
+            <!-- top row -->
+            <rect class="svg-box" x="24" y="24" width="560" height="54"/>
+            <text class="svg-t" x="44" y="46">Vue 3 UI</text>
+            <text class="svg-s" x="44" y="64">CodeMirror 6 editor · TanStack views · lens switcher · agent panel</text>
+
+            <rect class="svg-box-dash" x="630" y="24" width="226" height="54"/>
+            <text class="svg-t" x="650" y="46">Claude Code / desktop</text>
+            <text class="svg-s" x="650" y="64">external MCP client</text>
+
+            <!-- ipc arrows -->
+            <line class="svg-line" x1="140" y1="78" x2="140" y2="130" marker-end="url(#ar)" marker-start="url(#ar)"/>
+            <text class="svg-s" x="150" y="102">IPC command</text>
+            <line class="svg-line" x1="450" y1="78" x2="450" y2="130" marker-end="url(#ar)" marker-start="url(#ar)"/>
+            <text class="svg-s" x="460" y="102">streamed events</text>
+            <line class="svg-line" x1="743" y1="78" x2="743" y2="130" marker-end="url(#ar)" marker-start="url(#ar)"/>
+            <text class="svg-s" x="753" y="102">stdio</text>
+
+            <!-- core row -->
+            <rect class="svg-box" x="24" y="130" width="270" height="66"/>
+            <text class="svg-t" x="44" y="154">Query engine</text>
+            <text class="svg-s" x="44" y="172">SQ parse → typecheck → SQL</text>
+
+            <rect class="svg-box" x="318" y="130" width="266" height="66"/>
+            <text class="svg-t" x="338" y="154">AI service</text>
+            <text class="svg-s" x="338" y="172">embed · retrieve · propose diffs</text>
+
+            <rect class="svg-box" x="630" y="130" width="226" height="66"/>
+            <text class="svg-t" x="650" y="154">MCP server</text>
+            <text class="svg-s" x="650" y="172">search · query · propose_edit</text>
+
+            <!-- to index -->
+            <line class="svg-line" x1="140" y1="196" x2="140" y2="242" marker-end="url(#ar)"/>
+            <text class="svg-s" x="150" y="224">one SQL stmt</text>
+            <line class="svg-line" x1="450" y1="196" x2="450" y2="242" marker-end="url(#ar)"/>
+            <text class="svg-s" x="460" y="224">vec + BM25</text>
+            <polyline class="svg-line" points="743,196 743,272 592,272" marker-end="url(#ar)"/>
+            <text class="svg-s" x="612" y="264">same query API</text>
+
+            <!-- index -->
+            <rect class="svg-box-accent" x="24" y="242" width="560" height="62"/>
+            <text class="svg-t" x="44" y="266">SQLite index — rebuildable, never synced</text>
+            <text class="svg-s" x="44" y="284">notes · blocks · fields · links · tasks · fts5 · vec0</text>
+
+            <!-- bottom row -->
+            <line class="svg-line" x1="140" y1="352" x2="140" y2="308" marker-end="url(#ar)"/>
+            <text class="svg-s" x="150" y="334">upsert changed rows</text>
+
+            <rect class="svg-box" x="24" y="352" width="250" height="60"/>
+            <text class="svg-t" x="44" y="376">Watcher + parser</text>
+            <text class="svg-s" x="44" y="394">debounce · AST · extract</text>
+
+            <line class="svg-line" x1="330" y1="382" x2="280" y2="382" marker-end="url(#ar)"/>
+            <text class="svg-s" x="286" y="370">fs events</text>
+
+            <rect class="svg-box" x="334" y="352" width="250" height="60"/>
+            <text class="svg-t" x="354" y="376">Vault folder</text>
+            <text class="svg-s" x="354" y="394">.md + assets — source of truth</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 1 — The read path. Everything above the vault folder is derived and disposable: delete the index and it rebuilds. The MCP server is not a wrapper around the app, it is a second front door onto the same query API, which is why an external agent can never see a staler vault than the UI does.</figcaption>
+      </figure>
+
+      <h4>Layer responsibilities</h4>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Layer</th><th>Owns</th><th>Candidate crates / libs</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Vault IO</td><td>Atomic writes, path canonicalisation, debounced watching, echo suppression</td><td><code>notify</code>, <code>tempfile</code> + rename, <code>camino</code></td></tr>
+            <tr><td class="name">Parser</td><td>Markdown → AST; extract headings, blocks, links, tasks, tags, inline fields, frontmatter</td><td><code>comrak</code> (GFM), <code>serde_yaml</code>, custom extensions for <code>[[ ]]</code> and <code>key::</code></td></tr>
+            <tr><td class="name">Index</td><td>The schema in §05, incremental upsert, FTS5, vector table</td><td><code>rusqlite</code> (bundled SQLite), <code>sqlite-vec</code>, FTS5</td></tr>
+            <tr><td class="name">Schema registry</td><td>Load type notes, validate, cache, expose field kinds to the typechecker</td><td>Plain Rust + <code>serde</code></td></tr>
+            <tr><td class="name">Query engine</td><td>SQ lexer/parser → typed AST → SQL codegen → execute → row stream</td><td><code>chumsky</code> or <code>pest</code> for the grammar</td></tr>
+            <tr><td class="name">AI service</td><td>Chunking, embedding, hybrid retrieval, provider calls, diff proposals</td><td><code>fastembed</code>/<code>ort</code> (ONNX), <code>reqwest</code>, <code>rmcp</code></td></tr>
+            <tr><td class="name">IPC</td><td>Typed commands; large result sets streamed as events, never one giant JSON blob</td><td>Tauri v2 commands + channels; <code>ts-rs</code> to generate the TS types</td></tr>
+            <tr><td class="name">Frontend</td><td>Editor buffer, view rendering, lens state, agent panel</td><td>Vue 3, Pinia, CodeMirror 6, TanStack Table, Tailwind, shadcn-vue</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <span class="label">On Rust, given a Go-shaped brain</span>
+        <p>Tauri v2 (currently <code>2.11.x</code>) is the right shell, but it means the core is Rust rather than Go. Keep the Rust surface deliberately small and boring: no async framework gymnastics, no trait-heavy abstractions, one background thread pool, and as much product logic as possible pushed into SQL and into Vue. A Go sidecar binary is technically possible and is the wrong call — it doubles the packaging, signing, and notarisation work for every platform, and puts a process boundary in the hot path. Roughly six focused files of Rust carry this design.</p>
+      </div>
+    </section>
+
+    <!-- 05 -->
+    <section id="data">
+      <div class="sec-head"><span class="sec-num">05</span><h2>Data model</h2></div>
+      <p class="lede">The one decision everything else hangs from: index at <strong>block</strong> granularity, not note granularity. Block rows are what make block references, precise AI citations, and writable views all possible from a single table.</p>
+
+      <pre><code><span class="cm">-- lives in .serat/index.db — rebuildable, gitignored, never synced</span>
+
+<span class="kw">CREATE TABLE</span> notes (
+  id          <span class="kw">INTEGER PRIMARY KEY</span>,
+  path        <span class="kw">TEXT UNIQUE NOT NULL</span>,   <span class="cm">-- vault-relative, canonical</span>
+  title       <span class="kw">TEXT</span>,
+  type        <span class="kw">TEXT</span>,                    <span class="cm">-- FK-ish → types.name, nullable</span>
+  lens        <span class="kw">TEXT</span>,                    <span class="cm">-- pm | analyst | engineer | ...</span>
+  folder_tier <span class="kw">TEXT</span>,                    <span class="cm">-- inbox|project|system|note|ref</span>
+  mtime       <span class="kw">INTEGER</span>,
+  hash        <span class="kw">TEXT</span>,                    <span class="cm">-- blake3 of bytes; skip reparse if equal</span>
+  word_count  <span class="kw">INTEGER</span>
+);
+
+<span class="kw">CREATE TABLE</span> blocks (
+  id         <span class="kw">INTEGER PRIMARY KEY</span>,
+  note_id    <span class="kw">INTEGER NOT NULL REFERENCES</span> notes(id) <span class="kw">ON DELETE CASCADE</span>,
+  ord        <span class="kw">INTEGER NOT NULL</span>,
+  kind       <span class="kw">TEXT NOT NULL</span>,           <span class="cm">-- para|heading|task|code|list|quote|table</span>
+  block_ref  <span class="kw">TEXT</span>,                    <span class="cm">-- the ^id, if the author gave one</span>
+  heading_path <span class="kw">TEXT</span>,                  <span class="cm">-- 'Design / Storage' — cheap breadcrumbs</span>
+  text       <span class="kw">TEXT</span>,
+  byte_start <span class="kw">INTEGER</span>, byte_end <span class="kw">INTEGER</span>  <span class="cm">-- the write-back handle</span>
+);
+
+<span class="kw">CREATE TABLE</span> fields (             <span class="cm">-- frontmatter AND inline key:: value</span>
+  note_id    <span class="kw">INTEGER NOT NULL</span>,
+  block_id   <span class="kw">INTEGER</span>,                <span class="cm">-- null ⇒ frontmatter</span>
+  key        <span class="kw">TEXT NOT NULL</span>,
+  val_text   <span class="kw">TEXT</span>, val_num <span class="kw">REAL</span>, val_date <span class="kw">TEXT</span>,  <span class="cm">-- typed at index time</span>
+  source     <span class="kw">TEXT NOT NULL</span>,           <span class="cm">-- frontmatter | inline</span>
+  byte_start <span class="kw">INTEGER</span>, byte_end <span class="kw">INTEGER</span>
+);
+
+<span class="kw">CREATE TABLE</span> links (
+  src_note   <span class="kw">INTEGER NOT NULL</span>, src_block <span class="kw">INTEGER</span>,
+  dst_path   <span class="kw">TEXT</span>, dst_note <span class="kw">INTEGER</span>, dst_block_ref <span class="kw">TEXT</span>,
+  kind       <span class="kw">TEXT NOT NULL</span>,           <span class="cm">-- wiki | embed | md | tag | unresolved</span>
+  alias      <span class="kw">TEXT</span>
+);
+
+<span class="kw">CREATE TABLE</span> tasks (
+  id <span class="kw">INTEGER PRIMARY KEY</span>, note_id <span class="kw">INTEGER</span>, block_id <span class="kw">INTEGER</span>,
+  status <span class="kw">TEXT</span>, text <span class="kw">TEXT</span>, due <span class="kw">TEXT</span>, owner <span class="kw">TEXT</span>, est <span class="kw">REAL</span>
+);
+
+<span class="kw">CREATE TABLE</span> types (name <span class="kw">TEXT PRIMARY KEY</span>, path <span class="kw">TEXT</span>, spec_json <span class="kw">TEXT</span>);
+
+<span class="cm">-- binaries are notes too (§08)</span>
+<span class="cm">--   notes.kind         'note' | 'asset'</span>
+<span class="cm">--   notes.asset_path   the binary this row stands for</span>
+<span class="cm">--   notes.sidecar_path the .md holding its frontmatter</span>
+<span class="cm">--   blocks.locator     'p:12' | 's:7' | 'Sales!A1:D20' | 't:00:14:22'</span>
+<span class="kw">CREATE TABLE</span> assets (
+  note_id     <span class="kw">INTEGER PRIMARY KEY REFERENCES</span> notes(id) <span class="kw">ON DELETE CASCADE</span>,
+  mime        <span class="kw">TEXT</span>, bytes <span class="kw">INTEGER</span>, page_count <span class="kw">INTEGER</span>,
+  extractor   <span class="kw">TEXT</span>, extractor_ver <span class="kw">INTEGER</span>,
+  content_hash <span class="kw">TEXT</span>,             <span class="cm">-- blake3 of the binary itself</span>
+  extracted_at <span class="kw">INTEGER</span>, needs_ocr <span class="kw">INTEGER</span>
+);
+
+<span class="kw">CREATE VIRTUAL TABLE</span> notes_fts <span class="kw">USING</span> fts5(title, body, content=<span class="st">''</span>);
+<span class="kw">CREATE VIRTUAL TABLE</span> chunk_vec <span class="kw">USING</span> vec0(
+  chunk_id <span class="kw">INTEGER PRIMARY KEY</span>, embedding <span class="kw">FLOAT</span>[384]
+);
+<span class="kw">CREATE TABLE</span> chunks (id <span class="kw">INTEGER PRIMARY KEY</span>, note_id <span class="kw">INTEGER</span>,
+                    block_lo <span class="kw">INTEGER</span>, block_hi <span class="kw">INTEGER</span>, text <span class="kw">TEXT</span>);</code></pre>
+
+      <ul class="plain">
+        <li><strong>Why <code>byte_start</code>/<code>byte_end</code> on both blocks and fields.</strong> They are the handle that makes a table cell edit a byte-range patch rather than a document rewrite. Without them, writable views mean re-serialising Markdown and losing the author's formatting.</li>
+        <li><strong>Why <code>hash</code>.</strong> A watcher event on an unchanged file (very common with sync tools) costs one hash, not one parse.</li>
+        <li><strong>Why <code>val_text</code> / <code>val_num</code> / <code>val_date</code> as three columns.</strong> Typing happens once at index time, so <code>where due &lt; today()</code> is an indexed range scan rather than a per-row string parse — this is most of the gap between Serat and Dataview at scale.</li>
+        <li><strong>Why <code>blocks.locator</code>.</strong> A Markdown block is anchored by byte range; an extracted block cannot be, because you cannot patch bytes inside a PDF. The locator is the same idea in the binary's own coordinate system — page, slide, cell range, timestamp — so "point back at the source" stays one concept across every file type.</li>
+        <li><strong>Why 384 dimensions.</strong> Sized for a small local model (bge-small / MiniLM class). At 50k notes ≈ 200k chunks that is roughly 300MB of vectors — acceptable on disk, and <code>sqlite-vec</code> brute-forces it fast enough at this scale that no ANN index is needed in v1.</li>
+      </ul>
+    </section>
+
+    <!-- 06 -->
+    <section id="query">
+      <div class="sec-head"><span class="sec-num">06</span><h2>SQ — the query language</h2></div>
+      <p class="lede">Familiar enough to guess, restrictive enough to compile. Every query is parsed, checked against the schema registry, and lowered to exactly one SQL statement — so its cost is knowable before it runs.</p>
+
+      <pre><code><span class="cm">```sq</span>
+<span class="kw">from</span> type:project
+<span class="kw">where</span> status != <span class="st">"done"</span> <span class="kw">and</span> lens <span class="kw">has</span> <span class="st">"pm"</span>
+<span class="kw">let</span> remaining = <span class="kw">rollup</span>(out.tasks[status != <span class="st">"done"</span>].est, sum)
+<span class="kw">let</span> slipping  = due &lt; <span class="kw">today</span>() + 7d <span class="kw">and</span> remaining &gt; 8
+<span class="kw">select</span> title, status, owner, due, remaining, slipping
+<span class="kw">sort</span> slipping <span class="kw">desc</span>, due <span class="kw">asc</span>
+<span class="kw">as</span> board <span class="kw">group by</span> status
+<span class="cm">```</span></code></pre>
+
+      <ul class="plain">
+        <li><strong><code>from</code></strong> takes a type, a tag, a folder, or a link expression — never a table name. Users never see the schema in §05.</li>
+        <li><strong><code>let</code></strong> defines a computed column in the query, not in the note. Nothing is written to disk to make a derived value queryable.</li>
+        <li><strong><code>rollup</code></strong> walks the link graph one hop and aggregates — the thing Dataview needs hand-written JS for.</li>
+        <li><strong><code>as</code></strong> chooses the view kind. The row set is identical across table, board, calendar and gallery; only the renderer differs.</li>
+        <li><strong>Static typechecking.</strong> Because <code>types</code> knows <code>project.due</code> is a date, <code>due &lt; today() + 7d</code> is validated at parse time and a typo in a field name is an editor squiggle, not an empty table at render time.</li>
+      </ul>
+
+      <div class="note">
+        <span class="label">Deliberate omission</span>
+        <p>SQ has no user-defined functions, no loops, and no escape hatch to JavaScript. That is what buys the performance guarantee and the writable views — the engine can always answer "which note and which byte range produced this cell", which is impossible once arbitrary code is in the path. If someone needs a computation SQ cannot express, the answer is to compute it in a note or a script and store it as a field, not to widen the language.</p>
+      </div>
+    </section>
+
+    <!-- 07 -->
+    <section id="writeback">
+      <div class="sec-head"><span class="sec-num">07</span><h2>Write-back: the risky mechanism</h2></div>
+      <p class="lede">Editing a cell in a query result and having it land correctly in a Markdown file is the hardest correctness problem in this design, and the one most likely to burn a user's data. It gets designed explicitly rather than discovered.</p>
+
+      <figure>
+        <div class="figwrap">
+          <svg viewBox="0 0 880 240" role="img" aria-label="A cell edit resolves to a byte range in the source note, patches only those bytes, writes atomically, and the watcher suppresses its own echo before reindexing just that note; the refreshed row updates the view.">
+            <defs>
+              <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+            <rect class="svg-box" x="14" y="46" width="150" height="62"/>
+            <text class="svg-t" x="28" y="70">Cell edit</text>
+            <text class="svg-s" x="28" y="88">status → done</text>
+
+            <line class="svg-line" x1="164" y1="77" x2="196" y2="77" marker-end="url(#ar2)"/>
+            <text class="svg-s" x="158" y="122">resolve</text>
+
+            <rect class="svg-box" x="196" y="46" width="150" height="62"/>
+            <text class="svg-t" x="210" y="70">Field row</text>
+            <text class="svg-s" x="210" y="88">note + byte range</text>
+
+            <line class="svg-line" x1="346" y1="77" x2="378" y2="77" marker-end="url(#ar2)"/>
+            <text class="svg-s" x="330" y="122">patch ≤ 1 field</text>
+
+            <rect class="svg-box" x="378" y="46" width="150" height="62"/>
+            <text class="svg-t" x="392" y="70">Atomic write</text>
+            <text class="svg-s" x="392" y="88">tmp + rename</text>
+
+            <line class="svg-line" x1="528" y1="77" x2="560" y2="77" marker-end="url(#ar2)"/>
+            <text class="svg-s" x="524" y="122">fs event</text>
+
+            <rect class="svg-box-accent" x="560" y="46" width="150" height="62"/>
+            <text class="svg-t" x="574" y="70">Watcher</text>
+            <text class="svg-s" x="574" y="88">echo suppressed</text>
+
+            <line class="svg-line" x1="710" y1="77" x2="742" y2="77" marker-end="url(#ar2)"/>
+
+            <rect class="svg-box" x="742" y="46" width="124" height="62"/>
+            <text class="svg-t" x="756" y="70">Reindex</text>
+            <text class="svg-s" x="756" y="88">that note only</text>
+
+            <polyline class="svg-line" points="804,108 804,176 89,176 89,108" marker-end="url(#ar2)"/>
+            <text class="svg-s" x="360" y="196">row refresh — the view never re-runs the whole query</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 2 — The write-back round trip. The two rules that keep it safe: a patch may only replace the bytes of a single field or task marker, never re-serialise the document; and the writer records the hash it just wrote, so the watcher recognises its own echo and does not fight the editor.</figcaption>
+      </figure>
+
+      <h4>Constraints on write-back</h4>
+      <ul class="plain">
+        <li><strong>Field-scoped patches only.</strong> A view can change a frontmatter value, an inline <code>key:: value</code>, or a task checkbox. It can never move a block, reflow text, or reorder frontmatter keys. Round-trip fidelity is not a goal — <em>not round-tripping at all</em> is the goal.</li>
+        <li><strong>Stale-range guard.</strong> If the file's hash changed since the row was read, the patch is rejected and the view refreshes instead of writing. Same discipline as an optimistic lock.</li>
+        <li><strong>Creating a missing field.</strong> Writing to a field a note does not have appends it to frontmatter in schema order. That is the one structural edit permitted, and it is why type notes declare field order.</li>
+        <li><strong>Undo crosses the boundary.</strong> A view edit pushes onto the same undo stack as an editor edit, and undo re-patches the file. Anything less makes writable views feel dangerous, and users will stop trusting them.</li>
+      </ul>
+    </section>
+
+    <!-- 08 -->
+    <section id="binaries">
+      <div class="sec-head"><span class="sec-num">08</span><h2>Binaries as first-class citizens</h2></div>
+      <p class="lede">Most of a working archive is not Markdown. Obsidian's model has nowhere to put metadata on a file that isn't a note, so PDFs, decks, spreadsheets and screenshots are opaque attachments — unsearchable, unqueryable, untypeable. Two mechanisms fix that, and neither adds a new subsystem.</p>
+
+      <h3>Mechanism 1 — the sidecar note</h3>
+      <p>A binary gets an optional companion note: <code>contract.pdf</code> plus <code>contract.pdf.md</code>. The sidecar holds frontmatter, type, tags, links and your own annotations. Because it is an ordinary note, a PDF instantly becomes a typed row that <code>from type:contract where expires &lt; today() + 30d</code> can return — with no change to the schema registry, the query engine, or write-back.</p>
+      <p>The alternatives all lose to the first principle. Storing this metadata in the index only would make it un-portable and un-rebuildable; extended attributes do not survive git or sync; one manifest per folder invites merge conflicts. A sidecar is portable, greppable, diffable, and already understood by every part of the system. Its one real cost is folder clutter, which the file browser hides by folding the pair into a single entry.</p>
+
+      <h3>Mechanism 2 — the extraction pipeline</h3>
+      <p>On index, a binary is routed by MIME type to an extractor that emits the <em>same block rows</em> a Markdown parser emits. That is the whole trick, and it is only cheap because §05 already indexes at block granularity: once a PDF's pages are blocks, full-text search, backlinks, embeddings, hybrid retrieval and block-precise AI citations all work on it with no new code.</p>
+
+      <figure>
+        <div class="figwrap">
+          <svg viewBox="0 0 880 270" role="img" aria-label="A Markdown note and a PDF take different front ends — a parser and a MIME-routed extractor — but both emit identical block and field rows into one index, so search, queries, backlinks and citations work the same on either.">
+            <defs>
+              <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+
+            <rect class="svg-box" x="14" y="20" width="200" height="58"/>
+            <text class="svg-t" x="30" y="44">note.md</text>
+            <text class="svg-s" x="30" y="62">anchored by byte range</text>
+
+            <rect class="svg-box" x="14" y="150" width="200" height="58"/>
+            <text class="svg-t" x="30" y="174">report.pdf</text>
+            <text class="svg-s" x="30" y="192">+ report.pdf.md sidecar</text>
+
+            <line class="svg-line" x1="214" y1="49" x2="258" y2="49" marker-end="url(#ar3)"/>
+            <text class="svg-s" x="216" y="40">parse</text>
+            <line class="svg-line" x1="214" y1="179" x2="258" y2="179" marker-end="url(#ar3)"/>
+            <text class="svg-s" x="216" y="170">route</text>
+
+            <rect class="svg-box" x="258" y="20" width="200" height="58"/>
+            <text class="svg-t" x="274" y="44">Markdown parser</text>
+            <text class="svg-s" x="274" y="62">comrak AST</text>
+
+            <rect class="svg-box" x="258" y="150" width="200" height="58"/>
+            <text class="svg-t" x="274" y="174">Extractor by MIME</text>
+            <text class="svg-s" x="274" y="192">child process · cached by hash</text>
+
+            <line class="svg-line" x1="458" y1="49" x2="554" y2="90" marker-end="url(#ar3)"/>
+            <line class="svg-line" x1="458" y1="179" x2="554" y2="138" marker-end="url(#ar3)"/>
+            <text class="svg-l" x="506" y="119" text-anchor="middle">identical rows</text>
+
+            <rect class="svg-box-accent" x="560" y="84" width="296" height="60"/>
+            <text class="svg-t" x="576" y="108">blocks + fields</text>
+            <text class="svg-s" x="576" y="126">anchor: byte range · page · slide · cell</text>
+
+            <line class="svg-line" x1="708" y1="144" x2="708" y2="180" marker-end="url(#ar3)"/>
+
+            <rect class="svg-box" x="560" y="180" width="296" height="56"/>
+            <text class="svg-t" x="576" y="204">One index, one query engine</text>
+            <text class="svg-s" x="576" y="222">fts5 · vec0 · SQ · backlinks · citations</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 3 — Why block-granular indexing pays for itself twice. A PDF and a note take different front ends but converge on the same row shape, so every capability built for notes applies to binaries without a parallel code path.</figcaption>
+      </figure>
+
+      <h4>Extractors</h4>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Format</th><th>Candidate crate</th><th>Blocks produced</th><th>Locator</th></tr></thead>
+          <tbody>
+            <tr><td class="name">PDF (text)</td><td><code>pdfium-render</code>, or a pure-Rust extractor if layout quality holds</td><td>Text runs merged into paragraphs by layout</td><td class="num">p:12</td></tr>
+            <tr><td class="name">PDF (scanned)</td><td>+ ONNX OCR, downloaded on demand</td><td>Same, flagged <code>needs_ocr</code></td><td class="num">p:12</td></tr>
+            <tr><td class="name">DOCX</td><td><code>zip</code> + <code>quick-xml</code> (OOXML text is simple), or <code>office_oxide</code></td><td>Paragraphs with heading level; tables</td><td class="num">¶:214</td></tr>
+            <tr><td class="name">PPTX</td><td>Same</td><td>One block per slide, plus speaker notes</td><td class="num">s:7</td></tr>
+            <tr><td class="name">XLSX / ODS</td><td><code>calamine</code></td><td>Header row as field names; rows as data</td><td class="num">Sales!A1:D20</td></tr>
+            <tr><td class="name">CSV / TSV</td><td><code>csv</code></td><td>Rows as queryable data</td><td class="num">row:88</td></tr>
+            <tr><td class="name">Images</td><td><code>kamadak-exif</code> + optional caption/OCR model</td><td>EXIF as fields; caption and OCR text as blocks</td><td class="num">—</td></tr>
+            <tr><td class="name">EPUB / EML</td><td><code>epub</code>, <code>mail-parser</code></td><td>Chapters; message parts and headers</td><td class="num">ch:3</td></tr>
+            <tr><td class="name">Audio / video</td><td>Whisper via ONNX — <strong>v2</strong></td><td>Transcript segments</td><td class="num">t:00:14:22</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Four rules that keep this from wrecking the app</h4>
+      <ul class="plain">
+        <li><strong>Extraction runs out of process.</strong> Parsing untrusted binaries in the main process is how a notes app becomes a CVE. A short-lived child with a wall-clock limit, a memory cap and no network; a crash marks that file unextractable and the indexer moves on.</li>
+        <li><strong>Two caches, deliberately separated.</strong> The index is disposable by principle — but re-OCRing 400 scanned PDFs is hours, not seconds. Extraction output lives in <code>.serat/extract/&lt;blake3&gt;.json</code>, keyed by content hash <em>and</em> extractor version, and survives an index wipe. Deleting the index stays cheap; the expensive thing is kept separately and can be synced if you want it to be.</li>
+        <li><strong>Extraction never blocks.</strong> A file appears in the index immediately with metadata only; its text arrives later and views update in place. A 900-page PDF dropped into the vault must not stall a keystroke.</li>
+        <li><strong>A format with no extractor still works.</strong> It indexes as an asset row with a sidecar, so it is still typed, linkable and queryable — just not full-text searchable. Nothing breaks; capability degrades.</li>
+      </ul>
+
+      <div class="note">
+        <span class="label">Where the line is</span>
+        <p>Serat reads, extracts, annotates and queries binaries. It does not edit them. Round-tripping a DOCX is a product in itself and would put the same corruption risk as §07 onto files whose format you do not control. Editing a Word document opens Word — and the extracted blocks reindex when it comes back.</p>
+      </div>
+    </section>
+
+    <!-- 09 -->
+    <section id="ai">
+      <div class="sec-head"><span class="sec-num">09</span><h2>AI layer</h2></div>
+      <p class="lede">Three separable pieces: retrieval (always local), generation (provider-agnostic), and exposure (the vault as an MCP server). Only the middle one ever touches the network.</p>
+
+      <h3>Retrieval</h3>
+      <p>Chunk on block boundaries with heading-path context prepended, embed with a small ONNX model in-process (<code>fastembed</code> or <code>ort</code> directly, bge-small / MiniLM class, 384 dims), store in <code>sqlite-vec</code>. Re-embed only chunks whose text hash changed on save. Retrieval fuses three signals:</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Signal</th><th>Source</th><th>Catches</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Lexical</td><td>FTS5 / BM25</td><td>Exact identifiers, error strings, names — where embeddings are weakest</td></tr>
+            <tr><td class="name">Semantic</td><td><code>sqlite-vec</code> cosine over chunk embeddings</td><td>Paraphrase, "the note where I argued against X"</td></tr>
+            <tr><td class="name">Structural</td><td><code>links</code> table, 1–2 hops from seed notes</td><td>The note that is <em>about</em> this, which neither text search finds</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Fuse with reciprocal-rank fusion, then optionally rerank the top ~40 with the model. Structural boost is what makes this feel different from a semantic-search plugin: a project note two hops from three strong hits outranks a lexically similar note with no graph relationship.</p>
+
+      <h3>Generation and trust</h3>
+      <ul class="plain">
+        <li><strong>Provider-agnostic.</strong> Anthropic API by key, or a local model over Ollama. The retrieval half never depends on which.</li>
+        <li><strong>Every write is a diff.</strong> The agent panel proposes patches; you see a per-file diff and accept, edit, or reject. There is no configuration that turns this off — it is the reason the feature is safe to build at all.</li>
+        <li><strong>Citations are block-precise.</strong> Because chunks map to block ranges, every generated claim links to the block that produced it, not just the note.</li>
+        <li><strong>Scope is explicit.</strong> Network scope is set per folder; <code>ai: false</code> in frontmatter excludes a note from retrieval and from context, absolutely.</li>
+      </ul>
+
+      <h3>The vault as an MCP server</h3>
+      <p>This is the highest-leverage feature in the document and among the cheapest to build, because it is a thin second front door onto the query API that already exists. Serat exposes <code>search</code>, <code>read_note</code>, <code>run_query</code>, <code>list_types</code> and <code>propose_edit</code> over MCP. Your existing Claude Code subagents stop grepping a folder and start asking typed questions — <em>"which systems notes have no project referencing them"</em> is one SQ query, not a shell pipeline. Writes from an external agent land in the same diff-review queue as writes from the in-app panel.</p>
+    </section>
+
+    <!-- 09 -->
+    <section id="sync">
+      <div class="sec-head"><span class="sec-num">10</span><h2>Sync and history</h2></div>
+      <p class="lede">Build no sync engine. Build a very good history view.</p>
+      <p>Because files are truth and the index is disposable, sync is somebody else's problem: git, Syncthing, iCloud, Dropbox all work on the folder as-is, and <code>.serat/</code> is gitignored so two machines never fight over an index. Writing a CRDT sync layer would be months of the hardest work in the project, competing with Obsidian Sync on its strongest ground.</p>
+      <p>What is worth building instead — and cheaply, with the <code>gix</code> crate — is <strong>git-backed history</strong>: auto-commit on a debounce, a per-note timeline, diff any two points, restore a version, and a conflict view that renders both sides as notes rather than as merge markers in a text file. That covers the actual user need (undo across days, "what did this note say in June") without owning a distributed systems problem.</p>
+    </section>
+
+    <!-- 10 -->
+    <section id="roadmap">
+      <div class="sec-head"><span class="sec-num">11</span><h2>Roadmap</h2></div>
+      <p class="lede">Ordered so that the riskiest unknowns are answered first and so that you are dogfooding on your real vault by the end of P1. Weeks assume solo, part-time; each phase ends on a gate, not a date.</p>
+
+      <div class="phases">
+        <div class="phase">
+          <div class="phase-id">P0<span class="wk">2 weeks</span></div>
+          <div>
+            <h3>Spike — prove the numbers</h3>
+            <p>Tauri v2 shell, CodeMirror 6 mounted, read/write one file, <code>notify</code> watcher, <code>comrak</code> parse and index a generated 20k-note vault into SQLite. No product features whatsoever.</p>
+            <p class="gate"><span>Gate:</span> full index &lt; 30s, incremental save→index &lt; 50ms, cold start &lt; 1s. If these miss badly, the architecture changes before anything is built on it.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">P1<span class="wk">8–10 weeks</span></div>
+          <div>
+            <h3>An editor you could actually live in</h3>
+            <p>Hybrid live-preview editing, wikilinks and embeds, backlinks pane, quick switcher, command palette, full-text search, Obsidian vault compatibility, external-edit reconciliation. One flat table view over frontmatter — no query language yet. Also the sidecar/asset model and PDF + image viewers: the data-model half is cheap now and painful to retrofit later.</p>
+            <p class="gate"><span>Gate:</span> you open your own vault in Serat for a week without needing Obsidian.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">P2<span class="wk">6–8 weeks</span></div>
+          <div>
+            <h3>Structure — types, SQ, writable tables</h3>
+            <p>Schema registry from type notes, inline field indexing, the SQ parser and typechecker, SQL codegen, embedded query blocks, table view with cell write-back (§07) and its undo integration. Plus the extraction pipeline (§08) for PDF, Office and CSV, and sheets as queryable data.</p>
+            <p class="gate"><span>Gate:</span> every Dataview query in your current vault is expressible in SQ; a table cell edit survives a hostile test — concurrent external edit, undo, redo, crash mid-write; and a phrase inside a PDF is findable from the same search box as a phrase in a note.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">P3<span class="wk">4–5 weeks</span></div>
+          <div>
+            <h3>Lenses, lifecycle, tasks</h3>
+            <p>Lens definitions and the switcher, dashboard notes, promote-across-tiers with link repair, task model and board/calendar views, rollups.</p>
+            <p class="gate"><span>Gate:</span> your PM, analyst and engineer dashboards all live in Serat, and promoting an inbox note to a project leaves zero broken links.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">P4<span class="wk">6–8 weeks</span></div>
+          <div>
+            <h3>AI — retrieval, agent panel, MCP</h3>
+            <p>Local embedding pipeline over notes <em>and</em> extracted blocks, hybrid retrieval, agent panel with diff review, capture agent, synthesis with citations, MCP server. OCR and image captioning land here too, behind on-demand model downloads. Ship MCP early in the phase: it is the cheapest piece and the one that changes your daily workflow most.</p>
+            <p class="gate"><span>Gate:</span> a Claude Code subagent can answer a question about the vault through MCP that grep cannot, and no AI write has ever landed unreviewed.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">P5<span class="wk">4 weeks</span></div>
+          <div>
+            <h3>Harden and ship v1</h3>
+            <p>Performance pass against the 50k budget, schema migration tooling, validation view, git history view, crash recovery, packaging, code signing and notarisation, auto-update.</p>
+            <p class="gate"><span>Gate:</span> a stranger installs it, opens a 30k-note vault, and nothing frightening happens.</p>
+          </div>
+        </div>
+      </div>
+
+      <h4>Held for v2 — deliberately</h4>
+      <p>WASM plugin API with capability scoping · mobile client · audio and video transcription · publish/share · canvas · multi-vault · collaboration. Each of these is a product in its own right, and any of them started before v1 will eat it.</p>
+    </section>
+
+    <!-- 11 -->
+    <section id="risks">
+      <div class="sec-head"><span class="sec-num">12</span><h2>Risks, honestly</h2></div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Risk</th><th>Severity</th><th>Mitigation</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Write-back corrupts notes</td><td class="num">Critical</td><td>Byte-range patches only; hash guard; atomic rename; git auto-commit before any view-originated write in the first releases. Property-test the patcher against a corpus of real notes.</td></tr>
+            <tr><td class="name">Rust ramp-up eats the schedule</td><td class="num">High</td><td>Small, boring Rust surface; product logic in SQL and Vue. P0 exists partly to find out how much friction this actually is before committing 30 weeks.</td></tr>
+            <tr><td class="name">CodeMirror 6 hybrid preview is deep water</td><td class="num">High</td><td>It is the single largest frontend cost. Start from an existing CM6 Markdown live-preview implementation rather than from zero; time-box it inside P1 and fall back to split preview if it overruns.</td></tr>
+            <tr><td class="name">Obsidian's plugin ecosystem</td><td class="num">Medium</td><td>Do not compete on breadth — it is unwinnable. Compete on the four pillars plus vault compatibility, so leaving is never all-or-nothing.</td></tr>
+            <tr><td class="name">Scope creep into "second Obsidian"</td><td class="num">Medium</td><td>§13 is the contract. Anything on that list needs an explicit decision to reopen, not a quiet afternoon.</td></tr>
+            <tr><td class="name">Obsidian closes the gap</td><td class="num">Medium</td><td>Bases is improving and will keep improving. The parts hardest for them to copy are writable views and a core AI layer — lead with those, not with query syntax.</td></tr>
+            <tr><td class="name">Binary parsing is an attack surface</td><td class="num">High</td><td>Every extractor runs in a short-lived child process with a wall-clock limit, a memory cap and no network. A crash marks the file unextractable rather than taking the app down. Fuzz the MIME dispatcher, not just the parsers.</td></tr>
+            <tr><td class="name">Extractors are a long tail</td><td class="num">Medium</td><td>One format per iteration behind a trait — PDF first, Office next, the rest optional. A format with no extractor still indexes as a typed asset row, so coverage gaps degrade capability instead of breaking the vault.</td></tr>
+            <tr><td class="name">Embedding model ships as a fat binary</td><td class="num">Low</td><td>Download the model on first AI use, not at install. The app must be fully useful with the AI layer never enabled.</td></tr>
+            <tr><td class="name">Solo project loses momentum</td><td class="num">High</td><td>The gates are chosen so each phase ends with something you personally use daily. Dogfooding is the momentum plan.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 12 -->
+    <section id="notbuilding">
+      <div class="sec-head"><span class="sec-num">13</span><h2>What this is deliberately not</h2></div>
+      <p class="lede">A blueprint is as much about the closed doors as the open ones. Each of these is a reasonable product; none of them is this one.</p>
+      <ul class="plain">
+        <li><strong>Not a block-based WYSIWYG.</strong> The editor is Markdown with live preview. Notion's editing model and plain-file truth are in tension, and truth wins.</li>
+        <li><strong>Not a real-time collaboration tool.</strong> Single-user, local-first. Collaboration means git.</li>
+        <li><strong>Not a mobile app in v1.</strong> Tauri v2 supports mobile; the editor and view surface do not survive the shrink without a separate design pass.</li>
+        <li><strong>Not a plugin marketplace.</strong> No plugin API until v1 ships, and then WASM-sandboxed with scoped capabilities — not "arbitrary JS with filesystem access".</li>
+        <li><strong>Not an Office editor.</strong> Binaries are read, extracted, annotated and queried — never rewritten. Round-tripping a DOCX carries §07-scale corruption risk on a format you do not control.</li>
+        <li><strong>Not a sync service.</strong> §10.</li>
+        <li><strong>Not a canvas or whiteboard.</strong> Large, visual, and orthogonal to every pillar here.</li>
+        <li><strong>Not a publishing platform.</strong> Static export exists; hosting does not.</li>
+      </ul>
+    </section>
+
+    <!-- 13 -->
+    <section id="next">
+      <div class="sec-head"><span class="sec-num">14</span><h2>Next five moves</h2></div>
+      <p class="lede">Concrete enough to start this week. None of them require committing to the whole thing.</p>
+      <ol class="moves">
+        <li><strong>Generate the benchmark vault.</strong> A script that emits 20k realistic notes — frontmatter, wikilinks, inline fields, tasks, a plausible link distribution. Everything downstream is measured against it, so it exists before any app code.</li>
+        <li><strong>Run the P0 spike.</strong> Tauri v2 + <code>comrak</code> + <code>rusqlite</code>, no UI beyond a text box. Index the benchmark vault and record the four numbers. This is two weeks that can save thirty.</li>
+        <li><strong>Write the SQ grammar as a document, then as a parser.</strong> Take ten real Dataview queries from your current vault and write each one in SQ by hand. If any is awkward, the language is wrong — and that is far cheaper to learn on paper.</li>
+        <li><strong>Prototype the write-back patcher standalone.</strong> A Rust function: given a file, a field key, and a new value, produce new bytes. Property-test it against your real vault with the assertion that nothing outside the field's byte range changes. This is the riskiest mechanism in the design and it can be de-risked with no app around it.</li>
+        <li><strong>Spike one extractor against your real archive.</strong> PDF text to blocks, out of process, cached by hash — pointed at whatever folder of contracts, specs or papers you already have. It tells you fast whether extraction quality is good enough to build a pillar on, and it is independent of everything else in P0.</li>
+        <li><strong>Ship the MCP server first, against Obsidian.</strong> Point the P0 indexer at your existing vault and expose <code>search</code> and <code>run_query</code> over MCP. You get real value in your Claude Code workflow within weeks, and it validates the query API long before there is a UI to render it.</li>
+      </ol>
+    </section>
+
+    <p class="closer">Draft v0.1 — the numbers in §03 are targets, not measurements, and P0 exists to replace them with real ones. Tool versions current as of August 2026 (Tauri 2.11.x). Name confirmed: <em>Serat</em>, for the double sense of a written work and a fibre. Known collision to watch if this ever goes public — Serato, the DJ software, is phonetically one letter away and owns the search results.</p>
+
+  </main>
+</div>
+
+</body></html>

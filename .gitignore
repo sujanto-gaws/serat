@@ -1,0 +1,15 @@
+# Build output
+/target/
+**/target/
+node_modules/
+
+# Derived index — C-02: .serat/ is disposable and never required for correctness (NFR-CMP-03)
+.serat/
+
+# Generated benchmark vault — regenerate with the bench/vaultgen command (NFR-MNT-02)
+/bench/vaults/
+/bench/out/
+
+# OS / editor
+.DS_Store
+Thumbs.db

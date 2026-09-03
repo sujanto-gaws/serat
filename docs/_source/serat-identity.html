@@ -1,0 +1,385 @@
+<!doctype html><html><head><!-- frame-runtime --><script>window.__FRAME_PREAMBLE={"v":1,"capabilities":{"artifact":"artifact.0kpk9vgi.js","assets":"assets.8Gk803W0.js","comments":"comments.vw5vQdGA.js","db":"db.h-3sndFg.js","downloads":"downloads.C3GSvEDP.js","embed":"embed.CxGAyc-v.js","mcp":"mcp.Bvma3qD7.js","network":"network.B5UA9Su4.js","notifications":"notifications.ssU4jy7G.js","permissions":"permissions.BNySkLV5.js","room":"room.VSdFwTE9.js","sample":"sample.BW2Uysoh.js","self":"artifact.0kpk9vgi.js","user":"user.BpKav-Rf.js"},"transforms":"_transforms.DSB5x63f.js","comments":"_comments.C6E0cR5g.js","translate":"_translate.5HCW4BJh.js"}</script><script>(function(){"use strict";var te=["light","dark","system"],re=/^[A-Za-z0-9_-]{1,64}$/,$=/^[a-zA-Z_:][a-zA-Z0-9_:.-]{0,127}$/,ne=new Set(["class","hidden","value","checked","style","title","alt","placeholder","lang","dir","role","tabindex","disabled","readonly","contenteditable","open","colspan","rowspan"]);function oe(e){const t=e.toLowerCase();return t.startsWith("data-")||t.startsWith("aria-")||ne.has(t)}var Be="http://www.w3.org/1999/xhtml",se="http://www.w3.org/2000/svg",ae=new Set(["script","style","iframe","noscript","noframes","noembed","xmp","plaintext","template","title","textarea","object","embed"]),ie=new Set(["script","style"]);function ce(e){const t=e.localName.toLowerCase();return e.namespaceURI==="http://www.w3.org/1999/xhtml"?!ae.has(t):e.namespaceURI===se?!ie.has(t):!1}function M(e,t){return e===t||(e===160||e===32)&&(t===160||t===32)}function le(e,t){const r=e.length,n=t.length;let s=0;for(;s<r&&s<n&&M(e.charCodeAt(s),t.charCodeAt(s));)s++;let o=0;for(;o<r-s&&o<n-s&&M(e.charCodeAt(r-1-o),t.charCodeAt(n-1-o));)o++;return{p:s,s:o}}function ue(e,t){const r=e.firstChild;if(e.childNodes.length!==1||r===null||r.nodeType!==Node.TEXT_NODE){e.textContent=t;return}const n=r.data,s=n.length,o=t.length,{p:i,s:c}=le(n,t);i===s&&c===0&&s===o||r.replaceData(i,s-i-c,t.slice(i,o-c));const h=r.data,p=e.ownerDocument.getSelection?.()??null,w=p!==null&&p.rangeCount>0&&(p.anchorNode===r||p.focusNode===r)?{anchor:p.anchorNode,anchorOffset:p.anchorOffset,focus:p.focusNode,focusOffset:p.focusOffset}:null;let m=-1,g=-1;for(let f=0;f<h.length&&f<t.length;f++){const v=h.charCodeAt(f),b=t.charCodeAt(f);v!==b&&M(v,b)&&(m<0&&(m=f),g=f)}const a=m>=0;if(a&&r.replaceData(m,g-m+1,t.slice(m,g+1)),a&&w!==null&&w.anchor!==null&&w.focus!==null)try{p.setBaseAndExtent(w.anchor,w.anchorOffset,w.focus,w.focusOffset)}catch{}}var fe=new Set(["html","head","body","frameset"]);function de(e){return e.namespaceURI==="http://www.w3.org/1999/xhtml"&&fe.has(e.localName)}function pe(e){if(e===null||typeof e!="object")return!1;const t=e;if(typeof t.target!="string"||!re.test(t.target)||t.text!==void 0&&typeof t.text!="string")return!1;if(t.attrsSet!==void 0){if(t.attrsSet===null||typeof t.attrsSet!="object")return!1;for(const[r,n]of Object.entries(t.attrsSet))if(!$.test(r)||typeof n!="string")return!1}if(t.attrsRemoved!==void 0){if(!Array.isArray(t.attrsRemoved))return!1;for(const r of t.attrsRemoved)if(typeof r!="string"||!$.test(r))return!1}return!0}function me(e,t){if(e===null||typeof e!="object")return!1;const{seq:r,elements:n}=e;if(typeof r!="number"||!Number.isSafeInteger(r)||!Array.isArray(n)||n.length===0||n.length>64)return!1;for(let s=0;s<n.length;s++)if(!t(n[s]))return!1;return!0}function he(e){return e===null||typeof e!="object"?!1:me(e.__frame_patch,pe)}function _e(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function ve(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function ye(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const r=t.theme;return typeof r=="string"&&te.includes(r)}var A=/^[\w.-]+\.js$/;function we(e,t,r){return r?"inert":typeof t=="string"&&A.test(t)?e?[t]:"inert":e?"inert":"framed"}function ge(){return{post(e,t){parent.postMessage(e,t)},on(e){const t=r=>{r.source===parent&&e(r.data,r.origin,r.isTrusted)};return addEventListener("message",t),()=>removeEventListener("message",t)}}}function be(){return{post:()=>{},on:()=>()=>{}}}var j="__frame_scroll",Ee=150,Ae=310,Se=160,Te=3e4;function ke(){let e=0,t=!1,r=!1,n=!1,s=0,o=null;const i=l=>{try{sessionStorage.setItem(j,JSON.stringify({y:l}))}catch{}},c=()=>{if(clearTimeout(e),o===null)return;const l=o;o=null,i(l)},h=()=>{if(t){t=!1;return}r=!0,o=scrollY,clearTimeout(e),e=setTimeout(c,Ee)};try{addEventListener("scroll",h,{passive:!0}),addEventListener("pagehide",c)}catch{}const p=()=>{let l;try{l=sessionStorage.getItem(j)}catch{return null}if(l===null)return null;let _;try{_=JSON.parse(l)}catch{_=null}const d=_?.y;if(!(typeof d=="number"&&Number.isFinite(d)&&d>=0)){try{sessionStorage.removeItem(j)}catch{}return null}return d};let w=!1;const m=l=>{try{const _=scrollY;scrollTo({top:l,left:0,behavior:"instant"}),s=l,n=!0,clearTimeout(e),o=null,i(l);const d=scrollY;d!==_&&(t=!0),d!==l&&!w&&(w=!0,addEventListener("load",()=>{try{if(scrollY===d){const T=p();m(T!==null?T:s)}}catch{}},{once:!0}))}catch{}},g=()=>{try{return!!location.hash}catch{return!0}};let a=!1;const f=()=>{try{if(a||innerWidth>Ae||innerHeight>Se)return;a=!0;const l=Date.now(),_=()=>{try{removeEventListener("resize",_)}catch{}if(Date.now()-l>Te||r||g())return;const d=p();m(d!==null?d:s)};addEventListener("resize",_)}catch{}};let v=!1,b=!1;return{restore(){if(v||(v=!0,g()))return;const l=p();l!==null&&(m(l),f())},promoted(){if(b||(b=!0,g()))return;const l=p();l!==null?(m(l),f()):n&&m(s)}}}function Re(e,t,r,n){let s=null;try{s=window.trustedTypes?.createPolicy("frame-runtime",{createScriptURL:h=>h})??null}catch{}const o=window.Worker,i=o?.prototype,c=Object.freeze({Worker:o,workerOn:i?.addEventListener,workerPost:i?.postMessage,workerTerminate:i?.terminate,fetch:window.fetch.bind(window),preventDefault:Event.prototype.preventDefault,policy:s,origins:t});r(e).then(h=>h?.bootTopLevel?h.bootTopLevel(c,n):n.settle()).catch(()=>n.settle())}var De="modulepreload",Ie=function(e){return"/"+e},Ue={},Le=function(t,r,n){let s=Promise.resolve();function o(i){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=i,window.dispatchEvent(c),!c.defaultPrevented)throw i}return s.then(i=>{for(const c of i||[])c.status==="rejected"&&o(c.reason);return t().catch(o)})},Oe=window===top,q=Object.getOwnPropertyDescriptor(window,"claude"),k=we(Oe,window.__FRAME_PREAMBLE?.topLevel,q?.writable===!1),N=typeof k=="object"&&k[0],y=N?be():ge();(function(){const e=Object.defineProperty,t=globalThis,r=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let n=0;for(let s=0;s<r.length;s++){const o=r[s];try{e(t,o,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[o]}catch{}try{e(t,o,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[o]=="function"&&n++}if(n&&k==="framed")try{y.post({__frame_rtc_lockdown_failed:n},"*")}catch{}})();var Pe=1e4,Y=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function X(e){for(const t of Y)if(t.endsWith(":*"))try{const r=new URL(e);if(`${r.protocol}//${r.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}var R=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),B=window.__FRAME_PREAMBLE?.transforms,D=window.__FRAME_PREAMBLE?.comments,I=window.__FRAME_PREAMBLE?.translate;function S(e){return Le(()=>import("/_runtime/"+e),void 0)}function G(e,t){return{contract:e.contract,changes:new Set(e.changes??[]),flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:new Map,shellOrigin:t,mount:x,hooks:O,pipe:()=>({wrap:(r,n)=>(...s)=>{try{return n(...s)}catch(o){return Promise.reject(o)}}})}}var L=null,E=null;function V(e,t,r){try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!0,enumerable:!0})}catch{}}}var U=!1,O={editBefore:null,edit:null};function Ce(e,t,r=!1){const n=[];let s;if(r)try{O.editBefore?.(e)}catch{}for(const o of e.elements){const i=document.querySelector(`[data-id="${o.target}"]`);if(!i){s=o.target;break}if([...Object.keys(o.attrsSet??{}),...o.attrsRemoved??[]].some(c=>!oe(c))){s=o.target;break}if(o.text!==void 0&&(!ce(i)||de(i))){s=o.target;break}for(const[c,h]of Object.entries(o.attrsSet??{}))if(!J(i,c)){try{i.setAttribute(c,h)}catch{}Z(i,c,h)}for(const c of o.attrsRemoved??[])J(i,c)||(i.removeAttribute(c),Z(i,c,null));typeof o.text=="string"&&ue(i,o.text),n.push(o.target)}if(r)try{O.edit?.(e.seq,n,s)}catch{}if(s!==void 0){y.post({__frame_patch_miss:{seq:e.seq}},t);return}try{document.dispatchEvent(new CustomEvent("claude:edit",{detail:{seq:e.seq,targets:n}}))}catch{}}function Z(e,t,r){if(!(e instanceof HTMLInputElement))return;const n=t.toLowerCase();n==="checked"?e.checked=r!==null:n==="value"&&e.type!=="file"&&(e.value=r??"")}function J(e,t){const r=t.toLowerCase(),n=e;return r==="data-id"||(r==="value"||r==="checked")&&(n.__artifactSecret===!0||/^(password|hidden|file)$/.test(n.type??"")||/(^|\s)(cc-|one-time-code|current-password|new-password)/i.test(`${e.getAttribute("autocomplete")??""} ${n.autocomplete??""}`))}function Q(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,U=!0):U&&(delete t.dataset.theme,t.style.colorScheme="",U=!1)}var P=new Map;function Me(){let e;const t={u:new Promise(r=>{e=r}),r:r=>{t.done=!0,e(r)},done:!1,nulled:!1};return t}function F(){for(const e of P.values())e.done||(e.nulled=!0,e.r(null))}var je=Object.freeze(Object.assign(Object.create(null),{call:Function.prototype.call,apply:Function.prototype.apply,bind:Function.prototype.bind})),x=(e,t)=>{const r=P.get(e);if(!r||r.done){r?.nulled&&E&&y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:e}},E);return}const n=typeof t=="function"?Object.setPrototypeOf(t,je):Object.assign(Object.create(null),t);typeof n.then=="function"&&delete n.then,r.r(Object.freeze(n))};function ee(){const e=q?.value??{};V(window,"claude",e);for(const t of Object.keys(R)){if(e[t]!==void 0){V(e,t,e[t]);continue}P.set(t,Me())}if(e.use===void 0){const t=r=>{if(typeof r!="string"||!Object.hasOwn(R,r))return Promise.resolve(null);const n=P.get(r);return n?n.u:Promise.resolve(e[r]??null)};try{Object.defineProperty(e,"use",{value:t,writable:!0,configurable:!0,enumerable:!1})}catch{}}}if(k==="framed"){const e=B&&A.test(B)?S(B).catch(()=>{}):Promise.resolve(void 0),t=a=>{if(a.type==="auxclick"&&a.button!==1)return;const f=a.target,v=f&&f.closest?f.closest("a[href],area[href]"):null;if(!v)return;const b=v.getAttribute("href");if(!b)return;let l;try{l=new URL(b,document.baseURI)}catch{return}if((l.protocol==="http:"||l.protocol==="https:")&&l.origin!==location.origin){a.preventDefault();const _=(v.getAttribute("target")??"").toLowerCase(),d=a.type==="auxclick"||a.metaKey||a.ctrlKey||a.shiftKey||a.altKey||!["","_self","_top","_parent"].includes(_);y.post({__frame_nav:!0,url:l.href,newTab:d},"*")}};addEventListener("click",t,!0),addEventListener("auxclick",t,!0);const r={},n=a=>{a.isTrusted&&(r.pointer=!0)},s=a=>{a.isTrusted&&(r.click=!0)};addEventListener("pointermove",n,{capture:!0,passive:!0}),addEventListener("click",s,{capture:!0,passive:!0}),e.then(a=>{a?.wireNav&&(a.wireNav(),removeEventListener("click",t,!0),removeEventListener("auxclick",t,!0),removeEventListener("pointermove",n,!0),removeEventListener("click",s,!0),a.wireEngagement?.(r))});let o=null;try{o=ke()}catch{}ee();let i=null,c=null,h=0;const p=y.on((a,f)=>{X(f)&&_e(a)&&(i=a.__frame_init,E=f,p(),clearTimeout(h),c?.())});y.post({__frame_connect:!0},"*");const w=new Promise(a=>{c=a,h=setTimeout(()=>{p(),a()},Pe)}),m=document.readyState==="loading"?new Promise(a=>document.addEventListener("DOMContentLoaded",()=>a(),{once:!0})):Promise.resolve();m.then(()=>{try{o?.restore()}catch{}});const g={cb:null};y.on((a,f)=>{if(X(f)&&ve(a)){try{o?.promoted()}catch{}g.cb?.()}}),w.then(async()=>{if(!i||!E){F();return}Q(i.theme);const a=E;let f=!1,v=!1;y.on((u,z,C)=>{if(z!==a)return;ye(u)&&Q(u.__frame_theme.theme),he(u)&&Ce(u.__frame_patch,a,C);const H=u?.__fc_mode;H&&typeof H=="object"&&!f&&D&&A.test(D)&&(f=!0,S(D).then(K=>K.install?.(a,H.on===!0)).catch(()=>{}));const W=u?.__ft_cmd;W&&typeof W=="object"&&!v&&I&&A.test(I)&&(v=!0,S(I).then(K=>K.install?.(a,W)).catch(()=>{}))});const b=Object.keys(i.capabilities??{}).filter(u=>Object.hasOwn(R,u)).map(u=>[u,R[u]]).filter(u=>typeof u[1]=="string"&&A.test(u[1])),l=await Promise.allSettled(b.map(([,u])=>S(u))),_=await e,d=E;if(_?.buildBoot||y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},d),_?.buildBoot)try{L=_.buildBoot(i,_.TRANSFORMS??{},{shellOrigin:d,mount:x,hooks:O},u=>y.post({__frame_cap_telemetry:u},d))}catch{y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:"_transforms"}},d),L=G(i,d)}else L=G(i,d);const T=u=>y.post({__frame_cap_telemetry:{kind:"cap-load-error",cap:u}},d),Ne=L;l.forEach((u,z)=>{const C=b[z][0];if(u.status!=="fulfilled"){T(C);return}try{u.value?.install?.(Ne)}catch{T(C)}}),F(),await m,y.post({__frame_ready:!0},E),e.then(u=>u?.installSizeReporter?.(d,g))})}else N&&(ee(),Re(N,Y,S,{settle:F,mount:x}))})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<title>Serat Identity</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+
+<style>
+  :root {
+    --ground:      #F3F4F1;
+    --surface:     #FFFFFF;
+    --surface-2:   #EBEDE8;
+    --ink:         #16191B;
+    --ink-2:       #454C52;
+    --muted:       #737C83;
+    --rule:        #D8DBD4;
+    --rule-soft:   #E6E8E2;
+    --indigo:      #24457E;
+    --brass:       #8E5F26;
+    --good:        #2A6349;
+    --crit:        #92332F;
+
+    /* fixed brand values — identical in both themes */
+    --brand-indigo: #24457E;
+    --brand-brass:  #C08A47;
+    --brand-ink:    #16191B;
+    --brand-paper:  #F3F4F1;
+
+    --f-display: "Bricolage Grotesque", "Helvetica Neue", Arial, sans-serif;
+    --f-body: "Source Serif 4", Georgia, serif;
+    --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:    #121517;
+      --surface:   #191D20;
+      --surface-2: #21262A;
+      --ink:       #E5E8E9;
+      --ink-2:     #B0B7BC;
+      --muted:     #828B92;
+      --rule:      #2C3237;
+      --rule-soft: #232A2E;
+      --indigo:    #8FABE8;
+      --brass:     #D2A468;
+      --good:      #6CBE95;
+      --crit:      #E08682;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:    #121517;
+    --surface:   #191D20;
+    --surface-2: #21262A;
+    --ink:       #E5E8E9;
+    --ink-2:     #B0B7BC;
+    --muted:     #828B92;
+    --rule:      #2C3237;
+    --rule-soft: #232A2E;
+    --indigo:    #8FABE8;
+    --brass:     #D2A468;
+    --good:      #6CBE95;
+    --crit:      #E08682;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 1rem;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page { max-width: 1000px; margin: 0 auto; padding: 0 clamp(20px, 5vw, 48px) 96px; }
+
+  /* ---------- masthead ---------- */
+  .masthead { padding: clamp(48px, 8vw, 88px) 0 36px; border-bottom: 1px solid var(--rule); }
+  .eyebrow {
+    font-family: var(--f-mono); font-size: 0.7rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 20px;
+  }
+  h1 {
+    font-family: var(--f-display); font-weight: 700; font-size: clamp(2.2rem, 6vw, 3rem);
+    line-height: 1.04; letter-spacing: -0.025em; margin: 0 0 18px; text-wrap: balance;
+  }
+  .lede { font-size: 1.1875rem; color: var(--ink-2); max-width: 60ch; margin: 0 0 8px; }
+
+  section { padding-top: 60px; }
+  h2 {
+    font-family: var(--f-display); font-weight: 700; font-size: 1.75rem;
+    letter-spacing: -0.02em; margin: 0 0 10px; text-wrap: balance;
+  }
+  h3 { font-family: var(--f-display); font-weight: 700; font-size: 1.15rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h4 {
+    font-family: var(--f-mono); font-weight: 600; font-size: 0.68rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 12px;
+  }
+  p { max-width: 66ch; margin: 0 0 14px; }
+  code { font-family: var(--f-mono); font-size: 0.85em; background: var(--surface-2); padding: 0.1em 0.35em; border-radius: 2px; }
+  :focus-visible { outline: 2px solid var(--indigo); outline-offset: 3px; }
+
+  ul.plain { max-width: 66ch; padding-left: 20px; margin: 0 0 16px; }
+  ul.plain li { margin-bottom: 6px; }
+
+  /* ---------- brief ---------- */
+  .brief { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .brief div { background: var(--ground); padding: 15px 17px; }
+  .brief dt { font-family: var(--f-mono); font-size: 0.64rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 5px; }
+  .brief dd { margin: 0; font-size: 0.9rem; color: var(--ink-2); }
+  .brief dd strong { color: var(--ink); font-family: var(--f-display); font-weight: 600; }
+
+  /* ---------- mark rendering ---------- */
+  .mark { display: block; }
+  .ctx-paper { color: var(--brand-ink); --mark-accent: var(--brand-brass); }
+  .ctx-reverse { color: var(--brand-paper); --mark-accent: var(--brand-brass); }
+  .ctx-mono { color: var(--brand-ink); --mark-accent: currentColor; }
+  .ctx-mono-rev { color: var(--brand-paper); --mark-accent: currentColor; }
+
+  .direction {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    margin-bottom: 28px;
+  }
+  .dir-top { display: grid; grid-template-columns: 200px minmax(0,1fr); gap: 28px; padding: 30px 30px 26px; align-items: center; }
+  @media (max-width: 720px) { .dir-top { grid-template-columns: 1fr; gap: 20px; } }
+
+  .hero-mark {
+    background: var(--brand-paper);
+    border: 1px solid var(--rule);
+    display: grid; place-items: center;
+    padding: 26px;
+    aspect-ratio: 1;
+  }
+  .hero-mark .mark { width: 100%; height: auto; }
+
+  .dir-label { font-family: var(--f-mono); font-size: 0.66rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--brass); margin: 0 0 6px; }
+  .reads { font-family: var(--f-mono); font-size: 0.75rem; color: var(--muted); margin: 12px 0 0; }
+  .reads b { color: var(--ink-2); font-weight: 600; }
+
+  /* application strip */
+  .apps {
+    border-top: 1px solid var(--rule);
+    display: flex; flex-wrap: wrap; gap: 26px 34px;
+    padding: 22px 30px 26px;
+    align-items: flex-end;
+  }
+  .app { display: flex; flex-direction: column; gap: 9px; align-items: center; }
+  .app .cap { font-family: var(--f-mono); font-size: 0.6rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+
+  .tile { display: grid; place-items: center; border-radius: 22.5%; }
+  .tile-indigo { background: var(--brand-indigo); }
+  .tile-ink { background: var(--brand-ink); }
+  .tile-paper { background: var(--brand-paper); border: 1px solid var(--rule); }
+  .t72 { width: 72px; height: 72px; }
+  .t72 .mark { width: 45px; height: 45px; }
+  .t40 { width: 40px; height: 40px; }
+  .t40 .mark { width: 25px; height: 25px; }
+  .t22 { width: 22px; height: 22px; border-radius: 24%; }
+  .t22 .mark { width: 14px; height: 14px; }
+  .bare32 .mark { width: 32px; height: 32px; }
+  .bare16 .mark { width: 16px; height: 16px; }
+
+  .lockup { display: flex; align-items: center; gap: 12px; }
+  .lockup .mark { width: 34px; height: 34px; }
+  .wordmark {
+    font-family: var(--f-display); font-weight: 700; font-size: 1.7rem;
+    letter-spacing: -0.035em; color: var(--brand-ink); line-height: 1;
+  }
+  .lockup-box { background: var(--brand-paper); border: 1px solid var(--rule); padding: 16px 22px; }
+
+  /* verdict */
+  .verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin-bottom: 20px; }
+  .vcell { background: var(--surface); padding: 18px 20px; }
+  .vcell h3 { display: flex; align-items: baseline; gap: 9px; }
+  .score { font-family: var(--f-mono); font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase; padding: 2px 6px; border: 1px solid currentColor; border-radius: 2px; }
+  .pick { color: var(--good); }
+  .alt { color: var(--indigo); }
+  .safe { color: var(--muted); }
+  .vcell p { font-size: 0.88rem; color: var(--ink-2); margin: 8px 0 0; }
+
+  .note { background: var(--surface-2); border-left: 2px solid var(--indigo); padding: 16px 20px; margin: 0 0 20px; max-width: 68ch; }
+  .note p:last-child { margin-bottom: 0; }
+  .note .label { font-family: var(--f-mono); font-size: 0.63rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--indigo); display: block; margin-bottom: 6px; }
+
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); background: var(--surface); margin-bottom: 20px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th { font-family: var(--f-mono); font-weight: 600; font-size: 0.65rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); background: var(--surface-2); border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.name { font-family: var(--f-display); font-weight: 500; white-space: nowrap; }
+  td.sw { white-space: nowrap; font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+  .chipcol { display: inline-block; width: 13px; height: 13px; border-radius: 2px; vertical-align: -2px; margin-right: 7px; border: 1px solid rgba(128,128,128,.35); }
+
+  .closer { margin-top: 66px; padding-top: 24px; border-top: 1px solid var(--rule); font-family: var(--f-mono); font-size: 0.7rem; color: var(--muted); max-width: 70ch; }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+
+    <symbol id="mk-lontar" viewBox="0 0 64 64">
+      <rect x="12" y="14" width="40" height="8" rx="4" fill="currentColor"/>
+      <rect x="8"  y="28" width="48" height="8" rx="4" fill="currentColor"/>
+      <rect x="14" y="42" width="36" height="8" rx="4" fill="currentColor"/>
+      <path d="M32 5 L32 50 C32 57.5 39.5 58.5 42.5 53" fill="none"
+            stroke="var(--mark-accent)" stroke-width="5" stroke-linecap="round"/>
+    </symbol>
+
+    <symbol id="mk-lontar-sm" viewBox="0 0 16 16">
+      <rect x="2.4" y="3.8" width="11.2" height="2.6" rx="1.3" fill="currentColor"/>
+      <rect x="2.4" y="9.6" width="11.2" height="2.6" rx="1.3" fill="currentColor"/>
+      <path d="M8 1.4 L8 14.6" fill="none" stroke="var(--mark-accent)" stroke-width="2" stroke-linecap="round"/>
+    </symbol>
+
+    <symbol id="mk-weave" viewBox="0 0 64 64">
+      <rect x="12" y="8" width="10" height="48" rx="5" fill="currentColor"/>
+      <rect x="27" y="8" width="10" height="48" rx="5" fill="currentColor"/>
+      <rect x="42" y="8" width="10" height="48" rx="5" fill="currentColor"/>
+      <rect x="8" y="12" width="48" height="10" rx="5" fill="var(--mark-accent)"/>
+      <rect x="8" y="27" width="48" height="10" rx="5" fill="var(--mark-accent)"/>
+      <rect x="8" y="42" width="48" height="10" rx="5" fill="var(--mark-accent)"/>
+      <rect x="12" y="12" width="10" height="10" fill="currentColor"/>
+      <rect x="42" y="12" width="10" height="10" fill="currentColor"/>
+      <rect x="27" y="27" width="10" height="10" fill="currentColor"/>
+      <rect x="12" y="42" width="10" height="10" fill="currentColor"/>
+      <rect x="42" y="42" width="10" height="10" fill="currentColor"/>
+    </symbol>
+
+    <symbol id="mk-thread" viewBox="0 0 64 64">
+      <path d="M46 17 C46 8 18 8 18 21 C18 34 46 31 46 44 C46 57 18 57 18 47"
+            fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
+      <circle cx="32" cy="32" r="6.5" fill="var(--mark-accent)"/>
+    </symbol>
+
+  </defs>
+</svg>
+
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Identity exploration · three directions · August 2026</p>
+    <h1>Serat Identity</h1>
+    <p class="lede">Three marks built from the two things the name already means — a written work, and a fibre. Each is drawn as flat geometry so it survives at 16 pixels and needs no gradient, no bevel, and no second version for dark mode.</p>
+  </header>
+
+  <section>
+    <h2>The brief the mark has to satisfy</h2>
+    <p>An app icon has a harder job than a logo. It lives at 16px in a browser tab, 32px in a taskbar, and 512px in a store listing, and it has to be findable in a dock next to thirty other squares. That rules out most of what makes a pretty logo.</p>
+    <dl class="brief">
+      <div><dt>Legible at 16px</dt><dd>One dominant shape, high contrast, no detail that dissolves</dd></div>
+      <div><dt>Not Obsidian</dt><dd><strong>No violet gem.</strong> Indigo reads as navy, not purple</dd></div>
+      <div><dt>Not a brain-graph</dt><dd>Nodes-and-edges is the most tired cliché in this category</dd></div>
+      <div><dt>Both meanings</dt><dd>Manuscript <em>and</em> thread — the name's own double sense</dd></div>
+      <div><dt>One drawing</dt><dd>Flat fills only, so it inverts cleanly instead of needing a variant</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Three directions</h2>
+
+    <!-- A -->
+    <article class="direction">
+      <div class="dir-top">
+        <div class="hero-mark ctx-paper">
+          <svg class="mark" viewBox="0 0 64 64" role="img" aria-label="Three stacked palm-leaf strips with a single thread passing down through them and curling at the base."><use href="#mk-lontar"/></svg>
+        </div>
+        <div>
+          <p class="dir-label">Direction A</p>
+          <h3>Lontar — the bound manuscript</h3>
+          <p>Javanese <em>serat</em> were written on lontar: strips of palm leaf, stacked and held by a single cord threaded through them. That is the literal object the name refers to, drawn literally — three leaves, one thread, a loose end at the bottom so the cord reads as fibre rather than a rule.</p>
+          <p>It carries a second reading for anyone who has never heard of a lontar: three lines of text with something running through them. A notes app whose icon looks like lines of text is not a bad accident.</p>
+          <p class="reads"><b>Risk:</b> at a glance it can read as a list or hamburger icon. The staggered widths and the thread are what break that — which is why the strips must never be equal length.</p>
+        </div>
+      </div>
+      <div class="apps">
+        <div class="app"><div class="tile tile-indigo t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-lontar"/></svg></div><span class="cap">App icon</span></div>
+        <div class="app"><div class="tile tile-ink t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-lontar"/></svg></div><span class="cap">Ink variant</span></div>
+        <div class="app"><div class="tile tile-indigo t40 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-lontar"/></svg></div><span class="cap">32px</span></div>
+        <div class="app"><div class="tile tile-indigo t22 ctx-reverse"><svg class="mark" viewBox="0 0 16 16" aria-hidden="true"><use href="#mk-lontar-sm"/></svg></div><span class="cap">16px opt.</span></div>
+        <div class="app"><div class="bare32 ctx-mono"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-lontar"/></svg></div><span class="cap">Mono</span></div>
+        <div class="app"><div class="lockup-box lockup ctx-paper"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-lontar"/></svg><span class="wordmark">serat</span></div><span class="cap">Lockup</span></div>
+      </div>
+    </article>
+
+    <!-- B -->
+    <article class="direction">
+      <div class="dir-top">
+        <div class="hero-mark ctx-paper">
+          <svg class="mark" viewBox="0 0 64 64" role="img" aria-label="A three-by-three plain weave of interlaced strands, warp in ink and weft in brass, each crossing showing which strand passes over."><use href="#mk-weave"/></svg>
+        </div>
+        <div>
+          <p class="dir-label">Direction B</p>
+          <h3>Tenun — the plain weave</h3>
+          <p>A true plain weave: three strands each way, with the over-under alternation actually drawn rather than implied. It is the other meaning of <em>serat</em>, and it is the closer fit to what the product does — individual threads becoming a structure, which is the whole argument of the blueprint.</p>
+          <p>The two-tone interlace is what makes it work. A single-colour weave collapses into a solid block; warp in ink and weft in brass keeps every crossing legible, and gives the icon a texture no competitor in this category has.</p>
+          <p class="reads"><b>Risk:</b> the densest of the three. It holds its silhouette when blurred, but individual strands merge below about 20px — it wants a two-by-two reduction for the favicon.</p>
+        </div>
+      </div>
+      <div class="apps">
+        <div class="app"><div class="tile tile-indigo t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg></div><span class="cap">App icon</span></div>
+        <div class="app"><div class="tile tile-ink t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg></div><span class="cap">Ink variant</span></div>
+        <div class="app"><div class="tile tile-indigo t40 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg></div><span class="cap">32px</span></div>
+        <div class="app"><div class="tile tile-indigo t22 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg></div><span class="cap">16px</span></div>
+        <div class="app"><div class="bare32 ctx-mono"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg></div><span class="cap">Mono</span></div>
+        <div class="app"><div class="lockup-box lockup ctx-paper"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-weave"/></svg><span class="wordmark">serat</span></div><span class="cap">Lockup</span></div>
+      </div>
+    </article>
+
+    <!-- C -->
+    <article class="direction">
+      <div class="dir-top">
+        <div class="hero-mark ctx-paper">
+          <svg class="mark" viewBox="0 0 64 64" role="img" aria-label="A single continuous thread drawn as a letter S, with one solid bead sitting on it at the centre."><use href="#mk-thread"/></svg>
+        </div>
+        <div>
+          <p class="dir-label">Direction C</p>
+          <h3>Simpul — one thread, one node</h3>
+          <p>A monogram, but drawn as a single unbroken fibre rather than a letterform: one stroke, round-capped at both ends so it reads as cut thread, with one bead sitting on it where the curve crosses its own centre. The bead is the note on the thread.</p>
+          <p>This is the flexible one. It scales further down than the other two, works as a loading spinner and a cursor badge, and stamps cleanly on anything. It is also the least specific — an S with a dot could belong to a dozen products.</p>
+          <p class="reads"><b>Risk:</b> safe to the point of forgettable. Choose it if you expect the name to do the identifying work and want the mark to stay out of the way.</p>
+        </div>
+      </div>
+      <div class="apps">
+        <div class="app"><div class="tile tile-indigo t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg></div><span class="cap">App icon</span></div>
+        <div class="app"><div class="tile tile-ink t72 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg></div><span class="cap">Ink variant</span></div>
+        <div class="app"><div class="tile tile-indigo t40 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg></div><span class="cap">32px</span></div>
+        <div class="app"><div class="tile tile-indigo t22 ctx-reverse"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg></div><span class="cap">16px</span></div>
+        <div class="app"><div class="bare32 ctx-mono"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg></div><span class="cap">Mono</span></div>
+        <div class="app"><div class="lockup-box lockup ctx-paper"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#mk-thread"/></svg><span class="wordmark">serat</span></div><span class="cap">Lockup</span></div>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <h2>Which one</h2>
+    <div class="verdict">
+      <div class="vcell">
+        <h3>A. Lontar <span class="score pick">recommended</span></h3>
+        <p>The only one of the three that could not belong to another product. It is specific to the name, it has the cleanest small-size silhouette, and its accidental second reading — lines of text — is exactly right for what the app is. Ship the simplified two-strip version below 20px.</p>
+      </div>
+      <div class="vcell">
+        <h3>B. Tenun <span class="score alt">strong alternative</span></h3>
+        <p>The better mark if you want the icon to argue for the <em>structure</em> story rather than the manuscript one. Most distinctive texture of the three and the most confident as a large icon; needs a reduced version for the favicon.</p>
+      </div>
+      <div class="vcell">
+        <h3>C. Simpul <span class="score safe">fallback</span></h3>
+        <p>Pick this only if A and B both feel too illustrative. It will never be wrong and it will never be memorable. Its better job is as a secondary device — spinner, badge, watermark — under whichever mark wins.</p>
+      </div>
+    </div>
+    <div class="note">
+      <span class="label">On the indigo</span>
+      <p>Obsidian's icon is a saturated violet gem. The brand indigo here is <code>#24457E</code> — a dark navy-leaning blue drawn from batik indigo dye, roughly 30 points darker and considerably less magenta. Side by side in a dock they do not read as related, which is deliberate: the whole positioning is "not another purple PKM app".</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Palette and specs</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Token</th><th>Hex</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td class="name"><span class="chipcol" style="background:#24457E"></span>Indigo</td><td class="sw">#24457E</td><td>Icon ground, primary brand colour, accents in the UI</td></tr>
+          <tr><td class="name"><span class="chipcol" style="background:#C08A47"></span>Brass</td><td class="sw">#C08A47</td><td>The thread, the weft, the bead — always the secondary element, never the whole mark</td></tr>
+          <tr><td class="name"><span class="chipcol" style="background:#16191B"></span>Ink</td><td class="sw">#16191B</td><td>The mark on light grounds; alternate icon ground</td></tr>
+          <tr><td class="name"><span class="chipcol" style="background:#F3F4F1"></span>Paper</td><td class="sw">#F3F4F1</td><td>Light ground; the mark on indigo and ink grounds</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h4>Rules</h4>
+    <ul class="plain">
+      <li><strong>Clear space</strong> equal to the height of one strip (A), one strand (B), or the stroke width (C) on all four sides.</li>
+      <li><strong>Minimum size</strong> 16px with the optimised variant, 24px with the full drawing. Below that, use the wordmark alone.</li>
+      <li><strong>Icon padding</strong> is 62% mark to 38% ground on a squircle — the macOS convention. A full-bleed square is fine for Windows; keep the same optical size.</li>
+      <li><strong>Wordmark</strong> is lowercase, Bricolage Grotesque 700 at −0.035em tracking. Lowercase reads as a personal tool; uppercase reads as enterprise software, which this is not.</li>
+      <li><strong>Never</strong> add a gradient, an outline, or a drop shadow; never recolour the accent to anything but brass; never place the mark on a photograph.</li>
+    </ul>
+  </section>
+
+  <p class="closer">All three marks are flat SVG on a 64-unit grid with no gradients, strokes converted at export, and a single accent colour driven by one variable — so the same file serves the app icon, the favicon, the About panel and the installer. Companion to the Serat product blueprint.</p>
+
+</div>
+
+</body></html>
