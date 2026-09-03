@@ -269,6 +269,16 @@ impl Vault {
 
         fs::create_dir_all(parent).map_err(|err| failed(err.to_string()))?;
 
+        // F-33. The replacement inherits the original's permissions, because a
+        // temp-and-rename write creates a *new* file and a new file gets the process
+        // default. Without this, replacing a note the user chmod'd 600 silently
+        // publishes it at 644 — an application quietly widening access to the user's
+        // own data, which is design goal 1 failing in the one direction nobody checks.
+        //
+        // Cross-platform, though what it carries differs: on Unix this is the full
+        // mode; on Windows only the read-only flag exists to carry.
+        let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
+
         let temp = unique_temp_path(parent, path.file_name());
         let write_temp = || -> std::io::Result<()> {
             let mut file = fs::File::create(&temp)?;
@@ -276,7 +286,11 @@ impl Vault {
             // Flush before the rename. Without this the rename can be durable while
             // the contents are not, which turns a power cut into a note full of
             // zeroes — the exact outcome the temp file exists to prevent.
-            file.sync_all()
+            file.sync_all()?;
+            if let Some(permissions) = existing_permissions.clone() {
+                fs::set_permissions(&temp, permissions)?;
+            }
+            Ok(())
         };
         if let Err(err) = write_temp() {
             let _ = fs::remove_file(&temp);
@@ -640,5 +654,117 @@ mod source_tests {
         assert_eq!(loaded.bytes, b"# A\n");
         assert_eq!(loaded.meta.kind, NoteKind::Note);
         assert_eq!(loaded.meta.size, note.size);
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    fn vault() -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(dir.path()).expect("open vault");
+        (dir, vault)
+    }
+
+    #[test]
+    fn replacing_a_note_does_not_change_its_permissions() {
+        // F-33, design goal 1. A temp-and-rename write creates a new file, and a new
+        // file gets the process default — so without care, saving a note the user
+        // restricted quietly publishes it.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("private.md").expect("path");
+        vault.write_atomic(&path, b"# Before\n").expect("write");
+
+        let absolute = vault.resolve(&path);
+        let before = fs::metadata(&absolute).expect("stat").permissions();
+
+        vault.write_atomic(&path, b"# After\n").expect("write");
+
+        let after = fs::metadata(&absolute).expect("stat").permissions();
+        assert_eq!(
+            before, after,
+            "the replacement did not inherit the original's permissions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_note_the_user_restricted_stays_restricted() {
+        // The case the cross-platform test cannot make bite: on Windows only the
+        // read-only flag exists to carry, so 600-stays-600 is Unix-only.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("secrets.md").expect("path");
+        vault.write_atomic(&path, b"# Secrets\n").expect("write");
+
+        let absolute = vault.resolve(&path);
+        fs::set_permissions(&absolute, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        vault
+            .write_atomic(&path, b"# Still secret\n")
+            .expect("write");
+
+        let mode = fs::metadata(&absolute).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a note the user chmod'd 600 was published at {mode:o}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_note_is_not_silently_replaced() {
+        // The one part of F-33 that can bite on Windows, where the read-only flag is
+        // the whole of what permissions carry. Renaming over a read-only file is
+        // refused by the platform, so the user's intent survives — and the failure is
+        // a refusal the caller sees, not a silent no-op.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("locked.md").expect("path");
+        vault
+            .write_atomic(
+                &path,
+                b"# Locked
+",
+            )
+            .expect("write");
+
+        let absolute = vault.resolve(&path);
+        let mut permissions = fs::metadata(&absolute).expect("stat").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&absolute, permissions).expect("set read-only");
+
+        let refused = vault.write_atomic(
+            &path,
+            b"# Overwritten
+",
+        );
+
+        // Restore before the assertion so a failure does not leave an undeletable
+        // temp directory behind.
+        let mut writable = fs::metadata(&absolute).expect("stat").permissions();
+        writable.set_readonly(false);
+        fs::set_permissions(&absolute, writable).expect("restore");
+
+        assert!(
+            refused.is_err(),
+            "a note the user marked read-only was replaced anyway"
+        );
+        assert_eq!(
+            fs::read(&absolute).expect("read"),
+            b"# Locked
+",
+            "the original contents did not survive the refused write"
+        );
+    }
+
+    #[test]
+    fn a_new_note_is_created_without_inheriting_anything() {
+        // The other side: there is nothing to inherit from, so this must not fail or
+        // reach for a default that is not the platform's.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("brand-new.md").expect("path");
+        vault.write_atomic(&path, b"# New\n").expect("write");
+        assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
     }
 }
