@@ -1,0 +1,403 @@
+//! Creating and validating the index database.
+//!
+//! There is no migration path and there will not be one (ADR-0002). A database whose
+//! schema does not match this build is deleted and rebuilt, which is a direct
+//! consequence of the index being derived: every row in it can be recomputed from
+//! files on disk, so the cheapest correct response to any doubt is to throw it away.
+
+use std::path::Path;
+
+use rusqlite::Connection;
+use serat_core::IndexError;
+
+/// The DDL, compiled into the binary.
+///
+/// `include_str!` rather than a runtime read: the schema is not configuration, and a
+/// shipped binary that looked for a `.sql` file beside itself would have a failure
+/// mode ("someone deleted the schema file") that cannot exist if the bytes are in the
+/// executable. It also means the version test below compares the constant against the
+/// exact text this build will execute, not against whatever is on disk.
+pub const DDL: &str = include_str!("../../../schema/001_init.sql");
+
+/// The schema version this build expects.
+///
+/// Bumping it is the whole of a schema change: a database reporting any other value
+/// is deleted and rebuilt. It must equal the `PRAGMA user_version` in [`DDL`], which
+/// is asserted by a test rather than remembered by two people — under ADR-0002 a
+/// silent drift costs every user a full reindex.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// What an existing database turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// Schema matches and the last rebuild completed. Usable as-is.
+    Ready,
+    /// Nothing there. Build it.
+    Absent,
+    /// Present but unusable: wrong version, failed integrity check, or a rebuild that
+    /// never finished. Every one of these has the same answer (ADR-0002), which is why
+    /// they are one variant with a reason rather than three.
+    Unusable {
+        /// Why, for the log and for the UI's "rebuilding because…" line.
+        reason: UnusableReason,
+    },
+}
+
+/// Why an index could not be opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnusableReason {
+    /// Built by a different schema version.
+    SchemaVersion,
+    /// `PRAGMA integrity_check` or the FTS integrity check failed.
+    Corrupt,
+    /// `state` is still 'building': a rebuild was interrupted.
+    RebuildInterrupted,
+    /// `note_count` disagrees with `count(*)` on notes.
+    ///
+    /// The DDL makes this an invariant maintained inside each transaction, so a
+    /// mismatch means a transaction was torn — which is corruption that
+    /// `integrity_check` cannot see, because the file is structurally fine and
+    /// semantically wrong.
+    CountMismatch,
+    /// The file exists but SQLite will not open it as a database.
+    Unopenable,
+}
+
+/// Open a connection with the pragmas every connection needs.
+///
+/// # Errors
+///
+/// [`IndexError::Sqlite`] if the file cannot be opened or the pragmas rejected.
+pub fn open(path: &Path) -> Result<Connection, IndexError> {
+    let conn = Connection::open(path).map_err(sqlite)?;
+    configure(&conn)?;
+    Ok(conn)
+}
+
+/// An in-memory database, for tests.
+///
+/// # Errors
+///
+/// [`IndexError::Sqlite`] if SQLite refuses.
+pub fn open_in_memory() -> Result<Connection, IndexError> {
+    let conn = Connection::open_in_memory().map_err(sqlite)?;
+    configure(&conn)?;
+    Ok(conn)
+}
+
+/// The pragmas, applied to every connection, writer and reader alike.
+fn configure(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;",
+    )
+    .map_err(sqlite)
+}
+
+/// Create every table, index and trigger.
+///
+/// # Errors
+///
+/// [`IndexError::Sqlite`] if any statement fails.
+pub fn bootstrap(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute_batch(DDL).map_err(sqlite)
+}
+
+/// Decide whether an existing database can be used.
+///
+/// Everything that is not `Ready` leads to the same action — delete and rebuild — so
+/// this deliberately does not try to repair anything.
+///
+/// # Errors
+///
+/// Never returns an error for a bad database; a database it cannot make sense of is
+/// [`IndexState::Unusable`], which is a value and not a failure.
+pub fn inspect(path: &Path) -> Result<IndexState, IndexError> {
+    if !path.exists() {
+        return Ok(IndexState::Absent);
+    }
+
+    let unusable = |reason| Ok(IndexState::Unusable { reason });
+
+    let Ok(conn) = open(path) else {
+        return unusable(UnusableReason::Unopenable);
+    };
+
+    let version: Result<i64, _> = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
+    match version {
+        Ok(found) if found == SCHEMA_VERSION => {}
+        Ok(_) => return unusable(UnusableReason::SchemaVersion),
+        Err(_) => return unusable(UnusableReason::Unopenable),
+    }
+
+    let integrity: Result<String, _> =
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get(0));
+    if integrity.as_deref() != Ok("ok") {
+        return unusable(UnusableReason::Corrupt);
+    }
+
+    let state: Result<String, _> =
+        conn.query_row("SELECT state FROM index_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        });
+    match state.as_deref() {
+        Ok("ready") => {}
+        Ok(_) => return unusable(UnusableReason::RebuildInterrupted),
+        Err(_) => return unusable(UnusableReason::Corrupt),
+    }
+
+    // The invariant the DDL asks serat-index to maintain: note_count is updated in
+    // the same transaction as any change to the number of notes. A mismatch is a torn
+    // transaction, which integrity_check cannot see because the file is structurally
+    // fine and semantically wrong.
+    let counts: Result<(i64, i64), _> = conn.query_row(
+        "SELECT (SELECT count(*) FROM notes), (SELECT note_count FROM index_meta WHERE id = 1)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    match counts {
+        Ok((actual, recorded)) if actual == recorded => Ok(IndexState::Ready),
+        Ok(_) => unusable(UnusableReason::CountMismatch),
+        Err(_) => unusable(UnusableReason::Corrupt),
+    }
+}
+
+pub(crate) fn sqlite(error: rusqlite::Error) -> IndexError {
+    IndexError::Sqlite {
+        message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ddl_runs_as_delivered() {
+        // architecture.md §4 claims "the full DDL is schema/001_init.sql and runs as
+        // delivered". Until this test existed that was an assertion in a document.
+        // The system sqlite3 CLI cannot run it — the one on PATH here is the Android
+        // platform-tools build, which has no fts5 — so this proves the only thing
+        // that matters: it runs against the SQLite this binary links.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("the delivered DDL must run with no statement failing");
+    }
+
+    #[test]
+    fn the_constant_and_the_ddl_agree_on_the_schema_version() {
+        // Under ADR-0002 a drift between these costs every user a full reindex, and
+        // it would be discovered at runtime by the rebuild firing for no reason.
+        let declared = DDL
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("PRAGMA user_version = ")?
+                    .trim_end_matches(';')
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+            })
+            .expect("schema/001_init.sql must set PRAGMA user_version");
+
+        assert_eq!(
+            declared, SCHEMA_VERSION,
+            "schema/001_init.sql sets user_version = {declared} but SCHEMA_VERSION is \
+             {SCHEMA_VERSION}. Bump both in the same commit (ADR-0002)."
+        );
+
+        // And the value the DDL actually leaves behind, not just the text of it.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(applied, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_bundled_sqlite_has_fts5() {
+        // FR-NAV-02 and the P2 "phrase inside a PDF findable from the note search
+        // box" gate both sit on this. The bundled build is not the host's SQLite, so
+        // this asserts a property of what we ship.
+        let conn = open_in_memory().expect("open");
+        conn.execute_batch("CREATE VIRTUAL TABLE probe USING fts5(body);")
+            .expect("the bundled SQLite must have FTS5 compiled in");
+    }
+
+    #[test]
+    fn foreign_keys_are_on_for_every_connection() {
+        // Our bundled libsqlite3-sys happens to compile with DEFAULT_FOREIGN_KEYS, so
+        // this is already 1 before we ask. We set it anyway and assert it here,
+        // because depending on a vendored build flag is exactly what changes silently
+        // at a version bump — and with it off, every ON DELETE CASCADE in the schema
+        // becomes decoration and the FTS delete triggers never fire.
+        let conn = open_in_memory().expect("open");
+        let enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("pragma");
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn the_fts_delete_path_keeps_the_index_in_step() {
+        // architecture.md §4.4 flags this as the case that breaks quietly: an
+        // external-content FTS table keeps returning hits for deleted rows unless the
+        // delete trigger fires. The hard version is deleting the PARENT note and
+        // letting ON DELETE CASCADE remove the block, because then the trigger only
+        // runs if the cascade does.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+
+        conn.execute(
+            "INSERT INTO notes (id, path, kind, mtime, hash) \
+             VALUES (1, '10-projects/a.md', 'note', 0, 'h')",
+            [],
+        )
+        .expect("insert note");
+        conn.execute(
+            "INSERT INTO blocks (id, note_id, ord, kind, text) \
+             VALUES (1, 1, 0, 'para', 'the reconciler is idempotent')",
+            [],
+        )
+        .expect("insert block");
+
+        assert_eq!(
+            fts_hits(&conn, "reconciler"),
+            1,
+            "insert trigger did not fire"
+        );
+
+        conn.execute("DELETE FROM notes WHERE id = 1", [])
+            .expect("delete note");
+
+        let blocks: i64 = conn
+            .query_row("SELECT count(*) FROM blocks", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(blocks, 0, "ON DELETE CASCADE did not remove the block");
+        assert_eq!(
+            fts_hits(&conn, "reconciler"),
+            0,
+            "blocks_fts still matches text whose row no longer exists"
+        );
+
+        // Structural check as well as behavioural: an external-content index can
+        // disagree with its content table without either looking wrong on its own.
+        conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES ('integrity-check');")
+            .expect("fts index must be internally consistent");
+    }
+
+    #[test]
+    fn an_update_replaces_the_fts_row_rather_than_adding_one() {
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        conn.execute(
+            "INSERT INTO notes (id, path, kind, mtime, hash) VALUES (1, 'a.md', 'note', 0, 'h')",
+            [],
+        )
+        .expect("note");
+        conn.execute(
+            "INSERT INTO blocks (id, note_id, ord, kind, text) VALUES (1, 1, 0, 'para', 'before')",
+            [],
+        )
+        .expect("block");
+        conn.execute("UPDATE blocks SET text = 'after' WHERE id = 1", [])
+            .expect("update");
+
+        assert_eq!(fts_hits(&conn, "before"), 0, "the old text still matches");
+        assert_eq!(fts_hits(&conn, "after"), 1, "the new text does not match");
+        conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES ('integrity-check');")
+            .expect("consistent");
+    }
+
+    #[test]
+    fn an_absent_index_is_absent_rather_than_an_error() {
+        let dir = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            inspect(&dir.path().join("index.db")).expect("inspect"),
+            IndexState::Absent
+        );
+    }
+
+    #[test]
+    fn a_wrong_schema_version_is_unusable() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        {
+            let conn = open(&path).expect("open");
+            bootstrap(&conn).expect("bootstrap");
+            conn.execute_batch("UPDATE index_meta SET state = 'ready'; PRAGMA user_version = 99;")
+                .expect("meddle");
+        }
+        assert_eq!(
+            inspect(&path).expect("inspect"),
+            IndexState::Unusable {
+                reason: UnusableReason::SchemaVersion
+            }
+        );
+    }
+
+    #[test]
+    fn an_interrupted_rebuild_is_unusable() {
+        // state stays 'building' until the first full rebuild commits, so a process
+        // killed mid-rebuild leaves a database that must not be trusted.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        {
+            let conn = open(&path).expect("open");
+            bootstrap(&conn).expect("bootstrap");
+        }
+        assert_eq!(
+            inspect(&path).expect("inspect"),
+            IndexState::Unusable {
+                reason: UnusableReason::RebuildInterrupted
+            }
+        );
+    }
+
+    #[test]
+    fn a_note_count_that_disagrees_with_the_notes_table_is_unusable() {
+        // The invariant the DDL delegates to this crate. A mismatch is a torn
+        // transaction: integrity_check passes, because the file is structurally fine
+        // and semantically wrong.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        {
+            let conn = open(&path).expect("open");
+            bootstrap(&conn).expect("bootstrap");
+            conn.execute_batch(
+                "INSERT INTO notes (id, path, kind, mtime, hash) \
+                     VALUES (1, 'a.md', 'note', 0, 'h');
+                 UPDATE index_meta SET state = 'ready', note_count = 7;",
+            )
+            .expect("meddle");
+        }
+        assert_eq!(
+            inspect(&path).expect("inspect"),
+            IndexState::Unusable {
+                reason: UnusableReason::CountMismatch
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_unusable_rather_than_a_panic() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        std::fs::write(&path, b"this is not a database, it is a text file").expect("write");
+        assert!(matches!(
+            inspect(&path).expect("inspect"),
+            IndexState::Unusable { .. }
+        ));
+    }
+
+    fn fts_hits(conn: &Connection, needle: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM blocks_fts WHERE blocks_fts MATCH ?1",
+            [needle],
+            |row| row.get(0),
+        )
+        .expect("fts query")
+    }
+}

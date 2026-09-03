@@ -59,8 +59,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 ts-rs = "12.0.1"
 serde_json = "1.0.151"
 thiserror = "2.0.20"
-# Test-only. A vault test needs a real directory on a real filesystem — the whole
-# point of serat-vault is the filesystem, so a mock would test the mock.
+# Test-only. A vault test needs a real directory and an index test a real file: the
+# whole point of both crates is the filesystem, so a mock would test the mock.
 tempfile = "3"
 
 # --- internal ---

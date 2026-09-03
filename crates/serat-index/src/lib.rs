@@ -11,12 +11,9 @@
 //! I4; the incremental save path in I5; corruption detection and automatic rebuild
 //! in I6.
 
-/// The schema version this build expects.
-///
-/// Bumping it is the whole of a schema change: a database on disk reporting any
-/// other value is dropped and rebuilt (ADR-0002). There is no migration to write,
-/// which is the point.
-pub const SCHEMA_VERSION: i64 = 1;
+pub mod schema;
+
+pub use schema::{DDL, IndexState, SCHEMA_VERSION, UnusableReason, bootstrap, inspect, open};
 
 /// The version of SQLite compiled into this binary.
 ///
