@@ -229,7 +229,17 @@ The watcher clause is load-bearing and is why it is in the definition rather tha
 
 `t_usable` as defined is the warm-index case NFR-PRF-01 names. With no index the file tree comes from the streaming walk instead, and that case is bounded by FR-VLT-01's own two-second criterion, not by this one — a cold vault and a warm vault are different measurements and the gate report must not average them.
 
-The mechanism is one environment variable, so the harness measures the application rather than itself: with `SERAT_STARTUP_BENCH=<file>` set, `serat-app` writes one line of JSON — `t0_to_main_ms`, `t0_to_visible_ms`, `t0_to_usable_ms` and the index state at `t_usable` — and exits. It exits because a harness that has to kill the process adds its own timing noise to the number it is trying to measure. The same marks are available in a normal session through `IndexStatus.since_process_start_ms` in `contracts/ipc.rs`; the trace file and the IPC field read the same clock, so the benchmark and the application can never disagree about what happened.
+The mechanism is one environment variable, so the harness measures the application rather than itself: with `SERAT_STARTUP_TRACE=<file>` set, `serat-app` writes one line of JSON — `t0_to_main_ms`, `t0_to_visible_ms`, `t0_to_usable_ms` and the index state at `t_usable` — and exits. It exits because a harness that has to kill the process adds its own timing noise to the number it is trying to measure, and `t0` is handed in by the harness so that the pre-`main` cost is inside the number rather than beside it. The same marks are available in a normal session through `IndexStatus.since_process_start_ms` in `contracts/ipc.rs`, reading the same monotonic clock. The trace file is the gate number for P0, because a process that exits at `t_usable` leaves no window in which to observe an event stream; if the two ever disagree, that disagreement is a finding rather than a rounding difference.
+
+##### Which mark is constant in the size of the vault, and which is not
+
+This distinction decides what a budget job may assert, so it is stated rather than left to be inferred.
+
+`t_visible` is **strictly constant**. Nothing the main thread does before the first paint is a function of note count: it reads a settings file of a few kilobytes, creates a window, loads a bundle compiled into the binary, and paints with `IndexState::Opening`. It does not wait on the index actor, enumerate anything, or read a directory. A budget job may therefore assert that `t_visible` does not grow between a 20,000-note vault and a 50,000-note one, and a violation is a real defect rather than noise — a path that had become proportional to vault size would show around 2.5x.
+
+`t_usable` is **not** constant, and asserting that it is would eventually fail for a legitimate reason. Two of its three preconditions grow with the vault. The file tree is one query returning every path, so it grows linearly in note count — cheaply, but it grows. And watcher registration grows in the number of *directories* on Linux, where inotify takes one watch per directory, while it is a single call on Windows and macOS. So `t_usable` is bounded and sub-linear rather than flat, and the way to hold it is the absolute budget NFR-PRF-01 states, measured at 20,000 notes with the 50,000 figure recorded beside it — not a growth ratio.
+
+The recovery journal of §10.1 is read after `t_usable`, not before. Its cost is proportional to the number of unsaved buffers rather than to the size of the vault, so it would not breach either budget; it is deferred because nothing about it is needed in order to type.
 
 ##### Validating the index on open
 
