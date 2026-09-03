@@ -1,0 +1,48 @@
+# The budget harness — one asserting job per NFR-PRF budget.
+# Serves NFR-PRF-08, US-35, C-06. See docs/05-testing/budget-harness.md.
+#
+# This crate depends on serat-index, serat-vault and serat-parse, which the
+# dependency rule of architecture §2.1 forbids *between product crates*. That
+# rule governs the product graph; a harness that may not link the thing it
+# measures cannot measure anything. The rule that applies here, and that
+# crates/serat-core/tests/dependency_rule.rs enforces, is the other direction:
+# nothing under crates/ may depend on anything under bench/.
+[package]
+name = "budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Serat performance budget harness (NFR-PRF-08)"
+
+[lib]
+name = "budget"
+path = "src/lib.rs"
+
+[[bin]]
+name = "environment"
+path = "src/bin/environment.rs"
+
+[[bin]]
+name = "prf01-cold-start"
+path = "src/bin/prf01-cold-start.rs"
+
+[[bin]]
+name = "prf03-save-to-index"
+path = "src/bin/prf03-save-to-index.rs"
+
+[[bin]]
+name = "prf04-full-rebuild"
+path = "src/bin/prf04-full-rebuild.rs"
+
+[dependencies]
+vaultgen = { path = "../vaultgen" }
+serat-core = { workspace = true }
+serat-index = { path = "../../crates/serat-index" }
+serat-parse = { path = "../../crates/serat-parse" }
+serat-vault = { path = "../../crates/serat-vault" }
+
+[lints]
+workspace = true

@@ -15,6 +15,7 @@ members = [
     "crates/serat-parse",
     "crates/serat-index",
     "bench/vaultgen",
+    "bench/budget",
 ]
 # Each teammate works in a git worktree under .worktrees/ (coding-standards.md), and
 # every one of them contains a full copy of this workspace. Without this, cargo
