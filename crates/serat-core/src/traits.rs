@@ -13,8 +13,8 @@
 //! phases that need them. Declaring them now would be guessing.
 
 use crate::{
-    error::{IndexError, ParseError},
-    note::{IndexOp, ParsedNote},
+    error::{IndexError, ParseError, VaultError},
+    note::{IndexOp, LoadedNote, ParsedNote},
     path::VaultPath,
 };
 
@@ -82,4 +82,41 @@ pub trait IndexWriter: Send + Sync {
     ///
     /// [`IndexError::WriterStopped`] if the writer died before draining.
     fn flush(&self) -> Result<(), IndexError>;
+}
+
+/// Somewhere notes can be enumerated and read from.
+///
+/// Implemented by `serat_vault::Vault`. It exists so that a full rebuild — which must
+/// walk, read, parse and write — can be written at all: no product crate may take two
+/// of those capabilities as dependencies (architecture §2.1), so the walk and the read
+/// arrive as a trait object and the parse as [`NoteParser`].
+///
+/// # Provisional
+///
+/// The trait is settled; where the function that consumes it lives is not. It sits in
+/// `serat-index` on the lead's interim ruling, because the signature is what
+/// test-engineer's budget harness, T1 and I5 bind to, while moving the function to a
+/// `serat-pipeline` crate later is a file move and an import change. Architect has the
+/// ruling on the home. Do not read the current location as settled.
+pub trait NoteSource: Send + Sync {
+    /// Every indexable file, in a deterministic order.
+    ///
+    /// Deterministic because a rebuild that visits files in a different order each
+    /// time makes "delete the index, rebuild, get the same answers" (FR-VLT-02) harder
+    /// to assert than it needs to be.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError`] only if the source itself cannot be enumerated. An individual
+    /// unreadable directory is skipped, not fatal: one bad folder must not stop a
+    /// vault indexing (design goal 5).
+    fn entries(&self) -> Result<Vec<VaultPath>, VaultError>;
+
+    /// Read one file and hash it.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] if it has gone — ordinary during a rebuild racing a
+    /// delete, and the caller's cue to skip it rather than to fail.
+    fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError>;
 }
