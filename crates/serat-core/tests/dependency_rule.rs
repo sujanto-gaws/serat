@@ -217,10 +217,21 @@ fn the_check_ignores_teammate_worktrees() {
     // six copies of every crate and report violations that do not exist. This one
     // asks cargo instead, and the root manifest carries exclude = [".worktrees"];
     // between them, no manifest inside a worktree is ever considered.
-    let strays: Vec<String> = workspace_metadata()
-        .into_iter()
-        .map(|package| package.manifest_path)
-        .filter(|path| path.contains(".worktrees"))
+    //
+    // The comparison is relative to the workspace root, not absolute: run from inside
+    // .worktrees/rust-core, every path in the workspace legitimately contains
+    // ".worktrees" and only a nested one is a problem.
+    let workspace = workspace();
+    let strays: Vec<String> = workspace
+        .packages
+        .iter()
+        .map(|package| package.manifest_path.as_str())
+        .filter(|path| {
+            path.strip_prefix(&workspace.root)
+                .unwrap_or(path)
+                .contains(".worktrees")
+        })
+        .map(ToOwned::to_owned)
         .collect();
 
     assert!(
@@ -351,7 +362,21 @@ impl Dependency {
 /// `--no-deps` keeps this to workspace members and their declared edges: no registry
 /// resolution, no network, and a runtime in the tens of milliseconds, so this can sit
 /// in the ordinary test run rather than in a job someone remembers to add.
+/// The workspace as cargo sees it.
+#[derive(Debug)]
+struct Workspace {
+    /// Absolute path of the directory holding the root manifest.
+    root: String,
+    /// Every workspace member.
+    packages: Vec<Package>,
+}
+
+/// Just the members, for the checks that do not care where the workspace lives.
 fn workspace_metadata() -> Vec<Package> {
+    workspace().packages
+}
+
+fn workspace() -> Workspace {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
@@ -372,7 +397,12 @@ fn workspace_metadata() -> Vec<Package> {
         .as_array()
         .expect("metadata has a packages array");
 
-    packages
+    let root = json["workspace_root"]
+        .as_str()
+        .expect("metadata has a workspace root")
+        .to_owned();
+
+    let packages = packages
         .iter()
         .map(|package| Package {
             name: package["name"]
@@ -396,7 +426,9 @@ fn workspace_metadata() -> Vec<Package> {
                 })
                 .collect(),
         })
-        .collect()
+        .collect();
+
+    Workspace { root, packages }
 }
 
 /// Tests of the check itself, against graphs that are wrong on purpose.
