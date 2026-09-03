@@ -36,6 +36,11 @@ use std::process::Command;
 const POLICY: &[(&str, &[&str])] = &[
     // Tier 0 — types and traits, no I/O, no internal dependencies at all.
     ("serat-core", &[]),
+    // The IPC contract. Takes no internal dependency and never will: serat-app
+    // includes contracts/ipc.rs as its own module, so this crate exists to compile
+    // and export it, not to be linked. Wiring it to serat-core would let the wire
+    // types drift into domain types, which ADR-0007 relies on them not being.
+    ("serat-contracts", &[]),
     // Tier 1 — capability crates. serat-core and nothing else internal.
     ("serat-vault", &["serat-core"]),
     ("serat-parse", &["serat-core"]),
