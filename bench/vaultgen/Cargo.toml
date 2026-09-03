@@ -1,0 +1,29 @@
+# Serat benchmark vault generator — serves NFR-MNT-02 and US-35.
+# One documented command; see docs/05-testing/benchmark-vault.md.
+#
+# Deliberately has ZERO dependencies, including zero Serat crates:
+#   * it must build and run before any product crate compiles (working agreement #4),
+#   * determinism must not depend on another crate's PRNG staying stable across versions,
+#   * the vault must be generatable in CI with no registry access.
+[package]
+name = "vaultgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Deterministic Serat benchmark vault generator (NFR-MNT-02)"
+
+[lib]
+name = "vaultgen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vaultgen"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
