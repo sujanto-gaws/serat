@@ -13,3 +13,6 @@ node_modules/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Per-teammate git worktrees (see docs/04-implementation/coding-standards.md)
+/.worktrees/
