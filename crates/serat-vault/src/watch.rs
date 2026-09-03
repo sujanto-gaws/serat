@@ -206,8 +206,19 @@ fn coalesce(
                 if is_interesting(&event.kind) {
                     let deadline = Instant::now() + window;
                     for path in &event.paths {
-                        if let Some(path) = accept(vault, path) {
-                            pending.entry(path).or_insert(deadline);
+                        match accept(vault, path) {
+                            Accepted::File(path) => {
+                                pending.entry(path).or_insert(deadline);
+                            }
+                            // A directory event describes a subtree, and no platform
+                            // emits per-child events for a folder rename. Queueing the
+                            // directory itself would hand the consumer a path it cannot
+                            // read, while the notes that actually moved reach nothing —
+                            // the index keeps rows for files that no longer exist and
+                            // never learns the new ones. A rescan is the honest answer
+                            // and it is the mechanism that already exists.
+                            Accepted::Subtree => raise(events, VaultEvent::RescanRequired),
+                            Accepted::Ignored => {}
                         }
                     }
                 }
@@ -248,7 +259,10 @@ fn flush(
         queue.push(path);
     }
 
-    if queue.take_overflowed() {
+    // Peek, never clear: the queue owns the latch and only the consumer that finishes
+    // a walk may clear it (WorkQueue::rescan_completed). raise() deduplicates, so a
+    // latch that stays set does not flood the event list.
+    if queue.rescan_needed().is_some() {
         raise(events, VaultEvent::RescanRequired);
     }
 }
@@ -273,27 +287,50 @@ fn is_interesting(kind: &EventKind) -> bool {
     )
 }
 
-/// Turn a platform path into a vault path, or drop it.
+/// What an event path turned out to be.
+#[derive(Debug)]
+enum Accepted {
+    /// A file to index.
+    File(VaultPath),
+    /// A directory, so an unknown number of files under it changed.
+    Subtree,
+    /// Nothing we index.
+    Ignored,
+}
+
+/// Classify a platform path.
 ///
 /// Everything the walk skips, the watcher skips, using the same rules — a file the
 /// walk ignores and the watcher accepts would appear on edit and vanish on rebuild.
-fn accept(vault: &Vault, path: &Path) -> Option<VaultPath> {
-    let relative = vault.relativise(path).ok()?;
+fn accept(vault: &Vault, path: &Path) -> Accepted {
+    let Ok(relative) = vault.relativise(path) else {
+        return Accepted::Ignored;
+    };
 
-    if vault.ignore_rules().is_ignored_file(relative.file_name()) {
-        return None;
-    }
     // Any ignored directory anywhere in the path: .serat/index.db must not enqueue
-    // itself, which would be an index that reindexes because it indexed.
+    // itself, which would be an index that reindexes because it indexed. Checked
+    // before the directory test so an ignored folder does not trigger a rescan.
     if relative
         .as_str()
         .split('/')
         .any(|segment| vault.ignore_rules().is_ignored_dir(segment))
     {
-        return None;
+        return Accepted::Ignored;
     }
 
-    Some(relative)
+    // A directory still on disk is a subtree event. One that has gone cannot be
+    // distinguished from a deleted file by looking, so it is treated as a file: the
+    // consumer's read fails, which is how a delete is recognised anyway, and the
+    // rename's destination raises the rescan that covers the rest.
+    if vault.resolve(&relative).is_dir() {
+        return Accepted::Subtree;
+    }
+
+    if vault.ignore_rules().is_ignored_file(relative.file_name()) {
+        return Accepted::Ignored;
+    }
+
+    Accepted::File(relative)
 }
 
 #[cfg(test)]
@@ -416,6 +453,168 @@ mod tests {
             queue.drain(),
             vec![VaultPath::new("real.md").expect("path")],
             "something from an ignored path reached the queue"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn a_folder_rename_never_puts_a_directory_on_the_queue() {
+        // BLOCKING 2 from the I2 review. No platform emits per-child events for a
+        // folder rename, so before this the queue got two directory paths the consumer
+        // cannot read, while the four note paths that actually changed reached
+        // nothing — the index keeping rows for files that no longer exist, with no
+        // signal. That is the permanent divergence C-02 forbids.
+        let (dir, vault, queue) = fixture();
+        fs::create_dir_all(dir.path().join("10-projects")).expect("mkdir");
+        fs::write(
+            dir.path().join("10-projects/alpha.md"),
+            b"# Alpha
+",
+        )
+        .expect("write");
+        fs::write(
+            dir.path().join("10-projects/beta.md"),
+            b"# Beta
+",
+        )
+        .expect("write");
+
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+        std::thread::sleep(COALESCE_WINDOW * 2);
+        queue.drain();
+        let _ = watcher.take_events();
+
+        fs::rename(
+            dir.path().join("10-projects"),
+            dir.path().join("20-archive"),
+        )
+        .expect("rename the folder");
+
+        let saw_rescan = eventually(|| {
+            watcher.take_events().contains(&VaultEvent::RescanRequired) || queue.depth() > 0
+        });
+        assert!(saw_rescan, "a folder rename produced no signal at all");
+
+        std::thread::sleep(COALESCE_WINDOW * 2);
+        for queued in queue.drain() {
+            assert!(
+                !vault.resolve(&queued).is_dir(),
+                "{queued} is a directory and was queued as if it were a file"
+            );
+        }
+        watcher.stop();
+    }
+
+    #[test]
+    fn the_coalescing_window_actually_delays_the_enqueue() {
+        // The old version of this test passed identically with the window set to zero,
+        // because it was measuring WorkQueue's path dedup rather than the coalescer.
+        // This one cannot: it asserts the path is absent while the window is open and
+        // present once it has closed.
+        let (dir, vault, queue) = fixture();
+        let watcher = Watcher::start(
+            &vault,
+            Arc::clone(&queue),
+            WatcherConfig {
+                coalesce_window: Duration::from_millis(1_500),
+            },
+        )
+        .expect("start");
+
+        fs::write(
+            dir.path().join("slow.md"),
+            b"# Slow
+",
+        )
+        .expect("write");
+
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            queue.depth(),
+            0,
+            "the path was enqueued before its window closed"
+        );
+
+        assert!(
+            eventually(|| queue.depth() > 0),
+            "the path never arrived after its window closed"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn repeated_writes_inside_one_window_reach_a_draining_consumer_once() {
+        // The other half, with a consumer popping continuously so the queue's dedup
+        // cannot be what collapses the writes. With no window this reaches five.
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            let stop = Arc::clone(&stop);
+            let pops = Arc::clone(&pops);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if queue.pop_timeout(Duration::from_millis(10)).is_some() {
+                        pops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        let target = dir.path().join("busy.md");
+        for round in 0..5 {
+            fs::write(
+                &target,
+                format!(
+                    "# Round {round}
+"
+                ),
+            )
+            .expect("write");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(COALESCE_WINDOW * 4);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        consumer.join().expect("consumer");
+
+        let observed = pops.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=2).contains(&observed),
+            "five writes 20 ms apart produced {observed} units of work; the window is              not coalescing"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn a_queue_overflow_raises_rescan_required() {
+        // VaultEvent::RescanRequired had no coverage at all, which is partly why the
+        // folder-rename defect went unnoticed: nobody had ever watched it fire.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(dir.path()).expect("open");
+        let queue = Arc::new(WorkQueue::with_capacity(1));
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        for i in 0..8 {
+            fs::write(
+                dir.path().join(format!("note-{i}.md")),
+                b"# Note
+",
+            )
+            .expect("write");
+        }
+
+        assert!(
+            eventually(
+                || watcher.take_events().contains(&VaultEvent::RescanRequired)
+                    || queue.rescan_needed().is_some()
+            ),
+            "the queue overflowed and nothing raised RescanRequired"
         );
         watcher.stop();
     }

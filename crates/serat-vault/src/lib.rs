@@ -35,6 +35,7 @@ pub mod watch;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serat_core::{ContentHash, NoteKind, NoteMeta, VaultError, VaultPath};
 
@@ -65,6 +66,11 @@ pub struct LoadedFile {
 pub struct Vault {
     root: PathBuf,
     ignore: IgnoreRules,
+    /// Hashes this vault is about to write, so the watcher can recognise our own
+    /// events and drop them (architecture §3.2). Shared rather than owned: the
+    /// watcher and the writer must consult the same set, and the writer is whoever
+    /// holds a clone of this `Vault`.
+    echo: Arc<EchoSuppressor>,
 }
 
 impl Vault {
@@ -101,6 +107,7 @@ impl Vault {
         Ok(Self {
             root: strip_verbatim(&canonical),
             ignore,
+            echo: Arc::new(EchoSuppressor::new()),
         })
     }
 
@@ -114,6 +121,15 @@ impl Vault {
     #[must_use]
     pub fn ignore_rules(&self) -> &IgnoreRules {
         &self.ignore
+    }
+
+    /// The echo suppressor this vault writes through.
+    ///
+    /// The indexing consumer asks it whether an event carries bytes we just wrote:
+    /// `if vault.echo().take_echo(loaded.meta.hash) { skip }` after the hash gate.
+    #[must_use]
+    pub fn echo(&self) -> &Arc<EchoSuppressor> {
+        &self.echo
     }
 
     /// The absolute path of a vault-relative one.
@@ -239,6 +255,23 @@ impl Vault {
     /// [`VaultError::AtomicWriteFailed`] if any step fails, in which case the
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
+        // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
+        // rewritten. The threat model's stated mechanism is that no write path accepts
+        // a non-Markdown target, so the refusal belongs here — in the one function that
+        // writes — rather than in each caller that might remember to check.
+        if !path.is_markdown() {
+            return Err(VaultError::NotAMarkdownTarget {
+                path: path.as_str().to_owned(),
+            });
+        }
+
+        let hash = hash_bytes(bytes);
+        // Before the write, not after (architecture §3.2, and echo.rs is explicit
+        // about it): on a fast filesystem the watcher can deliver the event before a
+        // later call would have returned, and an entry recorded too late suppresses
+        // nothing.
+        self.echo.expect(hash);
+
         let target = self.resolve(path);
         let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
             path: path.as_str().to_owned(),
@@ -270,7 +303,7 @@ impl Vault {
             return Err(failed(err.to_string()));
         }
 
-        Ok(hash_bytes(bytes))
+        Ok(hash)
     }
 }
 
@@ -369,6 +402,142 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_never_observes_a_partially_written_note() {
+        // S2 from the I2 review. Both previous atomic-write tests passed unchanged
+        // against a plain truncate-in-place fs::write — the "no temp files left
+        // behind" one especially, since an implementation with no temp files
+        // trivially leaves none. So nothing asserted the property temp-and-rename
+        // exists for.
+        //
+        // A reader spins on the file while a writer replaces 4 MiB of it. Every byte
+        // string it observes must be exactly the old one or exactly the new one, never
+        // a prefix, a mixture or a truncation. Under truncate-in-place this fails
+        // within a handful of iterations.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("big.md").expect("path");
+        let old_bytes = vec![b'o'; 4 * 1024 * 1024];
+        let new_bytes = vec![b'n'; 4 * 1024 * 1024];
+        vault.write_atomic(&path, &old_bytes).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let absolute = vault.resolve(&path);
+            let stop = Arc::clone(&stop);
+            let torn = Arc::clone(&torn);
+            let reads = Arc::clone(&reads);
+            let old_bytes = old_bytes.clone();
+            let new_bytes = new_bytes.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(seen) = fs::read(&absolute) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if seen != old_bytes && seen != new_bytes {
+                            torn.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+
+        for round in 0..20 {
+            let bytes = if round % 2 == 0 {
+                &new_bytes
+            } else {
+                &old_bytes
+            };
+            vault.write_atomic(&path, bytes).expect("write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader");
+
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the reader never managed a read, so this proved nothing"
+        );
+        assert_eq!(
+            torn.load(Ordering::Relaxed),
+            0,
+            "a reader saw a file that was neither the old contents nor the new"
+        );
+    }
+
+    #[test]
+    fn a_binary_target_is_refused() {
+        // T-06 and FR-BIN-19: binaries are read, extracted, annotated and queried,
+        // never rewritten. The threat model's mechanism is that no write path accepts
+        // a non-Markdown target, so the refusal lives in the only function that writes.
+        let (_dir, vault) = vault();
+        for binary in [
+            "40-refs/contract.pdf",
+            "assets/diagram.png",
+            "data/rows.xlsx",
+        ] {
+            let path = VaultPath::new(binary).expect("path");
+            assert!(
+                matches!(
+                    vault.write_atomic(&path, b"anything"),
+                    Err(VaultError::NotAMarkdownTarget { .. })
+                ),
+                "{binary} was accepted as a write target"
+            );
+            assert!(
+                !vault.resolve(&path).exists(),
+                "{binary} was created despite the refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn our_own_write_is_recorded_for_echo_suppression_before_it_lands() {
+        // §3.2, and the half that was missing: EchoSuppressor was correct but nothing
+        // called it, so the branch did not implement echo suppression at all. Recording
+        // must happen before the write — on a fast filesystem the watcher can deliver
+        // the event before a later call would have returned.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let hash = vault
+            .write_atomic(
+                &path, b"# Ours
+",
+            )
+            .expect("write");
+
+        assert!(
+            vault.echo().take_echo(hash),
+            "the writer did not record the hash it was about to produce"
+        );
+        assert!(
+            !vault.echo().take_echo(hash),
+            "one write suppressed two events"
+        );
+    }
+
+    #[test]
+    fn someone_elses_write_is_not_suppressed() {
+        let (dir, vault) = vault();
+        vault
+            .write_atomic(&VaultPath::new("ours.md").expect("path"), b"ours")
+            .expect("write");
+
+        // Another tool writes, bypassing us entirely.
+        fs::write(dir.path().join("theirs.md"), b"theirs").expect("write");
+        let theirs = vault
+            .read(&VaultPath::new("theirs.md").expect("path"))
+            .expect("read");
+
+        assert!(
+            !vault.echo().take_echo(theirs.meta.hash),
+            "an external edit was mistaken for our own echo"
+        );
+    }
+
+    #[test]
     fn paths_outside_the_vault_are_refused() {
         let (dir, vault) = vault();
         let outside = dir.path().parent().expect("parent").join("elsewhere.md");
@@ -408,9 +577,14 @@ mod tests {
 
     #[test]
     fn an_asset_is_read_as_an_asset() {
+        // Built with fs::write rather than write_atomic: our own write path refuses a
+        // non-Markdown target (T-06), and a fixture that established the opposite as
+        // normal usage would undermine the invariant it sits beside.
         let (_dir, vault) = vault();
         let path = VaultPath::new("40-refs/contract.pdf").expect("path");
-        vault.write_atomic(&path, b"%PDF-1.7\n").expect("write");
+        let absolute = vault.resolve(&path);
+        fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir");
+        fs::write(&absolute, b"%PDF-1.7 header only").expect("write");
         assert_eq!(vault.read(&path).expect("read").meta.kind, NoteKind::Asset);
     }
 

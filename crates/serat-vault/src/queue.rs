@@ -34,23 +34,43 @@ pub struct QueueStats {
     pub overflowed: u64,
 }
 
+/// Evidence that a rescan was owed, handed back when it completes.
+///
+/// Carries the overflow generation it covers, so a rescan that ran while more paths
+/// were being dropped does not clear a latch it did not earn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RescanTicket(u64);
+
 /// A bounded queue of paths waiting to be indexed, holding each path at most once.
 ///
-/// # Why dropping on overflow is correct
+/// # Which producer may be dropped
 ///
-/// When the queue is full a push is refused and [`WorkQueue::overflowed`] latches.
-/// The consumer's contract is then to do a full walk and reconcile, which finds
-/// everything the drops lost — so overflow costs a rescan, never a missed change.
+/// This is the decision, and it is not "may we drop" — it is "who".
 ///
-/// The alternative, blocking the producer, is worse in exactly the case that matters:
-/// the producer is the watcher's coalescer, and blocking it means the OS event buffer
-/// overflows instead. That loses events with no record that anything was lost, which
-/// is the one outcome C-02 cannot tolerate — a vault whose index quietly disagrees
-/// with its files.
+/// **The watcher may be dropped.** [`WorkQueue::push`] refuses when full and latches
+/// a rescan. Blocking the watcher's coalescer instead would stop us draining the OS
+/// event buffer, so the platform would drop notifications and tell nobody — losing
+/// changes with no record that anything was lost, which is the one outcome C-02
+/// cannot tolerate. A dropped watcher event is recoverable because a walk finds it.
+///
+/// **A walk may not be dropped.** [`WorkQueue::push_blocking`] waits for space. The
+/// walk is not the coalescer, so the argument above does not apply to it, and it is
+/// the recovery mechanism: routing it through a queue that drops means the recovery
+/// re-enters the failure.
+///
+/// That second half was a defect, not a design. The queue holds 8,192 paths and the
+/// P0 vault has 20,200 files; `walk()` returns them sorted and this queue is FIFO, so
+/// every rescan pushed the same sorted prefix, the same 8,192 won the slots, and
+/// 12,008 files had never once reached the consumer after five full rescans. A stable
+/// loop, not a slow one. `overflow_recovery_converges_on_a_vault_larger_than_the_queue`
+/// is the test that would have caught it.
 #[derive(Debug)]
 pub struct WorkQueue {
     inner: Mutex<Inner>,
+    /// Signalled when work arrives, for consumers waiting in `pop`.
     ready: Condvar,
+    /// Signalled when work is taken, for bulk producers waiting in `push_blocking`.
+    space: Condvar,
     capacity: usize,
 }
 
@@ -59,7 +79,12 @@ struct Inner {
     order: VecDeque<VaultPath>,
     queued: HashSet<VaultPath>,
     stats: QueueStats,
-    overflowed: bool,
+    /// Bumped on every overflow. A rescan clears the latch only if no further
+    /// overflow happened while it ran, which is what makes the clear happen on
+    /// completion rather than on read.
+    overflow_generation: u64,
+    /// The generation a rescan has successfully covered.
+    rescanned_generation: u64,
     closed: bool,
 }
 
@@ -86,10 +111,12 @@ impl WorkQueue {
                 order: VecDeque::new(),
                 queued: HashSet::new(),
                 stats: QueueStats::default(),
-                overflowed: false,
+                overflow_generation: 0,
+                rescanned_generation: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
+            space: Condvar::new(),
             capacity,
         }
     }
@@ -110,7 +137,7 @@ impl WorkQueue {
         }
         if inner.order.len() >= self.capacity {
             inner.stats.overflowed += 1;
-            inner.overflowed = true;
+            inner.overflow_generation += 1;
             return false;
         }
         inner.queued.insert(path.clone());
@@ -121,6 +148,44 @@ impl WorkQueue {
         true
     }
 
+    /// Offer a path, waiting for space rather than dropping it.
+    ///
+    /// For bulk producers: the initial walk and the rescan that recovers from an
+    /// overflow. Nothing will mention these paths again, so dropping one means the
+    /// index silently disagrees with the disk — and when the producer *is* the
+    /// recovery mechanism, dropping means the recovery re-enters the failure it was
+    /// sent to repair.
+    ///
+    /// Safe to block precisely because this producer is not the watcher's coalescer:
+    /// waiting here cannot stop the OS event buffer being drained.
+    ///
+    /// Returns whether the path was newly queued; `false` means it was already
+    /// waiting, or the queue closed.
+    pub fn push_blocking(&self, path: VaultPath) -> bool {
+        let mut inner = self.lock();
+        loop {
+            if inner.closed {
+                return false;
+            }
+            if inner.queued.contains(&path) {
+                inner.stats.deduplicated += 1;
+                return false;
+            }
+            if inner.order.len() < self.capacity {
+                inner.queued.insert(path.clone());
+                inner.order.push_back(path);
+                inner.stats.accepted += 1;
+                drop(inner);
+                self.ready.notify_one();
+                return true;
+            }
+            inner = self
+                .space
+                .wait(inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     /// Take the next path, blocking until one arrives or the queue closes.
     ///
     /// `None` means closed and drained, which is the consumer's signal to stop.
@@ -129,6 +194,8 @@ impl WorkQueue {
         loop {
             if let Some(path) = inner.order.pop_front() {
                 inner.queued.remove(&path);
+                drop(inner);
+                self.space.notify_one();
                 return Some(path);
             }
             if inner.closed {
@@ -148,6 +215,8 @@ impl WorkQueue {
         loop {
             if let Some(path) = inner.order.pop_front() {
                 inner.queued.remove(&path);
+                drop(inner);
+                self.space.notify_one();
                 return Some(path);
             }
             if inner.closed {
@@ -171,18 +240,38 @@ impl WorkQueue {
     pub fn drain(&self) -> Vec<VaultPath> {
         let mut inner = self.lock();
         inner.queued.clear();
-        inner.order.drain(..).collect()
+        let taken: Vec<VaultPath> = inner.order.drain(..).collect();
+        drop(inner);
+        self.space.notify_all();
+        taken
     }
 
-    /// Whether the queue has overflowed since this was last checked, clearing the
-    /// flag.
+    /// Whether paths have been dropped and not yet reconciled.
     ///
-    /// A `true` means: paths were dropped, so walk the vault and reconcile. It is
-    /// latched rather than counted because the answer to one drop and to four
-    /// thousand is the same.
-    pub fn take_overflowed(&self) -> bool {
+    /// Returns the ticket a completed rescan hands back. Peeking does **not** clear:
+    /// clear-on-read loses the signal if the rescan then fails part-way or the process
+    /// exits, and "the index may disagree with the disk" is exactly the state that
+    /// must survive a crash.
+    ///
+    /// The queue owns this latch. The watcher may peek to raise
+    /// `VaultEvent::RescanRequired`, but only the consumer that actually completes the
+    /// walk calls [`WorkQueue::rescan_completed`].
+    #[must_use]
+    pub fn rescan_needed(&self) -> Option<RescanTicket> {
+        let inner = self.lock();
+        (inner.overflow_generation > inner.rescanned_generation)
+            .then_some(RescanTicket(inner.overflow_generation))
+    }
+
+    /// Record that a rescan covering `ticket` finished.
+    ///
+    /// Clears the latch only if nothing overflowed while the rescan ran; otherwise the
+    /// newer overflow is still outstanding and another rescan is owed. Returns whether
+    /// the latch is now clear.
+    pub fn rescan_completed(&self, ticket: RescanTicket) -> bool {
         let mut inner = self.lock();
-        std::mem::replace(&mut inner.overflowed, false)
+        inner.rescanned_generation = inner.rescanned_generation.max(ticket.0);
+        inner.overflow_generation <= inner.rescanned_generation
     }
 
     /// Counters since construction.
@@ -286,13 +375,100 @@ mod tests {
         assert!(queue.push(path("b.md")));
         assert!(!queue.push(path("c.md")), "accepted past capacity");
 
-        assert!(queue.take_overflowed(), "overflow was not reported");
-        assert!(!queue.take_overflowed(), "overflow did not clear");
+        let ticket = queue.rescan_needed().expect("overflow was not reported");
+        assert!(
+            queue.rescan_needed().is_some(),
+            "peeking cleared the latch; it must survive until a rescan completes"
+        );
+        assert!(queue.rescan_completed(ticket), "the latch did not clear");
+        assert!(queue.rescan_needed().is_none());
         assert_eq!(queue.stats().overflowed, 1);
 
         // The queue keeps working; it is the dropped path that needs the rescan.
         assert_eq!(queue.pop(), Some(path("a.md")));
         assert!(queue.push(path("c.md")));
+    }
+
+    #[test]
+    fn a_rescan_does_not_clear_a_latch_it_did_not_earn() {
+        // S7. If paths were dropped while the rescan was running, that rescan cannot
+        // have seen them, so the latch stays set and another is owed. Clearing on read
+        // would have lost the second overflow entirely.
+        let queue = WorkQueue::with_capacity(1);
+        queue.push(path("a.md"));
+        assert!(!queue.push(path("b.md")));
+        let ticket = queue.rescan_needed().expect("first overflow");
+
+        // ... rescan starts ... and another overflow happens while it runs.
+        assert!(!queue.push(path("c.md")));
+
+        assert!(
+            !queue.rescan_completed(ticket),
+            "a rescan cleared a latch raised after it started"
+        );
+        assert!(
+            queue.rescan_needed().is_some(),
+            "the second overflow was lost"
+        );
+    }
+
+    #[test]
+    fn overflow_recovery_converges_on_a_vault_larger_than_the_queue() {
+        // BLOCKING 1 from the I2 review, as a test. The queue holds 8,192 and the P0
+        // vault has 20,200 files; walk() returns them sorted and this queue is FIFO,
+        // so a rescan that pushed with the dropping producer re-pushed the same sorted
+        // prefix, the same paths won the slots, and 12,008 files never once reached
+        // the consumer. The recovery re-entered the failure.
+        //
+        // With the bulk producer waiting for space instead, every path arrives.
+        let queue = Arc::new(WorkQueue::with_capacity(8_192));
+        let paths: Vec<VaultPath> = (0..20_200)
+            .map(|i| path(&format!("10-projects/note-{i:05}.md")))
+            .collect();
+
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while let Some(path) = queue.pop() {
+                    seen.push(path);
+                }
+                seen
+            })
+        };
+
+        for path in &paths {
+            queue.push_blocking(path.clone());
+        }
+        queue.close();
+
+        let seen = consumer.join().expect("consumer");
+        assert_eq!(seen.len(), paths.len(), "the walk lost paths");
+        assert_eq!(seen, paths, "and it lost their order");
+        assert_eq!(
+            queue.stats().overflowed,
+            0,
+            "a blocking producer overflowed"
+        );
+        assert!(queue.rescan_needed().is_none());
+    }
+
+    #[test]
+    fn the_watcher_still_drops_rather_than_blocking() {
+        // The other half of the ruling: push (the watcher's door) must never wait, or
+        // the coalescer stops draining the OS event buffer and the platform loses
+        // events without telling anyone.
+        let queue = WorkQueue::with_capacity(2);
+        queue.push(path("a.md"));
+        queue.push(path("b.md"));
+
+        let started = std::time::Instant::now();
+        assert!(!queue.push(path("c.md")), "push waited for space");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "push blocked; it must refuse instead"
+        );
+        assert!(queue.rescan_needed().is_some());
     }
 
     #[test]
