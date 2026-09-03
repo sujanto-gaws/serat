@@ -13,6 +13,11 @@
 //! 39.4 MiB off disk dominates" are indistinguishable in one figure and imply
 //! completely different fixes.
 //!
+//! `write` is split into row insert and FTS build on the architect's evidence:
+//! 3.7 s of bulk insert against 1.9 s of `blocks_fts` build at 259,971 blocks,
+//! and 6x worse again with the FTS triggers left live. Reported as one figure
+//! those are indistinguishable, and again the fixes differ.
+//!
 //! ```text
 //! cargo run --release -p budget --bin prf04-full-rebuild -- --profile reference
 //! ```
@@ -68,6 +73,7 @@ fn median_phases(runs: &[RebuildTiming]) -> RebuildPhases {
         walk: median(runs.iter().map(|r| r.phases.walk).collect()),
         read_hash: median(runs.iter().map(|r| r.phases.read_hash).collect()),
         parse: median(runs.iter().map(|r| r.phases.parse).collect()),
-        write: median(runs.iter().map(|r| r.phases.write).collect()),
+        write_rows: median(runs.iter().map(|r| r.phases.write_rows).collect()),
+        write_fts: median(runs.iter().map(|r| r.phases.write_fts).collect()),
     }
 }

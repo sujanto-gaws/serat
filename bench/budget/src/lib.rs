@@ -20,6 +20,7 @@
 
 pub mod env;
 pub mod subject;
+pub mod trace;
 
 use env::Environment;
 
@@ -180,6 +181,36 @@ pub const PRF04_FULL_REBUILD: Budget = Budget {
     vault: "20k",
     interval: "entry to rebuild() until it returns, writer drained and ANALYZE run",
 };
+
+/// The share by which the window-painted mark may grow between the 20k and the
+/// 50k vault before the critical path is judged to depend on vault size.
+///
+/// Architecture §3.4's load-bearing property is that **nothing on the critical
+/// path is proportional to vault size**: the main thread never opens the index,
+/// and the file tree renders from a query rather than from the walk. If that
+/// were false, 2.5x the notes would show up as roughly 2.5x the time. 20% sits
+/// far below that and comfortably above run-to-run noise, so the check fails on
+/// the thing it is for and not on a warm afternoon.
+///
+/// This is the assertion that makes §3.4 a claim rather than an intention, and
+/// it is the reason the cold-start job runs against two vaults.
+pub const SCALE_TOLERANCE: f64 = 0.20;
+
+/// Judge whether the critical path grew with vault size.
+///
+/// # Errors
+/// A sentence naming both figures when it did.
+pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), String> {
+    let ceiling = small_ms * (1.0 + SCALE_TOLERANCE);
+    if large_ms <= ceiling {
+        return Ok(());
+    }
+    Err(format!(
+        "window painted at 50,000 notes is {large_ms:.1} ms against {small_ms:.1} ms at 20,000          — {:.0}% growth, over the {:.0}% tolerance. Architecture §3.4 says nothing on the          critical path is proportional to vault size; something on it now is.",
+        (large_ms / small_ms - 1.0) * 100.0,
+        SCALE_TOLERANCE * 100.0
+    ))
+}
 
 /// Every P0 budget, so a CI configuration review (NFR-PRF-08's acceptance
 /// criterion is `Inspect`) can check the list against the PRD rather than
@@ -369,15 +400,17 @@ impl Outcome {
             let share = |d: std::time::Duration| ms(d) / total * 100.0;
             let _ = writeln!(
                 s,
-                "  phases      walk {:.0} ms ({:.0}%) · read+hash {:.0} ms ({:.0}%) · parse {:.0} ms ({:.0}%) · write {:.0} ms ({:.0}%)",
+                "  phases      walk {:.0} ms ({:.0}%) · read+hash {:.0} ms ({:.0}%) · parse {:.0} ms ({:.0}%) · write rows {:.0} ms ({:.0}%) · write fts {:.0} ms ({:.0}%)",
                 ms(p.walk),
                 share(p.walk),
                 ms(p.read_hash),
                 share(p.read_hash),
                 ms(p.parse),
                 share(p.parse),
-                ms(p.write),
-                share(p.write)
+                ms(p.write_rows),
+                share(p.write_rows),
+                ms(p.write_fts),
+                share(p.write_fts)
             );
             let _ = writeln!(
                 s,
@@ -445,7 +478,8 @@ impl Outcome {
             let _ = writeln!(s, "    \"walk\": {:.3},", ms(p.walk));
             let _ = writeln!(s, "    \"read_hash\": {:.3},", ms(p.read_hash));
             let _ = writeln!(s, "    \"parse\": {:.3},", ms(p.parse));
-            let _ = writeln!(s, "    \"write\": {:.3}", ms(p.write));
+            let _ = writeln!(s, "    \"write_rows\": {:.3},", ms(p.write_rows));
+            let _ = writeln!(s, "    \"write_fts\": {:.3}", ms(p.write_fts));
             let _ = writeln!(s, "  }},");
         }
         let _ = write!(s, "  \"samples_ms\": [");
@@ -798,6 +832,23 @@ mod tests {
                 b.id
             );
         }
+    }
+
+    #[test]
+    fn a_critical_path_that_grows_with_the_vault_is_caught() {
+        // Architecture §3.4's load-bearing property, as a test. If the main
+        // thread ever opened the index, or the tree rendered from the walk,
+        // 2.5x the notes would show up here.
+        assert!(assert_scale_independent(300.0, 300.0).is_ok());
+        assert!(
+            assert_scale_independent(300.0, 360.0).is_ok(),
+            "exactly at tolerance"
+        );
+        let err = assert_scale_independent(300.0, 361.0).expect_err("over tolerance");
+        assert!(err.contains("proportional to vault size"), "{err}");
+        // The shape a proportional path would actually produce.
+        let err = assert_scale_independent(300.0, 750.0).expect_err("2.5x must fail");
+        assert!(err.contains("150%"), "{err}");
     }
 
     #[test]

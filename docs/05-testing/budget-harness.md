@@ -52,14 +52,14 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 
 | Budget | Interval |
 |---|---|
-| NFR-PRF-01 window visible | process spawn to the first painted frame |
-| NFR-PRF-01 vault usable | process spawn to the vault-usable mark, as task D2 defines it |
+| NFR-PRF-01 window visible | process spawn to the first **composited frame** of the shell (architecture §3.4 row 1) |
+| NFR-PRF-01 vault usable | process spawn to the file tree rendered and the last-open buffer accepting keystrokes (§3.4 row 2) |
 | NFR-PRF-03 | watcher event dequeued to the row being visible to a reader |
 | NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
 
 **F-10 and NFR-PRF-04: the aggregate is asserted, the breakdown is recorded.** NFR-PRF-04 is a wall-clock requirement and the budget still asserts one number. But one number cannot answer architecture.md's **open design question 1** — *does the parse pool or the index writer dominate rebuild time?* — and §1.2 says the parse pool exists precisely because that assumption is unmeasured. Reported as a single figure, "the index writer dominates" and "reading 39.4 MiB off disk dominates" are indistinguishable, and they imply completely different fixes.
 
-So the job records four phases beside the total — **walk, read+hash, parse, write** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
+So the job records five phases beside the total — **walk, read+hash, parse, write rows, write FTS** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. `write` is split on the architect's evidence: 3.7 s of bulk row insert against 1.9 s of `blocks_fts` build at 259,971 blocks, and with the FTS triggers left live the same shape cost 2.1-10.3 s at 26,000 blocks against 0.32 s dropped, and had not finished after 25 minutes at 260,000. Reported as one figure those are indistinguishable and the fixes differ, which is the same argument as F-10 itself, one level down. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
 
 The phases are allowed to sum to *less* than the wall clock. That is concurrency between the parse pool and the writer, not an error, and the report says so rather than leaving a reader to wonder — a sum that exceeded the total would be the thing worth investigating.
 
@@ -73,6 +73,27 @@ When T2 reports, this breakdown is not decoration. It is the evidence that close
 The job measures **both** and asserts the pipeline interval, printing the end-to-end figure beside it as `F-03 … reported, not asserted`. That way the gate report states which number the 50 ms claim rests on instead of implying there was only ever one, and if the architect rules the other way the assertion moves one line. The seam asks I5 for a dequeue timestamp for exactly this reason.
 
 This is a measurement decision, not a ruling: F-03 is the architect's to close and product-analyst's to re-baseline at Q1.
+
+### Cold start: four ways a trace is refused
+
+D2 has landed, so NFR-PRF-01 is measurable. The app writes one line of JSON to `SERAT_STARTUP_TRACE` and exits; the harness stamps t0 immediately before `spawn()` and passes it in as `SERAT_STARTUP_T0_UNIX_NANOS`, so everything before `main` — loader, DLLs, webview init — is inside the number rather than outside it.
+
+`budget::trace` refuses a trace rather than turning it into a number when:
+
+1. **`t0_source` is not `harness`.** The app falls back to an `Instant` inside `main` when the variable is absent, and says so. That figure undercounts pre-main; it is a different measurement, not a slightly worse one.
+2. **`profile` is not `release`.** A budget measured in a debug build is not a measurement. The mark is emitted in both builds so it is exercised locally; only the recording is refused.
+3. **The marks are out of order.** `main` ≤ `window_created` ≤ `window_visible` ≤ `vault_usable`. Out of order means the wall clock moved under the run, and a sample that survived a clock step is not a sample.
+4. **`window_visible - window_created < 5 ms`.** This is the blank-rectangle check. §3.4 measures the *painted shell*, not window creation, and the two differ by the cost of loading and compositing the webview bundle — far more than 5 ms. A paint mark rewired to fire at window creation collapses that gap to about zero, passes 400 ms, and ships a blank rectangle. The threshold is a mutation detector, not a performance floor; tauri-app-dev asked the harness to own it, and if it ever fires on an honest run that is a more interesting result than the job passing.
+
+The app has no Rust-side path that stamps the paint mark — it comes only from a double `requestAnimationFrame` after the shell's first render — so a shell that paints nothing never marks, the run times out, and the job goes red. There is no fast path for a blank rectangle.
+
+**Two honesty notes for the gate report**, from tauri-app-dev: until S2 lands the webview is a placeholder page rather than the Vue app, so the P0 figure is the shell's cold start with a trivial front end and S2 will move it; and `--exit-after-ready` exits after the usable mark, so every iteration is genuinely cold.
+
+### Scale independence: §3.4's load-bearing claim, as a test
+
+Architecture §3.4 states that **nothing on the critical path is proportional to vault size** — the main thread never opens the index, and the file tree renders from one query over `notes(path)` rather than from the walk. That is a claim, so it gets a test rather than a paragraph.
+
+`prf01-cold-start` runs the same measurement against the 20k and the 50k vault and asserts the window-painted p95 did not grow by more than **20%**. If the critical path were proportional to vault size, 2.5x the notes would show up as roughly 2.5x the time; 20% sits far below that and comfortably above run-to-run noise, so the check fails on the thing it is for and not on a warm afternoon. `--skip-scale` omits it for a quick local run.
 
 ### p95 is nearest-rank
 
@@ -126,7 +147,9 @@ The entry points the harness is waiting on:
 | NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change — **and** the moment the watcher event left the queue, so F-03's two intervals can be reported separately | task I5, `serat-index` / `serat-vault` |
 | NFR-PRF-01 | `SERAT_STARTUP_TRACE=<file>` writing `{"t0_to_window_visible_ms":…, "t0_to_vault_usable_ms":…}` and exiting; t0 is process spawn measured by the harness, not an `Instant::now()` inside `main` | task D2 (definition), task S1 (`serat-app`) |
 
-**NFR-PRF-01 is blocked on D2, not on effort.** The architect has been asked to define t0, "window visible" (first painted frame, not window creation — measuring window creation would pass 400 ms and ship a blank rectangle) and "vault usable", plus which integrity check runs on the warm start path, since whatever it is sits inside the 1 s budget. The harness measures what D2 defines and does not guess.
+**NFR-PRF-01 is no longer blocked on definition, only on S1.** D2 answered all three marks, and the warm-start integrity check is the stamp — `user_version`, `index_meta`, `count(*) notes` — measured at **2.4 ms** against 1150 ms for `quick_check` and 1310 ms for `integrity_check`, so it fits inside the budget with three orders of magnitude to spare. `quick_check` runs in the background only when a `-wal` file at open says the previous session ended badly.
+
+Explicitly **off** the critical path, so a job that waits for them is measuring NFR-PRF-04 with extra steps: the catch-up walk, `ANALYZE`, the FTS integrity check, `quick_check`, extraction and embedding. The cold-start job stops at the usable mark and does not wait for indexing to finish.
 
 ## Why the harness may link the product
 
@@ -149,4 +172,9 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-040 | NFR-PRF-04 — a scanner-disabled Windows run is not gate eligible | `bench/budget/src/env.rs::a_scanner_disabled_windows_run_is_not_gate_eligible` | pass |
 | TC-041 | NFR-PRF-01/03/04 — the measurement environment is detected and recorded | `bench/budget/src/env.rs::detection_reports_something_about_this_machine` | pass |
 | TC-042 | F-03 — every budget declares the interval it times | `bench/budget/src/lib.rs::every_p0_budget_matches_the_number_in_the_prd` | pass |
-| TC-043 | F-10 — the rebuild seam asks for the four phases and they sum coherently | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
+| TC-043 | F-10 — the rebuild seam asks for the phases and they sum coherently | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
+| TC-044 | NFR-PRF-01 — a trace that undercounts pre-`main` time is refused | `bench/budget/src/trace.rs::a_trace_that_undercounts_pre_main_is_refused` | pass |
+| TC-045 | NFR-PRF-01 — a debug build cannot produce a budget number | `…::a_debug_build_cannot_produce_a_budget_number` | pass |
+| TC-046 | NFR-PRF-01 — a paint mark wired to window creation is caught | `…::a_paint_mark_wired_to_window_creation_is_caught` | pass |
+| TC-047 | NFR-PRF-01 — marks out of order mean the clock moved, and the sample is refused | `…::marks_out_of_order_mean_the_clock_moved` | pass |
+| TC-048 | NFR-PRF-01, arch §3.4 — a critical path that grows with the vault is caught | `bench/budget/src/lib.rs::a_critical_path_that_grows_with_the_vault_is_caught` | pass |

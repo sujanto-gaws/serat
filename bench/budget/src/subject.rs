@@ -13,10 +13,12 @@
 //! request to `rust-core-dev` — anything that satisfies them satisfies the
 //! harness.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::Samples;
+use crate::trace::StartupTrace;
 
 /// How a rebuild's cost splits. P0 finding **F-10**.
 ///
@@ -38,8 +40,17 @@ pub struct RebuildPhases {
     pub read_hash: Duration,
     /// Markdown to blocks, fields, links, tasks, on the rayon pool.
     pub parse: Duration,
-    /// Everything the single-writer actor did, including the final ANALYZE.
-    pub write: Duration,
+    /// Inserting rows, with the FTS triggers dropped. Architect measured 3.7 s
+    /// for 259,971 blocks.
+    pub write_rows: Duration,
+    /// Building `blocks_fts` afterwards with the FTS5 `rebuild` command, plus
+    /// the final ANALYZE. Architect measured 1.9 s for the same shape.
+    ///
+    /// Split from `write_rows` because the two have different fixes and
+    /// reporting them together hides a 6x: with the triggers left live, the same
+    /// insert cost 2.1-10.3 s at 26,000 blocks against 0.32 s with them dropped,
+    /// and at 260,000 blocks it had not finished after 25 minutes.
+    pub write_fts: Duration,
 }
 
 impl RebuildPhases {
@@ -47,7 +58,13 @@ impl RebuildPhases {
     /// so: phases overlap when the parse pool and the writer run concurrently,
     /// and a sum that exceeded the total would be the first evidence of that.
     pub fn sum(&self) -> Duration {
-        self.walk + self.read_hash + self.parse + self.write
+        self.walk + self.read_hash + self.parse + self.write_rows + self.write_fts
+    }
+
+    /// Row insert and FTS build together, for a reader who wants the old
+    /// four-phase shape.
+    pub fn write(&self) -> Duration {
+        self.write_rows + self.write_fts
     }
 }
 
@@ -80,9 +97,13 @@ pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task 
 
     pub struct RebuildReport {
         pub notes: usize, pub blocks: usize, pub links: usize, // ...
-        // F-10: the four phases, so open design question 1 can be answered.
-        pub walk: Duration, pub read_hash: Duration,
-        pub parse: Duration, pub write: Duration,
+        // F-10: the phases, so open design question 1 can be answered.
+        // write is split because architect measured the FTS build as a
+        // separate cost with a separate fix -- 3.7 s of row insert against
+        // 1.9 s of FTS build at 259,971 blocks, and 6x worse with the
+        // triggers left live.
+        pub walk: Duration, pub read_hash: Duration, pub parse: Duration,
+        pub write_rows: Duration, pub write_fts: Duration,
     }
 
 Call site:
@@ -97,8 +118,8 @@ monotonic clock, does not time the vault generation, and asserts the returned
 note count against the vault manifest -- a rebuild that indexed half the vault
 quickly is the failure a wall-clock number cannot see on its own.
 
-The four phase durations are the whole content of open design question 1. The
-budget still asserts the total; the phases are recorded beside it.";
+The phase durations are the whole content of open design question 1. The budget
+still asserts the total; the phases are recorded beside it.";
 
 /// Two intervals, because P0 finding F-03 showed that "save to index" has two
 /// defensible readings that differ by more than the budget itself.
@@ -208,17 +229,93 @@ pub fn save_to_index(
     ))
 }
 
+/// Locate the application binary the cold-start job drives.
+///
+/// `SERAT_BIN` overrides; otherwise the release build beside this crate's
+/// target directory. Returns an error naming task S1 rather than a path that
+/// does not exist, because "file not found" is not a useful CI log line.
+///
+/// # Errors
+/// When the binary is absent.
+pub fn app_binary() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("SERAT_BIN") {
+        let path = PathBuf::from(explicit);
+        return if path.exists() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "SERAT_BIN points at {}, which does not exist",
+                path.display()
+            ))
+        };
+    }
+    let name = if cfg!(windows) { "serat.exe" } else { "serat" };
+    let candidate = crate::repo_root().join("target/release").join(name);
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        Err(format!(
+            "there is no application to start yet -- tasks D2 and S1. Looked for {}.
+
+{}",
+            candidate.display(),
+            COLD_START_ENTRY_POINT
+        ))
+    }
+}
+
 /// Run `iterations` cold starts, returning the window-visible and vault-usable
 /// timelines.
 ///
+/// Each iteration is a fresh process. t0 is stamped immediately before
+/// `spawn()` and handed to the app, so everything before `main` is inside the
+/// number; every trace is validated before it becomes a sample.
+///
 /// # Errors
-/// Today: always, because neither the app nor D2's definition of the marks
-/// exists.
+/// When the application does not exist, when a run fails or times out, or when
+/// a trace is rejected by any of the checks in [`crate::trace`].
 pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
-    let _ = (vault, iterations);
-    Err(format!(
-        "there is no application to start yet — tasks D2 and S1.\n\n{COLD_START_ENTRY_POINT}"
-    ))
+    let binary = app_binary()?;
+    let mut visible = Samples::new();
+    let mut usable = Samples::new();
+
+    for run in 0..iterations {
+        let trace_path =
+            std::env::temp_dir().join(format!("serat-startup-{}-{run}.json", std::process::id()));
+        let _ = std::fs::remove_file(&trace_path);
+
+        // t0: the instant the harness asked the OS for a process. Everything
+        // before main -- loader, DLLs, webview init -- is on the far side of
+        // this, which is the whole point of passing it in rather than letting
+        // the app take its own Instant.
+        let t0 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("the system clock is before the epoch: {e}"))?
+            .as_nanos();
+
+        let status = Command::new(&binary)
+            .arg("--vault")
+            .arg(vault)
+            .arg("--exit-after-ready")
+            .env("SERAT_STARTUP_TRACE", &trace_path)
+            .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string())
+            .status()
+            .map_err(|e| format!("spawning {}: {e}", binary.display()))?;
+        if !status.success() {
+            return Err(format!(
+                "run {run} exited with {status}. If it reports no first-paint mark, the shell                  painted nothing -- which is a red job rather than a fast one, by design."
+            ));
+        }
+
+        let line = std::fs::read_to_string(&trace_path)
+            .map_err(|e| format!("reading {}: {e}", trace_path.display()))?;
+        let trace = StartupTrace::parse(line.trim()).map_err(|e| format!("run {run}: {e}"))?;
+        let _ = std::fs::remove_file(&trace_path);
+
+        visible.push(trace.window_visible());
+        usable.push(trace.vault_usable());
+    }
+    Ok((visible, usable))
 }
 
 #[cfg(test)]
@@ -246,15 +343,17 @@ mod tests {
             walk: Duration::from_millis(100),
             read_hash: Duration::from_millis(200),
             parse: Duration::from_millis(300),
-            write: Duration::from_millis(400),
+            write_rows: Duration::from_millis(370),
+            write_fts: Duration::from_millis(190),
         };
-        assert_eq!(phases.sum(), Duration::from_millis(1_000));
+        assert_eq!(phases.sum(), Duration::from_millis(1_160));
+        assert_eq!(phases.write(), Duration::from_millis(560));
 
         let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
         assert!(e.contains("task I5"), "{e}");
 
         let e = cold_start(vault, 20).expect_err("must not silently pass");
-        assert!(e.contains("D2"), "{e}");
+        assert!(e.contains("S1"), "{e}");
         assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
     }
 }
