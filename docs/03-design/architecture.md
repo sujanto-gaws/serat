@@ -133,7 +133,35 @@ The pipeline that turns filesystem events into index rows. Its design constraint
 
 Fig. 2 — The indexing pipeline. Backpressure lives in the bounded, path-deduplicating work queue; the hash check discards most events before any parsing happens. Nothing here sits on the keystroke path.
 
-#### 3.1 From event to row
+#### 3.1 Two paths into the index, and two budgets
+
+There are two ways a note reaches the index, and conflating them is what made NFR-PRF-03 look unsatisfiable.
+
+| Path                      | Trigger                                       | Budget                                   | Debounced?                       |
+|---------------------------|-----------------------------------------------|------------------------------------------|----------------------------------|
+| Save path (§3.1.1)        | Serat writes a file the user is editing.      | 50ms p95 — NFR-PRF-03                  | No. The watcher is not involved. |
+| Watcher path (§3.1.2)     | Any other process writes a file in the vault. | 500ms — FR-VLT-04's acceptance criterion | Yes, 150ms coalescing.         |
+
+Finding F-03 read the 150ms coalescing window as a design that misses a 50ms budget by construction, and the arithmetic was right: 150 > 50. The mistake was in taking both requirements to describe one path. They do not, and they never conflicted — FR-VLT-04, the requirement that actually governs an external change, allows 500ms precisely because it has a debounce to absorb.
+
+Found by reading the design against itself
+
+The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself. F-03 did not find a missing 100ms; it found a missing paragraph.
+
+##### 3.1.1 The save path
+
+Serat knows what it wrote, so it does not wait to be told.
+
+1.  The buffer is written by temp-file-and-rename (§6.1 step 5), recording the hash it is about to produce for echo suppression **before** the rename.
+2.  The bytes just written — the ones already in memory, not a re-read of the file — go to the parse pool.
+3.  The rows go to the index writer on the same channel everything else uses.
+4.  `index.changed` is emitted and open views refresh.
+
+The watcher sees the event and drops it (§3.2), which is the whole of the interaction between the two paths. Nothing is coalesced because there is nothing to coalesce: one save is one write is one set of rows.
+
+Two consequences, stated because each looks like a bug otherwise. If another process modifies the file between our write and our parse, the index briefly reflects our bytes rather than the file's; the watcher then sees an event whose post-hash is *not* in the suppression set and the note is reindexed from disk, so the race is self-correcting and needs no mechanism of its own. And the save path must never call `flush()`: waiting for the writer to drain would put the index back on the keystroke path, which design goal 2 forbids. The UI reports "saved" when the rename completes and learns "indexed" from `index.changed`. Those are two different facts and the interface should not pretend otherwise (§2.2).
+
+##### 3.1.2 The watcher path
 
 1.  The watcher coalesces events per path over a 150ms window. Editors that save via temp-and-rename emit several events per save; they collapse to one.
 2.  The work queue deduplicates by path and is bounded. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses.
@@ -177,6 +205,22 @@ Two ordering rules that are correctness, not optimisation:
 
 Deferred deliberately, because none of it is needed to type: the catch-up scan, `ANALYZE`, the FTS integrity check, `quick_check`, extraction and the embedding model, which is never loaded at start.
 
+##### The three marks, defined so they can be measured
+
+A budget that is not defined as two observable events is a number that flatters whoever reports it. NFR-PRF-01 is therefore three marks on one timeline.
+
+| Mark        | Definition                                                                                                                                                  | Why not the cheaper thing                                                                                                                                        |
+|-------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `t0`        | Process spawn, taken by the harness from outside the process.                                                                                                | Not `Instant::now()` in `main`. The loader, the DLLs and the webview runtime are real cost the user waits through, and a t0 inside `main` hides exactly the part we do not control. The app also records its own `main` entry, so the pre-`main` gap is visible rather than absorbed. |
+| `t_visible` | The first frame the webview actually paints, signalled by the front end from the first `requestAnimationFrame` after the shell mounts.                        | Not window creation. Window creation is much cheaper and would pass 400ms while shipping a blank rectangle. This is test-engineer's trap and they are right about it.                                                                                                              |
+| `t_usable`  | All three of: the open check has finished, so the index state is known; the file tree has been delivered to the front end; and the watcher is registered. | Not "the index is open". A vault that is usable but unwatched silently misses every edit made in that window, which is a correctness bug dressed as a faster number.                                                                                                              |
+
+The watcher clause is load-bearing and is why it is in the definition rather than in a note. It also fixes an ordering: the watcher is registered before the walk, so nothing that changes during startup is lost.
+
+`t_usable` as defined is the warm-index case NFR-PRF-01 names. With no index the file tree comes from the streaming walk instead, and that case is bounded by FR-VLT-01's own two-second criterion, not by this one — a cold vault and a warm vault are different measurements and the gate report must not average them.
+
+The mechanism is one environment variable, so the harness measures the application rather than itself: with `SERAT_STARTUP_BENCH=<file>` set, `serat-app` writes one line of JSON — `t0_to_main_ms`, `t0_to_visible_ms`, `t0_to_usable_ms` and the index state at `t_usable` — and exits. It exits because a harness that has to kill the process adds its own timing noise to the number it is trying to measure. The same marks are available in a normal session through `IndexStatus.since_process_start_ms` in `contracts/ipc.rs`; the trace file and the IPC field read the same clock, so the benchmark and the application can never disagree about what happened.
+
 ##### Validating the index on open
 
 Four candidates, measured against the schema on a 20,000-note fixture (259,971 blocks, 41,647 fields, 90,744 links; `index.db` 124.2MB), warm OS cache, SQLite 3.50.4:
@@ -218,6 +262,18 @@ A rebuild is a status line, not a modal and not an error: *"Rebuilding index —
 A rebuild is never retried in a loop. If a rebuild fails to complete twice in one session the state becomes `IndexState::Unavailable` with the path and the operating-system error, and the application runs on as an editor with no search — for the same reason a malformed binary is never re-extracted automatically (§7.1). An indexer that spins forever is worse than an index that is missing, and the vault is unharmed either way.
 
 The states and reasons in this section are the enum the front end renders; they are defined once, in `contracts/ipc.rs`, as `IndexState` and `RebuildReason`.
+
+##### Three things this path deliberately does not depend on
+
+**Per-file work.** Nothing on the critical path opens, stats or hashes a note. This matters more than it reads: the reference machine measures with Windows Defender real-time protection disabled, so every per-file operation is cheaper there than on a stock machine, and a startup path that touched 20,000 files would pass the gate and fail the user. The design's answer is not that per-file work is fast; it is that there is none. The walk, which does touch every file, is after `t_usable` on the warm path.
+
+**Git.** Whether the vault is a git repository is the user's business and not ours. `.serat/` is ignored by C-02 and NFR-CMP-03, the recovery journal is a directory of files rather than a commit, and no part of the cold-start path or the index-open check looks for a repository. A vault under git, under Syncthing, or under nothing at all takes the same path.
+
+**An FTS index that is present and valid.** The open check does not touch `blocks_fts` — an FTS integrity check costs 390ms, which is most of the window budget, and rebuilding the whole index because the search index is stale would be a disproportionate response to a recoverable state. Full-text search degrades to unavailable and the FTS index is rebuilt in the background; the vault stays usable meanwhile, which is design goal 5.
+
+##### Why no ADR
+
+Recorded because an absent ADR should read as a judgement rather than an oversight. An ADR is for a decision that is expensive to reverse. Reversing "check cheaply at open, thoroughly in the background" means adding one call at one site, and nothing is built on top of it. Deferring the index off the main thread is not a new decision at all — it is ADR-01's actor. And `index_meta` is a table, so under ADR-02 changing a column costs a rebuild, which is the sanctioned move rather than a cost. Nothing here has the property that makes an ADR worth its weight.
 
 > The costs above were measured on a development machine, not on the reference machine, and through a Python harness rather than the real pipeline. They are three orders of magnitude apart, so the decision is safe; the numbers that go into the baseline are T2's, on the benchmark vault.
 
