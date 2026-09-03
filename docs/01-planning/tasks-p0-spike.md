@@ -12,7 +12,7 @@ owner: lead
 **Stories:** US-35 (primary), US-01, US-07. **ADRs:** 0001, 0002, 0003, 0006, 0007.
 **Also settled by P0:** assumption A-06, architecture §1.2, open design question 1 (parse pool vs index writer), RISK-002.
 
-No git repository exists yet, so tasks cite **artifact paths**, not branches. Status is maintained by the lead.
+Each teammate works in a git worktree under `.worktrees/<role>` and branches per task as `task/<id>-<slug>` from `main`; the lead merges after code-reviewer approval. See `docs/04-implementation/coding-standards.md`. Wave 1 (D1, B1, I1) was already in flight when the repository was created and lands directly on `main`. Status is maintained by the lead.
 
 | # | Subject | IDs / ADRs | Owner | Artifact | Depends on | Status |
 |---|---|---|---|---|---|---|
