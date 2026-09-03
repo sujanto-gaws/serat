@@ -225,17 +225,47 @@ fn nothing_in_the_product_depends_on_a_bench_crate() {
 }
 
 #[test]
-fn the_check_ignores_teammate_worktrees() {
-    // Every teammate's worktree under .worktrees/ holds a full copy of this
-    // workspace (coding-standards.md), so a checker that walked the tree would find
-    // six copies of every crate and report violations that do not exist. This one
-    // asks cargo instead, and the root manifest carries exclude = [".worktrees"];
-    // between them, no manifest inside a worktree is ever considered.
+fn no_worktree_copy_is_part_of_this_workspace() {
+    // F-28. The previous version of this test could not fail, and neither could the
+    // version before that: `members` is an explicit list with no globs, so
+    // `cargo metadata --no-deps` can never report a manifest under `.worktrees/`
+    // whether the exclude is there or not. code-reviewer proved it by putting a full
+    // workspace copy in a worktree, deleting the exclude, and watching the test pass.
     //
-    // The comparison is relative to the workspace root, not absolute: run from inside
-    // .worktrees/rust-core, every path in the workspace legitimately contains
-    // ".worktrees" and only a nested one is a problem.
+    // So this asserts the two properties that actually protect the invariant, against
+    // the manifest TEXT, where they can genuinely break:
+    //
+    //   1. `members` stays glob-free. A `crates/*` or `**` pattern is what would let
+    //      cargo discover a worktree copy, and it is the plausible future edit — it
+    //      looks tidier than a list.
+    //   2. `exclude = [".worktrees"]` is present, which is what stops cargo treating a
+    //      nested manifest as part of this workspace for the commands that do walk.
+    //
+    // Keeping the cargo-metadata check as well, because it is the one that would catch
+    // a worktree copy arriving by some route neither of us has thought of.
     let workspace = workspace();
+    let manifest_path = std::path::Path::new(&workspace.root).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
+
+    let members =
+        section(&manifest, "members = [").expect("the root manifest must list workspace members");
+    let globbed: Vec<&str> = members
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains('*'))
+        .collect();
+    assert!(
+        globbed.is_empty(),
+        "workspace.members contains a glob: {globbed:?}. Cargo expands globs by walking          the tree, which would discover every teammate's worktree copy as a member.          List members explicitly."
+    );
+
+    assert!(
+        manifest.contains(r#"exclude = [".worktrees"]"#),
+        "the root manifest no longer excludes .worktrees. Every teammate's worktree          holds a full copy of this workspace (coding-standards.md), and cargo commands          that walk the tree will treat those copies as nested packages."
+    );
+
+    // And the belt to that pair of braces: nothing cargo reports may live in one.
     let strays: Vec<String> = workspace
         .packages
         .iter()
@@ -247,13 +277,20 @@ fn the_check_ignores_teammate_worktrees() {
         })
         .map(ToOwned::to_owned)
         .collect();
-
     assert!(
         strays.is_empty(),
-        "the workspace has discovered crates inside .worktrees/. Check that the root \
-         Cargo.toml still carries exclude = [\".worktrees\"]. Found: {}",
+        "cargo reports workspace members inside .worktrees/: {}",
         strays.join(", ")
     );
+}
+
+/// The bracketed body following `header` in a manifest, for the crude text checks
+/// above. Not a TOML parser, and it does not need to be: it is looking for the
+/// presence of a character, not for structure.
+fn section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
+    let start = manifest.find(header)? + header.len();
+    let end = manifest[start..].find(']')? + start;
+    Some(&manifest[start..end])
 }
 
 #[test]

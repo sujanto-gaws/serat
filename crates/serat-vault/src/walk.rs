@@ -3,27 +3,9 @@
 use std::fs::{self, Metadata};
 use std::time::UNIX_EPOCH;
 
-use serat_core::{NoteKind, VaultError, VaultPath};
+use serat_core::{NoteKind, SourceEntry, VaultError, VaultPath};
 
 use crate::{Vault, ignore::is_note_file};
-
-/// One indexable file, as the walk found it.
-///
-/// No hash: hashing means reading every byte of every file, and the walk's job is to
-/// enumerate. The rebuild reads and hashes as it goes ([`Vault::read`]); the
-/// incremental path reads only what changed. Hashing here would make listing a vault
-/// as expensive as indexing it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VaultEntry {
-    /// Vault-relative path.
-    pub path: VaultPath,
-    /// Whether this file is parsed or extracted.
-    pub kind: NoteKind,
-    /// Size in bytes.
-    pub size: u64,
-    /// Modification time, milliseconds since the Unix epoch.
-    pub mtime_ms: i64,
-}
 
 /// Every indexable file under the vault root, sorted by path.
 ///
@@ -35,7 +17,7 @@ pub struct VaultEntry {
 /// Directory symlinks are not followed. A vault containing a link to its own parent
 /// would otherwise walk forever, and Serat indexes the folder the user pointed it at
 /// rather than everything reachable from it.
-pub(crate) fn walk(vault: &Vault) -> Result<Vec<VaultEntry>, VaultError> {
+pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
     let mut entries = Vec::new();
     let mut pending = vec![vault.root().to_path_buf()];
 
@@ -78,7 +60,7 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<VaultEntry>, VaultError> {
                 Ok(path) => path,
                 Err(_) => continue,
             };
-            entries.push(VaultEntry {
+            entries.push(SourceEntry {
                 kind: if is_note_file(&name) {
                     NoteKind::Note
                 } else {
@@ -111,7 +93,7 @@ pub(crate) fn mtime_ms(stat: &Metadata) -> i64 {
 
 /// Paths that exist on disk right now, as a set, for reconciling against the index.
 #[must_use]
-pub fn paths_of(entries: &[VaultEntry]) -> Vec<VaultPath> {
+pub fn paths_of(entries: &[SourceEntry]) -> Vec<VaultPath> {
     entries.iter().map(|entry| entry.path.clone()).collect()
 }
 

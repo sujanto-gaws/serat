@@ -126,3 +126,25 @@ pub struct LoadedNote {
     /// translation: the parser records byte offsets into this.
     pub bytes: Vec<u8>,
 }
+
+/// One indexable file, as a [`NoteSource`](crate::NoteSource) found it.
+///
+/// No hash: hashing means reading every byte, and enumerating a vault should not cost
+/// what indexing it does. The rebuild reads and hashes as it goes.
+///
+/// It carries `kind`, `size` and `mtime_ms` because the walk already had them —
+/// `read_dir` returns the metadata — and discarding them would make the rebuild
+/// re-derive the kind from the extension and re-stat 20,000 files it has already
+/// statted, inside a 30 s budget (F-29b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEntry {
+    /// Vault-relative path.
+    pub path: VaultPath,
+    /// Whether this file is parsed or extracted.
+    pub kind: NoteKind,
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time, milliseconds since the Unix epoch. For display and
+    /// ordering only — change detection is the hash gate's job.
+    pub mtime_ms: i64,
+}

@@ -37,29 +37,14 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use serat_core::{ContentHash, NoteKind, NoteMeta, VaultError, VaultPath};
+use serat_core::{ContentHash, LoadedNote, NoteKind, NoteMeta, VaultError, VaultPath};
 
 pub use echo::EchoSuppressor;
 pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
 pub use queue::{QueueStats, WorkQueue};
-pub use walk::VaultEntry;
-pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
-/// A file's bytes together with the identity of exactly those bytes.
-///
-/// The two travel together because a byte range is only meaningful against the bytes
-/// it was computed from. Handing a caller bytes without the hash is how a parse
-/// result ends up attributed to a file that has since changed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedFile {
-    /// Identity, hash and stat data.
-    pub meta: NoteMeta,
-    /// The bytes, exactly as they are on disk. No decoding, no line-ending
-    /// translation: the parser records byte offsets into this, and normalising here
-    /// would shift every one of them.
-    pub bytes: Vec<u8>,
-}
+pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
 /// An open vault: a root directory, and the rules for what inside it counts.
 #[derive(Debug, Clone)]
@@ -178,7 +163,7 @@ impl Vault {
     /// [`VaultError::Io`] if the root itself cannot be read. A directory that cannot
     /// be read part-way through is skipped rather than fatal: one unreadable folder
     /// must not stop a vault from indexing (design goal 5).
-    pub fn walk(&self) -> Result<Vec<VaultEntry>, VaultError> {
+    pub fn walk(&self) -> Result<Vec<serat_core::SourceEntry>, VaultError> {
         walk::walk(self)
     }
 
@@ -187,12 +172,12 @@ impl Vault {
     /// # Errors
     ///
     /// [`VaultError::NotFound`] if it is gone, [`VaultError::Io`] otherwise.
-    pub fn read(&self, path: &VaultPath) -> Result<LoadedFile, VaultError> {
+    pub fn read(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
         let absolute = self.resolve(path);
         let bytes = fs::read(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
         let stat = fs::metadata(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
 
-        Ok(LoadedFile {
+        Ok(LoadedNote {
             meta: NoteMeta {
                 hash: hash_bytes(&bytes),
                 kind: if is_note_file(path.file_name()) {
@@ -226,7 +211,7 @@ impl Vault {
         &self,
         path: &VaultPath,
         previous: Option<ContentHash>,
-    ) -> Result<Option<LoadedFile>, VaultError> {
+    ) -> Result<Option<LoadedNote>, VaultError> {
         let loaded = self.read(path)?;
         if Some(loaded.meta.hash) == previous {
             return Ok(None);
@@ -596,5 +581,64 @@ mod tests {
             vault.read(&path),
             Err(VaultError::NotFound { .. })
         ));
+    }
+}
+
+/// The vault, as the index sees it.
+///
+/// This is the seam architecture §2.1 prescribes: `serat-index` needs to walk and read
+/// in order to rebuild, and may not depend on this crate, so it takes a
+/// [`NoteSource`] and `serat-app` supplies the `Vault`. It is also what lets the
+/// rebuild be tested against a `Vec` with no filesystem in sight.
+impl serat_core::NoteSource for Vault {
+    fn entries(&self) -> Result<Vec<serat_core::SourceEntry>, VaultError> {
+        self.walk()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+        self.read(path)
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use serat_core::NoteSource as _;
+
+    #[test]
+    fn the_vault_satisfies_the_trait_the_index_rebuilds_through() {
+        // The seam, exercised rather than assumed. If this compiles and passes, a
+        // rebuild driven by serat-index over a real vault works without serat-index
+        // ever linking this crate.
+        let dir = tempfile::tempdir().expect("temp");
+        let vault = Vault::open(dir.path()).expect("open");
+        vault
+            .write_atomic(&VaultPath::new("a.md").expect("path"), b"# A\n")
+            .expect("write");
+        fs::write(dir.path().join("b.pdf"), b"%PDF binary").expect("write");
+
+        let entries = vault.entries().expect("entries");
+        assert_eq!(entries.len(), 2);
+
+        // F-29b: the entry carries what the walk already knew, so the rebuild does not
+        // re-stat every file to rediscover it.
+        let note = entries
+            .iter()
+            .find(|entry| entry.path.as_str() == "a.md")
+            .expect("note");
+        assert_eq!(note.kind, NoteKind::Note);
+        assert_eq!(note.size, 4);
+        assert!(note.mtime_ms > 0);
+
+        let asset = entries
+            .iter()
+            .find(|entry| entry.path.as_str() == "b.pdf")
+            .expect("asset");
+        assert_eq!(asset.kind, NoteKind::Asset);
+
+        let loaded = vault.load(&note.path).expect("load");
+        assert_eq!(loaded.bytes, b"# A\n");
+        assert_eq!(loaded.meta.kind, NoteKind::Note);
+        assert_eq!(loaded.meta.size, note.size);
     }
 }
