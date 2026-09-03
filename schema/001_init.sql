@@ -40,8 +40,15 @@
 -- writer and readers alike. They are repeated here so that the connection that
 -- loads this file behaves like the ones that follow it.
 --
---   foreign_keys = ON     -- OFF by default in SQLite. Without it every
---                            ON DELETE CASCADE below is decoration.
+--   foreign_keys = ON     -- Set it explicitly on every connection, and know
+--                            why: finding F-08 established that our vendored
+--                            SQLite is compiled with DEFAULT_FOREIGN_KEYS, so
+--                            cascade already fires without it. It is set anyway
+--                            because the stock default is OFF and depending on a
+--                            vendored build flag is precisely what changes
+--                            silently at a version bump. Without it every ON
+--                            DELETE CASCADE below is decoration, and blocks_fts
+--                            keeps hits for text that no longer exists.
 --   busy_timeout = 5000   -- readers never block the single writer under WAL
 --                            (ADR-0001), but the checkpointer can.
 
@@ -301,8 +308,30 @@ CREATE VIRTUAL TABLE blocks_fts USING fts5(
 -- so a delete command must replay the OLD text exactly as it was indexed. Get
 -- this wrong and the index rots silently — no error, just missing hits.
 --
+-- A FULL REBUILD MUST NOT LOAD THROUGH THESE TRIGGERS. Measured: 26,000 blocks
+-- took 2.1 s in one transaction and 6.8-10.3 s across several with the triggers
+-- live, against 0.32 s when they were dropped and blocks_fts was built once with
+-- the FTS5 'rebuild' command; the resulting search index is identical. The
+-- rebuild sequence in serat-index is therefore:
+--
+--   1. run this file
+--   2. SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='blocks'
+--      -- keep the strings, then DROP the three triggers
+--   3. bulk-load notes, blocks, fields, links, tasks in batched transactions
+--   4. INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild')
+--   5. re-execute the strings from step 2
+--   6. UPDATE index_meta ... state='ready'; ANALYZE; wal_checkpoint(TRUNCATE)
+--
+-- Step 2 reads the triggers out of the database rather than keeping a second
+-- copy of this DDL anywhere, so what is restored is identical to what was
+-- delivered by construction and not by a test that has to catch a stale copy.
+--
+-- The INCREMENTAL path keeps the triggers. One save is a dozen blocks, and at
+-- 100 blocks per transaction the trigger path cost 15 ms — inside NFR-PRF-03.
+--
 -- These fire on cascaded deletes as well as direct ones — verified by running
--- it on SQLite 3.42.0 and 3.50.4, with foreign_keys = ON and recursive_triggers
+-- it on SQLite 3.42.0 and 3.50.4 here and, per finding F-02, through rusqlite on
+-- the 3.53.2 the application actually links, with foreign_keys = ON and recursive_triggers
 -- left at its default of 0. That is what makes "delete the note, delete its
 -- blocks, delete its search rows" one DELETE FROM notes, and it is the reason
 -- foreign_keys = ON is not optional on any connection: with it off, the blocks
