@@ -11,7 +11,7 @@ derived_from: Serat Design Description 1.0 (design baseline, August 2026) — or
 
 How the 135 requirements are actually built: the crate graph, the indexing pipeline, the query compiler, the write-back patcher, the extraction sandbox and the ten decisions that would be expensive to reverse. The original document has six figures; they did not survive conversion to Markdown and are referenced below by figure number — open the HTML original to see them.
 
-> The design description names companion repo-ready files — `schema/001_init.sql`, `grammar/sq.ebnf`, `grammar/lowering.md`, `grammar/conformance.md`, `contracts/ipc.rs`, `contracts/extractor.rs`, `contracts/mcp-tools.json` — and states that where this document and those files disagree, the files are correct. Those files are **not yet in this repository**; producing them is the architect's first implementation-phase task.
+> The design description names companion repo-ready files — `schema/001_init.sql`, `grammar/sq.ebnf`, `grammar/lowering.md`, `grammar/conformance.md`, `contracts/ipc.rs`, `contracts/extractor.rs`, `contracts/mcp-tools.json` — and states that where this document and those files disagree, the files are correct. `schema/001_init.sql` exists as of P0 and is the correct copy of §4; §4 and §4.4 have been updated where writing and running it contradicted them. The rest arrive with the phase that needs them: `contracts/ipc.rs` in P0 as the four-command subset, the `grammar/` files in P2, `contracts/extractor.rs` in P2 and `contracts/mcp-tools.json` in P4.
 
 ## Context diagram
 
@@ -81,6 +81,10 @@ A shared connection behind a mutex has the same throughput and worse failure mod
 
 The full DDL is schema/001_init.sql and runs as delivered. This section records why it is shaped that way.
 
+The file in the repository is the P0 subset — notes, blocks, fields, links, tasks, the full-text index and the index's own stamp — and it names, in a header comment, the phase that adds each of the tables it omits: assets in P1, types in P2, chunks and the sqlite-vec table in P4. Under ADR-02 there is nothing to gain from stubbing them now, because the upgrade path for a schema change is `rm`.
+
+One table is in the DDL that is not in the requirements data dictionary. `index_meta` is a single row describing the index itself — schema version, indexer version, the vault root it was built from, a note count and whether the last build committed. It is what makes the open check of §3.4 cost two milliseconds instead of a second. Every column of it describes the index rather than the vault and is re-derived by a rebuild, so it does not breach C-02; nothing about the user's notes may ever be added to it. The data dictionary also names the full-text table `notes_fts`, which the DDL does not have: it is `blocks_fts`, over blocks, per §4.4 — a note-level FTS table cannot answer "which block" and so cannot serve a citation or a locator.
+
 ### 4.1 Block granularity is the pivotal decision
 
 Serat indexes at block level rather than note level. One table of blocks, each anchored either by a byte range in a Markdown file or by a locator inside a binary, is what makes block references, precise AI citations, writable views and binary extraction all fall out of the same structure. Every one of those features would need its own machinery under note-level indexing; under block-level indexing they need none.
@@ -103,12 +107,21 @@ Executing the reference query against a fresh database showed the planner choosi
 
 | Index                               | Serves                                                    | Note                                                          |
 |-------------------------------------|-----------------------------------------------------------|---------------------------------------------------------------|
-| ix_notes_type                       | Every typed query's outer scan                            | Requires statistics to be chosen; see above.                  |
+| ix_notes_type                       | Every typed query's outer scan                            | Partial on type IS NOT NULL, and requires statistics; see above and below. |
+| ix_notes_kind                       | Listing assets; separating notes from assets              | The index the planner wrongly preferred before ANALYZE existed. |
 | ix_fields_note_key                  | The pivot join, one per referenced field key              | Becomes a covering index for the common projection.           |
 | ix_fields_key_date / \_num / \_text | Range and equality predicates on a field across the vault | Partial indexes — only rows where that column is non-null.    |
 | ix_links_src / ix_links_dst         | Rollups and the backlinks pane                            | Backlinks read dst; rollups read src.                         |
 | ix_tasks_open                       | Every open-task query                                     | Partial on done = 0, which is the only side anyone queries.   |
 | blocks_fts (external content)       | Full-text over notes and extracted binaries alike         | Triggers keep it in step; verified including the delete path. |
+
+Two of these were changed by writing the DDL and running it, and the file is now the correct copy. `ix_notes_type` is partial on `type IS NOT NULL`, because an untyped note is always valid and most of a real vault is untyped: on a 20,000-note fixture with 500 typed notes, the full index holds 20,000 entries and `ANALYZE` estimates 10,000 rows for `type = 'project'`, while the partial index holds 500 and estimates 500. Both give the same plan; only one gives the planner an estimate that is not wrong by a factor of twenty, which is the same failure §4.3 is about. The cost accepted is that `GROUP BY type` becomes a scan and a temp b-tree.
+
+Running the DDL also settled how a full rebuild must load it. `blocks_fts` is kept in step by triggers, and for an incremental save that is exactly right — a note is a dozen blocks and the trigger is what makes the search index correct with no second code path. For a rebuild it is the wrong shape by a wide margin. Loading 26,000 blocks with the triggers live took 2.1 seconds in one transaction and 6.8 to 10.3 seconds spread across two to twenty-six; dropping the three triggers, loading, and then issuing the FTS5 `'rebuild'` command took 0.32 seconds, and produced a byte-identical search index. The same shape loaded 259,971 blocks in 5.6 seconds.
+
+So a full rebuild runs: recreate the schema, read the trigger definitions out of `sqlite_master` and drop them, bulk-load in batched transactions, `INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild')`, re-execute the saved trigger text, then stamp `index_meta` and `ANALYZE`. Reading the triggers back out of the database rather than keeping a second copy of the DDL is what makes the recreated triggers identical to the delivered ones by construction, instead of by a test that has to notice a copy going stale. The incremental path never drops anything: at 100 blocks per transaction the trigger path cost 15ms, which is inside NFR-PRF-03 with room to spare.
+
+The three `ix_fields_key_*` partial indexes were expected to need help from the query compiler — a redundant `val_date IS NOT NULL` emitted beside every predicate — on the assumption that SQLite's partial-index prover is too limited to infer it. It is not: `=`, `<`, `BETWEEN`, `IN` and a `LIKE` prefix on the typed column all select the partial index unaided. The lowering emits no redundant term. The one shape that cannot use them is a bare `key = ?` with no predicate on the value, which is why a merely *projected* field must be reached through the pivot join on `ix_fields_note_key`, never by selecting on `key` alone.
 
 ## Key flows
 
@@ -126,7 +139,7 @@ Fig. 2 — The indexing pipeline. Backpressure lives in the bounded, path-dedupl
 2.  The work queue deduplicates by path and is bounded. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses.
 3.  The hash check reads the file and compares blake3 against notes.hash. Sync tools touch mtime constantly without changing content; this discards those for the cost of a hash.
 4.  Changed files go to the parse pool, which is pure: bytes in, structures out, no I/O, so it parallelises across cores without coordination.
-5.  Rows go to the index writer on a channel. It batches within a transaction, and runs ANALYZE when a batch touched more than 5% of notes.
+5.  Rows go to the index writer on a channel. It batches within a transaction, and runs ANALYZE when a batch touched more than 5% of notes. A full rebuild takes the bulk path instead — triggers dropped, FTS index built once at the end, triggers restored from their own definitions; see §4.4.
 6.  The event bus emits index.changed, throttled to ten per second, and open views invalidate the rows they hold.
 
 #### 3.2 Echo suppression
@@ -142,6 +155,71 @@ On an external change to an open file, the core diffs old bytes against new and 
 The case that decides the design
 
 You are editing line 400. Claude Code rewrites the frontmatter at line 3. With a document replacement you lose your place and your undo history; with an edit script you do not notice. Every reconciliation decision follows from wanting the second outcome.
+
+#### 3.4 Cold start, and how a broken index is noticed
+
+Two requirements meet on this path and pull in opposite directions. NFR-PRF-01 wants an interactive window in 400ms and a usable vault in one second at 20,000 notes. NFR-REL-02 wants a corrupt index detected and rebuilt with no user action beyond restarting. Every thorough way of detecting corruption costs more than the entire window budget, so the two are reconciled by deciding what is checked *when*, rather than by checking less.
+
+##### The critical path does not scale with the vault
+
+| Phase                            | On the main thread                                                                                                                | In parallel                                                                                                                              | Budget                       |
+|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+| Process start → window painted   | Read the settings TOML, create the Tauri window, load the embedded webview bundle, paint the shell with `IndexState::Opening`.        | Index actor opens the index and runs the open check below. Vault thread registers the watcher, then starts the walk.                          | 400ms (NFR-PRF-01)         |
+| Window painted → vault usable    | Render the file tree and restore the last-open buffer as they arrive; the editor accepts keystrokes from the first paint.             | The walk streams paths; the index answers the first queries; the last-open file is read from disk.                                            | 1s total (NFR-PRF-01)      |
+| After usable                     | Nothing.                                                                                                                             | Catch-up reconciliation, `ANALYZE` if a rebuild ran, background `quick_check` if the last session ended badly, extraction and embedding (P2/P4). | Unbudgeted; must not stall the UI. |
+
+The load-bearing property is in the first row: **nothing on the critical path is proportional to the size of the vault**. The main thread never opens the index — the index actor does, on its own thread (ADR-01) — and no IPC command blocks on it. The shell paints with whatever state the actor has published, which is why 400ms is achievable at 20,000 notes and still achievable at 50,000.
+
+Two ordering rules that are correctness, not optimisation:
+
+- **The watcher is registered before the walk starts.** A file changed during the walk then produces an event rather than being silently missed, and the walk reconciles anything that changed before the watcher existed.
+- **The file tree is rendered from the index when it is `Ready`, and from the streaming walk when it is not.** One query over `notes(path)` returns 20,000 paths in about ten milliseconds; a cold directory walk takes far longer. This is design goal 5 in miniature — with a warm index the tree is instant, without one it degrades to streaming, and neither case blocks.
+
+Deferred deliberately, because none of it is needed to type: the catch-up scan, `ANALYZE`, the FTS integrity check, `quick_check`, extraction and the embedding model, which is never loaded at start.
+
+##### Validating the index on open
+
+Four candidates, measured against the schema on a 20,000-note fixture (259,971 blocks, 41,647 fields, 90,744 links; `index.db` 124.2MB), warm OS cache, SQLite 3.50.4:
+
+| Candidate                                             | Cost      | Catches                                                              | Verdict                                        |
+|-------------------------------------------------------|-----------|----------------------------------------------------------------------|------------------------------------------------|
+| `PRAGMA integrity_check`                              | 1310ms  | Everything, including index-versus-table disagreement.               | Rejected — 3× the whole window budget.         |
+| `PRAGMA quick_check`                                  | 1150ms  | Page-level damage anywhere in the file.                              | Rejected on the open path; kept as a background and on-demand check. |
+| FTS5 `integrity-check`                                | 390ms   | `blocks_fts` out of step with `blocks`.                              | Rejected on the open path; runs in CI and on demand. |
+| Stamp: `user_version`, `index_meta`, `count(*) notes` | 2.4ms   | Wrong schema, interrupted build, wrong vault, truncation, row loss.  | **Chosen.**                                    |
+
+The stamp is the open check. In order, and stopping at the first failure:
+
+1. `.serat/index.db` absent → rebuild, reason `NoIndex`.
+2. Opening it fails, or any statement below returns `SQLITE_CORRUPT` or `SQLITE_NOTADB` → rebuild, reason `Corrupt`.
+3. `PRAGMA user_version` differs from the version this build writes → rebuild, reason `SchemaChanged`. This is the whole of ADR-02's upgrade path.
+4. `index_meta` is missing or `state <> 'ready'` → rebuild, reason `Interrupted`; the previous build did not commit.
+5. `index_meta.vault_root` is not the canonical root being opened → rebuild, reason `VaultMoved`; the folder moved, or a `.serat/` directory was copied between vaults.
+6. `count(*) FROM notes` differs from `index_meta.note_count` → rebuild, reason `Corrupt`. This is why the schema requires the count to be updated in the same transaction as any change to the row count: a lag between them is indistinguishable from damage, and must be.
+
+Measured before it was decided
+
+The acceptance criterion for NFR-REL-02 is a *truncated* index file, so the file was truncated — by 0.1%, by half, to 5%, and to 100 bytes — and every statement failed instantly, including `PRAGMA user_version`, with "database disk image is malformed". SQLite compares the page count in the header against the size of the file, so truncation is caught by step 2 at no cost at all. The expensive checks buy nothing for this case. What they *do* buy showed up in the other experiment: overwriting 4KB in the middle of the file passed all six steps of the stamp, and passed `count(*)` over notes, blocks and a full-text match as well — only `quick_check` caught it. That is the honest limit of a cheap open check, and it is why the lazy path below is not optional.
+
+##### What the stamp cannot see
+
+Page-level damage deeper in the file survives the open check and is detected when a statement reads the damaged page. Therefore **exactly one function classifies index failures**, and it is reachable from every index read and write: any `SQLITE_CORRUPT`, `SQLITE_NOTADB`, "malformed" error, missing table, or failed FTS integrity check — at open or in the middle of a session — becomes one `IndexFault`, and `IndexFault` has exactly one handler.
+
+That handler closes every connection, deletes `index.db`, `index.db-wal` and `index.db-shm`, recreates the schema from `schema/001_init.sql` and rebuilds. There is no repair path and no code that attempts one (ADR-02), and the rebuild is bounded by NFR-PRF-04.
+
+`quick_check` runs in two places, never on the open path: in the background after the window is interactive when the previous session did not shut down cleanly, and on demand from the command palette. Clean shutdown checkpoints with `TRUNCATE` and closes every connection, which removes `-wal` and `-shm`; a `-wal` file present at open is therefore the unclean-shutdown signal, and it costs a `stat` to read.
+
+Crash safety needs no mechanism of its own. WAL recovery replays the journal on first open, and `synchronous = NORMAL` is safe *here* — not in general — precisely because the index is derived: the worst case of a power cut is losing the last committed transactions, and those are re-derived from files that were never at risk. C-02 is what pays for the pragma.
+
+##### What the user sees
+
+A rebuild is a status line, not a modal and not an error: *"Rebuilding index — search and queries are incomplete until this finishes"*, with a count. Editing works throughout, because editing reads and writes files and never the index (goals 1 and 2). Views and search render the partial index and refresh as `index.changed` arrives.
+
+A rebuild is never retried in a loop. If a rebuild fails to complete twice in one session the state becomes `IndexState::Unavailable` with the path and the operating-system error, and the application runs on as an editor with no search — for the same reason a malformed binary is never re-extracted automatically (§7.1). An indexer that spins forever is worse than an index that is missing, and the vault is unharmed either way.
+
+The states and reasons in this section are the enum the front end renders; they are defined once, in `contracts/ipc.rs`, as `IndexState` and `RebuildReason`.
+
+> The costs above were measured on a development machine, not on the reference machine, and through a Python harness rather than the real pipeline. They are three orders of magnitude apart, so the decision is safe; the numbers that go into the baseline are T2's, on the benchmark vault.
 
 ### Query compilation
 
@@ -357,6 +435,8 @@ Each design element and the requirements it satisfies. Every requirement of prio
 | Indexing pipeline                       | §3, Fig. 2                 | FR-VLT-04, FR-VLT-07, NFR-PRF-02, NFR-PRF-03, NFR-PRF-04                      |
 | Echo suppression                        | §3.2                       | FR-VLT-06                                                                     |
 | Diff-based reconciliation               | §3.3                       | FR-VLT-05                                                                     |
+| Cold-start path and phase budgets       | §3.4                       | NFR-PRF-01, FR-VLT-01                                                         |
+| Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
 | Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, NFR-PRF-05  |
 | Rebuild-not-migrate                     | §4.3, ADR-02               | FR-VLT-02, NFR-REL-02                                                         |
 | SQ grammar and type rules               | §5, grammar/sq.ebnf        | FR-STR-06, FR-STR-07, FR-STR-09                                               |
@@ -370,6 +450,8 @@ Each design element and the requirements it satisfies. Every requirement of prio
 | MCP tool schemas                        | contracts/mcp-tools.json   | FR-MCP-01, FR-MCP-02, FR-MCP-04, NFR-SEC-05                                   |
 | IPC contract                            | contracts/ipc.rs           | FR-VLT-01, FR-VLT-09, FR-LNS-02, FR-LNS-04, NFR-USE-04                        |
 | Screen designs and interaction rules    | §9, Figs. 4–6              | FR-EDT-02, FR-STR-10, FR-NAV-04, FR-LNS-02, FR-VIW-05, NFR-USE-01, NFR-USE-04 |
+| Benchmark vault generator               | §10.3, bench/              | NFR-MNT-02                                                                    |
+| Budget jobs in CI, one per NFR-PRF      | §10.3, bench/, CI workflow | NFR-PRF-08                                                                    |
 
 ## Open design questions
 
