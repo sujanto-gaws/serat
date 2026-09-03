@@ -9,6 +9,7 @@ node_modules/
 # Generated benchmark vault — regenerate with the bench/vaultgen command (NFR-MNT-02)
 /bench/vaults/
 /bench/out/
+/bench/.out/
 
 # OS / editor
 .DS_Store
@@ -16,3 +17,10 @@ Thumbs.db
 
 # Per-teammate git worktrees (see docs/04-implementation/coding-standards.md)
 /.worktrees/
+
+# rustfmt backups and MSVC debug symbols
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is deliberately NOT ignored: this workspace builds applications, and a
+# committed lockfile is what makes a CI budget number comparable between runs.

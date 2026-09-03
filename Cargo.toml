@@ -1,0 +1,68 @@
+# Serat workspace.
+#
+# Members are the crates that exist today. serat-sq, serat-extract, serat-ai and
+# serat-mcp are deliberately absent: P0 is a spike, and an empty crate for a later
+# phase is noise. serat-app is added when tauri-app-dev arrives.
+#
+# The dependency rule (docs/03-design/architecture.md §2.1) is enforced
+# mechanically, not by memory: crates/serat-core/tests/dependency_rule.rs.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/serat-core",
+    "crates/serat-vault",
+    "crates/serat-parse",
+    "crates/serat-index",
+    "bench/vaultgen",
+]
+# Each teammate works in a git worktree under .worktrees/ (coding-standards.md), and
+# every one of them contains a full copy of this workspace. Without this, cargo
+# discovers those copies as nested workspaces and every command in the root fails.
+exclude = [".worktrees"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/sujanto/serat"
+
+# Versions are pinned here once and referenced with `workspace = true`, so a
+# crate cannot quietly resolve a different major than the rest of the workspace.
+# The five P0 choices are named in the charter §Technical baseline and §Milestones P0.
+[workspace.dependencies]
+# --- P0 dependency choices (charter) ---
+# Markdown parse. default-features = false drops syntect + clap (a syntax
+# highlighter and a CLI parser that a library has no use for): 134 crates in the
+# graph become 60, and a clean debug build goes from ~45 s to ~5 s.
+comrak = { version = "0.54.0", default-features = false }
+# Filesystem watcher. ReadDirectoryChangesW / FSEvents / inotify behind one API.
+notify = "8.2.0"
+# SQLite. `bundled` compiles SQLite from source, so the index does not depend on
+# whatever libsqlite3 the host happens to ship. Needs a C compiler; see dev-setup.md.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Content hashing for the hash gate (architecture §3.1 step 3) and echo
+# suppression (§3.2).
+blake3 = "1.8.7"
+# The parse pool, cores - 1 (architecture §2.2).
+rayon = "1.12.0"
+
+# --- supporting ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+# --- internal ---
+serat-core = { path = "crates/serat-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# CI runs `cargo clippy --workspace --all-targets -- -D warnings`, so these are errors
+# there. Deliberately not `unwrap_used`: it is allow-by-default for a reason, and
+# turning it on makes every test a fight with the linter rather than with the code.
+todo = "warn"
