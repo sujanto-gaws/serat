@@ -485,6 +485,7 @@ impl Outcome {
         let Some(phases) = self.phases else {
             return Ok(());
         };
+        check_bulk_load_shape(&phases)?;
         let sum_ms = phases.sum().as_secs_f64() * 1000.0;
         let total_ms = self.value_ms();
         if sum_ms <= total_ms * 1.05 {
@@ -784,6 +785,20 @@ pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
         vaultgen::generate(&opts).map_err(|e| format!("generating the vault: {e}"))?;
     }
 
+    verify_vault_at(preset, &path)
+}
+
+/// Verify a vault that already exists, wherever it is.
+///
+/// Split from [`ensure_vault`] so the verification can be exercised against a
+/// real vault in a temporary directory. The digest is over paths relative to the
+/// vault root, so it does not depend on where the vault lives -- which is what
+/// makes this testable at all.
+///
+/// # Errors
+/// A missing or unreadable manifest, or any of [`check_vault`]'s refusals.
+pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, String> {
+    let manifest_path = vaultgen::manifest_path_for(path);
     let manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
     let expected = json_string(&manifest, "tree_digest_sha256")
@@ -791,7 +806,7 @@ pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
     let format_version = json_number(&manifest, "format_version").unwrap_or(0.0) as u32;
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
 
-    let actual = tree_digest(&path)?;
+    let actual = tree_digest(path)?;
     check_vault(
         preset,
         &actual,
@@ -802,7 +817,7 @@ pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
     .map_err(|e| format!("{e}\n  vault {}", path.display()))?;
 
     Ok(VaultUnderTest {
-        path,
+        path: path.to_path_buf(),
         digest: actual,
         format_version,
         notes: notes_in_manifest,
@@ -856,6 +871,42 @@ pub fn check_vault(
              notes\n{regenerate}",
             preset.name, preset.notes
         ));
+    }
+    Ok(())
+}
+
+/// Whether the rebuild still used the bulk-load shape (P0 finding F-38).
+///
+/// `write_rows` and `write_fts` are only comparable across runs if both were
+/// measured on the same shape: FTS triggers dropped, `blocks_fts` built once at
+/// the end. If a rebuild ever regressed to loading *through* the triggers,
+/// `write_fts` would read as roughly zero and `write_rows` would absorb the
+/// whole cost — **the breakdown would look better while the total got worse**,
+/// and nothing in a wall-clock figure can see that.
+///
+/// It is worth a check rather than a comment because of what the regression
+/// costs: architect measured 260,000 blocks not finishing after 25 minutes with
+/// the triggers live, against 0.32 s for the same shape at 26,000 blocks with
+/// them dropped (F-32). This is also the phase breakdown justifying its own
+/// existence — the aggregate cannot distinguish these two worlds.
+///
+/// # Errors
+/// When a rebuild that did real work reports no FTS build at all.
+pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), String> {
+    // A breakdown that is entirely zero is a harness that measured nothing, and
+    // `check_phases` has other things to say about that; this check is only
+    // meaningful once rows were actually written.
+    if phases.write_rows.is_zero() {
+        return Ok(());
+    }
+    if phases.write_fts.is_zero() {
+        return Err(
+            "the rebuild wrote rows but reports no FTS build time. blocks_fts is built once at \
+             the end of the bulk load, so a zero here means the load went through the FTS \
+             triggers instead — which shows as a better-looking breakdown and a worse total, \
+             and cost 25 minutes for 260,000 blocks when it was last measured (F-32)."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -921,8 +972,15 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io
 /// # Errors
 /// Any filesystem failure.
 pub fn write_result(outcome: &Outcome) -> std::io::Result<PathBuf> {
-    let dir = repo_root().join("bench/out/budgets");
-    std::fs::create_dir_all(&dir)?;
+    write_result_to(&repo_root().join("bench/out/budgets"), outcome)
+}
+
+/// As [`write_result`], into a directory of the caller's choosing.
+///
+/// # Errors
+/// Any filesystem failure.
+pub fn write_result_to(dir: &Path, outcome: &Outcome) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", outcome.budget.id));
     std::fs::write(&path, outcome.to_json())?;
     Ok(path)
@@ -1116,6 +1174,26 @@ pub fn measure_full_rebuild(
     vault: &VaultUnderTest,
     iterations: usize,
 ) -> Result<Measurement, String> {
+    measure_full_rebuild_with(vault, iterations, subject::full_rebuild)
+}
+
+/// As [`measure_full_rebuild`], against an injected rebuild.
+///
+/// The loop — fresh index per iteration, the note-count guard, the per-phase
+/// median — is the part worth testing, and it cannot be tested through the real
+/// seam because the real seam does not exist yet. A mutation sweep found the
+/// note-count guard survived precisely because nothing exercised this function.
+///
+/// # Errors
+/// As [`measure_full_rebuild`].
+pub fn measure_full_rebuild_with<F>(
+    vault: &VaultUnderTest,
+    iterations: usize,
+    mut rebuild: F,
+) -> Result<Measurement, String>
+where
+    F: FnMut(&Path, &Path) -> Result<subject::RebuildTiming, String>,
+{
     let mut samples = Samples::new();
     let mut runs: Vec<subject::RebuildTiming> = Vec::with_capacity(iterations);
     for i in 0..iterations {
@@ -1124,7 +1202,7 @@ pub fn measure_full_rebuild(
         // of something the requirement describes as the first.
         let index_dir = vault.path.join(format!(".serat-bench-{i}"));
         let _ = std::fs::remove_dir_all(&index_dir);
-        let timing = subject::full_rebuild(&vault.path, &index_dir)?;
+        let timing = rebuild(&vault.path, &index_dir)?;
         let _ = std::fs::remove_dir_all(&index_dir);
         check_note_count(timing.notes, vault.notes)?;
         samples.push(timing.total);
@@ -1524,6 +1602,43 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_that_loaded_through_the_fts_triggers_is_caught() {
+        // F-38. The regression is invisible in the total: write-FTS collapses to
+        // zero, write-rows absorbs the cost, and the breakdown reads as if the
+        // FTS build got free while the wall clock quietly got worse.
+        let bulk = subject::RebuildPhases {
+            walk: Duration::from_millis(500),
+            read_hash: Duration::from_millis(3_000),
+            parse: Duration::from_millis(6_000),
+            write_rows: Duration::from_millis(3_700),
+            write_fts: Duration::from_millis(1_900),
+        };
+        check_bulk_load_shape(&bulk).expect("the bulk shape is what we expect");
+
+        let through_triggers = subject::RebuildPhases {
+            write_fts: Duration::ZERO,
+            write_rows: Duration::from_millis(5_600),
+            ..bulk
+        };
+        let err = check_bulk_load_shape(&through_triggers).expect_err("triggers live");
+        assert!(err.contains("FTS triggers"), "{err}");
+
+        // And it does not fire on a breakdown where nothing was written at all,
+        // which is a different fault with a different message.
+        check_bulk_load_shape(&subject::RebuildPhases::default()).expect("nothing written");
+
+        // It is wired into the outcome, not merely available.
+        let err = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[20_000.0])).with_phases(through_triggers),
+        )
+        .expect_err("an outcome must not carry a trigger-loaded breakdown");
+        assert!(err.contains("FTS triggers"), "{err}");
+    }
+
+    #[test]
     fn a_phase_breakdown_that_double_counts_is_refused() {
         // The report says a sum below the wall clock is concurrency. A sum
         // above it means a phase is counted twice, and these numbers answer
@@ -1594,6 +1709,132 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- F-30
+
+    // ------------------------------------------------ closing the survivors
+
+    #[test]
+    fn the_rebuild_loop_refuses_a_partial_index_and_takes_per_phase_medians() {
+        // The mutation sweep found `check_note_count(..)?` could be dropped from
+        // measure_full_rebuild with every test still green, because nothing
+        // exercised the loop. It does now, through an injected rebuild.
+        fn timing(total_ms: u64, notes: usize, parse_ms: u64) -> subject::RebuildTiming {
+            subject::RebuildTiming {
+                total: Duration::from_millis(total_ms),
+                notes,
+                phases: subject::RebuildPhases {
+                    walk: Duration::from_millis(1),
+                    read_hash: Duration::from_millis(2),
+                    parse: Duration::from_millis(parse_ms),
+                    write_rows: Duration::from_millis(4),
+                    write_fts: Duration::from_millis(5),
+                },
+            }
+        }
+
+        // A rebuild that indexed half the vault must not post a fast number.
+        let err = measure_full_rebuild_with(&a_vault(), 1, |_, _| Ok(timing(1, 10_000, 3)))
+            .expect_err("half a vault is not a passing budget");
+        assert!(err.contains("not a passing budget"), "{err}");
+
+        // A failing rebuild propagates rather than being absorbed.
+        let err = measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()))
+            .expect_err("a failed rebuild is not a measurement");
+        assert_eq!(err, "boom");
+
+        // Three good runs: the phase reported is the per-phase median, not the
+        // phase of the median run and not the slowest.
+        let mut n = 0;
+        let m = measure_full_rebuild_with(&a_vault(), 3, |_, _| {
+            n += 1;
+            Ok(timing(1_000 * n, 20_000, [30, 10, 20][(n - 1) as usize]))
+        })
+        .expect("three complete rebuilds");
+        assert_eq!(m.samples.len(), 3);
+        assert_eq!(m.samples.median(), 2_000.0);
+        let phases = m.phases.expect("phases");
+        assert_eq!(
+            phases.parse,
+            Duration::from_millis(20),
+            "median parse phase"
+        );
+    }
+
+    #[test]
+    fn the_p95_statistic_is_the_ninety_fifth_percentile() {
+        // 0.95 -> 0.90 survived the first sweep: at n = 20 nearest rank moves
+        // from the 19th sample to the 18th, and nothing looked at the 18th.
+        let mut ms = vec![100.0; 18];
+        ms.push(500.0);
+        ms.push(9_999.0);
+        let s = samples(&ms);
+        assert_eq!(s.statistic(Statistic::P95), 500.0, "the 19th of 20 sorted");
+        assert_ne!(s.statistic(Statistic::P95), s.percentile(0.90));
+    }
+
+    #[test]
+    fn a_result_file_is_actually_written_and_holds_the_numbers() {
+        // "write_result writes nothing" survived: nothing read the file back.
+        let dir = std::env::temp_dir().join(format!("budget-result-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outcome = Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[19_000.0, 21_000.0, 20_000.0]),
+            reported: Vec::new(),
+            phases: None,
+        };
+        let path = write_result_to(&dir, &outcome).expect("write");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("\"budget_id\": \"prf04-full-rebuild\""),
+            "{written}"
+        );
+        assert!(written.contains("\"value_ms\": 20000.000"), "{written}");
+        assert!(
+            written.contains("\"samples_ms\": [19000.000, 21000.000, 20000.000]"),
+            "{written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_outcome_taken_in_the_wrong_environment_is_not_a_gate_number() {
+        // "gate_eligible always true" survived: the flag was tested on
+        // Environment and never through the Outcome that carries it into a
+        // report.
+        let scanner_off = env::Environment {
+            os: env::Os::Windows,
+            cores: 16,
+            realtime_scanner: Some(false),
+            power_plan: Some("Energy Star".into()),
+        };
+        let outcome = Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: scanner_off,
+            samples: samples(&[20_000.0]),
+            reported: Vec::new(),
+            phases: None,
+        };
+        assert!(outcome.passed(), "20 s is inside 30 s");
+        assert!(
+            !outcome.gate_eligible(),
+            "but a scanner-off run is not the number the charter gate is judged on"
+        );
+        assert!(
+            outcome.to_report().contains("NOT A GATE NUMBER"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(
+            outcome.to_json().contains("\"gate_eligible\": false"),
+            "{}",
+            outcome.to_json()
+        );
+    }
 
     #[test]
     fn every_budget_has_a_job_in_the_ci_workflow() {
