@@ -2,7 +2,9 @@
 #
 # Members are the crates that exist today. serat-sq, serat-extract, serat-ai and
 # serat-mcp are deliberately absent: P0 is a spike, and an empty crate for a later
-# phase is noise. serat-app is added when tauri-app-dev arrives.
+# phase is noise. serat-app arrived with task S1 and is a member from its first
+# commit: an untracked or non-compiling member breaks cargo metadata in every
+# teammate worktree at once (P0 finding F-07).
 #
 # The dependency rule (docs/03-design/architecture.md §2.1) is enforced
 # mechanically, not by memory: crates/serat-core/tests/dependency_rule.rs.
@@ -14,6 +16,7 @@ members = [
     "crates/serat-vault",
     "crates/serat-parse",
     "crates/serat-index",
+    "crates/serat-app",
     "bench/vaultgen",
     "bench/budget",
     # The IPC contract, so that contracts/ipc.rs is compiled and its TypeScript is

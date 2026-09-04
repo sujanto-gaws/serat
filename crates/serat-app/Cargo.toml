@@ -1,0 +1,46 @@
+[package]
+name = "serat-app"
+description = "The Tauri shell: commands, events, wiring. No domain logic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "serat"
+
+# The binary the cold-start budget spawns (NFR-PRF-01). Named `serat` rather than
+# `serat-app` because bench/budget/src/subject.rs spells it `serat.exe`.
+[[bin]]
+name = "serat"
+path = "src/main.rs"
+
+[lib]
+name = "serat_app"
+path = "src/lib.rs"
+
+[dependencies]
+# Every capability comes from a crate that owns it (architecture §2.1). serat-app
+# adds none of its own; serat-parse and serat-index arrive on the pipeline branches.
+serat-core = { workspace = true }
+serat-vault = { path = "../serat-vault" }
+serat-index = { path = "../serat-index" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Pinned here rather than in [workspace.dependencies] because serat-app is their only
+# consumer: the workspace table exists so two crates cannot resolve different majors
+# of the same crate, and there is no second crate to disagree with.
+tauri = { version = "2.11.5", features = ["custom-protocol"] }
+# ADR-0007: the front-end types are generated from the contract, never hand-written.
+ts-rs = "12.0.1"
+# Settings live in a TOML file in the platform config directory (§3.4, first row of
+# the cold-start table). `dirs` is what knows where that is on three platforms.
+toml = "1.1.5"
+dirs = "6.0.0"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[lints]
+workspace = true
