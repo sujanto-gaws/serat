@@ -54,12 +54,24 @@ This is not architectural decoration. It is what lets serat-sq typecheck a query
 | serat-core    | Domain types, trait definitions, error taxonomy                                | Any I/O whatsoever                                                |
 | serat-vault   | Watching, reading, atomic writes, ignore rules, path canonicalisation          | Knowledge of Markdown                                             |
 | serat-parse   | Markdown to blocks, fields, links, tasks; custom syntax extensions             | Any file access — it takes bytes and returns structures           |
-| serat-index   | SQLite schema, the single-writer actor, incremental upsert, FTS, vectors       | Query language semantics                                          |
+| serat-index   | SQLite schema, the single-writer actor, incremental upsert, FTS, vectors, and the pipelines that fill them | Query language semantics; any knowledge of Markdown or of the filesystem |
 | serat-sq      | Lexer, parser, typechecker, SQL codegen                                        | Execution — it emits a statement and a plan, nothing more         |
 | serat-extract | Extractor registry, cache, child-process supervision                           | The parsing of any specific binary format                         |
 | serat-ai      | Chunking, embedding, retrieval fusion, provider clients, proposal construction | Applying a proposal — only the app can, and only on a user action |
 | serat-mcp     | Tool schemas and transport over the same query API the UI uses                 | A second implementation of anything                               |
 | serat-app     | Tauri commands and events, wiring, the review queue                            | Domain logic of any kind                                          |
+
+Where the rebuild lives, and why the rule is not bent to put it there
+
+A full rebuild walks, reads, parses and writes, and the rule forbids any crate from taking two of those as dependencies. It is the first thing built that has no obvious home, and the answer decides whether the rule survives contact with the product.
+
+It lives in **serat-index**, as `rebuild(source: &dyn NoteSource, parser: &dyn NoteParser, index_dir: &Path)`, with `serat_vault::Vault` implementing `NoteSource`. This adds no dependency edge: serat-index still depends on serat-core and nothing else internal, and it links neither a Markdown parser nor a filesystem walker. It is the escape hatch this section already describes, used for the case it was designed for.
+
+Two arguments decided it against a `serat-pipeline` crate sitting above vault, parse and index. The first is that such a crate would need an exception to the rule — *this one crate may depend on three others* — and the rule's whole value is that it is one sentence a test can check. An exception is not a small cost; it is the cost of the rule. The second is that `rebuild` is less of a pipeline than it looks: four of its six steps are the bulk-load sequence in `schema/001_init.sql` §4.4 — drop the FTS triggers, load, rebuild the index, restore them — and all four are SQLite's business and nobody else's. The walk and the parse are inputs to it. Reading it as "the index's bulk-load entry point, taking its input through traits" describes it more accurately than "a pipeline that happens to end in SQLite", and the crate table above was simply written too narrowly.
+
+The ruling comes with a constraint that keeps it from becoming a licence, and it is mechanically checkable in the same way the dependency rule is: **serat-index may acquire no knowledge of Markdown and no knowledge of the filesystem.** Everything it learns about either arrives through a trait declared in serat-core. If `comrak`, `notify` or a `std::fs` call ever appears in that crate, orchestration has stopped being a caller of traits and has started being a second implementation, and the placement is wrong rather than merely untidy.
+
+The trigger to revisit is named so the decision cannot drift indefinitely: **the second orchestrator that must not link SQLite.** Extraction in P2 and embedding in P4 are the candidates. One orchestrator in the crate that owns the sink is a narrow reading of a table row; two, one of which has no business linking a database, is a `serat-pipeline` crate and an ADR amending this rule — and by then it will be written against two real callers instead of one imagined one.
 
 ### 2.2 Threading and ownership
 
