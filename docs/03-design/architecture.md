@@ -281,7 +281,17 @@ The mechanism is one environment variable, so the harness measures the applicati
 
 S1's first measurement of the real shell, twenty spawns, release build, scanner disabled: `window_visible` p95 **1088ms against a 400ms budget**, and `vault_usable` p95 **1094ms against 1000ms**. The median splits into 57ms of loader, 23ms of Tauri runtime, **619ms inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation — 100ms to the first painted frame, and 5ms to usable.
 
-So Serat's own contribution to the first row of that table is roughly 130ms of the 400, and the largest single term is a platform cost that no decision in this document moves. That is worth stating plainly rather than leaving as an inference, because the table budgets the phase as though all of it were ours, and a reader optimising against it would be tuning the 130 and not the 619.
+The largest single term is a platform cost that no decision in this document moves. That is worth stating plainly rather than leaving as an inference, because the table budgets the phase as though all of it were ours, and a reader optimising against it would be tuning the wrong end of the split.
+
+**"Serat's own share" is not one number, and the section deliberately does not name one.** An earlier draft here said "roughly 130ms of the 400"; it matched no definition of the five terms and is withdrawn. Three defensible quantities can be read off the same run and they differ by a factor of six:
+
+| Quantity | Median | What it answers |
+|---|---|---|
+| Code we wrote, executing on the main thread | 28ms | Is Serat itself slow? No. |
+| Everything except WebView2 environment creation | 185ms | What is left if the platform term were free? |
+| The whole phase | 804ms | What does the user wait for? |
+
+None of the three is wrong; quoting one without saying which is. The middle figure is the one that misleads most easily, because the 57ms of loader inside it is a function of our binary size and dependency count — ours to influence, not ours to execute — and the 100ms to first paint is our HTML and CSS being rendered by a webview we did not write. So the split is what this section carries, and an aggregate quoted anywhere else must name its basis in the same sentence as the number.
 
 This does not re-baseline NFR-PRF-01, which is product-analyst's at Q1 and needs more than one platform's number: WebView2 on Windows is one of three webviews, and WKWebView and WebKitGTK have their own startup costs that may differ by a lot. What P0 establishes is the shape of the answer — if all three platforms carry a webview cost of this order, the requirement is wrong rather than the design, and the honest fix is a budget that separates the part we control from the part we inherit. What it does *not* establish is that the budget is unreachable, because the figure above was taken before F-12's walk fix and on one platform.
 
