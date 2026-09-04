@@ -99,7 +99,16 @@ Anything that must observe its own write needs a barrier, so the writer handle a
 
 This is the design's real shape: **one writer, asynchronous, with an explicit and expensive barrier** — not an interface with no synchronisation left in it, which is how the paragraph above reads on its own. The barrier must never appear on the save path, where blocking would put the index back on the keystroke path (goal 2). A caller there reads the pre-write snapshot and is corrected by `index.changed`; a caller that cannot tolerate that is telling you it belongs on the writer's thread, not that it needs a longer lock.
 
-The test that keeps this honest: **if a message needs a reply, the channel is a lie and you have a mutex with extra steps.** `IndexOp`'s variants need none, which is why the shape holds. A variant that did would be the signal to redesign rather than to add a return channel — which is also why callers get no per-operation completion handle. Per-op completion tracking is how an actor turns back into a request/response API, and then into a mutex.
+The test that keeps this honest: **if a message needs a reply, the channel is a lie and you have a mutex with extra steps.** That sentence was written against `IndexOp`, whose variants need no reply, and it is the right instinct stated one word too narrowly — `flush()` was carved out of it by name on the day it was written, and I4 added three more replies for the rebuild's phases. Four exceptions to a rule that names one is a rule about to be ignored, so here is the category rather than the list.
+
+**A message may need a reply only if it is a barrier.** The distinction is not whether a reply exists but what it is for, and one question separates them: *would this message exist if the caller did not need to wait?*
+
+- A **barrier** exists only because of the wait. Its reply means "the state you asked for has been reached", the caller is the code that owns the sequence, and the next step is invalid until the previous one has landed. `flush()` before `ANALYZE`, and the rebuild bracketing its own bulk load, are barriers. A barrier may carry a value — a count of what it completed — as long as that value is a fact about what the barrier finished and not an answer computed on the caller's behalf.
+- A **request** would exist anyway, and the reply is the point of sending it: the caller wants a value the actor holds. That is the thing the original sentence forbids, and it is still forbidden. A request answered over the channel is a mutex with extra steps, and a per-operation completion handle is the same thing wearing a smaller hat — which is why callers still get none.
+
+Two limits keep the category from swallowing the rule. No barrier may appear on the save path or on anything a keystroke waits for, because blocking there puts the index back on the editor's path whatever the message is called (goal 2, §3.1.1). And a barrier is a phase boundary in a sequence, so the number of them is small and each one is legible as such; a barrier that appears in the middle of ordinary work is a request that has been renamed.
+
+The rule earned its keep by catching its own exceptions: it is why the three new replies were examined at all, and the answer was that they are correct and the wording was too narrow. A test sharp enough to fire on the cases it should permit is worth more than one loose enough never to fire.
 
 The queue's other under-specified half — what happens when it is full — is ADR-11. The short version is that the answer is different for each producer: the watcher may be dropped because it cannot be blocked without losing OS events silently, and the bulk producer may not be dropped because it can be blocked at no cost. Routing both through one policy is a measured defect, not a theoretical one.
 
@@ -196,9 +205,17 @@ Two consequences, stated because each looks like a bug otherwise. If another pro
 1.  The watcher coalesces events per path over a 150ms window. Editors that save via temp-and-rename emit several events per save; they collapse to one.
 2.  The work queue deduplicates by path and is bounded, and when it is full the watcher's push is refused, a rescan flag latches, and the consumer reconciles by walking. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses. The bulk producer is never dropped this way — see ADR-11, which is about which producer may be dropped rather than about whether dropping is allowed.
 3.  The hash check reads the file and compares blake3 against notes.hash. Sync tools touch mtime constantly without changing content; this discards those for the cost of a hash.
-4.  Changed files go to the parse pool, which is pure: bytes in, structures out, no I/O, so it parallelises across cores without coordination.
+4.  Changed files go to the parse pool, which is pure: bytes in, structures out, no I/O, so it parallelises across cores without coordination. A file the parser cannot read is **indexed as a bare row, never skipped** — see below.
 5.  Rows go to the index writer on a channel. It batches within a transaction, and runs ANALYZE when a batch touched more than 5% of notes. A full rebuild takes the bulk path instead — triggers dropped, FTS index built once at the end, triggers restored from their own definitions; see §4.4.
 6.  The event bus emits index.changed, throttled to ten per second, and open views invalidate the rows they hold.
+
+##### A note that cannot be parsed is still a note
+
+F-67, and the answer is design goal 5 applied to Markdown rather than to binaries. When the parser cannot produce structures — in practice a `.md` file that is not valid UTF-8, since CommonMark has no parse failures and broken frontmatter already indexes the note and records the problem — the note is indexed as a **bare row**: path, hash, mtime, size and a title from the filename, with no blocks, no fields and no links.
+
+It is not skipped. Skipping is the option that looks safe and is not: the file exists, so an application that indexes nothing for it is one where the note is missing from the tree and from path search, links to it read as unresolved, and there is no surface anywhere that says why. The vault would contain a file the product denies. §7.3 already settles the identical question for a binary with no extractor — it "still indexes with its sidecar and stays typed, linkable and queryable", and only full-text over its contents is unavailable — and there is no reason for a Markdown file to be treated worse than a PDF nobody can read.
+
+Nothing records the failure in the index, deliberately. It needs no column, because it is not a fact about the note that the index has to remember: anyone can re-derive it in the time it takes to read the file. P1's validation surface lists such notes by computing them, and a column would be a schema change — a rebuild, under ADR-02 — bought for a consumer that does not exist.
 
 #### 3.2 Echo suppression
 
