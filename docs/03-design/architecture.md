@@ -287,11 +287,13 @@ The largest single term is a platform cost that no decision in this document mov
 
 | Quantity | Median | What it answers |
 |---|---|---|
-| Code we wrote, executing on the main thread | 28ms | Is Serat itself slow? No. |
+| Main-thread work outside the loader and the webview build | 28ms | Is Serat itself slow? No. |
 | Everything except WebView2 environment creation | 185ms | What is left if the platform term were free? |
 | The whole phase | 804ms | What does the user wait for? |
 
 None of the three is wrong; quoting one without saying which is. The middle figure is the one that misleads most easily, because the 57ms of loader inside it is a function of our binary size and dependency count — ours to influence, not ours to execute — and the 100ms to first paint is our HTML and CSS being rendered by a webview we did not write. So the split is what this section carries, and an aggregate quoted anywhere else must name its basis in the same sentence as the number.
+
+The first row is deliberately *not* labelled "code we wrote", which is what an earlier draft called it. The five medians offer only one way to reach 28ms — the 23ms of Tauri runtime plus the 5ms to usable — and on that reading most of it is somebody else's runtime rather than ours. Whether that is how the figure is actually composed is not established by this run, and the answer to the question the row asks does not depend on it: 28ms is not slow however it divides. But a table whose entire purpose is that a figure without its basis is the error is the last place to assert a basis nobody has checked.
 
 This does not re-baseline NFR-PRF-01, which is product-analyst's at Q1 and needs more than one platform's number: WebView2 on Windows is one of three webviews, and WKWebView and WebKitGTK have their own startup costs that may differ by a lot. What P0 establishes is the shape of the answer — if all three platforms carry a webview cost of this order, the requirement is wrong rather than the design, and the honest fix is a budget that separates the part we control from the part we inherit. What it does *not* establish is that the budget is unreachable, because the figure above was taken before F-12's walk fix and on one platform.
 
