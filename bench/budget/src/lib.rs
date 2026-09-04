@@ -894,7 +894,7 @@ pub fn check_vault(
 /// and nothing in a wall-clock figure can see that.
 ///
 /// It is worth a check rather than a comment because of what the regression
-/// costs: architect measured 260,000 blocks not finishing after 25 minutes with
+/// costs: architect measured about 6x - 26,000 blocks at 2.1 s with
 /// the triggers live, against 0.32 s for the same shape at 26,000 blocks with
 /// them dropped (F-32). This is also the phase breakdown justifying its own
 /// existence — the aggregate cannot distinguish these two worlds.
@@ -914,7 +914,7 @@ pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), Stri
             "the rebuild wrote rows but reports no FTS build time. blocks_fts is built once at \
              the end of the bulk load, so a zero here means the load went through the FTS \
              triggers instead — which shows as a better-looking breakdown and a worse total, \
-             and cost 25 minutes for 260,000 blocks when it was last measured (F-32)."
+             and cost about 6x when it was last measured: 2.1 s against 0.32 s at 26,000 blocks (F-32)."
                 .to_string(),
         );
     }

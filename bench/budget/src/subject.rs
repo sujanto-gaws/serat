@@ -63,7 +63,7 @@ pub struct RebuildPhases {
     /// Split from `write_rows` because the two have different fixes and
     /// reporting them together hides a 6x: with the triggers left live, the same
     /// insert cost 2.1-10.3 s at 26,000 blocks against 0.32 s with them dropped,
-    /// and at 260,000 blocks it had not finished after 25 minutes.
+    /// against 0.32 s with them dropped - about 6x, reproduced independently at 5.8x.
     pub write_fts: Duration,
 }
 
