@@ -1621,12 +1621,50 @@ pub struct ScaleCheck {
     pub small_ms: f64,
     /// Median at the 50k vault.
     pub large_ms: f64,
+    /// p95 at the 20k vault. **This is what the judgement compares**, because
+    /// it is what the budget itself asserts.
+    pub small_p95_ms: f64,
+    /// p95 at the 50k vault.
+    pub large_p95_ms: f64,
     /// How many pairs were taken.
     pub pairs: usize,
-    /// Mean of `large - small` measured within each pair.
-    pub mean_diff_ms: f64,
-    /// 95% confidence interval on that mean.
-    pub ci95_ms: (f64, f64),
+    /// **Median** of `large - small` within each pair.
+    ///
+    /// A rank statistic rather than a mean, because these distributions are
+    /// heavy-tailed and a mean under-detects: in the run that produced F-141,
+    /// the mean's confidence interval included zero while the sign test gave
+    /// p ≈ 0.04 and the p95 ratio was 1.20. A mean would have called a real
+    /// effect noise.
+    pub median_diff_ms: f64,
+    /// How many pairs had the larger vault slower.
+    pub larger_slower: usize,
+    /// Two-sided sign-test p for that count against a fair coin.
+    pub sign_test_p: f64,
+}
+
+/// Two-sided sign test: the probability of a split at least this lopsided if
+/// the two arms were exchangeable.
+///
+/// Exact rather than normal-approximated, since the harness runs tens of pairs
+/// rather than hundreds.
+pub fn sign_test_p(pairs: usize, successes: usize) -> f64 {
+    if pairs == 0 {
+        return 1.0;
+    }
+    let n = pairs;
+    let k = successes.min(n - successes);
+    // Sum the two tails: P(X <= k) + P(X >= n-k), which for a symmetric
+    // binomial is 2 * P(X <= k), capped at 1.
+    let mut tail = 0.0f64;
+    let mut coeff = 1.0f64; // C(n, 0)
+    for i in 0..=k {
+        if i > 0 {
+            coeff = coeff * ((n - i + 1) as f64) / (i as f64);
+        }
+        tail += coeff;
+    }
+    let total = 2.0f64.powi(n as i32);
+    ((2.0 * tail) / total).min(1.0)
 }
 
 /// Measure the window-painted mark at both vault sizes, **interleaved**.
@@ -1692,32 +1730,31 @@ where
         diffs.push(l_ms - s_ms);
     }
 
-    let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
-    // Sample standard deviation; with one pair there is no spread to report.
-    let ci = if diffs.len() < 2 {
-        (mean, mean)
-    } else {
-        let var =
-            diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (diffs.len() as f64 - 1.0);
-        let half = 1.96 * (var / diffs.len() as f64).sqrt();
-        (mean - half, mean + half)
-    };
-
+    let larger_slower = diffs.iter().filter(|d| **d > 0.0).count();
     Ok(ScaleCheck {
         small_ms: median_of(&small_ms),
         large_ms: median_of(&large_ms),
+        small_p95_ms: percentile_of(&small_ms, 0.95),
+        large_p95_ms: percentile_of(&large_ms, 0.95),
         pairs,
-        mean_diff_ms: mean,
-        ci95_ms: ci,
+        median_diff_ms: median_of(&diffs),
+        larger_slower,
+        sign_test_p: sign_test_p(pairs, larger_slower),
     })
 }
 
-/// Nearest-rank median of a slice of milliseconds, matching `Samples::median`.
-fn median_of(xs: &[f64]) -> f64 {
+/// Nearest-rank percentile of a slice of milliseconds, matching
+/// `Samples::percentile` exactly so the two cannot drift apart.
+fn percentile_of(xs: &[f64], q: f64) -> f64 {
     let mut sorted = xs.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = ((0.5 * sorted.len() as f64).ceil().max(1.0) as usize).min(sorted.len());
+    let rank = ((q * sorted.len() as f64).ceil().max(1.0) as usize).min(sorted.len());
     sorted[rank - 1]
+}
+
+/// Nearest-rank median, matching `Samples::median`.
+fn median_of(xs: &[f64]) -> f64 {
+    percentile_of(xs, 0.50)
 }
 
 /// Turn a scale measurement into the line a gate report carries.
@@ -1725,18 +1762,29 @@ fn median_of(xs: &[f64]) -> f64 {
 /// # Errors
 /// When the critical path grew with the vault.
 pub fn judge_scale(check: &ScaleCheck) -> Result<String, String> {
-    assert_scale_independent(check.small_ms, check.large_ms)?;
+    // The comparison is on p95, because that is the statistic the budget
+    // asserts. The median and the sign test are reported beside it: they are
+    // the sensitive detectors, and the p95 is the one that means something
+    // against NFR-PRF-01. Judging on the mean would under-detect on these
+    // heavy-tailed distributions, and judging on the median alone would assert
+    // something the budget does not care about.
+    assert_scale_independent(check.small_p95_ms, check.large_p95_ms)?;
     Ok(format!(
-        "PASS  NFR-PRF-01 · scale independence\n  window painted median {:.1} ms at 20k, {:.1} \
-         ms at 50k over {} interleaved pairs\n  paired difference {:+.1} ms, 95% CI [{:+.1}, \
-         {:+.1}] — vault size does not inflate the mark beyond the {:.0}% tolerance (§3.4). \
-         This bounds the effect; it does not claim there is none.",
+        "PASS  NFR-PRF-01 · scale independence\n  window painted p95 {:.1} ms at 20k, {:.1} ms \
+         at 50k over {} interleaved pairs (median {:.1} / {:.1})\n  paired median difference \
+         {:+.1} ms, larger vault slower in {}/{} pairs, sign test p = {:.3} — vault size does \
+         not inflate the mark beyond the {:.0}% tolerance (§3.4). This bounds the effect; it \
+         does not claim there is none.\n  caveat: every iteration reads a page-cached vault, so \
+         no figure here is a cold-VAULT figure",
+        check.small_p95_ms,
+        check.large_p95_ms,
+        check.pairs,
         check.small_ms,
         check.large_ms,
+        check.median_diff_ms,
+        check.larger_slower,
         check.pairs,
-        check.mean_diff_ms,
-        check.ci95_ms.0,
-        check.ci95_ms.1,
+        check.sign_test_p,
         SCALE_TOLERANCE * 100.0
     ))
 }
@@ -2577,8 +2625,17 @@ mod tests {
         assert_eq!(check.small_ms, 300.0);
         assert_eq!(check.large_ms, 310.0);
         assert!(
-            (check.mean_diff_ms - 10.0).abs() < 1e-9,
-            "paired difference"
+            (check.median_diff_ms - 10.0).abs() < 1e-9,
+            "paired median difference"
+        );
+        assert_eq!(
+            check.larger_slower, 4,
+            "the larger vault was slower every time"
+        );
+        assert!(
+            check.sign_test_p < 0.13,
+            "4/4 one way: p = {}",
+            check.sign_test_p
         );
 
         let line = judge_scale(&check).expect("3% growth is within tolerance");
@@ -2600,18 +2657,43 @@ mod tests {
         })
         .expect("six pairs");
         assert!(
-            drifting.mean_diff_ms.abs() < 106.0,
+            drifting.median_diff_ms.abs() < 106.0,
             "drift must not read as an effect: {:?}",
             drifting
         );
+
+        // A tail-only regression: the median is flat and the p95 is not. The
+        // judgement must fail. This is the case tauri-app-dev warned about --
+        // the real walk-deferral effect was in the tail, with a p95 ratio of
+        // 1.20 while the median barely moved -- and a judgement on the median
+        // or the mean would call it noise.
+        let mut n = 0;
+        let tail_only = measure_scale_independence(&small, &large, 20, |vault, _| {
+            if vault.notes == 20_000 {
+                return Ok(300.0);
+            }
+            n += 1;
+            // Four slow spawns in twenty: the median is untouched, the p95 is not.
+            Ok(if n > 16 { 900.0 } else { 300.0 })
+        })
+        .expect("twenty pairs");
+        assert_eq!(tail_only.large_ms, 300.0, "the median is flat");
+        assert_eq!(tail_only.small_p95_ms, 300.0);
+        assert_eq!(tail_only.large_p95_ms, 900.0, "the tail is not");
+        let err = judge_scale(&tail_only)
+            .expect_err("a tail-only regression must fail; the budget is a p95");
+        assert!(err.contains("proportional to vault size"), "{err}");
 
         // The shape a path proportional to vault size would produce.
         let grew = ScaleCheck {
             small_ms: 300.0,
             large_ms: 750.0,
+            small_p95_ms: 300.0,
+            large_p95_ms: 750.0,
             pairs: 30,
-            mean_diff_ms: 450.0,
-            ci95_ms: (400.0, 500.0),
+            median_diff_ms: 450.0,
+            larger_slower: 30,
+            sign_test_p: 0.0,
         };
         let err = judge_scale(&grew).expect_err("2.5x must fail the job");
         assert!(err.contains("proportional to vault size"), "{err}");

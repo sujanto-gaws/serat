@@ -112,6 +112,10 @@ The app has no Rust-side path that stamps the paint mark — it comes only from 
 
 **Two honesty notes for the gate report**, from tauri-app-dev: until S2 lands the webview is a placeholder page rather than the Vue app, so the P0 figure is the shell's cold start with a trivial front end and S2 will move it; and `--exit-after-ready` exits after the usable mark, so every iteration is genuinely cold.
 
+### Every cold-start figure is a warm-vault figure
+
+Stated in the report line itself, not only here. Each iteration spawns against the same vault, so after the first the page cache holds it and the walk is CPU-bound; a user's cold start reads a cold vault. The gap is unmeasured because dropping the Windows page cache needs privileges the measuring account lacks, and a freshly generated vault is write-cached rather than cold — measuring that way gave +42.9 ms against a **null control of +15.9 ms with the same binary on both arms**, so most of the apparent effect was the harness measuring itself. `reference-machine.md` records what would fix it. Until then this is a stated bound on what P0 established.
+
 ### Scale independence: §3.4's load-bearing claim, as a test
 
 Architecture §3.4 states that **nothing on the critical path is proportional to vault size** — the main thread never opens the index, and the file tree renders from one query over `notes(path)` rather than from the walk. That is a claim, so it gets a test rather than a paragraph.
@@ -122,8 +126,10 @@ Architecture §3.4 states that **nothing on the critical path is proportional to
 
 Three consequences, each of which the harness states rather than assumes:
 
-- **The comparison uses medians; the budget stays a p95.** A p95 over twenty samples is a noisier estimator than the quantity it estimates. NFR-PRF-01 says p95 and that is what the *budget* asserts; only the ratio test uses the median.
+- **The comparison is judged on p95 and reported with rank statistics.** The judgement compares the two p95s, because that is the statistic NFR-PRF-01 itself asserts. Beside it the report carries the paired **median** difference and a **sign test** — rank statistics, because these distributions are heavy-tailed and a mean under-detects: in the run behind F-141 the mean's confidence interval included zero while the sign test gave p ≈ 0.04 and the p95 ratio was 1.20. A mean would have called a real effect noise.
 - **The tolerance stays at 20%.** Widening it would trade away the detection it was sized for. The instrument was the problem, not the threshold — and architect, who set it, said so themselves after measuring the noise they had not measured when they set it.
+
+  It is worth knowing how little headroom that leaves for one specific regression. Removing the walk deferral costs a **p95 ratio of 1.20** — measured paired, after the same blocked-sampling error inflated the original estimate by about ten times. So this assertion would sit exactly on its threshold for that defect rather than clearly failing, which is a further argument for judging on the p95 the budget cares about rather than on a mean that would miss it entirely.
 - **The claim is stated as a bound, not as an absence.** The report says "vault size does not inflate the mark beyond the tolerance … This bounds the effect; it does not claim there is none." The CI excludes an effect as large as the tolerance; it does not exclude a small real one, and the budget is about the former.
 
 Blocked runs remain fine for the absolute budget p95s — a budget is a threshold and needs no pairing. Only the comparison between vault sizes does.
