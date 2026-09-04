@@ -24,3 +24,7 @@ Thumbs.db
 
 # Cargo.lock is deliberately NOT ignored: this workspace builds applications, and a
 # committed lockfile is what makes a CI budget number comparable between runs.
+
+# ts-rs default output when TS_RS_EXPORT_DIR is unset; the committed types live
+# in app/src/ipc/generated (ADR-0007).
+contracts/bindings/
