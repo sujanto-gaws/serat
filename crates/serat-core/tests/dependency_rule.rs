@@ -154,6 +154,23 @@ const FORBIDDEN_EXTERNAL: &[(&str, &[&str], &str)] = &[
         "serat-contracts is the IPC contract: the types and the TypeScript generated from them (ADR-0007). It is compiled so contracts/ipc.rs cannot drift from its bindings, not so that it can do anything. A capability here would be a capability on both sides of the boundary at once.",
     ),
     (
+        "serat-extract",
+        &[
+            "reqwest", "hyper", "ureq", "curl", "isahc", "surf", "tokio", "rusqlite", "comrak",
+        ],
+        "serat-extract runs untrusted binaries, and T-03's mechanism is that the worker links no HTTP client AT ALL — so a network call from an extractor is a link error rather than a policy someone can misconfigure (ADR-0004, NFR-SEC-03). A dependency here is the difference between a boundary and an intention. It also owns no database and no Markdown: it turns a binary into the same block rows a parser emits, and hands them on.",
+    ),
+    (
+        "serat-ai",
+        &["rusqlite", "comrak", "notify"],
+        "serat-ai is the one crate that may reach a network at all, and NFR-SEC-02 says every outbound call goes through one client here — so the forbid list cannot name HTTP. What it can say is that retrieval reads through a trait rather than a connection, so an embedding path cannot quietly become a second query engine, and that it parses nothing.",
+    ),
+    (
+        "serat-mcp",
+        &["rusqlite", "comrak", "reqwest", "hyper", "ureq"],
+        "serat-mcp is a second front door onto the same query API the UI uses, not a second implementation of anything (§2.1). Linking a database would be exactly that second implementation, and it is how an external agent ends up seeing a staler vault than the window does. NFR-SEC-05 also binds it to stdio or a unix socket: there is no TCP listener in the codebase, and no HTTP client either.",
+    ),
+    (
         "serat-sq",
         &["rusqlite"],
         "serat-sq emits a statement and a plan and does not execute (§2.1). Linking a database is how a compiler becomes an engine, and it is what lets SQ be typechecked against a SchemaProvider without one.",
@@ -233,14 +250,30 @@ fn violations_in(packages: &[Package]) -> Vec<String> {
 
 #[test]
 fn no_crate_acquires_a_capability_it_was_defined_not_to_have() {
-    // The other half of §2.1. The dependency rule keeps the graph acyclic; this keeps
-    // each crate's charter honest. Nothing else would catch serat-index taking comrak:
-    // the graph stays perfectly acyclic, every existing test passes, and the crate has
-    // simply stopped being what the design says it is.
-    let metadata = workspace_metadata();
+    let violations = capability_violations(&workspace_metadata());
+    assert!(
+        violations.is_empty(),
+        "a crate acquired a capability §2.1 says it does not own:
+  - {}",
+        violations.join(
+            "
+  - "
+        )
+    );
+}
+
+/// Every capability a package took that its charter forbids.
+///
+/// Separated from the test that calls it so the entries for crates that do not exist
+/// yet can be exercised. Four of the forbid lists — serat-extract, serat-ai, serat-mcp,
+/// serat-sq — describe crates nobody has written, so against the real workspace they
+/// match nothing and cannot fail. An entry that cannot fire is not yet a guard, and
+/// serat-extract's is the one where that matters most: T-03's whole mechanism is that
+/// the worker links no HTTP client at all.
+fn capability_violations(packages: &[Package]) -> Vec<String> {
     let mut violations = Vec::new();
 
-    for package in &metadata {
+    for package in packages {
         let Some((_, forbidden, reason)) = FORBIDDEN_EXTERNAL
             .iter()
             .find(|(name, _, _)| *name == package.name)
@@ -261,41 +294,31 @@ fn no_crate_acquires_a_capability_it_was_defined_not_to_have() {
         }
     }
 
-    assert!(
-        violations.is_empty(),
-        "a crate acquired a capability §2.1 says it does not own:
-  - {}",
-        violations.join(
-            "
-  - "
-        )
-    );
+    violations
 }
 
-/// Crates in [`POLICY`] that deliberately have no forbid-list entry yet.
+/// Crates in [`POLICY`] that deliberately have no forbid-list entry.
 ///
-/// F-91. The staleness check below runs forbid-list to POLICY; without this the other
+/// F-91. The staleness check runs forbid-list to POLICY; without this the other
 /// direction is silent — a crate with no entry falls through the `continue` in
-/// `no_crate_acquires_a_capability_it_was_defined_not_to_have` and is simply
-/// unprotected, with nothing to prompt whoever adds it.
+/// `capability_violations` and is simply unprotected, with nothing to prompt whoever
+/// adds it. So the complement is written down and asserted to be exact.
 ///
-/// So the complement is written down and asserted to be exact. Adding a crate to
-/// POLICY then forces a decision: give it a forbid list, or record here that it does
-/// not have one yet.
+/// Both entries are deliberate rather than pending:
 ///
-/// `serat-extract` is why this is not left for later. Its charter is a security
-/// boundary — ADR-0004 and T-03: the worker links no HTTP client at all, so a network
-/// call is a link error rather than a runtime check. That is exactly the claim that
-/// wants a mechanical guard on the day the crate arrives, not a month afterwards.
-const NO_FORBID_LIST_YET: &[&str] = &[
-    "serat-core",    // held to something stricter by CORE_ALLOWED_EXTERNAL
-    "serat-extract", // give it one when it arrives: no HTTP client (T-03, ADR-0004)
-    "serat-ai",      // the one crate that may reach a network at all (NFR-SEC-02)
-    "serat-mcp",     // no second implementation of anything (§2.1)
-    "serat-app",     // depends on everything by design
-    "vaultgen",      // tool tier, zero dependencies by test-engineer's decision
-    "budget",        // tool tier, links the product in order to measure it
-];
+/// * `serat-core` is held to something stricter by `CORE_ALLOWED_EXTERNAL`, which is
+///   an allow-list because "performs no I/O whatsoever" is a claim about everything it
+///   links rather than about named crates.
+/// * `serat-app` depends on every crate by design, and its charter — "no domain logic
+///   of any kind" — is a statement about what its code does rather than about what it
+///   links, so no dependency list can express it. The mechanical guard that does apply
+///   already exists: nothing may depend on serat-app, so whatever it grows cannot leak
+///   into the product.
+///
+/// The tool-tier crates are here because the dependency rule governs the product graph
+/// and they sit outside it, which `nothing_in_the_product_depends_on_a_bench_crate`
+/// already enforces from the direction that matters.
+const NO_FORBID_LIST_YET: &[&str] = &["serat-core", "serat-app", "vaultgen", "budget"];
 
 #[test]
 fn every_crate_either_has_a_forbid_list_or_is_recorded_as_not_having_one() {
@@ -780,6 +803,72 @@ mod the_check_catches {
             ),
         ];
         assert!(violations_in(&packages).is_empty());
+    }
+
+    #[test]
+    fn the_extraction_worker_linking_an_http_client() {
+        // T-03 and ADR-0004: extraction runs untrusted binaries in a child process
+        // with no network, and the mechanism is that the worker links no HTTP client
+        // at all — a network call is a link error rather than a policy that can be
+        // misconfigured. serat-extract does not exist yet, so its forbid list matches
+        // nothing against the real workspace and cannot fail there.
+        for client in ["reqwest", "hyper", "ureq", "curl"] {
+            let packages = [Package::new(
+                "serat-extract",
+                &[("serat-core", None), (client, None)],
+            )];
+            let violations = super::capability_violations(&packages);
+            assert_eq!(
+                violations.len(),
+                1,
+                "{client} was permitted: {violations:?}"
+            );
+            assert!(
+                violations[0].contains("link error"),
+                "the failure does not say why it is a link error rather than a check: {}",
+                violations[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_mcp_server_linking_a_database() {
+        // §2.1: serat-mcp is a second front door onto the same query API, not a second
+        // implementation of anything. Linking rusqlite is exactly that second
+        // implementation, and it is how an external agent ends up seeing a staler vault
+        // than the window does.
+        let packages = [Package::new(
+            "serat-mcp",
+            &[("serat-core", None), ("rusqlite", None)],
+        )];
+        let violations = super::capability_violations(&packages);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn the_query_compiler_linking_the_database_it_compiles_for() {
+        let packages = [Package::new(
+            "serat-sq",
+            &[("serat-core", None), ("rusqlite", None)],
+        )];
+        assert_eq!(super::capability_violations(&packages).len(), 1);
+    }
+
+    #[test]
+    fn and_a_dependency_a_charter_permits_is_not_flagged() {
+        // The converse, and the one that matters for a forbid list's credibility: it
+        // must not block a legitimate dependency. serat-ai may reach a network —
+        // NFR-SEC-02 says every outbound call goes through one client there — so an
+        // HTTP client in serat-ai is correct and must pass.
+        let packages = [
+            Package::new("serat-ai", &[("serat-core", None), ("reqwest", None)]),
+            Package::new("serat-index", &[("serat-core", None), ("rayon", None)]),
+            Package::new(
+                "serat-extract",
+                &[("serat-core", None), ("serde_json", None)],
+            ),
+        ];
+        assert!(super::capability_violations(&packages).is_empty());
     }
 
     #[test]
