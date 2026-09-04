@@ -322,47 +322,42 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             // These three answer with something other than `()`, so they are handled
             // here and not through the Barrier path.
             //
-            // Each drains the batch first, and the drain is currently unreachable —
-            // which is worth stating rather than leaving as an implied guarantee.
-            // Every iteration of this loop ends in a `commit`, and these arms are
-            // reached either as the first command of an iteration or from `deferred`,
-            // so `pending` is empty both ways. Removing the drains passes every test,
-            // and the tests suggested for them cannot bite, because the hazard they
-            // guard cannot currently be produced. A probe asserting `pending.is_empty()`
-            // at each of the three never fired across the whole suite.
+            // Each drains the batch first, and it is worth being exact about when that
+            // matters. On the success path it never does: every iteration of this loop
+            // ends in a `commit`, and these arms are entered either as an iteration's
+            // first command or from `deferred`, so `pending` is empty both ways. A
+            // probe asserting that never fired across the suite, and the tests one
+            // would naturally write for the drains enter the arms with nothing to drain
+            // and prove nothing.
             //
-            // They stay, as the correct behaviour if that ever stops being true — a
-            // bulk load that began with operations still queued would load them through
-            // the triggers it was about to drop, and the rows would be missing from
-            // search with `blocks` perfectly correct. The `debug_assert` is what makes
-            // the invariant enforced rather than remembered: a future change to the
-            // loop that lets work reach here undrained fails loudly in tests instead of
-            // silently relying on a guard nobody has exercised.
+            // The route that does reach them is a failed commit. `commit` clears
+            // `pending` at its end, after apply, sync_note_count and tx.commit, so an
+            // error before any of those returns through `?` with the batch still in
+            // hand — which is the IndexFault case §3.4 exists for. The next command
+            // then meets a non-empty `pending`, and these drains are what re-attempt
+            // it and report the failure rather than silently carrying a batch that a
+            // bulk load is about to make meaningless.
+            //
+            // An earlier version asserted the invariant instead of testing it. The
+            // assertion was false on exactly that route, so a SQLite failure panicked
+            // the writer thread in every debug build — killing the actor at the moment
+            // the index was already in trouble. The lesson is not that asserting an
+            // invariant is a poor substitute for an untestable path, but that the
+            // substitute is only as good as the search for routes into it, and that
+            // search covered the success path only.
             Command::BeginBulkLoad(reply) => {
-                debug_assert!(
-                    pending.is_empty(),
-                    "work reached BeginBulkLoad undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
-                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| begin_bulk_load(&conn));
                 let _ = reply.send(result);
                 continue;
             }
             Command::EndBulkLoad(triggers, reply) => {
-                debug_assert!(
-                    pending.is_empty(),
-                    "work reached EndBulkLoad undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
-                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| end_bulk_load(&conn, &triggers));
                 let _ = reply.send(result);
                 continue;
             }
             Command::ResolveLinks(reply) => {
-                debug_assert!(
-                    pending.is_empty(),
-                    "work reached ResolveLinks undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
-                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);
@@ -492,6 +487,16 @@ enum Barrier {
 }
 
 /// Apply a batch in one transaction, keeping `note_count` in step inside it.
+/// Makes the next `commit` fail once, so a test can reach the code that runs when a
+/// batch is left in hand.
+///
+/// A commit failure cannot be provoked from outside — it needs SQLite to refuse — and
+/// the path it opens is the one that turned an assertion into a panic in every debug
+/// build. A one-line seam is a smaller price than leaving that route untested.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_COMMIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn commit(
     conn: &Connection,
     pending: &mut Vec<IndexOp>,
@@ -499,6 +504,13 @@ fn commit(
 ) -> Result<(), IndexError> {
     if pending.is_empty() {
         return Ok(());
+    }
+
+    #[cfg(test)]
+    if FAIL_NEXT_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(IndexError::Corrupt {
+            message: "simulated commit failure".to_owned(),
+        });
     }
 
     let tx = conn.unchecked_transaction().map_err(sqlite)?;
@@ -536,4 +548,85 @@ fn mark_ready(conn: &Connection, vault_root: &str) -> Result<(), IndexError> {
     apply::sync_note_count(&tx)?;
     apply::mark_ready(&tx, vault_root)?;
     tx.commit().map_err(sqlite)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serat_core::{ContentHash, NoteKind, NoteMeta, VaultPath};
+    use std::sync::atomic::Ordering;
+
+    fn asset(path: &str) -> IndexOp {
+        let path = VaultPath::new(path).expect("path");
+        IndexOp::UpsertAsset {
+            meta: NoteMeta {
+                kind: NoteKind::Asset,
+                hash: ContentHash::from_bytes([2u8; 32]),
+                size: 0,
+                mtime_ms: 0,
+                path,
+            },
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_the_batch_for_the_next_command_and_does_not_kill_the_writer() {
+        // The route the unreachability analysis missed. commit clears `pending` at its
+        // end, so an error before that returns with the batch still in hand and the
+        // next command meets a non-empty queue. An earlier version asserted that could
+        // not happen; the assertion panicked the writer thread here, in every debug
+        // build, at the moment the index was already in trouble.
+        //
+        // What must be true instead: the failure reaches the caller that provoked it,
+        // the actor stays alive, the next command drains what was left, and no work is
+        // lost.
+        //
+        // One test rather than two, because the seam is a process-wide static and two
+        // tests sharing it race — the first version of this had one test's injected
+        // failure surface in the other, which is a test that fails for a reason that
+        // says nothing about the code.
+        // File-backed rather than in-memory, so a second connection can observe what
+        // the actor has committed between one command and the next. That is what makes
+        // the drain observable: with it removed, resolve_links returns Ok(0) either
+        // way, because an empty links table resolves to nothing whether or not the
+        // batch was applied first.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        let conn = schema::open(&path).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        let actor = IndexActor::with_connection(conn);
+        let writer = actor.handle();
+
+        writer.submit(asset("assets/a.pdf")).expect("submit");
+        FAIL_NEXT_COMMIT.store(true, Ordering::SeqCst);
+
+        let failed = writer.flush();
+        assert!(
+            matches!(failed, Err(IndexError::Corrupt { .. })),
+            "the injected failure was not reported to the caller: {failed:?}"
+        );
+
+        // The batch is still in hand. A command arriving now must drain it rather than
+        // run against an index missing the work — and must not find a dead actor.
+        let resolved = writer.resolve_links();
+        assert!(
+            !matches!(resolved, Err(IndexError::WriterStopped)),
+            "the writer died on a failed commit; the caller was told the actor had              stopped when it had only failed a transaction"
+        );
+        assert!(resolved.is_ok(), "{resolved:?}");
+
+        // The work the failed commit was carrying is in the index by now, because
+        // resolve_links drained it first. Read it through a separate connection: this
+        // is the assertion that fails if the drain is removed.
+        let reader = schema::open(&path).expect("reader");
+        let notes: i64 = reader
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            notes, 1,
+            "the batch left in hand by the failed commit was not applied by the next              command; the work is still queued and a bulk load would have run without it"
+        );
+
+        actor.shutdown().expect("shutdown");
+    }
 }
