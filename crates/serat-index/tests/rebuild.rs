@@ -259,7 +259,28 @@ fn a_rebuild_over_an_existing_index_replaces_it_rather_than_merging() {
     let dir = tempfile::tempdir().expect("temp");
     let first = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("first");
     let second = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("second");
-    assert_eq!(first, second);
+
+    // Counts only. The phase durations differ run to run by construction, so comparing
+    // whole reports would be asserting that a clock is deterministic.
+    assert_eq!(
+        (
+            first.notes,
+            first.blocks,
+            first.fields,
+            first.links,
+            first.tasks,
+            first.links_resolved
+        ),
+        (
+            second.notes,
+            second.blocks,
+            second.fields,
+            second.links,
+            second.tasks,
+            second.links_resolved
+        ),
+        "a second rebuild produced a different index"
+    );
 }
 
 #[test]
@@ -746,4 +767,151 @@ fn a_rebuild_loses_nothing_when_it_outruns_the_writer() {
         "the rebuild lost notes under backpressure"
     );
     assert_eq!(report.skipped, 0, "the rebuild skipped notes it could read");
+}
+
+// ---------------------------------------------------------------------------
+// The rebuild sequence: bulk load, link resolution, phase timings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_rebuild_leaves_the_fts_triggers_in_place() {
+    // The rebuild drops the triggers to bulk load and restores them from
+    // sqlite_master. If it forgot the restore, the bulk index would be correct and
+    // every later save would be silently absent from search — so the check that
+    // matters is that an insert made *after* the rebuild is findable.
+    let dir = tempfile::tempdir().expect("temp");
+    rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+
+    let path = rebuild_path(dir.path());
+    let conn = schema::open(&path).expect("open");
+
+    let triggers: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = 'blocks'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count triggers");
+    assert_eq!(triggers, 3, "the rebuild did not restore the FTS triggers");
+
+    conn.execute(
+        "INSERT INTO notes (id, path, kind, mtime, hash) \
+         VALUES (99, 'later.md', 'note', 0, 'h')",
+        [],
+    )
+    .expect("note");
+    conn.execute(
+        "INSERT INTO blocks (note_id, ord, kind, text) \
+         VALUES (99, 0, 'para', 'written after the rebuild')",
+        [],
+    )
+    .expect("block");
+
+    let hits: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM blocks_fts WHERE blocks_fts MATCH 'afterwards OR rebuild'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("fts");
+    assert!(hits > 0, "a save after the rebuild is not searchable");
+
+    conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES ('integrity-check');")
+        .expect("the bulk-built index must be internally consistent");
+}
+
+#[test]
+fn links_are_resolved_once_every_note_exists() {
+    // The second pass the foreign key forces. A link can name a note that has not been
+    // inserted yet, so dst_note starts NULL and is filled at the end.
+    let dir = tempfile::tempdir().expect("temp");
+    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+
+    assert_eq!(report.links, 2);
+    assert_eq!(
+        report.links_resolved, 2,
+        "the two mutual links between the fixture's notes were not resolved"
+    );
+
+    let conn = schema::open(&rebuild_path(dir.path())).expect("open");
+    let unresolved: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM links WHERE dst_note IS NULL AND kind <> 'tag'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(unresolved, 0, "links remained unresolved after the rebuild");
+}
+
+#[test]
+fn a_link_to_a_note_that_does_not_exist_stays_unresolved_rather_than_wrong() {
+    // The half that matters more: resolution must leave a dangling link NULL, not
+    // point it at whatever happened to be nearby. A link to a note nobody has written
+    // yet is how people write.
+    let vault = FakeVault::with(&[(
+        "10-projects/serat.md",
+        "# Serat\n[[20-systems/does-not-exist]]\n",
+    )]);
+    let dir = tempfile::tempdir().expect("temp");
+    let report = rebuild(&vault, &LineParser::default(), dir.path()).expect("rebuild");
+
+    assert_eq!(report.links, 1);
+    assert_eq!(
+        report.links_resolved, 0,
+        "a dangling link was resolved to something"
+    );
+
+    let conn = schema::open(&rebuild_path(dir.path())).expect("open");
+    let dst: Option<i64> = conn
+        .query_row("SELECT dst_note FROM links", [], |row| row.get(0))
+        .expect("link row");
+    assert_eq!(dst, None);
+}
+
+#[test]
+fn the_report_breaks_the_rebuild_into_phases() {
+    // F-10. A single wall-clock number cannot settle open design question 1, which
+    // architecture §1.2 says the P0 benchmark answers: reported as one figure, "the
+    // writer dominates" and "reading the vault off disk dominates" are
+    // indistinguishable while implying completely different fixes.
+    let files: Vec<(String, String)> = (0..200)
+        .map(|i| {
+            (
+                format!("10-projects/note-{i:04}.md"),
+                format!("# Note {i}\ntype:: project\nstatus:: active\n"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+
+    let dir = tempfile::tempdir().expect("temp");
+    let report = rebuild(
+        &FakeVault::with(&borrowed),
+        &LineParser::default(),
+        dir.path(),
+    )
+    .expect("rebuild");
+
+    assert_eq!(report.notes, 200);
+    assert!(
+        report.read_hash > std::time::Duration::ZERO,
+        "the read phase was not measured"
+    );
+    assert!(
+        report.parse > std::time::Duration::ZERO,
+        "the parse phase was not measured"
+    );
+    // walk and write can legitimately round to zero on a fast in-memory fixture, so
+    // asserting they are non-zero would be asserting the clock's resolution rather
+    // than the code. What must hold is that no phase exceeds the whole.
+    let total = report.walk + report.read_hash + report.parse + report.write;
+    assert!(
+        total < std::time::Duration::from_secs(60),
+        "the phases sum to {total:?}, which is not plausible for 200 notes"
+    );
 }

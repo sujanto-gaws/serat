@@ -6,6 +6,7 @@
 //! rebuild would be a second implementation of the truth.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serat_core::{IndexError, IndexOp, IndexWriter, NoteKind, NoteParser, NoteSource, VaultPath};
 
@@ -29,6 +30,27 @@ pub struct RebuildReport {
     pub links: usize,
     /// Rows in `tasks`.
     pub tasks: usize,
+    /// Links that now point at a note, filled by the second pass.
+    pub links_resolved: usize,
+    /// How long enumerating the vault took.
+    ///
+    /// The four phases exist because a single wall-clock number cannot settle open
+    /// design question 1 — does the parse pool or the index writer dominate a rebuild
+    /// — which architecture §1.2 says the P0 benchmark answers. Reported as one figure,
+    /// "the writer dominates" and "reading 39 MiB off disk dominates" are
+    /// indistinguishable while implying completely different fixes (F-10).
+    pub walk: Duration,
+    /// How long reading and hashing files took.
+    pub read_hash: Duration,
+    /// How long parsing took.
+    pub parse: Duration,
+    /// How long the writer took, measured as the barrier at the end: everything
+    /// submitted but not yet applied when the last file was parsed.
+    ///
+    /// The four will not sum to the wall clock, and that gap is a finding rather than
+    /// a defect — it is the producer and the writer overlapping, which is the whole
+    /// point of the actor.
+    pub write: Duration,
     /// Files the source refused to read. Not a failure: a file deleted while the
     /// rebuild was walking is ordinary, and one unreadable file must not stop a vault
     /// indexing (design goal 5).
@@ -105,44 +127,89 @@ pub fn rebuild_with_queue_depth(
     let actor = IndexActor::with_capacity(conn, queue_depth);
     let writer = actor.handle();
 
+    // Step 2 of the sequence in schema/001_init.sql: the triggers come off before any
+    // row is loaded. Loading 26,000 blocks through them costs 6x, and at 260,000 the
+    // trigger shape did not finish in 25 minutes — so this is the difference between
+    // a rebuild that completes and one that does not, not a micro-optimisation.
+    let triggers = writer.begin_bulk_load()?;
+
+    let started = Instant::now();
     let entries = source.entries().map_err(|err| IndexError::Corrupt {
         message: format!("could not enumerate the vault: {err}"),
     })?;
+    let walk = started.elapsed();
 
+    let mut timing = Phases::default();
     let mut skipped = 0usize;
     for path in entries {
-        match index_one(source, parser, &writer, &path) {
+        match index_one(source, parser, &writer, &path, &mut timing) {
             Ok(()) => {}
             Err(Skip) => skipped += 1,
         }
     }
 
     // The barrier. Everything above is asynchronous; nothing below may observe a
-    // partial index.
+    // partial index. What it costs is the writer's backlog — the work the producer
+    // did not have to wait for — which is the honest reading of the write phase.
+    let drain = Instant::now();
     writer.flush()?;
+    let write = timing.write + drain.elapsed();
+
+    // Steps 4 and 5: build the FTS index in one pass, then put the triggers back so
+    // the incremental path keeps working.
+    writer.end_bulk_load(triggers)?;
+
+    // The second pass the foreign key forces.
+    let links_resolved = writer.resolve_links()?;
+
+    // Step 6, and only after everything above has committed: marking the index ready
+    // is what makes a crash mid-rebuild recoverable, because a rebuild that died
+    // between dropping the triggers and restoring them leaves the state building.
     writer.analyze()?;
     writer.mark_ready(&index_dir.to_string_lossy())?;
     actor.shutdown()?;
 
-    let report = count(&path, skipped)?;
+    let mut report = count(&path, skipped)?;
+    report.links_resolved = links_resolved;
+    report.walk = walk;
+    report.read_hash = timing.read_hash;
+    report.parse = timing.parse;
+    report.write = write;
     Ok(report)
 }
 
 /// A file that could not be read or parsed. Counted, not propagated.
 struct Skip;
 
+/// Time spent in each phase, accumulated across files.
+#[derive(Debug, Default)]
+struct Phases {
+    read_hash: Duration,
+    parse: Duration,
+    write: Duration,
+}
+
 fn index_one(
     source: &dyn NoteSource,
     parser: &dyn NoteParser,
     writer: &WriterHandle,
+    // Takes the bare path because that is what NoteSource::entries returns on main.
+    // F-29b enriches it to SourceEntry (kind, size, mtime) so the rebuild stops
+    // re-deriving what the walk already knew; that change is on the I2 branch and
+    // adapting this is one line once it merges.
     path: &VaultPath,
+    timing: &mut Phases,
 ) -> Result<(), Skip> {
+    let reading = Instant::now();
     let loaded = source.load(path).map_err(|_| Skip)?;
+    timing.read_hash += reading.elapsed();
 
     let op = match loaded.meta.kind {
         NoteKind::Asset => IndexOp::UpsertAsset { meta: loaded.meta },
         NoteKind::Note => {
+            let parsing = Instant::now();
             let parsed = parser.parse(path, &loaded.bytes).map_err(|_| Skip)?;
+            timing.parse += parsing.elapsed();
             IndexOp::UpsertNote {
                 meta: loaded.meta,
                 parsed: Box::new(parsed),
@@ -157,7 +224,13 @@ fn index_one(
     // walk). During a rebuild nothing will ever tell us about this file again, so
     // dropping it would mean quietly indexing part of the vault — the failure a
     // wall-clock benchmark number cannot see. Here the producer waits for the writer.
-    writer.submit_blocking(op).map_err(|_| Skip)
+    // Only the waiting counts as write time here: the writer's own work happens on
+    // its thread and is charged at the barrier. What this measures is the producer
+    // being held up, which is the number that says the writer is the bottleneck.
+    let submitting = Instant::now();
+    let result = writer.submit_blocking(op).map_err(|_| Skip);
+    timing.write += submitting.elapsed();
+    result
 }
 
 /// Count what actually landed.
@@ -176,6 +249,7 @@ fn count(path: &Path, skipped: usize) -> Result<RebuildReport, IndexError> {
         links: one("SELECT count(*) FROM links")?,
         tasks: one("SELECT count(*) FROM tasks")?,
         skipped,
+        ..RebuildReport::default()
     })
 }
 

@@ -57,6 +57,12 @@ enum Command {
     Analyze(SyncSender<Result<(), IndexError>>),
     /// Mark the index ready and record the vault it was built from.
     MarkReady(String, SyncSender<Result<(), IndexError>>),
+    /// Capture and drop the blocks_fts triggers before a bulk load.
+    BeginBulkLoad(SyncSender<Result<Vec<String>, IndexError>>),
+    /// Rebuild the FTS index in one pass and restore the captured triggers.
+    EndBulkLoad(Vec<String>, SyncSender<Result<(), IndexError>>),
+    /// Resolve every link whose target is now present.
+    ResolveLinks(SyncSender<Result<usize, IndexError>>),
     /// Apply anything in hand and end the loop.
     ///
     /// An explicit message rather than relying on every sender being dropped: handles
@@ -119,6 +125,55 @@ impl WriterHandle {
         self.tx
             .send(Command::Apply(Box::new(op)))
             .map_err(|_| IndexError::WriterStopped)
+    }
+
+    /// Drop the `blocks_fts` triggers, returning their definitions.
+    ///
+    /// Step 2 of the rebuild sequence in `schema/001_init.sql`. The definitions come
+    /// out of `sqlite_master` rather than from a second copy of the DDL, so what is
+    /// restored is identical to what was delivered by construction rather than by a
+    /// test that has to catch a stale copy.
+    ///
+    /// Loading through the triggers is 6x slower at 26,000 blocks and unbounded at
+    /// 260,000 — architect abandoned that shape after 25 minutes — so this is not a
+    /// micro-optimisation, it is the difference between a rebuild that finishes and
+    /// one that does not.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::WriterStopped`], or whatever SQLite says.
+    pub fn begin_bulk_load(&self) -> Result<Vec<String>, IndexError> {
+        let (reply, answer) = sync_channel(1);
+        self.tx
+            .send(Command::BeginBulkLoad(reply))
+            .map_err(|_| IndexError::WriterStopped)?;
+        answer.recv().map_err(|_| IndexError::WriterStopped)?
+    }
+
+    /// Rebuild the FTS index in one pass and put the triggers back.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriterHandle::begin_bulk_load`]. A failure here leaves the index without
+    /// its triggers, which is why the caller must not mark it ready.
+    pub fn end_bulk_load(&self, triggers: Vec<String>) -> Result<(), IndexError> {
+        self.round_trip(|reply| Command::EndBulkLoad(triggers, reply))
+    }
+
+    /// Point every link at the note it names, where that note now exists.
+    ///
+    /// Necessarily a second pass: a link can name a note that has not been inserted
+    /// yet, and `links.dst_note` is a foreign key. Returns how many resolved.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriterHandle::begin_bulk_load`].
+    pub fn resolve_links(&self) -> Result<usize, IndexError> {
+        let (reply, answer) = sync_channel(1);
+        self.tx
+            .send(Command::ResolveLinks(reply))
+            .map_err(|_| IndexError::WriterStopped)?;
+        answer.recv().map_err(|_| IndexError::WriterStopped)?
     }
 
     /// Run `ANALYZE` and wait for it.
@@ -238,21 +293,54 @@ impl Drop for IndexActor {
 fn run(conn: Connection, rx: &Receiver<Command>) {
     let mut pending: Vec<IndexOp> = Vec::with_capacity(BATCH_SIZE);
     let mut since_analyze = 0usize;
+    // A command taken off the channel while draining a batch that cannot be folded
+    // into it. Held here rather than pushed back, because a channel has no way to
+    // un-receive and dropping it would lose a caller's barrier.
+    let mut deferred: Option<Command> = None;
 
     loop {
-        let Ok(first) = rx.recv() else {
-            // Sender dropped: apply whatever is in hand and stop. Discarding a queued
-            // change at shutdown would leave the index disagreeing with the disk.
-            let _ = commit(&conn, &mut pending, &mut since_analyze);
-            return;
+        let next = match deferred.take() {
+            Some(command) => command,
+            None => match rx.recv() {
+                Ok(command) => command,
+                // Every sender dropped: apply whatever is in hand and stop. Discarding
+                // a queued change at shutdown would leave the index disagreeing with
+                // the disk.
+                Err(_) => {
+                    let _ = commit(&conn, &mut pending, &mut since_analyze);
+                    return;
+                }
+            },
         };
 
         let mut barrier: Option<(SyncSender<Result<(), IndexError>>, Barrier)> = None;
-        match first {
+        match next {
             Command::Apply(op) => pending.push(*op),
             Command::Flush(reply) => barrier = Some((reply, Barrier::None)),
             Command::Analyze(reply) => barrier = Some((reply, Barrier::Analyze)),
             Command::MarkReady(root, reply) => barrier = Some((reply, Barrier::MarkReady(root))),
+            // These three answer with something other than `()`, so they are handled
+            // here and not through the Barrier path. Each drains the batch first: a
+            // bulk load that began with operations still queued would load them
+            // through the triggers it was about to drop.
+            Command::BeginBulkLoad(reply) => {
+                let result = commit(&conn, &mut pending, &mut since_analyze)
+                    .and_then(|()| begin_bulk_load(&conn));
+                let _ = reply.send(result);
+                continue;
+            }
+            Command::EndBulkLoad(triggers, reply) => {
+                let result = commit(&conn, &mut pending, &mut since_analyze)
+                    .and_then(|()| end_bulk_load(&conn, &triggers));
+                let _ = reply.send(result);
+                continue;
+            }
+            Command::ResolveLinks(reply) => {
+                let result = commit(&conn, &mut pending, &mut since_analyze)
+                    .and_then(|()| resolve_links(&conn));
+                let _ = reply.send(result);
+                continue;
+            }
             Command::Stop => {
                 let _ = commit(&conn, &mut pending, &mut since_analyze);
                 return;
@@ -271,6 +359,10 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                 Ok(Command::Stop) => {
                     let _ = commit(&conn, &mut pending, &mut since_analyze);
                     return;
+                }
+                Ok(other) => {
+                    deferred = Some(other);
+                    break;
                 }
                 Err(_) => break,
             }
@@ -291,6 +383,79 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             let _ = reply.send(result);
         }
     }
+}
+
+/// Capture the `blocks_fts` trigger definitions and drop them.
+fn begin_bulk_load(conn: &Connection) -> Result<Vec<String>, IndexError> {
+    let definitions: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master                  WHERE type = 'trigger' AND tbl_name = 'blocks' ORDER BY name",
+            )
+            .map_err(sqlite)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite)?
+    };
+
+    for definition in &definitions {
+        // The name is the third whitespace-separated token of CREATE TRIGGER <name>.
+        if let Some(name) = definition.split_whitespace().nth(2) {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+                .map_err(sqlite)?;
+        }
+    }
+    Ok(definitions)
+}
+
+/// Build the FTS index in one pass and restore the triggers.
+fn end_bulk_load(conn: &Connection, triggers: &[String]) -> Result<(), IndexError> {
+    conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild');")
+        .map_err(sqlite)?;
+    for definition in triggers {
+        conn.execute_batch(&format!("{definition};"))
+            .map_err(sqlite)?;
+    }
+    Ok(())
+}
+
+/// Point every link at the note it names, where that note exists.
+///
+/// The second pass the foreign key forces: a link can name a note that has not been
+/// inserted yet, so `dst_note` starts NULL and is filled once every note is present.
+///
+/// P0 resolves by exact path and by path plus the Markdown extension, which is what
+/// the benchmark vault and an Obsidian vault using full paths both produce. Obsidian's
+/// shortest-unique-name resolution is P1 and belongs with the rest of link handling;
+/// what matters here is that unresolved stays NULL rather than becoming wrong.
+fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
+    // The EXISTS clause is load-bearing twice over. Without it the UPDATE touches
+    // every unresolved link and sets dst_note to NULL again where the target is
+    // missing — so the row count comes back as "rows touched" rather than "links
+    // resolved", and a dangling link reads as resolved. It also keeps a rebuild from
+    // writing to rows it has nothing to say about.
+    let resolved = conn
+        .execute(
+            "UPDATE links
+                SET dst_note = (
+                    SELECT n.id FROM notes n
+                     WHERE n.path = links.dst_path
+                        OR n.path = links.dst_path || '.md'
+                     LIMIT 1
+                )
+              WHERE dst_note IS NULL
+                AND kind <> 'tag'
+                AND dst_path IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM notes n
+                     WHERE n.path = links.dst_path
+                        OR n.path = links.dst_path || '.md'
+                )",
+            [],
+        )
+        .map_err(sqlite)?;
+    Ok(resolved)
 }
 
 enum Barrier {
