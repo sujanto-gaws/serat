@@ -23,7 +23,7 @@ What exists instead is a verification apparatus with no subject yet: the benchma
 
 ## What P0 actually produced
 
-**40 recorded findings** (`tasks-p0-spike.md`), every one measured or reproduced rather than argued. P0's stated purpose is to replace blueprint targets with real numbers; it did not do that. What it did instead, at a cost of one merge, was find a class of defect that would have made those numbers untrustworthy had they been taken.
+**62 recorded findings** (`tasks-p0-spike.md`), every one measured or reproduced rather than argued — including several that correct earlier findings, and two that correct the lead. P0's stated purpose is to replace blueprint targets with real numbers; it did not do that. What it did instead, at a cost of one merge, was find a class of defect that would have made those numbers untrustworthy had they been taken.
 
 ### The four findings that would have corrupted the gate result
 
@@ -38,13 +38,13 @@ Every one is invisible **in the direction that flatters the number**. Had the nu
 
 ### The pattern, which is the transferable result
 
-**Five tests that could not fail, across three teammates** (F-13, F-28, F-35), every one found by mutation or boundary arithmetic and none by reading. Twice, the fix for one produced another that still could not fail — including one the lead merged (F-28). The generalisation (F-40): the useful question is *which of these guards can be removed without a test going red*, and the stronger answer is a structural guarantee no deletion can reach. Two mechanisms guarded F-19; one could be deleted silently, the other could not, and its author's own assessment was that the difference was luck as much as design.
+**Six tests that could not fail, across three teammates** (F-13, F-28, F-35, F-50), every one found by mutation or boundary arithmetic and none by reading. Twice, the fix for one produced another that still could not fail — including one the lead merged (F-28) — and the sixth was the guard for F-19, the spike's headline defect. The sharpest statement of the pattern is its most frequent author's (F-58): *"I write the assertion correctly and then arrange the setup so the code path under test is never entered."* Reading the test tells you nothing, because the assertion looks right; the check is whether the setup reaches the path, not whether the assertion is correct. The generalisation (F-40): the useful question is *which of these guards can be removed without a test going red*, and the stronger answer is a structural guarantee no deletion can reach. Two mechanisms guarded F-19; one could be deleted silently, the other could not, and its author's own assessment was that the difference was luck as much as design.
 
 ### Design defects found by implementation
 
 - **F-11** — the drop-latch-rescan recovery path re-entered the loss: capacity 8,192 against 20,200 sorted paths, FIFO, so the same prefix won every rescan and **12,008 files never reached the consumer after five rescans**.
 - **F-31** — ADR-0011's own clear-on-completion wording still lost an overflow occurring *during* the rescan; found by its author reading the ADR against the first implementation to meet it. Recorded against the ADR, not the code.
-- **F-32** — a bulk load with the FTS triggers live **had not finished after 25 minutes at 260,000 blocks**, against 0.32 s with them dropped.
+- **F-32** — a bulk load with the FTS triggers live costs about **6x** on the phase that must fit inside a 30 s budget: 26,000 blocks at 2.1 s live against 0.32 s dropped, independently reproduced at 5.8x. *An earlier, larger figure was struck by its own author as an abandoned run rather than a measurement; the lead had repeated it twice before it was withdrawn.*
 - **F-16** — the PRD's data dictionary contradicts the DDL; the DDL is correct, because a note-level FTS table cannot answer *which block* and so cannot serve a citation or a locator.
 - **F-15, F-33** — a folder rename reached nothing; `write_atomic` silently widens the permissions of a note the user chmod'd 600 (design goal 1).
 
@@ -61,9 +61,9 @@ Every one is invisible **in the direction that flatters the number**. Had the nu
 
 ## Artifacts
 
-**On main (28 commits):** the Cargo workspace and a mechanically-enforced dependency rule; `serat-core`; the deterministic 20k/50k benchmark vault generator (`bench/vaultgen`, one command, byte-identical from a fixed seed); the budget harness and CI budget jobs (`bench/budget`, task B2 — the spike's one merge); `schema/001_init.sql`; the findings register; `coding-standards.md` (worktree workflow), `dev-setup.md`, `benchmark-vault.md`, `reference-machine.md` (RM-1), `budget-harness.md`, `test-plan.md` (TC-001..TC-029).
+**On main (37 commits, two merges):** the Cargo workspace and a mechanically-enforced dependency rule; `serat-core`; the deterministic 20k/50k benchmark vault generator (`bench/vaultgen`, one command, byte-identical from a fixed seed); the budget harness and CI budget jobs (`bench/budget`, task B2); the compiled IPC contract and the `serat-contracts` crate that keeps it compiled (task D3 + review fixes); `schema/001_init.sql`; the findings register; `coding-standards.md` (worktree workflow), `dev-setup.md`, `benchmark-vault.md`, `reference-machine.md` (RM-1), `budget-harness.md`, `test-plan.md` (TC-001..TC-029).
 
-**Unmerged — 16 branches.** Design stack (D1b → D2 → D3 → F04 → F03 → F05/F06 → F19 → F20 → cite-ids → startup-marks, tip `9e20472`, 13 commits: §3.4, ADR-0011, §2.1's F-04 ruling, §2.2's barrier correction, ADR-0005's pin); `task/d3-review-fixes` (`397fd06`, **two breaking changes to `contracts/ipc.rs`**); `task/i2-serat-vault-watcher` (`9936da5`, revision with both blockers fixed and guards mutation-checked); `task/i4-serat-index-actor` (`ffeaf0b`, **WIP**); `task/b3-ci-workflow` (`480fe7a`); `task/b4-close-f25-f26-f27` (`a26dbf5`, **WIP**); `task/s1-tauri-shell` (`c78f6be`, **WIP** — compiles, trace marks unproven).
+**Unmerged.** The design stack is now a **single tip**, `task/f43-truncation-page-threshold` — §3.4, ADR-0011 (amended), §2.1's F-04 ruling (corrected per F-61), §2.2's barrier correction, ADR-0005's pin, F-43's one-page truncation rule. Then `task/i2-serat-vault-watcher` (both blockers fixed; the reviewer's mutation now fails two tests where all 55 passed); `task/i4-serat-index-actor` (bulk-load sequence in `rebuild()`, two-pass link resolution, F-10's phase durations); `task/b3-ci-workflow`; `task/b4-close-f25-f26-f27` (**WIP** — the harness fixes that must land before any number is taken); `task/s1-tauri-shell` (**WIP** — compiles, trace marks unproven, needs the F-46 `t_usable` gate).
 
 Three branches are lead-committed WIP: their authors' sessions ended mid-task with the work uncommitted in shared worktrees. Each commit message states exactly what is unfinished. **None may be merged as-is.**
 
