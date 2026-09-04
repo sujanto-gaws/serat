@@ -8,15 +8,17 @@ status: interrupted — gate NOT reached
 
 # P0 Spike — Status
 
-> **P0 produced no gate numbers. The four budgets are exactly as unknown as they were at the start.**
+> **One of the four gate numbers now exists, and it misses: cold start is 1088 ms p95 against a 400 ms budget - 2.7x over - with about 28 ms of that 810 ms median being Serat's own work (F-86). The other three budgets remain unmeasured.**
 > The design was reviewed and corrected, repeatedly and usefully — that is not the same as validated, and the most likely misreading of a report full of design findings is that it was.
 > The measurement apparatus is now well guarded against flattering itself, which is also not the same as the numbers being good (F-71). The first real figure is still the first real figure.
 
 **Gate (charter §Milestones):** full index of 20,000 notes < 30 s · save→index < 50 ms p95 · cold start < 1 s (window visible < 400 ms).
 
-## Gate verdict: NOT REACHED — no budget number was ever taken
+## Gate verdict: NOT REACHED - one budget measured, three unmeasured
 
-**Zero of the four gate numbers exist.** The spike ended when every teammate hit a session limit within six minutes of each other, with the measurement subjects still unlanded. This is not a NO-GO — a NO-GO is a measured miss, and would itself be a result. Nothing was measured, so nothing is known about whether the architecture meets its budgets.
+**NFR-PRF-01 misses by 2.7x, and the miss is not attributable to Serat's design.** 619 ms of an 810 ms median sits inside `WebviewWindowBuilder::build` - WebView2 environment and controller creation, before any Serat code that matters. Section 3.4 budgets that whole phase at 400 ms *including* our own work, which the measurement shows is not available to us. The question this hands Q1 is not whether Serat can be made faster but **whether 400 ms is achievable on Tauri v2 at all** - a question about C-07, not about the implementation. Taken with the scanner off, so it is a best case and not yet the gate figure.
+
+**Three of the four gate numbers do not exist.** The spike had earlier stalled when every teammate hit a session limit within six minutes of each other, with the measurement subjects still unlanded. This is not a NO-GO — a NO-GO is a measured miss, and would itself be a result. Nothing was measured, so nothing is known about whether the architecture meets its budgets.
 
 What exists instead is a verification apparatus with no subject yet: the benchmark vault, the budget harness, the CI jobs, the startup-trace contract and the test cases are built and green, and each budget job fails loudly today naming the task that unblocks it. Three go green with one function body each — TC-020 when `rebuild` lands, TC-021 when `apply_and_wait` lands, TC-022 when the `serat` binary lands.
 
