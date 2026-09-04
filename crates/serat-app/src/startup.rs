@@ -428,6 +428,31 @@ impl Startup {
         let mut marks = self.lock();
         marks.walk_complete.get_or_insert(now);
         marks.notes_walked = Some(entries);
+        drop(marks);
+        self.usable.notify_all();
+    }
+
+    /// Block until the vault walk has finished, or `timeout` elapses.
+    ///
+    /// Only `--exit-after-walk` waits on this. Nothing a user does waits for the walk;
+    /// that is the whole point of deferring it.
+    pub fn wait_for_walk_complete(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut marks = self.lock();
+        while marks.walk_complete.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (guard, wait) = self
+                .usable
+                .wait_timeout(marks, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            marks = guard;
+            if wait.timed_out() && marks.walk_complete.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Record which note the shell opened, so a run that opened nothing is legible as
@@ -1073,6 +1098,26 @@ mod tests {
             signaller.mark_buffer_rendered();
         });
         assert!(startup.wait_for_usable(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn waiting_for_the_walk_returns_when_it_lands_and_times_out_when_it_does_not() {
+        // F-151's mark. The trace does not require it -- see the next test -- so the
+        // wait has to be the thing that makes it present, and it has to give up rather
+        // than hang on a vault whose walk failed.
+        let startup = in_process();
+        assert!(
+            !startup.wait_for_walk_complete(Duration::from_millis(30)),
+            "waited on a walk that never completed and claimed it did"
+        );
+
+        let startup = std::sync::Arc::new(in_process());
+        let walker = std::sync::Arc::clone(&startup);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            walker.mark_walk_complete(20_200);
+        });
+        assert!(startup.wait_for_walk_complete(Duration::from_secs(5)));
     }
 
     #[test]
