@@ -10,7 +10,7 @@ use std::path::Path;
 use serat_core::{IndexError, IndexOp, IndexWriter, NoteKind, NoteParser, NoteSource, VaultPath};
 
 use crate::schema;
-use crate::writer::{IndexActor, WriterHandle};
+use crate::writer::{DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
 /// What a rebuild produced.
 ///
@@ -59,6 +59,27 @@ pub fn rebuild(
     parser: &dyn NoteParser,
     index_dir: &Path,
 ) -> Result<RebuildReport, IndexError> {
+    rebuild_with_queue_depth(source, parser, index_dir, DEFAULT_QUEUE_DEPTH)
+}
+
+/// A rebuild whose writer queue holds at most `queue_depth` operations.
+///
+/// [`rebuild`] is this with the default depth, and that is what callers want. This
+/// exists because at the default depth a test would have to submit more than 4,096
+/// operations before the queue ever fills — so a smaller rebuild cannot tell a
+/// blocking producer from a dropping one, and the regression test for F-19 did not in
+/// fact test F-19 (F-35). With a small depth here, the rebuild's own choice of a
+/// blocking submit is observable.
+///
+/// # Errors
+///
+/// As [`rebuild`].
+pub fn rebuild_with_queue_depth(
+    source: &dyn NoteSource,
+    parser: &dyn NoteParser,
+    index_dir: &Path,
+    queue_depth: usize,
+) -> Result<RebuildReport, IndexError> {
     let path = index_path(index_dir);
 
     // ADR-0002: there is no repair, so an existing index is removed rather than
@@ -79,7 +100,9 @@ pub fn rebuild(
         })?;
     }
 
-    let actor = IndexActor::open(&path)?;
+    let conn = schema::open(&path)?;
+    schema::bootstrap_if_empty(&conn)?;
+    let actor = IndexActor::with_capacity(conn, queue_depth);
     let writer = actor.handle();
 
     let entries = source.entries().map_err(|err| IndexError::Corrupt {

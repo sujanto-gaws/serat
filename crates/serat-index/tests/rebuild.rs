@@ -342,11 +342,17 @@ fn an_asset_indexes_without_being_parsed() {
 }
 
 #[test]
-fn a_rebuild_of_a_thousand_notes_loses_none_of_them() {
-    // The bound on the writer's queue is 4,096 and a rebuild submits without waiting
-    // to be asked, so this is the case where a non-blocking submit would silently
-    // drop work. Deliberately larger than one batch (512) and sized so the producer
-    // can outrun the writer.
+fn a_rebuild_of_a_thousand_notes_indexes_all_of_them() {
+    // NOTE, because the original name claimed more than this proves: 1,000 notes
+    // against a queue depth of 4,096 never fills the queue, so this cannot tell a
+    // blocking producer from a dropping one. I mutation-checked it — reverting the
+    // rebuild to the non-blocking submit leaves this passing, which means the test
+    // written to guard F-19 did not guard F-19 (F-35).
+    //
+    // The boundary case now lives in submit_blocking_delivers_every_operation_when_
+    // the_queue_is_smaller_than_the_work, which sets the capacity small enough that
+    // the refusal path is reached. This one stays as what it honestly is: a
+    // multi-batch rebuild that must not lose anything.
     let files: Vec<(String, String)> = (0..1_000)
         .map(|i| {
             (
@@ -559,4 +565,109 @@ fn meta(path: &str) -> NoteMeta {
 
 fn rebuild_path(dir: &std::path::Path) -> std::path::PathBuf {
     serat_index::index_path(dir)
+}
+
+// ---------------------------------------------------------------------------
+// The producer asymmetry (ADR-0011), at a capacity where it can actually bite
+// ---------------------------------------------------------------------------
+
+#[test]
+fn submit_blocking_delivers_every_operation_when_the_queue_is_smaller_than_the_work() {
+    // F-19's real guard. The queue holds four; the producer sends five hundred. A
+    // non-blocking submit refuses most of them, so if this passes with a dropping
+    // producer, the test is worthless — which is exactly what was wrong with the
+    // 1,000-note version against a 4,096-deep queue.
+    let dir = tempfile::tempdir().expect("temp");
+    let path = dir.path().join("index.db");
+    let conn = schema::open(&path).expect("open");
+    schema::bootstrap(&conn).expect("bootstrap");
+    let actor = IndexActor::with_capacity(conn, 4);
+    let writer = actor.handle();
+
+    for i in 0..500 {
+        writer
+            .submit_blocking(IndexOp::UpsertAsset {
+                meta: meta(&format!("assets/{i:04}.pdf")),
+            })
+            .expect("submit_blocking must not refuse");
+    }
+    actor.shutdown().expect("shutdown");
+
+    let conn = schema::open(&path).expect("reader");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 500, "a blocking producer lost work");
+}
+
+#[test]
+fn submit_refuses_rather_than_waiting_when_the_queue_is_full() {
+    // The other half of ADR-0011's asymmetry, and the one that protects the argument
+    // rather than a line of code: if a later change made both producers block, the
+    // watcher's coalescer would stop draining the OS event buffer and the platform
+    // would discard notifications without telling us.
+    //
+    // The writer is held off with a barrier so the queue cannot drain underneath us.
+    let dir = tempfile::tempdir().expect("temp");
+    let path = dir.path().join("index.db");
+    let conn = schema::open(&path).expect("open");
+    schema::bootstrap(&conn).expect("bootstrap");
+    let actor = IndexActor::with_capacity(conn, 2);
+    let writer = actor.handle();
+
+    let mut refused = None;
+    let started = std::time::Instant::now();
+    for i in 0..64 {
+        if let Err(err) = writer.submit(IndexOp::UpsertAsset {
+            meta: meta(&format!("assets/{i}.pdf")),
+        }) {
+            refused = Some(err);
+            break;
+        }
+    }
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "submit appears to be waiting for space; it must refuse"
+    );
+    assert!(
+        matches!(refused, Some(serat_core::IndexError::QueueFull { .. })),
+        "submit never refused against a queue of two, so the refusal path is untested"
+    );
+}
+
+#[test]
+fn a_rebuild_loses_nothing_when_it_outruns_the_writer() {
+    // The guard F-19 actually needed, and the one the 1,000-note test only appeared
+    // to be. The queue holds four and the rebuild submits five hundred, so the
+    // refusal path is reached on nearly every operation: with a dropping submit the
+    // rebuild completes successfully and indexes a fraction of the vault, which is
+    // the failure a wall-clock benchmark number cannot see.
+    let files: Vec<(String, String)> = (0..500)
+        .map(|i| {
+            (
+                format!("10-projects/note-{i:04}.md"),
+                format!("# Note {i}\ntype:: project\n"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+
+    let dir = tempfile::tempdir().expect("temp");
+    let report = serat_index::rebuild_with_queue_depth(
+        &FakeVault::with(&borrowed),
+        &LineParser::default(),
+        dir.path(),
+        4,
+    )
+    .expect("rebuild");
+
+    assert_eq!(
+        report.notes, 500,
+        "the rebuild lost notes under backpressure"
+    );
+    assert_eq!(report.skipped, 0, "the rebuild skipped notes it could read");
 }

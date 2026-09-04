@@ -160,10 +160,30 @@ impl IndexActor {
         Ok(Self::with_connection(conn))
     }
 
-    /// Start a writer over an already-open connection, for tests.
+    /// Start a writer over an already-open connection.
     #[must_use]
     pub fn with_connection(conn: Connection) -> Self {
-        let (tx, rx) = sync_channel(DEFAULT_QUEUE_DEPTH);
+        Self::with_capacity(conn, DEFAULT_QUEUE_DEPTH)
+    }
+
+    /// Start a writer whose queue holds at most `capacity` operations.
+    ///
+    /// Exists because the default depth makes the refusal path unreachable in a test:
+    /// a test that submits fewer operations than the queue holds never fills it, so it
+    /// cannot tell a blocking producer from a dropping one. That is how the first
+    /// version of this crate's own regression test failed to catch the bug it was
+    /// written for (F-19, F-35).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
+    #[must_use]
+    pub fn with_capacity(conn: Connection, capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "a writer queue with no capacity accepts nothing"
+        );
+        let (tx, rx) = sync_channel(capacity);
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
             .spawn(move || run(conn, &rx))
