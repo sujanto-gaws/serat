@@ -285,25 +285,25 @@ The mechanism is one environment variable, so the harness measures the applicati
 
 ##### Most of the window budget is not ours to spend
 
-S1's first measurement of the real shell, twenty spawns, release build, scanner disabled: `window_visible` p95 **1088ms against a 400ms budget**, and `vault_usable` p95 **1094ms against 1000ms**. The median splits into 57ms of loader, 23ms of Tauri runtime, **619ms inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation — 100ms to the first painted frame, and 5ms to usable.
+S1's first measurement of the real shell, twenty spawns, release build, scanner disabled: `window_visible` p95 **1088ms against a 400ms budget**, and `vault_usable` p95 **1094ms against 1000ms**. Where that time goes is the table below, measured on a later run with marks placed for the purpose; the figures moved between runs and the shape did not.
 
 The largest single term is a platform cost that no decision in this document moves. That is worth stating plainly rather than leaving as an inference, because the table budgets the phase as though all of it were ours, and a reader optimising against it would be tuning the wrong end of the split.
 
-**"Serat's own share" is not one number, and the section deliberately does not name one.** An earlier draft here said "roughly 130ms of the 400"; it matched no definition of the five terms and is withdrawn. Three defensible quantities can be read off the same run and they differ by a factor of six:
+**"Serat's own share" was published twice as a composed number and was wrong both times.** This section said "roughly 130ms of the 400", which matched no subset of the terms; S1 reported 28ms, which was `main → runtime_ready` plus `painted → usable` added together, most of the first being `tauri::Builder` constructing itself. Both were withdrawn. It is now bracketed by marks placed for the purpose and measured, twenty spawns per figure, release build, scanner off:
 
-| Quantity | Median | What it answers |
-|---|---|---|
-| Main-thread work outside the loader and the webview build | 28ms | Is Serat itself slow? No. |
-| Everything except WebView2 environment creation | 185ms | What is left if the platform term were free? |
-| The whole phase | 804ms | What does the user wait for? |
+| Phase | Owner | 2 notes | 20,000 notes |
+|---|---|---|---|
+| `t0 → main` | platform loader | 69.4ms | 71.0ms |
+| **`main → state_ready`** | **ours** — arguments, settings TOML, `AppState` | **4.7ms** | **5.0ms** |
+| `state_ready → runtime_ready` | `tauri::Builder` | 25.7ms | 29.5ms |
+| **`runtime_ready → setup_done`** | **ours** — event sink, `open_vault`, thread spawns, boot info | **0.5ms** | **0.5ms** |
+| `setup_done → window_created` | WebView2 | 753.7ms | 865.4ms |
+| `window_created → painted` | our HTML in their renderer | 116.4ms | 130.5ms |
+| `painted → usable` | mixed | 4.7ms | 7.5ms |
 
-None of the three is wrong; quoting one without saying which is. The middle figure is the one that misleads most easily, because the 57ms of loader inside it is a function of our binary size and dependency count — ours to influence, not ours to execute — and the 100ms to first paint is our HTML and CSS being rendered by a webview we did not write. So the split is what this section carries, and an aggregate quoted anywhere else must name its basis in the same sentence as the number.
+**Serat's own main-thread work is 5.2ms at two notes and 5.6ms at twenty thousand** — p95 9.4 and 9.6 — which is 0.5% of the time to first paint. The basis belongs with the figure wherever it is quoted, because the figure without it is what went wrong twice: *bracketed by `main → state_ready` and `runtime_ready → setup_done`; excludes the loader, `tauri::Builder` and the webview build.* The 25.7ms of Tauri builder that the withdrawn 28 counted as ours is five times our entire contribution.
 
-The first row is deliberately *not* labelled "code we wrote", which is what an earlier draft called it. The five medians offer only one way to reach 28ms — the 23ms of Tauri runtime plus the 5ms to usable — and on that reading most of it is somebody else's runtime rather than ours. Whether that is how the figure is actually composed is not established by this run, and the answer to the question the row asks does not depend on it: 28ms is not slow however it divides. But a table whose entire purpose is that a figure without its basis is the error is the last place to assert a basis nobody has checked.
-
-This does not re-baseline NFR-PRF-01, which is product-analyst's at Q1 and needs more than one platform's number: WebView2 on Windows is one of three webviews, and WKWebView and WebKitGTK have their own startup costs that may differ by a lot. What P0 establishes is the shape of the answer — if all three platforms carry a webview cost of this order, the requirement is wrong rather than the design, and the honest fix is a budget that separates the part we control from the part we inherit. What it does *not* establish is that the budget is unreachable, because the figure above was taken before F-12's walk fix and on one platform.
-
-The number is also a best case in the one way that matters for the gate: it was taken with the scanner disabled, so it is marked `gate_eligible: false` and a stock machine is slower.
+The rule that follows is sharper than the one this section had, and it is S1's: **an aggregate should be measured, not composed.** Naming the basis of a composed number makes it look defensible while leaving the composition itself as the error — which is what both withdrawn figures had in common.
 
 ##### Which mark is constant in the size of the vault, and which is not
 
@@ -317,7 +317,9 @@ So the assertion a budget job may make is that `t_visible` does not grow **beyon
 
 That headroom is about the effect, and it says nothing about the noise — which is the half that decides whether the job survives, and the half the first draft of this paragraph ignored. Measured after the walk fix: two back-to-back batches of twenty spawns gave `t_visible` p95 of 1146ms at two notes against 940ms at twenty thousand — the larger vault came out faster. Run-to-run variation is therefore about 20%, the same size as the threshold, and a tolerance chosen against the effect and never against the noise is a job that goes red for no reason and is disabled by the third person it wakes.
 
-Note carefully what that measurement does and does not say, because the tempting reading is the wrong one. It does **not** establish that the vault-size effect is gone. It establishes that the instrument can no longer see one: at this iteration count the noise exceeds anything the effect could now be, so the proportionality claim in this section is currently **unfalsifiable rather than confirmed**. What is genuinely established is narrower and was measured separately — the walk was proportional, at 808ms against 1410ms, and delaying it returned the large-vault figure to 821ms. A known mechanism was identified and removed. Whether any residual proportionality remains is a question this instrument cannot currently answer, and saying otherwise would be claiming a result from an absence of evidence.
+The claim about **main-thread work** is a different matter and is now measured directly rather than inferred from wall clock: 5.2ms against 5.6ms across a vault ten thousand times larger. That is the one term in the table where the property can be checked cleanly, because it is the only one not dominated by a platform cost that moves with the weather, and it holds there.
+
+The wall-clock claim is what the noise defeats. Note carefully what that measurement does and does not say, because the tempting reading is the wrong one. It does **not** establish that the vault-size effect is gone. It establishes that the instrument can no longer see one: at this iteration count the noise exceeds anything the effect could now be, so the proportionality claim in this section is currently **unfalsifiable rather than confirmed**. What is genuinely established is narrower and was measured separately — the walk was proportional, at 808ms against 1410ms, and delaying it returned the large-vault figure to 821ms. A known mechanism was identified and removed. Whether any residual proportionality remains is a question this instrument cannot currently answer, and saying otherwise would be claiming a result from an absence of evidence.
 
 The tolerance is therefore not the whole instrument, and widening it is the wrong repair, because it trades away the detection it was sized for. Two things fix the measurement instead. **Interleave the two vault sizes within one batch** rather than running them as separate batches, so machine drift lands on both arms equally rather than being read as an effect — the 940ms-at-20k result is what drift looks like when it is free to masquerade. And **take enough iterations for the statistic to settle**, or compare medians, since a p95 over twenty samples is an estimator noisier than the thing it is estimating.
 
