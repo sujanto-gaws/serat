@@ -591,6 +591,64 @@ mod tests {
     }
 
     #[test]
+    fn a_file_written_continuously_is_still_indexed_rather_than_starved() {
+        // The reviewer found that changing or_insert to insert — extending the deadline
+        // on every event instead of leaving it fixed — passed all 129 tests, while the
+        // property is documented three lines above the call. That is a real starvation
+        // mode: a process writing faster than every 150 ms, a build tool appending to a
+        // log in the vault or a sync client streaming a large attachment, would reset
+        // the deadline forever and the path would never be enqueued at all.
+        //
+        // The window is fixed from the first event for exactly this reason, and until
+        // now nothing said so in a way that could fail.
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            let stop = Arc::clone(&stop);
+            let pops = Arc::clone(&pops);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if queue.pop_timeout(Duration::from_millis(10)).is_some() {
+                        pops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        // One second of writes, every 30 ms — five times faster than the window closes.
+        let target = dir.path().join("busy.md");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut round = 0u32;
+        while Instant::now() < deadline {
+            fs::write(
+                &target,
+                format!(
+                    "# Round {round}
+"
+                ),
+            )
+            .expect("write");
+            round += 1;
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        std::thread::sleep(COALESCE_WINDOW * 3);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        consumer.join().expect("consumer");
+
+        let observed = pops.load(std::sync::atomic::Ordering::Relaxed);
+        watcher.stop();
+        assert!(
+            observed >= 2,
+            "a file written every 30 ms for a second reached the consumer {observed}              times; with the deadline extended on each event it would be starved              entirely and a vault could hold a file that is never indexed"
+        );
+    }
+
+    #[test]
     fn a_queue_overflow_raises_rescan_required() {
         // VaultEvent::RescanRequired had no coverage at all, which is partly why the
         // folder-rename defect went unnoticed: nobody had ever watched it fire.
