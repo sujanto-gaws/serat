@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The P0 shell. Core event listening only: every Serat capability arrives as an application command, not as a plugin, so there is no plugin permission to grant. Widening this set is a threat-model decision (docs/03-design/threat-model.md), not a convenience.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

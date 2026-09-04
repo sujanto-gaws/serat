@@ -1,0 +1,83 @@
+/* The P0 shell, in the brand palette (docs/03-design/ui/serat-identity.md §Palette).
+   Deliberately minimal: frontend-designer owns tokens and components, and task S2
+   brings the real screens. Four colours and a layout, so the shell that gets timed for
+   NFR-PRF-01 is recognisably Serat and not an unstyled document. */
+
+:root {
+  --indigo: #24457e;
+  --brass: #c08a47;
+  --ink: #16191b;
+  --paper: #f3f4f1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.titlebar {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.5rem 0.9rem;
+  background: var(--indigo);
+  color: var(--paper);
+}
+
+.wordmark {
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.vault {
+  font-size: 12px;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  display: flex;
+  min-height: 0;
+}
+
+.editor {
+  flex: 1;
+  border: 0;
+  outline: 0;
+  resize: none;
+  padding: 1.25rem 1.5rem;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.65 ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  tab-size: 4;
+}
+
+.statusbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.35rem 0.9rem;
+  border-top: 1px solid rgba(22, 25, 27, 0.12);
+  font-size: 12px;
+  color: rgba(22, 25, 27, 0.7);
+}
+
+.marks {
+  color: var(--brass);
+  white-space: nowrap;
+}
