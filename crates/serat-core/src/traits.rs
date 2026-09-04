@@ -14,7 +14,7 @@
 
 use crate::{
     error::{IndexError, ParseError, VaultError},
-    note::{IndexOp, LoadedNote, ParsedNote},
+    note::{IndexOp, LoadedNote, ParsedNote, SourceEntry},
     path::VaultPath,
 };
 
@@ -110,7 +110,10 @@ pub trait NoteSource: Send + Sync {
     /// [`VaultError`] only if the source itself cannot be enumerated. An individual
     /// unreadable directory is skipped, not fatal: one bad folder must not stop a
     /// vault indexing (design goal 5).
-    fn entries(&self) -> Result<Vec<VaultPath>, VaultError>;
+    /// Returns the entry rather than the bare path so the rebuild does not re-derive
+    /// what the walk already knew: `read_dir` yields metadata, and throwing it away
+    /// costs 20,000 redundant stats inside a 30 s budget (F-29b).
+    fn entries(&self) -> Result<Vec<SourceEntry>, VaultError>;
 
     /// Read one file and hash it.
     ///

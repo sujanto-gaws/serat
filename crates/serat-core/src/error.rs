@@ -68,6 +68,18 @@ pub enum VaultError {
         message: String,
     },
 
+    /// A write was aimed at something that is not a Markdown note.
+    ///
+    /// Threat T-06 and FR-BIN-19: binaries are read, extracted, annotated and
+    /// queried — never rewritten. The mechanism the threat model names is "no write
+    /// path accepts a non-Markdown target", so the refusal lives in the one function
+    /// that writes rather than in each of its callers.
+    #[error("refusing to write {path}: only Markdown notes are written, never binaries")]
+    NotAMarkdownTarget {
+        /// Vault-relative path of the refused target.
+        path: String,
+    },
+
     /// The filesystem watcher could not be started, or it died.
     #[error("watcher failure: {message}")]
     Watcher {

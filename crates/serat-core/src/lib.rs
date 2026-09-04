@@ -37,7 +37,7 @@ pub use field::{Field, FieldKind, FieldSource, FieldValue};
 pub use hash::ContentHash;
 pub use ids::{BlockId, FieldId, NoteId};
 pub use link::{Link, LinkKind, LinkTarget};
-pub use note::{IndexOp, LoadedNote, NoteKind, NoteMeta, ParsedNote};
+pub use note::{IndexOp, LoadedNote, NoteKind, NoteMeta, ParsedNote, SourceEntry};
 pub use path::VaultPath;
 pub use span::ByteRange;
 pub use task::Task;
