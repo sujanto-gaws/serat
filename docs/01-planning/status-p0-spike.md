@@ -8,6 +8,9 @@ status: interrupted — gate NOT reached
 
 # P0 Spike — Status
 
+> **P0 produced no gate numbers. The four budgets are exactly as unknown as they were at the start.**
+> The design was reviewed and corrected, repeatedly and usefully — that is not the same as validated, and the most likely misreading of a report full of design findings is that it was.
+
 **Gate (charter §Milestones):** full index of 20,000 notes < 30 s · save→index < 50 ms p95 · cold start < 1 s (window visible < 400 ms).
 
 ## Gate verdict: NOT REACHED — no budget number was ever taken
