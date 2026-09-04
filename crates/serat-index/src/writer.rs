@@ -134,10 +134,10 @@ impl WriterHandle {
     /// restored is identical to what was delivered by construction rather than by a
     /// test that has to catch a stale copy.
     ///
-    /// Loading through the triggers is 6x slower at 26,000 blocks and unbounded at
-    /// 260,000 — architect abandoned that shape after 25 minutes — so this is not a
-    /// micro-optimisation, it is the difference between a rebuild that finishes and
-    /// one that does not.
+    /// Loading through the triggers costs about 6x at 26,000 blocks: 2.1 s live against
+    /// 0.32 s dropped-and-rebuilt, reproduced independently at 5.8x. The search index
+    /// is identical either way, which is what makes the faster shape a free choice
+    /// rather than a trade.
     ///
     /// # Errors
     ///
@@ -320,22 +320,49 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             Command::Analyze(reply) => barrier = Some((reply, Barrier::Analyze)),
             Command::MarkReady(root, reply) => barrier = Some((reply, Barrier::MarkReady(root))),
             // These three answer with something other than `()`, so they are handled
-            // here and not through the Barrier path. Each drains the batch first: a
-            // bulk load that began with operations still queued would load them
-            // through the triggers it was about to drop.
+            // here and not through the Barrier path.
+            //
+            // Each drains the batch first, and the drain is currently unreachable —
+            // which is worth stating rather than leaving as an implied guarantee.
+            // Every iteration of this loop ends in a `commit`, and these arms are
+            // reached either as the first command of an iteration or from `deferred`,
+            // so `pending` is empty both ways. Removing the drains passes every test,
+            // and the tests suggested for them cannot bite, because the hazard they
+            // guard cannot currently be produced. A probe asserting `pending.is_empty()`
+            // at each of the three never fired across the whole suite.
+            //
+            // They stay, as the correct behaviour if that ever stops being true — a
+            // bulk load that began with operations still queued would load them through
+            // the triggers it was about to drop, and the rows would be missing from
+            // search with `blocks` perfectly correct. The `debug_assert` is what makes
+            // the invariant enforced rather than remembered: a future change to the
+            // loop that lets work reach here undrained fails loudly in tests instead of
+            // silently relying on a guard nobody has exercised.
             Command::BeginBulkLoad(reply) => {
+                debug_assert!(
+                    pending.is_empty(),
+                    "work reached BeginBulkLoad undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
+                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| begin_bulk_load(&conn));
                 let _ = reply.send(result);
                 continue;
             }
             Command::EndBulkLoad(triggers, reply) => {
+                debug_assert!(
+                    pending.is_empty(),
+                    "work reached EndBulkLoad undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
+                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| end_bulk_load(&conn, &triggers));
                 let _ = reply.send(result);
                 continue;
             }
             Command::ResolveLinks(reply) => {
+                debug_assert!(
+                    pending.is_empty(),
+                    "work reached ResolveLinks undrained; the loop no longer commits every \n                     iteration, so the drain below is now load-bearing and needs a test"
+                );
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);

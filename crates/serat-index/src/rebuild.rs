@@ -128,9 +128,10 @@ pub fn rebuild_with_queue_depth(
     let writer = actor.handle();
 
     // Step 2 of the sequence in schema/001_init.sql: the triggers come off before any
-    // row is loaded. Loading 26,000 blocks through them costs 6x, and at 260,000 the
-    // trigger shape did not finish in 25 minutes — so this is the difference between
-    // a rebuild that completes and one that does not, not a micro-optimisation.
+    // row is loaded. Loading 26,000 blocks through them costs about 6x — 2.1 s live
+    // against 0.32 s dropped-and-rebuilt, reproduced independently at 5.8x — and the
+    // resulting search index is identical, which
+    // the_bulk_load_and_the_trigger_path_produce_the_same_search_index asserts.
     let triggers = writer.begin_bulk_load()?;
 
     let started = Instant::now();
