@@ -24,10 +24,7 @@
 
 use std::process::ExitCode;
 
-use budget::{
-    PRF01_VAULT_USABLE, PRF01_WINDOW_VISIBLE, assert_scale_independent, ensure_vault,
-    measure_cold_start, run_paired_job, subject,
-};
+use budget::{PRF01_VAULT_USABLE, PRF01_WINDOW_VISIBLE, measure_cold_start, run_paired_job};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,48 +42,12 @@ fn main() -> ExitCode {
     if budgets != ExitCode::SUCCESS || skip_scale {
         return budgets;
     }
-    if scale_check() {
+    // Architecture §3.4: nothing on the critical path is proportional to vault
+    // size. The measurement and the judgement both live in the library, because
+    // F-81 was this exact call being droppable with nothing going red.
+    if budget::run_scale_check(PRF01_WINDOW_VISIBLE.iterations) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    }
-}
-
-/// Architecture §3.4: nothing on the critical path is proportional to vault
-/// size. Same measurement, 2.5x the notes.
-fn scale_check() -> bool {
-    let mut p95 = Vec::new();
-    for preset in ["20k", "50k"] {
-        let vault = match ensure_vault(preset) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("budget: cannot check scale independence: {e}");
-                return false;
-            }
-        };
-        match subject::cold_start(&vault.path, PRF01_WINDOW_VISIBLE.iterations) {
-            Ok((visible, _)) => p95.push(visible.percentile(0.95)),
-            Err(e) => {
-                eprintln!("budget: cannot check scale independence: {e}");
-                return false;
-            }
-        }
-    }
-    match assert_scale_independent(p95[0], p95[1]) {
-        Ok(()) => {
-            println!(
-                "PASS  NFR-PRF-01 · scale independence
-  window painted p95 {:.1} ms at 20k,                  {:.1} ms at 50k — the critical path does not grow with the vault (§3.4)",
-                p95[0], p95[1]
-            );
-            true
-        }
-        Err(e) => {
-            println!(
-                "FAIL  NFR-PRF-01 · scale independence
-  {e}"
-            );
-            false
-        }
     }
 }

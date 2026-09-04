@@ -43,11 +43,31 @@ use crate::trace::StartupTrace;
 /// notional: four phases, four durations, reported beside the total.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RebuildPhases {
-    /// Enumerating the vault. No file contents read.
+    /// **Wall clock.** Enumerating the vault, single-threaded. No contents read.
     pub walk: Duration,
-    /// Reading bytes and hashing them for the change gate (§3.1 step 3).
+    /// **CPU time, summed across the parse pool.** Reading bytes and hashing
+    /// them for the change gate (§3.1 step 3).
+    ///
+    /// Can legitimately exceed the rebuild's wall clock — on eight cores it
+    /// should. It is not a share of anything.
     pub read_hash: Duration,
-    /// Markdown to blocks, fields, links, tasks, on the rayon pool.
+    /// **CPU time, summed across the parse pool.** Markdown to blocks, fields,
+    /// links and tasks.
+    ///
+    /// Can legitimately exceed the wall clock, and this is the number that
+    /// settles architecture.md's open design question 1 when read against
+    /// `producer_wait`:
+    ///
+    /// * **parse-dominated** — `parse` several times the wall clock (the pool
+    ///   busy on every core) and `producer_wait` near zero (the writer never
+    ///   made anyone wait). The fix is pool sizing.
+    /// * **writer-dominated** — `parse` at or below the wall clock (cores idle,
+    ///   waiting on the queue) and `producer_wait` large. The fix is batching.
+    ///
+    /// Those are opposite conclusions from the same two columns, which is why
+    /// the harness labels rather than normalises. Dividing these by the wall
+    /// clock to make the five phases add up would destroy the one number P0 was
+    /// built to produce.
     pub parse: Duration,
     /// **How long the producer was blocked, not what the writer cost.**
     ///
@@ -67,19 +87,23 @@ pub struct RebuildPhases {
     pub producer_wait: Duration,
     /// Building `blocks_fts` with the FTS5 `rebuild` command after the bulk
     /// load, plus the final ANALYZE. Architect measured 1.9 s for 259,971
-    /// blocks. Unlike `producer_wait` this is real writer-side work.
+    /// blocks on the dropped-trigger load (architecture 4.4). Unlike
+    /// `producer_wait` this is real writer-side work.
     ///
-    /// Split from `write_rows` because the two have different fixes and
-    /// reporting them together hides a 6x: with the triggers left live, the same
-    /// insert cost 2.1-10.3 s at 26,000 blocks against 0.32 s with them dropped,
-    /// against 0.32 s with them dropped - about 6x, reproduced independently at 5.8x.
+    /// Split from the producer's wait because the two have different fixes and
+    /// reporting them together hides a 6x: with the FTS triggers left live the
+    /// same insert cost 2.1 s at 26,000 blocks against 0.32 s with them
+    /// dropped, independently reproduced at 5.8x.
     pub write_fts: Duration,
 }
 
 impl RebuildPhases {
-    /// The four phases summed. Not the same as the wall clock, and deliberately
-    /// so: phases overlap when the parse pool and the writer run concurrently,
-    /// and a sum that exceeded the total would be the first evidence of that.
+    /// The phases summed. **Not comparable with the wall clock**, and
+    /// deliberately so: `walk` is wall clock, `read_hash` and `parse` are CPU
+    /// time across the pool, `producer_wait` is a wait rather than a cost, and
+    /// `write_fts` is writer-side wall clock. A reader adding them expecting a
+    /// total is wrong twice over — once by a figure that is too small and twice
+    /// by two that are too large.
     pub fn sum(&self) -> Duration {
         self.walk + self.read_hash + self.parse + self.producer_wait + self.write_fts
     }
@@ -124,6 +148,7 @@ pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task 
     pub fn rebuild(
         source: &dyn NoteSource,
         parser: &dyn NoteParser,
+        vault_root: &Path,          // written to index_meta.vault_root; I6 reads it
         index_dir: &Path,
     ) -> Result<RebuildReport, IndexError>;
 
@@ -136,8 +161,8 @@ pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task 
         // F-10: the phases, so open design question 1 can be answered.
         // write is split because architect measured the FTS build as a
         // separate cost with a separate fix -- 3.7 s of row insert against
-        // 1.9 s of FTS build at 259,971 blocks, and 6x worse with the
-        // triggers left live.
+        // 1.9 s of FTS build at 259,971 blocks on the dropped-trigger load,
+        // and about 6x worse with the triggers left live.
         pub walk: Duration, pub read_hash: Duration, pub parse: Duration,
         // producer_wait is time blocked on submit_blocking plus the final
         // drain -- how long the producer WAITED, not what the writer cost.
@@ -152,7 +177,7 @@ Call site:
 
     let vault  = serat_vault::Vault::open(vault_path)?;
     let parser = serat_parse::CommonMarkParser::new();
-    let report = serat_index::rebuild(&vault, &parser, index_dir)?;
+    let report = serat_index::rebuild(&vault, &parser, vault_root, index_dir)?;
 
 Callable from a plain binary with no Tauri app running, returning only after the
 writer has drained and ANALYZE has run. The harness times the call with a
@@ -208,6 +233,12 @@ pub struct SaveSamples {
     /// name is the reason this went unnoticed as long as it did (F-268).
     /// Reported beside `end_to_end`, never asserted.
     pub pipeline: Samples,
+    /// Submit to the `index.changed` event arriving — what the UI learns from,
+    /// throttled to ten per second and therefore up to 100 ms later than the
+    /// drain (F-99). Reported, not asserted: only this end is what a person
+    /// experiences, and which end the requirement means is product-analyst's to
+    /// settle at Q1.
+    pub notified: Samples,
 }
 
 /// What the harness needs before NFR-PRF-03 is measurable.
@@ -310,22 +341,15 @@ blocked rather than guessed at.";
 /// # Errors
 /// When the index cannot be found or read.
 pub fn stat1_note_rows(index_dir: &Path) -> Result<usize, String> {
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(index_dir)
-        .map_err(|e| format!("reading {}: {e}", index_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "db"))
-        .collect();
-    candidates.sort();
-    let db = match candidates.len() {
-        1 => candidates.remove(0),
-        0 => return Err(format!("no .db file in {}", index_dir.display())),
-        n => {
-            return Err(format!(
-                "{n} .db files in {}; the harness cannot tell which is the index",
-                index_dir.display()
-            ));
-        }
-    };
+    // `serat_index::index_path(index_dir)` is the right call and replaces this
+    // the moment I4 merges. Until then the name is matched exactly rather than
+    // globbed: the rebuild also writes `index.db-wal` and `index.db-shm`, and a
+    // `*.db*` glob would find three files while a `*.db` glob is one WAL-mode
+    // change away from finding the wrong one.
+    let db = index_dir.join("index.db");
+    if !db.exists() {
+        return Err(format!("no index at {}", db.display()));
+    }
 
     let conn =
         rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -459,15 +483,44 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// `spawn()` and handed to the app, so everything before `main` is inside the
 /// number; every trace is validated before it becomes a sample.
 ///
+/// `open_note` is a vault-relative note the shell opens. `--exit-after-ready`
+/// refuses without one, and rightly: "vault usable" over a shell that rendered
+/// nothing is not the number NFR-PRF-01 is about. It is a fixed note rather
+/// than an arbitrary one so the figure is reproducible between runs.
+///
 /// # Errors
 /// When the application does not exist, when a run fails or times out, or when
 /// a trace is rejected by any of the checks in [`crate::trace`].
-pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
-    let binary = app_binary()?;
+pub fn cold_start(
+    vault: &Path,
+    open_note: &str,
+    iterations: usize,
+) -> Result<(Samples, Samples), String> {
     let mut visible = Samples::new();
     let mut usable = Samples::new();
-
     for run in 0..iterations {
+        let trace = cold_start_once(vault, open_note, run)?;
+        visible.push(trace.window_visible());
+        usable.push(trace.vault_usable());
+    }
+    Ok((visible, usable))
+}
+
+/// One cold start, validated.
+///
+/// Separate from [`cold_start`] so the proportionality check can **interleave**
+/// vault sizes spawn by spawn rather than running them as two blocks. The
+/// within-arm spread on this machine is about five times the effect being
+/// tested for, so a blocked comparison is contaminated by whatever the machine
+/// was doing during each block — which is how a 20,000-note vault came out
+/// faster than a 2-note one (F-109). Interleaved, slow drift lands on both arms
+/// and cancels in the paired difference.
+///
+/// # Errors
+/// As [`cold_start`].
+pub fn cold_start_once(vault: &Path, open_note: &str, run: usize) -> Result<StartupTrace, String> {
+    let binary = app_binary()?;
+    {
         let trace_path =
             std::env::temp_dir().join(format!("serat-startup-{}-{run}.json", std::process::id()));
         let _ = std::fs::remove_file(&trace_path);
@@ -484,6 +537,12 @@ pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples),
         let status = Command::new(&binary)
             .arg("--vault")
             .arg(vault)
+            // --exit-after-ready refuses without a note to open, and rightly:
+            // "vault usable" over a shell that rendered nothing is not the
+            // number NFR-PRF-01 is about. A fixed note rather than an arbitrary
+            // one, so the figure is reproducible across runs.
+            .arg("--open")
+            .arg(open_note)
             .arg("--exit-after-ready")
             .env("SERAT_STARTUP_TRACE", &trace_path)
             .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string())
@@ -500,10 +559,8 @@ pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples),
         let trace = StartupTrace::parse(line.trim()).map_err(|e| format!("run {run}: {e}"))?;
         let _ = std::fs::remove_file(&trace_path);
 
-        visible.push(trace.window_visible());
-        usable.push(trace.vault_usable());
+        Ok(trace)
     }
-    Ok((visible, usable))
 }
 
 /// What `Vault::resolve`'s symlink guard (T-07) costs across a whole vault.
@@ -638,9 +695,21 @@ mod tests {
         assert!(e.contains("\"save\""), "{e}");
         assert!(e.contains("writer().flush()"), "{e}");
 
-        let e = cold_start(vault, 20).expect_err("must not silently pass");
-        assert!(e.contains("S1"), "{e}");
-        assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
+        // Cold start branches on whether the application exists yet. Before S1
+        // merges, the seam itself refuses and names the task. After it merges,
+        // the binary refuses -- `--vault nowhere` cannot be opened -- and the
+        // message is the app's rather than the seam's. Asserting only the first
+        // would turn tauri-app-dev landing S1 into a red test in my crate.
+        let e = cold_start(vault, "_types/Project.md", 20).expect_err("must not silently pass");
+        if app_binary().is_err() {
+            assert!(e.contains("S1"), "{e}");
+            assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
+        } else {
+            assert!(
+                !e.is_empty(),
+                "an unopenable vault must refuse with a sentence, not silently"
+            );
+        }
     }
 
     // ------------------------------------------------------ T-07 / task #30
