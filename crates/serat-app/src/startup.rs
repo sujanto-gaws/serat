@@ -165,7 +165,9 @@ impl Clock {
 /// The marks, in the order they can legally occur.
 #[derive(Debug, Default)]
 struct Marks {
+    state_ready: Option<f64>,
     runtime_ready: Option<f64>,
+    setup_done: Option<f64>,
     index_settled: Option<f64>,
     window_created: Option<f64>,
     window_visible: Option<f64>,
@@ -270,6 +272,29 @@ impl Startup {
     #[must_use]
     pub fn t0_source(&self) -> T0Source {
         self.clock.source
+    }
+
+    /// Settings are loaded and `AppState` is built: the end of the work this crate
+    /// does on the main thread *before* handing control to Tauri.
+    ///
+    /// One of the two brackets that make "Serat's own main-thread work" a measurement
+    /// rather than a subtraction. Everything between [`Startup::begin`] and this mark
+    /// is ours — argument parsing, the settings TOML read, state construction. See
+    /// [`Trace::serat_main_thread_ms`].
+    pub fn mark_state_ready(&self) {
+        let now = self.elapsed_ms();
+        self.lock().state_ready.get_or_insert(now);
+    }
+
+    /// Our work inside Tauri's `setup` is finished and the window is about to be
+    /// built.
+    ///
+    /// The closing bracket. Everything between [`Startup::mark_runtime_ready`] and
+    /// this mark is ours — installing the event sink, opening the vault, spawning the
+    /// index and vault threads, resolving the note to open, serialising the boot info.
+    pub fn mark_setup_done(&self) {
+        let now = self.elapsed_ms();
+        self.lock().setup_done.get_or_insert(now);
     }
 
     /// The Tauri runtime is up and `setup` has been entered.
@@ -475,7 +500,9 @@ impl Startup {
             t0_to_window_visible_ms: window_visible,
             t0_to_vault_usable_ms: marks.vault_usable().expect("every term was just unwrapped"),
             t0_to_main_ms: self.main_ms,
+            t0_to_state_ready_ms: marks.state_ready,
             t0_to_runtime_ready_ms: marks.runtime_ready,
+            t0_to_setup_done_ms: marks.setup_done,
             t0_to_window_created_ms: marks.window_created,
             t0_to_buffer_rendered_ms: buffer,
             t0_to_index_settled_ms: index_ms,
@@ -523,10 +550,13 @@ pub struct Trace {
     /// t0 to the first line of `main`: the loader's share. `0.0` when `t0_source` is
     /// `in_process`, by construction.
     pub t0_to_main_ms: f64,
-    /// t0 to the Tauri runtime being up and `setup` entered. Diagnostic: the gap from
-    /// here to `t0_to_window_created_ms` is window and webview construction, and the
-    /// gap from `t0_to_main_ms` to here is the runtime starting.
+    /// t0 to settings being loaded and `AppState` built — the end of our own
+    /// pre-Tauri work on the main thread.
+    pub t0_to_state_ready_ms: Option<f64>,
+    /// t0 to the Tauri runtime being up and `setup` entered.
     pub t0_to_runtime_ready_ms: Option<f64>,
+    /// t0 to our work inside `setup` finishing, just before the window is built.
+    pub t0_to_setup_done_ms: Option<f64>,
     /// t0 to the window object existing. The budget job fails a run where
     /// `window_visible - window_created < 5 ms`.
     pub t0_to_window_created_ms: Option<f64>,
@@ -558,6 +588,32 @@ pub struct Trace {
 }
 
 impl Trace {
+    /// **Code this crate wrote, executing on the main thread, before the first paint.**
+    ///
+    /// The two intervals bracketed by our own marks, and nothing else:
+    ///
+    /// * `main` → `state_ready` — argument parsing, the settings TOML read, building
+    ///   `AppState`.
+    /// * `runtime_ready` → `setup_done` — installing the event sink, opening the
+    ///   vault, spawning the index and vault threads, resolving the note to open,
+    ///   serialising the boot info.
+    ///
+    /// It deliberately excludes the loader, `tauri::Builder`'s own construction, and
+    /// `WebviewWindowBuilder::build`. Those are real costs and three of them are large,
+    /// but none of them is code in this repository, and a figure that mixes them
+    /// answers a different question than the one its name implies.
+    ///
+    /// This exists because the first version of that claim was a subtraction rather
+    /// than a measurement — two published intervals added together, one of which was
+    /// mostly Tauri's runtime. An aggregate has to name its basis, and the safest way
+    /// to make that true is for the basis to be the thing measured.
+    #[must_use]
+    pub fn serat_main_thread_ms(&self) -> Option<f64> {
+        let pre_tauri = self.t0_to_state_ready_ms? - self.t0_to_main_ms;
+        let in_setup = self.t0_to_setup_done_ms? - self.t0_to_runtime_ready_ms?;
+        Some(pre_tauri + in_setup)
+    }
+
     /// The single line written to [`TRACE_ENV`].
     ///
     /// # Errors
@@ -798,6 +854,59 @@ mod tests {
             trace.t0_to_window_visible_ms - created >= 5.0,
             "visible {} is not 5 ms after created {created}",
             trace.t0_to_window_visible_ms
+        );
+    }
+
+    #[test]
+    fn serat_main_thread_work_is_measured_rather_than_subtracted() {
+        // The figure "Serat's own main-thread work" was first published as a
+        // subtraction -- two of the reported intervals added together, one of which was
+        // mostly Tauri's runtime rather than ours. This asserts the shape that makes it
+        // a measurement: two intervals bracketed by our own marks, excluding the loader,
+        // Tauri's builder and the webview build.
+        let startup = in_process();
+        startup.mark_state_ready();
+        startup.mark_runtime_ready();
+        std::thread::sleep(Duration::from_millis(5));
+        startup.mark_setup_done();
+        startup.mark_window_created();
+        startup.mark_first_paint();
+        startup.mark_index_settled();
+        startup.mark_watcher(WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+
+        let trace = startup.trace().expect("complete");
+        let ours = trace.serat_main_thread_ms().expect("both brackets marked");
+        let setup_gap = trace.t0_to_setup_done_ms.expect("setup")
+            - trace.t0_to_runtime_ready_ms.expect("runtime");
+
+        assert!(ours >= 5.0, "the 5 ms slept inside setup is ours: {ours}");
+        assert!(
+            ours >= setup_gap,
+            "the setup interval alone cannot exceed the total: {ours} < {setup_gap}"
+        );
+        // And it must not have swallowed the phases that are not ours. The window
+        // build is between setup_done and window_created; nothing here may include it.
+        assert!(
+            ours < trace.t0_to_window_visible_ms,
+            "our share {ours} cannot be the whole pre-paint phase {}",
+            trace.t0_to_window_visible_ms
+        );
+    }
+
+    #[test]
+    fn a_trace_missing_a_bracket_reports_no_share_rather_than_a_wrong_one() {
+        // The failure mode being prevented: a partially marked run yielding a number
+        // that looks like a measurement. `None` is the honest answer.
+        let startup = in_process();
+        complete(&startup);
+        assert!(
+            startup
+                .trace()
+                .expect("complete")
+                .serat_main_thread_ms()
+                .is_none(),
+            "a share was reported without the marks that define it"
         );
     }
 

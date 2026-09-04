@@ -24,4 +24,4 @@ state: IndexState,
  * reads this instead of timing an IPC round trip, so the number it reports
  * is the application's, not the harness's.
  */
-since_process_start_ms: bigint, };
+since_process_start_ms: number, };

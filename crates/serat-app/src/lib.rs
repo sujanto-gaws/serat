@@ -100,6 +100,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         eprintln!("serat: {problem}");
     }
     let state = Arc::new(state);
+    state.startup.mark_state_ready();
 
     // `AppHandle::exit(code)` asks the event loop to stop; it does not decide what the
     // process returns, because `Builder::run` then returns `Ok(())` and `main` would
@@ -186,6 +187,10 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 open: note,
                 exit_after_ready: state.boot.exit_after_ready,
             })?;
+
+            // Our work on the main thread ends here; everything after it until the
+            // window exists belongs to Tauri and the platform webview.
+            state.startup.mark_setup_done();
 
             // 3. Then the window.
             let geometry = settings_geometry();

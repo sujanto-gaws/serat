@@ -26,9 +26,9 @@ hash: string,
  * `serat_core::NoteMeta::mtime_ms` uses. One concept, one unit, one name
  * across the boundary.
  */
-mtime_ms: bigint, 
+mtime_ms: number, 
 /**
  * Byte length on disk. Not `text.len()`: the front end should not have to
  * re-encode to learn how large the file was.
  */
-bytes: bigint, };
+bytes: number, };

@@ -17,8 +17,8 @@ hash: string,
  * Filesystem mtime after the write, unix milliseconds. See
  * `FileContents::mtime_ms`.
  */
-mtime_ms: bigint, 
+mtime_ms: number, 
 /**
  * Byte length after the write.
  */
-bytes: bigint, };
+bytes: number, };
