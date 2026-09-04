@@ -40,8 +40,15 @@
 -- writer and readers alike. They are repeated here so that the connection that
 -- loads this file behaves like the ones that follow it.
 --
---   foreign_keys = ON     -- OFF by default in SQLite. Without it every
---                            ON DELETE CASCADE below is decoration.
+--   foreign_keys = ON     -- Set it explicitly on every connection, and know
+--                            why: finding F-08 established that our vendored
+--                            SQLite is compiled with DEFAULT_FOREIGN_KEYS, so
+--                            cascade already fires without it. It is set anyway
+--                            because the stock default is OFF and depending on a
+--                            vendored build flag is precisely what changes
+--                            silently at a version bump. Without it every ON
+--                            DELETE CASCADE below is decoration, and blocks_fts
+--                            keeps hits for text that no longer exists.
 --   busy_timeout = 5000   -- readers never block the single writer under WAL
 --                            (ADR-0001), but the checkpointer can.
 
@@ -128,7 +135,17 @@ CREATE TABLE blocks (
     note_id      INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     ord          INTEGER NOT NULL,         -- position within the note, 0-based
     kind         TEXT    NOT NULL CHECK (kind IN
-                     ('para','heading','task','code','list','quote','table')),
+                     ('para','heading','task','code','list','quote','table','html')),
+                 -- 'html' is here and 'rule' is not, deliberately. A raw HTML
+                 -- block holds text people search for — a pasted table, an
+                 -- embedded callout — and dropping it silently costs full-text
+                 -- hits, which design goal 5 forbids. A thematic break holds
+                 -- nothing, so a row per '---' across 20,000 notes is pure cost
+                 -- and serat-parse emits none. Frontmatter is likewise not a
+                 -- block: its fields carry their own byte ranges, and the CHECK
+                 -- on fields already says a frontmatter field has no block.
+                 -- Finding F-20, raised by rust-core-dev before I3 emitted a
+                 -- single row.
     block_ref    TEXT,                     -- author-supplied ^id
     heading_path TEXT,                     -- breadcrumb of enclosing headings (§8.1)
     text         TEXT,                     -- plain text; the FTS content column
@@ -184,12 +201,38 @@ CREATE TABLE links (
     dst_note      INTEGER REFERENCES notes(id) ON DELETE SET NULL,
     dst_block_ref TEXT,                    -- targeted ^id
     kind          TEXT NOT NULL CHECK (kind IN ('wiki','embed','md','tag','unresolved')),
-    alias         TEXT
+    alias         TEXT,
+    -- A tag names no note and never will, so it can never carry a dst_note.
+    -- Structural rather than remembered: see the note below.
+    CHECK (kind <> 'tag' OR dst_note IS NULL)
 );
--- dst_note IS NULL is the authoritative test for unresolved; kind records how
--- the link was written. ON DELETE SET NULL is why: deleting a note makes every
+-- Resolution. kind records how the link was written; dst_note records whether it
+-- found a target. The test for "unresolved, and worth retrying when a new note
+-- appears" is therefore NOT dst_note IS NULL on its own:
+--
+--     dst_note IS NULL AND kind <> 'tag'
+--
+-- because a tag has no target by construction, and a re-resolution pass that
+-- trusts the shorter predicate would try to resolve every tag in the vault on
+-- every pass, forever. Tags live in this table on purpose — tag search and the
+-- link graph are then one mechanism rather than two, which is the same reasoning
+-- that makes a task a block — and the CHECK above is what keeps the longer
+-- predicate honest instead of merely documented. Finding F-22, caught by
+-- rust-core-dev reading the DDL against its own comment before any code
+-- depended on it.
+--
+-- P1 adds the index that makes the predicate cheap and keeps it in one place,
+-- which is where the re-resolution pass must read it from:
+--
+--     CREATE INDEX ix_links_unresolved ON links(dst_path)
+--         WHERE dst_note IS NULL AND kind <> 'tag';
+--
+-- It is not here because P0 does not re-resolve links, and an index P0 never
+-- reads would still cost P0's rebuild benchmark (NFR-PRF-04) to build.
+--
+-- ON DELETE SET NULL on dst_note is what makes deleting a note mark every
 -- inbound link unresolved in the same statement, so the index can never hold a
--- dangling note id — and P1's re-resolution pass has dst_path to work from.
+-- dangling note id — and the re-resolution pass has dst_path to work from.
 
 -- ----------------------------------------------------------------------------
 -- tasks — a task is a block, not a new mechanism (§10.4)
@@ -205,6 +248,14 @@ CREATE TABLE tasks (
     owner    TEXT,                         -- from owner::
     est      REAL                          -- from est::   (the usual rollup target)
 );
+-- due, owner and est are denormalised from inline fields, and serat-index fills
+-- them from the field rows it is already writing — not serat-parse. Which keys
+-- are special is a schema question, and it becomes the schema registry's answer
+-- in P2 (FR-STR-01); putting it in the parser would mean the same decision
+-- living in two places, and would give serat-parse domain knowledge that has
+-- nothing to do with Markdown. serat-index needs no Markdown knowledge for this
+-- either: it reads field keys off rows, never off a document.
+--
 -- Why both status and done: status keeps the author's marker, because a vault
 -- that uses / for in-progress must survive a round trip (C-01). done is the
 -- binary projection ix_tasks_open is partial on. The marker-to-done mapping is
@@ -301,8 +352,30 @@ CREATE VIRTUAL TABLE blocks_fts USING fts5(
 -- so a delete command must replay the OLD text exactly as it was indexed. Get
 -- this wrong and the index rots silently — no error, just missing hits.
 --
+-- A FULL REBUILD MUST NOT LOAD THROUGH THESE TRIGGERS. Measured: 26,000 blocks
+-- took 2.1 s in one transaction and 6.8-10.3 s across several with the triggers
+-- live, against 0.32 s when they were dropped and blocks_fts was built once with
+-- the FTS5 'rebuild' command; the resulting search index is identical. The
+-- rebuild sequence in serat-index is therefore:
+--
+--   1. run this file
+--   2. SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='blocks'
+--      -- keep the strings, then DROP the three triggers
+--   3. bulk-load notes, blocks, fields, links, tasks in batched transactions
+--   4. INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild')
+--   5. re-execute the strings from step 2
+--   6. UPDATE index_meta ... state='ready'; ANALYZE; wal_checkpoint(TRUNCATE)
+--
+-- Step 2 reads the triggers out of the database rather than keeping a second
+-- copy of this DDL anywhere, so what is restored is identical to what was
+-- delivered by construction and not by a test that has to catch a stale copy.
+--
+-- The INCREMENTAL path keeps the triggers. One save is a dozen blocks, and at
+-- 100 blocks per transaction the trigger path cost 15 ms — inside NFR-PRF-03.
+--
 -- These fire on cascaded deletes as well as direct ones — verified by running
--- it on SQLite 3.42.0 and 3.50.4, with foreign_keys = ON and recursive_triggers
+-- it on SQLite 3.42.0 and 3.50.4 here and, per finding F-02, through rusqlite on
+-- the 3.53.2 the application actually links, with foreign_keys = ON and recursive_triggers
 -- left at its default of 0. That is what makes "delete the note, delete its
 -- blocks, delete its search rows" one DELETE FROM notes, and it is the reason
 -- foreign_keys = ON is not optional on any connection: with it off, the blocks
