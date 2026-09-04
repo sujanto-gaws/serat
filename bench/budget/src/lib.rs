@@ -397,6 +397,9 @@ pub struct VaultUnderTest {
     pub format_version: u32,
     /// Notes it contains.
     pub notes: usize,
+    /// Note-to-note link edges the generator produced, from the manifest's
+    /// `link_degree.edges`. The oracle for `RebuildReport.links_resolved`.
+    pub note_links: usize,
 }
 
 /// A series the job measured but does not assert.
@@ -554,17 +557,21 @@ impl Outcome {
             let share = |d: std::time::Duration| ms(d) / total * 100.0;
             let _ = writeln!(
                 s,
-                "  phases      walk {:.0} ms ({:.0}%) · read+hash {:.0} ms ({:.0}%) · parse {:.0} ms ({:.0}%) · write rows {:.0} ms ({:.0}%) · write fts {:.0} ms ({:.0}%)",
+                "  phases      walk {:.0} ms ({:.0}%) · read+hash {:.0} ms ({:.0}%) · parse {:.0} ms ({:.0}%) · producer waited {:.0} ms ({:.0}%) · fts build {:.0} ms ({:.0}%)",
                 ms(p.walk),
                 share(p.walk),
                 ms(p.read_hash),
                 share(p.read_hash),
                 ms(p.parse),
                 share(p.parse),
-                ms(p.write_rows),
-                share(p.write_rows),
+                ms(p.producer_wait),
+                share(p.producer_wait),
                 ms(p.write_fts),
                 share(p.write_fts)
+            );
+            let _ = writeln!(
+                s,
+                "  reading     \"producer waited\" is how long the producer was BLOCKED on the writer, not what the writer cost — near zero means the writer kept up, large means it is the bottleneck"
             );
             let _ = writeln!(
                 s,
@@ -632,7 +639,7 @@ impl Outcome {
             let _ = writeln!(s, "    \"walk\": {:.3},", ms(p.walk));
             let _ = writeln!(s, "    \"read_hash\": {:.3},", ms(p.read_hash));
             let _ = writeln!(s, "    \"parse\": {:.3},", ms(p.parse));
-            let _ = writeln!(s, "    \"write_rows\": {:.3},", ms(p.write_rows));
+            let _ = writeln!(s, "    \"producer_wait\": {:.3},", ms(p.producer_wait));
             let _ = writeln!(s, "    \"write_fts\": {:.3}", ms(p.write_fts));
             let _ = writeln!(s, "  }},");
         }
@@ -805,6 +812,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         .ok_or_else(|| format!("{} has no tree digest", manifest_path.display()))?;
     let format_version = json_number(&manifest, "format_version").unwrap_or(0.0) as u32;
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
+    let note_links = json_number(&manifest, "edges").unwrap_or(0.0) as usize;
 
     let actual = tree_digest(path)?;
     check_vault(
@@ -821,6 +829,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         digest: actual,
         format_version,
         notes: notes_in_manifest,
+        note_links,
     })
 }
 
@@ -893,10 +902,11 @@ pub fn check_vault(
 /// # Errors
 /// When a rebuild that did real work reports no FTS build at all.
 pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), String> {
-    // A breakdown that is entirely zero is a harness that measured nothing, and
-    // `check_phases` has other things to say about that; this check is only
-    // meaningful once rows were actually written.
-    if phases.write_rows.is_zero() {
+    // Gated on `parse` rather than on the producer's wait: a fast writer means
+    // the producer never blocks, so `producer_wait` is legitimately near zero on
+    // exactly the healthy runs this check must still cover. `parse` is non-zero
+    // whenever the rebuild did any work at all.
+    if phases.parse.is_zero() {
         return Ok(());
     }
     if phases.write_fts.is_zero() {
@@ -909,6 +919,53 @@ pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), Stri
         );
     }
     Ok(())
+}
+
+/// Whether `ANALYZE` described the finished index rather than an earlier one.
+///
+/// P0 finding **F-47**. `sqlite_stat1` is read from the index directly, so this
+/// is an independent oracle rather than a number the rebuild reports about
+/// itself.
+///
+/// # Errors
+/// When the recorded row count is not the vault's note count.
+pub fn check_analyze_freshness(recorded: usize, expected: usize) -> Result<(), String> {
+    if recorded == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "ANALYZE recorded {recorded} rows for `notes`; the vault holds {expected}. The \
+         statistics describe an earlier index, so the planner picks ix_notes_kind over \
+         ix_notes_type and every typed query degrades to a full scan (architecture §4.3). At \
+         20,000 notes the opportunistic 5% re-ANALYZE never fires for the tail batch of 32, so \
+         the explicit analyze() is the only thing that makes this true — and this is the only \
+         scale at which its absence is visible."
+    ))
+}
+
+/// Whether every link the vault contains was resolved.
+///
+/// The vault's manifest records the exact number of note-to-note link edges it
+/// generated, and a test asserts every wikilink in it resolves. So a rebuild
+/// reporting fewer has dropped links, and one reporting more has counted rows
+/// touched rather than links resolved — the bug rust-core-dev hit while writing
+/// the second pass, which is the rebuild-backpressure shape one layer up.
+///
+/// # Errors
+/// When the counts disagree.
+pub fn check_links_resolved(reported: usize, expected: usize) -> Result<(), String> {
+    if reported == expected {
+        return Ok(());
+    }
+    let direction = if reported < expected {
+        "fewer, so links were dropped"
+    } else {
+        "more, so something other than resolved links is being counted"
+    };
+    Err(format!(
+        "the rebuild resolved {reported} note-to-note links; the vault manifest generated \
+         {expected}. That is {direction}."
+    ))
 }
 
 /// Whether a rebuild indexed the whole vault.
@@ -1174,7 +1231,12 @@ pub fn measure_full_rebuild(
     vault: &VaultUnderTest,
     iterations: usize,
 ) -> Result<Measurement, String> {
-    measure_full_rebuild_with(vault, iterations, subject::full_rebuild)
+    measure_full_rebuild_with(
+        vault,
+        iterations,
+        subject::full_rebuild,
+        subject::stat1_note_rows,
+    )
 }
 
 /// As [`measure_full_rebuild`], against an injected rebuild.
@@ -1186,13 +1248,15 @@ pub fn measure_full_rebuild(
 ///
 /// # Errors
 /// As [`measure_full_rebuild`].
-pub fn measure_full_rebuild_with<F>(
+pub fn measure_full_rebuild_with<F, A>(
     vault: &VaultUnderTest,
     iterations: usize,
     mut rebuild: F,
+    mut analyze: A,
 ) -> Result<Measurement, String>
 where
     F: FnMut(&Path, &Path) -> Result<subject::RebuildTiming, String>,
+    A: FnMut(&Path) -> Result<usize, String>,
 {
     let mut samples = Samples::new();
     let mut runs: Vec<subject::RebuildTiming> = Vec::with_capacity(iterations);
@@ -1203,8 +1267,12 @@ where
         let index_dir = vault.path.join(format!(".serat-bench-{i}"));
         let _ = std::fs::remove_dir_all(&index_dir);
         let timing = rebuild(&vault.path, &index_dir)?;
-        let _ = std::fs::remove_dir_all(&index_dir);
         check_note_count(timing.notes, vault.notes)?;
+        check_links_resolved(timing.links_resolved, vault.note_links)?;
+        // Read before the directory goes away. F-47 is only visible here.
+        let recorded = analyze(&index_dir);
+        let _ = std::fs::remove_dir_all(&index_dir);
+        check_analyze_freshness(recorded?, vault.notes)?;
         samples.push(timing.total);
         runs.push(timing);
     }
@@ -1214,7 +1282,7 @@ where
         walk: median_duration(runs.iter().map(|r| r.phases.walk).collect()),
         read_hash: median_duration(runs.iter().map(|r| r.phases.read_hash).collect()),
         parse: median_duration(runs.iter().map(|r| r.phases.parse).collect()),
-        write_rows: median_duration(runs.iter().map(|r| r.phases.write_rows).collect()),
+        producer_wait: median_duration(runs.iter().map(|r| r.phases.producer_wait).collect()),
         write_fts: median_duration(runs.iter().map(|r| r.phases.write_fts).collect()),
     };
     Ok(Measurement::new(samples).with_phases(phases))
@@ -1305,6 +1373,7 @@ mod tests {
             digest: "d".into(),
             format_version: 1,
             notes: 20_000,
+            note_links: 216_971,
         };
         let at_limit = Outcome {
             budget: PRF04_FULL_REBUILD,
@@ -1381,6 +1450,7 @@ mod tests {
             digest: "d".into(),
             format_version: vaultgen::VAULT_FORMAT_VERSION,
             notes: 20_000,
+            note_links: 216_971,
         }
     }
 
@@ -1574,7 +1644,7 @@ mod tests {
             walk: Duration::from_millis(500),
             read_hash: Duration::from_millis(3_000),
             parse: Duration::from_millis(6_000),
-            write_rows: Duration::from_millis(3_700),
+            producer_wait: Duration::from_millis(3_700),
             write_fts: Duration::from_millis(1_900),
         };
         let outcome = outcome_from(
@@ -1586,7 +1656,7 @@ mod tests {
         .expect("phases sum below the wall clock");
 
         let report = outcome.to_report();
-        for needle in ["walk", "read+hash", "parse", "write rows", "write fts"] {
+        for needle in ["walk", "read+hash", "parse", "producer waited", "fts build"] {
             assert!(report.contains(needle), "report lacks {needle}: {report}");
         }
         let json = outcome.to_json();
@@ -1594,7 +1664,7 @@ mod tests {
             "\"walk\"",
             "\"read_hash\"",
             "\"parse\"",
-            "\"write_rows\"",
+            "\"producer_wait\"",
             "\"write_fts\"",
         ] {
             assert!(json.contains(needle), "json lacks {needle}: {json}");
@@ -1610,14 +1680,14 @@ mod tests {
             walk: Duration::from_millis(500),
             read_hash: Duration::from_millis(3_000),
             parse: Duration::from_millis(6_000),
-            write_rows: Duration::from_millis(3_700),
+            producer_wait: Duration::from_millis(3_700),
             write_fts: Duration::from_millis(1_900),
         };
         check_bulk_load_shape(&bulk).expect("the bulk shape is what we expect");
 
         let through_triggers = subject::RebuildPhases {
             write_fts: Duration::ZERO,
-            write_rows: Duration::from_millis(5_600),
+            producer_wait: Duration::from_millis(5_600),
             ..bulk
         };
         let err = check_bulk_load_shape(&through_triggers).expect_err("triggers live");
@@ -1648,7 +1718,7 @@ mod tests {
             walk: Duration::from_millis(10_000),
             read_hash: Duration::from_millis(10_000),
             parse: Duration::from_millis(10_000),
-            write_rows: Duration::from_millis(10_000),
+            producer_wait: Duration::from_millis(10_000),
             write_fts: Duration::from_millis(10_000),
         };
         let err = outcome_from(
@@ -1721,34 +1791,70 @@ mod tests {
             subject::RebuildTiming {
                 total: Duration::from_millis(total_ms),
                 notes,
+                links_resolved: 216_971,
                 phases: subject::RebuildPhases {
                     walk: Duration::from_millis(1),
                     read_hash: Duration::from_millis(2),
                     parse: Duration::from_millis(parse_ms),
-                    write_rows: Duration::from_millis(4),
+                    producer_wait: Duration::from_millis(4),
                     write_fts: Duration::from_millis(5),
                 },
             }
         }
 
         // A rebuild that indexed half the vault must not post a fast number.
-        let err = measure_full_rebuild_with(&a_vault(), 1, |_, _| Ok(timing(1, 10_000, 3)))
-            .expect_err("half a vault is not a passing budget");
+        let err = measure_full_rebuild_with(
+            &a_vault(),
+            1,
+            |_, _| Ok(timing(1, 10_000, 3)),
+            |_| Ok(20_000),
+        )
+        .expect_err("half a vault is not a passing budget");
         assert!(err.contains("not a passing budget"), "{err}");
 
         // A failing rebuild propagates rather than being absorbed.
-        let err = measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()))
-            .expect_err("a failed rebuild is not a measurement");
+        let err =
+            measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()), |_| Ok(20_000))
+                .expect_err("a failed rebuild is not a measurement");
         assert_eq!(err, "boom");
 
         // Three good runs: the phase reported is the per-phase median, not the
         // phase of the median run and not the slowest.
         let mut n = 0;
-        let m = measure_full_rebuild_with(&a_vault(), 3, |_, _| {
-            n += 1;
-            Ok(timing(1_000 * n, 20_000, [30, 10, 20][(n - 1) as usize]))
-        })
+        let m = measure_full_rebuild_with(
+            &a_vault(),
+            3,
+            |_, _| {
+                n += 1;
+                Ok(timing(1_000 * n, 20_000, [30, 10, 20][(n - 1) as usize]))
+            },
+            |_| Ok(20_000),
+        )
         .expect("three complete rebuilds");
+
+        // And stale statistics stop the run, at the level the check runs.
+        let err = measure_full_rebuild_with(
+            &a_vault(),
+            1,
+            |_, _| Ok(timing(1, 20_000, 3)),
+            |_| Ok(19_968),
+        )
+        .expect_err("32 notes short of the finished index");
+        assert!(err.contains("ix_notes_type"), "{err}");
+
+        // As does a link count that does not match the vault.
+        let err = measure_full_rebuild_with(
+            &a_vault(),
+            1,
+            |_, _| {
+                let mut t = timing(1, 20_000, 3);
+                t.links_resolved = 200_000;
+                Ok(t)
+            },
+            |_| Ok(20_000),
+        )
+        .expect_err("links dropped");
+        assert!(err.contains("dropped"), "{err}");
         assert_eq!(m.samples.len(), 3);
         assert_eq!(m.samples.median(), 2_000.0);
         let phases = m.phases.expect("phases");
@@ -1757,6 +1863,76 @@ mod tests {
             Duration::from_millis(20),
             "median parse phase"
         );
+    }
+
+    #[test]
+    fn stale_analyze_statistics_are_caught() {
+        // F-47: the only scale at which this is visible is the real vault.
+        // 20000 % 512 = 32, and 32 never crosses the 5% (1,000-note) threshold.
+        check_analyze_freshness(20_000, 20_000).expect("statistics describe the finished index");
+        let err = check_analyze_freshness(19_968, 20_000).expect_err("32 notes short");
+        assert!(err.contains("ix_notes_type"), "{err}");
+        assert!(err.contains("full scan"), "{err}");
+    }
+
+    #[test]
+    fn dropped_or_over_counted_links_are_caught() {
+        check_links_resolved(216_971, 216_971).expect("every link resolved");
+        let dropped = check_links_resolved(200_000, 216_971).expect_err("links lost");
+        assert!(dropped.contains("dropped"), "{dropped}");
+        // The bug rust-core-dev hit: rows touched counted as links resolved.
+        let over = check_links_resolved(230_000, 216_971).expect_err("over-counted");
+        assert!(over.contains("other than resolved links"), "{over}");
+    }
+
+    #[test]
+    fn the_producer_wait_phase_is_labelled_for_what_it_measures() {
+        // A column called "write" holding a small number would settle open
+        // design question 1 backwards: near zero means the writer KEPT UP.
+        let outcome = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[20_000.0])).with_phases(subject::RebuildPhases {
+                walk: Duration::from_millis(500),
+                read_hash: Duration::from_millis(3_000),
+                parse: Duration::from_millis(6_000),
+                producer_wait: Duration::from_millis(40),
+                write_fts: Duration::from_millis(1_900),
+            }),
+        )
+        .expect("valid");
+        let report = outcome.to_report();
+        assert!(report.contains("producer waited"), "{report}");
+        assert!(
+            report.contains("BLOCKED on the writer"),
+            "the reading must travel with the number: {report}"
+        );
+        // And it must be findable: a reader scanning the block for the
+        // explanation looks for a labelled line, not for a sentence.
+        assert!(
+            report
+                .lines()
+                .any(|l| l.starts_with("  reading ") && l.contains("BLOCKED on the writer")),
+            "{report}"
+        );
+        assert!(!report.contains("write rows"), "{report}");
+    }
+
+    #[test]
+    fn the_fts_check_still_covers_a_run_where_the_writer_kept_up() {
+        // Gating F-38 on the producer's wait would have skipped the check on
+        // exactly the healthy runs it must cover, since a fast writer means the
+        // producer never blocks.
+        let fast_writer_no_fts = subject::RebuildPhases {
+            walk: Duration::from_millis(500),
+            read_hash: Duration::from_millis(3_000),
+            parse: Duration::from_millis(6_000),
+            producer_wait: Duration::ZERO,
+            write_fts: Duration::ZERO,
+        };
+        let err = check_bulk_load_shape(&fast_writer_no_fts).expect_err("still checked");
+        assert!(err.contains("FTS triggers"), "{err}");
     }
 
     #[test]

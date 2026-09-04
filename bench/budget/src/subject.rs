@@ -40,11 +40,25 @@ pub struct RebuildPhases {
     pub read_hash: Duration,
     /// Markdown to blocks, fields, links, tasks, on the rayon pool.
     pub parse: Duration,
-    /// Inserting rows, with the FTS triggers dropped. Architect measured 3.7 s
-    /// for 259,971 blocks.
-    pub write_rows: Duration,
-    /// Building `blocks_fts` afterwards with the FTS5 `rebuild` command, plus
-    /// the final ANALYZE. Architect measured 1.9 s for the same shape.
+    /// **How long the producer was blocked, not what the writer cost.**
+    ///
+    /// Measured around `submit_blocking` plus the barrier at the end. The
+    /// writer's own SQL runs on its own thread, concurrently, and is charged to
+    /// nobody. So the reading is the opposite of the obvious one:
+    ///
+    /// * near zero means the writer **kept up** — the producer never waited —
+    ///   not that writing is cheap;
+    /// * large means the writer **is** the bottleneck, because the only way
+    ///   this grows is the queue being full.
+    ///
+    /// The field is named for what it measures, because this is the number a
+    /// gate reader will use to answer open design question 1 — parse pool
+    /// versus index writer — and a column called "write" holding a small value
+    /// would settle that question backwards.
+    pub producer_wait: Duration,
+    /// Building `blocks_fts` with the FTS5 `rebuild` command after the bulk
+    /// load, plus the final ANALYZE. Architect measured 1.9 s for 259,971
+    /// blocks. Unlike `producer_wait` this is real writer-side work.
     ///
     /// Split from `write_rows` because the two have different fixes and
     /// reporting them together hides a 6x: with the triggers left live, the same
@@ -58,13 +72,12 @@ impl RebuildPhases {
     /// so: phases overlap when the parse pool and the writer run concurrently,
     /// and a sum that exceeded the total would be the first evidence of that.
     pub fn sum(&self) -> Duration {
-        self.walk + self.read_hash + self.parse + self.write_rows + self.write_fts
+        self.walk + self.read_hash + self.parse + self.producer_wait + self.write_fts
     }
 
-    /// Row insert and FTS build together, for a reader who wants the old
-    /// four-phase shape.
+    /// Everything charged to the writer's side of the queue.
     pub fn write(&self) -> Duration {
-        self.write_rows + self.write_fts
+        self.producer_wait + self.write_fts
     }
 }
 
@@ -79,6 +92,16 @@ pub struct RebuildTiming {
     pub phases: RebuildPhases,
     /// Notes the rebuild says it indexed, asserted against the vault manifest.
     pub notes: usize,
+    /// Links whose `dst_note` resolved to a note, asserted against the vault
+    /// manifest's `link_degree.edges`.
+    ///
+    /// Link resolution is necessarily a second pass — a link can name a note
+    /// not yet inserted — and rust-core-dev hit exactly the bug this exists to
+    /// catch while writing it: counting rows *touched* rather than links
+    /// *resolved*, so a dangling link came back reported as resolved. That is
+    /// the rebuild-backpressure shape one layer up, a wrong number that looks
+    /// right, and the manifest is the only independent oracle for it.
+    pub links_resolved: usize,
 }
 
 /// What the harness needs from `serat-index` before NFR-PRF-04 is measurable.
@@ -107,7 +130,13 @@ pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task 
         // 1.9 s of FTS build at 259,971 blocks, and 6x worse with the
         // triggers left live.
         pub walk: Duration, pub read_hash: Duration, pub parse: Duration,
-        pub write_rows: Duration, pub write_fts: Duration,
+        // producer_wait is time blocked on submit_blocking plus the final
+        // drain -- how long the producer WAITED, not what the writer cost.
+        pub producer_wait: Duration, pub write_fts: Duration,
+
+        // The oracles the harness checks against the vault manifest.
+        pub notes: usize,           // Markdown notes only, excluding assets
+        pub links_resolved: usize,  // links whose dst_note resolved to a note
     }
 
 Call site:
@@ -195,6 +224,65 @@ everything before main is cold-start cost the user feels. `window visible` must
 be the first painted frame, not window creation. `vault usable` is D2's to
 define, and the harness asserts whatever D2 says. Until D2 lands this job is
 blocked rather than guessed at.";
+
+/// How many rows `ANALYZE` recorded for the `notes` table, read straight out
+/// of the index.
+///
+/// P0 finding **F-47**, and the only place in the project where the assertion
+/// can bite. `commit()` re-runs ANALYZE when a batch touches more than 5% of
+/// the notes; at test scale 5% is smaller than one batch, so the opportunistic
+/// path fires every time and the rebuild's explicit `analyze()` is
+/// unobservable. At 20,000 notes the threshold is 1,000 against a batch of 512,
+/// so the tail — `20000 % 512` = 32 notes — never crosses it. Remove or reorder
+/// the explicit call and the planner's statistics describe the index as it was
+/// 32 notes ago, which is architecture §4.3's defect returning at the one scale
+/// that can show it: `ix_notes_kind` over `ix_notes_type`, and every typed
+/// query a full scan.
+///
+/// The harness reads `sqlite_stat1` itself rather than trusting a number the
+/// code under test reports, for the same reason it recomputes the vault digest.
+///
+/// # Errors
+/// When the index cannot be found or read.
+pub fn stat1_note_rows(index_dir: &Path) -> Result<usize, String> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(index_dir)
+        .map_err(|e| format!("reading {}: {e}", index_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "db"))
+        .collect();
+    candidates.sort();
+    let db = match candidates.len() {
+        1 => candidates.remove(0),
+        0 => return Err(format!("no .db file in {}", index_dir.display())),
+        n => {
+            return Err(format!(
+                "{n} .db files in {}; the harness cannot tell which is the index",
+                index_dir.display()
+            ));
+        }
+    };
+
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("opening {}: {e}", db.display()))?;
+    let stat: String = conn
+        .query_row(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' ORDER BY idx LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            format!(
+                "reading sqlite_stat1 for notes from {}: {e}. No row means ANALYZE never ran, \
+                 which is F-47 itself.",
+                db.display()
+            )
+        })?;
+    stat.split_whitespace()
+        .next()
+        .and_then(|first| first.parse().ok())
+        .ok_or_else(|| format!("sqlite_stat1 for notes holds {stat:?}, which is not a row count"))
+}
 
 /// Time one full rebuild of the vault into a throwaway index directory,
 /// including the phase breakdown F-10 asks for.
@@ -347,7 +435,7 @@ mod tests {
             walk: Duration::from_millis(100),
             read_hash: Duration::from_millis(200),
             parse: Duration::from_millis(300),
-            write_rows: Duration::from_millis(370),
+            producer_wait: Duration::from_millis(370),
             write_fts: Duration::from_millis(190),
         };
         assert_eq!(phases.sum(), Duration::from_millis(1_160));

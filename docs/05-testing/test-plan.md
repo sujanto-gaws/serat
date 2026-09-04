@@ -107,7 +107,10 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-070..TC-073 | F-25 — the statistic is pinned: median of three is the middle run, `WallClock` is the median, the report says "median", the two medians agree, `P95` is the 95th | unit | `bench/budget/src/lib.rs` | pass |
 | TC-074, TC-075 | F-26 — a vault that is coherent but not canonical, hand-edited, miscounted, or unmanifested stops the clock | integration | `bench/budget/tests/vault_gate.rs` | pass |
 | TC-076..TC-081, TC-083, TC-084 | F-27, F-29, F-30, RISK-012 — the four invisible mutations, the double-counted breakdown, the vacuous meta-job, the unwritten result file, the ineligible environment | unit | `bench/budget/src/lib.rs` | pass |
-| TC-082 | F-38 — a rebuild that loaded through the FTS triggers is caught | unit | `bench/budget/src/lib.rs` | pass |
+| TC-082 | F-38 — a rebuild that loaded through the FTS triggers is caught, including when the writer kept up | unit | `bench/budget/src/lib.rs` | pass |
+| TC-090 | F-47 — `ANALYZE` describes the finished index, read from `sqlite_stat1` rather than reported by the rebuild | unit + bench | `bench/budget/src/{lib,subject}.rs` | pass (check), **red** pending I4 (measurement) |
+| TC-091 | F-49 — resolved links match the manifest, catching both dropped links and rows counted as links | unit + bench | `bench/budget/src/lib.rs` | pass (check), **red** pending I4 |
+| TC-092 | F-46 — the producer-wait phase carries its reading, so a small number is not read as a cheap writer | unit | `bench/budget/src/lib.rs` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a **truncated** index is detected at open and rebuilt without user action | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 | TC-060 | NFR-REL-02 — corruption the open check cannot catch routes to rebuild, not to an error dialog | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
