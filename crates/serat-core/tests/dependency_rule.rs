@@ -106,6 +106,53 @@ const BUDGET_MAY_LINK: &[&str] = &[
 /// product, and nothing in the product may depend on a bench crate.
 const BENCH_CRATES: &[&str] = &["vaultgen", "budget"];
 
+/// External crates each product crate may **not** take, and why.
+///
+/// This is architecture §2.1's "notably does not own" column made mechanical. That
+/// table is the load-bearing half of the crate decomposition — a crate that quietly
+/// acquires a capability it was defined not to have does not break the dependency
+/// graph, so nothing else here would notice, and the design is wrong from then on
+/// without a single failing test.
+///
+/// A forbid-list rather than an allow-list, deliberately: these crates legitimately
+/// take supporting dependencies nobody needs to approve, and an allow-list would turn
+/// every serde or thiserror into a policy question. `serat-core` is the exception and
+/// keeps its allow-list, because "performs no I/O whatsoever" is a claim about
+/// everything it links rather than about a handful of named crates.
+///
+/// The reason strings are not decoration. A failure here should say what capability
+/// was acquired and why the crate was defined not to have it, because the person
+/// reading it will otherwise conclude the rule is arbitrary and add an exception.
+const FORBIDDEN_EXTERNAL: &[(&str, &[&str], &str)] = &[
+    (
+        "serat-index",
+        &[
+            "comrak",
+            "pulldown-cmark",
+            "markdown",
+            "notify",
+            "walkdir",
+            "ignore",
+        ],
+        "serat-index owns the index and no knowledge of Markdown or of the vault's          filesystem (§2.1). A vault path reaches it only as a VaultPath inside a row —          a string it stores, not a file it opens. It owns .serat/ and may create and          delete the index there; the vault belongs to serat-vault, and what the bytes          mean belongs to serat-parse, which arrive as NoteSource and NoteParser.",
+    ),
+    (
+        "serat-parse",
+        &["rusqlite", "notify", "walkdir", "ignore", "tokio"],
+        "serat-parse takes bytes and returns structures and performs no file access at          all (§2.1, §3.1 step 4). That purity is what lets the parse pool run it across          cores with no coordination; a parser that could read a file could not be run          that way and could not be tested with a string literal.",
+    ),
+    (
+        "serat-vault",
+        &["comrak", "pulldown-cmark", "markdown", "rusqlite"],
+        "serat-vault owns watching, reading, atomic writes and path canonicalisation,          and no knowledge of Markdown (§2.1). It hands out bytes; deciding what they          mean is serat-parse's, and storing them is serat-index's.",
+    ),
+    (
+        "serat-sq",
+        &["rusqlite"],
+        "serat-sq emits a statement and a plan and does not execute (§2.1). Linking a          database is how a compiler becomes an engine, and it is what lets SQ be          typechecked against a SchemaProvider without one.",
+    ),
+];
+
 /// External dependencies `serat-core` is allowed to have.
 ///
 /// The list is short because the argument for it is short: a crate that performs no
@@ -175,6 +222,60 @@ fn violations_in(packages: &[Package]) -> Vec<String> {
     }
 
     violations
+}
+
+#[test]
+fn no_crate_acquires_a_capability_it_was_defined_not_to_have() {
+    // The other half of §2.1. The dependency rule keeps the graph acyclic; this keeps
+    // each crate's charter honest. Nothing else would catch serat-index taking comrak:
+    // the graph stays perfectly acyclic, every existing test passes, and the crate has
+    // simply stopped being what the design says it is.
+    let metadata = workspace_metadata();
+    let mut violations = Vec::new();
+
+    for package in &metadata {
+        let Some((_, forbidden, reason)) = FORBIDDEN_EXTERNAL
+            .iter()
+            .find(|(name, _, _)| *name == package.name)
+        else {
+            continue;
+        };
+
+        for dependency in &package.dependencies {
+            if forbidden.contains(&dependency.name.as_str()) {
+                violations.push(format!(
+                    "{} takes {} ({}).
+    {reason}",
+                    package.name,
+                    dependency.name,
+                    dependency.kind_label()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a crate acquired a capability §2.1 says it does not own:
+  - {}",
+        violations.join(
+            "
+  - "
+        )
+    );
+}
+
+#[test]
+fn every_forbid_list_names_a_crate_the_policy_knows_about() {
+    // A forbid-list entry for a crate that has been renamed or dropped protects
+    // nothing while looking like it does. This is the same failure as a guard that
+    // cannot fail, one level up in the file.
+    for (name, _, _) in FORBIDDEN_EXTERNAL {
+        assert!(
+            policy_for(name).is_some(),
+            "{name} has a forbid-list but is not in POLICY; one of the two is stale"
+        );
+    }
 }
 
 #[test]
