@@ -57,17 +57,37 @@ PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
 
 -- ----------------------------------------------------------------------------
--- Schema stamp (ADR-0002, NFR-REL-02)
+-- Index version stamp (ADR-0002, NFR-REL-02)
 -- ----------------------------------------------------------------------------
 -- user_version is NOT a migration marker and there is no upgrade path to a
 -- higher one. It exists so that opening the index is a two-way decision and
 -- never a three-way one:
 --
---     user_version == SCHEMA_VERSION  ->  open it
---     anything else                   ->  delete the file and rebuild
+--     user_version == INDEX_VERSION  ->  open it
+--     anything else                  ->  delete the file and rebuild
 --
--- There is deliberately no migration machinery to read this value with. Bump it
--- in the same commit that changes any statement in this file.
+-- There is deliberately no migration machinery to read this value with.
+--
+-- IT IS NOT A SCHEMA VERSION, and the constant is deliberately not named for
+-- one. Bump it in the same commit as EITHER of:
+--
+--   * a change to any statement in this file; or
+--   * a change to what the indexer extracts from input that has not changed --
+--     a parser that starts recognising an inline field it used to ignore, a
+--     block-kind mapping that stops dropping HTML, a different FTS tokenizer.
+--
+-- The second case is the one that gets missed, and it was missed here: this
+-- comment used to say "any statement in this file", which is a rule no author
+-- of a parse change would think applied to them. The failure is silent -- the
+-- schema matches, the vault matches, every open check passes, and the rows are
+-- quietly derived by a version of the code that no longer exists (F-134).
+--
+-- One number rather than two. A second constant for the derivation layer would
+-- carry the same discipline, the same absence of any test that can enforce it,
+-- and one more thing to forget; and both cases have the identical remedy and
+-- the identical cost to the user, which is one rebuild. What made a single
+-- number look insufficient was its name, and a name is cheaper to fix than a
+-- mechanism is to add.
 
 PRAGMA user_version = 1;
 
@@ -91,7 +111,12 @@ PRAGMA user_version = 1;
 CREATE TABLE index_meta (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version  INTEGER NOT NULL,      -- must equal PRAGMA user_version
-    indexer_version TEXT,                  -- crate version that built it; a bump rebuilds
+    indexer_version TEXT,                  -- crate version that built it. DIAGNOSTIC ONLY:
+                                           -- nothing reads it and nothing should. What
+                                           -- invalidates an index is user_version above;
+                                           -- wiring a check to a crate version would
+                                           -- rebuild 20,000 notes for a patch release that
+                                           -- changed a log message (F-134).
     vault_root      TEXT,                  -- canonical vault path this index was built from
     built_at        INTEGER,               -- unix seconds, last completed full rebuild
     note_count      INTEGER NOT NULL DEFAULT 0,  -- must equal (SELECT count(*) FROM notes)
