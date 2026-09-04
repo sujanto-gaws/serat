@@ -141,8 +141,12 @@ pub fn rebuild_with_queue_depth(
 
     let mut timing = Phases::default();
     let mut skipped = 0usize;
-    for path in entries {
-        match index_one(source, parser, &writer, &path, &mut timing) {
+    for entry in entries {
+        // F-29b: entries() now carries kind, size and mtime as well as the path, so
+        // the rebuild no longer re-derives what the walk already knew. index_one still
+        // takes the path because load() is what supplies the hash, and the hash is
+        // what the index stores.
+        match index_one(source, parser, &writer, &entry.path, &mut timing) {
             Ok(()) => {}
             Err(Skip) => skipped += 1,
         }
@@ -193,10 +197,6 @@ fn index_one(
     source: &dyn NoteSource,
     parser: &dyn NoteParser,
     writer: &WriterHandle,
-    // Takes the bare path because that is what NoteSource::entries returns on main.
-    // F-29b enriches it to SourceEntry (kind, size, mtime) so the rebuild stops
-    // re-deriving what the walk already knew; that change is on the I2 branch and
-    // adapting this is one line once it merges.
     path: &VaultPath,
     timing: &mut Phases,
 ) -> Result<(), Skip> {

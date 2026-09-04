@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serat_core::{
     Block, BlockKind, ByteRange, ContentHash, Field, FieldSource, FieldValue, IndexOp, IndexWriter,
     Link, LinkKind, LinkTarget, LoadedNote, NoteKind, NoteMeta, NoteParser, NoteSource, ParseError,
-    ParsedNote, Task, VaultError, VaultPath,
+    ParsedNote, SourceEntry, Task, VaultError, VaultPath,
 };
 use serat_index::{IndexActor, SCHEMA_VERSION, rebuild, schema};
 
@@ -50,8 +50,21 @@ impl FakeVault {
 }
 
 impl NoteSource for FakeVault {
-    fn entries(&self) -> Result<Vec<VaultPath>, VaultError> {
-        Ok(self.files.iter().map(|(path, _)| path.clone()).collect())
+    fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
+        Ok(self
+            .files
+            .iter()
+            .map(|(path, bytes)| SourceEntry {
+                kind: if path.is_markdown() {
+                    NoteKind::Note
+                } else {
+                    NoteKind::Asset
+                },
+                size: bytes.len() as u64,
+                mtime_ms: 1_700_000_000_000,
+                path: path.clone(),
+            })
+            .collect())
     }
 
     fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
