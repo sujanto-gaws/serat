@@ -134,22 +134,29 @@ const FORBIDDEN_EXTERNAL: &[(&str, &[&str], &str)] = &[
             "walkdir",
             "ignore",
         ],
-        "serat-index owns the index and no knowledge of Markdown or of the vault's          filesystem (§2.1). A vault path reaches it only as a VaultPath inside a row —          a string it stores, not a file it opens. It owns .serat/ and may create and          delete the index there; the vault belongs to serat-vault, and what the bytes          mean belongs to serat-parse, which arrive as NoteSource and NoteParser.",
+        "serat-index owns the index and no knowledge of Markdown or of the vault's filesystem (§2.1). A vault path reaches it only as a VaultPath inside a row — a string it stores, not a file it opens. It owns .serat/ and may create and delete the index there; the vault belongs to serat-vault, and what the bytes mean belongs to serat-parse, which arrive as NoteSource and NoteParser.",
     ),
     (
         "serat-parse",
         &["rusqlite", "notify", "walkdir", "ignore", "tokio"],
-        "serat-parse takes bytes and returns structures and performs no file access at          all (§2.1, §3.1 step 4). That purity is what lets the parse pool run it across          cores with no coordination; a parser that could read a file could not be run          that way and could not be tested with a string literal.",
+        "serat-parse takes bytes and returns structures and performs no file access at all (§2.1, §3.1 step 4). That purity is what lets the parse pool run it across cores with no coordination; a parser that could read a file could not be run that way and could not be tested with a string literal.",
     ),
     (
         "serat-vault",
         &["comrak", "pulldown-cmark", "markdown", "rusqlite"],
-        "serat-vault owns watching, reading, atomic writes and path canonicalisation,          and no knowledge of Markdown (§2.1). It hands out bytes; deciding what they          mean is serat-parse's, and storing them is serat-index's.",
+        "serat-vault owns watching, reading, atomic writes and path canonicalisation, and no knowledge of Markdown (§2.1). It hands out bytes; deciding what they mean is serat-parse's, and storing them is serat-index's.",
+    ),
+    (
+        "serat-contracts",
+        &[
+            "rusqlite", "comrak", "notify", "walkdir", "tokio", "reqwest",
+        ],
+        "serat-contracts is the IPC contract: the types and the TypeScript generated from them (ADR-0007). It is compiled so contracts/ipc.rs cannot drift from its bindings, not so that it can do anything. A capability here would be a capability on both sides of the boundary at once.",
     ),
     (
         "serat-sq",
         &["rusqlite"],
-        "serat-sq emits a statement and a plan and does not execute (§2.1). Linking a          database is how a compiler becomes an engine, and it is what lets SQ be          typechecked against a SchemaProvider without one.",
+        "serat-sq emits a statement and a plan and does not execute (§2.1). Linking a database is how a compiler becomes an engine, and it is what lets SQ be typechecked against a SchemaProvider without one.",
     ),
 ];
 
@@ -262,6 +269,64 @@ fn no_crate_acquires_a_capability_it_was_defined_not_to_have() {
             "
   - "
         )
+    );
+}
+
+/// Crates in [`POLICY`] that deliberately have no forbid-list entry yet.
+///
+/// F-91. The staleness check below runs forbid-list to POLICY; without this the other
+/// direction is silent — a crate with no entry falls through the `continue` in
+/// `no_crate_acquires_a_capability_it_was_defined_not_to_have` and is simply
+/// unprotected, with nothing to prompt whoever adds it.
+///
+/// So the complement is written down and asserted to be exact. Adding a crate to
+/// POLICY then forces a decision: give it a forbid list, or record here that it does
+/// not have one yet.
+///
+/// `serat-extract` is why this is not left for later. Its charter is a security
+/// boundary — ADR-0004 and T-03: the worker links no HTTP client at all, so a network
+/// call is a link error rather than a runtime check. That is exactly the claim that
+/// wants a mechanical guard on the day the crate arrives, not a month afterwards.
+const NO_FORBID_LIST_YET: &[&str] = &[
+    "serat-core",    // held to something stricter by CORE_ALLOWED_EXTERNAL
+    "serat-extract", // give it one when it arrives: no HTTP client (T-03, ADR-0004)
+    "serat-ai",      // the one crate that may reach a network at all (NFR-SEC-02)
+    "serat-mcp",     // no second implementation of anything (§2.1)
+    "serat-app",     // depends on everything by design
+    "vaultgen",      // tool tier, zero dependencies by test-engineer's decision
+    "budget",        // tool tier, links the product in order to measure it
+];
+
+#[test]
+fn every_crate_either_has_a_forbid_list_or_is_recorded_as_not_having_one() {
+    // F-91, the direction the first version missed. Without it a crate added to POLICY
+    // is skipped in silence by the capability check, and the day serat-extract arrives
+    // nothing prompts anyone to write down what it must not link.
+    //
+    // It found serat-contracts on its first run: the crate had arrived from the D3
+    // review fixes and nobody had decided what a wire contract is not allowed to be.
+    let mut unaccounted = Vec::new();
+    for (name, _) in POLICY {
+        let listed = FORBIDDEN_EXTERNAL
+            .iter()
+            .any(|(crate_name, _, _)| crate_name == name);
+        let exempt = NO_FORBID_LIST_YET.contains(name);
+
+        if listed == exempt {
+            unaccounted.push(if listed {
+                format!("{name} is in both FORBIDDEN_EXTERNAL and NO_FORBID_LIST_YET")
+            } else {
+                format!("{name} is in neither, so its capabilities are unguarded")
+            });
+        }
+    }
+
+    assert!(
+        unaccounted.is_empty(),
+        "every crate in POLICY must either have a forbid list or be recorded as deliberately not having one. §2.1 gives each of them a \"notably does not own\" entry, and a crate in neither list is skipped in silence:
+  - {}",
+        unaccounted.join("
+  - ")
     );
 }
 
