@@ -93,7 +93,17 @@
 //!    passes the hash it read; a mismatch returns `IpcError::StaleHash` with
 //!    the current hash. That is an expected outcome, not a fault, and the UI
 //!    resolves it in place — no modal on the write path (§9.1).
-//! 5. **Errors are a closed set.** `IpcError` is the only error type that
+//! 5. **Integers that cross this boundary are `number`, not `bigint`.** Tauri's
+//!    IPC is JSON, so an `i64` arrives in JavaScript as a `number` whatever the
+//!    Rust type says. `ts-rs` maps 64-bit integers to `bigint` by default, which
+//!    type-checks and then fails at run time the first time anyone writes
+//!    `file.mtime_ms > 0n`. Every 64-bit field here therefore carries
+//!    `#[ts(type = "number")]`, which is accurate rather than a convenience: a
+//!    millisecond timestamp is about 1.8e12 and a file size fits comfortably
+//!    below `Number.MAX_SAFE_INTEGER` at 9.0e15. A future field that could
+//!    exceed that must cross as a string, and saying so must not be left to
+//!    whoever adds it.
+//! 6. **Errors are a closed set.** `IpcError` is the only error type that
 //!    crosses, and `serat-app` maps `serat_core::VaultError` onto it with an
 //!    exhaustive `match` and no `_` arm, so a new variant in the core taxonomy
 //!    is a compile error here rather than a `String` at the boundary. That
@@ -183,9 +193,11 @@ pub struct FileContents {
     /// Filesystem mtime in unix **milliseconds**, the unit and the name
     /// `serat_core::NoteMeta::mtime_ms` uses. One concept, one unit, one name
     /// across the boundary.
+    #[ts(type = "number")]
     pub mtime_ms: i64,
     /// Byte length on disk. Not `text.len()`: the front end should not have to
     /// re-encode to learn how large the file was.
+    #[ts(type = "number")]
     pub bytes: u64,
 }
 
@@ -225,8 +237,10 @@ pub struct FileWritten {
     pub hash: String,
     /// Filesystem mtime after the write, unix milliseconds. See
     /// `FileContents::mtime_ms`.
+    #[ts(type = "number")]
     pub mtime_ms: i64,
     /// Byte length after the write.
+    #[ts(type = "number")]
     pub bytes: u64,
 }
 
@@ -247,6 +261,7 @@ pub struct IndexStatus {
     /// Milliseconds since process start. The cold-start benchmark (NFR-PRF-01)
     /// reads this instead of timing an IPC round trip, so the number it reports
     /// is the application's, not the harness's.
+    #[ts(type = "number")]
     pub since_process_start_ms: u64,
 }
 
