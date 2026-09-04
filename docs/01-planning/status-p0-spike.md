@@ -10,6 +10,7 @@ status: interrupted — gate NOT reached
 
 > **P0 produced no gate numbers. The four budgets are exactly as unknown as they were at the start.**
 > The design was reviewed and corrected, repeatedly and usefully — that is not the same as validated, and the most likely misreading of a report full of design findings is that it was.
+> The measurement apparatus is now well guarded against flattering itself, which is also not the same as the numbers being good (F-71). The first real figure is still the first real figure.
 
 **Gate (charter §Milestones):** full index of 20,000 notes < 30 s · save→index < 50 ms p95 · cold start < 1 s (window visible < 400 ms).
 
