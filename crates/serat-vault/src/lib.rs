@@ -713,38 +713,36 @@ mod permission_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_read_only_note_is_not_silently_replaced() {
-        // The one part of F-33 that can bite on Windows, where the read-only flag is
-        // the whole of what permissions carry. Renaming over a read-only file is
-        // refused by the platform, so the user's intent survives — and the failure is
-        // a refusal the caller sees, not a silent no-op.
+        // Windows-only, and the reviewer was right that it needed gating. On Unix
+        // set_readonly(true) clears the write bits on the file, but rename(2) checks
+        // the permissions of the containing directory rather than of the target, so
+        // the rename succeeds and this would fail for a reason that says nothing
+        // about write_atomic. a_note_the_user_restricted_stays_restricted is the Unix
+        // half.
+        //
+        // What it asserts here: the read-only flag is the whole of what permissions
+        // carry on Windows, renaming over a read-only file is refused by the
+        // platform, and the caller sees a refusal rather than a silent no-op.
         let (_dir, vault) = vault();
         let path = VaultPath::new("locked.md").expect("path");
-        vault
-            .write_atomic(
-                &path,
-                b"# Locked
-",
-            )
-            .expect("write");
+        vault.write_atomic(&path, b"# Locked").expect("write");
 
         let absolute = vault.resolve(&path);
-        let mut permissions = fs::metadata(&absolute).expect("stat").permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&absolute, permissions).expect("set read-only");
+        let original = fs::metadata(&absolute).expect("stat").permissions();
 
-        let refused = vault.write_atomic(
-            &path,
-            b"# Overwritten
-",
-        );
+        let mut locked = original.clone();
+        locked.set_readonly(true);
+        fs::set_permissions(&absolute, locked).expect("set read-only");
 
-        // Restore before the assertion so a failure does not leave an undeletable
-        // temp directory behind.
-        let mut writable = fs::metadata(&absolute).expect("stat").permissions();
-        writable.set_readonly(false);
-        fs::set_permissions(&absolute, writable).expect("restore");
+        let refused = vault.write_atomic(&path, b"# Overwritten");
+
+        // Restore by putting back exactly what was there rather than by clearing the
+        // read-only flag: set_readonly(false) is world-writable on Unix, which clippy
+        // rejects and which would be wrong even here.
+        fs::set_permissions(&absolute, original).expect("restore");
 
         assert!(
             refused.is_err(),
@@ -752,8 +750,7 @@ mod permission_tests {
         );
         assert_eq!(
             fs::read(&absolute).expect("read"),
-            b"# Locked
-",
+            b"# Locked",
             "the original contents did not survive the refused write"
         );
     }

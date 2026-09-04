@@ -426,14 +426,33 @@ mod tests {
             .map(|i| path(&format!("10-projects/note-{i:05}.md")))
             .collect();
 
+        // The consumer starts late and drains in bursts, so the queue genuinely fills
+        // and push_blocking genuinely waits. Without this the producer never reaches
+        // capacity, and a version that drops on full behaves identically — which is
+        // what the first version of this test asserted by accident.
         let consumer = {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
                 let mut seen = Vec::new();
-                while let Some(path) = queue.pop() {
-                    seen.push(path);
+                loop {
+                    let mut drained = 0;
+                    while drained < 500 {
+                        match queue.pop_timeout(Duration::from_millis(50)) {
+                            Some(path) => {
+                                seen.push(path);
+                                drained += 1;
+                            }
+                            None => {
+                                if queue.is_closed() && queue.depth() == 0 {
+                                    return seen;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                seen
             })
         };
 
@@ -450,6 +469,39 @@ mod tests {
             0,
             "a blocking producer overflowed"
         );
+        assert!(queue.rescan_needed().is_none());
+    }
+
+    #[test]
+    fn push_blocking_waits_for_space_rather_than_refusing() {
+        // The mirror of the_watcher_still_drops_rather_than_blocking, and the guard
+        // the convergence test was standing in for without actually providing: that
+        // one had its consumer draining from the start, so the queue never filled and
+        // a push_blocking that dropped on full behaved identically.
+        //
+        // Here the queue is full before the third push, so the producer must be
+        // observed still waiting — and then completing once room is made.
+        let queue = Arc::new(WorkQueue::with_capacity(2));
+        assert!(queue.push_blocking(path("a.md")));
+        assert!(queue.push_blocking(path("b.md")));
+
+        let waiting = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.push_blocking(path("c.md")))
+        };
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiting.is_finished(),
+            "push_blocking refused instead of waiting; the walk would lose this path              and nothing would ever mention it again"
+        );
+
+        assert_eq!(queue.pop(), Some(path("a.md")));
+        assert!(
+            waiting.join().expect("producer"),
+            "push_blocking did not queue the path once there was room"
+        );
+        assert_eq!(queue.stats().overflowed, 0);
         assert!(queue.rescan_needed().is_none());
     }
 
