@@ -18,11 +18,11 @@ status: interrupted — gate NOT reached
 
 **This section is deliberately before the findings.** A reader who meets a hundred findings first will have formed a view by the time they reach the verdict, and the view formed from a hundred design corrections is "this was validated". It was not.
 
-1. **Cold start is MEASURED AND MISSED** — 1088 ms p95 against 400 ms, on one platform, best case (scanner off, so `gate_eligible: false`), with the cause attributed and mostly outside our control.
+1. **Cold start is MEASURED AND MISSED** — `t0 → window visible` p95 **1146 ms at 2 notes and 940 ms at 20,000** against a 400 ms budget (2.4–2.9x over), on one platform, best case (scanner off, so `gate_eligible: false`), with the cause attributed and mostly outside our control. **Read the spread before the miss:** those are back-to-back batches of 20 and the larger vault came out *faster*, so run-to-run noise here exceeds any vault-size effect (F-109). The miss is unambiguous; the proportionality signal is not.
 2. **The other three budgets are UNMEASURED** — full rebuild, save-to-index, and the 50k scale run.
 3. **§1.2's three structural assumptions remain UNTESTED**, and this number touches none of them. It says nothing about whether the parse pool or the index writer dominates a rebuild.
 
-**Serat's own share of the cold start is 28 ms of code we wrote, executing on the main thread** (F-94 — that basis is part of the figure; two other defensible quantities exist for "our share", differing by a factor of six). **619 ms of the 804 ms median sits inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation, before any Serat code that matters.
+**Serat's own share of the cold start is ~28-35 ms of main-thread work outside the loader and the webview build** (F-94, F-106 — that basis is part of the figure, and how it divides between Tauri's runtime and our own code is *not* established by this run; two other defensible quantities exist for "our share", differing by a factor of six). **619 ms of the 804 ms median sits inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation, before any Serat code that matters.
 
 §3.4 budgets that whole phase at 400 ms *including* our own work, which the measurement shows is not available to us. The question this hands Q1 is not whether Serat can be made faster but **whether 400 ms is achievable on Tauri v2 at all** — a question about C-07, not about the implementation. NFR-PRF-01 was deliberately **not** re-baselined on it: one platform is not enough when WebView2 is one of three webviews (F-96).
 
