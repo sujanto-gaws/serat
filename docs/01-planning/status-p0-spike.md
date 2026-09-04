@@ -49,6 +49,12 @@ What the harness gives: the benchmark vault, the budget harness, the CI jobs, th
 
 **The one measured figure bearing on a budget is not reassuring, and is not a verdict either:** `Vault::walk` costs ~2.0 s on the 20k vault (F-12), against FR-VLT-01's own 2 s budget on the no-index path. It is off the cold-start critical path per §3.4, and its fix (lexical prefix strip, ~50 ms) is written but deliberately unlanded, because working agreement 4 requires it to land with the bench that measures it.
 
+## The one practice worth carrying out of P0
+
+**Refuse to accept a sentence as evidence.** Six of eight mutations invisible in the budget harness; three drains and a no-retry rule that could not fail; a rescan named in a comment and implemented in no crate. **In every case the code was reviewable and the claim *about* the code was the thing that was wrong** — and in every case the defect was invisible to reading and visible to asking whether the named thing can actually happen.
+
+**A guard, a recovery and a measurement each need someone to check that the thing they name can actually occur.** Every failure class this spike named is a special case: the setup never reaches the path (F-58); the guard is tested and its caller is not (F-69); the guard fires and means the wrong thing (F-107); an assertion claims all paths from a one-path search (F-127); the fix reached the analysis and not the instrument (F-147); the recovery is named in a comment and implemented nowhere (F-196).
+
 ## What P0 actually produced
 
 **62 recorded findings** (`tasks-p0-spike.md`), every one measured or reproduced rather than argued — including several that correct earlier findings, and two that correct the lead. P0's stated purpose is to replace blueprint targets with real numbers; it did not do that. What it did instead, at a cost of one merge, was find a class of defect that would have made those numbers untrustworthy had they been taken.
