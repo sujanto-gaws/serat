@@ -288,18 +288,80 @@ fn a_rebuild_leaves_the_index_ready_and_the_note_count_true() {
 }
 
 #[test]
-fn analyze_has_run_so_the_planner_has_statistics() {
-    // architecture.md §4.3: without ANALYZE the planner prefers ix_notes_kind, which
-    // matches nearly every row, over ix_notes_type, and every typed query becomes a
-    // full scan. The evidence that it ran is sqlite_stat1 existing and non-empty.
+fn the_statistics_left_behind_describe_the_finished_index() {
+    // architecture.md §4.3: without current statistics the planner prefers
+    // ix_notes_kind, which matches nearly every row, over ix_notes_type, and every
+    // typed query becomes a full scan.
+    //
+    // The earlier version of this test asserted only that sqlite_stat1 was non-empty,
+    // and I mutation-checked it: deleting the rebuild's explicit analyze() call left
+    // it passing, because commit() also runs ANALYZE opportunistically when a batch
+    // touches more than 5% of the notes. So it was guarding "ANALYZE ran at some
+    // point", which is not the property — stale statistics gathered a third of the way
+    // through a rebuild are exactly as bad as none (F-35).
+    //
+    // What matters is that the statistics describe the index as it finally stands.
+    //
+    // Being straight about what this still does NOT catch, because the rewrite did not
+    // fix that half: deleting the rebuild's explicit analyze() leaves this passing too.
+    // The reason is arithmetic rather than a weak assertion. commit() re-runs ANALYZE
+    // whenever a batch has touched more than 5% of the notes, and at test scale 5% is
+    // smaller than one batch, so the opportunistic path fires on the last batch every
+    // time and the explicit call changes nothing observable.
+    //
+    // It is still load-bearing at real scale: 20,000 notes make the threshold 1,000
+    // while BATCH_SIZE is 512, so the tail batch (20000 % 512 = 32 notes) does not
+    // cross it and the statistics would be left describing the index as it was 32
+    // notes ago. Reproducing that needs a 20,000-note rebuild, which belongs in the
+    // budget harness against the real vault rather than here. Recorded rather than
+    // papered over: this test guards currency, not the explicit call.
+    let files: Vec<(String, String)> = (0..400)
+        .map(|i| {
+            (
+                format!("10-projects/note-{i:04}.md"),
+                format!(
+                    "# Note {i}
+type:: project
+"
+                ),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+
     let dir = tempfile::tempdir().expect("temp");
-    rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = serat_index::rebuild_with_queue_depth(
+        &FakeVault::with(&borrowed),
+        &LineParser::default(),
+        dir.path(),
+        8,
+    )
+    .expect("rebuild");
 
     let conn = schema::open(&rebuild_path(dir.path())).expect("open");
-    let rows: i64 = conn
-        .query_row("SELECT count(*) FROM sqlite_stat1", [], |row| row.get(0))
-        .expect("sqlite_stat1 must exist after a rebuild");
-    assert!(rows > 0, "ANALYZE collected no statistics");
+    let recorded: String = conn
+        .query_row(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("ANALYZE must leave statistics for notes");
+
+    // sqlite_stat1.stat begins with the number of rows the index covers.
+    let rows: usize = recorded
+        .split_whitespace()
+        .next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected sqlite_stat1 stat {recorded:?}"));
+
+    assert_eq!(
+        rows, report.notes,
+        "the statistics describe {rows} notes but the index holds {}; ANALYZE ran          during the rebuild rather than after it",
+        report.notes
+    );
 }
 
 #[test]
@@ -392,18 +454,32 @@ fn flush_means_the_write_is_visible_to_a_new_reader() {
     let actor = IndexActor::open(&path).expect("open");
     let writer = actor.handle();
 
-    writer
-        .submit(IndexOp::UpsertAsset {
-            meta: meta("40-refs/a.pdf"),
-        })
-        .expect("submit");
+    // Volume, deliberately. With one operation the writer has almost certainly
+    // committed before the reader gets there, so the assertion passes whether or not
+    // flush() does anything — I mutation-checked the single-operation version by
+    // making flush() return Ok(()) immediately, and it still passed while two other
+    // tests failed. A guard that only passes because of what the writer happens to
+    // have finished is not guarding flush (F-35).
+    //
+    // Two thousand operations across four batches cannot all have landed by the time
+    // submit returns, so an absent barrier shows up as a short count.
+    for i in 0..2_000 {
+        writer
+            .submit(IndexOp::UpsertAsset {
+                meta: meta(&format!("40-refs/{i:04}.pdf")),
+            })
+            .expect("submit");
+    }
     writer.flush().expect("flush");
 
     let conn = schema::open(&path).expect("reader");
     let count: i64 = conn
         .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(count, 1, "a reader opened after flush cannot see the write");
+    assert_eq!(
+        count, 2_000,
+        "a reader opened after flush returned saw only {count} of 2000 writes"
+    );
 }
 
 #[test]
