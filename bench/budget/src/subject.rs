@@ -96,6 +96,10 @@ pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task 
     ) -> Result<RebuildReport, IndexError>;
 
     pub struct RebuildReport {
+        // notes counts MARKDOWN NOTES ONLY, excluding the 200 assets, so it can
+        // be compared directly with the vault manifest's counts.notes. The 20k
+        // vault holds 20,200 indexable files; if this returned 20,200 the
+        // harness would reject every correct rebuild.
         pub notes: usize, pub blocks: usize, pub links: usize, // ...
         // F-10: the phases, so open design question 1 can be answered.
         // write is split because architect measured the FTS build as a

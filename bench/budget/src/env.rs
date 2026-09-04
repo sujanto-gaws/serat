@@ -21,11 +21,42 @@
 
 use std::process::Command;
 
+/// Which operating system the measurement was taken on.
+///
+/// An enum rather than a string, and defaulting to `Unknown` rather than to an
+/// empty name, because [`Environment::gate_eligible`] is a safety check: a
+/// default-constructed environment used to fall through to "eligible", which is
+/// the wrong way for a check like this to fail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Os {
+    /// Not determined. Never gate eligible.
+    #[default]
+    Unknown,
+    /// Windows, where the on-access scanner question arises.
+    Windows,
+    /// macOS.
+    MacOs,
+    /// Linux.
+    Linux,
+}
+
+impl Os {
+    /// How it prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            Os::Unknown => "unknown",
+            Os::Windows => "windows",
+            Os::MacOs => "macos",
+            Os::Linux => "linux",
+        }
+    }
+}
+
 /// The measurement environment, detected at run time.
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
-    /// `windows`, `macos`, `linux`.
-    pub os: &'static str,
+    /// Which platform.
+    pub os: Os,
     /// Logical processors.
     pub cores: usize,
     /// Windows Defender real-time protection. `None` where it does not apply or
@@ -43,11 +74,11 @@ impl Environment {
             .map(|n| n.get())
             .unwrap_or(0);
         let os = if cfg!(target_os = "windows") {
-            "windows"
+            Os::Windows
         } else if cfg!(target_os = "macos") {
-            "macos"
+            Os::MacOs
         } else {
-            "linux"
+            Os::Linux
         };
         let (realtime_scanner, power_plan) = if cfg!(target_os = "windows") {
             (windows_defender_realtime(), windows_power_plan())
@@ -69,8 +100,11 @@ impl Environment {
     /// is no equivalent switch, so the question does not arise.
     pub fn gate_eligible(&self) -> bool {
         match self.os {
-            "windows" => self.realtime_scanner == Some(true),
-            _ => true,
+            Os::Windows => self.realtime_scanner == Some(true),
+            // Unknown is not the same as fine: if the harness cannot say where
+            // it ran, it cannot say the number is a gate number.
+            Os::Unknown => false,
+            Os::MacOs | Os::Linux => true,
         }
     }
 
@@ -78,6 +112,11 @@ impl Environment {
     pub fn ineligibility_reason(&self) -> Option<&'static str> {
         if self.gate_eligible() {
             return None;
+        }
+        if self.os == Os::Unknown {
+            return Some(
+                "the platform could not be determined, so this run cannot be attributed to any environment.",
+            );
         }
         Some(match self.realtime_scanner {
             Some(false) => {
@@ -102,7 +141,8 @@ impl Environment {
         let plan = self.power_plan.as_deref().unwrap_or("unknown");
         format!(
             "{} · {} cores · realtime scanner {scanner} · power plan {plan}",
-            self.os, self.cores
+            self.os.label(),
+            self.cores
         )
     }
 }
@@ -155,7 +195,7 @@ mod tests {
     fn a_scanner_disabled_windows_run_is_not_gate_eligible() {
         // The rule the lead set for B2, asserted rather than remembered.
         let off = Environment {
-            os: "windows",
+            os: Os::Windows,
             cores: 8,
             realtime_scanner: Some(false),
             power_plan: Some("Energy Star".into()),
@@ -181,11 +221,21 @@ mod tests {
     #[test]
     fn a_non_windows_run_has_no_scanner_question_to_answer() {
         let linux = Environment {
-            os: "linux",
+            os: Os::Linux,
             cores: 4,
             realtime_scanner: None,
             power_plan: None,
         };
         assert!(linux.gate_eligible());
+
+        // But a default environment is not eligible: an unknown platform is not
+        // a safe platform, and this is a safety check.
+        assert!(!Environment::default().gate_eligible());
+        assert!(
+            Environment::default()
+                .ineligibility_reason()
+                .unwrap()
+                .contains("could not be determined")
+        );
     }
 }

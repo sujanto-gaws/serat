@@ -39,7 +39,7 @@ path = "src/bin/prf04-full-rebuild.rs"
 
 [dependencies]
 vaultgen = { path = "../vaultgen" }
-serat-core = { workspace = true }
+serat-core = { path = "../../crates/serat-core" }
 serat-index = { path = "../../crates/serat-index" }
 serat-parse = { path = "../../crates/serat-parse" }
 serat-vault = { path = "../../crates/serat-vault" }

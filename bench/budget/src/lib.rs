@@ -33,16 +33,29 @@ use std::time::Duration;
 pub enum Statistic {
     /// The 95th percentile, nearest-rank. NFR-PRF-01 and NFR-PRF-03.
     P95,
-    /// A single wall-clock figure. NFR-PRF-04.
+    /// The median wall-clock figure across runs. NFR-PRF-04's acceptance
+    /// criterion says "wall-clock within budget" without naming a count; one run
+    /// of a thirty-second operation on a laptop is a coin toss, so the harness
+    /// takes three and reports the middle one.
     WallClock,
 }
 
 impl Statistic {
-    /// How it prints in a report.
+    /// The machine-readable name, for the result JSON.
     pub fn label(self) -> &'static str {
         match self {
             Statistic::P95 => "p95",
-            Statistic::WallClock => "wall clock",
+            Statistic::WallClock => "wall_clock_median",
+        }
+    }
+
+    /// What a reader of the gate report needs to see, including the sample
+    /// count, because "wall clock = 27431 ms" over three runs reads as one run.
+    /// That exact line goes into the charter gate report (F-25).
+    pub fn describe(self, n: usize) -> String {
+        match self {
+            Statistic::P95 => format!("p95 over {n} runs"),
+            Statistic::WallClock => format!("median of {n} wall-clock runs"),
         }
     }
 }
@@ -222,6 +235,76 @@ pub const P0_BUDGETS: &[&Budget] = &[
     &PRF04_FULL_REBUILD,
 ];
 
+/// A benchmark vault the harness knows how to produce and how to recognise.
+#[derive(Clone, Copy, Debug)]
+pub struct Preset {
+    /// `smoke`, `20k`, `50k`.
+    pub name: &'static str,
+    /// Total `.md` files.
+    pub notes: usize,
+    /// Binaries under `assets/`.
+    pub assets: usize,
+    /// Location, relative to the repository root.
+    pub dir: &'static str,
+    /// **The canonical tree digest**, at `VAULT_FORMAT_VERSION` 1 and the
+    /// canonical seed.
+    ///
+    /// Pinned here rather than only in CI because of P0 finding F-26. Verifying
+    /// the vault against its own manifest proves self-consistency and nothing
+    /// else: regenerate with `--seed 424242` and the manifest is regenerated
+    /// alongside it, so the two agree perfectly about a vault nobody meant to
+    /// measure. `vaultgen` prints a warning in that case and the harness never
+    /// sees it. This constant is what turns "the vault matches its manifest"
+    /// into "the vault is the one every recorded number was taken against".
+    pub digest: &'static str,
+}
+
+/// The three vaults, with their canonical digests.
+///
+/// If a change to `vaultgen` changes these, `VAULT_FORMAT_VERSION` is bumped in
+/// the same commit and every recorded benchmark number is re-taken. A number
+/// from format version 1 and a number from format version 2 are not comparable.
+pub const PRESETS: &[Preset] = &[
+    Preset {
+        name: "smoke",
+        notes: 400,
+        assets: 24,
+        dir: "bench/vaults/vault-smoke",
+        digest: "c461c84347186fa66ff0be205d2a2e2aab1ed5bd9f281c2fba8e8b746bd9f3e9",
+    },
+    Preset {
+        name: "20k",
+        notes: 20_000,
+        assets: 200,
+        dir: "bench/vaults/vault-20k",
+        digest: "35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e",
+    },
+    Preset {
+        name: "50k",
+        notes: 50_000,
+        assets: 500,
+        dir: "bench/vaults/vault-50k",
+        digest: "42fb99b2c7fcef77c26d6a578d63efd4169f68236c4a4b066608d3e0f0276aa1",
+    },
+];
+
+/// Look a preset up by name.
+///
+/// # Errors
+/// An unknown name, listing the ones that exist.
+pub fn preset(name: &str) -> Result<&'static Preset, String> {
+    PRESETS.iter().find(|p| p.name == name).ok_or_else(|| {
+        format!(
+            "unknown preset {name}; expected one of {}",
+            PRESETS
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// Timings, in milliseconds.
 #[derive(Clone, Debug, Default)]
 pub struct Samples {
@@ -288,11 +371,17 @@ impl Samples {
         self.values.iter().sum::<f64>() / self.values.len() as f64
     }
 
+    /// The median. Nearest rank at q = 0.5, so at n = 3 it is the middle
+    /// sample and emphatically not the fastest.
+    pub fn median(&self) -> f64 {
+        self.percentile(0.50)
+    }
+
     /// The statistic this budget is judged on.
     pub fn statistic(&self, s: Statistic) -> f64 {
         match s {
             Statistic::P95 => self.percentile(0.95),
-            Statistic::WallClock => self.percentile(0.50),
+            Statistic::WallClock => self.median(),
         }
     }
 }
@@ -310,6 +399,23 @@ pub struct VaultUnderTest {
     pub notes: usize,
 }
 
+/// A series the job measured but does not assert.
+///
+/// NFR-PRF-03's end-to-end interval is the case that forced this: it is real,
+/// it is worth reporting, and printing it outside the report block put an
+/// unasserted 812 ms above a line reading `PASS` (P0 finding F-28). Carried on
+/// the [`Outcome`] and rendered in one place, so its label and its verdict
+/// cannot drift apart.
+#[derive(Clone, Debug)]
+pub struct ReportedSeries {
+    /// Short name, e.g. `end-to-end`.
+    pub label: String,
+    /// Why it is here and why it is not the budget figure.
+    pub note: String,
+    /// The timings.
+    pub samples: Samples,
+}
+
 /// A finished measurement.
 #[derive(Clone, Debug)]
 pub struct Outcome {
@@ -321,8 +427,11 @@ pub struct Outcome {
     pub vault: VaultUnderTest,
     /// What the machine was doing while the number was taken.
     pub environment: Environment,
-    /// The timings.
+    /// The timings the budget is asserted against.
     pub samples: Samples,
+    /// Series measured and reported but **not** asserted, rendered inside the
+    /// report block so they cannot be read as the budget figure (F-28).
+    pub reported: Vec<ReportedSeries>,
     /// Where the time went, for budgets that can say. P0 finding F-10.
     ///
     /// The budget still asserts the aggregate — NFR-PRF-04 is a wall-clock
@@ -358,6 +467,37 @@ impl Outcome {
         self.environment.gate_eligible()
     }
 
+    /// The phase breakdown must not claim more time than the clock measured.
+    ///
+    /// The report already tells a reader that a sum *below* the wall clock is
+    /// concurrency between the parse pool and the writer rather than an error.
+    /// It named the anomaly and did not check it (P0 finding F-29). Since the
+    /// phases are the whole content of open design question 1, a breakdown that
+    /// double-counted would be reported as fact and would send the architect
+    /// the wrong way.
+    ///
+    /// The 5% tolerance is for timer granularity across five separately
+    /// measured spans, not for slop.
+    ///
+    /// # Errors
+    /// When the phases sum to more than the wall clock plus tolerance.
+    pub fn check_phases(&self) -> Result<(), String> {
+        let Some(phases) = self.phases else {
+            return Ok(());
+        };
+        let sum_ms = phases.sum().as_secs_f64() * 1000.0;
+        let total_ms = self.value_ms();
+        if sum_ms <= total_ms * 1.05 {
+            return Ok(());
+        }
+        Err(format!(
+            "the phase breakdown sums to {sum_ms:.0} ms against a {total_ms:.0} ms wall clock. \
+             A sum below the total is concurrency; a sum above it means a phase is counted \
+             twice, and these numbers answer open design question 1 — they must not be \
+             reported as fact."
+        ))
+    }
+
     /// Human-readable report. Printed by the job, pasted into a gate report.
     pub fn to_report(&self) -> String {
         let mut s = String::new();
@@ -372,7 +512,7 @@ impl Outcome {
         let _ = writeln!(
             s,
             "  measured    {} = {:.1} ms   limit {:.1} ms ({} profile)",
-            self.budget.statistic.label(),
+            self.budget.statistic.describe(self.samples.len()),
             self.value_ms(),
             self.limit_ms(),
             self.profile.label()
@@ -392,6 +532,19 @@ impl Outcome {
             self.vault.notes,
             self.vault.format_version
         );
+        for extra in &self.reported {
+            if extra.samples.is_empty() {
+                continue;
+            }
+            let _ = writeln!(
+                s,
+                "  {:<11} p95 {:.1} ms over {} samples — reported, not asserted. {}",
+                extra.label,
+                extra.samples.percentile(0.95),
+                extra.samples.len(),
+                extra.note
+            );
+        }
         let _ = writeln!(s, "  digest      {}", self.vault.digest);
         let _ = writeln!(s, "  machine     {}", self.environment.summary());
         if let Some(p) = self.phases {
@@ -455,7 +608,7 @@ impl Outcome {
             self.vault.format_version
         );
         let _ = writeln!(s, "  \"vault_notes\": {},", self.vault.notes);
-        let _ = writeln!(s, "  \"os\": \"{}\",", self.environment.os);
+        let _ = writeln!(s, "  \"os\": \"{}\",", self.environment.os.label());
         let _ = writeln!(s, "  \"cores\": {},", self.environment.cores);
         let _ = writeln!(
             s,
@@ -482,6 +635,21 @@ impl Outcome {
             let _ = writeln!(s, "    \"write_fts\": {:.3}", ms(p.write_fts));
             let _ = writeln!(s, "  }},");
         }
+        if !self.reported.is_empty() {
+            let _ = writeln!(s, "  \"reported_not_asserted\": {{");
+            let last = self.reported.len() - 1;
+            for (i, extra) in self.reported.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "    \"{}\": {{ \"p95_ms\": {:.3}, \"samples_n\": {} }}{}",
+                    extra.label,
+                    extra.samples.percentile(0.95),
+                    extra.samples.len(),
+                    if i == last { "" } else { "," }
+                );
+            }
+            let _ = writeln!(s, "  }},");
+        }
         let _ = write!(s, "  \"samples_ms\": [");
         for (i, v) in self.samples.values().iter().enumerate() {
             if i > 0 {
@@ -493,6 +661,90 @@ impl Outcome {
         let _ = writeln!(s, "}}");
         s
     }
+}
+
+/// What one budget's measurement produced.
+///
+/// One asserted series, optionally a phase breakdown, and any number of series
+/// that are reported but not asserted. Every job now returns this, which is
+/// what let `prf01-cold-start` stop reimplementing argument parsing and lose
+/// two of the guards in the process (P0 finding F-27).
+#[derive(Clone, Debug, Default)]
+pub struct Measurement {
+    /// The series the budget is judged on.
+    pub samples: Samples,
+    /// Where the time went, for budgets that can say (F-10).
+    pub phases: Option<subject::RebuildPhases>,
+    /// Series reported beside it.
+    pub reported: Vec<ReportedSeries>,
+}
+
+impl Measurement {
+    /// A measurement with nothing but the asserted series.
+    pub fn new(samples: Samples) -> Measurement {
+        Measurement {
+            samples,
+            phases: None,
+            reported: Vec::new(),
+        }
+    }
+
+    /// Add a series that is reported but not asserted.
+    #[must_use]
+    pub fn reporting(mut self, label: &str, note: &str, samples: Samples) -> Measurement {
+        self.reported.push(ReportedSeries {
+            label: label.to_string(),
+            note: note.to_string(),
+            samples,
+        });
+        self
+    }
+
+    /// Attach the phase breakdown.
+    #[must_use]
+    pub fn with_phases(mut self, phases: subject::RebuildPhases) -> Measurement {
+        self.phases = Some(phases);
+        self
+    }
+}
+
+/// The command-line options every budget job accepts.
+#[derive(Clone, Copy, Debug)]
+pub struct JobArgs {
+    /// Which machine profile's threshold applies.
+    pub profile: Profile,
+    /// How many iterations to run.
+    pub iterations: usize,
+    /// Whether `iterations` differs from the acceptance criterion's count, in
+    /// which case the result is indicative and must not be recorded.
+    pub indicative: bool,
+}
+
+/// Parse the arguments every job shares.
+///
+/// # Errors
+/// A malformed flag, as a sentence.
+pub fn parse_args(budget: &Budget, args: &[String]) -> Result<JobArgs, String> {
+    let mut profile = Profile::Reference;
+    if let Some(i) = args.iter().position(|a| a == "--profile") {
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| "--profile needs a value".to_string())?;
+        profile = Profile::parse(value)?;
+    }
+    let mut iterations = budget.iterations;
+    if let Some(i) = args.iter().position(|a| a == "--iterations") {
+        iterations = args
+            .get(i + 1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| "--iterations needs a positive integer".to_string())?;
+    }
+    Ok(JobArgs {
+        profile,
+        iterations,
+        indicative: iterations != budget.iterations,
+    })
 }
 
 /// Repository root, resolved at compile time from this crate's location.
@@ -511,18 +763,14 @@ pub fn repo_root() -> PathBuf {
 /// If generation fails, if the manifest is missing, or if the vault on disk does
 /// not match its manifest — in which case the number that would follow is
 /// attributable to nothing and must not be taken.
-pub fn ensure_vault(preset: &str) -> Result<VaultUnderTest, String> {
-    let (notes, assets, dir) = match preset {
-        "smoke" => (400usize, 24usize, "bench/vaults/vault-smoke"),
-        "20k" => (20_000, 200, "bench/vaults/vault-20k"),
-        "50k" => (50_000, 500, "bench/vaults/vault-50k"),
-        other => return Err(format!("unknown preset {other}")),
-    };
-    let path = repo_root().join(dir);
+pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
+    let preset = preset(name)?;
+    let (notes, assets) = (preset.notes, preset.assets);
+    let path = repo_root().join(preset.dir);
     let manifest_path = vaultgen::manifest_path_for(&path);
 
     if !path.join(".vaultgen").exists() || !manifest_path.exists() {
-        eprintln!("budget: generating {preset} vault at {}", path.display());
+        eprintln!("budget: generating {name} vault at {}", path.display());
         let opts = vaultgen::Options {
             seed: vaultgen::DEFAULT_SEED,
             notes,
@@ -544,13 +792,14 @@ pub fn ensure_vault(preset: &str) -> Result<VaultUnderTest, String> {
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
 
     let actual = tree_digest(&path)?;
-    if actual != expected {
-        return Err(format!(
-            "the vault at {} does not match its manifest\n  manifest {expected}\n  on disk  {actual}\n\
-             Regenerate it: cargo run --release -p vaultgen -- --preset {preset} --force",
-            path.display()
-        ));
-    }
+    check_vault(
+        preset,
+        &actual,
+        &expected,
+        format_version,
+        notes_in_manifest,
+    )
+    .map_err(|e| format!("{e}\n  vault {}", path.display()))?;
 
     Ok(VaultUnderTest {
         path,
@@ -558,6 +807,75 @@ pub fn ensure_vault(preset: &str) -> Result<VaultUnderTest, String> {
         format_version,
         notes: notes_in_manifest,
     })
+}
+
+/// The three things that must be true of a vault before a clock starts.
+///
+/// Split out of [`ensure_vault`] so it can be tested without generating 39 MiB
+/// (P0 finding F-26): the on-disk bytes match the manifest, the manifest is the
+/// *canonical* one, and it holds the number of notes the preset promises.
+///
+/// # Errors
+/// A sentence naming which of the three failed and how to fix it.
+pub fn check_vault(
+    preset: &Preset,
+    on_disk: &str,
+    in_manifest: &str,
+    format_version: u32,
+    notes_in_manifest: usize,
+) -> Result<(), String> {
+    let regenerate = format!(
+        "Regenerate it: cargo run --release -p vaultgen -- --preset {} --force",
+        preset.name
+    );
+    if on_disk != in_manifest {
+        return Err(format!(
+            "the vault does not match its manifest\n  manifest {in_manifest}\n  on disk  \
+             {on_disk}\n{regenerate}"
+        ));
+    }
+    if on_disk != preset.digest {
+        return Err(format!(
+            "this is not the canonical {} vault\n  canonical {}\n  on disk   {on_disk}\n\
+             It matches its own manifest, so it was generated coherently — with a different \
+             seed, a different note count, or a different generator version. A number taken \
+             against it is not comparable with any recorded number.\n{regenerate}",
+            preset.name, preset.digest
+        ));
+    }
+    if format_version != vaultgen::VAULT_FORMAT_VERSION {
+        return Err(format!(
+            "the vault was written by generator format version {format_version}; this build \
+             expects {}. Numbers from two format versions are not comparable.\n{regenerate}",
+            vaultgen::VAULT_FORMAT_VERSION
+        ));
+    }
+    if notes_in_manifest != preset.notes {
+        return Err(format!(
+            "the manifest reports {notes_in_manifest} notes; the {} preset is {} \
+             notes\n{regenerate}",
+            preset.name, preset.notes
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a rebuild indexed the whole vault.
+///
+/// A fast number over a partially indexed vault is the shape of a false pass,
+/// and a wall clock cannot see it (P0 finding F-19). Extracted from the job so
+/// that deleting it fails a test rather than passing silently (F-27).
+///
+/// # Errors
+/// When the counts disagree.
+pub fn check_note_count(reported: usize, expected: usize) -> Result<(), String> {
+    if reported == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "the rebuild reported {reported} notes, the vault manifest says {expected}. A fast \
+         number over a partial index is not a passing budget."
+    ))
 }
 
 /// Recompute the vault's tree digest from what is on disk, exactly as the
@@ -632,108 +950,234 @@ fn json_number(text: &str, key: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
-/// Run one budget end to end and exit with the right code.
+/// The whole of a budget job except printing and exiting.
 ///
-/// Returns the process exit code: 0 if the budget held, 1 if it was breached or
-/// the measurement could not be taken. A measurement that cannot be taken is a
-/// failure, not a skip — a budget job that silently passes when the thing it
-/// measures does not exist is worse than no job at all.
-pub fn run_job<F>(budget: &Budget, args: &[String], measure: F) -> std::process::ExitCode
-where
-    F: FnOnce(&VaultUnderTest, usize) -> Result<Samples, String>,
-{
-    run_job_with_phases(budget, args, |vault, iterations| {
-        measure(vault, iterations).map(|s| (s, None))
-    })
-}
-
-/// As [`run_job`], for a budget whose measurement can also say where the time
-/// went (P0 finding F-10).
+/// Split out of [`run_job`] because a function returning an opaque `ExitCode`
+/// cannot be tested, and P0 finding F-27 was four mutations that no test
+/// noticed — including a job swallowing the seam error to post a fabricated
+/// number, and the deletion of the note-count guard. Every one of those is now
+/// a `Result` a test can inspect.
 ///
-/// # Panics
-/// Never; the signature mirrors [`run_job`].
-pub fn run_job_with_phases<F>(
-    budget: &Budget,
-    args: &[String],
-    measure: F,
-) -> std::process::ExitCode
+/// # Errors
+/// A malformed argument, an unusable vault, a failed measurement, a measurement
+/// that produced no samples, or a phase breakdown that does not add up.
+pub fn decide<F>(budget: &Budget, args: &[String], measure: F) -> Result<Outcome, String>
 where
-    F: FnOnce(&VaultUnderTest, usize) -> Result<(Samples, Option<subject::RebuildPhases>), String>,
+    F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
 {
-    let profile = match args.iter().position(|a| a == "--profile") {
-        Some(i) => match args.get(i + 1).map(|s| Profile::parse(s)) {
-            Some(Ok(p)) => p,
-            Some(Err(e)) => {
-                eprintln!("budget: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            None => {
-                eprintln!("budget: --profile needs a value");
-                return std::process::ExitCode::FAILURE;
-            }
-        },
-        None => Profile::Reference,
-    };
-    let iterations = match args.iter().position(|a| a == "--iterations") {
-        Some(i) => match args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
-            Some(n) if n > 0 => n,
-            _ => {
-                eprintln!("budget: --iterations needs a positive integer");
-                return std::process::ExitCode::FAILURE;
-            }
-        },
-        None => budget.iterations,
-    };
-    if iterations != budget.iterations {
+    let parsed = parse_args(budget, args)?;
+    if parsed.indicative {
         eprintln!(
-            "budget: running {iterations} iterations, not the {} the acceptance criterion names; \
-             this result is indicative only and must not be recorded as a gate number",
-            budget.iterations
+            "budget: running {} iterations, not the {} the acceptance criterion names; this \
+             result is indicative only and must not be recorded as a gate number",
+            parsed.iterations, budget.iterations
         );
     }
+    let vault = ensure_vault(budget.vault)?;
+    let measurement = measure(&vault, parsed.iterations)?;
+    outcome_from(budget, parsed.profile, vault, measurement)
+}
 
-    let vault = match ensure_vault(budget.vault) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("budget: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
-    let mut phases;
-    let samples = match measure(&vault, iterations) {
-        Ok((s, p)) if !s.is_empty() => {
-            phases = p;
-            s
-        }
-        Ok(_) => {
-            eprintln!("budget: the measurement produced no samples");
-            return std::process::ExitCode::FAILURE;
-        }
-        Err(e) => {
-            eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
+/// Build the outcome, refusing a measurement that cannot mean anything.
+///
+/// # Errors
+/// No samples, or phases that sum to more than the wall clock.
+pub fn outcome_from(
+    budget: &Budget,
+    profile: Profile,
+    vault: VaultUnderTest,
+    measurement: Measurement,
+) -> Result<Outcome, String> {
+    if measurement.samples.is_empty() {
+        return Err("the measurement produced no samples".to_string());
+    }
     let outcome = Outcome {
         budget: *budget,
         profile,
         vault,
         environment: Environment::detect(),
-        samples,
-        phases: phases.take(),
+        samples: measurement.samples,
+        reported: measurement.reported,
+        phases: measurement.phases,
     };
-    print!("{}", outcome.to_report());
-    match write_result(&outcome) {
-        Ok(p) => println!("  result      {}", p.display()),
-        Err(e) => eprintln!("budget: could not write the result file: {e}"),
-    }
+    outcome.check_phases()?;
+    Ok(outcome)
+}
 
-    if outcome.passed() {
+/// Run one budget end to end and exit with the right code.
+///
+/// 0 if the budget held, 1 if it was breached or the measurement could not be
+/// taken. A measurement that cannot be taken is a failure, not a skip — a
+/// budget job that silently passes when the thing it measures does not exist is
+/// worse than no job at all.
+pub fn run_job<F>(budget: &Budget, args: &[String], measure: F) -> std::process::ExitCode
+where
+    F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
+{
+    match decide(budget, args, measure) {
+        Ok(outcome) => {
+            report(&outcome);
+            if outcome.passed() {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run two budgets that share one measurement, as NFR-PRF-01 does.
+///
+/// Both are reported; the job fails if either is breached. "Cold start failed"
+/// without saying which half is a bug report nobody can act on.
+pub fn run_paired_job<F>(
+    first: &Budget,
+    second: &Budget,
+    args: &[String],
+    measure: F,
+) -> std::process::ExitCode
+where
+    F: FnOnce(&VaultUnderTest, usize) -> Result<(Measurement, Measurement), String>,
+{
+    let parsed = match parse_args(first, args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("budget: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let vault = match ensure_vault(first.vault) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("FAIL  {} · {}\n  {e}", first.requirement, first.id);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let (a, b) = match measure(&vault, parsed.iterations) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!(
+                "FAIL  {} · {} and {}\n  {e}",
+                first.requirement, first.id, second.id
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut ok = true;
+    for (budget, measurement) in [(first, a), (second, b)] {
+        match outcome_from(budget, parsed.profile, vault.clone(), measurement) {
+            Ok(outcome) => {
+                report(&outcome);
+                ok &= outcome.passed();
+            }
+            Err(e) => {
+                eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
+                ok = false;
+            }
+        }
+    }
+    if ok {
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE
+    }
+}
+
+/// The median of a list of durations.
+///
+/// One definition, used by the phase breakdown and agreeing with
+/// `Samples::median()` by construction — P0 finding F-25 noted two definitions
+/// of median in the crate with nothing holding them together.
+pub fn median_duration(mut xs: Vec<Duration>) -> Duration {
+    if xs.is_empty() {
+        return Duration::ZERO;
+    }
+    xs.sort_unstable();
+    // Nearest rank at q = 0.5, matching Samples::percentile exactly: at n = 3
+    // the middle sample, never the fastest.
+    let rank = ((0.5 * xs.len() as f64).ceil().max(1.0) as usize).min(xs.len());
+    xs[rank - 1]
+}
+
+/// NFR-PRF-04's measurement: `iterations` rebuilds into a fresh index each time.
+///
+/// Lives in the library rather than in the binary because P0 finding F-27 was
+/// four mutations no test noticed, and every one of them was in a job binary
+/// that nothing covered. The logic under test is now the logic that runs.
+///
+/// # Errors
+/// Any rebuild failure, or a rebuild whose note count disagrees with the vault
+/// manifest.
+pub fn measure_full_rebuild(
+    vault: &VaultUnderTest,
+    iterations: usize,
+) -> Result<Measurement, String> {
+    let mut samples = Samples::new();
+    let mut runs: Vec<subject::RebuildTiming> = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        // A fresh index directory per iteration: a rebuild over a warm index is
+        // not a rebuild, and reusing the directory would measure the second run
+        // of something the requirement describes as the first.
+        let index_dir = vault.path.join(format!(".serat-bench-{i}"));
+        let _ = std::fs::remove_dir_all(&index_dir);
+        let timing = subject::full_rebuild(&vault.path, &index_dir)?;
+        let _ = std::fs::remove_dir_all(&index_dir);
+        check_note_count(timing.notes, vault.notes)?;
+        samples.push(timing.total);
+        runs.push(timing);
+    }
+    // Per-phase median across runs, not the phases of the median run: one slow
+    // run should not decide where the time went.
+    let phases = subject::RebuildPhases {
+        walk: median_duration(runs.iter().map(|r| r.phases.walk).collect()),
+        read_hash: median_duration(runs.iter().map(|r| r.phases.read_hash).collect()),
+        parse: median_duration(runs.iter().map(|r| r.phases.parse).collect()),
+        write_rows: median_duration(runs.iter().map(|r| r.phases.write_rows).collect()),
+        write_fts: median_duration(runs.iter().map(|r| r.phases.write_fts).collect()),
+    };
+    Ok(Measurement::new(samples).with_phases(phases))
+}
+
+/// NFR-PRF-03's measurement: both of F-03's intervals, one asserted.
+///
+/// # Errors
+/// Any failure of the save path.
+pub fn measure_save_to_index(
+    vault: &VaultUnderTest,
+    iterations: usize,
+) -> Result<Measurement, String> {
+    let index_dir = vault.path.join(".serat-bench");
+    let both = subject::save_to_index(&vault.path, &index_dir, iterations)?;
+    Ok(Measurement::new(both.pipeline).reporting(
+        "F-03",
+        "End to end from the file being written, which includes the 150 ms coalescing window \
+         of architecture §3.1 step 1. F-03 ruled that interval is FR-VLT-04's, not this budget's.",
+        both.end_to_end,
+    ))
+}
+
+/// NFR-PRF-01's measurement: two marks from one set of cold starts.
+///
+/// # Errors
+/// Any failure to start the application or to validate a trace.
+pub fn measure_cold_start(
+    vault: &VaultUnderTest,
+    iterations: usize,
+) -> Result<(Measurement, Measurement), String> {
+    let (visible, usable) = subject::cold_start(&vault.path, iterations)?;
+    Ok((Measurement::new(visible), Measurement::new(usable)))
+}
+
+/// Print an outcome and write its result file.
+pub fn report(outcome: &Outcome) {
+    print!("{}", outcome.to_report());
+    match write_result(outcome) {
+        Ok(p) => println!("  result      {}", p.display()),
+        Err(e) => eprintln!("budget: could not write the result file: {e}"),
     }
 }
 
@@ -790,6 +1234,7 @@ mod tests {
             vault: vault.clone(),
             environment: Environment::default(),
             samples: samples(&[30_000.0]),
+            reported: Vec::new(),
             phases: None,
         };
         assert!(
@@ -803,6 +1248,7 @@ mod tests {
             vault,
             environment: Environment::default(),
             samples: samples(&[30_001.0]),
+            reported: Vec::new(),
             phases: None,
         };
         assert!(!over.passed());
@@ -849,6 +1295,329 @@ mod tests {
         // The shape a proportional path would actually produce.
         let err = assert_scale_independent(300.0, 750.0).expect_err("2.5x must fail");
         assert!(err.contains("150%"), "{err}");
+    }
+
+    fn a_vault() -> VaultUnderTest {
+        VaultUnderTest {
+            path: PathBuf::from("x"),
+            digest: "d".into(),
+            format_version: vaultgen::VAULT_FORMAT_VERSION,
+            notes: 20_000,
+        }
+    }
+
+    // ---------------------------------------------------------------- F-25
+
+    #[test]
+    fn the_median_of_three_is_the_middle_run_and_not_the_fastest() {
+        // The mutation this exists for: ceil() -> floor() in percentile().
+        // At n = 20 and n = 1000 the two coincide, so every earlier test was
+        // blind to it. At n = 3, floor(0.5 * 3) = 1 gives sorted[0] — the
+        // FASTEST of three — where nearest rank gives the middle one. One
+        // character turns NFR-PRF-04's median-of-three into a best-of-three.
+        let s = samples(&[10.0, 30.0, 20.0]);
+        assert_eq!(s.percentile(0.50), 20.0, "median of three is the middle");
+        assert_ne!(
+            s.percentile(0.50),
+            s.min(),
+            "and emphatically not the fastest"
+        );
+        assert_eq!(s.median(), 20.0);
+
+        // Even n, so nobody can quietly average.
+        assert_eq!(samples(&[10.0, 20.0, 30.0, 40.0]).percentile(0.50), 20.0);
+    }
+
+    #[test]
+    fn the_wall_clock_statistic_is_the_median() {
+        // Nothing asserted this: WallClock => percentile(0.01) left every test
+        // green, so a budget could have been judged on its fastest run.
+        let s = samples(&[10.0, 30.0, 20.0]);
+        assert_eq!(s.statistic(Statistic::WallClock), 20.0);
+        assert_eq!(s.statistic(Statistic::P95), 30.0);
+
+        let outcome = Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[10_000.0, 40_000.0, 20_000.0]),
+            reported: Vec::new(),
+            phases: None,
+        };
+        assert_eq!(outcome.value_ms(), 20_000.0, "the middle run decides");
+        assert!(outcome.passed());
+    }
+
+    #[test]
+    fn the_report_says_the_number_is_a_median_of_three() {
+        // This exact line goes into the charter gate report, and "wall clock =
+        // 27431 ms" over three runs reads as one run.
+        assert_eq!(
+            Statistic::WallClock.describe(3),
+            "median of 3 wall-clock runs"
+        );
+        assert_eq!(Statistic::P95.describe(20), "p95 over 20 runs");
+
+        let outcome = Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[10_000.0, 40_000.0, 20_000.0]),
+            reported: Vec::new(),
+            phases: None,
+        };
+        assert!(
+            outcome.to_report().contains("median of 3 wall-clock runs"),
+            "{}",
+            outcome.to_report()
+        );
+    }
+
+    #[test]
+    fn the_two_medians_in_the_crate_agree() {
+        // Samples::median and median_duration are separate implementations of
+        // the same idea; nothing held them together before.
+        for n in 1..=8usize {
+            let ms: Vec<f64> = (0..n).map(|i| (i as f64 + 1.0) * 10.0).collect();
+            let durations: Vec<Duration> = ms
+                .iter()
+                .map(|v| Duration::from_secs_f64(v / 1000.0))
+                .collect();
+            let a = samples(&ms).median();
+            let b = median_duration(durations).as_secs_f64() * 1000.0;
+            assert!((a - b).abs() < 1e-9, "n={n}: {a} vs {b}");
+        }
+    }
+
+    // ---------------------------------------------------------------- F-26
+
+    #[test]
+    fn a_coherent_vault_generated_from_the_wrong_seed_is_refused() {
+        // The finding: regenerate with --seed 424242 and the manifest is
+        // regenerated alongside it, so vault and manifest agree perfectly about
+        // a vault nobody meant to measure. Self-consistency is not canonicality.
+        let p = preset("20k").expect("20k exists");
+        let wrong = "da0d24b738bbc20657752c8960002b2eed2adbd3c891c4767cf902fd1303e0e4";
+
+        check_vault(
+            p,
+            p.digest,
+            p.digest,
+            vaultgen::VAULT_FORMAT_VERSION,
+            p.notes,
+        )
+        .expect("the canonical vault passes");
+
+        let err = check_vault(p, wrong, wrong, vaultgen::VAULT_FORMAT_VERSION, p.notes)
+            .expect_err("a coherent but non-canonical vault must be refused");
+        assert!(err.contains("not the canonical"), "{err}");
+        assert!(err.contains("--preset 20k --force"), "{err}");
+    }
+
+    #[test]
+    fn a_vault_that_disagrees_with_its_manifest_is_refused() {
+        let p = preset("20k").expect("20k exists");
+        let err = check_vault(p, "aaa", p.digest, vaultgen::VAULT_FORMAT_VERSION, p.notes)
+            .expect_err("hand-edited vault");
+        assert!(err.contains("does not match its manifest"), "{err}");
+    }
+
+    #[test]
+    fn the_wrong_note_count_or_format_version_is_refused() {
+        let p = preset("20k").expect("20k exists");
+        let err = check_vault(p, p.digest, p.digest, vaultgen::VAULT_FORMAT_VERSION, 400)
+            .expect_err("wrong note count");
+        assert!(err.contains("400 notes"), "{err}");
+
+        let err = check_vault(p, p.digest, p.digest, 99, p.notes).expect_err("wrong version");
+        assert!(err.contains("format version 99"), "{err}");
+    }
+
+    #[test]
+    fn every_preset_is_pinned_to_a_digest() {
+        assert_eq!(PRESETS.len(), 3);
+        for p in PRESETS {
+            assert_eq!(p.digest.len(), 64, "{} has no canonical digest", p.name);
+            assert!(
+                p.digest.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                p.name
+            );
+            assert!(p.notes >= 400, "{}", p.name);
+        }
+        assert!(preset("nope").is_err());
+        // The 20k preset is the one every P0 budget measures.
+        assert_eq!(preset("20k").unwrap().notes, 20_000);
+    }
+
+    // ---------------------------------------------------------------- F-27
+
+    #[test]
+    fn a_job_cannot_swallow_the_seam_error_and_post_a_number() {
+        // The mutation: `subject::full_rebuild(..)?` becomes
+        // `.unwrap_or_default()`, and a fabricated 1 ms number passes. decide()
+        // returns the error rather than an Outcome, so there is nothing to
+        // swallow that a test cannot see.
+        let err = decide(&PRF04_FULL_REBUILD, &[], |_, _| {
+            Err("serat-index exposes no rebuild entry point yet — task I4".to_string())
+        })
+        .expect_err("a failed measurement is not a passing budget");
+        assert!(err.contains("task I4"), "{err}");
+    }
+
+    #[test]
+    fn no_samples_is_a_failure_and_not_an_empty_pass() {
+        let err = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::default(),
+        )
+        .expect_err("zero samples cannot be a budget");
+        assert!(err.contains("no samples"), "{err}");
+    }
+
+    #[test]
+    fn a_partially_indexed_vault_cannot_post_a_fast_number() {
+        // F-19's guard, extracted from the job so that deleting it fails here.
+        check_note_count(20_000, 20_000).expect("a complete rebuild");
+        let err = check_note_count(10_000, 20_000).expect_err("half a vault");
+        assert!(err.contains("10000 notes"), "{err}");
+        assert!(err.contains("not a passing budget"), "{err}");
+    }
+
+    #[test]
+    fn the_phase_breakdown_is_printed_and_recorded() {
+        // The mutation: never print the phases and never write them to JSON.
+        // They are the whole content of open design question 1.
+        let phases = subject::RebuildPhases {
+            walk: Duration::from_millis(500),
+            read_hash: Duration::from_millis(3_000),
+            parse: Duration::from_millis(6_000),
+            write_rows: Duration::from_millis(3_700),
+            write_fts: Duration::from_millis(1_900),
+        };
+        let outcome = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[20_000.0])).with_phases(phases),
+        )
+        .expect("phases sum below the wall clock");
+
+        let report = outcome.to_report();
+        for needle in ["walk", "read+hash", "parse", "write rows", "write fts"] {
+            assert!(report.contains(needle), "report lacks {needle}: {report}");
+        }
+        let json = outcome.to_json();
+        for needle in [
+            "\"walk\"",
+            "\"read_hash\"",
+            "\"parse\"",
+            "\"write_rows\"",
+            "\"write_fts\"",
+        ] {
+            assert!(json.contains(needle), "json lacks {needle}: {json}");
+        }
+    }
+
+    #[test]
+    fn a_phase_breakdown_that_double_counts_is_refused() {
+        // The report says a sum below the wall clock is concurrency. A sum
+        // above it means a phase is counted twice, and these numbers answer
+        // open design question 1 — reporting them as fact would send architect
+        // the wrong way.
+        let phases = subject::RebuildPhases {
+            walk: Duration::from_millis(10_000),
+            read_hash: Duration::from_millis(10_000),
+            parse: Duration::from_millis(10_000),
+            write_rows: Duration::from_millis(10_000),
+            write_fts: Duration::from_millis(10_000),
+        };
+        let err = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[20_000.0])).with_phases(phases),
+        )
+        .expect_err("50 s of phases against a 20 s wall clock");
+        assert!(err.contains("counted"), "{err}");
+    }
+
+    #[test]
+    fn an_unasserted_series_is_reported_inside_the_block_and_labelled() {
+        // F-28: printing it outside put an unasserted 812 ms above a line
+        // reading PASS.
+        let outcome = outcome_from(
+            &PRF03_SAVE_TO_INDEX,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[31.2])).reporting(
+                "F-03",
+                "the external-change path, which is FR-VLT-04's",
+                samples(&[812.4]),
+            ),
+        )
+        .expect("valid");
+        let report = outcome.to_report();
+        let verdict = report.find("PASS").expect("a verdict");
+        let extra = report.find("812.4").expect("the reported series");
+        assert!(
+            extra > verdict,
+            "the unasserted number must sit below the verdict:\n{report}"
+        );
+        assert!(report.contains("reported, not asserted"), "{report}");
+        assert!(
+            outcome.to_json().contains("reported_not_asserted"),
+            "{}",
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn argument_parsing_rejects_what_it_cannot_honour() {
+        let ok =
+            parse_args(&PRF04_FULL_REBUILD, &["--profile".into(), "ci".into()]).expect("valid");
+        assert_eq!(ok.profile, Profile::Ci);
+        assert_eq!(ok.iterations, PRF04_FULL_REBUILD.iterations);
+        assert!(!ok.indicative);
+
+        let fewer =
+            parse_args(&PRF04_FULL_REBUILD, &["--iterations".into(), "1".into()]).expect("valid");
+        assert!(fewer.indicative, "a short run must be marked indicative");
+
+        assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into()]).is_err());
+        assert!(parse_args(&PRF04_FULL_REBUILD, &["--iterations".into(), "0".into()]).is_err());
+        assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into(), "laptop".into()]).is_err());
+    }
+
+    // ---------------------------------------------------------------- F-30
+
+    #[test]
+    fn every_budget_has_a_job_in_the_ci_workflow() {
+        // NFR-PRF-08's acceptance criterion is Inspect. This was a shell loop
+        // over a grep, and a grep that matches nothing runs zero iterations and
+        // exits 0 — the job whose purpose is catching an unasserted budget was
+        // itself unasserted. Iterating P0_BUDGETS instead cannot pass vacuously.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+
+        assert!(!P0_BUDGETS.is_empty());
+        for budget in P0_BUDGETS {
+            // NFR-PRF-01 is one requirement with two marks measured by one job.
+            let job = match budget.id {
+                "prf01-window-visible" | "prf01-vault-usable" => "prf01-cold-start",
+                other => other,
+            };
+            assert!(
+                text.contains(&format!("\n  {job}:")),
+                "budget {} has no asserting job in budgets.yml (NFR-PRF-08)",
+                budget.id
+            );
+        }
     }
 
     #[test]
