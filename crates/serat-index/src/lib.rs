@@ -12,10 +12,12 @@
 //! in I6.
 
 mod apply;
+pub mod incremental;
 pub mod rebuild;
 pub mod schema;
 pub mod writer;
 
+pub use incremental::{IndexHandle, PARSE_CHUNK, SaveTiming, build_parse_pool, parse_pool_threads};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
 pub use schema::{DDL, IndexState, INDEX_VERSION, UnusableReason, bootstrap, inspect, open};
 pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};

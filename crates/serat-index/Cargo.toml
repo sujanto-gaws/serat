@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 serat-core = { workspace = true }
 rusqlite = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
