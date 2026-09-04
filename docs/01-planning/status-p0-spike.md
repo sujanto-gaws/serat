@@ -14,9 +14,19 @@ status: interrupted — gate NOT reached
 
 **Gate (charter §Milestones):** full index of 20,000 notes < 30 s · save→index < 50 ms p95 · cold start < 1 s (window visible < 400 ms).
 
-## Gate verdict: NOT REACHED - one budget measured, three unmeasured
+## Gate verdict: NOT REACHED — three statements, not one
 
-**NFR-PRF-01 misses by 2.7x, and the miss is not attributable to Serat's design.** 619 ms of an 810 ms median sits inside `WebviewWindowBuilder::build` - WebView2 environment and controller creation, before any Serat code that matters. Section 3.4 budgets that whole phase at 400 ms *including* our own work, which the measurement shows is not available to us. The question this hands Q1 is not whether Serat can be made faster but **whether 400 ms is achievable on Tauri v2 at all** - a question about C-07, not about the implementation. Taken with the scanner off, so it is a best case and not yet the gate figure.
+**This section is deliberately before the findings.** A reader who meets a hundred findings first will have formed a view by the time they reach the verdict, and the view formed from a hundred design corrections is "this was validated". It was not.
+
+1. **Cold start is MEASURED AND MISSED** — 1088 ms p95 against 400 ms, on one platform, best case (scanner off, so `gate_eligible: false`), with the cause attributed and mostly outside our control.
+2. **The other three budgets are UNMEASURED** — full rebuild, save-to-index, and the 50k scale run.
+3. **§1.2's three structural assumptions remain UNTESTED**, and this number touches none of them. It says nothing about whether the parse pool or the index writer dominates a rebuild.
+
+**Serat's own share of the cold start is 28 ms of code we wrote, executing on the main thread** (F-94 — that basis is part of the figure; two other defensible quantities exist for "our share", differing by a factor of six). **619 ms of the 804 ms median sits inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation, before any Serat code that matters.
+
+§3.4 budgets that whole phase at 400 ms *including* our own work, which the measurement shows is not available to us. The question this hands Q1 is not whether Serat can be made faster but **whether 400 ms is achievable on Tauri v2 at all** — a question about C-07, not about the implementation. NFR-PRF-01 was deliberately **not** re-baselined on it: one platform is not enough when WebView2 is one of three webviews (F-96).
+
+**The failure mode to avoid when reading this document:** the 619 ms is not a finding about the crate graph, the actor, or the schema. **It is a finding that the requirement was written without a webview-startup term in it.**
 
 **Three of the four gate numbers do not exist.** The spike had earlier stalled when every teammate hit a session limit within six minutes of each other, with the measurement subjects still unlanded. This is not a NO-GO — a NO-GO is a measured miss, and would itself be a result. Nothing was measured, so nothing is known about whether the architecture meets its budgets.
 
