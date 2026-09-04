@@ -393,6 +393,20 @@ pub(crate) fn sync_note_count(tx: &Transaction<'_>) -> Result<(), IndexError> {
 }
 
 /// Mark the index as usable. Only a completed full rebuild may call this.
+///
+/// Two of the columns written here are not read by anything (F-134), and the
+/// difference between them matters:
+///
+/// * `built_at` is diagnostic. Nothing claims to depend on it and nothing should.
+/// * `indexer_version` is **not** diagnostic, and this is the gap. The DDL describes
+///   it as "crate version that built it; a bump rebuilds", and no such check exists —
+///   §3.4's open check reads `user_version`, `state`, `vault_root` and `note_count`
+///   and never this. So a change to what the indexer *extracts*, without a schema
+///   change, leaves every stamp step passing over an index whose content is stale:
+///   the vault and the schema agree and only the derivation is out of date.
+///
+/// Raised as a design question rather than fixed here, because `CARGO_PKG_VERSION` is
+/// the wrong granularity for it — see the note in `crate::open`.
 pub(crate) fn mark_ready(tx: &Transaction<'_>, vault_root: &str) -> Result<(), IndexError> {
     tx.execute(
         "UPDATE index_meta
