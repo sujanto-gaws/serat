@@ -39,7 +39,11 @@ path = "src/bin/prf04-full-rebuild.rs"
 
 [dependencies]
 vaultgen = { path = "../vaultgen" }
-serat-core = { workspace = true }
+# Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
+# number the code under test reports -- the same argument as recomputing the
+# vault digest. serat-index already links it, so this costs no build time.
+rusqlite = { workspace = true }
+serat-core = { path = "../../crates/serat-core" }
 serat-index = { path = "../../crates/serat-index" }
 serat-parse = { path = "../../crates/serat-parse" }
 serat-vault = { path = "../../crates/serat-vault" }

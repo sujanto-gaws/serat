@@ -59,7 +59,24 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 
 **F-10 and NFR-PRF-04: the aggregate is asserted, the breakdown is recorded.** NFR-PRF-04 is a wall-clock requirement and the budget still asserts one number. But one number cannot answer architecture.md's **open design question 1** — *does the parse pool or the index writer dominate rebuild time?* — and §1.2 says the parse pool exists precisely because that assumption is unmeasured. Reported as a single figure, "the index writer dominates" and "reading 39.4 MiB off disk dominates" are indistinguishable, and they imply completely different fixes.
 
-So the job records five phases beside the total — **walk, read+hash, parse, write rows, write FTS** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. `write` is split on the architect's evidence: 3.7 s of bulk row insert against 1.9 s of `blocks_fts` build at 259,971 blocks, and with the FTS triggers left live the same shape cost 2.1-10.3 s at 26,000 blocks against 0.32 s dropped, and had not finished after 25 minutes at 260,000. Reported as one figure those are indistinguishable and the fixes differ, which is the same argument as F-10 itself, one level down. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
+**"Producer waited" is not the writer's cost, and the label says so.** The phase is measured around `submit_blocking` plus the final drain, so it is how long the *producer was blocked*. The writer's own SQL runs concurrently on its own thread and is charged to nobody. The reading is therefore the opposite of the obvious one:
+
+- near zero means the writer **kept up** — not that writing is cheap;
+- large means the writer **is** the bottleneck, because the only way it grows is the queue being full.
+
+A column called "write" holding a small number would settle open design question 1 backwards — someone would conclude parsing dominates when the writer does. The field is named `producer_wait`, the report prints `producer waited`, and a line under the breakdown carries the reading with the number. A test asserts both the label and the explanation are present, because the sentence is the load-bearing part.
+
+The five phases will not sum to the wall clock, and the gap is the producer and the writer overlapping — the actor working, not the harness broken. The report says that too.
+
+**F-47: `ANALYZE` must describe the finished index, and only this vault can show it.** `commit()` re-runs `ANALYZE` when a batch touches more than 5% of the notes. At test scale 5% is smaller than one batch, so the opportunistic path fires on the last batch every time and the rebuild's explicit `analyze()` is unobservable — which is why deleting it changed nothing in `serat-index`'s own tests. At 20,000 notes the threshold is 1,000 against a batch of 512, so the tail of `20000 % 512` = **32 notes** never crosses it. Remove or reorder the explicit call and the planner's statistics describe the index as it was 32 notes ago; architecture §4.3 records what follows — `ix_notes_kind` over `ix_notes_type`, and every typed query a full scan. That is the defect that otherwise surfaces as "queries are slow on my real vault but fine in the tests" three months into P2.
+
+So after each rebuild the harness reads `sqlite_stat1` **out of the index itself** and asserts the row count it records for `notes` equals the vault's note count. Reading the database rather than trusting a number the rebuild reports is the same argument as recomputing the vault digest: an oracle the code under test does not supply.
+
+**Links resolved are checked against the manifest too.** The generator records exactly how many note-to-note edges it produced, and a test asserts every wikilink in the vault resolves — so a rebuild reporting fewer has dropped links, and one reporting *more* has counted rows touched rather than links resolved. That second case is not hypothetical: rust-core-dev hit it while writing the second pass, and a dangling link came back reported as resolved. It is the rebuild-backpressure shape one layer up — a wrong number that looks right.
+
+**F-38: `write-FTS` must be non-zero.** `write_rows` and `write_fts` are only comparable across runs if both were measured on the bulk-load shape — triggers dropped, `blocks_fts` built once at the end. A rebuild that regressed to loading *through* the triggers would report `write_fts` at roughly zero with `write_rows` absorbing the cost: **the breakdown would look better while the total got worse**, and no wall-clock figure can see that. Given F-32 — 260,000 blocks unfinished after 25 minutes with the triggers live, against 0.32 s for 26,000 with them dropped — it is the rebuild regression most worth catching, and it is the phase breakdown justifying its own existence.
+
+So the job records five phases beside the total — **walk, read+hash, parse, producer waited, FTS build** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. `write` is split on the architect's evidence: 3.7 s of bulk row insert against 1.9 s of `blocks_fts` build at 259,971 blocks, and with the FTS triggers left live the same shape cost 2.1-10.3 s at 26,000 blocks against 0.32 s dropped, and had not finished after 25 minutes at 260,000. Reported as one figure those are indistinguishable and the fixes differ, which is the same argument as F-10 itself, one level down. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
 
 The phases are allowed to sum to *less* than the wall clock. That is concurrency between the parse pool and the writer, not an error, and the report says so rather than leaving a reader to wonder — a sum that exceeded the total would be the thing worth investigating.
 
@@ -122,6 +139,31 @@ cargo run --release -p budget --bin environment
 
 It prints the scanner state, power plan and core count, and exits non-zero when the environment cannot produce a gate number — so a script can refuse to take the gate figure in the wrong conditions.
 
+## Which of these guards can be removed without a test going red
+
+The harness exists to stop a number being believed when it should not be, so it is the component where a test that cannot fail does the most damage. Reading a test does not tell you whether it can fail — the assertion looks right either way. The only way to find out is to change the code and watch.
+
+`bench/budget` is therefore swept by mutation: apply one change to a scratch copy, run the suite, record whether anything went red. **The current sweep is 27 mutations, all caught.** It is not a fixture in the repository, because a mutation harness that runs in CI becomes a thing to satisfy rather than a thing to learn from; it is a technique, and the record of what it found belongs in the gate report.
+
+The first two rounds are the useful part, because they failed:
+
+| Round | Result |
+|---|---|
+| Round 1 — 16 mutations I wrote tests for | 16 caught. Self-confirming: I authored both sides. |
+| Round 2 — 10 more, aimed at code I had **not** written a test for | **5 survived.** |
+
+The five survivors, and what each says:
+
+| Mutation | Why it survived | Closed by |
+|---|---|---|
+| `check_note_count(..)?` dropped from the rebuild loop | The guard was covered; the function that *calls* it was not. F-19's defence could be deleted silently. | `measure_full_rebuild_with`, so the loop is testable through an injected rebuild |
+| `Statistic::P95` 0.95 → 0.90 | At n = 20 nearest rank moves from the 19th sample to the 18th, and nothing ever looked at the 18th. | A 20-sample case where the two differ |
+| `ensure_vault` trusts the manifest instead of recomputing the digest | `check_vault`'s three refusals were covered; the wiring that feeds them was not. | `verify_vault_at`, exercised against a real tampered vault in `tests/vault_gate.rs` |
+| `write_result` writes nothing | Nothing read the file back. | `write_result_to`, and a test that reads it back |
+| `Outcome::gate_eligible` always true | Tested on `Environment`, never through the `Outcome` that carries it into a report. | A scanner-off outcome asserting `NOT A GATE NUMBER` reaches the report |
+
+The pattern in four of the five is the same and worth naming: **the guard was tested and its caller was not.** A unit test on a refusal proves the refusal works, not that anything asks it. Three of the five were only closable by testing at the level the guard actually runs — which is why `tests/vault_gate.rs` generates a real vault, tampers with one byte, and checks the gate refuses it.
+
 ## What every result carries
 
 A number without its conditions is not comparable with another number, so each result records:
@@ -143,7 +185,7 @@ The entry points the harness is waiting on:
 
 | Budget | Needs | From |
 |---|---|---|
-| NFR-PRF-04 | `rebuild(source: &dyn NoteSource, parser: &dyn NoteParser, index_dir: &Path) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained — plus the four F-10 phase durations on `RebuildReport` | task I4, `serat-index` |
+| NFR-PRF-04 | `rebuild(source: &dyn NoteSource, parser: &dyn NoteParser, index_dir: &Path) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained — plus the F-10 phase durations, `notes` (Markdown notes only, excluding assets) and `links_resolved` (links whose `dst_note` resolved) on `RebuildReport` | task I4, `serat-index` |
 | NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change — **and** the moment the watcher event left the queue, so F-03's two intervals can be reported separately | task I5, `serat-index` / `serat-vault` |
 | NFR-PRF-01 | `SERAT_STARTUP_TRACE=<file>` writing `{"t0_to_window_visible_ms":…, "t0_to_vault_usable_ms":…}` and exiting; t0 is process spawn measured by the harness, not an `Instant::now()` inside `main` | task D2 (definition), task S1 (`serat-app`) |
 
@@ -178,3 +220,22 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-046 | NFR-PRF-01 — a paint mark wired to window creation is caught | `…::a_paint_mark_wired_to_window_creation_is_caught` | pass |
 | TC-047 | NFR-PRF-01 — marks out of order mean the clock moved, and the sample is refused | `…::marks_out_of_order_mean_the_clock_moved` | pass |
 | TC-048 | NFR-PRF-01, arch §3.4 — a critical path that grows with the vault is caught | `bench/budget/src/lib.rs::a_critical_path_that_grows_with_the_vault_is_caught` | pass |
+| TC-070 | F-25 — the median of three is the middle run, not the fastest | `bench/budget/src/lib.rs::the_median_of_three_is_the_middle_run_and_not_the_fastest` | pass |
+| TC-071 | F-25 — `WallClock` is the median, and the report says so | `…::the_wall_clock_statistic_is_the_median`, `…::the_report_says_the_number_is_a_median_of_three` | pass |
+| TC-072 | F-25 — the crate's two definitions of median agree | `…::the_two_medians_in_the_crate_agree` | pass |
+| TC-073 | F-25 — `P95` is the 95th percentile and not the 90th | `…::the_p95_statistic_is_the_ninety_fifth_percentile` | pass |
+| TC-074 | F-26 — a coherent vault from another seed is refused | `…::a_coherent_vault_generated_from_the_wrong_seed_is_refused`, `tests/vault_gate.rs` | pass |
+| TC-075 | F-26 — a hand-edited vault, a wrong note count, a missing manifest | `tests/vault_gate.rs` | pass |
+| TC-076 | F-27 — a job cannot swallow the seam error and post a number | `…::a_job_cannot_swallow_the_seam_error_and_post_a_number` | pass |
+| TC-077 | F-27 — no samples is a failure, not an empty pass | `…::no_samples_is_a_failure_and_not_an_empty_pass` | pass |
+| TC-078 | F-19, F-27 — the rebuild loop refuses a partial index and takes per-phase medians | `…::the_rebuild_loop_refuses_a_partial_index_and_takes_per_phase_medians` | pass |
+| TC-079 | F-27 — the phase breakdown is printed and recorded | `…::the_phase_breakdown_is_printed_and_recorded` | pass |
+| TC-080 | F-29 — a phase breakdown that double-counts is refused | `…::a_phase_breakdown_that_double_counts_is_refused` | pass |
+| TC-081 | F-30 — every budget has a job, iterating the budgets rather than a grep | `…::every_budget_has_a_job_in_the_ci_workflow` | pass |
+| TC-082 | F-38 — a rebuild that loaded through the FTS triggers is caught | `…::a_rebuild_that_loaded_through_the_fts_triggers_is_caught` | pass |
+| TC-083 | F-27 — a result file is written and holds the numbers | `…::a_result_file_is_actually_written_and_holds_the_numbers` | pass |
+| TC-084 | RISK-012 — an outcome taken in the wrong environment is not a gate number | `…::an_outcome_taken_in_the_wrong_environment_is_not_a_gate_number` | pass |
+| TC-090 | F-47 — stale `ANALYZE` statistics are caught | `…::stale_analyze_statistics_are_caught` | pass |
+| TC-091 | F-49 — dropped or over-counted resolved links are caught | `…::dropped_or_over_counted_links_are_caught` | pass |
+| TC-092 | F-46 — the producer-wait phase is labelled for what it measures | `…::the_producer_wait_phase_is_labelled_for_what_it_measures` | pass |
+| TC-093 | F-38 — the FTS check still covers a run where the writer kept up | `…::the_fts_check_still_covers_a_run_where_the_writer_kept_up` | pass |

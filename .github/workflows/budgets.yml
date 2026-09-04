@@ -98,6 +98,14 @@ jobs:
   # confirms each budget has an asserting job". This job is that review, run
   # automatically, so a budget added to the PRD without a job fails the build
   # rather than waiting for someone to notice.
+  #
+  # It used to be a shell loop over `grep -o 'id: "..."'`, and P0 finding F-30
+  # is what that was worth: reformat the field to `id:"x"` and the grep matches
+  # nothing, the loop body never runs, and the job exits 0 having reviewed
+  # nothing. The job whose entire purpose was catching an unasserted budget was
+  # itself unasserted. It is now a Rust test that iterates P0_BUDGETS and reads
+  # this file, so it cannot pass vacuously — and it runs in every `cargo test`,
+  # not only here.
   every-budget-has-a-job:
     name: "NFR-PRF-08 · every budget has an asserting job"
     runs-on: ubuntu-latest
@@ -105,20 +113,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Budget table matches the PRD
+      - name: Budget table matches the PRD, and every budget has a job here
         run: cargo test -p budget --lib
-      - name: Every budget id in the table has a job in this file
-        shell: bash
-        run: |
-          set -euo pipefail
-          missing=0
-          for id in $(grep -o 'id: "[a-z0-9-]*"' bench/budget/src/lib.rs | sed 's/id: "//; s/"//'); do
-            # prf01 is one requirement with two marks measured by one job.
-            job="${id/prf01-window-visible/prf01-cold-start}"
-            job="${job/prf01-vault-usable/prf01-cold-start}"
-            if ! grep -q "^  ${job}:" .github/workflows/budgets.yml; then
-              echo "NFR-PRF-08: budget '${id}' has no asserting job in budgets.yml"
-              missing=1
-            fi
-          done
-          exit $missing

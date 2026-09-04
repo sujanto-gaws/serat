@@ -31,6 +31,7 @@ dependencies = [
 name = "budget"
 version = "0.0.0"
 dependencies = [
+ "rusqlite",
  "serat-core",
  "serat-index",
  "serat-parse",
