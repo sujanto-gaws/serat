@@ -8,8 +8,8 @@
 //! There are two paths into the index and they belong to different requirements.
 //!
 //! A save made *in Serat* goes bytes → hash → parse → writer, with no watcher and no
-//! debounce. That is what [`IndexHandle::apply_and_wait`] measures and what
-//! NFR-PRF-03's 50 ms governs. It is not a shortcut for benchmarking: architecture
+//! debounce. That is what [`IndexHandle::apply`] serves and what NFR-PRF-03's 50 ms
+//! governs. It is not a shortcut for benchmarking: architecture
 //! §3.2 requires it, because echo suppression drops the watcher event for our own
 //! write — an index fed only by the watcher would never index a note saved in Serat
 //! at all.
@@ -70,26 +70,6 @@ pub fn build_parse_pool() -> Result<rayon::ThreadPool, IndexError> {
         })
 }
 
-/// What one save cost, split at the boundary that matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SaveTiming {
-    /// Reading the file and hashing it.
-    pub read_hash: Duration,
-    /// Parsing.
-    pub parse: Duration,
-    /// Submitting and waiting for the writer to commit — the point at which a new
-    /// reader would see the change.
-    pub write: Duration,
-}
-
-impl SaveTiming {
-    /// The whole interval NFR-PRF-03 governs.
-    #[must_use]
-    pub fn total(self) -> Duration {
-        self.read_hash + self.parse + self.write
-    }
-}
-
 /// An open index, kept open across saves.
 ///
 /// Holds the writer actor so that a save does not pay to open a database. That is most
@@ -143,61 +123,51 @@ impl IndexHandle {
         &self.index_dir
     }
 
-    /// Index one note and return when a new reader would see it.
+    /// Index one note. Submits and returns; it does **not** wait.
     ///
-    /// This is NFR-PRF-03's interval. It reads through `source` rather than taking
-    /// bytes, because the hash is what the index stores and what the hash gate and the
-    /// stale guard compare — a caller passing bytes would have to hash them itself,
-    /// and then two places would define what a note's identity is.
+    /// This is the save path of architecture §3.1.1, and not waiting is the whole of
+    /// it. The UI reports "saved" when the rename completes and learns "indexed" from
+    /// `index.changed`; a save that blocked on the writer would put the index back on
+    /// the keystroke path, which design goal 2 forbids.
     ///
-    /// It ends at the barrier, so "reflected in the index" means committed and visible
-    /// to a reader that opens a transaction afterwards, not merely queued. That is the
-    /// only reading of the requirement a benchmark can honestly take.
+    /// There is deliberately no `apply_and_wait`. It would be a barrier called once
+    /// per note rather than once per phase, and — the reason that actually settles it —
+    /// `apply_and_wait()` reads like a write with the wait hidden inside it, one
+    /// copy-paste away from the path where waiting is forbidden. A caller that must
+    /// wait writes `apply(...)` then `writer().flush()`, which shows the wait at the
+    /// call site. That is the benchmark harness's business, not the product's.
+    ///
+    /// It reads through `source` rather than taking bytes, because the hash is what
+    /// the index stores and what both the hash gate and the stale guard compare; a
+    /// caller passing bytes would have to hash them itself, and then two places would
+    /// define what a note's identity is.
     ///
     /// # Errors
     ///
-    /// [`IndexError`] if the write fails. A file that cannot be read is indexed as a
-    /// removal, because a save path told about a file that is no longer there is
-    /// describing a delete.
-    pub fn apply_and_wait(
+    /// [`IndexError::QueueFull`] if the writer is behind — backpressure, and the
+    /// caller's cue to drop this and let a rescan find it, exactly as the watcher
+    /// path does. [`IndexError::WriterStopped`] if the writer is gone.
+    pub fn apply(
         &self,
         source: &dyn NoteSource,
         parser: &dyn NoteParser,
         path: &VaultPath,
-    ) -> Result<SaveTiming, IndexError> {
-        let writer = self.actor.handle();
-
-        let reading = Instant::now();
-        let loaded = source.load(path);
-        let read_hash = reading.elapsed();
-
-        let (op, parse) = match loaded {
+    ) -> Result<(), IndexError> {
+        let op = match source.load(path) {
             // A file the save path was told about but cannot read has been deleted.
-            Err(_) => (IndexOp::Remove { path: path.clone() }, Duration::ZERO),
+            Err(_) => IndexOp::Remove { path: path.clone() },
             Ok(loaded) => match build_op(parser, path, loaded) {
-                Some(pair) => pair,
-                // Nothing to index and nothing to report: the previous row stays, which
-                // is better than deleting a note because one save of it did not parse.
-                None => {
-                    return Ok(SaveTiming {
-                        read_hash,
-                        parse: Duration::ZERO,
-                        write: Duration::ZERO,
-                    });
-                }
+                Some((op, _)) => op,
+                // Nothing to index: the previous row stays, which is better than
+                // deleting a note because one save of it did not parse.
+                None => return Ok(()),
             },
         };
 
-        let writing = Instant::now();
-        writer.submit_blocking(op)?;
-        writer.flush()?;
-        let write = writing.elapsed();
-
-        Ok(SaveTiming {
-            read_hash,
-            parse,
-            write,
-        })
+        // submit, not submit_blocking. On the save path a full queue means the writer
+        // is behind, and waiting here is precisely what design goal 2 forbids — the
+        // refusal is recoverable because a rescan finds the path again.
+        self.actor.handle().submit(op)
     }
 
     /// Stop the writer, applying anything queued.

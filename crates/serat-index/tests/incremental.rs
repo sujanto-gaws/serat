@@ -19,7 +19,7 @@ fn note_count(index_dir: &std::path::Path) -> i64 {
 }
 
 #[test]
-fn a_save_is_visible_to_a_reader_when_apply_and_wait_returns() {
+fn a_save_is_visible_to_a_reader_once_the_writer_has_been_flushed() {
     // NFR-PRF-03's interval, and the only reading of "reflected in the index" a
     // benchmark can honestly take: committed and visible, not merely queued.
     let dir = tempfile::tempdir().expect("temp");
@@ -28,38 +28,42 @@ fn a_save_is_visible_to_a_reader_when_apply_and_wait_returns() {
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     handle
-        .apply_and_wait(&vault, &parser, &path("10-projects/serat.md"))
+        .apply(&vault, &parser, &path("10-projects/serat.md"))
         .expect("save");
+    // The composition the ruling requires: apply submits, flush waits, and the wait is
+    // visible at the call site rather than hidden inside a verb.
+    handle.writer().flush().expect("flush");
 
     assert_eq!(
         note_count(dir.path()),
         1,
-        "a reader could not see the note after apply_and_wait returned"
+        "a reader could not see the note after apply and flush"
     );
     handle.close().expect("close");
 }
 
 #[test]
-fn a_save_reports_the_three_phases_it_spent() {
+fn a_save_does_not_wait_for_the_writer() {
+    // Design goal 2, and the reason apply_and_wait does not exist. A save that blocked
+    // on the writer would put the index back on the keystroke path. The queue is one
+    // deep and the writer is given work it has not drained, so a waiting apply would
+    // block here rather than return.
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
-    let handle = IndexHandle::open(dir.path()).expect("open");
+    let handle = IndexHandle::with_queue_depth(dir.path(), 1).expect("open");
 
-    let timing = handle
-        .apply_and_wait(&vault, &parser, &path("10-projects/serat.md"))
-        .expect("save");
+    let started = std::time::Instant::now();
+    for _ in 0..64 {
+        // Some of these will be refused with QueueFull, which is backpressure and the
+        // save path's cue to let a rescan find the file — not a reason to wait.
+        let _ = handle.apply(&vault, &parser, &path("10-projects/serat.md"));
+    }
+    let elapsed = started.elapsed();
 
-    // The phases must sum to the total by construction; asserting a clock's resolution
-    // would be asserting the machine rather than the code.
-    assert_eq!(
-        timing.total(),
-        timing.read_hash + timing.parse + timing.write
-    );
     assert!(
-        timing.total() < Duration::from_secs(5),
-        "one note took {:?}, which is not a save",
-        timing.total()
+        elapsed < Duration::from_secs(2),
+        "64 saves against a one-deep queue took {elapsed:?}; apply is waiting for the          writer, which puts the index back on the keystroke path"
     );
     handle.close().expect("close");
 }
@@ -72,9 +76,8 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     let target = path("10-projects/serat.md");
-    handle
-        .apply_and_wait(&vault, &parser, &target)
-        .expect("first");
+    handle.apply(&vault, &parser, &target).expect("first");
+    handle.writer().flush().expect("flush");
     let blocks_after_first = {
         let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
         conn.query_row("SELECT count(*) FROM blocks", [], |row| {
@@ -83,9 +86,8 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
         .expect("count")
     };
 
-    handle
-        .apply_and_wait(&vault, &parser, &target)
-        .expect("second");
+    handle.apply(&vault, &parser, &target).expect("second");
+    handle.writer().flush().expect("flush");
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
     let blocks: i64 = conn
         .query_row("SELECT count(*) FROM blocks", [], |row| row.get(0))
@@ -109,15 +111,13 @@ fn a_save_of_a_file_that_has_gone_removes_it() {
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     let target = path("10-projects/serat.md");
-    handle
-        .apply_and_wait(&vault, &parser, &target)
-        .expect("save");
+    handle.apply(&vault, &parser, &target).expect("save");
+    handle.writer().flush().expect("flush");
     assert_eq!(note_count(dir.path()), 1);
 
     let emptied = FakeVault::with(&[]);
-    handle
-        .apply_and_wait(&emptied, &parser, &target)
-        .expect("removal");
+    handle.apply(&emptied, &parser, &target).expect("removal");
+    handle.writer().flush().expect("flush");
     assert_eq!(
         note_count(dir.path()),
         0,
@@ -140,8 +140,9 @@ fn a_save_after_a_rebuild_updates_the_note_rather_than_adding_one() {
 
     let handle = IndexHandle::open(dir.path()).expect("open");
     handle
-        .apply_and_wait(&vault, &parser, &path("10-projects/serat.md"))
+        .apply(&vault, &parser, &path("10-projects/serat.md"))
         .expect("save");
+    handle.writer().flush().expect("flush");
 
     assert_eq!(note_count(dir.path()), 3, "the save added a duplicate note");
     handle.close().expect("close");
@@ -158,14 +159,12 @@ fn a_save_keeps_the_full_text_index_in_step() {
     let handle = IndexHandle::open(dir.path()).expect("open");
     let target = path("note.md");
 
-    handle
-        .apply_and_wait(&vault, &parser, &target)
-        .expect("save");
+    handle.apply(&vault, &parser, &target).expect("save");
+    handle.writer().flush().expect("flush");
 
     let amended = FakeVault::with(&[("note.md", "# After\nthe amended wording\n")]);
-    handle
-        .apply_and_wait(&amended, &parser, &target)
-        .expect("save");
+    handle.apply(&amended, &parser, &target).expect("save");
+    handle.writer().flush().expect("flush");
 
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
     let stale: i64 = conn
