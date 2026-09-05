@@ -322,7 +322,15 @@ fn accept(vault: &Vault, path: &Path) -> Accepted {
     // distinguished from a deleted file by looking, so it is treated as a file: the
     // consumer's read fails, which is how a delete is recognised anyway, and the
     // rename's destination raises the rescan that covers the rest.
-    if vault.resolve(&relative).is_dir() {
+    //
+    // resolve() now refuses a symlinked path (T-07) rather than returning one to
+    // stat — ignored here for the same reason the walk never queues one: a symlink
+    // is not a vault file, and this function's whole job is applying the walk's
+    // rules to events instead of directory entries.
+    let Ok(resolved) = vault.resolve(&relative) else {
+        return Accepted::Ignored;
+    };
+    if resolved.is_dir() {
         return Accepted::Subtree;
     }
 
@@ -499,7 +507,7 @@ mod tests {
         std::thread::sleep(COALESCE_WINDOW * 2);
         for queued in queue.drain() {
             assert!(
-                !vault.resolve(&queued).is_dir(),
+                !vault.resolve(&queued).expect("resolve").is_dir(),
                 "{queued} is a directory and was queued as if it were a file"
             );
         }

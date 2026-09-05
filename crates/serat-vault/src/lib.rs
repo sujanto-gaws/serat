@@ -121,10 +121,53 @@ impl Vault {
         &self.echo
     }
 
-    /// The absolute path of a vault-relative one.
-    #[must_use]
-    pub fn resolve(&self, path: &VaultPath) -> PathBuf {
-        self.root.join(path.as_str())
+    /// The absolute path of a vault-relative one, refusing to resolve through a
+    /// symlink.
+    ///
+    /// This is the narrowest point every filesystem access in this crate passes
+    /// through — [`Vault::read`] and [`Vault::write_atomic`] both call it, and nothing
+    /// bypasses it to reach the disk. That is deliberate (T-07, found by code-reviewer's
+    /// Tauri surface audit, task #18 finding 4): [`walk::walk`] refuses every symlink
+    /// as it discovers files, but a path that arrives some other way — the IPC
+    /// boundary's `read_file`/`write_file`, most concretely — never went through the
+    /// walk, and `root.join(path)` alone follows a symlinked component exactly as
+    /// happily as a real one. "A symlink is not a vault file" needs to be one rule
+    /// with one enforcement point, not the walk's rule and a second, absent one here —
+    /// two mechanisms that happen to agree are two mechanisms that can drift apart,
+    /// which is exactly what had already happened.
+    ///
+    /// Checked component by component from the root down with `symlink_metadata`
+    /// (never `metadata`, which follows the very thing being checked for), the same
+    /// primitive the walk already uses — deliberately not a full `canonicalize`, which
+    /// does more syscalls than this needs and returns a path that then has to be
+    /// re-compared against the root, a second mechanism for the same question. A
+    /// component that does not exist yet is not a symlink, so this refuses an existing
+    /// symlinked ancestor without also refusing a legitimate new file in a new
+    /// subdirectory that has not been created yet.
+    ///
+    /// This sits on `NoteSource::load`'s path, so a rebuild pays it once per file
+    /// (NFR-PRF-04, working agreement 4) — a small, bounded number of `lstat` calls per
+    /// path rather than one, but each is cheap, and design goal 1 (the vault survives
+    /// the application) outranks the budget if the two are ever actually in tension.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::PathEscapesVault`] if any path component between the root and the
+    /// target, inclusive, is a symlink.
+    pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, VaultError> {
+        let mut current = self.root.clone();
+        for component in path.as_str().split('/') {
+            current.push(component);
+            let is_symlink = fs::symlink_metadata(&current)
+                .map(|meta| meta.is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                return Err(VaultError::PathEscapesVault {
+                    path: path.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(current)
     }
 
     /// Turn an absolute path into a vault-relative one.
@@ -175,9 +218,10 @@ impl Vault {
     ///
     /// # Errors
     ///
-    /// [`VaultError::NotFound`] if it is gone, [`VaultError::Io`] otherwise.
+    /// [`VaultError::NotFound`] if it is gone, [`VaultError::PathEscapesVault`] if it
+    /// resolves through a symlink (T-07), [`VaultError::Io`] otherwise.
     pub fn read(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
-        let absolute = self.resolve(path);
+        let absolute = self.resolve(path)?;
         let bytes = fs::read(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
         let stat = fs::metadata(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
 
@@ -241,6 +285,9 @@ impl Vault {
     ///
     /// # Errors
     ///
+    /// [`VaultError::PathEscapesVault`] if the target resolves through a symlink
+    /// (T-07) — refused before the parent directory is even created, so a symlinked
+    /// ancestor is never written through, only ever discovered.
     /// [`VaultError::AtomicWriteFailed`] if any step fails, in which case the
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
@@ -264,7 +311,7 @@ impl Vault {
         // else now; recording is [`EchoGuard::record_echo`], called by the index's save
         // path only after a submit has actually been accepted (F-224).
 
-        let target = self.resolve(path);
+        let target = self.resolve(path)?;
         let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
             path: path.as_str().to_owned(),
             reason: "has no parent directory".to_owned(),
@@ -441,7 +488,7 @@ mod tests {
         let reads = Arc::new(AtomicUsize::new(0));
 
         let reader = {
-            let absolute = vault.resolve(&path);
+            let absolute = vault.resolve(&path).expect("resolve");
             let stop = Arc::clone(&stop);
             let torn = Arc::clone(&torn);
             let reads = Arc::clone(&reads);
@@ -501,7 +548,7 @@ mod tests {
                 "{binary} was accepted as a write target"
             );
             assert!(
-                !vault.resolve(&path).exists(),
+                !vault.resolve(&path).expect("resolve").exists(),
                 "{binary} was created despite the refusal"
             );
         }
@@ -596,7 +643,7 @@ mod tests {
         let path = VaultPath::new("20-systems/indexing.md").expect("path");
         vault.write_atomic(&path, b"body").expect("write");
 
-        let absolute = vault.resolve(&path);
+        let absolute = vault.resolve(&path).expect("resolve");
         assert_eq!(vault.relativise(&absolute).expect("relativise"), path);
     }
 
@@ -608,10 +655,8 @@ mod tests {
         // exist.
         let (_dir, vault) = vault();
         let path = VaultPath::new("gone.md").expect("path");
-        assert_eq!(
-            vault.relativise(&vault.resolve(&path)).expect("relativise"),
-            path
-        );
+        let absolute = vault.resolve(&path).expect("resolve");
+        assert_eq!(vault.relativise(&absolute).expect("relativise"), path);
     }
 
     #[test]
@@ -621,7 +666,7 @@ mod tests {
         // normal usage would undermine the invariant it sits beside.
         let (_dir, vault) = vault();
         let path = VaultPath::new("40-refs/contract.pdf").expect("path");
-        let absolute = vault.resolve(&path);
+        let absolute = vault.resolve(&path).expect("resolve");
         fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir");
         fs::write(&absolute, b"%PDF-1.7 header only").expect("write");
         assert_eq!(vault.read(&path).expect("read").meta.kind, NoteKind::Asset);
@@ -716,7 +761,7 @@ mod permission_tests {
         let path = VaultPath::new("private.md").expect("path");
         vault.write_atomic(&path, b"# Before\n").expect("write");
 
-        let absolute = vault.resolve(&path);
+        let absolute = vault.resolve(&path).expect("resolve");
         let before = fs::metadata(&absolute).expect("stat").permissions();
 
         vault.write_atomic(&path, b"# After\n").expect("write");
@@ -739,7 +784,7 @@ mod permission_tests {
         let path = VaultPath::new("secrets.md").expect("path");
         vault.write_atomic(&path, b"# Secrets\n").expect("write");
 
-        let absolute = vault.resolve(&path);
+        let absolute = vault.resolve(&path).expect("resolve");
         fs::set_permissions(&absolute, fs::Permissions::from_mode(0o600)).expect("chmod");
 
         vault
@@ -770,7 +815,7 @@ mod permission_tests {
         let path = VaultPath::new("locked.md").expect("path");
         vault.write_atomic(&path, b"# Locked").expect("write");
 
-        let absolute = vault.resolve(&path);
+        let absolute = vault.resolve(&path).expect("resolve");
         let original = fs::metadata(&absolute).expect("stat").permissions();
 
         let mut locked = original.clone();
@@ -804,4 +849,97 @@ mod permission_tests {
         vault.write_atomic(&path, b"# New\n").expect("write");
         assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
     }
+
+    #[test]
+    fn resolve_does_not_mistake_a_new_subdirectory_for_a_symlink() {
+        // T-07's control, cross-platform because it needs no real symlink: resolve()
+        // checks every path component with symlink_metadata, and a component that
+        // does not exist yet must read as "not a symlink" rather than as a refusal,
+        // or a write into any subdirectory that has not been created yet would fail.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("10-projects/new-subdir/note.md").expect("path");
+        vault.write_atomic(&path, b"# New\n").expect("write");
+        assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
+    }
+}
+
+// Unix-only: creating a real symlink on Windows needs Developer Mode or an
+// elevated process, which a test runner cannot assume. The property under test —
+// resolve() refuses any path component that is a symlink — has no platform-specific
+// content, so one platform's coverage stands for the mechanism.
+#[cfg(all(test, unix))]
+mod symlink_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn vault() -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(dir.path()).expect("open vault");
+        (dir, vault)
+    }
+
+    #[test]
+    fn a_symlinked_note_is_refused_rather_than_read() {
+        // T-07. Setup reaches the path being tested (F-58): without the fix this read
+        // succeeds and returns "outside", which is exactly the escape the fix exists
+        // to close, so a broken fix would fail this test by returning Ok(_) with the
+        // wrong bytes rather than by some incidental error.
+        let (dir, vault) = vault();
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.md");
+        fs::write(&secret, b"outside").expect("write outside the vault");
+
+        symlink(&secret, dir.path().join("escape.md")).expect("symlink");
+
+        let path = VaultPath::new("escape.md").expect("path");
+        let result = vault.read(&path);
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "a symlinked note was followed instead of refused: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_directory_component_is_refused() {
+        // The case a single lstat on the final component would miss: the file itself
+        // is ordinary, but an ancestor directory is the symlink, matching a synced
+        // folder or a git submodule inside the vault — exactly the ordinary case the
+        // task named, not an exotic one.
+        let (dir, vault) = vault();
+        let outside = tempfile::tempdir().expect("outside");
+        fs::create_dir_all(outside.path().join("nested")).expect("mkdir outside");
+        fs::write(outside.path().join("nested/secret.md"), b"outside").expect("write outside");
+
+        symlink(outside.path(), dir.path().join("synced")).expect("symlink dir");
+
+        let path = VaultPath::new("synced/nested/secret.md").expect("path");
+        let result = vault.read(&path);
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "a symlinked ancestor directory was followed instead of refused: {result:?}"
+        );
+    }
+
+    #[test]
+    fn write_atomic_refuses_a_symlinked_ancestor_before_touching_the_disk() {
+        // The write side, mirroring the read side: a symlinked ancestor must be
+        // refused before create_dir_all or the temp file, not discovered by writing
+        // through the link and then noticing.
+        let (dir, vault) = vault();
+        let outside = tempfile::tempdir().expect("outside");
+
+        symlink(outside.path(), dir.path().join("synced")).expect("symlink dir");
+
+        let path = VaultPath::new("synced/new.md").expect("path");
+        let result = vault.write_atomic(&path, b"# New\n");
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "a write through a symlinked ancestor was not refused: {result:?}"
+        );
+        assert!(
+            !outside.path().join("new.md").exists(),
+            "the write landed outside the vault despite being refused"
+        );
+    }
+
 }
