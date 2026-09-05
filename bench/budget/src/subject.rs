@@ -532,9 +532,12 @@ pub fn measure_resolve_overhead(vault_path: &Path) -> Result<ResolveOverhead, St
     let mut lstat_calls = 0usize;
     let started = Instant::now();
     for entry in &entries {
-        vault
-            .resolve(&entry.path)
-            .map_err(|e| format!("resolving {:?}, which the walk just reported: {e}", entry.path))?;
+        vault.resolve(&entry.path).map_err(|e| {
+            format!(
+                "resolving {:?}, which the walk just reported: {e}",
+                entry.path
+            )
+        })?;
         lstat_calls += entry.path.as_str().split('/').count();
     }
     let elapsed = started.elapsed();
@@ -604,8 +607,7 @@ mod tests {
         // 40,000 syscalls" as an estimate nobody measured.
         let preset = crate::preset("20k").expect("the 20k preset exists");
         let vault = crate::ensure_vault("20k").expect("the 20k vault is available");
-        let overhead =
-            measure_resolve_overhead(&vault.path).expect("resolving every walked entry");
+        let overhead = measure_resolve_overhead(&vault.path).expect("resolving every walked entry");
 
         assert_eq!(
             overhead.files,
