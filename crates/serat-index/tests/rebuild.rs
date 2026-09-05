@@ -710,12 +710,49 @@ fn the_report_breaks_the_rebuild_into_phases() {
         report.parse > std::time::Duration::ZERO,
         "the parse phase was not measured"
     );
-    // walk and write can legitimately round to zero on a fast in-memory fixture, so
-    // asserting they are non-zero would be asserting the clock's resolution rather
-    // than the code. What must hold is that no phase exceeds the whole.
-    let total = report.walk + report.read_hash + report.parse + report.write;
+    // walk, producer_wait and write_fts can legitimately round to zero on a fast
+    // in-memory fixture, so asserting they are non-zero would be asserting the
+    // clock's resolution rather than the code. What must hold is that no phase
+    // exceeds the whole.
+    let total =
+        report.walk + report.read_hash + report.parse + report.producer_wait + report.write_fts;
     assert!(
         total < std::time::Duration::from_secs(60),
         "the phases sum to {total:?}, which is not plausible for 200 notes"
+    );
+}
+
+#[test]
+fn write_fts_times_the_trigger_rebuild_and_analyze_rather_than_nothing() {
+    // F-38 / task #9. end_bulk_load and analyze used to be untimed altogether, which
+    // means a regression that made the rebuild load through the live FTS triggers
+    // again (F-32: about 6x on this phase) would have nowhere to show up — the total
+    // would grow, but nothing would say where. On a 200-note fixture the FTS rebuild
+    // and ANALYZE are real SQLite work against a populated blocks table, so this is
+    // not asserting clock resolution the way walk/producer_wait sometimes would.
+    let files: Vec<(String, String)> = (0..200)
+        .map(|i| {
+            (
+                format!("10-projects/note-{i:04}.md"),
+                format!("# Note {i}\nsome searchable body text for note {i}\n"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+
+    let dir = tempfile::tempdir().expect("temp");
+    let report = rebuild(
+        &FakeVault::with(&borrowed),
+        &LineParser::default(),
+        dir.path(),
+    )
+    .expect("rebuild");
+
+    assert!(
+        report.write_fts > std::time::Duration::ZERO,
+        "write_fts was zero; end_bulk_load and analyze are not being timed"
     );
 }

@@ -44,13 +44,32 @@ pub struct RebuildReport {
     pub read_hash: Duration,
     /// How long parsing took.
     pub parse: Duration,
-    /// How long the writer took, measured as the barrier at the end: everything
-    /// submitted but not yet applied when the last file was parsed.
+    /// How long the producer was blocked waiting for the writer, not what the writer
+    /// cost. Measured around `submit_blocking` in `index_one`, plus the barrier at the
+    /// end — everything submitted but not yet applied when the last file was parsed.
     ///
-    /// The four will not sum to the wall clock, and that gap is a finding rather than
-    /// a defect — it is the producer and the writer overlapping, which is the whole
-    /// point of the actor.
-    pub write: Duration,
+    /// The reading is the opposite of the obvious one: near zero means the writer
+    /// **kept up**, not that writing is cheap; large means the writer **is** the
+    /// bottleneck, because the only way this grows is the queue being full. Named for
+    /// what it measures (F-10) — a field called `write` holding a small value would
+    /// answer open design question 1 backwards.
+    pub producer_wait: Duration,
+    /// Building `blocks_fts` with the FTS5 `rebuild` command after the bulk load
+    /// ([`crate::writer::WriterHandle::end_bulk_load`]), plus the final `ANALYZE`
+    /// ([`crate::writer::WriterHandle::analyze`]). Unlike `producer_wait` this is real
+    /// writer-side work, and it is split out because it has a different fix: F-32
+    /// measured loading through the live FTS triggers at about 6x on this phase, and a
+    /// regression back to that shape must be visible here rather than absorbed into a
+    /// combined figure where it would read as an improvement (F-38).
+    ///
+    /// Was not timed at all before this field existed — real time attributed to
+    /// nothing, and the gap this split closes.
+    ///
+    /// None of the five phases above will sum to the wall clock, and that gap is a
+    /// finding rather than a defect — it is the producer and the writer overlapping,
+    /// which is the whole point of the actor, plus the untimed bootstrap and
+    /// bulk-load-open steps around them.
+    pub write_fts: Duration,
     /// Files the source refused to read. Not a failure: a file deleted while the
     /// rebuild was walking is ordinary, and one unreadable file must not stop a vault
     /// indexing (design goal 5).
@@ -155,22 +174,32 @@ pub fn rebuild_with_queue_depth(
 
     // The barrier. Everything above is asynchronous; nothing below may observe a
     // partial index. What it costs is the writer's backlog — the work the producer
-    // did not have to wait for — which is the honest reading of the write phase.
+    // did not have to wait for — which is the honest reading of producer_wait.
     let drain = Instant::now();
     writer.flush()?;
-    let write = timing.write + drain.elapsed();
+    let producer_wait = timing.producer_wait + drain.elapsed();
 
     // Steps 4 and 5: build the FTS index in one pass, then put the triggers back so
-    // the incremental path keeps working.
+    // the incremental path keeps working. Timed — F-38 needs write_fts to move when a
+    // regression makes the rebuild load through the live triggers again, and a
+    // combined figure would absorb that 6x rather than show it.
+    let fts_started = Instant::now();
     writer.end_bulk_load(triggers)?;
+    let end_bulk_load = fts_started.elapsed();
 
-    // The second pass the foreign key forces.
+    // The second pass the foreign key forces. Not part of write_fts: it is its own
+    // phase (resolving links, not building the FTS index), and it is small enough
+    // relative to the others that it is left in the untimed remainder rather than
+    // given a sixth field nobody has asked to see split out yet.
     let links_resolved = writer.resolve_links()?;
 
     // Step 6, and only after everything above has committed: marking the index ready
     // is what makes a crash mid-rebuild recoverable, because a rebuild that died
     // between dropping the triggers and restoring them leaves the state building.
+    let analyze_started = Instant::now();
     writer.analyze()?;
+    let write_fts = end_bulk_load + analyze_started.elapsed();
+
     writer.mark_ready(&index_dir.to_string_lossy())?;
     actor.shutdown()?;
 
@@ -179,7 +208,8 @@ pub fn rebuild_with_queue_depth(
     report.walk = walk;
     report.read_hash = timing.read_hash;
     report.parse = timing.parse;
-    report.write = write;
+    report.producer_wait = producer_wait;
+    report.write_fts = write_fts;
     Ok(report)
 }
 
@@ -191,7 +221,7 @@ struct Skip;
 struct Phases {
     read_hash: Duration,
     parse: Duration,
-    write: Duration,
+    producer_wait: Duration,
 }
 
 fn index_one(
@@ -225,12 +255,12 @@ fn index_one(
     // walk). During a rebuild nothing will ever tell us about this file again, so
     // dropping it would mean quietly indexing part of the vault — the failure a
     // wall-clock benchmark number cannot see. Here the producer waits for the writer.
-    // Only the waiting counts as write time here: the writer's own work happens on
+    // Only the waiting counts as producer_wait here: the writer's own work happens on
     // its thread and is charged at the barrier. What this measures is the producer
     // being held up, which is the number that says the writer is the bottleneck.
     let submitting = Instant::now();
     let result = writer.submit_blocking(op).map_err(|_| Skip);
-    timing.write += submitting.elapsed();
+    timing.producer_wait += submitting.elapsed();
     result
 }
 
