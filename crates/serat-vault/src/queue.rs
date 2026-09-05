@@ -288,12 +288,24 @@ impl WorkQueue {
         self.lock().order.len()
     }
 
-    /// Refuse further pushes and wake every consumer.
+    /// Refuse further pushes and wake every consumer and every blocked producer.
+    ///
+    /// Both condvars, not just `ready` (F-11 review follow-up, code-reviewer). A
+    /// producer parked in [`WorkQueue::push_blocking`] waits on `space`, and closing
+    /// without waking it left that producer blocked indefinitely — measured at 200 ms
+    /// still blocked in 7 of 8 runs, with a no-close control confirming the wake was
+    /// not coming from anywhere else. The window is not a corner case: ADR-0011's
+    /// rescan recovery drives its walk through `push_blocking` precisely so it cannot
+    /// drop a path, which means it spends most of a large rescan blocked in exactly
+    /// this state, and a shutdown during a rescan hits it with high probability rather
+    /// than low. Same family as F-21, where a channel's lifetime stood in for a signal
+    /// and a caller waiting on the wrong thing hung for 600 s before anyone noticed.
     pub fn close(&self) {
         let mut inner = self.lock();
         inner.closed = true;
         drop(inner);
         self.ready.notify_all();
+        self.space.notify_all();
     }
 
     /// Whether the queue is closed.
@@ -576,6 +588,55 @@ mod tests {
         }
         assert!(!queue.push(path("too-late.md")));
         assert!(queue.is_closed());
+    }
+
+    #[test]
+    fn closing_wakes_a_producer_blocked_in_push_blocking() {
+        // Task #12 / F-11 review follow-up. `close()` used to notify only `ready`,
+        // never `space` — so a producer parked in `push_blocking` on a full queue was
+        // not woken by a close at all, and this is the state ADR-0011's rescan spends
+        // most of its life in on a vault larger than the queue.
+        //
+        // The queue is filled to capacity with no consumer running, so the producer
+        // below is genuinely parked on `space` before `close()` runs — checking the
+        // setup reaches the path (F-58), since a producer that was never actually
+        // blocked would pass this test whether or not the fix exists.
+        let queue = Arc::new(WorkQueue::with_capacity(1));
+        assert!(queue.push(path("a.md")));
+
+        let producer_queue = Arc::clone(&queue);
+        let producer = std::thread::spawn(move || producer_queue.push_blocking(path("b.md")));
+
+        // Give the producer thread time to actually reach the wait, not just to have
+        // been spawned. Not a source of flakiness in the failing direction: if this
+        // sleep were too short the producer might not yet be parked, which would make
+        // the test pass falsely on the *old*, broken code too — so the assertion below
+        // that it is still running after the sleep is what makes the setup honest.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !producer.is_finished(),
+            "the producer returned before close(); it was never blocked, so this test \
+             cannot tell the fix from its absence"
+        );
+
+        queue.close();
+
+        // A timeout that fails loudly rather than hanging the suite if the fix
+        // regresses: a `JoinHandle` has no built-in one, so a second thread races the
+        // join against a deadline.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(producer.join());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(joined) => {
+                joined.expect("producer thread panicked");
+            }
+            Err(_) => panic!(
+                "the producer blocked in push_blocking was not woken by close() within \
+                 5 s"
+            ),
+        }
     }
 
     #[test]
