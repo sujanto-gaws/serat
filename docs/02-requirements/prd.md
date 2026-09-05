@@ -8,9 +8,13 @@ companion: docs/02-requirements/user-stories.md
 
 # Product Requirements Document — Serat
 
-**Owner:** Sujanto (product-analyst role) · **Version:** 1.0 (requirements baseline) · **Status:** Baselined, pre-P0 · **Derived from:** Blueprint v0.2 → `docs/01-planning/project-charter.md`
+**Owner:** Sujanto (product-analyst role) · **Version:** 1.1 (requirements baseline, amended) · **Status:** Baselined, pre-P0 · **Derived from:** Blueprint v0.2 → `docs/01-planning/project-charter.md`
 
-This document restates the product blueprint as verifiable obligations: every requirement carries a priority, a delivery phase, an acceptance criterion and a verification method, and every one traces to a user story in `user-stories.md` or is recorded as a deliberate exclusion. 135 requirements (107 functional, 28 non-functional), 40 user stories, 86 Must-have, 4 scope exclusions. Phase load: P0 7 · P1 29 · P2 41 · P3 17 · P4 26 · P5 11 · v2 4 — P2 and P4 carry the heaviest load and are where scope is cut first if the schedule slips.
+**Amendment log:** v1.1 — NFR-SEC-06 allocated for T-07, path containment (task #23); NFR-CMP-03 split into NFR-CMP-03/04, its two clauses having opposite postures (F-249); NFR-PRF-03's acceptance criterion clarified to name the path it governs, target unchanged (F-03); data-dictionary appendix reconciled against `schema/001_init.sql` (F-16). No NFR-PRF target was re-baselined — Q1 remains blocked on T2/D4.
+
+**NFR-SEC-06 is P1, not P0, deliberately:** the charter's P0 gate is strictly the three performance numbers, so tagging a security requirement P0 would misstate what that gate checks. The live defect it names is in shipped P0 code and its fix is tracked as a P0 task — a requirement's phase and an operational task's phase are different things and do not have to agree.
+
+This document restates the product blueprint as verifiable obligations: every requirement carries a priority, a delivery phase, an acceptance criterion and a verification method, and every one traces to a user story in `user-stories.md` or is recorded as a deliberate exclusion. 137 requirements (107 functional, 30 non-functional), 40 user stories, 87 Must-have, 4 scope exclusions. Phase load: P0 7 · P1 31 · P2 41 · P3 17 · P4 26 · P5 11 · v2 4 — P2 and P4 carry the heaviest load and are where scope is cut first if the schedule slips.
 
 ## Problem statement
 
@@ -250,7 +254,7 @@ The numeric budgets that constrain every design decision.
 |------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|--------|-------|-------------------------------------------------------------------------------|---------|
 | NFR-PRF-01 | **Cold start** — The application shall present an interactive window within 400ms and a fully usable vault within 1 second, at 20,000 notes with a warm index.  | Must   | P0    | Measured on the reference machine over 20 runs; p95 within budget.            | Bench   |
 | NFR-PRF-02 | **Editor latency** — Keystroke to paint shall not exceed 16ms at p95 in a 5,000-line note.                                                                      | Must   | P1    | Benchmark harness reports p95 under 16ms.                                     | Bench   |
-| NFR-PRF-03 | **Incremental index** — A single note save shall be reflected in the index within 50ms at p95.                                                                  | Must   | P0    | Benchmark over 1,000 saves; p95 within budget.                                | Bench   |
+| NFR-PRF-03 | **Incremental index (Serat-originated save)** — A note saved through Serat's own write path shall be reflected in the index within 50ms at p95. External changes are FR-VLT-04's concern, on its own 500ms window. | Must   | P0    | Given a save made through Serat (not an external file change), when it completes, then the index reflects it within 50ms at p95 on the write→parse→index path, with no watcher or debounce interposed. Benchmarked over 1,000 saves. | Bench   |
 | NFR-PRF-04 | **Full rebuild** — A full index rebuild of 20,000 Markdown notes shall complete within 30 seconds.                                                              | Must   | P0    | Benchmark on the synthetic vault; wall-clock within budget.                   | Bench   |
 | NFR-PRF-05 | **Query latency** — A query returning 500 rows over a 20,000-note vault shall complete within 100ms at p95.                                                     | Must   | P2    | Conformance query suite benchmarked; p95 within budget.                       | Bench   |
 | NFR-PRF-06 | **Switcher latency** — Quick-switcher results shall render within 50ms of a keystroke at 20,000 notes.                                                          | Must   | P1    | Benchmarked; p95 within budget.                                               | Bench   |
@@ -270,6 +274,7 @@ What may leave the machine, and what may run untrusted input.
 | NFR-SEC-03 | **Sandboxed extraction** — Extractor processes shall have no network access and shall be terminated on exceeding time or memory limits.                                      | Must | P2    | Fault-injection suite confirms termination and isolation; network syscalls are unavailable to the child. | Test    |
 | NFR-SEC-04 | **Credential storage** — API keys shall be stored in the operating system credential store, never in the vault or in plain configuration.                                    | Must | P4    | Filesystem inspection after configuring a key finds no key material outside the OS store.                | Inspect |
 | NFR-SEC-05 | **Local-only services** — Any service the application listens on shall bind to a local transport only.                                                                       | Must | P4    | Port scan from another host finds no reachable service.                                                  | Test    |
+| NFR-SEC-06 | **Path containment** — The system shall never read from or write to a filesystem path that resolves outside the vault root, whether reached directly, through a relative traversal, or through a symlink. | Must | P1    | Given a symlink inside the vault pointing to a target outside the vault root, when any read or write operation is invoked on it, then the request is refused and no bytes cross the vault boundary. | Test    |
 
 ### NFR-REL — Reliability
 
@@ -289,7 +294,8 @@ Interoperation with Obsidian and with plain-text tooling.
 |------------|-----------------------------------------------------------------------------------------------------------------------------------------|------|-------|--------------------------------------------------------------------------------------------------------------------------------|---------|
 | NFR-CMP-01 | **Obsidian vault compatibility** — The system shall open an existing Obsidian vault without modification, preserving .obsidian/ untouched. | Must | P1    | Given a real Obsidian vault, when opened and used for a session, then Obsidian opens it afterwards with no configuration loss. | Demo    |
 | NFR-CMP-02 | **No proprietary content format** — All user content shall remain readable and editable with a plain text editor.                          | Must | P1    | Inspection of every file the app writes confirms plain Markdown, YAML or documented plain text.                                | Inspect |
-| NFR-CMP-03 | **Index excluded from version control** — The index directory shall be gitignored by default and shall never be required for correctness.  | Must | P1    | A fresh clone without .serat/ builds a correct index on first open.                                                            | Test    |
+| NFR-CMP-03 | **Index independence from version control** — The index directory (`.serat/`) shall never be required for correctness. | Must | P1    | Given a vault copied, cloned or restored without `.serat/`, when it is opened, then a correct index is built from the Markdown files alone, with no user action beyond opening. | Test    |
+| NFR-CMP-04 | **`.serat/` never enters version control silently** — If the vault root is a git repository with no ignore entry for `.serat/`, the system shall offer to add one; it shall not create or edit a `.gitignore` the user did not ask it to touch. | Should | P1    | Given a vault that is a git repository with no ignore entry for `.serat/`, when it is first opened, then the user is offered to add one and no file is modified without that confirmation. | Demo    |
 
 ### NFR-USE — Usability & accessibility
 
@@ -442,12 +448,14 @@ Requirement to story to phase to gate to verification method. Four requirements 
 | NFR-SEC-03 | **Sandboxed extraction**                | Must   | P2    | US-22                             | Test    | Every current Dataview query expressible in SQ; write-back survives hostile tests; PDF text findable from the same search box |
 | NFR-SEC-04 | **Credential storage**                  | Must   | P4    | US-32                             | Inspect | A subagent answers via MCP what grep cannot; no unreviewed AI write                                                           |
 | NFR-SEC-05 | **Local-only services**                 | Must   | P4    | US-33                             | Test    | A subagent answers via MCP what grep cannot; no unreviewed AI write                                                           |
+| NFR-SEC-06 | **Path containment**                    | Must   | P1    | US-01                             | Test    | A week in Serat on the real vault without needing Obsidian                                                                    |
 | NFR-REL-01 | **No data loss**                        | Must   | P1    | US-07                             | Test    | A week in Serat on the real vault without needing Obsidian                                                                    |
 | NFR-REL-02 | **Index is recoverable**                | Must   | P0    | US-07                             | Test    | Index under 30s, save-to-index under 50ms, cold start under 1s                                                                |
 | NFR-REL-03 | **Failure isolation**                   | Must   | P2    | US-22                             | Test    | Every current Dataview query expressible in SQ; write-back survives hostile tests; PDF text findable from the same search box |
 | NFR-CMP-01 | **Obsidian vault compatibility**        | Must   | P1    | US-01                             | Demo    | A week in Serat on the real vault without needing Obsidian                                                                    |
 | NFR-CMP-02 | **No proprietary content format**       | Must   | P1    | US-29                             | Inspect | A week in Serat on the real vault without needing Obsidian                                                                    |
-| NFR-CMP-03 | **Index excluded from version control** | Must   | P1    | US-01                             | Test    | A week in Serat on the real vault without needing Obsidian                                                                    |
+| NFR-CMP-03 | **Index independence from version control** | Must   | P1    | US-01                             | Test    | A week in Serat on the real vault without needing Obsidian                                                                    |
+| NFR-CMP-04 | **`.serat/` never enters version control silently** | Should | P1    | US-01                             | Demo    | A week in Serat on the real vault without needing Obsidian                                                                    |
 | NFR-USE-01 | **Keyboard-first operation**            | Must   | P1    | US-04                             | Inspect | A week in Serat on the real vault without needing Obsidian                                                                    |
 | NFR-USE-02 | **Accessible presentation**             | Should | P5    | US-36                             | Test    | A stranger opens a 30k vault and nothing frightening happens                                                                  |
 | NFR-USE-03 | **Light and dark themes**               | Should | P2    | US-38                             | Demo    | Every current Dataview query expressible in SQ; write-back survives hostile tests; PDF text findable from the same search box |
@@ -563,15 +571,18 @@ Field-level definition of the index. Everything here is derived from the vault a
 | blocks    | byte_start                            | INTEGER           | Yes  | Start offset in the source file. Null for extracted blocks.                              | §05      |
 | blocks    | byte_end                              | INTEGER           | Yes  | End offset in the source file. The write-back handle.                                    | §05, §07 |
 | blocks    | locator                               | TEXT              | Yes  | Position inside a binary: p:12, s:7, Sales!A1:D20, t:00:14:22.                           | §08      |
+| fields    | id                                    | INTEGER           | No   | Surrogate key; the `__fid` every editable view cell carries back to the write-back patcher (ADR-0008). | §07      |
 | fields    | note_id                               | INTEGER           | No   | Owning note.                                                                             | §05      |
 | fields    | block_id                              | INTEGER           | Yes  | Null means the field came from frontmatter.                                              | §05      |
 | fields    | key                                   | TEXT              | No   | Field name.                                                                              | §05      |
 | fields    | val_text                              | TEXT              | Yes  | Text projection of the value.                                                            | §05      |
 | fields    | val_num                               | REAL              | Yes  | Numeric projection, when the schema declares a number.                                   | §05      |
 | fields    | val_date                              | TEXT              | Yes  | ISO-8601 projection, when the schema declares a date. Makes range queries indexed scans. | §05      |
+| fields    | val_bool                              | INTEGER           | Yes  | Boolean projection (0/1), when the schema declares a boolean.                             | §05      |
 | fields    | source                                | TEXT              | No   | frontmatter \| inline.                                                                   | §05      |
 | fields    | byte_start                            | INTEGER           | Yes  | Start of the value's bytes — the patch target.                                           | §07      |
 | fields    | byte_end                              | INTEGER           | Yes  | End of the value's bytes.                                                                | §07      |
+| links     | id                                    | INTEGER           | No   | Surrogate key.                                                                           | §05      |
 | links     | src_note                              | INTEGER           | No   | Linking note.                                                                            | §05      |
 | links     | src_block                             | INTEGER           | Yes  | Block the link occurs in, for block-precise backlinks.                                   | §05      |
 | links     | dst_path                              | TEXT              | Yes  | Raw link target as written.                                                              | §05      |
@@ -583,10 +594,13 @@ Field-level definition of the index. Everything here is derived from the vault a
 | tasks     | note_id                               | INTEGER           | No   | Owning note.                                                                             | §05      |
 | tasks     | block_id                              | INTEGER           | No   | The checkbox block; the write target when ticked from a view.                            | §05      |
 | tasks     | status                                | TEXT              | No   | Checkbox state, supporting non-binary markers.                                           | §05      |
+| tasks     | done                                  | INTEGER           | No   | Binary projection of status (0/1); ix_tasks_open is partial on this column.              | §05      |
 | tasks     | text                                  | TEXT              | Yes  | Task text with inline fields stripped.                                                   | §05      |
 | tasks     | due                                   | TEXT              | Yes  | From due:: inline field.                                                                 | §05      |
 | tasks     | owner                                 | TEXT              | Yes  | From owner:: inline field.                                                               | §05      |
 | tasks     | est                                   | REAL              | Yes  | From est:: inline field; the usual rollup target.                                        | §05      |
+| tasks     | byte_start                            | INTEGER           | Yes  | Start of the marker byte — the patch target (ADR-0008).                                  | §07      |
+| tasks     | byte_end                              | INTEGER           | Yes  | End of the marker byte.                                                                  | §07      |
 | types     | name                                  | TEXT              | No   | Type name as referenced by notes.                                                        | §05      |
 | types     | path                                  | TEXT              | No   | Path of the type note that declares it.                                                  | §05      |
 | types     | spec_json                             | TEXT              | No   | Compiled schema: fields, kinds, required, enums, defaults, order.                        | §05      |
@@ -599,7 +613,7 @@ Field-level definition of the index. Everything here is derived from the vault a
 | assets    | content_hash                          | TEXT              | Yes  | blake3 of the binary. The extraction cache key.                                          | §08      |
 | assets    | extracted_at                          | INTEGER           | Yes  | Timestamp of last successful extraction.                                                 | §08      |
 | assets    | needs_ocr                             | INTEGER           | Yes  | Set when a PDF yielded no text layer.                                                    | §08      |
-| notes_fts | title, body                           | FTS5              | No   | External-content FTS5 index over notes and extracted blocks.                             | §05      |
+| blocks_fts | text                                  | FTS5              | No   | External-content FTS5 index over blocks — note paragraphs and extracted binary blocks alike, keyed by blocks.id. A note-level table cannot answer *which block*, so it could not serve a citation or a locator (FR-AIX-04, FR-BIN-06). | §05      |
 | chunks    | id, note_id, block_lo, block_hi, text | mixed             | No   | Embedding units spanning a block range, with heading-path context.                       | §05      |
 | chunk_vec | chunk_id, embedding                   | vec0 FLOAT\[384\] | No   | Vector index sized for a small local model.                                              | §05      |
 

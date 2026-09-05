@@ -15,7 +15,7 @@ The same scope as the PRD's functional and non-functional requirements, expresse
 
 P1 · An editor you could live in: open the real vault, write, link, find, and survive external edits.
 
-### US-01 — Open my real vault  (serves FR-VLT-01, FR-VLT-07, NFR-CMP-01, FR-VLT-02, NFR-CMP-03)
+### US-01 — Open my real vault  (serves FR-VLT-01, FR-VLT-07, NFR-CMP-01, FR-VLT-02, NFR-CMP-03, NFR-CMP-04, NFR-SEC-06)
 **Phase:** P1 · **Size:** M
 
 As a vault owner, I want to open my existing Obsidian vault directly, so that trying Serat costs me nothing and I can keep Obsidian as a fallback.
