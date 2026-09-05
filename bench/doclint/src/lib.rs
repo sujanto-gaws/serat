@@ -40,7 +40,13 @@ use std::path::{Path, PathBuf};
 /// in this repository — out of the check entirely, rather than needing a
 /// special case for every such reference architecture.md makes.
 pub const KNOWN_PREFIXES: &[&str] = &[
-    "docs", "crates", "bench", "app", "schema", "grammar", "contracts",
+    "docs",
+    "crates",
+    "bench",
+    "app",
+    "schema",
+    "grammar",
+    "contracts",
 ];
 
 /// Extensions the design documents use when citing a real repo-ready file.
@@ -449,7 +455,10 @@ mod tests {
         // architecture.md's stamp description: ".serat/index.db" is a path
         // inside a user's vault, not a file this repository ships.
         let text = "1. `.serat/index.db` absent -> rebuild, reason `NoIndex`.";
-        assert_eq!(extract_citations(text, Path::new("architecture.md")), vec![]);
+        assert_eq!(
+            extract_citations(text, Path::new("architecture.md")),
+            vec![]
+        );
     }
 
     #[test]
@@ -609,6 +618,9 @@ mod tests {
         let files = scanned_files(&repo_root()).expect("scan");
         assert!(files.iter().any(|f| f.ends_with("CLAUDE.md")));
         assert!(files.iter().any(|f| f.ends_with("architecture.md")));
-        assert!(files.len() > 5, "docs/03-design has more than five .md files");
+        assert!(
+            files.len() > 5,
+            "docs/03-design has more than five .md files"
+        );
     }
 }

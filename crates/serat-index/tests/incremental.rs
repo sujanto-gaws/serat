@@ -79,7 +79,9 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     let target = path("10-projects/serat.md");
-    handle.apply(&vault, &parser, &echo, &target).expect("first");
+    handle
+        .apply(&vault, &parser, &echo, &target)
+        .expect("first");
     handle.writer().flush().expect("flush");
     let blocks_after_first = {
         let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
@@ -89,7 +91,9 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
         .expect("count")
     };
 
-    handle.apply(&vault, &parser, &echo, &target).expect("second");
+    handle
+        .apply(&vault, &parser, &echo, &target)
+        .expect("second");
     handle.writer().flush().expect("flush");
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
     let blocks: i64 = conn
@@ -120,7 +124,9 @@ fn a_save_of_a_file_that_has_gone_removes_it() {
     assert_eq!(note_count(dir.path()), 1);
 
     let emptied = FakeVault::with(&[]);
-    handle.apply(&emptied, &parser, &echo, &target).expect("removal");
+    handle
+        .apply(&emptied, &parser, &echo, &target)
+        .expect("removal");
     handle.writer().flush().expect("flush");
     assert_eq!(
         note_count(dir.path()),
@@ -169,7 +175,9 @@ fn a_save_keeps_the_full_text_index_in_step() {
     handle.writer().flush().expect("flush");
 
     let amended = FakeVault::with(&[("note.md", "# After\nthe amended wording\n")]);
-    handle.apply(&amended, &parser, &echo, &target).expect("save");
+    handle
+        .apply(&amended, &parser, &echo, &target)
+        .expect("save");
     handle.writer().flush().expect("flush");
 
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
@@ -209,7 +217,10 @@ fn parse_pool_threads_leaves_a_core_free() {
         .unwrap_or(1);
     let threads = parse_pool_threads();
 
-    assert!(threads >= 1, "cores minus one must have at least one thread");
+    assert!(
+        threads >= 1,
+        "cores minus one must have at least one thread"
+    );
     if cores > 1 {
         assert_eq!(
             threads,

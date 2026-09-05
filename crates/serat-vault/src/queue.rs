@@ -502,7 +502,9 @@ mod tests {
             "the watcher's dropped path was never recovered by the rescan that followed it"
         );
         assert_eq!(
-            seen.iter().filter(|candidate| **candidate == dropped).count(),
+            seen.iter()
+                .filter(|candidate| **candidate == dropped)
+                .count(),
             1,
             "the dropped path was recovered more than once"
         );
