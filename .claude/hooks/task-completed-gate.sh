@@ -19,8 +19,8 @@ payload=$(cat)
 fields=$(printf '%s' "$payload" | python -c '
 import json, sys
 
-SUBJ = ("subject", "title", "name")
-DESC = ("description", "body", "content", "activeForm")
+SUBJ = ("task_subject", "subject", "title", "name")
+DESC = ("task_description", "description", "body", "content", "activeForm")
 
 def walk(node, wanted, depth=0):
     """First non-empty string under any key in `wanted`, breadth-first by depth."""
@@ -123,7 +123,7 @@ run_cargo() {
 }
 
 if [ -f Cargo.toml ]; then
-  run_cargo "cargo test --workspace" cargo test --workspace --quiet || exit 2
+  run_cargo "cargo test --workspace" cargo test --workspace --quiet --jobs 1 || exit 2
   run_cargo "cargo clippy -D warnings" cargo clippy --workspace --quiet -- -D warnings || exit 2
 fi
 if [ -f app/package.json ] && grep -q '"test"' app/package.json; then
