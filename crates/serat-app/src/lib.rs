@@ -46,6 +46,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod index;
+mod security_config;
 pub mod settings;
 pub mod startup;
 pub mod state;
@@ -61,6 +62,7 @@ pub mod ipc;
 
 use cli::Boot;
 use ipc::{INDEX_STATUS_EVENT, OpenVaultArgs};
+use security_config::MAIN_WINDOW_LABEL;
 use startup::Startup;
 use state::AppState;
 
@@ -197,7 +199,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             // 3. Then the window.
             let geometry = settings_geometry();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
                 .title("Serat")
                 .inner_size(geometry.0, geometry.1)
                 .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
