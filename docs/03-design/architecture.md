@@ -228,7 +228,19 @@ Nothing records the failure in the index, deliberately. It needs no column, beca
 
 #### 3.2 Echo suppression
 
-Serat's own writes produce filesystem events indistinguishable from anyone else's. When a save has been submitted to the index, the save path records the hash it wrote in a short-lived set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path and entries expire after two seconds, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one.
+Serat's own writes produce filesystem events indistinguishable from anyone else's. When a save has been submitted to the index, the save path records the hash it wrote in a set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one. Keying by path would instead drop a real edit that landed in the same window, which is a lost update.
+
+##### The set is bounded by size, not by time
+
+It held entries for two seconds until F-252. **The failure that number produces is silent and safe, which is why it would never have been reported:** the watcher's event reaches the suppressor only after the 150ms coalescing window *and* whatever backlog the work queue is carrying, and at ADR-11's own worked shape — 20,200 paths against a capacity of 8,192 — a path waits far longer than two seconds. Every entry has expired by the time its event arrives, nothing is suppressed, and every save Serat makes is reindexed from disk by the watcher. The index stays correct. The work merely doubles, indefinitely, with no symptom.
+
+Two seconds was chosen for a reason that F-224 has since made void, and the module implementing it already contradicted itself on the point. The stated purpose was that a hash must not linger and swallow an unrelated edit made a minute later — but under late recording an entry exists **only after a submit has succeeded**, so at the moment it is created the index provably holds those bytes, and suppressing a later event carrying the same bytes is correct however late it arrives. That is the paragraph above, and it is now a guarantee rather than a usual case. **The correctness argument for expiring an entry does not survive the ordering change, and nobody re-read it when the ordering changed** — which is the same lapse F-226 corrected in this document, found in a doc comment instead.
+
+What is left for the bound to do is stop entries leaking when a watcher event never arrives at all — dropped under overflow, or lost to the platform. That is a memory concern, and **a duration bounds memory only if you already know how long the consumer takes, while a capacity bounds it unconditionally.** So the set holds a fixed number of entries and evicts the oldest when full. Suppression then works whenever the consumer catches up within that many saves, whatever the wall clock says, and the memory cost is a number rather than an assumption.
+
+The capacity is **at least the work queue's**, because the queue is what delays the consumer; sizing the set against the thing that causes the delay is the only figure here that is derived rather than guessed. Thirty-two bytes a hash makes ADR-11's 8,192 about a quarter of a megabyte, which is not a budget anyone needs to discuss.
+
+One thing this deliberately does not do is keep a long duration as a second bound behind the capacity. That would reintroduce exactly the coupling being removed, at a length nobody could justify by measurement either — and an optimisation that can silently stop applying should not depend on a number that can be quietly wrong.
 
 ##### The hash is recorded after the submit, not before the write
 
