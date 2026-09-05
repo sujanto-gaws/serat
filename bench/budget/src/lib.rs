@@ -1305,6 +1305,16 @@ where
         let index_dir = vault.path.join(format!(".serat-bench-{i}"));
         let _ = std::fs::remove_dir_all(&index_dir);
         let timing = rebuild(&vault.path, &index_dir)?;
+        // Read before the directory goes away. F-47 is only visible here.
+        let recorded = analyze(&index_dir);
+        // F-311: remove it BEFORE the checks, not after. Every check below exits
+        // with `?`, and this directory lives *inside* the vault -- so a failing
+        // check left it behind, the vault stopped matching its manifest, and the
+        // NEXT run died at F-26's canonicality gate with a message blaming the
+        // vault and advising regeneration, which would have destroyed the
+        // evidence of the real failure. The failure of one guard silently
+        // disarmed another, and it cost four runs before it was fixed.
+        let _ = std::fs::remove_dir_all(&index_dir);
         // F-247, test-engineer's: `RebuildReport::notes` counts every row in
         // `notes` -- markdown notes AND assets alike, `kind='asset'` per
         // ADR-0005 -- so the oracle has to be the same sum, or a correct rebuild
@@ -1313,9 +1323,6 @@ where
         // oracle of 20,000 and was refused.
         check_note_count(timing.notes, vault.notes + vault.assets)?;
         check_links_resolved(timing.links_resolved, vault.note_links)?;
-        // Read before the directory goes away. F-47 is only visible here.
-        let recorded = analyze(&index_dir);
-        let _ = std::fs::remove_dir_all(&index_dir);
         check_analyze_freshness(recorded?, vault.notes)?;
         samples.push(timing.total);
         runs.push(timing);
