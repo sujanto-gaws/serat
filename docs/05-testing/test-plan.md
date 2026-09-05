@@ -91,6 +91,9 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-022 | NFR-PRF-01, NFR-PRF-08 — cold start: window visible < 400 ms, usable < 1 s, p95 over 20 runs | bench | `bench/budget/src/bin/prf01-cold-start.rs` | harness landed, **red** pending S1; D2 answered, trace contract agreed with tauri-app-dev |
 | TC-049 | NFR-PRF-01, arch §3.4 — the window-painted mark does not grow between the 20k and 50k vaults | bench | `bench/budget/src/bin/prf01-cold-start.rs` | harness landed, **red** pending S1 |
 | TC-023 | NFR-PRF-08, US-35 — every budget has an asserting job; a breach fails the build | CI | `.github/workflows/budgets.yml` | pass |
+| TC-050 | NFR-MNT-01 — fmt, clippy and the workspace suite are asserted on every push | CI | `.github/workflows/ci.yml` | pass |
+| TC-051 | NFR-MNT-01 — the suite passes from a git worktree and from a copy outside the repository | CI | `.github/workflows/ci.yml::location-independence` | pass |
+| TC-052 | NFR-MNT-01 — every workspace member is tested on its own, from a list cargo derives | CI | `.github/workflows/ci.yml::crate` | pass |
 | TC-026 | NFR-PRF-08 — the budget table matches the numbers in the PRD | unit | `bench/budget/src/lib.rs` | pass |
 | TC-027 | NFR-PRF-01, NFR-PRF-03 — p95 is nearest-rank, so one slow run of twenty passes and two do not | unit | `bench/budget/src/lib.rs` | pass |
 | TC-028 | NFR-PRF-08 — a breach fails and the exact boundary passes | unit | `bench/budget/src/lib.rs` | pass |
@@ -130,6 +133,28 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-034 | hostile — crash mid-write leaves the file intact | P2 | |
 | TC-035 | NFR-PRF-09 — extraction throughput, budgeted separately from the rebuild | P2 | Never counted against NFR-PRF-04. |
 | TC-036 | NFR-PRF-05 — 500-row query over 20,000 notes < 100 ms p95 | P2 | |
+
+## Continuous integration
+
+Three workflows, because they answer different questions and fail for different reasons.
+
+| Workflow | Asserts | Owner |
+|---|---|---|
+| `.github/workflows/ci.yml` | The three commands CLAUDE.md's definition of done names: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | test-engineer (task B3) |
+| `.github/workflows/budgets.yml` | One asserting job per NFR-PRF budget; a breach fails the build (NFR-PRF-08) | test-engineer (task B2) |
+| `.github/workflows/design-docs.yml` | Every path a design document cites resolves or is marked `*(planned)*` (F-239) | test-engineer (task #11) |
+
+Four things in `ci.yml` are deliberate:
+
+**The suite runs from outside the repository root, twice.** Once from a `git worktree`, which is the layout `coding-standards.md` mandates for every teammate, and once from a plain copy in a temporary directory, which catches anything that needs the repository root to be an ancestor at all. This job exists because a real defect shipped that way: the dependency-rule check matched the substring `.worktrees` anywhere in an absolute path, so it passed at the repository root and failed one directory over — green for the lead, red for everyone working where they were told to. A suite whose result depends on which directory it ran in is a measurement that reports success because of *where* it was taken rather than *what* it measured, which is the class of defect this entire harness exists to prevent. CI is where "it passes on my machine" is supposed to die.
+
+**The tests run twice more, per crate as well as per workspace.** The workspace run is the gate the definition of done names. The per-crate matrix exists because a workspace-wide gate couples every teammate's completion to every other teammate's crate compiling at that instant — P0 finding F-07 records that the real cost of this project so far has been coordination rather than Rust, and this is one of the places that cost lands. When the workspace job is red, the matrix says whose crate it is without anyone reading a log.
+
+**The crate matrix is derived from `cargo metadata`, not typed out.** A hand-written member list drifts silently the first time somebody adds a crate, and a matrix that has quietly stopped covering a crate is worse than no matrix.
+
+**Every Linux job that compiles the workspace installs Tauri's apt dependencies first.** `serat-app` (task S1) did not exist when this workflow was written, and Tauri v2 needs `libwebkit2gtk-4.1-dev` and friends to link on Linux — a gap `dev-setup.md` still has for a local Linux checkout. Found while rebasing this branch onto the main `serat-app` landed on, and fixed here rather than left for the first Linux CI run to surface as an unhelpful linker error nobody had a step to fix.
+
+One job, `definition of done`, is green only when every leg is, so a branch protection rule has a single thing to point at.
 
 ## Reports
 
