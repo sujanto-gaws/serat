@@ -356,7 +356,7 @@ pub(crate) fn mark_ready(tx: &Transaction<'_>, vault_root: &str) -> Result<(), I
             SET state = 'ready', vault_root = ?1, built_at = unixepoch(),
                 indexer_version = ?2, schema_version = ?3
           WHERE id = 1",
-        params![vault_root, env!("CARGO_PKG_VERSION"), crate::SCHEMA_VERSION],
+        params![vault_root, env!("CARGO_PKG_VERSION"), crate::INDEX_VERSION],
     )
     .map_err(sqlite)?;
     Ok(())

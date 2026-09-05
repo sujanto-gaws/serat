@@ -17,7 +17,7 @@ pub mod schema;
 pub mod writer;
 
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
-pub use schema::{DDL, IndexState, SCHEMA_VERSION, UnusableReason, bootstrap, inspect, open};
+pub use schema::{DDL, IndexState, INDEX_VERSION, UnusableReason, bootstrap, inspect, open};
 pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
 /// The version of SQLite compiled into this binary.

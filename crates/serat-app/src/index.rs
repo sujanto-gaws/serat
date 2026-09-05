@@ -255,10 +255,10 @@ impl IndexOpen for SeratIndexOpen {
     fn open(&mut self, _vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
         publish(IndexState::Unavailable {
             message: format!(
-                "no index open check yet (task I6, architecture §3.4). serat-index is at schema \
+                "no index open check yet (task I6, architecture §3.4). serat-index is at index \
                  v{} on sqlite {}, and exposes no open-or-rebuild entry point. Search and queries \
                  are unavailable; the vault is fully editable.",
-                serat_index::SCHEMA_VERSION,
+                serat_index::INDEX_VERSION,
                 serat_index::sqlite_version(),
             ),
             path: index_dir.display().to_string(),

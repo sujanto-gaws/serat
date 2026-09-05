@@ -511,7 +511,7 @@ impl Startup {
             t0_to_walk_complete_ms: marks.walk_complete,
             t0_source: self.clock.source,
             profile: Profile::current(),
-            schema_version: serat_index::SCHEMA_VERSION,
+            schema_version: serat_index::INDEX_VERSION,
             notes_walked: marks.notes_walked,
             vault: marks.vault.clone(),
             last_open: marks.last_open.clone(),
