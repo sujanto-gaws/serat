@@ -491,7 +491,7 @@ impl AppState {
     /// As [`AppState::vault_path`], plus [`IpcError::VaultNotFound`] with no vault open.
     pub fn resolve(&self, raw: &str) -> Result<PathBuf, IpcError> {
         let path = Self::vault_path(raw)?;
-        Ok(self.vault()?.resolve(&path))
+        self.vault()?.resolve(&path).map_err(from_vault_error)
     }
 
     fn open_lock(&self) -> std::sync::RwLockReadGuard<'_, Option<OpenVault>> {

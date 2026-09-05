@@ -14,9 +14,12 @@ use crate::{Vault, ignore::is_note_file};
 /// (FR-VLT-02, and the T1 rebuild-equivalence test) is easier to assert when the only
 /// thing that varies is the content.
 ///
-/// Directory symlinks are not followed. A vault containing a link to its own parent
-/// would otherwise walk forever, and Serat indexes the folder the user pointed it at
-/// rather than everything reachable from it.
+/// No symlink is followed, directory or file (`link_stat.is_symlink()` below skips
+/// both, not only directories as an earlier version of this comment claimed). A vault
+/// containing a link to its own parent would otherwise walk forever, and Serat indexes
+/// the folder the user pointed it at rather than everything reachable from it — the
+/// same rule [`Vault::resolve`] enforces for a path that arrives without going through
+/// this walk at all (T-07).
 pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
     let mut entries = Vec::new();
     let mut pending = vec![vault.root().to_path_buf()];
