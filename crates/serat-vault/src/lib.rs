@@ -941,5 +941,4 @@ mod symlink_tests {
             "the write landed outside the vault despite being refused"
         );
     }
-
 }
