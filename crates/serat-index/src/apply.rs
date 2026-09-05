@@ -105,7 +105,7 @@ fn upsert_note(
     }
     for task in &parsed.tasks {
         if let Some(block_id) = id_of(Some(task.block_ord)) {
-            insert_task(tx, note_id, block_id, task)?;
+            insert_task(tx, note_id, block_id, task, &parsed.fields)?;
         }
     }
 
@@ -314,25 +314,68 @@ fn insert_link(
 /// `status` keeps the author's marker so a vault using `/` for in-progress survives a
 /// round trip (C-01); `done` is the binary projection `ix_tasks_open` is partial on.
 /// The mapping between them is the parser's, not SQL's.
+///
+/// `byte_start`/`byte_end` are `task.marker_range` — just the character between the
+/// brackets, the smallest possible instance of ADR-0008 (F-237). `due`/`owner`/`est`
+/// are rolled up from `fields` here rather than parsed by `serat-parse` (F-253,
+/// schema/001_init.sql's comment above `CREATE TABLE tasks`): they are ordinary inline
+/// fields on the same block, so serat-index reads them off the rows it is already
+/// writing in this transaction and needs no Markdown knowledge to do it.
 fn insert_task(
     tx: &Transaction<'_>,
     note_id: i64,
     block_id: i64,
     task: &Task,
+    fields: &[Field],
 ) -> Result<(), IndexError> {
+    let (due, owner, est) = task_rollup(fields, task.block_ord);
     tx.execute(
-        "INSERT INTO tasks (note_id, block_id, status, done, text)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO tasks (note_id, block_id, status, done, text, due, owner, est,
+                             byte_start, byte_end)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             note_id,
             block_id,
             task.marker.to_string(),
             i64::from(task.done),
             task.text,
+            due,
+            owner,
+            est,
+            task.marker_range.start as i64,
+            task.marker_range.end as i64,
         ],
     )
     .map_err(sqlite)?;
     Ok(())
+}
+
+/// `due`, `owner` and `est` for one task's block, read off the fields already parsed
+/// for it — not queried back from the database, since this runs before the fields
+/// inserted above are visible to anything but this same transaction's own writes.
+///
+/// Which three keys are special is a schema question and becomes the schema
+/// registry's answer in P2 (FR-STR-01); fixed here for P0, matching the DDL comment.
+/// A list-valued `due`/`owner`/`est` does not roll up — none of the three is a key
+/// anyone writes more than once per task, and inventing a first-wins rule for a case
+/// nobody has produced would be a decision made up rather than one asked for.
+fn task_rollup(fields: &[Field], block_ord: u32) -> (Option<String>, Option<String>, Option<f64>) {
+    let mut due = None;
+    let mut owner = None;
+    let mut est = None;
+    for field in fields {
+        if field.block_ord != Some(block_ord) {
+            continue;
+        }
+        let (text, num, date, _) = columns(&field.value);
+        match field.key.as_str() {
+            "due" => due = date.or(text),
+            "owner" => owner = text,
+            "est" => est = num,
+            _ => {}
+        }
+    }
+    (due, owner, est)
 }
 
 /// Keep `index_meta.note_count` in step, in the same transaction as the change.
@@ -360,4 +403,170 @@ pub(crate) fn mark_ready(tx: &Transaction<'_>, vault_root: &str) -> Result<(), I
     )
     .map_err(sqlite)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{bootstrap, open_in_memory};
+    use serat_core::{ByteRange, ContentHash, FieldSource, NoteKind};
+
+    /// A note with `block_count` blocks (ord 0 the task's, any others plain
+    /// paragraphs), so a field can legitimately attach to a block other than the
+    /// task's own.
+    fn note_with_blocks(
+        block_count: u32,
+        fields: Vec<Field>,
+        tasks: Vec<Task>,
+    ) -> (NoteMeta, ParsedNote) {
+        let meta = NoteMeta {
+            path: VaultPath::new("note.md").expect("path"),
+            hash: ContentHash::from_bytes([1u8; 32]),
+            kind: NoteKind::Note,
+            size: 0,
+            mtime_ms: 0,
+        };
+        let blocks = (0..block_count)
+            .map(|ord| Block {
+                ord,
+                kind: if ord == 0 {
+                    BlockKind::Task { depth: 0 }
+                } else {
+                    BlockKind::Paragraph
+                },
+                range: ByteRange::new(0, 20),
+                text: if ord == 0 {
+                    "- [ ] ship it".to_owned()
+                } else {
+                    "elsewhere".to_owned()
+                },
+                heading_path: Vec::new(),
+                block_ref: None,
+            })
+            .collect();
+        let parsed = ParsedNote {
+            blocks,
+            fields,
+            tasks,
+            ..ParsedNote::default()
+        };
+        (meta, parsed)
+    }
+
+    fn note(fields: Vec<Field>, tasks: Vec<Task>) -> (NoteMeta, ParsedNote) {
+        note_with_blocks(1, fields, tasks)
+    }
+
+    fn field(key: &str, value: FieldValue, block_ord: u32) -> Field {
+        Field {
+            key: key.to_owned(),
+            value,
+            source: FieldSource::Inline,
+            range: ByteRange::new(0, 1),
+            value_range: ByteRange::new(0, 1),
+            block_ord: Some(block_ord),
+        }
+    }
+
+    fn task(block_ord: u32, marker_range: ByteRange) -> Task {
+        Task {
+            block_ord,
+            done: false,
+            marker: ' ',
+            text: "ship it".to_owned(),
+            range: ByteRange::new(0, 13),
+            marker_range,
+        }
+    }
+
+    #[test]
+    fn a_task_records_its_marker_range() {
+        // F-237. Task::marker_range exists and is written by nobody until this;
+        // tasks had no column to be written to at all.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let tx = conn.unchecked_transaction().expect("tx");
+
+        let (meta, parsed) = note(Vec::new(), vec![task(0, ByteRange::new(6, 7))]);
+        upsert_note(&tx, &meta, &parsed).expect("upsert");
+
+        let (start, end): (i64, i64) = tx
+            .query_row(
+                "SELECT byte_start, byte_end FROM tasks WHERE note_id = (SELECT id FROM notes WHERE path = 'note.md')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!((start, end), (6, 7));
+    }
+
+    #[test]
+    fn a_task_rolls_up_due_owner_and_est_from_its_own_block() {
+        // F-253. due/owner/est are ordinary inline fields on the task's block,
+        // denormalised onto the task row by serat-index rather than parsed as task
+        // properties (schema/001_init.sql's comment above CREATE TABLE tasks).
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let tx = conn.unchecked_transaction().expect("tx");
+
+        let fields = vec![
+            field("due", FieldValue::Date("2024-01-01".to_owned()), 0),
+            field("owner", FieldValue::Text("alex".to_owned()), 0),
+            field("est", FieldValue::Num(2.5), 0),
+        ];
+        let (meta, parsed) = note(fields, vec![task(0, ByteRange::new(6, 7))]);
+        upsert_note(&tx, &meta, &parsed).expect("upsert");
+
+        let (due, owner, est): (String, String, f64) = tx
+            .query_row(
+                "SELECT due, owner, est FROM tasks WHERE note_id = (SELECT id FROM notes WHERE path = 'note.md')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(due, "2024-01-01");
+        assert_eq!(owner, "alex");
+        assert!((est - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_field_on_a_different_block_does_not_roll_up() {
+        // The rollup must key on the task's own block_ord — a due:: on some other
+        // block in the note is not this task's due date.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let tx = conn.unchecked_transaction().expect("tx");
+
+        let fields = vec![field("due", FieldValue::Date("2024-01-01".to_owned()), 1)];
+        let (meta, parsed) = note_with_blocks(2, fields, vec![task(0, ByteRange::new(6, 7))]);
+        upsert_note(&tx, &meta, &parsed).expect("upsert");
+
+        let due: Option<String> = tx
+            .query_row(
+                "SELECT due FROM tasks WHERE note_id = (SELECT id FROM notes WHERE path = 'note.md')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(due, None, "a field on a different block rolled up anyway");
+    }
+
+    #[test]
+    fn a_task_with_no_matching_fields_leaves_due_owner_est_null() {
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let tx = conn.unchecked_transaction().expect("tx");
+
+        let (meta, parsed) = note(Vec::new(), vec![task(0, ByteRange::new(6, 7))]);
+        upsert_note(&tx, &meta, &parsed).expect("upsert");
+
+        let (due, owner, est): (Option<String>, Option<String>, Option<f64>) = tx
+            .query_row(
+                "SELECT due, owner, est FROM tasks WHERE note_id = (SELECT id FROM notes WHERE path = 'note.md')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!((due, owner, est), (None, None, None));
+    }
 }
