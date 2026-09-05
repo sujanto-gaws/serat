@@ -205,9 +205,14 @@ pub struct FileContents {
 ///
 /// `write_file(args: WriteFileArgs) -> Result<FileWritten, IpcError>`
 ///
-/// Serves FR-VLT-02, FR-VLT-03. Writes by temp-file-and-rename (§6.1 step 5),
-/// recording the hash it is about to produce for echo suppression (§3.2)
-/// **before** the rename, so the watcher drops the event it is about to see.
+/// Serves FR-VLT-02, FR-VLT-03. Writes by temp-file-and-rename (§6.1 step 5).
+/// The write records **no** echo (§3.2): a hash is recorded only after a
+/// successful submit to the index, and in P0 this command has no submit behind
+/// it. So the watcher sees the rename, matches nothing, and indexes the note.
+/// That is correct, and it puts the write on FR-VLT-04's 500ms path rather
+/// than NFR-PRF-03's 50ms one — a save timed through this command is a
+/// *watcher* number. NFR-PRF-03 measures the save path of §3.1.1, which
+/// arrives with the direct submit in I5.
 ///
 /// P0 writes a whole file because P0 has a text box and no views. The byte-range
 /// patcher of ADR-0008 arrives in P2 as a separate command. This command never

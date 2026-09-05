@@ -191,18 +191,21 @@ Finding F-03 read the 150ms coalescing window as a design that misses a 50ms bud
 
 Found by reading the design against itself
 
-The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself. F-03 did not find a missing 100ms; it found a missing paragraph.
+The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself — which §3.2's ordering now *enforces* rather than assumes, since nothing is recorded, and so nothing can be suppressed, until a submit has succeeded. F-03 did not find a missing 100ms; it found a missing paragraph.
 
 ##### 3.1.1 The save path
 
 Serat knows what it wrote, so it does not wait to be told.
 
-1.  The buffer is written by temp-file-and-rename (§6.1 step 5), recording the hash it is about to produce for echo suppression **before** the rename.
+1.  The buffer is written by temp-file-and-rename (§6.1 step 5). The write records nothing: `write_atomic` writes bytes and returns the hash it produced, which is all its name claims.
 2.  The bytes just written — the ones already in memory, not a re-read of the file — go to the parse pool.
 3.  The rows go to the index writer on the same channel everything else uses.
-4.  `index.changed` is emitted and open views refresh.
+4.  **Once that submit has succeeded**, and not before, the hash is recorded for echo suppression. §3.2 sets out why that ordering is the mechanism rather than a detail of it.
+5.  `index.changed` is emitted and open views refresh.
 
-The watcher sees the event and drops it (§3.2), which is the whole of the interaction between the two paths. Nothing is coalesced because there is nothing to coalesce: one save is one write is one set of rows.
+Steps 1–4 are one sequence with one owner, and §2.1's ruling on `rebuild` already named it: the orchestration lives in **serat-index**, which reaches the vault and the parser through traits declared in serat-core and links neither crate. The suppressor arrives the same way, as a `&dyn EchoGuard` — a separate one-method trait rather than a fourth method on `NoteSource`, because recording an echo is write-path bookkeeping, and `rebuild`, which cannot produce an echo, must not be handed a method it has no relationship to. `serat_vault::Vault` implements both traits, so the call site passes the same object twice; that is explicit rather than elegant, and the tidier alternative would introduce a type whose only purpose is to hide the thing worth seeing there.
+
+The watcher sees the event and, if step 4 has already happened, drops it (§3.2) — which is the whole of the interaction between the two paths, and is an optimisation rather than a load-bearing step. If the watcher gets there first it matches nothing, the event proceeds, and the note is indexed a second time from disk: wasteful and correct. Nothing is coalesced because there is nothing to coalesce: one save is one write is one set of rows.
 
 Two consequences, stated because each looks like a bug otherwise. If another process modifies the file between our write and our parse, the index briefly reflects our bytes rather than the file's; the watcher then sees an event whose post-hash is *not* in the suppression set and the note is reindexed from disk, so the race is self-correcting and needs no mechanism of its own. And the save path must never call `flush()`: waiting for the writer to drain would put the index back on the keystroke path, which design goal 2 forbids. The UI reports "saved" when the rename completes and learns "indexed" from `index.changed`. Those are two different facts and the interface should not pretend otherwise (§2.2).
 
@@ -225,7 +228,25 @@ Nothing records the failure in the index, deliberately. It needs no column, beca
 
 #### 3.2 Echo suppression
 
-Serat's own writes produce filesystem events indistinguishable from anyone else's. Before writing, the writer records the hash it is about to produce in a short-lived set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path and entries expire after two seconds, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one.
+Serat's own writes produce filesystem events indistinguishable from anyone else's. When a save has been submitted to the index, the save path records the hash it wrote in a short-lived set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path and entries expire after two seconds, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one.
+
+##### The hash is recorded after the submit, not before the write
+
+This document said *before writing* until F-219..F-224, and the earlier wording had a stated and correct reason: an entry recorded too late suppresses nothing. That reason is true, and it is not the deciding one, because the two orderings do not fail comparably.
+
+**Record early and the failure is lossy.** The entry exists from before the rename, so the watcher's event matches it whether or not any submit ever stands behind it. Anything that stops the save path short of the submit — a refusal under backpressure, or a caller that simply writes and returns — leaves the event dropped and the note indexed by nobody. This was not a corner case. `write_atomic` recorded the hash itself, and its only production caller wrote, re-read the file for its mtime, and returned without ever submitting, so record-early failed lossy on *every* call rather than on an interleaving.
+
+**Record late and the failure is redundant.** The entry exists only once rows are with the writer. A refused submit records nothing, so the watcher's event proceeds normally and indexes the note from disk. A watcher that wins the race — its event handled after the rename and before the recording — matches nothing, and the note is indexed a second time. `upsert_note` is delete-then-insert by path, so the second pass produces the rows the first one did: idempotent, wasteful, correct.
+
+That asymmetry is the argument, and it is why late recording **removes** the race rather than narrowing it. Record-late has no interleaving that loses a note, only interleavings that cost one redundant index. It also restores the mechanism to its proper rank: echo suppression is an optimisation — its job is to avoid indexing the same bytes twice — and an ordering that let it decide whether a note is indexed *at all* had given an optimisation an authority its failure mode could not carry. Under late recording the worst it can do is fail to save work, which is what an optimisation is allowed to do.
+
+Three things follow, each of which the earlier wording implied the opposite of.
+
+- **There is no `forget_echo`.** An intermediate version of this fix restored the watcher's event by removing the entry when a submit was refused. With nothing recorded before the submit there is nothing to forget — and the interleaving that version did not cover, where the watcher's event is handled first and consumes the entry before the refusal is seen, cannot arise.
+- **`write_atomic` records nothing.** It writes bytes and returns their hash. The recording belongs to whoever owns the save sequence, which §3.1.1 puts in serat-index; it does not belong to the function that moves the bytes, whose name promises a write and should mean one.
+- **A write with no submit behind it is watcher-indexed, not suppressed.** That is the correct outcome, and it changes which budget the write is measured against: FR-VLT-04's 500ms, not NFR-PRF-03's 50ms. A save benchmarked against a shell that has no direct submit will therefore produce a several-hundred-millisecond figure and read as NFR-PRF-03 missed by an order of magnitude, having in fact measured the watcher path working exactly as designed. Anything timing a save must record which of §3.1's two paths the write actually took; a save timing with no path on it is not a save number.
+
+One limit, stated as reasoned rather than measured. A redundant index is read-only with respect to the vault, so it cannot move a byte range or change a hash under P2's patcher and cannot interact with the stale-hash guard of §6.1. What it can do is consume writer-queue depth at the moment the patcher wants to submit. That is a backpressure question, ADR-11's subject rather than this section's, and nothing has measured it.
 
 #### 3.3 Reconciling an external change into an open buffer
 
@@ -471,8 +492,8 @@ Editing a source note by changing a value in a view is the highest-risk mechanis
 2.  The core re-reads the file and verifies the hash. A mismatch refuses the write and returns Refused{StaleHash} with the current hash — an expected outcome, not an error.
 3.  It verifies that the recorded byte range still contains the field it claims to. A mismatch returns Refused{RangeMoved}.
 4.  It replaces exactly those bytes with the serialised new value. Nothing else in the file is touched — no reflow, no key reordering, no re-serialisation.
-5.  It writes to a temporary file and renames, recording the new hash for echo suppression first.
-6.  The watcher recognises the echo; the note is reindexed alone; the affected row refreshes without re-running the query.
+5.  It writes to a temporary file and renames. The write records nothing (§3.2).
+6.  The patched bytes are parsed and submitted, and the new hash is recorded for echo suppression only once that submit has succeeded; the watcher's event is then dropped, the note is reindexed alone, and the affected row refreshes without re-running the query. If the submit is refused, nothing was recorded and the watcher indexes the note instead — one path or the other, never neither.
 
 #### 6.2 Invariants
 
@@ -674,3 +695,4 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
 | Does the 150ms watcher debounce hold for every sync tool?             | Observation during P1 against git, Syncthing and iCloud, which behave differently.                                             |
 | Should saved views live in .serat or in the vault as notes?           | Follows from whether a user wants views to sync with their vault. Leaning toward notes, for consistency with types and lenses. |
+| Does §3.2's redundant index contend with P2's write-back submits?     | A P2 measurement of writer-queue depth while patching under load. Reasoning settles the correctness half — a redundant index touches no vault byte — and settles nothing about backpressure (ADR-11). |
