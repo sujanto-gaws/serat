@@ -142,19 +142,18 @@ fn the_statistics_left_behind_describe_the_finished_index() {
     //
     // What matters is that the statistics describe the index as it finally stands.
     //
-    // Being straight about what this still does NOT catch, because the rewrite did not
-    // fix that half: deleting the rebuild's explicit analyze() leaves this passing too.
-    // The reason is arithmetic rather than a weak assertion. commit() re-runs ANALYZE
-    // whenever a batch has touched more than 5% of the notes, and at test scale 5% is
-    // smaller than one batch, so the opportunistic path fires on the last batch every
-    // time and the explicit call changes nothing observable.
+    // That gap is now closed, and it was closed by a performance fix rather than by a
+    // test change. This comment used to record that deleting the rebuild's explicit
+    // analyze() left the test passing: commit() re-ran ANALYZE whenever a batch
+    // touched more than 5% of the notes, and at test scale 5% is smaller than one
+    // batch, so the opportunistic path fired on the last batch every time and the
+    // explicit call changed nothing observable.
     //
-    // It is still load-bearing at real scale: 20,000 notes make the threshold 1,000
-    // while BATCH_SIZE is 512, so the tail batch (20000 % 512 = 32 notes) does not
-    // cross it and the statistics would be left describing the index as it was 32
-    // notes ago. Reproducing that needs a 20,000-note rebuild, which belongs in the
-    // budget harness against the real vault rather than here. Recorded rather than
-    // papered over: this test guards currency, not the explicit call.
+    // The opportunistic ANALYZE no longer runs during a bulk load at all (F-325) --
+    // it was firing 35 times per rebuild and every one was thrown away by the
+    // explicit call at the end. So the explicit call is now the ONLY thing that
+    // leaves statistics behind, at every scale, and deleting it fails this test:
+    // mutation-checked, and it reports 0 notes against 400.
     let files: Vec<(String, String)> = (0..400)
         .map(|i| {
             (

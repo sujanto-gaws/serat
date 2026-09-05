@@ -293,6 +293,11 @@ impl Drop for IndexActor {
 fn run(conn: Connection, rx: &Receiver<Command>) {
     let mut pending: Vec<IndexOp> = Vec::with_capacity(BATCH_SIZE);
     let mut since_analyze = 0usize;
+    // Whether the blocks_fts triggers are currently off, which is the writer's only
+    // signal that it is inside a rebuild rather than serving saves. Set by
+    // BeginBulkLoad and cleared by EndBulkLoad, so a writer that never sees either --
+    // the incremental path -- keeps the opportunistic ANALYZE it was designed for.
+    let mut bulk_load = false;
     // A command taken off the channel while draining a batch that cannot be folded
     // into it. Held here rather than pushed back, because a channel has no way to
     // un-receive and dropping it would lose a caller's barrier.
@@ -307,7 +312,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze);
+                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
                     return;
                 }
             },
@@ -350,25 +355,32 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             // about all paths; a test claims less and is therefore safe to get partly
             // wrong. FAIL_NEXT_COMMIT is the seam that makes the real route testable.
             Command::BeginBulkLoad(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
                     .and_then(|()| begin_bulk_load(&conn));
+                // Only once the triggers are actually off. Setting it before would
+                // suppress ANALYZE for a bulk load that failed to start.
+                bulk_load = result.is_ok();
                 let _ = reply.send(result);
                 continue;
             }
             Command::EndBulkLoad(triggers, reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
                     .and_then(|()| end_bulk_load(&conn, &triggers));
+                // Cleared either way: a failed end_bulk_load leaves the index without
+                // its triggers and the caller must not mark it ready, but the writer
+                // is no longer bulk loading and must not keep suppressing ANALYZE.
+                bulk_load = false;
                 let _ = reply.send(result);
                 continue;
             }
             Command::ResolveLinks(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
                     .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);
                 continue;
             }
             Command::Stop => {
-                let _ = commit(&conn, &mut pending, &mut since_analyze);
+                let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
                 return;
             }
         }
@@ -383,7 +395,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                     barrier = Some((reply, Barrier::MarkReady(root)));
                 }
                 Ok(Command::Stop) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze);
+                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
                     return;
                 }
                 Ok(other) => {
@@ -394,7 +406,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             }
         }
 
-        let mut result = commit(&conn, &mut pending, &mut since_analyze);
+        let mut result = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
 
         if let Some((reply, extra)) = barrier {
             if result.is_ok() {
@@ -529,6 +541,7 @@ fn commit(
     conn: &Connection,
     pending: &mut Vec<IndexOp>,
     since_analyze: &mut usize,
+    bulk_load: bool,
 ) -> Result<(), IndexError> {
     if pending.is_empty() {
         return Ok(());
@@ -555,11 +568,23 @@ fn commit(
 
     // §3.1 step 5 and §4.3: re-run ANALYZE after a batch touching more than 5% of
     // notes, because stale statistics are what make a typed query a full scan.
-    let total: i64 = conn
-        .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
-        .map_err(sqlite)?;
-    if total > 0 && (*since_analyze as f64) > (total as f64) * ANALYZE_FRACTION {
-        analyze(conn, since_analyze)?;
+    //
+    // Not during a bulk load. The 5% rule is written for a steady-state table --
+    // enough saves have touched enough of `notes` that the planner's statistics no
+    // longer describe it. A rebuild is the opposite case: `notes` starts EMPTY and
+    // grows, so "this batch touched more than 5% of the table" is true of nearly
+    // every batch, and ANALYZE ran 35 times over a database that was still being
+    // filled. Every one of those was superseded by the next, and the only
+    // statistics that survive the rebuild are the ones from the explicit ANALYZE
+    // the caller runs at the end (rebuild.rs, step 5). Measured at 2.8 s of a
+    // 21 s writer on the 20k vault (F-325).
+    if !bulk_load {
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .map_err(sqlite)?;
+        if total > 0 && (*since_analyze as f64) > (total as f64) * ANALYZE_FRACTION {
+            analyze(conn, since_analyze)?;
+        }
     }
 
     Ok(())

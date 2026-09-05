@@ -3,6 +3,20 @@
 //! Every function here runs inside a transaction owned by the writer thread. None of
 //! them opens a connection, and none is public: the only way to change the index is
 //! to send a message to the one writer (ADR-0001).
+//!
+//! # Why every statement goes through `prepare_cached`
+//!
+//! `Transaction::execute` prepares its statement afresh on every call, and these
+//! calls sit in per-row loops over blocks, fields, links and tasks. A 20,000-note
+//! rebuild re-parsed the same eight SQL strings roughly a million times: measured at
+//! **16.0 s of a ~21 s writer**, which was the whole of NFR-PRF-04's bottleneck
+//! (F-324). `prepare_cached` keys a per-connection cache on the SQL text, so each is
+//! parsed once; the same rebuild's apply phase fell to 6.6 s.
+//!
+//! So `tx.execute(SQL, params)` reads more simply and is the wrong call here. It is
+//! also the exact edit someone makes while tidying, which is why the reason lives at
+//! the top of the file rather than beside one of the eight. The cache capacity is
+//! pinned in `schema::STATEMENT_CACHE` for the same reason: outgrowing it is silent.
 
 use rusqlite::{Transaction, params};
 use serat_core::{
@@ -72,22 +86,23 @@ fn upsert_note(
         .map(|block| block.text.split_whitespace().count() as i64)
         .sum();
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO notes (path, file_name, title, type, kind, mtime, hash, word_count)
          VALUES (?1, ?2, ?3, ?4, 'note', ?5, ?6, ?7)",
-        params![
-            meta.path.as_str(),
-            // What a bare `[[wikilink]]` or `![[embed]]` names (F-312).
-            // With the extension, so one column serves note links (which omit
-            // `.md`) and asset embeds (which carry their own) alike.
-            meta.path.file_name(),
-            parsed.title.as_deref(),
-            parsed.note_type.as_deref(),
-            meta.mtime_ms,
-            meta.hash.to_hex(),
-            word_count,
-        ],
     )
+    .map_err(sqlite)?
+    .execute(params![
+        meta.path.as_str(),
+        // What a bare `[[wikilink]]` or `![[embed]]` names (F-312).
+        // With the extension, so one column serves note links (which omit
+        // `.md`) and asset embeds (which carry their own) alike.
+        meta.path.file_name(),
+        parsed.title.as_deref(),
+        parsed.note_type.as_deref(),
+        meta.mtime_ms,
+        meta.hash.to_hex(),
+        word_count,
+    ])
     .map_err(sqlite)?;
     let note_id = tx.last_insert_rowid();
 
@@ -123,19 +138,20 @@ fn upsert_note(
 /// inside it.
 fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError> {
     remove(tx, &meta.path)?;
-    tx.execute(
+    // Assets carry a file_name too: `![[report.pdf]]` names one, and §7.3
+    // says an asset stays typed, linkable and queryable. Omitting it here
+    // silently drops every embed (F-313).
+    tx.prepare_cached(
         "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash)
          VALUES (?1, ?2, 'asset', ?1, ?3, ?4)",
-        // Assets carry a file_name too: `![[report.pdf]]` names one, and §7.3
-        // says an asset stays typed, linkable and queryable. Omitting it here
-        // silently drops every embed (F-313).
-        params![
-            meta.path.as_str(),
-            meta.path.file_name(),
-            meta.mtime_ms,
-            meta.hash.to_hex()
-        ],
     )
+    .map_err(sqlite)?
+    .execute(params![
+        meta.path.as_str(),
+        meta.path.file_name(),
+        meta.mtime_ms,
+        meta.hash.to_hex()
+    ])
     .map_err(sqlite)?;
     Ok(())
 }
@@ -143,7 +159,9 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError>
 /// Delete a note and everything hanging off it. Returns whether a row was there.
 fn remove(tx: &Transaction<'_>, path: &VaultPath) -> Result<bool, IndexError> {
     let removed = tx
-        .execute("DELETE FROM notes WHERE path = ?1", params![path.as_str()])
+        .prepare_cached("DELETE FROM notes WHERE path = ?1")
+        .map_err(sqlite)?
+        .execute(params![path.as_str()])
         .map_err(sqlite)?;
     Ok(removed > 0)
 }
@@ -154,11 +172,10 @@ fn remove(tx: &Transaction<'_>, path: &VaultPath) -> Result<bool, IndexError> {
 /// `links.dst_note` to NULL, and the backlinks would have to be rediscovered. A
 /// rename changes where a file is, not what points at it.
 fn rename(tx: &Transaction<'_>, from: &VaultPath, to: &VaultPath) -> Result<(), IndexError> {
-    tx.execute(
-        "UPDATE notes SET path = ?2 WHERE path = ?1",
-        params![from.as_str(), to.as_str()],
-    )
-    .map_err(sqlite)?;
+    tx.prepare_cached("UPDATE notes SET path = ?2 WHERE path = ?1")
+        .map_err(sqlite)?
+        .execute(params![from.as_str(), to.as_str()])
+        .map_err(sqlite)?;
     Ok(())
 }
 
@@ -179,10 +196,12 @@ fn insert_block(
         Some(block.heading_path.join(" › "))
     };
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO blocks (note_id, ord, kind, block_ref, heading_path, text, byte_start, byte_end)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
+    )
+    .map_err(sqlite)?
+    .execute(params![
             note_id,
             block.ord,
             kind,
@@ -238,24 +257,25 @@ fn insert_field(
 ) -> Result<(), IndexError> {
     for value in flatten(&field.value) {
         let (text, num, date, boolean) = columns(value);
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO fields
                  (note_id, block_id, key, val_text, val_num, val_date, val_bool, source,
                   byte_start, byte_end)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                note_id,
-                block_id,
-                field.key,
-                text,
-                num,
-                date,
-                boolean,
-                source_name(field.source),
-                field.value_range.start as i64,
-                field.value_range.end as i64,
-            ],
         )
+        .map_err(sqlite)?
+        .execute(params![
+            note_id,
+            block_id,
+            field.key,
+            text,
+            num,
+            date,
+            boolean,
+            source_name(field.source),
+            field.value_range.start as i64,
+            field.value_range.end as i64,
+        ])
         .map_err(sqlite)?;
     }
     Ok(())
@@ -306,18 +326,19 @@ fn insert_link(
         LinkKind::Markdown => "md",
         LinkKind::Tag => "tag",
     };
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO links (src_note, src_block, dst_path, dst_block_ref, kind, alias)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            note_id,
-            block_id,
-            link.target.note,
-            link.target.block_ref.as_deref(),
-            kind,
-            link.target.alias.as_deref(),
-        ],
     )
+    .map_err(sqlite)?
+    .execute(params![
+        note_id,
+        block_id,
+        link.target.note,
+        link.target.block_ref.as_deref(),
+        kind,
+        link.target.alias.as_deref(),
+    ])
     .map_err(sqlite)?;
     Ok(())
 }
@@ -342,23 +363,24 @@ fn insert_task(
     fields: &[Field],
 ) -> Result<(), IndexError> {
     let (due, owner, est) = task_rollup(fields, task.block_ord);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO tasks (note_id, block_id, status, done, text, due, owner, est,
                              byte_start, byte_end)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            note_id,
-            block_id,
-            task.marker.to_string(),
-            i64::from(task.done),
-            task.text,
-            due,
-            owner,
-            est,
-            task.marker_range.start as i64,
-            task.marker_range.end as i64,
-        ],
     )
+    .map_err(sqlite)?
+    .execute(params![
+        note_id,
+        block_id,
+        task.marker.to_string(),
+        i64::from(task.done),
+        task.text,
+        due,
+        owner,
+        est,
+        task.marker_range.start as i64,
+        task.marker_range.end as i64,
+    ])
     .map_err(sqlite)?;
     Ok(())
 }

@@ -94,8 +94,23 @@ pub fn open_in_memory() -> Result<Connection, IndexError> {
     Ok(conn)
 }
 
+/// How many prepared statements one connection keeps.
+///
+/// `apply` prepares its inserts through the statement cache, because rusqlite's
+/// `execute` re-prepares on every call and those calls sit in per-row loops — a 20k
+/// rebuild was re-parsing the same eight SQL strings about a million times, which
+/// measured as 16 s of a 21 s writer (F-324).
+///
+/// Set here rather than left to rusqlite's default of 16, because the failure mode
+/// of outgrowing it is silent: the ninth, seventeenth or thirty-third distinct
+/// statement does not error, it evicts another one and quietly returns the writer to
+/// re-preparing on every call. Eight are cached today; this leaves room to add
+/// without the addition being the thing that undoes the fix.
+const STATEMENT_CACHE: usize = 32;
+
 /// The pragmas, applied to every connection, writer and reader alike.
 fn configure(conn: &Connection) -> Result<(), IndexError> {
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;

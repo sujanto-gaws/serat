@@ -1,0 +1,113 @@
+//! The opportunistic `ANALYZE`, and the one condition that switches it off.
+//!
+//! Its own binary rather than a unit test in `writer.rs`. `FAIL_NEXT_COMMIT` is a
+//! process-wide static, and the test that injects through it says in its own comment
+//! that a second test sharing the process races it — "one test's injected failure
+//! surfaces in the other". These tests commit dozens of batches, so they consumed
+//! that injection and the other test saw `Ok(())` instead of the failure it had
+//! asked for. An integration test gets its own binary, so there is no shared static
+//! to race (task #28).
+
+use std::path::Path;
+
+use serat_core::{ContentHash, IndexOp, IndexWriter, NoteKind, NoteMeta, VaultPath};
+use serat_index::IndexActor;
+use serat_index::schema;
+
+fn asset(path: &str) -> IndexOp {
+    let path = VaultPath::new(path).expect("path");
+    IndexOp::UpsertAsset {
+        meta: NoteMeta {
+            kind: NoteKind::Asset,
+            hash: ContentHash::from_bytes([2u8; 32]),
+            size: 0,
+            mtime_ms: 0,
+            path,
+        },
+    }
+}
+
+/// How many rows the planner's statistics believe `notes` holds.
+///
+/// Not the existence of `sqlite_stat1`, and not whether it mentions `notes`:
+/// `schema/001_init.sql` ends with its own `ANALYZE`, so the table is there from
+/// bootstrap and already carries a row saying `notes` holds 0. Both of those
+/// looked like the observable and neither is; the measurement said so twice.
+/// What actually distinguishes a load that re-analyzed from one that did not is
+/// whether that number moved off the bootstrap value.
+fn analyzed_notes(path: &Path) -> Option<i64> {
+    let conn = schema::open(path).expect("open");
+    conn.query_row(
+        "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|stat| {
+        // sqlite_stat1.stat begins with the number of rows the index covers.
+        stat.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// Fill an index with `n` assets through its own writer and report whether the
+/// opportunistic `ANALYZE` ran, with the bulk load either open or not.
+fn statistics_after_a_load(bulk: bool) -> Option<i64> {
+    let dir = tempfile::tempdir().expect("temp");
+    let path = dir.path().join("index.db");
+    let conn = schema::open(&path).expect("open");
+    schema::bootstrap(&conn).expect("bootstrap");
+    let actor = IndexActor::with_connection(conn);
+    let writer = actor.handle();
+
+    let triggers = if bulk {
+        Some(writer.begin_bulk_load().expect("begin bulk load"))
+    } else {
+        None
+    };
+
+    // `notes` starts empty, so any batch at all touches more than
+    // ANALYZE_FRACTION of it. This is exactly the condition that made the
+    // opportunistic path fire on nearly every batch of a rebuild.
+    for i in 0..40 {
+        writer
+            .submit_blocking(asset(&format!("assets/a{i}.pdf")))
+            .expect("submit");
+    }
+    writer.flush().expect("flush");
+
+    let seen = analyzed_notes(&path);
+    if let Some(triggers) = triggers {
+        writer.end_bulk_load(triggers).expect("end bulk load");
+    }
+    actor.shutdown().expect("shutdown");
+    seen
+}
+
+#[test]
+fn a_bulk_load_skips_the_opportunistic_analyze_and_an_ordinary_load_does_not() {
+    // The 5% rule (§4.3, ANALYZE_FRACTION) is written for a steady-state table:
+    // enough saves have touched enough of `notes` that the planner's statistics
+    // no longer describe it. During a rebuild `notes` starts EMPTY and grows, so
+    // "this batch touched more than 5% of the table" is true of nearly every
+    // batch — it ran 35 times on the 20k vault, each superseded by the next, and
+    // only the caller's explicit ANALYZE at the end survives.
+    //
+    // Both halves in one test, and in the same run, so the difference is
+    // attributable to the bulk load rather than to scale or timing. Asserting
+    // only the suppressed half would pass just as well if the opportunistic
+    // ANALYZE had been removed altogether, which is a different and much worse
+    // change: the incremental path is the one that needs it.
+    let bulk = statistics_after_a_load(true);
+    assert_eq!(
+        bulk,
+        Some(0),
+        "a bulk load ran ANALYZE and left statistics describing {bulk:?} notes; the              rebuild throws these away with its own ANALYZE at the end, so every one of              them is wasted work"
+    );
+
+    let ordinary = statistics_after_a_load(false);
+    assert_eq!(
+        ordinary,
+        Some(40),
+        "an ordinary load must leave the planner statistics describing all 40 notes;              without them every typed query degrades to a full scan (§4.3)"
+    );
+}
