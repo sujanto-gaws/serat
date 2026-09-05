@@ -111,6 +111,10 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-090 | F-47 — `ANALYZE` describes the finished index, read from `sqlite_stat1` rather than reported by the rebuild | unit + bench | `bench/budget/src/{lib,subject}.rs` | pass (check), **red** pending I4 (measurement) |
 | TC-091 | F-49 — resolved links match the manifest, catching both dropped links and rows counted as links | unit + bench | `bench/budget/src/lib.rs` | pass (check), **red** pending I4 |
 | TC-092 | F-46 — the producer-wait phase carries its reading, so a small number is not read as a cheap writer | unit | `bench/budget/src/lib.rs` | pass |
+| TC-093 | F-239 — a path cited in a design document is found whether backticked or bare, a trailing full stop is not part of it, a `0001..0010` range and a runtime (`.serat/`) path are not citations, and ADR-0005's own naming example is excluded by name | unit | `bench/doclint/src/lib.rs` | pass |
+| TC-094 | F-239 — a missing citation is reported with every place it was cited; a path marked `*(planned)*` anywhere it is cited is excused everywhere, and a planned path that now resolves is reported stale but not failed | unit | `bench/doclint/src/lib.rs` | pass |
+| TC-095 | F-239 — the check run against the real repository fails on exactly F-239's five recorded paths, not fewer or more (prove it can fail before trusting it, F-58/F-27) | unit | `bench/doclint/src/lib.rs` | pass |
+| TC-096 | NFR-MNT-01, F-239 — the check scans more than one document (CLAUDE.md and docs/03-design/**.md), so deleting either half of the scan fails a test rather than passing silently | unit | `bench/doclint/src/lib.rs` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a **truncated** index is detected at open and rebuilt without user action | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 | TC-060 | NFR-REL-02 — corruption the open check cannot catch routes to rebuild, not to an error dialog | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
