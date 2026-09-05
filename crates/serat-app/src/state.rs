@@ -1014,4 +1014,153 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Create a symlink at `link` pointing at `target`, or say why we could not.
+    ///
+    /// Deliberately not `#[cfg(unix)]`-gated the way `serat-vault`'s own symlink tests
+    /// are: those are mechanism tests, safe to skip on one platform because the
+    /// property under test has no platform-specific content. These two are the
+    /// **acceptance** tests for NFR-SEC-06 (task #29) — the case the requirement is
+    /// written at, a symlink reached through the IPC boundary — and a security
+    /// acceptance test that silently does not exist on a CI runner is worse than one
+    /// that exists and says it could not run (task #29, generalising F-58's "a guard
+    /// that cannot fail is worse than none" to "a test that cannot be seen not to run
+    /// is worse than none"). Every platform compiles and executes these tests; only
+    /// the symlink primitive, and what a missing privilege looks like, differs.
+    fn make_symlink(target: &Path, link: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+                .map_err(|err| format!("std::os::unix::fs::symlink failed: {err}"))
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).map_err(|err| {
+                format!(
+                    "std::os::windows::fs::symlink_file failed ({err}) -- creating a \
+                     symlink on Windows needs Developer Mode or an elevated process, \
+                     neither of which a test runner can assume"
+                )
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err("no symlink primitive is wired for this platform".to_owned())
+        }
+    }
+
+    /// Print a named, greppable reason a symlink acceptance test did not run, rather
+    /// than let it pass with nothing asserted. `cargo test` has no third "skipped"
+    /// outcome for a plain `#[test]`, so this is the loudest signal available short of
+    /// failing outright -- and failing outright would make the whole suite red on
+    /// every unprivileged Windows machine for a platform limitation, not a defect.
+    fn skip_loudly(test_name: &str, reason: &str) {
+        eprintln!("SKIPPED {test_name}: could not create a symlink -- {reason}");
+    }
+
+    #[test]
+    fn a_symlinked_note_is_refused_at_read_file_not_followed() {
+        // NFR-SEC-06's acceptance criterion, exercised at the level it is written at:
+        // "Given a symlink inside the vault pointing to a target outside the vault
+        // root, when any read ... operation is invoked on it, then the request is
+        // refused and no bytes cross the vault boundary." `serat-vault::resolve` has
+        // unit tests for the mechanism; nothing until now called `read_file` -- the
+        // IPC boundary the finding (task #18 finding 4, T-07) was actually about --
+        // against a real symlink. F-58: a broken guard would make this return `Ok`
+        // with the outside file's bytes, not merely error some other way.
+        let dir = fixture("symlink-read");
+        let outside = std::env::temp_dir().join(format!(
+            "serat-app-state-symlink-outside-read-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let secret = outside.join("secret.md");
+        std::fs::write(&secret, "outside the vault").expect("write outside");
+
+        let link = dir.join("escape.md");
+        match make_symlink(&secret, &link) {
+            Ok(()) => {
+                let state = state(&dir);
+                let result = state.read_file(ReadFileArgs {
+                    path: "escape.md".into(),
+                });
+                assert!(
+                    matches!(result, Err(IpcError::PathEscapesVault { .. })),
+                    "a symlink inside the vault was followed by read_file instead of \
+                     refused: {result:?}"
+                );
+            }
+            Err(reason) => {
+                skip_loudly(
+                    "a_symlinked_note_is_refused_at_read_file_not_followed",
+                    &reason,
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_symlinked_note_is_refused_at_write_file_and_the_target_is_untouched() {
+        // The write half of the same acceptance criterion, and the sharper one: "no
+        // bytes cross the vault boundary" means the file *outside* the vault must be
+        // provably unchanged, not merely that write_file returned an error. write_file
+        // reaches the symlink through its optimistic-lock read (rule 4) before
+        // write_atomic is ever called, so this also exercises that ordering.
+        //
+        // `base_hash` is set to the outside target's own hash rather than left `None`.
+        // With `None`, rule 4 alone would refuse an unguarded write anyway (it reads
+        // as "create over something that already exists"), which would pass this test
+        // for the wrong reason (F-58) and prove nothing about containment. Matching
+        // the hash means that if the symlink guard were removed, the lock would be
+        // satisfied by the followed read and the write would proceed to
+        // `write_atomic` -- isolating containment as the only thing standing between
+        // the request and the bytes outside the vault.
+        let dir = fixture("symlink-write");
+        let outside = std::env::temp_dir().join(format!(
+            "serat-app-state-symlink-outside-write-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let secret = outside.join("secret.md");
+        let original = "outside, original";
+        std::fs::write(&secret, original).expect("write outside");
+
+        let link = dir.join("escape.md");
+        match make_symlink(&secret, &link) {
+            Ok(()) => {
+                let state = state(&dir);
+                let base_hash = serat_vault::hash_bytes(original.as_bytes()).to_hex();
+                let result = state.write_file(WriteFileArgs {
+                    path: "escape.md".into(),
+                    text: "clobbered from inside the vault".into(),
+                    base_hash: Some(base_hash),
+                });
+                assert!(
+                    matches!(result, Err(IpcError::PathEscapesVault { .. })),
+                    "a symlink inside the vault was written through by write_file \
+                     instead of refused: {result:?}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&secret).expect("read outside"),
+                    original,
+                    "a refused write_file changed bytes outside the vault root anyway"
+                );
+            }
+            Err(reason) => {
+                skip_loudly(
+                    "a_symlinked_note_is_refused_at_write_file_and_the_target_is_untouched",
+                    &reason,
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 }
