@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::Samples;
 use crate::trace::StartupTrace;
@@ -410,6 +410,73 @@ pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples),
     Ok((visible, usable))
 }
 
+/// What `Vault::resolve`'s symlink guard (T-07) costs across a whole vault.
+///
+/// **Not a budget.** There is no NFR threshold for this, and `resolve`'s own
+/// doc comment already rules that design goal 1 (the vault survives the
+/// application) outranks the cost if the two are ever in tension — that
+/// ruling is not in question. What was missing is the number, not the
+/// argument (task #30, F-279): the guard sits on `NoteSource::load`'s path,
+/// so a rebuild pays it once per file, and F-123 says a justified decision
+/// with only one side measured is not a decision the next person can check.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolveOverhead {
+    /// How many vault entries were resolved.
+    pub files: usize,
+    /// `symlink_metadata` (lstat) calls the guard made — one per path
+    /// component per file, summed exactly rather than estimated, since every
+    /// call is counted as it happens.
+    pub lstat_calls: usize,
+    /// Wall-clock time spent inside `resolve()`, summed across every file.
+    pub elapsed: Duration,
+}
+
+impl ResolveOverhead {
+    /// Average cost per file, in microseconds.
+    #[must_use]
+    pub fn micros_per_file(&self) -> f64 {
+        if self.files == 0 {
+            return 0.0;
+        }
+        self.elapsed.as_secs_f64() * 1_000_000.0 / self.files as f64
+    }
+}
+
+/// Walk `vault` and call `resolve()` on every entry, timing the total.
+///
+/// Uses the real `Vault::walk` and `Vault::resolve` — not a synthetic loop —
+/// so the count and the timing are the same call a rebuild will make once
+/// `NoteSource::load` reaches this path (I3, task #8). `walk` already skips
+/// symlinks as it discovers them, so every entry resolves successfully; a
+/// resolve failure here means the vault changed under the walk, not that the
+/// guard fired, and is reported as an error rather than silently excluded.
+///
+/// # Errors
+/// A walk failure, or a resolve failure on a path the walk just reported.
+pub fn measure_resolve_overhead(vault_path: &Path) -> Result<ResolveOverhead, String> {
+    let vault = serat_vault::Vault::open(vault_path)
+        .map_err(|e| format!("opening {}: {e}", vault_path.display()))?;
+    let entries = vault
+        .walk()
+        .map_err(|e| format!("walking {}: {e}", vault_path.display()))?;
+
+    let mut lstat_calls = 0usize;
+    let started = Instant::now();
+    for entry in &entries {
+        vault
+            .resolve(&entry.path)
+            .map_err(|e| format!("resolving {:?}, which the walk just reported: {e}", entry.path))?;
+        lstat_calls += entry.path.as_str().split('/').count();
+    }
+    let elapsed = started.elapsed();
+
+    Ok(ResolveOverhead {
+        files: entries.len(),
+        lstat_calls,
+        elapsed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +514,55 @@ mod tests {
         let e = cold_start(vault, 20).expect_err("must not silently pass");
         assert!(e.contains("S1"), "{e}");
         assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
+    }
+
+    // ------------------------------------------------------ T-07 / task #30
+
+    #[test]
+    fn measure_resolve_overhead_on_the_20k_vault() {
+        // F-123: the doc comment on Vault::resolve rules that design goal 1
+        // outranks this cost, and that ruling stands. What was missing is the
+        // number, not the argument -- report it rather than leave "roughly
+        // 40,000 syscalls" as an estimate nobody measured.
+        let preset = crate::preset("20k").expect("the 20k preset exists");
+        let vault = crate::ensure_vault("20k").expect("the 20k vault is available");
+        let overhead =
+            measure_resolve_overhead(&vault.path).expect("resolving every walked entry");
+
+        assert_eq!(
+            overhead.files,
+            vault.notes + preset.assets,
+            "resolve() ran over a different file count than the vault manifest reports -- \
+             the walk skipped something or double-counted it"
+        );
+        // The claim task #30 opened on: this is the shape a full rebuild pays
+        // it in, once NoteSource::load reaches this path (I3, task #8).
+        assert!(
+            overhead.lstat_calls >= overhead.files,
+            "every file has at least one path component, so there must be at least one \
+             lstat call per file"
+        );
+
+        eprintln!(
+            "T-07 resolve() overhead (F-279, task #30): {} files, {} lstat calls, \
+             {:.1} ms total, {:.2} us/file",
+            overhead.files,
+            overhead.lstat_calls,
+            overhead.elapsed.as_secs_f64() * 1000.0,
+            overhead.micros_per_file()
+        );
+
+        // A sanity bound, not a budget: no NFR governs this, and the doc
+        // comment's ruling is not relitigated here. This exists only to catch
+        // resolve() becoming pathologically slow -- canonicalize() instead of
+        // symlink_metadata, say -- which the doc comment explicitly rejected
+        // for exactly this reason.
+        assert!(
+            overhead.elapsed < Duration::from_secs(5),
+            "resolve() over the whole 20k vault took {:?}, far more than the handful of \
+             lstat calls per file this is supposed to cost -- worth a second look even \
+             though no budget governs it",
+            overhead.elapsed
+        );
     }
 }
