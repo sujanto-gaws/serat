@@ -239,7 +239,7 @@ One rule with two enforcement points, written here rather than inside either of 
 - **The walk never sees one.** It `lstat`s every entry and skips any symlink, so a linked file is never enumerated and never indexed.
 - **The read path must refuse one for the same reason**, and it enforces the rule at `Vault::resolve` rather than at each caller — the narrowest point every filesystem access in serat-vault passes through, so `read` and `write_atomic` inherit it and a future caller cannot forget it. Components are checked from the root down with `symlink_metadata`, never `metadata`, which would follow the very thing being checked for. **Deliberately not a `canonicalize`:** that does more syscalls and returns a path which then has to be compared back against the root, which is a second mechanism for the same question.
 
-  Until task #20 lands this half, a file the walk refused is still readable through `read_file`, and **that gap is T-07 in the threat model** rather than a note here — a security document should carry a live gap, and a design document should carry the rule.
+  Both halves are now enforced; the read half arrived second, and T-07 in the threat model carries the history of the gap between them. A security document should carry the gap, a design document should carry the rule.
 
 **Two separate things rest on the first half, and whoever changes it will be looking at only one of them.**
 
