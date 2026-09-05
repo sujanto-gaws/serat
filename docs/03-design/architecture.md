@@ -33,7 +33,7 @@ When two goals conflict, the higher one wins. This ordering is the tie-breaker f
 
 ### 1.2 What P0 may invalidate
 
-The performance figures this design is shaped around are targets, not measurements. Three structures exist specifically because of a number that has not yet been measured: the single-writer index actor assumes write contention is the bottleneck; the parse pool assumes parsing dominates rebuild time; brute-force vector search assumes 200,000 chunks scan fast enough. If P0 contradicts any of them, this document is re-baselined before P1 rather than quietly amended.
+The performance figures this design is shaped around are targets, not measurements. Three structures exist specifically because of a number that has not yet been measured: the single-writer index actor assumes write contention is the bottleneck; the parse pool assumed parsing dominates rebuild time — **the assumption stands and the mechanism has been removed pending the measurement that tests it (§2.2)**; brute-force vector search assumes 200,000 chunks scan fast enough. If P0 contradicts any of them, this document is re-baselined before P1 rather than quietly amended.
 
 ## Components & responsibilities
 
@@ -86,8 +86,18 @@ Concurrency is designed by ownership rather than by locking. Each of the four co
 | Webview      | The main thread. Runs the UI and nothing else.                          | Anything that shares this thread can stall typing.                                                                                          |
 | Index writes | One thread owning the only write connection; work arrives on a channel. | SQLite in WAL permits one writer. Making that explicit removes lock contention from the design entirely — there is nothing to reason about. |
 | Index reads  | A small pool of read-only connections.                                  | WAL readers never block the writer, so views and queries proceed during indexing.                                                           |
-| Parsing      | A rayon pool over cores minus one.                                      | Parsing is pure and CPU-bound. Leaving a core free is what keeps the UI responsive during a rebuild.                                        |
+| Parsing      | **Sequential today**, one file at a time on the rebuild's own thread.   | Parsing is pure and CPU-bound, so a pool remains available the moment a measurement asks for one — see below, and §Open design questions.   |
 | Extraction   | Separate processes, supervised, capped at min(cores−1, 4).              | A security boundary and a fault boundary, both of which a thread cannot provide.                                                            |
+
+Why the parse pool is described in the past tense
+
+§2.2 said *a rayon pool over cores minus one* until I5's rebase, and the pool it described is now implemented by nothing that runs. I5 originally carried one; main independently grew a sequential rebuild, and the rebase kept the sequential version because it is the one merged and being measured. `PARSE_CHUNK`, `build_parse_pool` and `parse_chunk` were then removed rather than left with no callers, which is this project's own standard on unconsumed mechanisms (F-228). `parse_pool_threads()` survives as sizing, documented as unwired.
+
+**Recorded rather than quietly amended, because §1.2 names the parse pool as one of three structures P0 exists to test, and deleting a mechanism is not the same as testing the assumption behind it.** A rebuild number taken today measures the sequential design; presenting it as evidence about the architecture in this section would be a number honest about what it measured and misleading about what it means.
+
+**The measurement is better without the pool, which is why it is not being reinstated first.** Open design question 1 asks whether parsing or the writer dominates a rebuild. A *sequential* run answers that directly, because `RebuildReport` separates walk, read-and-hash, parse and write, and the ratio between those phases is the ratio of the **work** — which is the thing the question is about. Measuring a pooled rebuild would instead report the ratio *after* one side had already been optimised, which tells you what the pool achieved and not whether it was needed. So the pool gets built if and only if the number says parsing dominates, and it will be built against a figure rather than an assumption.
+
+**What was given up, stated because the pool existed for a reason:** wall-clock rebuild time on a many-core machine, if parsing does turn out to dominate. Nothing else — and notably not this table's own stated reason for the pool. *"Leaving a core free is what keeps the UI responsive during a rebuild"* is a justification for a **bound on** parallelism rather than for parallelism, and a sequential rebuild satisfies it completely.
 
 Why one writer, not a mutex
 
@@ -218,9 +228,24 @@ Two consequences, stated because each looks like a bug otherwise. If another pro
 1.  The watcher coalesces events per path over a 150ms window. Editors that save via temp-and-rename emit several events per save; they collapse to one.
 2.  The work queue deduplicates by path and is bounded, and when it is full the watcher's push is refused, a rescan flag latches, and the consumer reconciles by walking. A git checkout touching 4,000 files enqueues 4,000 entries, not 4,000 parses. The bulk producer is never dropped this way — see ADR-11, which is about which producer may be dropped rather than about whether dropping is allowed.
 3.  The hash check reads the file and compares blake3 against notes.hash. Sync tools touch mtime constantly without changing content; this discards those for the cost of a hash.
-4.  Changed files go to the parse pool, which is pure: bytes in, structures out, no I/O, so it parallelises across cores without coordination. A file the parser cannot read is **indexed as a bare row, never skipped** — see below.
+4.  Changed files are parsed — sequentially today (§2.2), and the parser is pure: bytes in, structures out, no I/O, so it would parallelise across cores without coordination if a measurement asks for it. A file the parser cannot read is **indexed as a bare row, never skipped** — see below.
 5.  Rows go to the index writer on a channel. It batches within a transaction, and runs ANALYZE when a batch touched more than 5% of notes. A full rebuild takes the bulk path instead — triggers dropped, FTS index built once at the end, triggers restored from their own definitions; see §4.4.
 6.  The event bus emits index.changed, throttled to ten per second, and open views invalidate the rows they hold.
+
+##### A symlink is not a vault file
+
+One rule with two enforcement points, written here rather than inside either of them, because **each is a reason the other exists and neither implementation says so.**
+
+- **The walk never sees one.** It `lstat`s every entry and skips any symlink, so a linked file is never enumerated and never indexed.
+- **The read path must refuse one for the same reason.** It does not yet; that asymmetry is T-07 in the threat model, and it is why a file the walk refused is still readable through `read_file`.
+
+**Two separate things rest on the first half, and whoever changes it will be looking at only one of them.**
+
+FR-VLT-01's fix rests on it. The walk is missed by 4.0x at 20,000 notes and 6.5x at 50,000, and the fix replaces canonicalising every entry with **stripping the root prefix lexically** — about 2.0s down to about 50ms. A lexical strip and a canonicalisation agree on every path *only while no symlink is enumerated*: canonicalising `vault/link.md` resolves to wherever the link points and is rejected if that is outside the root, while stripping the prefix off it yields a perfectly ordinary-looking `link.md`. **So the performance fix is sound because of a security property, and neither file mentions the other.**
+
+T-07 rests on the second half, for the reason the threat model gives.
+
+**The likely way to break it is a tidy-looking fix.** The read path must refuse symlinks (task #20), and the obvious way to make the two paths agree is to unify them. Unifying them by making the walk **follow** links satisfies the containment requirement and silently invalidates the lexical strip. Unify them the other way — both refuse — and one sentence covers both, which is checkable in a way *"the walk skips them and the reader canonicalises"* is not.
 
 ##### A note that cannot be parsed is still a note
 
@@ -721,7 +746,7 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 
 | Question                                                              | Settled by                                                                                                                     |
 |-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| Does the parse pool or the index writer dominate rebuild time?        | P0 benchmark. If the writer dominates, batching strategy changes; if parsing dominates, the pool sizing does.                  |
+| Does parsing or the index writer dominate rebuild time?               | TC-020 on the sequential rebuild, reading `RebuildReport`'s walk / read-and-hash / parse / write split. If the writer dominates, batching strategy changes. **If parsing dominates, that is the argument for building the parse pool §2.2 no longer has** — the question now decides whether a mechanism exists rather than how it is sized. |
 | Is brute-force vector search fast enough at 200,000 chunks?           | A P4 benchmark on the synthetic vault. ADR-09 is written to be reversed cheaply.                                               |
 | Which PDF extractor gives usable layout fidelity on the real archive? | Blueprint move 5 — spike one extractor against actual contracts and papers before committing to the pillar.                    |
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
