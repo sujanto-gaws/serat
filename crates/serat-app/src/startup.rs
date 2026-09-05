@@ -428,6 +428,31 @@ impl Startup {
         let mut marks = self.lock();
         marks.walk_complete.get_or_insert(now);
         marks.notes_walked = Some(entries);
+        drop(marks);
+        self.usable.notify_all();
+    }
+
+    /// Block until the vault walk has finished, or `timeout` elapses.
+    ///
+    /// Only `--exit-after-walk` waits on this. Nothing a user does waits for the walk;
+    /// that is the whole point of deferring it.
+    pub fn wait_for_walk_complete(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut marks = self.lock();
+        while marks.walk_complete.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (guard, wait) = self
+                .usable
+                .wait_timeout(marks, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            marks = guard;
+            if wait.timed_out() && marks.walk_complete.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Record which note the shell opened, so a run that opened nothing is legible as
@@ -895,19 +920,71 @@ mod tests {
     }
 
     #[test]
-    fn a_trace_missing_a_bracket_reports_no_share_rather_than_a_wrong_one() {
+    fn a_trace_missing_any_one_bracket_reports_no_share_rather_than_a_wrong_one() {
         // The failure mode being prevented: a partially marked run yielding a number
         // that looks like a measurement. `None` is the honest answer.
-        let startup = in_process();
-        complete(&startup);
+        //
+        // Each of the three `?` sites is exercised on its own. The previous version of
+        // this test marked *none* of them, so it proved only "all three missing gives
+        // None" while the docstring claims "either bracket missing" -- and each `?`
+        // could be deleted individually with the other two still returning None. That
+        // is P0 finding F-148, and it is the fourth time this figure has needed
+        // correcting, so the per-term case is exactly where the fifth would go wrong.
+        let whole = |trace: &Trace| trace.serat_main_thread_ms();
+
+        let complete_trace = Trace {
+            t0_to_window_visible_ms: 800.0,
+            t0_to_vault_usable_ms: 805.0,
+            t0_to_main_ms: 60.0,
+            t0_to_state_ready_ms: Some(65.0),
+            t0_to_runtime_ready_ms: Some(90.0),
+            t0_to_setup_done_ms: Some(90.5),
+            t0_to_window_created_ms: Some(700.0),
+            t0_to_buffer_rendered_ms: 805.0,
+            t0_to_index_settled_ms: 91.0,
+            t0_to_watcher_ms: 92.0,
+            watcher: WatcherOutcome::Registered,
+            t0_to_walk_complete_ms: None,
+            t0_source: T0Source::Harness,
+            profile: Profile::current(),
+            schema_version: 1,
+            notes_walked: None,
+            vault: None,
+            last_open: None,
+            usable_definition: USABLE_DEFINITION,
+        };
+
+        // The control: with every bracket present it is a number, and the right one.
+        // Without this, all three cases below would pass against a function that always
+        // returned None.
+        let share = whole(&complete_trace).expect("every bracket is marked");
         assert!(
-            startup
-                .trace()
-                .expect("complete")
-                .serat_main_thread_ms()
-                .is_none(),
-            "a share was reported without the marks that define it"
+            (share - 5.5).abs() < 1e-9,
+            "expected (65-60) + (90.5-90) = 5.5, got {share}"
         );
+
+        // One case per `?`. Delete any single one of them from
+        // `serat_main_thread_ms` and exactly one of these fails.
+        /// Clears one of the three brackets. Named because the tuple type is long
+        /// enough that clippy is right to ask.
+        type ClearBracket = fn(&mut Trace);
+
+        let cases: [(&str, ClearBracket); 3] = [
+            ("t0_to_state_ready_ms", |t| t.t0_to_state_ready_ms = None),
+            ("t0_to_runtime_ready_ms", |t| {
+                t.t0_to_runtime_ready_ms = None
+            }),
+            ("t0_to_setup_done_ms", |t| t.t0_to_setup_done_ms = None),
+        ];
+        for (field, clear) in cases {
+            let mut trace = complete_trace.clone();
+            clear(&mut trace);
+            assert!(
+                whole(&trace).is_none(),
+                "a share was reported with {field} unmarked; the other two brackets \
+                 cannot stand in for it"
+            );
+        }
     }
 
     #[test]
@@ -1021,6 +1098,26 @@ mod tests {
             signaller.mark_buffer_rendered();
         });
         assert!(startup.wait_for_usable(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn waiting_for_the_walk_returns_when_it_lands_and_times_out_when_it_does_not() {
+        // F-151's mark. The trace does not require it -- see the next test -- so the
+        // wait has to be the thing that makes it present, and it has to give up rather
+        // than hang on a vault whose walk failed.
+        let startup = in_process();
+        assert!(
+            !startup.wait_for_walk_complete(Duration::from_millis(30)),
+            "waited on a walk that never completed and claimed it did"
+        );
+
+        let startup = std::sync::Arc::new(in_process());
+        let walker = std::sync::Arc::clone(&startup);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            walker.mark_walk_complete(20_200);
+        });
+        assert!(startup.wait_for_walk_complete(Duration::from_secs(5)));
     }
 
     #[test]

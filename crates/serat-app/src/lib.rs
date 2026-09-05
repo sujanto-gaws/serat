@@ -46,6 +46,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod index;
+mod security_config;
 pub mod settings;
 pub mod startup;
 pub mod state;
@@ -61,6 +62,7 @@ pub mod ipc;
 
 use cli::Boot;
 use ipc::{INDEX_STATUS_EVENT, OpenVaultArgs};
+use security_config::MAIN_WINDOW_LABEL;
 use startup::Startup;
 use state::AppState;
 
@@ -167,9 +169,12 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 } else if note.is_none() {
                     Some(
                         concat!(
-                            "--exit-after-ready needs --open <note.md>, or a settings file ",
-                            "remembering one for this vault: \"vault usable\" over a shell ",
-                            "that rendered nothing is not the number NFR-PRF-01 is about"
+                            "--exit-after-ready needs --open <note.md>. \"Vault usable\" ",
+                            "over a shell that rendered nothing is not the number ",
+                            "NFR-PRF-01 is about, and the settings file is deliberately ",
+                            "not consulted here: a benchmark that fell back to ",
+                            "per-machine state would pass on a developer machine and ",
+                            "fail in CI (F-169)"
                         )
                         .to_owned(),
                     )
@@ -194,7 +199,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             // 3. Then the window.
             let geometry = settings_geometry();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
                 .title("Serat")
                 .inner_size(geometry.0, geometry.1)
                 .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
@@ -240,12 +245,21 @@ fn spawn_benchmark_exit(
     let startup = Arc::clone(&state.startup);
     let trace_path = state.boot.trace.clone();
     let timeout = state.boot.ready_timeout;
+    let wait_for_walk = state.boot.exit_after_walk;
     let handle = handle.clone();
 
     std::thread::Builder::new()
         .name("serat-benchmark-exit".to_owned())
         .spawn(move || {
             let arrived = startup.wait_for_usable(timeout);
+            if wait_for_walk && arrived {
+                // FR-VLT-01's quantity, not NFR-PRF-01's: with no index the file tree
+                // comes from the walk, so walk completion is when a tree could first
+                // render (F-151). Only reached under --exit-after-walk; the ordinary
+                // benchmark run exits at "usable" and leaves this mark absent, which is
+                // correct for the budget it measures.
+                startup.wait_for_walk_complete(timeout);
+            }
             let code = match startup.trace() {
                 Ok(trace) => match write_trace(&trace, trace_path.as_deref()) {
                     Ok(()) => 0,

@@ -27,6 +27,16 @@ pub struct Boot {
     /// `--exit-after-ready`: write the startup trace and exit as soon as the vault is
     /// usable. For the budget harness; a user never passes it.
     pub exit_after_ready: bool,
+    /// `--exit-after-walk`: as `--exit-after-ready`, but also wait for the vault walk
+    /// to finish, so `t0_to_walk_complete_ms` is populated.
+    ///
+    /// That mark is the one quantity the **no-index** path is judged on (P0 finding
+    /// F-151): with no index the file tree comes from the streaming walk, so walk
+    /// completion is when a tree could first render. It is absent from an ordinary
+    /// `--exit-after-ready` run on any vault large enough to matter, because the
+    /// process exits at "usable" while the walk is still going — which is correct for
+    /// NFR-PRF-01 and useless for FR-VLT-01.
+    pub exit_after_walk: bool,
     /// `--ready-timeout-ms <n>`: how long to wait before declaring the start failed.
     pub ready_timeout: Duration,
     /// `SERAT_STARTUP_TRACE`: where the trace line goes.
@@ -39,6 +49,7 @@ impl Default for Boot {
             vault: None,
             open: None,
             exit_after_ready: false,
+            exit_after_walk: false,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             trace: None,
         }
@@ -81,6 +92,13 @@ impl Boot {
                 "--vault" => boot.vault = Some(PathBuf::from(value("--vault")?)),
                 "--open" => boot.open = Some(value("--open")?),
                 "--exit-after-ready" => boot.exit_after_ready = true,
+                // Implies the ready behaviour: every guard and every mark that applies
+                // to a benchmark run applies to this one too, and stating it here means
+                // no later check has to remember to test for both.
+                "--exit-after-walk" => {
+                    boot.exit_after_walk = true;
+                    boot.exit_after_ready = true;
+                }
                 "--ready-timeout-ms" => {
                     let raw = value("--ready-timeout-ms")?;
                     let ms: u64 = raw
@@ -133,6 +151,27 @@ mod tests {
         assert!(boot.exit_after_ready);
         assert_eq!(boot.ready_timeout, Duration::from_millis(5_000));
         assert_eq!(boot.trace, Some(PathBuf::from("trace.json")));
+    }
+
+    #[test]
+    fn waiting_for_the_walk_implies_waiting_for_ready() {
+        // F-151's mark rides on the same guards as NFR-PRF-01's. If `--exit-after-walk`
+        // did not imply `--exit-after-ready`, every check written against the latter --
+        // needing a vault, needing `--open`, refusing the settings fallback -- would
+        // silently not apply to it.
+        let boot = Boot::parse(
+            &args(&["--vault", "d:/v", "--open", "a.md", "--exit-after-walk"]),
+            None,
+        )
+        .expect("parse");
+        assert!(boot.exit_after_walk);
+        assert!(
+            boot.exit_after_ready,
+            "--exit-after-walk must inherit every guard --exit-after-ready carries"
+        );
+
+        // And it is refused for the same reasons.
+        assert!(Boot::parse(&args(&["--exit-after-walk"]), None).is_err());
     }
 
     #[test]

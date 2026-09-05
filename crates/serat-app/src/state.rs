@@ -403,10 +403,26 @@ impl AppState {
 
     /// The note to restore for the open vault: `--open` if given, else the settings
     /// file's memory of this vault.
+    ///
+    /// # The fallback does not apply to a benchmark run
+    ///
+    /// Under `--exit-after-ready` only `--open` is consulted, and the settings file is
+    /// ignored entirely. The fallback is right for a user and dangerous for a budget
+    /// job: the settings file is per-machine state, so a job that omitted `--open`
+    /// would start passing on any developer machine that had once run the application
+    /// interactively, while still failing in clean CI. The local pass is the
+    /// reassuring one — somebody sees green and reports a number — which makes it the
+    /// flattering-number failure in its purest form (P0 finding F-169).
+    ///
+    /// Refused here rather than by convention in the harness, because a convention
+    /// holds until the first person who does not know about it.
     #[must_use]
     pub fn note_to_open(&self) -> Option<String> {
         if let Some(open) = self.boot.open.clone() {
             return Some(open);
+        }
+        if self.boot.exit_after_ready {
+            return None;
         }
         let root = self.vault_root()?;
         self.settings
@@ -879,6 +895,78 @@ mod tests {
             matches!(seen.last(), Some(IndexState::Ready { note_count: 3 })),
             "{seen:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_benchmark_run_never_takes_the_note_from_the_settings_file() {
+        // F-169. The hazard: a cold-start job that omitted `--open` would pass on any
+        // machine whose settings file remembered a note and fail in clean CI, and the
+        // local pass is the one somebody reports a number from. Delete the
+        // `exit_after_ready` early return in `note_to_open` and this fails.
+        let dir = fixture("benchfallback");
+        let canonical = Vault::open(&dir).expect("open").root().to_path_buf();
+        let mut settings = Settings::default();
+        settings.remember_open(&canonical, "10-projects/serat.md");
+
+        let bench = AppState::with_settings(
+            Arc::new(Startup::begin_with(None)),
+            Boot {
+                exit_after_ready: true,
+                ..Boot::default()
+            },
+            settings.clone(),
+        );
+        bench
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        assert_eq!(
+            bench.note_to_open(),
+            None,
+            "a benchmark run took its note from per-machine state"
+        );
+
+        // The same settings, the same vault, with the flag given: the run is defined
+        // by its arguments and nothing else.
+        let flagged = AppState::with_settings(
+            Arc::new(Startup::begin_with(None)),
+            Boot {
+                exit_after_ready: true,
+                open: Some("10-projects/serat.md".into()),
+                ..Boot::default()
+            },
+            settings.clone(),
+        );
+        flagged
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        assert_eq!(
+            flagged.note_to_open().as_deref(),
+            Some("10-projects/serat.md")
+        );
+
+        // And an ordinary session still restores where the user left off, which is the
+        // behaviour the guard must not have removed.
+        let session = AppState::with_settings(
+            Arc::new(Startup::begin_with(None)),
+            Boot::default(),
+            settings,
+        );
+        session
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        assert_eq!(
+            session.note_to_open().as_deref(),
+            Some("10-projects/serat.md"),
+            "the guard removed the fallback from ordinary sessions too"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
