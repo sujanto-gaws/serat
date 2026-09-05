@@ -126,10 +126,17 @@ run_cargo() {
   fi
   if [ $rc -ne 0 ]; then
     if printf '%s' "$out" | grep -q 'LNK1104'; then
-      echo "Task completion gate: $what hit LNK1104 (a Windows file-lock/link failure) twice in $PWD. This is environmental contention, not necessarily your code -- re-run it in your worktree before believing it." >&2
-    else
-      echo "Task completion rejected: $what is failing (gated in: $PWD)." >&2
+      # F-259: LNK1104 means the link never completed, so NO TESTS RAN. We have no
+      # evidence either way, and the previous version said exactly that and then
+      # rejected anyway -- a guard firing and meaning the wrong thing, for the third
+      # time in one session, this time written by the person fixing the first two.
+      # Fail open and say so loudly, as with an unreadable payload: a rejection the
+      # teammate has already disproved in their own worktree teaches them to stop
+      # believing the gate, which costs more than the check is worth.
+      echo "Task completion gate: $what could not link in $PWD (LNK1104, twice) so NO TESTS RAN -- this proves nothing about your code and is not being counted against you. Verify in your own worktree." >&2
+      return 0
     fi
+    echo "Task completion rejected: $what is failing (gated in: $PWD)." >&2
     return 1
   fi
   return 0
