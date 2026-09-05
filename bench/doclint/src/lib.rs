@@ -564,36 +564,40 @@ mod tests {
     // --------------------------------------------------------- TC-095/096
 
     #[test]
-    fn the_real_design_documents_fail_on_exactly_f_239s_five_paths() {
-        // Prove it can fail before trusting it (F-58, F-27): run the whole
-        // check against the actual repository and require it to name exactly
-        // the five paths F-239 recorded -- not fewer (the check missing
-        // something), not more (a false positive from the extraction
-        // heuristic). This crate is built on a branch cut before task #7's
-        // `*(planned)*` markers land, so today's architecture.md has none of
-        // them yet; this test starts passing with zero missing the moment
-        // the lead merges task #7 (the markers) or task #10 (the files
-        // themselves), and that is exactly the maintenance both mechanisms
-        // exist for.
+    fn the_real_design_documents_have_no_unmarked_missing_paths() {
+        // F-255. This test previously asserted that the real tree still had
+        // F-239's five missing paths, to "prove it can fail before trusting
+        // it" (F-58, F-27). That proof was real but it was pinned to a
+        // transient property of main: task #7 marked those five *(planned)*
+        // and the assertion went red -- the fix for the defect destroyed the
+        // fixture for the detector, which is the whole of F-255. Its own
+        // comment predicted it would "start passing with zero missing"; it
+        // started failing instead, because the assertion demanded the five.
+        //
+        // The can-it-fail proof belongs on a synthetic fixture, where it is
+        // deterministic and survives every future edit to the design docs --
+        // see `a_missing_path_is_reported`, `a_planned_marker_exempts` and
+        // the rest above, which cover all three arms including the one the
+        // real tree never offered: that the exemption actually exempts.
+        //
+        // What is left for the real tree is the property that must hold from
+        // now on, and it is worth asserting for its own sake: every path the
+        // design documents cite either resolves or is marked planned.
         let report = check_paths(&repo_root()).expect("the real docs tree reads");
-        let mut missing: Vec<&str> = report.missing.iter().map(|m| m.path.as_str()).collect();
-        missing.sort_unstable();
-        assert_eq!(
-            missing,
-            vec![
-                "contracts/extractor.rs",
-                "contracts/mcp-tools.json",
-                "grammar/conformance.md",
-                "grammar/lowering.md",
-                "grammar/sq.ebnf",
-            ],
-            "F-239's five paths changed shape -- either task #7's *(planned)* markers or \
-             task #10's files landed (update this test to match) or the extraction \
-             heuristic regressed"
+        assert!(
+            !report.has_failures(),
+            "the design documents cite a path that neither resolves nor is              marked *(planned)*:
+{}",
+            report.to_report()
         );
-        // And the two real, existing citations must not be false positives.
-        assert!(!missing.contains(&"schema/001_init.sql"));
-        assert!(!missing.contains(&"contracts/ipc.rs"));
+        // And the check must actually be looking at something -- F-27 one
+        // level up, since "0 missing" and "checked nothing" are the same
+        // one-line PASS unless the count is in it.
+        assert!(
+            report.checked > 10,
+            "only {} citations found in the real design documents, which              suggests the extraction heuristic regressed rather than that              the documents stopped citing paths",
+            report.checked
+        );
     }
 
     #[test]
