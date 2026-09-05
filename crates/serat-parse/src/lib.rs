@@ -195,7 +195,8 @@ impl<'b> Walker<'b> {
             NodeValue::FrontMatter(_) => {} // only ever a top-level node; handled by the caller
             NodeValue::Heading(heading) => {
                 let text = text::collect(node);
-                self.heading_stack.retain(|(level, _)| *level < heading.level);
+                self.heading_stack
+                    .retain(|(level, _)| *level < heading.level);
                 let heading_path = self.current_heading_path();
                 self.heading_stack.push((heading.level, text.clone()));
                 self.collect_markdown_links(node);
@@ -219,15 +220,15 @@ impl<'b> Walker<'b> {
                 self.collect_markdown_links(node);
                 let (text, block_ref) = strip_block_ref(text::collect(node));
                 let heading_path = self.current_heading_path();
-                self.push_block(BlockKind::Quote, range, text, heading_path).block_ref =
-                    block_ref;
+                self.push_block(BlockKind::Quote, range, text, heading_path)
+                    .block_ref = block_ref;
             }
             NodeValue::Table(_) => {
                 self.collect_markdown_links(node);
                 let (text, block_ref) = strip_block_ref(text::collect(node));
                 let heading_path = self.current_heading_path();
-                self.push_block(BlockKind::Table, range, text, heading_path).block_ref =
-                    block_ref;
+                self.push_block(BlockKind::Table, range, text, heading_path)
+                    .block_ref = block_ref;
             }
             NodeValue::ThematicBreak => {
                 let heading_path = self.current_heading_path();
@@ -272,8 +273,12 @@ impl<'b> Walker<'b> {
                 let done = Task::marker_is_done(marker);
                 let marker_range = self.lines.range(self.bytes, task.symbol_sourcepos);
                 let heading_path = self.current_heading_path();
-                let block =
-                    self.push_block(BlockKind::Task { depth }, range, raw_text.clone(), heading_path);
+                let block = self.push_block(
+                    BlockKind::Task { depth },
+                    range,
+                    raw_text.clone(),
+                    heading_path,
+                );
                 block.block_ref = block_ref;
                 let ord = block.ord;
                 self.tasks.push(Task {
@@ -468,7 +473,10 @@ mod tests {
         let parsed = parse("---\ntitle: Serat\ntype: project\nstatus: active\n---\n\nBody.\n");
         assert_eq!(parsed.title.as_deref(), Some("Serat"));
         assert_eq!(parsed.note_type.as_deref(), Some("project"));
-        assert_eq!(field(&parsed, "status").source, serat_core::FieldSource::Frontmatter);
+        assert_eq!(
+            field(&parsed, "status").source,
+            serat_core::FieldSource::Frontmatter
+        );
     }
 
     #[test]
@@ -532,10 +540,7 @@ mod tests {
             .parse(&VaultPath::new("note.md").expect("path"), source.as_bytes())
             .expect("parse");
         let task = &parsed.tasks[0];
-        assert_eq!(
-            task.marker_range.slice(source.as_bytes()),
-            Some(&b"x"[..])
-        );
+        assert_eq!(task.marker_range.slice(source.as_bytes()), Some(&b"x"[..]));
     }
 
     #[test]
@@ -575,7 +580,12 @@ mod tests {
     fn a_code_block_keeps_its_literal_content_and_language() {
         let parsed = parse("```rust\nfn main() {}\n```\n");
         let block = &parsed.blocks[0];
-        assert_eq!(block.kind, BlockKind::Code { language: Some("rust".to_owned()) });
+        assert_eq!(
+            block.kind,
+            BlockKind::Code {
+                language: Some("rust".to_owned())
+            }
+        );
         assert_eq!(block.text, "fn main() {}");
     }
 

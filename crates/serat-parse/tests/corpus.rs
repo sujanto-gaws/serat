@@ -80,7 +80,10 @@ const CORPUS_DIGEST: &str = "58178c9d63207c46a6833a3dff08594fbfb0a557e21d6d41d67
 #[test]
 fn the_corpus_digest_matches_what_this_parser_currently_produces() {
     let parsed = CommonMarkParser::new()
-        .parse(&VaultPath::new("corpus.md").expect("path"), CORPUS.as_bytes())
+        .parse(
+            &VaultPath::new("corpus.md").expect("path"),
+            CORPUS.as_bytes(),
+        )
         .expect("parse");
 
     // Condition 3: the footnote reference/definition pair must still be absent from
