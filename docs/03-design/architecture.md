@@ -237,7 +237,9 @@ Two consequences, stated because each looks like a bug otherwise. If another pro
 One rule with two enforcement points, written here rather than inside either of them, because **each is a reason the other exists and neither implementation says so.**
 
 - **The walk never sees one.** It `lstat`s every entry and skips any symlink, so a linked file is never enumerated and never indexed.
-- **The read path must refuse one for the same reason.** It does not yet; that asymmetry is T-07 in the threat model, and it is why a file the walk refused is still readable through `read_file`.
+- **The read path must refuse one for the same reason**, and it enforces the rule at `Vault::resolve` rather than at each caller — the narrowest point every filesystem access in serat-vault passes through, so `read` and `write_atomic` inherit it and a future caller cannot forget it. Components are checked from the root down with `symlink_metadata`, never `metadata`, which would follow the very thing being checked for. **Deliberately not a `canonicalize`:** that does more syscalls and returns a path which then has to be compared back against the root, which is a second mechanism for the same question.
+
+  Both halves are now enforced; the read half arrived second, and T-07 in the threat model carries the history of the gap between them. A security document should carry the gap, a design document should carry the rule.
 
 **Two separate things rest on the first half, and whoever changes it will be looking at only one of them.**
 
@@ -721,6 +723,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, NFR-SEC-03, NFR-REL-03                    |
 | Extraction cache                        | §7.2                       | FR-BIN-08                                                                     |
 | Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
+| Path containment: one rule, two enforcement points | §*A symlink is not a vault file*, threat-model.md T-07 | NFR-SEC-06 |
 | Chunking and incremental embedding      | §8.1                       | FR-AIX-02                                                                     |
 | Retrieval fusion                        | §8.2, Fig. 3               | FR-AIX-01, FR-AIX-03, FR-AIX-09, FR-AIX-10                                    |
 | Proposal lifecycle                      | §8.3, Fig. 6               | FR-AIX-05, FR-AIX-04, FR-MCP-03                                               |
@@ -738,7 +741,7 @@ Three, listed rather than mapped. Every one of them could be given a plausible r
 |-------------|--------------------------|
 | **FR-NAV-01** quick switcher (Must, P1) | Nothing here designs it. §9's *lens switcher* is a different control — it changes role, not note — and the resemblance is why this went unnoticed. Most of the input exists: `notes.title`, `notes.path`, an `aliases` frontmatter field in `fields`, and headings as `blocks` with `kind = 'heading'`. **What has no home is the ranking.** FR-NAV-01 requires results ranked by *recency and frequency*, and nothing records either. That is a decision rather than a missing column, and C-02 is what makes it one: per-note open counts are state, and if they live only in `.serat/` then nothing may depend on them. The likely answer is that they live there and the ranking degrades to lexical after a rebuild, which is design goal 5 working as intended — but it has not been ruled, and the alternative is writing a file into the user's vault that they did not ask for. |
 | **NFR-PRF-06** switcher latency (Must, P1) | Follows FR-NAV-01 and cannot be designed before it. It also has no budget job, which is correct rather than overdue: `bench/budget`'s table is P0-scoped and says so. It becomes due the day the switcher is designed, and §10.3's rule is that a budget with no job is an aspiration. |
-| **NFR-CMP-03**, the *by default* half (Must, P1) | Its acceptance criterion — a fresh clone without `.serat/` builds a correct index on first open — **is** designed and covered, by §3.4 step 1 and ADR-02. The other half is not: nothing says who writes `.serat/` into a `.gitignore`. §3.4 names NFR-CMP-03, but naming a requirement is not designing it, and the same paragraph says *"whether the vault is a git repository is the user's business and not ours"* — which is in tension with shipping a default that edits the user's `.gitignore`. Resolve the tension rather than inheriting it. |
+| ~~**NFR-CMP-03**, the *by default* half~~ — **resolved, by splitting the requirement rather than by designing anything.** The row said one requirement had two halves satisfied by opposite postures: a fresh clone rebuilding without `.serat/` is designed and covered (§3.4 step 1, ADR-02), while nothing said who writes `.serat/` into a `.gitignore`, and §3.4 says *"whether the vault is a git repository is the user's business and not ours"*. At v1.1 the requirement became **NFR-CMP-03** (index independence, Must — covered) and **NFR-CMP-04** (offer to add the entry, never edit a `.gitignore` unasked, Should — P1 UI work, not a design gap). **The tension was in the requirement, not in the design**, which is why nothing here had to change to close it. |
 
 ## Open design questions
 
