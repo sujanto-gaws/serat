@@ -33,6 +33,9 @@ const CORPUS: &str = "---\n\
 title: Corpus\n\
 type: fixture\n\
 tags: [parsing, corpus]\n\
+owner: \"[[Frontmatter Link]]\"\n\
+attendees:\n\
+  - \"[[Frontmatter List Link]]\"\n\
 ---\n\
 \n\
 # Corpus\n\
@@ -75,7 +78,7 @@ Text with a footnote reference[^1], which this parser does not resolve.\n\
 /// Pinned hash of `CommonMarkParser`'s output for [`CORPUS`]. Update it, in the same
 /// commit that bumps `INDEX_VERSION`, whenever a deliberate change to this parser's
 /// output makes this test fail — never as a change on its own.
-const CORPUS_DIGEST: &str = "58178c9d63207c46a6833a3dff08594fbfb0a557e21d6d41d67aa88d00db42ba";
+const CORPUS_DIGEST: &str = "c3001cfef219b162bda7ee76c779760fb379381a962ac346d6769682f88a39ec";
 
 #[test]
 fn the_corpus_digest_matches_what_this_parser_currently_produces() {

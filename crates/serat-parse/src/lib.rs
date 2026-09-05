@@ -76,6 +76,7 @@ impl NoteParser for CommonMarkParser {
         };
 
         let mut fm_fields = Vec::new();
+        let mut fm_range = None;
         let mut title = None;
         let mut note_type = None;
 
@@ -84,6 +85,7 @@ impl NoteParser for CommonMarkParser {
             if let NodeValue::FrontMatter(_) = value {
                 let range = lines.range(bytes, sourcepos);
                 walker.excluded.push(range);
+                fm_range = Some(range);
                 let parsed = frontmatter::parse(bytes, range);
                 fm_fields = parsed.fields;
                 title = parsed.title;
@@ -100,6 +102,30 @@ impl NoteParser for CommonMarkParser {
 
         let mut links = walker.markdown_links;
         links.extend(wikilinks::scan(text, &walker.excluded));
+        // F-316: a wikilink in a frontmatter value is a link. `owner: "[[Ada]]"`
+        // and an `attendees:` list render as links in Obsidian and appear in its
+        // backlinks, so NFR-CMP-01 and FR-NAV-04 both want them; the 20k
+        // benchmark vault alone carries 7,989, and without this a note whose only
+        // inbound reference is a property is invisible in that note's backlinks.
+        //
+        // Done as a second scoped pass through the SAME scanner rather than a
+        // second scanner, so there stays exactly one definition of what a
+        // wikilink is. The scope is inverted: `scan`'s first pass excludes the
+        // frontmatter, this one excludes everything else, which is one range
+        // because frontmatter can only be the first thing in the file.
+        //
+        // Tags are dropped rather than scanned for. `#` opens a comment in YAML,
+        // and frontmatter tags are declared with a `tags:` key rather than
+        // `#tag`, so treating a `#` here as a tag would invent links the file
+        // does not contain.
+        if let Some(fm) = fm_range {
+            let outside_frontmatter = [ByteRange::new(fm.end, bytes.len())];
+            links.extend(
+                wikilinks::scan(text, &outside_frontmatter)
+                    .into_iter()
+                    .filter(|link| link.kind != LinkKind::Tag),
+            );
+        }
         for link in &mut links {
             if link.block_ord.is_none() {
                 link.block_ord = containing_block(&walker.blocks, link.range);
@@ -466,6 +492,60 @@ mod tests {
             .iter()
             .find(|field| field.key == key)
             .unwrap_or_else(|| panic!("no field {key:?} among {:?}", parsed.fields))
+    }
+
+    #[test]
+    fn a_wikilink_in_a_frontmatter_value_is_a_link() {
+        // F-316. `owner:` is a scalar property and `attendees:` a block list;
+        // both render as links in Obsidian and both appear in its backlinks, so
+        // NFR-CMP-01 and FR-NAV-04 want them indexed. The block-list form matters
+        // on its own: those lines are not fields today (the YAML subset skips
+        // `-` items), so before this there was no trace of an attendee at all.
+        let parsed = parse(
+            "---\ntype: meeting\nowner: \"[[Juno Halvorsen]]\"\nattendees:\n  - \"[[Ada Lovelace]]\"\n  - \"[[Alan Turing]]\"\n---\n\n# Title\n\nBody with [[Body Link]].\n",
+        );
+        let mut targets: Vec<&str> = parsed
+            .links
+            .iter()
+            .map(|l| l.target.note.as_str())
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            vec!["Ada Lovelace", "Alan Turing", "Body Link", "Juno Halvorsen"],
+            "every frontmatter wikilink is a link, alongside the body one"
+        );
+
+        // The ranges must be file-absolute, not relative to a frontmatter slice:
+        // a link whose range is wrong is worse than one that is absent, because
+        // P2's patcher trusts recorded ranges (C-04, ADR-0008).
+        let src = "---\ntype: meeting\nowner: \"[[Juno Halvorsen]]\"\nattendees:\n  - \"[[Ada Lovelace]]\"\n  - \"[[Alan Turing]]\"\n---\n\n# Title\n\nBody with [[Body Link]].\n";
+        let owner = parsed
+            .links
+            .iter()
+            .find(|l| l.target.note == "Juno Halvorsen")
+            .expect("the owner link");
+        assert_eq!(
+            &src[owner.range.start..owner.range.end],
+            "[[Juno Halvorsen]]"
+        );
+    }
+
+    #[test]
+    fn a_hash_in_frontmatter_is_not_a_tag() {
+        // `#` opens a comment in YAML, and frontmatter tags are declared with a
+        // `tags:` key rather than `#tag`, so scanning frontmatter for tags would
+        // invent links the file does not contain. The body's tag still counts.
+        let parsed = parse(
+            "---\ntitle: Note\n# a comment mentioning #notatag\n---\n\nBody #realtag here.\n",
+        );
+        let tags: Vec<&str> = parsed
+            .links
+            .iter()
+            .filter(|l| l.kind == LinkKind::Tag)
+            .map(|l| l.target.note.as_str())
+            .collect();
+        assert_eq!(tags, vec!["realtag"], "only the body tag is a tag");
     }
 
     #[test]

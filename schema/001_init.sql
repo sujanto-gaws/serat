@@ -89,7 +89,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 -- ============================================================================
 -- Tables
