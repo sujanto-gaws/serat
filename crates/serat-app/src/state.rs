@@ -1030,8 +1030,14 @@ mod tests {
     fn make_symlink(target: &Path, link: &Path) -> Result<(), String> {
         #[cfg(unix)]
         {
+            // F-306: a skip is NOT acceptable here. Symlink creation on Unix needs no
+            // privilege, so a failure is a real error rather than a platform limit --
+            // and CI's ubuntu leg is the one place these tests genuinely execute.
+            // Returning Err on Unix would let the security test report `ok` having
+            // asserted nothing, which is the defect this whole task exists to close.
             std::os::unix::fs::symlink(target, link)
-                .map_err(|err| format!("std::os::unix::fs::symlink failed: {err}"))
+                .expect("symlink creation on Unix needs no privilege; a failure here is a real error, not a reason to skip a security test");
+            Ok::<(), String>(())
         }
         #[cfg(windows)]
         {
