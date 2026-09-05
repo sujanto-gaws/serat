@@ -20,6 +20,7 @@ fields=$(printf '%s' "$payload" | python -c '
 import json, sys
 
 SUBJ = ("task_subject", "subject", "title", "name")
+CWD  = ("cwd", "working_directory")
 DESC = ("task_description", "description", "body", "content", "activeForm")
 
 def walk(node, wanted, depth=0):
@@ -57,6 +58,7 @@ if not subject and not desc:
 
 print(subject)
 print(desc)
+print(" ".join(walk(d, CWD).split()))
 ' 2>"${TMPDIR:-/tmp}/serat-gate-keys.$$")
 
 parse_note=$(cat "${TMPDIR:-/tmp}/serat-gate-keys.$$" 2>/dev/null)
@@ -71,6 +73,7 @@ if [ -z "$fields" ]; then
 else
   subject=$(printf '%s' "$fields" | sed -n '1p')
   desc=$(printf '%s' "$fields" | sed -n '2p')
+  caller_cwd=$(printf '%s' "$fields" | sed -n '3p')
 
   # Rule 1: every task must cite at least one requirement/story/ADR ID.
   if ! printf '%s %s' "$subject" "$desc" | grep -qE '(FR|NFR)-[A-Z]{3}-[0-9]{2}|US-[0-9]{2}|ADR-[0-9]{4}'; then
@@ -94,7 +97,17 @@ fi
 # builds. One cargo reaches the run phase and holds its test binaries open while
 # another relinks them, and the linker reports LNK1104 on a green tree. A dedicated
 # target directory decouples the gate from the lead.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/.task-gate}"
+# F-257: a single shared gate directory only moved the contention. Several agents
+# complete tasks concurrently and all built into target/.task-gate, so a passing
+# branch could not close a task while another agent was compiling -- the same
+# false negative, one directory further along. The payload carries the caller's
+# `cwd`, which for a teammate is their own worktree: gate THERE. It removes the
+# contention entirely (each worktree has its own target/), it reuses a warm cache
+# instead of a cold one, and -- the part that actually matters -- it tests the tree
+# the teammate worked in rather than a copy of it.
+if [ -n "$caller_cwd" ] && [ -d "$caller_cwd" ] && [ -f "$caller_cwd/Cargo.toml" ]; then
+  cd "$caller_cwd" || true
+fi
 
 # F-242: that is necessary and not sufficient. The gate dir is still shared across
 # concurrent completions from different teammates, and LNK1104 is a *link-stage*
@@ -113,9 +126,9 @@ run_cargo() {
   fi
   if [ $rc -ne 0 ]; then
     if printf '%s' "$out" | grep -q 'LNK1104'; then
-      echo "Task completion gate: $what hit LNK1104 (a Windows file-lock/link failure) twice in $CARGO_TARGET_DIR. This is environmental contention, not necessarily your code -- re-run it in your worktree before believing it." >&2
+      echo "Task completion gate: $what hit LNK1104 (a Windows file-lock/link failure) twice in $PWD. This is environmental contention, not necessarily your code -- re-run it in your worktree before believing it." >&2
     else
-      echo "Task completion rejected: $what is failing (gate target dir: $CARGO_TARGET_DIR)." >&2
+      echo "Task completion rejected: $what is failing (gated in: $PWD)." >&2
     fi
     return 1
   fi
