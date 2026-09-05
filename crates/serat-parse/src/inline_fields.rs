@@ -81,7 +81,10 @@ pub(crate) fn strip(text: &str) -> String {
 /// inferred from what was written, the same way frontmatter's are.
 pub(crate) fn infer_value(raw: &str) -> FieldValue {
     let raw = raw.trim();
-    if let Some(list) = raw.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    if let Some(list) = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         return FieldValue::List(
             list.split(',')
                 .map(str::trim)
@@ -117,9 +120,9 @@ fn infer_scalar(raw: &str) -> FieldValue {
 fn is_iso_date(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     let digits_at = |range: std::ops::Range<usize>| {
-        bytes.get(range.clone()).is_some_and(|slice| {
-            slice.len() == range.len() && slice.iter().all(u8::is_ascii_digit)
-        })
+        bytes
+            .get(range.clone())
+            .is_some_and(|slice| slice.len() == range.len() && slice.iter().all(u8::is_ascii_digit))
     };
     bytes.len() >= 10
         && digits_at(0..4)
@@ -184,7 +187,10 @@ mod tests {
         assert_eq!(infer_value("42"), FieldValue::Num(42.0));
         assert_eq!(infer_value("3.5"), FieldValue::Num(3.5));
         assert_eq!(infer_value("true"), FieldValue::Bool(true));
-        assert_eq!(infer_value("2024-01-01"), FieldValue::Date("2024-01-01".to_owned()));
+        assert_eq!(
+            infer_value("2024-01-01"),
+            FieldValue::Date("2024-01-01".to_owned())
+        );
         assert_eq!(infer_value("sujan"), FieldValue::Text("sujan".to_owned()));
         assert_eq!(
             infer_value("[a, b, 2]"),

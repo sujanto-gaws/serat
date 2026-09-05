@@ -73,10 +73,14 @@ fn upsert_note(
         .sum();
 
     tx.execute(
-        "INSERT INTO notes (path, title, type, kind, mtime, hash, word_count)
-         VALUES (?1, ?2, ?3, 'note', ?4, ?5, ?6)",
+        "INSERT INTO notes (path, stem, title, type, kind, mtime, hash, word_count)
+         VALUES (?1, ?2, ?3, ?4, 'note', ?5, ?6, ?7)",
         params![
             meta.path.as_str(),
+            // What a bare `[[wikilink]]` names (F-312). Stored rather than
+            // derived because resolution joins on it once per link and a
+            // computed basename cannot use an index.
+            meta.path.stem(),
             parsed.title.as_deref(),
             parsed.note_type.as_deref(),
             meta.mtime_ms,

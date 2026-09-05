@@ -89,7 +89,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 -- ============================================================================
 -- Tables
@@ -132,6 +132,13 @@ CREATE TABLE index_meta (
 CREATE TABLE notes (
     id           INTEGER PRIMARY KEY,
     path         TEXT    NOT NULL UNIQUE,  -- vault-relative, canonical, / separated
+    -- The file name without its extension. This is what a bare `[[wikilink]]`
+    -- names: Obsidian resolves a target with no `/` in it by FILE NAME anywhere
+    -- in the vault, not by path and not by frontmatter title (NFR-CMP-01). It is
+    -- a stored column rather than an expression because resolution joins on it
+    -- once per link -- 216,971 of them on the 20k vault -- and a computed
+    -- basename cannot use an index (F-312).
+    stem         TEXT,
     title        TEXT,                     -- frontmatter title, else H1, else filename
     type         TEXT,                     -- declared type name; NULL = untyped (P2)
     lens         TEXT,                     -- role lens (P3)
@@ -325,6 +332,10 @@ CREATE INDEX ix_notes_type ON notes(type) WHERE type IS NOT NULL;
 -- the index the planner wrongly preferred over ix_notes_type before ANALYZE
 -- existed (§4.3): kind='note' matches nearly every row, type='project' a slice.
 CREATE INDEX ix_notes_kind ON notes(kind);
+-- Link resolution matches a bare `[[wikilink]]` against this. Without it the
+-- join is a full scan of notes per link and the rebuild does not finish inside
+-- NFR-PRF-04's budget (F-312).
+CREATE INDEX ix_notes_stem ON notes(stem) WHERE stem IS NOT NULL;
 
 -- The pivot join, one lookup per referenced field key per row (ADR-0003).
 -- val_text is carried so the common untyped projection is answered from the

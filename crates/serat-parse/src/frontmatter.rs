@@ -126,7 +126,11 @@ fn split_key_value(line: &str) -> Option<(&str, &str, usize)> {
     }
     let (key, rest) = trimmed.split_once(':')?;
     let key = key.trim();
-    if key.is_empty() || !key.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-') {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+    {
         return None;
     }
     let value_in_rest = rest.len() - rest.trim_start().len();

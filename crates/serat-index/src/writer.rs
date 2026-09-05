@@ -461,26 +461,44 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     // missing — so the row count comes back as "rows touched" rather than "links
     // resolved", and a dangling link reads as resolved. It also keeps a rebuild from
     // writing to rows it has nothing to say about.
-    let resolved = conn
-        .execute(
-            "UPDATE links
-                SET dst_note = (
-                    SELECT n.id FROM notes n
-                     WHERE n.path = links.dst_path
+    //
+    // F-312: a bare `[[wikilink]]` names a FILE, not a path. Obsidian resolves a
+    // target containing no `/` by file name anywhere in the vault (NFR-CMP-01),
+    // so matching `notes.path` alone resolves only the notes that happen to sit
+    // at the vault root — 8,359 of 216,971 on the 20k vault, because 18,605 of
+    // its 20,002 notes are nested. `notes.stem` carries the file name and is
+    // indexed for this join.
+    //
+    // Ties are broken by shortest path, which is Obsidian's rule and is
+    // deterministic here: two notes with the same file name in different folders
+    // resolve to the shallower one. `ORDER BY length(n.path), n.path` makes it
+    // total rather than leaving the second key to the query planner, because a
+    // rebuild that resolves the same link two ways on two runs would produce a
+    // corpus digest that changes without the corpus changing.
+    const RESOLVE: &str = "
+        UPDATE links
+           SET dst_note = (
+                SELECT n.id FROM notes n
+                 WHERE n.kind = 'note'
+                   AND (n.path = links.dst_path
                         OR n.path = links.dst_path || '.md'
-                     LIMIT 1
-                )
-              WHERE dst_note IS NULL
-                AND kind <> 'tag'
-                AND dst_path IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM notes n
-                     WHERE n.path = links.dst_path
+                        OR (instr(links.dst_path, '/') = 0
+                            AND n.stem = links.dst_path))
+              ORDER BY length(n.path), n.path
+                 LIMIT 1
+           )
+         WHERE dst_note IS NULL
+           AND kind <> 'tag'
+           AND dst_path IS NOT NULL
+           AND EXISTS (
+                SELECT 1 FROM notes n
+                 WHERE n.kind = 'note'
+                   AND (n.path = links.dst_path
                         OR n.path = links.dst_path || '.md'
-                )",
-            [],
-        )
-        .map_err(sqlite)?;
+                        OR (instr(links.dst_path, '/') = 0
+                            AND n.stem = links.dst_path))
+           )";
+    let resolved = conn.execute(RESOLVE, []).map_err(sqlite)?;
     Ok(resolved)
 }
 
