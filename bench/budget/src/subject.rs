@@ -1,17 +1,26 @@
 //! The seam — the only module in the harness that touches a Serat crate.
 //!
 //! Everything measured enters through one of the three functions below. They
-//! return an error today because the entry points they need do not exist yet:
-//! `serat-index` is scaffolded (task I1) and gets its rebuild in I4, its
-//! incremental save path in I5; the cold-start marks are task S1 once the
-//! architect's D2 defines them. **The jobs therefore land red on purpose.** A
-//! budget job that skips when the thing it measures is absent is worse than no
-//! job, because a green build then means nothing.
+//! return an error today because something they need does not exist yet.
 //!
-//! Keeping the seam in one file is deliberate: when I4 lands, exactly one
-//! function changes and no measurement code moves. The signatures below are the
-//! request to `rust-core-dev` — anything that satisfies them satisfies the
-//! harness.
+//! **I4 (rebuild) and I5 (incremental apply) have both landed** on
+//! `serat-index`. What is missing from both `full_rebuild()` and
+//! `save_to_index()` is the same thing: a production `NoteParser`.
+//! `serat-parse` (task I3) is still the I1 scaffold, and neither seam can be
+//! assembled without excluding real parse cost from its total — which for
+//! `save_to_index()` specifically would also mean asserting a number `apply()`
+//! never actually produced, since parsing is on its critical path. See
+//! [`SAVE_ENTRY_POINT`] and [`REBUILD_ENTRY_POINT`].
+//!
+//! `cold_start()` waits on S1 once architect's D2 defines the vault-usable
+//! mark. **The jobs therefore land red on purpose.** A budget job that skips
+//! when the thing it measures is absent is worse than no job, because a green
+//! build then means nothing.
+//!
+//! Keeping the seam in one file is deliberate: when a function's last blocker
+//! lands, only that function's body changes and no measurement code moves.
+//! The signatures in the `*_ENTRY_POINT` constants below are the request to
+//! `rust-core-dev` — anything that satisfies them satisfies the harness.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -179,9 +188,12 @@ still asserts the total; the phases are recorded beside it.";
 #[derive(Clone, Debug, Default)]
 pub struct SaveSamples {
     /// Which code path every sample in `save` was measured on. Must read
-    /// `"save"` — [`crate::check_save_path`] refuses anything else, the same
-    /// guard [`SaveTiming::path`] documents. Defaults to `""`, which fails
-    /// closed rather than open.
+    /// `"save"` — [`crate::check_save_path`] refuses anything else. This is
+    /// the harness's own claim about how it measured, since `apply()` returns
+    /// `Result<(), IndexError>` and hands back no discriminant of its own
+    /// (F-229) — the guard is a self-check on the measurement code, the same
+    /// role `check_bulk_load_shape` plays for the rebuild. Defaults to `""`,
+    /// which fails closed rather than open.
     pub path: &'static str,
     /// §3.1.1's save path: `apply()` submitted through `flush()` returning.
     /// No watcher, no debounce, no dequeue. **The asserted series.**
@@ -198,76 +210,56 @@ pub struct SaveSamples {
     pub pipeline: Samples,
 }
 
-/// A single save's timing, and which code path measured it.
-///
-/// **P0 finding F-229.** A wall-clock number cannot say on its own whether it
-/// came from Serat's own save path or from a save observed through the
-/// watcher — the two differ by an order of magnitude in what they are allowed
-/// to cost, and F-268 is what happens when the difference is invisible from
-/// inside the harness. `path` makes it a structural fact of the measurement
-/// rather than a name someone has to remember means something: it must read
-/// `"save"` — [`crate::check_save_path`] refuses anything else — because
-/// `"watcher"` (or any other value) means this timing carries FR-VLT-04's
-/// budget and the 150 ms coalescing window, not NFR-PRF-03's.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SaveTiming {
-    /// Must read `"save"`. Defaults to `""`, which fails the check closed
-    /// rather than open.
-    pub path: &'static str,
-    /// How long reading and hashing the buffer took (§3.1 step 3).
-    pub read_hash: Duration,
-    /// How long parsing took, on the in-memory bytes just written — never a
-    /// re-read of the file (§3.1.1's explicit requirement).
-    pub parse: Duration,
-    /// `apply()` submitted through `flush()` returning. Single-threaded on
-    /// this path, so `read_hash + parse + write` **does** sum to the total,
-    /// unlike the rebuild's phases.
-    pub write: Duration,
-}
-
 /// What the harness needs before NFR-PRF-03 is measurable.
 ///
-/// Corrected by **F-267**, which is itself a correction of F-230: this
-/// constant is a `&str`, not compiled code, so a stale call site here never
-/// broke the build the way F-230 assumed — it read as a plausible
-/// specification instead, which is the worse failure mode, because nothing
-/// forces a reader to notice. It instructed building `apply_and_wait`, which
-/// §2.2 ruled against (a barrier must stay visible where it is called); the
-/// real composition is `apply()` then `writer().flush()`, corrected below.
+/// **I5 landed** (`crates/serat-index/src/incremental.rs`), and its own module
+/// doc states F-268's split independently: *"A save made in Serat goes
+/// bytes → hash → parse → writer, with no watcher and no debounce. That is
+/// what `IndexHandle::apply` serves and what NFR-PRF-03's 50 ms governs...
+/// An external change goes through the watcher's 150 ms coalescing window...
+/// That interval is FR-VLT-04's, whose criterion is 500 ms."* What is missing
+/// is `NoteParser` — `apply()` takes one, and `serat-parse` (task I3) still
+/// has none, the same blocker [`crate::full_rebuild`] is waiting on.
+///
+/// Corrected by **F-267** (itself a correction of F-230) and then again once
+/// I5's real shape was visible: this constant is a `&str`, not compiled code,
+/// so a stale call site here never broke the build — it read as a plausible
+/// specification instead, the worse failure mode, because nothing forces a
+/// reader to notice. Two things this text got wrong before I5 landed:
+/// `IndexHandle::open` takes one argument, not `(vault_root, index_dir)`; and
+/// `apply()` returns `Result<(), IndexError>`, not a timing struct — it does
+/// not instrument itself, so the harness must time the call from the outside,
+/// the same way it already times `rebuild()`'s wall clock.
 pub const SAVE_ENTRY_POINT: &str = "\
-NFR-PRF-03 needs, from serat-index (task I5):
+NFR-PRF-03 needs, from serat-parse (task I3) -- serat-index's own half landed:
 
-    let handle = IndexHandle::open(vault_root, index_dir)?;
-    let timing: SaveTiming =
-        handle.apply(&vault, &parser, &echo, &path)?;   // submits directly
-    handle.writer().flush()?;                            // the barrier, visible at the call
-
-    // SaveTiming { path, read_hash, parse, write } -- single-threaded on this
-    // path, so read_hash + parse + write DOES sum to the total, unlike the
-    // rebuild's phases. `path` must read \"save\": this is Serat's own save
-    // path, with no watcher, no debounce, no dequeue, and it is the ONLY
-    // reading NFR-PRF-03 can mean (F-227, F-268) -- a save observed through
-    // the watcher instead carries FR-VLT-04's 500 ms budget and the 150 ms
-    // coalescing window, and the harness refuses to assert a number whose
-    // `path` does not read \"save\" (F-229, check_save_path).
+    let handle = IndexHandle::open(index_dir)?;
+    let started = Instant::now();
+    handle.apply(&vault, &parser, &echo, &path)?;   // submits directly, no watcher
+    handle.writer().flush()?;                        // the barrier, visible at the call
+    let elapsed = started.elapsed();                 // the harness's own timing; apply()
+                                                       // returns () and instruments nothing
 
 apply() then flush(), NOT a combined apply_and_wait(): a barrier must stay
 visible where it is called (architecture §2.2). apply(); flush(); shows the
 wait; a combined call hides one and is a copy-paste from the save path where
-waiting is forbidden by design goal 2.
+waiting is forbidden by design goal 2. There is no apply_and_wait anywhere in
+serat-index -- it was never built, only ever the wrong entry this text used
+to request (F-267, correcting F-230).
 
-The full signature is apply(&dyn NoteSource, &dyn NoteParser, &dyn EchoGuard,
-&VaultPath) then writer().flush(). NoteSource and NoteParser are the traits
-rebuild() already takes (architecture §2.1); EchoGuard is what makes echo
-suppression (§3.2) a parameter the harness can see rather than a private
-detail apply() reaches for on its own.
+The full, landed signature is apply(&dyn NoteSource, &dyn NoteParser,
+&dyn EchoGuard, &VaultPath) -> Result<(), IndexError>, then writer().flush().
+NoteSource and NoteParser are the traits rebuild() already takes (architecture
+§2.1); EchoGuard is what makes echo suppression (§3.2) a parameter the harness
+can see rather than a private detail apply() reaches for on its own.
 
 One submit per flush. flush() drains the whole queue, so submitting fifty and
 flushing once would be a throughput figure wearing a latency label, and
 NFR-PRF-03 is a p95 of individual saves.
 
 The harness edits 1,000 distinct notes, one at a time, and reports the save
-interval (asserted) beside the two watcher-path intervals (reported, F-227,
+interval (asserted, tagged path = \"save\" -- crate::check_save_path refuses
+anything else, F-229) beside the two watcher-path intervals (reported, F-227,
 F-268): file-written-to-visible via the watcher, and watcher-event-dequeued-
 to-visible. Distinct notes rather than one note a thousand times, because
 re-saving one note measures a warm row and not the budget -- and the sample
@@ -379,7 +371,10 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, Str
 /// intervals reported beside it (F-227, F-268).
 ///
 /// # Errors
-/// Today: always, because the incremental save path does not exist yet.
+/// Today: always. `IndexHandle::apply` (I5) is real, on main, but there is no
+/// production `NoteParser` to hand it — `serat-parse` (task I3) is still the
+/// I1 scaffold, the same blocker [`full_rebuild`] is waiting on. See
+/// [`SAVE_ENTRY_POINT`].
 pub fn save_to_index(
     vault: &Path,
     index_dir: &Path,
@@ -391,7 +386,7 @@ pub fn save_to_index(
     // measurement will use it for real.
     let _gate = serat_vault::hash_bytes(b"---\ntype: note\n---\n");
     Err(format!(
-        "the incremental save path does not exist yet — task I5.\n\n{SAVE_ENTRY_POINT}"
+        "serat-parse exposes no NoteParser implementation yet — task I3.\n\n{SAVE_ENTRY_POINT}"
     ))
 }
 
@@ -516,7 +511,9 @@ mod tests {
         assert_eq!(phases.write(), Duration::from_millis(560));
 
         let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
-        assert!(e.contains("task I5"), "{e}");
+        // I5 (apply/flush) is real on main; I3 (NoteParser) is the actual
+        // remaining blocker, the same one full_rebuild() is waiting on.
+        assert!(e.contains("task I3"), "{e}");
         // F-267 corrected the entry point away from apply_and_wait, which §2.2
         // ruled against; the request must name the real composition and the
         // F-229 path discriminant, or a future implementer builds the wrong

@@ -1335,8 +1335,10 @@ pub fn measure_save_to_index(
 /// As [`measure_save_to_index`], against an injected save path.
 ///
 /// Split out so `check_save_path` refusing a watcher-path measurement can be
-/// tested without the real seam existing yet (task I5) — the same reasoning
-/// as `measure_full_rebuild_with`, and forced by the same lesson: F-268 was a
+/// tested without the real seam existing yet (task I3, the last blocker
+/// standing between `subject::save_to_index` and a real number now that I5
+/// has landed) — the same reasoning as `measure_full_rebuild_with`, and
+/// forced by the same lesson: F-268 was a
 /// harness bug nothing exercised, because nothing could inject a `"watcher"`
 /// tag to prove the guard fires on it.
 ///
@@ -1856,8 +1858,8 @@ mod tests {
         assert!(err.contains("F-229"), "{err}");
         assert!(err.contains("F-268"), "{err}");
 
-        // SaveSamples::default()/SaveTiming::default() both give "" -- the
-        // guard must fail closed on the default, not open.
+        // SaveSamples::default() gives path: "" -- the guard must fail closed
+        // on the default, not open.
         assert!(check_save_path("").is_err());
     }
 
