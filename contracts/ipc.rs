@@ -360,7 +360,16 @@ pub enum RebuildReason {
     NoIndex,
     /// `PRAGMA user_version` is not the version this build writes. There is no
     /// migration path and never will be (ADR-0002); this is the whole of it.
-    SchemaChanged,
+    ///
+    /// Named for the *index* rather than the schema, deliberately. The stamp is
+    /// bumped when the DDL changes **or** when the indexer starts extracting
+    /// something different from unchanged input, and a user told their "schema
+    /// changed" when their parser improved has been told the wrong thing. There
+    /// is no second variant for the derivation case: the check cannot tell the
+    /// two apart from one number, and the sentence a user needs is the same for
+    /// both. The distinction that matters is this variant against `Corrupt`
+    /// (F-134, F-175).
+    IndexVersion,
     /// `index_meta.state` is not `'ready'`: a previous rebuild did not commit.
     Interrupted,
     /// `index_meta.vault_root` names a different vault. The folder moved, or a

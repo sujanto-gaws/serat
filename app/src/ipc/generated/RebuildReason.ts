@@ -9,4 +9,4 @@
  * last step, so there is no order to share. If a variant is added here, that
  * section is what changed.
  */
-export type RebuildReason = "no_index" | "schema_changed" | "interrupted" | "vault_moved" | "corrupt" | "user_requested";
+export type RebuildReason = "no_index" | "index_version" | "interrupted" | "vault_moved" | "corrupt" | "user_requested";
