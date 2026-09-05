@@ -25,10 +25,11 @@ fn a_save_is_visible_to_a_reader_once_the_writer_has_been_flushed() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     handle
-        .apply(&vault, &parser, &path("10-projects/serat.md"))
+        .apply(&vault, &parser, &echo, &path("10-projects/serat.md"))
         .expect("save");
     // The composition the ruling requires: apply submits, flush waits, and the wait is
     // visible at the call site rather than hidden inside a verb.
@@ -51,13 +52,14 @@ fn a_save_does_not_wait_for_the_writer() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
     let handle = IndexHandle::with_queue_depth(dir.path(), 1).expect("open");
 
     let started = std::time::Instant::now();
     for _ in 0..64 {
         // Some of these will be refused with QueueFull, which is backpressure and the
         // save path's cue to let a rescan find the file — not a reason to wait.
-        let _ = handle.apply(&vault, &parser, &path("10-projects/serat.md"));
+        let _ = handle.apply(&vault, &parser, &echo, &path("10-projects/serat.md"));
     }
     let elapsed = started.elapsed();
 
@@ -73,10 +75,11 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     let target = path("10-projects/serat.md");
-    handle.apply(&vault, &parser, &target).expect("first");
+    handle.apply(&vault, &parser, &echo, &target).expect("first");
     handle.writer().flush().expect("flush");
     let blocks_after_first = {
         let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
@@ -86,7 +89,7 @@ fn saving_the_same_note_twice_replaces_its_rows_rather_than_doubling_them() {
         .expect("count")
     };
 
-    handle.apply(&vault, &parser, &target).expect("second");
+    handle.apply(&vault, &parser, &echo, &target).expect("second");
     handle.writer().flush().expect("flush");
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");
     let blocks: i64 = conn
@@ -108,15 +111,16 @@ fn a_save_of_a_file_that_has_gone_removes_it() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
     let handle = IndexHandle::open(dir.path()).expect("open");
 
     let target = path("10-projects/serat.md");
-    handle.apply(&vault, &parser, &target).expect("save");
+    handle.apply(&vault, &parser, &echo, &target).expect("save");
     handle.writer().flush().expect("flush");
     assert_eq!(note_count(dir.path()), 1);
 
     let emptied = FakeVault::with(&[]);
-    handle.apply(&emptied, &parser, &target).expect("removal");
+    handle.apply(&emptied, &parser, &echo, &target).expect("removal");
     handle.writer().flush().expect("flush");
     assert_eq!(
         note_count(dir.path()),
@@ -134,13 +138,14 @@ fn a_save_after_a_rebuild_updates_the_note_rather_than_adding_one() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture();
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
 
     let report = rebuild(&vault, &parser, dir.path()).expect("rebuild");
     assert_eq!(report.notes, 3);
 
     let handle = IndexHandle::open(dir.path()).expect("open");
     handle
-        .apply(&vault, &parser, &path("10-projects/serat.md"))
+        .apply(&vault, &parser, &echo, &path("10-projects/serat.md"))
         .expect("save");
     handle.writer().flush().expect("flush");
 
@@ -156,14 +161,15 @@ fn a_save_keeps_the_full_text_index_in_step() {
     let dir = tempfile::tempdir().expect("temp");
     let vault = FakeVault::with(&[("note.md", "# Before\nthe original wording\n")]);
     let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
     let handle = IndexHandle::open(dir.path()).expect("open");
     let target = path("note.md");
 
-    handle.apply(&vault, &parser, &target).expect("save");
+    handle.apply(&vault, &parser, &echo, &target).expect("save");
     handle.writer().flush().expect("flush");
 
     let amended = FakeVault::with(&[("note.md", "# After\nthe amended wording\n")]);
-    handle.apply(&amended, &parser, &target).expect("save");
+    handle.apply(&amended, &parser, &echo, &target).expect("save");
     handle.writer().flush().expect("flush");
 
     let conn = schema::open(&serat_index::index_path(dir.path())).expect("open");

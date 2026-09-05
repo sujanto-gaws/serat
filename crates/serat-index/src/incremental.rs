@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use serat_core::{
-    IndexError, IndexOp, IndexWriter as _, LoadedNote, NoteKind, NoteParser, NoteSource,
+    EchoGuard, IndexError, IndexOp, IndexWriter, LoadedNote, NoteKind, NoteParser, NoteSource,
     SourceEntry, VaultPath,
 };
 
@@ -142,32 +142,33 @@ impl IndexHandle {
     /// caller passing bytes would have to hash them itself, and then two places would
     /// define what a note's identity is.
     ///
+    /// `echo` is a separate trait object rather than a fourth thing `source` knows how
+    /// to do (F-210): once — and only once — the submit below is accepted,
+    /// [`EchoGuard::record_echo`] is called with the hash just indexed, so the watcher
+    /// recognises the write that produced it and drops the event instead of reindexing
+    /// what this call already indexed. Recording only *after* a successful submit is
+    /// F-224's resolution to F-196/F-219/F-222: recording before the write could
+    /// suppress the only event that would ever have indexed the note, if the submit
+    /// that followed was then refused. Late recording removes that race rather than
+    /// narrowing it — a refused submit records nothing here, so the watcher's own
+    /// event carries the save instead, and a watcher event that wins a race against
+    /// this call merely indexes the same note a moment early, which is safe because
+    /// `upsert_note` is delete-then-insert by path.
+    ///
     /// # Errors
     ///
-    /// [`IndexError::QueueFull`] if the writer is behind — backpressure, and the
-    /// caller's cue to drop this and let a rescan find it, exactly as the watcher
-    /// path does. [`IndexError::WriterStopped`] if the writer is gone.
+    /// [`IndexError::QueueFull`] if the writer is behind — ordinary backpressure. No
+    /// special recovery is needed on this path any more: nothing was recorded, so the
+    /// watcher's own event for this write, whenever it arrives, indexes it normally.
+    /// [`IndexError::WriterStopped`] if the writer is gone.
     pub fn apply(
         &self,
         source: &dyn NoteSource,
         parser: &dyn NoteParser,
+        echo: &dyn EchoGuard,
         path: &VaultPath,
     ) -> Result<(), IndexError> {
-        let op = match source.load(path) {
-            // A file the save path was told about but cannot read has been deleted.
-            Err(_) => IndexOp::Remove { path: path.clone() },
-            Ok(loaded) => match build_op(parser, path, loaded) {
-                Some((op, _)) => op,
-                // Nothing to index: the previous row stays, which is better than
-                // deleting a note because one save of it did not parse.
-                None => return Ok(()),
-            },
-        };
-
-        // submit, not submit_blocking. On the save path a full queue means the writer
-        // is behind, and waiting here is precisely what design goal 2 forbids — the
-        // refusal is recoverable because a rescan finds the path again.
-        self.actor.handle().submit(op)
+        apply_via(&self.actor.handle(), source, parser, echo, path)
     }
 
     /// Stop the writer, applying anything queued.
@@ -178,6 +179,50 @@ impl IndexHandle {
     pub fn close(self) -> Result<(), IndexError> {
         self.actor.shutdown()
     }
+}
+
+/// The body of [`IndexHandle::apply`], taking the writer as a trait object.
+///
+/// Split out so the ordering it implements — submit, then record the echo only on
+/// success — can be tested against a writer that always refuses and one that always
+/// accepts, deterministically and without racing the real writer thread's draining
+/// speed (F-58: a test that cannot reliably reach the refusal branch proves nothing
+/// about it).
+fn apply_via(
+    writer: &dyn IndexWriter,
+    source: &dyn NoteSource,
+    parser: &dyn NoteParser,
+    echo: &dyn EchoGuard,
+    path: &VaultPath,
+) -> Result<(), IndexError> {
+    let (op, hash) = match source.load(path) {
+        // A file the save path was told about but cannot read has been deleted.
+        // Nothing was indexed, so there is nothing to record an echo for.
+        Err(_) => (IndexOp::Remove { path: path.clone() }, None),
+        Ok(loaded) => {
+            let hash = loaded.meta.hash;
+            match build_op(parser, path, loaded) {
+                Some((op, _)) => (op, Some(hash)),
+                // Nothing to index: the previous row stays, which is better than
+                // deleting a note because one save of it did not parse. Nothing was
+                // submitted, so again nothing to record.
+                None => return Ok(()),
+            }
+        }
+    };
+
+    // submit, not submit_blocking. On the save path a full queue means the writer is
+    // behind, and waiting here is precisely what design goal 2 forbids — the refusal
+    // is `?`'d straight back to the caller before anything is recorded below.
+    writer.submit(op)?;
+
+    // Late recording (F-224): only once the submit above has actually been accepted.
+    // See the doc comment on `IndexHandle::apply` for why "after" rather than "before"
+    // is the whole fix.
+    if let Some(hash) = hash {
+        echo.record_echo(hash);
+    }
+    Ok(())
 }
 
 /// Turn a loaded file into the operation that indexes it, or `None` if it cannot be.
@@ -257,4 +302,176 @@ pub(crate) fn parse_chunk(
         }
         (ops, read_hash, parse)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serat_core::{ContentHash, NoteMeta, ParseError, ParsedNote, VaultError};
+    use std::sync::Mutex;
+
+    /// A source with exactly one file, whose hash is fixed so a test can assert on it.
+    struct OneFile {
+        hash: ContentHash,
+    }
+
+    impl NoteSource for OneFile {
+        fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
+            unimplemented!("apply_via never enumerates; only load")
+        }
+
+        fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+            Ok(LoadedNote {
+                meta: NoteMeta {
+                    path: path.clone(),
+                    hash: self.hash,
+                    kind: NoteKind::Note,
+                    size: 0,
+                    mtime_ms: 0,
+                },
+                bytes: b"# Note\n".to_vec(),
+            })
+        }
+    }
+
+    /// Parses nothing; just proves `apply_via` reached the submit step.
+    struct TrivialParser;
+
+    impl NoteParser for TrivialParser {
+        fn parse(&self, _path: &VaultPath, _bytes: &[u8]) -> Result<ParsedNote, ParseError> {
+            Ok(ParsedNote::default())
+        }
+    }
+
+    /// Records every hash it is told about, so a test can assert exactly what was
+    /// recorded and in what order — including "nothing".
+    #[derive(Default)]
+    struct SpyEcho {
+        recorded: Mutex<Vec<ContentHash>>,
+    }
+
+    impl EchoGuard for SpyEcho {
+        fn record_echo(&self, hash: ContentHash) {
+            self.recorded.lock().expect("lock").push(hash);
+        }
+    }
+
+    /// A writer that refuses every submission, standing in for "the writer is behind"
+    /// without racing a real writer thread's draining speed.
+    struct AlwaysFull;
+
+    impl IndexWriter for AlwaysFull {
+        fn submit(&self, _op: IndexOp) -> Result<(), IndexError> {
+            Err(IndexError::QueueFull { depth: 0 })
+        }
+
+        fn flush(&self) -> Result<(), IndexError> {
+            Ok(())
+        }
+    }
+
+    /// A writer that accepts everything, standing in for the ordinary case.
+    struct AlwaysAccepts;
+
+    impl IndexWriter for AlwaysAccepts {
+        fn submit(&self, _op: IndexOp) -> Result<(), IndexError> {
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<(), IndexError> {
+            Ok(())
+        }
+    }
+
+    fn path(text: &str) -> VaultPath {
+        VaultPath::new(text).expect("path")
+    }
+
+    #[test]
+    fn a_refused_submit_records_no_echo() {
+        // F-196 / F-219 / F-222, closed by F-224's late recording rather than narrowed.
+        // The old design recorded the hash before the write, so a submit refused here
+        // would have left an entry that permanently suppressed the only event that
+        // would ever have indexed this note. Under late recording, a refusal must
+        // leave the echo suppressor untouched: the setup below genuinely reaches the
+        // refusal branch every time, deterministically (F-58), rather than racing a
+        // real writer's draining speed as `IndexHandle::with_queue_depth(dir, 1)` does
+        // in the integration tests.
+        let hash = ContentHash::from_bytes([9u8; 32]);
+        let echo = SpyEcho::default();
+
+        let result = apply_via(
+            &AlwaysFull,
+            &OneFile { hash },
+            &TrivialParser,
+            &echo,
+            &path("note.md"),
+        );
+
+        assert!(
+            matches!(result, Err(IndexError::QueueFull { .. })),
+            "the refusal was not propagated to the caller: {result:?}"
+        );
+        assert!(
+            echo.recorded.lock().expect("lock").is_empty(),
+            "a refused submit recorded an echo; the watcher event that is now the only \
+             way this save reaches the index would be suppressed for nothing"
+        );
+    }
+
+    #[test]
+    fn a_successful_submit_records_the_echo_after_not_before() {
+        // The mirror case: once the submit is accepted, the echo must be recorded so
+        // the watcher drops its own event for the write that already indexed it —
+        // otherwise every save is indexed twice, once here and once by the watcher.
+        let hash = ContentHash::from_bytes([9u8; 32]);
+        let echo = SpyEcho::default();
+
+        apply_via(
+            &AlwaysAccepts,
+            &OneFile { hash },
+            &TrivialParser,
+            &echo,
+            &path("note.md"),
+        )
+        .expect("submit");
+
+        assert_eq!(
+            *echo.recorded.lock().expect("lock"),
+            vec![hash],
+            "a successful submit did not record exactly the hash it indexed"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_records_no_echo_either() {
+        // A Remove op is not a write this vault produced bytes for, so there is no
+        // hash to suppress an event for — and none should be invented.
+        struct Gone;
+        impl NoteSource for Gone {
+            fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
+                unimplemented!()
+            }
+            fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+                Err(VaultError::NotFound {
+                    path: path.as_str().to_owned(),
+                })
+            }
+        }
+
+        let echo = SpyEcho::default();
+        apply_via(
+            &AlwaysAccepts,
+            &Gone,
+            &TrivialParser,
+            &echo,
+            &path("gone.md"),
+        )
+        .expect("remove");
+
+        assert!(
+            echo.recorded.lock().expect("lock").is_empty(),
+            "a removal recorded an echo, which has no bytes to be one"
+        );
+    }
 }

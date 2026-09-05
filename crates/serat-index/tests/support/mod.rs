@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serat_core::{
-    Block, BlockKind, ByteRange, ContentHash, Field, FieldSource, FieldValue, Link, LinkKind,
-    LinkTarget, LoadedNote, NoteKind, NoteMeta, NoteParser, NoteSource, ParseError, ParsedNote,
-    SourceEntry, Task, VaultError, VaultPath,
+    Block, BlockKind, ByteRange, ContentHash, EchoGuard, Field, FieldSource, FieldValue, Link,
+    LinkKind, LinkTarget, LoadedNote, NoteKind, NoteMeta, NoteParser, NoteSource, ParseError,
+    ParsedNote, SourceEntry, Task, VaultError, VaultPath,
 };
 
 /// A vault that lives in a `Vec`.
@@ -186,6 +186,23 @@ impl NoteParser for LineParser {
         }
 
         Ok(parsed)
+    }
+}
+
+/// An `EchoGuard` that records every hash it is told about, in order.
+///
+/// Standing in for `serat_vault::Vault` in these tests, which never depend on
+/// `serat-vault` at all (the dependency rule, paying for itself again). Integration
+/// tests that only care about the index's own behaviour and not about what got
+/// recorded can construct one and ignore it.
+#[derive(Debug, Default)]
+pub struct SpyEcho {
+    pub recorded: Mutex<Vec<ContentHash>>,
+}
+
+impl EchoGuard for SpyEcho {
+    fn record_echo(&self, hash: ContentHash) {
+        self.recorded.lock().expect("lock").push(hash);
     }
 }
 
