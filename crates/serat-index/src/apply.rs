@@ -292,6 +292,7 @@ fn insert_link(
         LinkKind::Wikilink => "wiki",
         LinkKind::Embed => "embed",
         LinkKind::Markdown => "md",
+        LinkKind::Tag => "tag",
     };
     tx.execute(
         "INSERT INTO links (src_note, src_block, dst_path, dst_block_ref, kind, alias)

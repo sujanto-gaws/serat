@@ -10,6 +10,14 @@ repository.workspace = true
 [dependencies]
 serat-core = { workspace = true }
 comrak = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+# The corpus digest guard's only user (F-185/F-188): hashing an in-memory string is
+# computation, not I/O, so this does not reopen "serat-parse performs no file access
+# of any kind" — it is dev-only and never touches a byte this crate did not already
+# produce in memory.
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
