@@ -396,8 +396,19 @@ pub struct VaultUnderTest {
     pub digest: String,
     /// The generator format version that produced it.
     pub format_version: u32,
-    /// Notes it contains.
+    /// Markdown notes it contains, from the manifest's `counts.notes`.
     pub notes: usize,
+    /// Binary asset files it contains, from the manifest's `counts.assets`.
+    ///
+    /// Kept separate from `notes` for the same reason as `asset_embeds` below:
+    /// `serat_index::RebuildReport::notes` counts every row in the `notes`
+    /// table, and an asset is a row there too (`kind='asset'`, ADR-0005), so a
+    /// correct rebuild of this vault reports `notes + assets`, not `notes`
+    /// alone. The 20k preset is 20,000 markdown notes and 200 assets; a check
+    /// against `notes` alone would reject every correct rebuild — the exact
+    /// failure `REBUILD_ENTRY_POINT`'s call-site comment warns against, found
+    /// while wiring `full_rebuild()` for real.
+    pub assets: usize,
     /// Note-to-note link edges the generator produced, from the manifest's
     /// `link_degree.edges`.
     pub note_links: usize,
@@ -985,6 +996,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         .ok_or_else(|| format!("{} has no tree digest", manifest_path.display()))?;
     let format_version = json_number(&manifest, "format_version").unwrap_or(0.0) as u32;
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
+    let assets_in_manifest = json_number(&manifest, "assets").unwrap_or(0.0) as usize;
     let note_links = json_number(&manifest, "edges").unwrap_or(0.0) as usize;
     // Default 0 rather than failing, so a manifest generated before these
     // counts existed still runs -- and then under-reports the oracle, which
@@ -1008,6 +1020,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         digest: actual,
         format_version,
         notes: notes_in_manifest,
+        assets: assets_in_manifest,
         note_links,
         assets: preset.assets,
         asset_embeds,
@@ -1109,10 +1122,12 @@ pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), Stri
 ///
 /// P0 finding **F-47**. `sqlite_stat1` is read from the index directly, so this
 /// is an independent oracle rather than a number the rebuild reports about
-/// itself.
+/// itself. `sqlite_stat1` describes the whole `notes` table, so `expected` must
+/// be `vault.notes + vault.assets`, the same correction [`check_note_count`]
+/// needs and for the same reason (ADR-0005: an asset is a row in `notes` too).
 ///
 /// # Errors
-/// When the recorded row count is not the vault's note count.
+/// When the recorded row count is not the vault's total row count.
 pub fn check_analyze_freshness(recorded: usize, expected: usize) -> Result<(), String> {
     // The precondition, stated rather than assumed (P0 finding F-128). This is
     // the only place in the project where the defect is visible at all: below
@@ -1173,6 +1188,12 @@ pub fn check_links_resolved(reported: usize, expected: usize) -> Result<(), Stri
 /// A fast number over a partially indexed vault is the shape of a false pass,
 /// and a wall clock cannot see it (P0 finding F-19). Extracted from the job so
 /// that deleting it fails a test rather than passing silently (F-27).
+///
+/// `expected` must be `vault.notes + vault.assets`, not `vault.notes` alone:
+/// `RebuildReport::notes` counts every row in the `notes` table, and an asset
+/// is a row there too (`kind='asset'`, ADR-0005). Passing `vault.notes` on its
+/// own rejects every correct rebuild of a vault that has any assets at all —
+/// the 20k preset always would have, at 20,000 against 20,200.
 ///
 /// # Errors
 /// When the counts disagree.
@@ -1901,6 +1922,7 @@ mod tests {
             digest: "d".into(),
             format_version: 1,
             notes: 20_000,
+            assets: 200,
             note_links: 216_971,
             assets: 200,
             asset_embeds: 2_004,
@@ -1981,6 +2003,7 @@ mod tests {
             digest: "d".into(),
             format_version: vaultgen::VAULT_FORMAT_VERSION,
             notes: 20_000,
+            assets: 200,
             note_links: 216_971,
             assets: 200,
             asset_embeds: 2_004,
@@ -2532,6 +2555,11 @@ mod tests {
             }
         }
 
+        // a_vault() is 20,000 notes and 200 assets; RebuildReport::notes and
+        // sqlite_stat1 both count the whole `notes` table, so the oracle every
+        // one of these closures is judged against is 20,200, not 20,000
+        // (found the hard way while wiring full_rebuild(), see check_note_count).
+
         // A rebuild that indexed half the vault must not post a fast number.
         let err = measure_full_rebuild_with(
             &a_vault(),
@@ -2544,7 +2572,7 @@ mod tests {
 
         // A failing rebuild propagates rather than being absorbed.
         let err =
-            measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()), |_| Ok(20_000))
+            measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()), |_| Ok(20_200))
                 .expect_err("a failed rebuild is not a measurement");
         assert_eq!(err, "boom");
 
@@ -2571,7 +2599,7 @@ mod tests {
             |_, _| Ok(timing(1, 20_200, 3)),
             |_| Ok(19_968),
         )
-        .expect_err("32 notes short of the finished index");
+        .expect_err("32 rows short of the finished index");
         assert!(err.contains("ix_notes_type"), "{err}");
 
         // As does a link count that does not match the vault.
