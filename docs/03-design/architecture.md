@@ -191,18 +191,21 @@ Finding F-03 read the 150ms coalescing window as a design that misses a 50ms bud
 
 Found by reading the design against itself
 
-The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself. F-03 did not find a missing 100ms; it found a missing paragraph.
+The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself — which §3.2's ordering now *enforces* rather than assumes, since nothing is recorded, and so nothing can be suppressed, until a submit has succeeded. F-03 did not find a missing 100ms; it found a missing paragraph.
 
 ##### 3.1.1 The save path
 
 Serat knows what it wrote, so it does not wait to be told.
 
-1.  The buffer is written by temp-file-and-rename (§6.1 step 5), recording the hash it is about to produce for echo suppression **before** the rename.
+1.  The buffer is written by temp-file-and-rename (§6.1 step 5). The write records nothing: `write_atomic` writes bytes and returns the hash it produced, which is all its name claims.
 2.  The bytes just written — the ones already in memory, not a re-read of the file — go to the parse pool.
 3.  The rows go to the index writer on the same channel everything else uses.
-4.  `index.changed` is emitted and open views refresh.
+4.  **Once that submit has succeeded**, and not before, the hash is recorded for echo suppression. §3.2 sets out why that ordering is the mechanism rather than a detail of it.
+5.  `index.changed` is emitted and open views refresh.
 
-The watcher sees the event and drops it (§3.2), which is the whole of the interaction between the two paths. Nothing is coalesced because there is nothing to coalesce: one save is one write is one set of rows.
+Steps 1–4 are one sequence with one owner, and §2.1's ruling on `rebuild` already named it: the orchestration lives in **serat-index**, which reaches the vault and the parser through traits declared in serat-core and links neither crate. The suppressor arrives the same way, as a `&dyn EchoGuard` — a separate one-method trait rather than a fourth method on `NoteSource`, because recording an echo is write-path bookkeeping, and `rebuild`, which cannot produce an echo, must not be handed a method it has no relationship to. `serat_vault::Vault` implements both traits, so the call site passes the same object twice; that is explicit rather than elegant, and the tidier alternative would introduce a type whose only purpose is to hide the thing worth seeing there.
+
+The watcher sees the event and, if step 4 has already happened, drops it (§3.2) — which is the whole of the interaction between the two paths, and is an optimisation rather than a load-bearing step. If the watcher gets there first it matches nothing, the event proceeds, and the note is indexed a second time from disk: wasteful and correct. Nothing is coalesced because there is nothing to coalesce: one save is one write is one set of rows.
 
 Two consequences, stated because each looks like a bug otherwise. If another process modifies the file between our write and our parse, the index briefly reflects our bytes rather than the file's; the watcher then sees an event whose post-hash is *not* in the suppression set and the note is reindexed from disk, so the race is self-correcting and needs no mechanism of its own. And the save path must never call `flush()`: waiting for the writer to drain would put the index back on the keystroke path, which design goal 2 forbids. The UI reports "saved" when the rename completes and learns "indexed" from `index.changed`. Those are two different facts and the interface should not pretend otherwise (§2.2).
 
@@ -225,7 +228,25 @@ Nothing records the failure in the index, deliberately. It needs no column, beca
 
 #### 3.2 Echo suppression
 
-Serat's own writes produce filesystem events indistinguishable from anyone else's. Before writing, the writer records the hash it is about to produce in a short-lived set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path and entries expire after two seconds, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one.
+Serat's own writes produce filesystem events indistinguishable from anyone else's. When a save has been submitted to the index, the save path records the hash it wrote in a short-lived set; when the watcher sees an event whose post-hash is in that set, it removes the entry and drops the event. The set is keyed by hash rather than by path and entries expire after two seconds, so a genuine external edit that happens to produce the same bytes is indistinguishable from our own — and is correctly treated as a no-op, because it is one.
+
+##### The hash is recorded after the submit, not before the write
+
+This document said *before writing* until F-219..F-224, and the earlier wording had a stated and correct reason: an entry recorded too late suppresses nothing. That reason is true, and it is not the deciding one, because the two orderings do not fail comparably.
+
+**Record early and the failure is lossy.** The entry exists from before the rename, so the watcher's event matches it whether or not any submit ever stands behind it. Anything that stops the save path short of the submit — a refusal under backpressure, or a caller that simply writes and returns — leaves the event dropped and the note indexed by nobody. This was not a corner case. `write_atomic` recorded the hash itself, and its only production caller wrote, re-read the file for its mtime, and returned without ever submitting, so record-early failed lossy on *every* call rather than on an interleaving.
+
+**Record late and the failure is redundant.** The entry exists only once rows are with the writer. A refused submit records nothing, so the watcher's event proceeds normally and indexes the note from disk. A watcher that wins the race — its event handled after the rename and before the recording — matches nothing, and the note is indexed a second time. `upsert_note` is delete-then-insert by path, so the second pass produces the rows the first one did: idempotent, wasteful, correct.
+
+That asymmetry is the argument, and it is why late recording **removes** the race rather than narrowing it. Record-late has no interleaving that loses a note, only interleavings that cost one redundant index. It also restores the mechanism to its proper rank: echo suppression is an optimisation — its job is to avoid indexing the same bytes twice — and an ordering that let it decide whether a note is indexed *at all* had given an optimisation an authority its failure mode could not carry. Under late recording the worst it can do is fail to save work, which is what an optimisation is allowed to do.
+
+Three things follow, each of which the earlier wording implied the opposite of.
+
+- **There is no `forget_echo`.** An intermediate version of this fix restored the watcher's event by removing the entry when a submit was refused. With nothing recorded before the submit there is nothing to forget — and the interleaving that version did not cover, where the watcher's event is handled first and consumes the entry before the refusal is seen, cannot arise.
+- **`write_atomic` records nothing.** It writes bytes and returns their hash. The recording belongs to whoever owns the save sequence, which §3.1.1 puts in serat-index; it does not belong to the function that moves the bytes, whose name promises a write and should mean one.
+- **A write with no submit behind it is watcher-indexed, not suppressed.** That is the correct outcome, and it changes which budget the write is measured against: FR-VLT-04's 500ms, not NFR-PRF-03's 50ms. A save benchmarked against a shell that has no direct submit will therefore produce a several-hundred-millisecond figure and read as NFR-PRF-03 missed by an order of magnitude, having in fact measured the watcher path working exactly as designed. Anything timing a save must record which of §3.1's two paths the write actually took; a save timing with no path on it is not a save number.
+
+One limit, stated as reasoned rather than measured. A redundant index is read-only with respect to the vault, so it cannot move a byte range or change a hash under P2's patcher and cannot interact with the stale-hash guard of §6.1. What it can do is consume writer-queue depth at the moment the patcher wants to submit. That is a backpressure question, ADR-11's subject rather than this section's, and nothing has measured it.
 
 #### 3.3 Reconciling an external change into an open buffer
 
@@ -255,6 +276,17 @@ Two ordering rules that are correctness, not optimisation:
 
 - **The watcher is registered before the walk starts.** A file changed during the walk then produces an event rather than being silently missed, and the walk reconciles anything that changed before the watcher existed. The gap between the two is now larger, because the walk waits for the first paint — which costs nothing, precisely because the watcher is already up and covering it.
 - **The walk does not start until the window has painted.** It is the largest single cost at startup, and nothing before the first paint needs it. Leaving it running against the paint made `t_visible` depend on the size of the vault through CPU and I/O contention rather than through anything the main thread did — which is not a budget anyone can hold. This is safe only once the walk is not itself absurd: F-12 measured it at about 2.0 seconds on the 20,000-note vault because it canonicalises every entry, against about 50ms with the prefix stripped lexically. On the no-index path, where the tree comes from the walk, deferring it by one paint eats into FR-VLT-01's two seconds, so this ordering and that fix are one decision and not two.
+
+  The deferral stays, and the reasons are not the ones first given for it. Both the size of the effect and the shape of the argument have been corrected by measurement.
+
+  **The effect was overstated by about ten times.** The figures that first justified this — 808ms at two notes against 1410ms at twenty thousand, returning to 821ms with the walk delayed — came from blocked sampling, the design later shown incapable of deciding this class of question. Paired and interleaved, 40 pairs on the same binary, the walk's cost to the paint at 20,000 notes is a median of **+54ms**, not 600.
+
+  **What survives is in the tail, and the budget is a p95.** The median moves 54ms; the p95 moves 271ms, a ratio of 1.20 — sitting exactly on the budget job's tolerance. A budget judged at the 95th percentile is judged on precisely the part the walk damages most, which is a better argument for the deferral than the one about medians it replaces.
+
+  **My projection was wrong, not merely unmeasured.** This paragraph previously argued from arithmetic — a 50ms walk at 20,000 becoming 125ms at 50,000 — and 50,000 has now been run: the effect there is *smaller*, a median of +28ms with a confidence interval including zero. Walk duration and paint delay do not scale together, and the extrapolation had the direction wrong as well as the magnitude.
+
+  **The strongest remaining reason is a case nobody can measure here.** Every cold-start figure this project has produced is a *warm-vault* figure: repeated spawns against one vault leave it in the page cache, so the walk is CPU-bound where a user's would be I/O-bound. Freshly generated vaults are write-cached rather than cold, and dropping the Windows page cache needs privileges this machine does not have. So **NFR-PRF-01 cannot be validated against a cold vault here**, and the case where the walk hurts most is the one case that cannot be tested. Deleting a mitigation on evidence that structurally excludes its worst case is not a decision the evidence supports — which is why the standing offer to delete it if it measured as worthless is withdrawn by the person who made it rather than overruled.
+
 - **The file tree is rendered from the index when it is `Ready`, and from the streaming walk when it is not.** One query over `notes(path)` returns 20,000 paths in about ten milliseconds; a cold directory walk takes far longer. This is design goal 5 in miniature — with a warm index the tree is instant, without one it degrades to streaming, and neither case blocks.
 
 Deferred deliberately, because none of it is needed to type: the catch-up scan, `ANALYZE`, the FTS integrity check, `quick_check`, extraction and the embedding model, which is never loaded at start.
@@ -271,6 +303,14 @@ A budget that is not defined as two observable events is a number that flatters 
 
 The watcher clause is load-bearing and is why it is in the definition rather than in a note. It also fixes an ordering: the watcher is registered before the walk, so nothing that changes during startup is lost. "Settled" rather than "registered", because a watcher that failed to start is a supported outcome — a vault with no watcher is stale, not broken (goal 5) — and the trace records which it was, since a usable figure taken without a watcher is not comparable to one taken with.
 
+"The index state is known" means **any state that is not `Opening`**, and that is not a detail. `Rebuilding` and `Unavailable` settle the term exactly as `Ready` does: the requirement is that the state is known, not that it is good. A shell that waited for `Ready` would hang for the length of a full rebuild — on precisely the vault where the window most needs to be up — and in P0, which never reaches `Ready` at all, it would never report usable at any time. The same applies to the watcher term, where `WatcherFailed` settles it and the trace records which outcome it was.
+
+That imposes one requirement on the index actor, and I6 is where it can be lost: **the actor publishes its classification as soon as the open check produces one, before it starts any rebuild work.** An implementation that publishes nothing until the rebuild completes turns a 2.4ms term into a thirty-second one. Measured on the real shell, the term settles at 78–95ms against 800–970ms to paint, so it is nowhere near binding — but it is only bounded because the classification is published early, not because the check is fast.
+
+And a precondition must not be derived from a channel that is allowed to drop or coalesce. S1 takes the index term from an observer on the actor's published state rather than from the event sink, because the sink is throttled to ten per second (§3.1 step 6): a `Rebuilding` whose event lost to the throttle would leave the mark waiting for a transition that had already happened. A precondition a throttle can swallow is a precondition in name only, and the failure is invisible — the mark simply never fires and the trace never exists. The general form is worth carrying into P1's views: throttled events are for invalidation, never for establishing that something has occurred.
+
+It cuts the other way too, and the opposite mistake is one line away in any implementation that reuses the emit path for both. **The value must stay readable from a channel that cannot drop.** `index_status()` returns the newest state even when the event announcing it lost to the throttle, which is what makes a late or reloaded subscriber correct rather than merely eventually correct. A poll that throttled the value as well as the notification would be the same defect wearing the opposite hat: the notification may be coalesced freely, the state may not.
+
 Taking the *latest* of the four rather than the last one to be reported is not pedantry, and S1 found out why on its first run. Both marks arrive as IPC round trips, so a fast disk can finish the buffer read before the paint mark's round trip completes; the process then exited with the paint still in flight and wrote no trace at all. Defining usable to include the paint term makes that structural instead of a rule the front end has to remember, and the same reasoning is why a trace whose watcher never settled does not exist rather than existing with a gap.
 
 `t_usable` as defined is the warm-index case NFR-PRF-01 names. With no index the file tree comes from the streaming walk instead, and that case is bounded by FR-VLT-01's own two-second criterion, not by this one — a cold vault and a warm vault are different measurements and the gate report must not average them.
@@ -279,25 +319,35 @@ The mechanism is one environment variable, so the harness measures the applicati
 
 ##### Most of the window budget is not ours to spend
 
-S1's first measurement of the real shell, twenty spawns, release build, scanner disabled: `window_visible` p95 **1088ms against a 400ms budget**, and `vault_usable` p95 **1094ms against 1000ms**. The median splits into 57ms of loader, 23ms of Tauri runtime, **619ms inside `WebviewWindowBuilder::build`** — WebView2 environment and controller creation — 100ms to the first painted frame, and 5ms to usable.
+S1's first measurement of the real shell, twenty spawns, release build, scanner disabled: `window_visible` p95 **1088ms against a 400ms budget**, and `vault_usable` p95 **1094ms against 1000ms**. Where that time goes is the table below, measured on a later run with marks placed for the purpose; the figures moved between runs and the shape did not.
+
+Those figures are a best case in two ways that matter for the gate, and the second is a bound on what P0 can establish rather than a caveat on a number. The scanner was disabled, so a stock machine is slower. And:
+
+> **Every cold-start figure this project has produced is a warm-vault figure.** Each measurement spawns the application repeatedly against one vault, so after the first iteration the operating system's page cache holds that vault and the walk is CPU-bound rather than I/O-bound — while the case NFR-PRF-01 describes is a user opening a vault the operating system has never read.
+>
+> The cold case was attempted and could not be reached. Generating a fresh 20,000-note vault for every spawn, one spawn per vault with the arms alternating, put the walk deferral at **+42.9ms** (n=12 per arm) against a **null control of +15.9ms** taken by running the *same* binary on both arms — a control run because the first result looked cleaner than the design deserved. That is still not a cold measurement: `vaultgen` writes the vault, so it is write-cached rather than uncached, and dropping the Windows page cache requires privileges this session does not have.
+>
+> **NFR-PRF-01 therefore cannot be validated against a cold vault on this machine.** Every cold-start number should be read as a best case on that axis, compounding with the disabled scanner — both omissions push the figure the same way. A reference machine able to drop the page cache between iterations would produce a materially better measurement than anything taken here, and it is the single change that would most improve confidence in the cold-start number.
+
+— tauri-app-dev, who hit the limitation and ran the control. "Cannot" is theirs and is not to be softened: the measurement is not hard or noisy, it is unavailable without privileges, and a reader who thinks it was merely skipped will assume it can be added later on the same hardware.
 
 The largest single term is a platform cost that no decision in this document moves. That is worth stating plainly rather than leaving as an inference, because the table budgets the phase as though all of it were ours, and a reader optimising against it would be tuning the wrong end of the split.
 
-**"Serat's own share" is not one number, and the section deliberately does not name one.** An earlier draft here said "roughly 130ms of the 400"; it matched no definition of the five terms and is withdrawn. Three defensible quantities can be read off the same run and they differ by a factor of six:
+**"Serat's own share" was published twice as a composed number and was wrong both times.** This section said "roughly 130ms of the 400", which matched no subset of the terms; S1 reported 28ms, which was `main → runtime_ready` plus `painted → usable` added together, most of the first being `tauri::Builder` constructing itself. Both were withdrawn. It is now bracketed by marks placed for the purpose and measured, twenty spawns per figure, release build, scanner off:
 
-| Quantity | Median | What it answers |
-|---|---|---|
-| Main-thread work outside the loader and the webview build | 28ms | Is Serat itself slow? No. |
-| Everything except WebView2 environment creation | 185ms | What is left if the platform term were free? |
-| The whole phase | 804ms | What does the user wait for? |
+| Phase | Owner | 2 notes | 20,000 notes |
+|---|---|---|---|
+| `t0 → main` | platform loader | 69.4ms | 71.0ms |
+| **`main → state_ready`** | **ours** — arguments, settings TOML, `AppState` | **4.7ms** | **5.0ms** |
+| `state_ready → runtime_ready` | `tauri::Builder` | 25.7ms | 29.5ms |
+| **`runtime_ready → setup_done`** | **ours** — event sink, `open_vault`, thread spawns, boot info | **0.5ms** | **0.5ms** |
+| `setup_done → window_created` | WebView2 | 753.7ms | 865.4ms |
+| `window_created → painted` | our HTML in their renderer | 116.4ms | 130.5ms |
+| `painted → usable` | mixed | 4.7ms | 7.5ms |
 
-None of the three is wrong; quoting one without saying which is. The middle figure is the one that misleads most easily, because the 57ms of loader inside it is a function of our binary size and dependency count — ours to influence, not ours to execute — and the 100ms to first paint is our HTML and CSS being rendered by a webview we did not write. So the split is what this section carries, and an aggregate quoted anywhere else must name its basis in the same sentence as the number.
+**Serat's own main-thread work is 5.2ms at two notes and 5.6ms at twenty thousand** — p95 9.4 and 9.6 — which is 0.5% of the time to first paint. The basis belongs with the figure wherever it is quoted, because the figure without it is what went wrong twice: *bracketed by `main → state_ready` and `runtime_ready → setup_done`; excludes the loader, `tauri::Builder` and the webview build.* The 25.7ms of Tauri builder that the withdrawn 28 counted as ours is five times our entire contribution.
 
-The first row is deliberately *not* labelled "code we wrote", which is what an earlier draft called it. The five medians offer only one way to reach 28ms — the 23ms of Tauri runtime plus the 5ms to usable — and on that reading most of it is somebody else's runtime rather than ours. Whether that is how the figure is actually composed is not established by this run, and the answer to the question the row asks does not depend on it: 28ms is not slow however it divides. But a table whose entire purpose is that a figure without its basis is the error is the last place to assert a basis nobody has checked.
-
-This does not re-baseline NFR-PRF-01, which is product-analyst's at Q1 and needs more than one platform's number: WebView2 on Windows is one of three webviews, and WKWebView and WebKitGTK have their own startup costs that may differ by a lot. What P0 establishes is the shape of the answer — if all three platforms carry a webview cost of this order, the requirement is wrong rather than the design, and the honest fix is a budget that separates the part we control from the part we inherit. What it does *not* establish is that the budget is unreachable, because the figure above was taken before F-12's walk fix and on one platform.
-
-The number is also a best case in the one way that matters for the gate: it was taken with the scanner disabled, so it is marked `gate_eligible: false` and a stock machine is slower.
+The rule that follows is sharper than the one this section had, and it is S1's: **an aggregate should be measured, not composed.** Naming the basis of a composed number makes it look defensible while leaving the composition itself as the error — which is what both withdrawn figures had in common.
 
 ##### Which mark is constant in the size of the vault, and which is not
 
@@ -307,7 +357,27 @@ This distinction decides what a budget job may assert, so it is stated rather th
 
 It is not constant in *wall clock*, and the difference matters to whoever writes the budget job. `t_visible` is measured from `t0`, so it includes contention from whatever runs in parallel — and on a two-to-four core CI runner with a virus scanner enabled, scheduler and I/O contention move that number on their own. Deferring the walk past the paint removes the largest such source deliberately, but it does not remove them all.
 
-So the assertion a budget job may make is that `t_visible` does not grow **beyond a stated tolerance** between a 20,000-note vault and a 50,000-note one; 20% is the agreed figure. A path that had become proportional to vault size would show around 2.5x, so the tolerance has better than a factor of ten of headroom against what it exists to catch, and buying sensitivity below that only buys a job that goes red from contention and gets disabled by the next person in a hurry.
+So the assertion a budget job may make is that `t_visible` does not grow **beyond a stated tolerance** between a 20,000-note vault and a 50,000-note one; 20% is the agreed figure. A path that had become proportional to vault size would show around 2.5x, so the tolerance has better than a factor of ten of headroom against the effect it exists to catch.
+
+That headroom is about the effect, and it says nothing about the noise — which is the half that decides whether the job survives, and the half the first draft of this paragraph ignored. Measured after the walk fix: two back-to-back batches of twenty spawns gave `t_visible` p95 of 1146ms at two notes against 940ms at twenty thousand — the larger vault came out faster. Run-to-run variation is therefore about 20%, the same size as the threshold, and a tolerance chosen against the effect and never against the noise is a job that goes red for no reason and is disabled by the third person it wakes.
+
+The claim about **main-thread work** is a different matter and is now measured directly rather than inferred from wall clock: 5.2ms against 5.6ms across a vault ten thousand times larger. That is the one term in the table where the property can be checked cleanly, because it is the only one not dominated by a platform cost that moves with the weather, and it holds there.
+
+The wall-clock claim is what the noise defeats. The wall-clock claim is decidable, and it is decided — but only under a sampling design that can see it. Measured as **30 interleaved pairs** at two notes and twenty thousand, alternating which arm spawns first: the paired difference has a 95% confidence interval of **[-123, +45]ms** against the budget job's tolerance of +20%, which is 180ms. The interval excludes the tolerance, so the claim holds. It is not the stronger claim that there is no effect at all — the interval does not exclude a small one, and nothing in the design needs it to.
+
+The supportable form is therefore: **wall clock to first paint does not grow with vault size beyond the budget's tolerance.**
+
+An earlier draft of this paragraph said the claim was unfalsifiable *at this iteration count*, which was wrong in an instructive way. The obstacle was never the count; it was blocked sampling — all twenty spawns of one arm, then all twenty of the other — which lets machine drift settle on one arm and be read as an effect. That is how the twenty-thousand-note vault came out *faster*. Within-arm spread is about 830ms, five times the effect being tested, so no number of blocked samples decides this and thirty interleaved pairs do. This section named interleaving as the fix two paragraphs above and then mis-attributed the cause to the sample size, which is the kind of thing that survives because both halves read plausibly on their own.
+
+Hence the third rule this section has had to learn, after *name the basis* and *measure, do not compose*: **a negative result names its design, not just its basis.** "Not decidable" without "under blocked sampling at n=20" attached reads as a fact about the system rather than about the method, and it is the form of claim least likely to be challenged, because it sounds like caution.
+
+And a fourth, which cost this section its largest number: **when you invalidate a method, re-run what it produced.** Blocked sampling was discredited here and then applied forward only — the walk's 600ms cost had already been banked from a blocked run, and it survived a day after the design behind it was known to be unsound. Conclusions a broken method has already delivered are harder to find than the ones it is about to, because they have stopped looking like open questions.
+
+Four rules in one section is not a method anyone has earned the right to claim. The same rule was broken four times here and recovered four times because someone else re-opened it, which is a property of having a reviewer and a register rather than of having a discipline. The narrower claim is the one worth carrying: **a document that accumulates measured claims needs an owner for retiring them.** Every one of the four survived not by being defended but by nobody going back to it.
+
+The tolerance is therefore not the whole instrument, and widening it is the wrong repair, because it trades away the detection it was sized for. Two things fix the measurement instead. **Interleave the two vault sizes within one batch** rather than running them as separate batches, so machine drift lands on both arms equally rather than being read as an effect — the 940ms-at-20k result is what drift looks like when it is free to masquerade. And **take enough iterations for the statistic to settle**, or compare medians, since a p95 over twenty samples is an estimator noisier than the thing it is estimating.
+
+The miss itself is not in doubt and needs none of this care: 2.4 to 2.9 times over a 400ms budget survives any amount of noise. It is only the proportionality signal that the instrument has to be good enough to see.
 
 `t_usable` is **not** constant, and asserting that it is would eventually fail for a legitimate reason. Two of its three preconditions grow with the vault. The file tree is one query returning every path, so it grows linearly in note count — cheaply, but it grows. And watcher registration grows in the number of *directories* on Linux, where inotify takes one watch per directory, while it is a single call on Windows and macOS. So `t_usable` is bounded and sub-linear rather than flat, and the way to hold it is the absolute budget NFR-PRF-01 states, measured at 20,000 notes with the 50,000 figure recorded beside it — not a growth ratio.
 
@@ -328,7 +398,11 @@ The stamp is the open check. In order, and stopping at the first failure:
 
 1. `.serat/index.db` absent → rebuild, reason `NoIndex`.
 2. Opening it fails, or any statement below returns `SQLITE_CORRUPT` or `SQLITE_NOTADB` → rebuild, reason `Corrupt`.
-3. `PRAGMA user_version` differs from the version this build writes → rebuild, reason `SchemaChanged`. This is the whole of ADR-02's upgrade path.
+3. `PRAGMA user_version` differs from the version this build writes → rebuild, reason `IndexVersion`. This is the whole of ADR-02's upgrade path.
+
+    That stamp covers more than the schema, and the name it had invited the opposite reading. An index is wrong if the DDL changed *or* if the indexer now extracts something different from input that has not changed — a parser recognising an inline field it used to ignore, a block-kind mapping that stops dropping HTML, a different tokenizer. Both make the stored rows disagree with what the current code would produce; neither is visible to any other step of the check, because the schema matches and the vault matches and the row count is whatever the old code wrote. So the constant is `INDEX_VERSION`, bumped in the commit that changes either, and the option of a second constant for the derivation layer was declined: it would carry the same discipline and the same absence of any test that could enforce it, while adding one more thing to forget, and both cases cost the user the same single rebuild. The single number looked insufficient because of its name, and a name is cheaper to fix than a mechanism is to add (F-134).
+
+    The reason the *user* is shown is renamed on that argument and no other. `SchemaChanged` was the constant's old name one layer down: it tells someone their schema changed when what moved may have been the parser, and since this enum is what the front end switches on, a wrong name here becomes a wrong sentence on screen. A **second** reason for the derivation case was considered and declined. The check cannot draw the distinction — one number cannot say which of the two things moved — and the user does not need it, because *"this index was built by a different version of Serat; rebuilding it"* is the same sentence in both cases. The distinction that does matter, *rebuilding because the indexer changed* versus *rebuilding because your index is damaged*, is `IndexVersion` against `Corrupt`, and the enum already drew it (F-175).
 4. `index_meta` is missing or `state <> 'ready'` → rebuild, reason `Interrupted`; the previous build did not commit.
 5. `index_meta.vault_root` is not the canonical root being opened → rebuild, reason `VaultMoved`; the folder moved, or a `.serat/` directory was copied between vaults.
 6. `count(*) FROM notes` differs from `index_meta.note_count` → rebuild, reason `Corrupt`. This is why the schema requires the count to be updated in the same transaction as any change to the row count: a lag between them is indistinguishable from damage, and must be.
@@ -420,8 +494,8 @@ Editing a source note by changing a value in a view is the highest-risk mechanis
 2.  The core re-reads the file and verifies the hash. A mismatch refuses the write and returns Refused{StaleHash} with the current hash — an expected outcome, not an error.
 3.  It verifies that the recorded byte range still contains the field it claims to. A mismatch returns Refused{RangeMoved}.
 4.  It replaces exactly those bytes with the serialised new value. Nothing else in the file is touched — no reflow, no key reordering, no re-serialisation.
-5.  It writes to a temporary file and renames, recording the new hash for echo suppression first.
-6.  The watcher recognises the echo; the note is reindexed alone; the affected row refreshes without re-running the query.
+5.  It writes to a temporary file and renames. The write records nothing (§3.2).
+6.  The patched bytes are parsed and submitted, and the new hash is recorded for echo suppression only once that submit has succeeded; the watcher's event is then dropped, the note is reindexed alone, and the affected row refreshes without re-running the query. If the submit is refused, nothing was recorded and the watcher indexes the note instead — one path or the other, never neither.
 
 #### 6.2 Invariants
 
@@ -623,3 +697,4 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
 | Does the 150ms watcher debounce hold for every sync tool?             | Observation during P1 against git, Syncthing and iCloud, which behave differently.                                             |
 | Should saved views live in .serat or in the vault as notes?           | Follows from whether a user wants views to sync with their vault. Leaning toward notes, for consistency with types and lenses. |
+| Does §3.2's redundant index contend with P2's write-back submits?     | A P2 measurement of writer-queue depth while patching under load. Reasoning settles the correctness half — a redundant index touches no vault byte — and settles nothing about backpressure (ADR-11). |
