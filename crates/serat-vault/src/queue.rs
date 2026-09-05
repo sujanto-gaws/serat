@@ -425,6 +425,90 @@ mod tests {
     }
 
     #[test]
+    fn a_watcher_drop_while_the_queue_is_full_is_recovered_by_the_rescan_that_follows() {
+        // F-225. "A dropped watcher event is recovered by the rescan latch" is
+        // load-bearing for the entire backpressure design, and before this test it was
+        // asserted in three comments (this module's own doc, `watch.rs`'s
+        // `VaultEvent::RescanRequired`, and I5's `incremental.rs` before F-224) and
+        // tested in none. `overflow_recovery_converges_on_a_vault_larger_than_the_queue`
+        // below proves a bulk producer using `push_blocking` alone never drops;
+        // `a_rescan_does_not_clear_a_latch_it_did_not_earn` above proves the generation
+        // bookkeeping abstractly, with plain pushes standing in for whatever produced
+        // them. Neither traces one concrete path from "the watcher's push was refused"
+        // through to "the consumer actually received it, exactly once" — which is the
+        // sentence itself, not a restatement of it.
+        //
+        // "Both queues full" (F-216, F-225): the writer being behind is usually why the
+        // watcher's own queue is full too, and the chain a fix must terminate at is not
+        // "the watcher enqueues it" but "the watcher enqueues it, or drops it and
+        // latches a generation a rescan covers." There is one `WorkQueue` type in this
+        // crate, so what is reproduced here is that second clause end to end: the
+        // queue is filled to capacity with no consumer draining it — standing in for a
+        // writer that cannot keep up — a live watcher event finds no room and is
+        // dropped, and only then does a consumer start and a rescan (the recovery
+        // mechanism the latch exists to trigger) run, through the door that waits
+        // rather than refuses.
+        //
+        // The queue is saturated synchronously, before anything is spawned, so the
+        // drop below is forced rather than raced — a setup that only sometimes reaches
+        // the drop would prove nothing about the recovery (F-58).
+        let queue = Arc::new(WorkQueue::with_capacity(2));
+        assert!(queue.push(path("backlog-1.md")));
+        assert!(queue.push(path("backlog-2.md")));
+
+        let dropped = path("watcher/live-edit.md");
+        assert!(
+            !queue.push(dropped.clone()),
+            "the queue had room; this test proves nothing about a drop"
+        );
+        assert_eq!(queue.stats().overflowed, 1);
+        let ticket = queue
+            .rescan_needed()
+            .expect("the refused push did not raise the latch");
+
+        // The consumer starts only now, and drains one at a time with a real timeout,
+        // so the rescan's push_blocking below genuinely waits for space at least once
+        // rather than finding it already free.
+        let consumer_queue = Arc::clone(&queue);
+        let consumer = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            loop {
+                match consumer_queue.pop_timeout(Duration::from_millis(20)) {
+                    Some(path) => seen.push(path),
+                    None if consumer_queue.is_closed() && consumer_queue.depth() == 0 => {
+                        return seen;
+                    }
+                    None => {}
+                }
+            }
+        });
+
+        // The rescan: walk the vault and offer every path again, including the one
+        // that was dropped. The two already-queued paths dedup harmlessly; the
+        // dropped one is what this test is about.
+        for candidate in [path("backlog-1.md"), path("backlog-2.md"), dropped.clone()] {
+            queue.push_blocking(candidate);
+        }
+        assert!(
+            queue.rescan_completed(ticket),
+            "the rescan did not clear the latch it was sent to cover"
+        );
+        assert!(queue.rescan_needed().is_none());
+        queue.close();
+
+        let seen = consumer.join().expect("consumer");
+        assert!(
+            seen.contains(&dropped),
+            "the watcher's dropped path was never recovered by the rescan that followed it"
+        );
+        assert_eq!(
+            seen.iter().filter(|candidate| **candidate == dropped).count(),
+            1,
+            "the dropped path was recovered more than once"
+        );
+    }
+
+    #[test]
     fn overflow_recovery_converges_on_a_vault_larger_than_the_queue() {
         // BLOCKING 1 from the I2 review, as a test. The queue holds 8,192 and the P0
         // vault has 20,200 files; walk() returns them sorted and this queue is FIFO,

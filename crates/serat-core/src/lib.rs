@@ -41,4 +41,4 @@ pub use note::{IndexOp, LoadedNote, NoteKind, NoteMeta, ParsedNote, SourceEntry}
 pub use path::VaultPath;
 pub use span::ByteRange;
 pub use task::Task;
-pub use traits::{IndexWriter, NoteParser, NoteSource};
+pub use traits::{EchoGuard, IndexWriter, NoteParser, NoteSource};

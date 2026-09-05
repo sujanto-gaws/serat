@@ -57,12 +57,17 @@ impl EchoSuppressor {
         }
     }
 
-    /// Record a hash we are about to write.
+    /// Record a hash the watcher should recognise as our own write and drop.
     ///
-    /// Called **before** the write, not after: on a fast filesystem the watcher can
-    /// deliver the event before a post-write call would have returned, and an entry
-    /// recorded too late suppresses nothing.
-    pub fn expect(&self, hash: ContentHash) {
+    /// Called **after** a write has been indexed, not before (architecture §3.2,
+    /// amended by F-226 following F-196/F-222/F-224). Recording ahead of the write
+    /// reads as the safer order — a fast filesystem can deliver the watcher event
+    /// before a later call would have returned — but it means a write recorded and
+    /// then refused downstream suppresses the only event that would ever have indexed
+    /// the note. `serat_core::EchoGuard` is the trait that decides *when* "after" is —
+    /// `Vault`'s implementation of it calls this once a submit has been accepted; this
+    /// method itself only ever records.
+    pub fn record(&self, hash: ContentHash) {
         let now = Instant::now();
         let mut entries = self.lock();
         entries.retain(|_, recorded| now.duration_since(*recorded) < self.lifetime);
@@ -115,7 +120,7 @@ mod tests {
         let echo = EchoSuppressor::new();
         let hash = hash_bytes(b"status:: done\n");
 
-        echo.expect(hash);
+        echo.record(hash);
         assert!(echo.take_echo(hash), "our own write was not recognised");
         assert!(
             !echo.take_echo(hash),
@@ -126,7 +131,7 @@ mod tests {
     #[test]
     fn an_unrelated_edit_is_not_suppressed() {
         let echo = EchoSuppressor::new();
-        echo.expect(hash_bytes(b"ours"));
+        echo.record(hash_bytes(b"ours"));
         assert!(!echo.take_echo(hash_bytes(b"someone else's")));
         // And ours is still waiting.
         assert_eq!(echo.pending(), 1);
@@ -136,7 +141,7 @@ mod tests {
     fn entries_expire_so_a_stale_hash_cannot_swallow_a_later_edit() {
         let echo = EchoSuppressor::with_lifetime(Duration::from_millis(1));
         let hash = hash_bytes(b"body");
-        echo.expect(hash);
+        echo.record(hash);
         std::thread::sleep(Duration::from_millis(10));
         assert!(!echo.take_echo(hash), "an expired entry still suppressed");
         assert_eq!(echo.pending(), 0);
@@ -148,9 +153,9 @@ mod tests {
         // undo. Each write records its own entry, and each event consumes one.
         let echo = EchoSuppressor::new();
         let hash = hash_bytes(b"same bytes");
-        echo.expect(hash);
-        echo.expect(hash);
-        // Keyed by hash, so the second expect replaces the first rather than stacking:
+        echo.record(hash);
+        echo.record(hash);
+        // Keyed by hash, so the second record replaces the first rather than stacking:
         // recorded once, suppressed once, and the second event is treated as a real
         // change that the hash gate then discards for the cost of a hash.
         assert!(echo.take_echo(hash));
@@ -163,7 +168,7 @@ mod tests {
         let writer = std::sync::Arc::clone(&echo);
         let handle = std::thread::spawn(move || {
             for i in 0..100u8 {
-                writer.expect(hash_bytes(&[i]));
+                writer.record(hash_bytes(&[i]));
             }
         });
         handle.join().expect("writer thread");

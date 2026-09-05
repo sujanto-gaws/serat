@@ -320,31 +320,35 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             Command::Analyze(reply) => barrier = Some((reply, Barrier::Analyze)),
             Command::MarkReady(root, reply) => barrier = Some((reply, Barrier::MarkReady(root))),
             // These three answer with something other than `()`, so they are handled
-            // here and not through the Barrier path.
+            // here and not through the Barrier path. Each drains the batch first, and
+            // only one of the three drains is load-bearing — which is worth naming,
+            // because the version of this comment that claimed all three were guarding
+            // the same hazard was wrong.
             //
-            // Each drains the batch first, and it is worth being exact about when that
-            // matters. On the success path it never does: every iteration of this loop
-            // ends in a `commit`, and these arms are entered either as an iteration's
-            // first command or from `deferred`, so `pending` is empty both ways. A
-            // probe asserting that never fired across the suite, and the tests one
-            // would naturally write for the drains enter the arms with nothing to drain
-            // and prove nothing.
+            // ResolveLinks is the one. Link rows still pending when the resolve pass
+            // runs stay unresolved, and there is no second pass to catch them.
             //
-            // The route that does reach them is a failed commit. `commit` clears
-            // `pending` at its end, after apply, sync_note_count and tx.commit, so an
-            // error before any of those returns through `?` with the batch still in
-            // hand — which is the IndexFault case §3.4 exists for. The next command
-            // then meets a non-empty `pending`, and these drains are what re-attempt
-            // it and report the failure rather than silently carrying a batch that a
-            // bulk load is about to make meaningless.
+            // The other two repair themselves, from opposite ends. Without the drain,
+            // BeginBulkLoad lets pending rows commit after the triggers come off, so
+            // their FTS rows are missing — and then end_bulk_load issues 'rebuild',
+            // which regenerates the whole index from `blocks` and restores exactly
+            // those rows. EndBulkLoad without the drain lets them commit after the
+            // triggers are back, so the triggers create their FTS rows correctly.
+            // They become load-bearing the moment the sequence changes: if 'rebuild'
+            // moves, or the triggers are restored later, neither repair happens.
             //
-            // An earlier version asserted the invariant instead of testing it. The
-            // assertion was false on exactly that route, so a SQLite failure panicked
-            // the writer thread in every debug build — killing the actor at the moment
-            // the index was already in trouble. The lesson is not that asserting an
-            // invariant is a poor substitute for an untestable path, but that the
-            // substitute is only as good as the search for routes into it, and that
-            // search covered the success path only.
+            // On the success path none of the three is entered with work in hand at
+            // all: every iteration of this loop ends in a commit, and these arms are
+            // reached either as an iteration's first command or from `deferred`. The
+            // route that does reach them is a failed commit — `commit` clears `pending`
+            // at its end, so an error before that returns through `?` with the batch
+            // still held, which is the IndexFault case §3.4 exists for.
+            //
+            // An earlier version asserted that could not happen. The assertion was
+            // false on exactly that route and panicked the writer in every debug build,
+            // at the moment the index was already in trouble. An assertion is a claim
+            // about all paths; a test claims less and is therefore safe to get partly
+            // wrong. FAIL_NEXT_COMMIT is the seam that makes the real route testable.
             Command::BeginBulkLoad(reply) => {
                 let result = commit(&conn, &mut pending, &mut since_analyze)
                     .and_then(|()| begin_bulk_load(&conn));

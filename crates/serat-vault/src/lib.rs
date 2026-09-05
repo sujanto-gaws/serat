@@ -37,7 +37,7 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use serat_core::{ContentHash, LoadedNote, NoteKind, NoteMeta, VaultError, VaultPath};
+use serat_core::{ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, VaultError, VaultPath};
 
 pub use echo::EchoSuppressor;
 pub use hash::hash_bytes;
@@ -51,10 +51,11 @@ pub use watch::{VaultEvent, Watcher, WatcherConfig};
 pub struct Vault {
     root: PathBuf,
     ignore: IgnoreRules,
-    /// Hashes this vault is about to write, so the watcher can recognise our own
-    /// events and drop them (architecture §3.2). Shared rather than owned: the
-    /// watcher and the writer must consult the same set, and the writer is whoever
-    /// holds a clone of this `Vault`.
+    /// Hashes an indexed write should tell the watcher to drop as its own echo
+    /// (architecture §3.2). Shared rather than owned: the watcher and whoever records
+    /// an echo must consult the same set, and `write_atomic` no longer touches this at
+    /// all — see [`Vault::write_atomic`] and the [`EchoGuard`] impl below for where
+    /// recording now happens and why (F-224, F-226).
     echo: Arc<EchoSuppressor>,
 }
 
@@ -108,10 +109,13 @@ impl Vault {
         &self.ignore
     }
 
-    /// The echo suppressor this vault writes through.
+    /// The echo suppressor the watcher consults.
     ///
-    /// The indexing consumer asks it whether an event carries bytes we just wrote:
+    /// The watcher asks it whether an event carries bytes we just indexed:
     /// `if vault.echo().take_echo(loaded.meta.hash) { skip }` after the hash gate.
+    /// Recording an entry is [`EchoGuard::record_echo`], which `Vault` implements
+    /// below — callers that write through the index's save path use that trait object
+    /// rather than reaching in here directly.
     #[must_use]
     pub fn echo(&self) -> &Arc<EchoSuppressor> {
         &self.echo
@@ -251,11 +255,14 @@ impl Vault {
         }
 
         let hash = hash_bytes(bytes);
-        // Before the write, not after (architecture §3.2, and echo.rs is explicit
-        // about it): on a fast filesystem the watcher can deliver the event before a
-        // later call would have returned, and an entry recorded too late suppresses
-        // nothing.
-        self.echo.expect(hash);
+        // No echo recording here (architecture §3.2, amended by F-226). It used to
+        // happen at this point, before the write — and that placement is why F-196 and
+        // F-222 were findable at all: it recorded regardless of whether anything ever
+        // indexed this write, so a caller with no submit path (F-222) or a submit
+        // later refused by the writer (F-196) permanently suppressed the only event
+        // that would ever have indexed the note. `write_atomic` is a write and nothing
+        // else now; recording is [`EchoGuard::record_echo`], called by the index's save
+        // path only after a submit has actually been accepted (F-224).
 
         let target = self.resolve(path);
         let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
@@ -303,6 +310,14 @@ impl Vault {
         }
 
         Ok(hash)
+    }
+}
+
+impl EchoGuard for Vault {
+    /// Delegates to the shared [`EchoSuppressor`], so the save path and the watcher
+    /// consult the same set regardless of which clone of `Vault` each holds.
+    fn record_echo(&self, hash: ContentHash) {
+        self.echo.record(hash);
     }
 }
 
@@ -493,11 +508,14 @@ mod tests {
     }
 
     #[test]
-    fn our_own_write_is_recorded_for_echo_suppression_before_it_lands() {
-        // §3.2, and the half that was missing: EchoSuppressor was correct but nothing
-        // called it, so the branch did not implement echo suppression at all. Recording
-        // must happen before the write — on a fast filesystem the watcher can deliver
-        // the event before a later call would have returned.
+    fn write_atomic_no_longer_touches_the_echo_suppressor() {
+        // F-226: recording moved out of write_atomic and into EchoGuard::record_echo,
+        // called by the index's save path only after a submit is accepted — not by the
+        // write itself. A write with nothing downstream to call record_echo (F-222's
+        // shape, S1's write_file before this fix) must not leave an entry behind: an
+        // entry nobody consumes just sits there until it expires, which is harmless,
+        // but a caller relying on write_atomic to have recorded anything is relying on
+        // behaviour this function no longer has.
         let (_dir, vault) = vault();
         let path = VaultPath::new("note.md").expect("path");
         let hash = vault
@@ -508,12 +526,34 @@ mod tests {
             .expect("write");
 
         assert!(
+            !vault.echo().take_echo(hash),
+            "write_atomic recorded an echo entry; it must be a plain write (F-224)"
+        );
+    }
+
+    #[test]
+    fn record_echo_after_a_write_suppresses_the_watchers_own_event() {
+        // The other half: EchoGuard::record_echo, called the way the real save path
+        // calls it — after write_atomic, standing in for "after a successful submit" —
+        // still suppresses exactly one event, keyed by hash.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let hash = vault
+            .write_atomic(
+                &path, b"# Ours
+",
+            )
+            .expect("write");
+
+        vault.record_echo(hash);
+
+        assert!(
             vault.echo().take_echo(hash),
-            "the writer did not record the hash it was about to produce"
+            "record_echo did not register the hash for suppression"
         );
         assert!(
             !vault.echo().take_echo(hash),
-            "one write suppressed two events"
+            "one recorded echo suppressed two events"
         );
     }
 

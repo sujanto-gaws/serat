@@ -1,19 +1,22 @@
 //! The traits that keep the crate graph acyclic.
 //!
 //! Cross-crate needs are expressed as traits declared here and implemented wherever
-//! the capability lives (architecture §2.1). Two exist in P0, and both earn their
+//! the capability lives (architecture §2.1). Three exist in P0, and each earns its
 //! place by removing a dependency edge that would otherwise be real:
 //!
 //! * [`NoteParser`] lets the indexing pipeline be driven by a stub parser in a test,
 //!   so `serat-index` never links `serat-parse`.
 //! * [`IndexWriter`] lets `serat-vault` hand work to the index actor without
 //!   depending on `serat-index`; in a test the implementation is a `Vec`.
+//! * [`EchoGuard`] lets the save path in `serat-index` tell the watcher which hash to
+//!   drop, without `serat-index` depending on `serat-vault` for it.
 //!
 //! Traits for the schema registry, the query API and extraction arrive with the
 //! phases that need them. Declaring them now would be guessing.
 
 use crate::{
     error::{IndexError, ParseError, VaultError},
+    hash::ContentHash,
     note::{IndexOp, LoadedNote, ParsedNote, SourceEntry},
     path::VaultPath,
 };
@@ -122,4 +125,38 @@ pub trait NoteSource: Send + Sync {
     /// [`VaultError::NotFound`] if it has gone — ordinary during a rebuild racing a
     /// delete, and the caller's cue to skip it rather than to fail.
     fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError>;
+}
+
+/// Tells the watcher which hash is our own write, so it drops the event instead of
+/// reindexing what the save path just indexed itself (architecture §3.2).
+///
+/// A separate one-method trait rather than a fourth method on [`NoteSource`] (F-210,
+/// ruled against the ruler's own convenience). `NoteSource` means "somewhere notes can
+/// be enumerated and read from"; `record_echo` is write-path bookkeeping with no
+/// relationship to that, and every stub `NoteSource` a rebuild is driven by exists to
+/// enumerate and read, never to produce an echo — a fourth method would oblige each of
+/// them to say something about a concern they do not have. The decomposition also
+/// removes a question the fourth-method version could not: `rebuild` takes only
+/// `&dyn NoteSource` and is never handed an `EchoGuard` at all, so there is nothing to
+/// default and no silent no-op can occur.
+///
+/// Implemented by `serat_vault::Vault`, alongside `NoteSource`; the save path's
+/// signature takes both as separate trait objects rather than one type that happens to
+/// implement both (F-218) — `serat-app`'s call site passing `Vault` twice is the thing
+/// worth seeing there, not the thing to hide behind a struct invented to shorten it.
+pub trait EchoGuard: Send + Sync {
+    /// Record a hash the watcher should recognise as our own write and drop.
+    ///
+    /// Called **after** a submit has been accepted, not before (architecture §3.2,
+    /// amended by F-226). The original design recorded the hash before the write, on
+    /// the reasoning that a fast filesystem can deliver the watcher event before a
+    /// later call would have returned — true, but it means a write recorded and then
+    /// refused downstream (`IndexError::QueueFull`) permanently suppresses the only
+    /// event that would ever have indexed the note (F-196, F-222). Recording late
+    /// removes the race rather than narrowing it (F-224): a refused submit records
+    /// nothing here, so the watcher's own event carries the save instead — redundant
+    /// with nothing to redo, since a later index write is idempotent by path — and a
+    /// watcher event that wins a race against this call merely indexes the same note a
+    /// moment early, for the same reason.
+    fn record_echo(&self, hash: ContentHash);
 }
