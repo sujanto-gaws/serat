@@ -464,26 +464,32 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     //
     // F-312: a bare `[[wikilink]]` names a FILE, not a path. Obsidian resolves a
     // target containing no `/` by file name anywhere in the vault (NFR-CMP-01),
-    // so matching `notes.path` alone resolves only the notes that happen to sit
-    // at the vault root — 8,359 of 216,971 on the 20k vault, because 18,605 of
-    // its 20,002 notes are nested. `notes.stem` carries the file name and is
+    // so matching `notes.path` alone resolved only the notes sitting at the
+    // vault root — 8,359 of 212,378 on the 20k vault, because 18,605 of its
+    // 20,002 notes are nested. `notes.file_name` carries the file name and is
     // indexed for this join.
     //
-    // Ties are broken by shortest path, which is Obsidian's rule and is
-    // deterministic here: two notes with the same file name in different folders
-    // resolve to the shallower one. `ORDER BY length(n.path), n.path` makes it
-    // total rather than leaving the second key to the query planner, because a
-    // rebuild that resolves the same link two ways on two runs would produce a
-    // corpus digest that changes without the corpus changing.
+    // F-313: the match deliberately does NOT restrict to `kind = 'note'`. An
+    // `![[report.pdf]]` names an asset, and §7.3 says an asset stays typed,
+    // linkable and queryable; excluding assets drops every embed — 2,525 of them
+    // here, every one an `.xlsx`, `.pdf`, `.png` or `.docx`. `file_name` carries
+    // the extension precisely so both halves match on one column: a note link
+    // omits `.md` and matches `file_name = target || '.md'`, an embed carries its
+    // own extension and matches `file_name = target`.
+    //
+    // Ties break on shortest path, which is Obsidian's rule, and the ORDER BY
+    // names both keys so the choice is total rather than left to the planner: a
+    // rebuild resolving the same link two ways on two runs would move the corpus
+    // digest without the corpus moving.
     const RESOLVE: &str = "
         UPDATE links
            SET dst_note = (
                 SELECT n.id FROM notes n
-                 WHERE n.kind = 'note'
-                   AND (n.path = links.dst_path
-                        OR n.path = links.dst_path || '.md'
-                        OR (instr(links.dst_path, '/') = 0
-                            AND n.stem = links.dst_path))
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
               ORDER BY length(n.path), n.path
                  LIMIT 1
            )
@@ -492,11 +498,11 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
            AND dst_path IS NOT NULL
            AND EXISTS (
                 SELECT 1 FROM notes n
-                 WHERE n.kind = 'note'
-                   AND (n.path = links.dst_path
-                        OR n.path = links.dst_path || '.md'
-                        OR (instr(links.dst_path, '/') = 0
-                            AND n.stem = links.dst_path))
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
            )";
     let resolved = conn.execute(RESOLVE, []).map_err(sqlite)?;
     Ok(resolved)

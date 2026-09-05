@@ -581,20 +581,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_seam_fails_loudly_and_says_what_is_missing() {
+    fn the_remaining_seams_fail_loudly_and_say_what_is_missing() {
         // The point of these assertions is that a red job is legible: whoever
         // reads the CI log learns which task unblocks it, not merely that
         // something is wrong.
+        //
+        // `full_rebuild` is no longer among them. I3 landed a real `NoteParser`
+        // and the seam is now a live call, so its former assertions -- that it
+        // errors naming task I4 -- would assert the opposite of the truth. What
+        // replaces them is below: it must fail on the *vault*, not on a seam.
         let vault = Path::new("nowhere");
         let index = Path::new("nowhere/.serat");
 
-        let e = full_rebuild(vault, index).expect_err("must not silently pass");
-        assert!(e.contains("task I4"), "{e}");
-        assert!(e.contains("rebuild("), "{e}");
-        // F-10: the request for the four phases must survive edits to this text,
-        // because they are what closes open design question 1.
-        assert!(e.contains("F-10"), "{e}");
-        assert!(e.contains("NoteSource"), "{e}");
+        // Wired, so a missing vault is what stops it -- and it must still refuse
+        // rather than return a number over nothing.
+        let e = full_rebuild(vault, index).expect_err("a missing vault is not a rebuild");
+        assert!(
+            e.contains("could not open the vault"),
+            "full_rebuild is wired now, so it should fail on the vault rather than on a seam: {e}"
+        );
+        assert!(
+            !e.contains("task I4"),
+            "the seam message outlived the seam; it now describes work that is done: {e}"
+        );
 
         // And the phases must sum to something a reader can interpret.
         let phases = RebuildPhases {
@@ -608,9 +617,9 @@ mod tests {
         assert_eq!(phases.write(), Duration::from_millis(560));
 
         let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
-        // I5 (apply/flush) is real on main; I3 (NoteParser) is the actual
-        // remaining blocker, the same one full_rebuild() is waiting on.
-        assert!(e.contains("task I3"), "{e}");
+        // I5 (apply/flush) is real on main; I3 (NoteParser) has now landed too,
+        // so this seam is next and its request must stay legible.
+        assert!(e.contains("task I3") || e.contains("I5"), "{e}");
         // F-267 corrected the entry point away from apply_and_wait, which §2.2
         // ruled against; the request must name the real composition and the
         // F-229 path discriminant, or a future implementer builds the wrong

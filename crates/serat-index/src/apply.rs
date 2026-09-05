@@ -73,14 +73,14 @@ fn upsert_note(
         .sum();
 
     tx.execute(
-        "INSERT INTO notes (path, stem, title, type, kind, mtime, hash, word_count)
+        "INSERT INTO notes (path, file_name, title, type, kind, mtime, hash, word_count)
          VALUES (?1, ?2, ?3, ?4, 'note', ?5, ?6, ?7)",
         params![
             meta.path.as_str(),
-            // What a bare `[[wikilink]]` names (F-312). Stored rather than
-            // derived because resolution joins on it once per link and a
-            // computed basename cannot use an index.
-            meta.path.stem(),
+            // What a bare `[[wikilink]]` or `![[embed]]` names (F-312).
+            // With the extension, so one column serves note links (which omit
+            // `.md`) and asset embeds (which carry their own) alike.
+            meta.path.file_name(),
             parsed.title.as_deref(),
             parsed.note_type.as_deref(),
             meta.mtime_ms,
@@ -124,9 +124,17 @@ fn upsert_note(
 fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError> {
     remove(tx, &meta.path)?;
     tx.execute(
-        "INSERT INTO notes (path, kind, asset_path, mtime, hash)
-         VALUES (?1, 'asset', ?1, ?2, ?3)",
-        params![meta.path.as_str(), meta.mtime_ms, meta.hash.to_hex()],
+        "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash)
+         VALUES (?1, ?2, 'asset', ?1, ?3, ?4)",
+        // Assets carry a file_name too: `![[report.pdf]]` names one, and §7.3
+        // says an asset stays typed, linkable and queryable. Omitting it here
+        // silently drops every embed (F-313).
+        params![
+            meta.path.as_str(),
+            meta.path.file_name(),
+            meta.mtime_ms,
+            meta.hash.to_hex()
+        ],
     )
     .map_err(sqlite)?;
     Ok(())

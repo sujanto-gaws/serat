@@ -1981,7 +1981,9 @@ mod tests {
             3,
             |_, _| {
                 n += 1;
-                Ok(timing(1_000 * n, 20_000, [30, 10, 20][(n - 1) as usize]))
+                // 20,200: what a CORRECT rebuild of this vault reports, notes plus
+                // assets alike (F-247). 20,000 is the partial-index case below.
+                Ok(timing(1_000 * n, 20_200, [30, 10, 20][(n - 1) as usize]))
             },
             |_| Ok(20_000),
         )
@@ -1991,7 +1993,7 @@ mod tests {
         let err = measure_full_rebuild_with(
             &a_vault(),
             1,
-            |_, _| Ok(timing(1, 20_000, 3)),
+            |_, _| Ok(timing(1, 20_200, 3)),
             |_| Ok(19_968),
         )
         .expect_err("32 notes short of the finished index");
@@ -2002,7 +2004,7 @@ mod tests {
             &a_vault(),
             1,
             |_, _| {
-                let mut t = timing(1, 20_000, 3);
+                let mut t = timing(1, 20_200, 3);
                 t.links_resolved = 200_000;
                 Ok(t)
             },
