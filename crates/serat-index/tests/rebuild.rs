@@ -10,7 +10,7 @@ mod support;
 use std::sync::atomic::Ordering;
 
 use serat_core::{IndexOp, IndexWriter, VaultPath};
-use serat_index::{IndexActor, SCHEMA_VERSION, rebuild, schema};
+use serat_index::{INDEX_VERSION, IndexActor, rebuild, schema};
 use support::{FakeVault, LineParser, meta, vault_fixture};
 
 // ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ fn a_rebuild_leaves_the_index_ready_and_the_note_count_true() {
         )
         .expect("meta");
     assert_eq!(recorded as usize, report.notes);
-    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(version, INDEX_VERSION);
 }
 
 #[test]

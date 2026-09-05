@@ -19,13 +19,21 @@ use serat_core::IndexError;
 /// exact text this build will execute, not against whatever is on disk.
 pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 
-/// The schema version this build expects.
+/// The index version this build expects.
 ///
-/// Bumping it is the whole of a schema change: a database reporting any other value
-/// is deleted and rebuilt. It must equal the `PRAGMA user_version` in [`DDL`], which
-/// is asserted by a test rather than remembered by two people — under ADR-0002 a
-/// silent drift costs every user a full reindex.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Named `INDEX_VERSION` rather than `SCHEMA_VERSION` (F-134/F-171, ruled at F-134):
+/// the stamp is bumped both when the DDL changes *and* when the indexer starts
+/// extracting something different from unchanged input — a parser that recognises a
+/// new inline field, a block-kind mapping that stops dropping HTML, a different
+/// tokenizer. A name that says only "schema" is why that second case went unnoticed
+/// for as long as it did. One number covers both; there is no separate
+/// derivation-only constant.
+///
+/// Bumping it is the whole of a change in either category: a database reporting any
+/// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
+/// [`DDL`], which is asserted by a test rather than remembered by two people — under
+/// ADR-0002 a silent drift costs every user a full reindex.
+pub const INDEX_VERSION: i64 = 1;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +54,9 @@ pub enum IndexState {
 /// Why an index could not be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnusableReason {
-    /// Built by a different schema version.
-    SchemaVersion,
+    /// Built by a different index version — the DDL or what the indexer extracts from
+    /// unchanged input, or both (F-134).
+    IndexVersion,
     /// `PRAGMA integrity_check` or the FTS integrity check failed.
     Corrupt,
     /// `state` is still 'building': a rebuild was interrupted.
@@ -148,8 +157,8 @@ pub fn inspect(path: &Path) -> Result<IndexState, IndexError> {
 
     let version: Result<i64, _> = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
     match version {
-        Ok(found) if found == SCHEMA_VERSION => {}
-        Ok(_) => return unusable(UnusableReason::SchemaVersion),
+        Ok(found) if found == INDEX_VERSION => {}
+        Ok(_) => return unusable(UnusableReason::IndexVersion),
         Err(_) => return unusable(UnusableReason::Unopenable),
     }
 
@@ -207,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn the_constant_and_the_ddl_agree_on_the_schema_version() {
+    fn the_constant_and_the_ddl_agree_on_the_index_version() {
         // Under ADR-0002 a drift between these costs every user a full reindex, and
         // it would be discovered at runtime by the rebuild firing for no reason.
         let declared = DDL
@@ -223,9 +232,9 @@ mod tests {
             .expect("schema/001_init.sql must set PRAGMA user_version");
 
         assert_eq!(
-            declared, SCHEMA_VERSION,
-            "schema/001_init.sql sets user_version = {declared} but SCHEMA_VERSION is \
-             {SCHEMA_VERSION}. Bump both in the same commit (ADR-0002)."
+            declared, INDEX_VERSION,
+            "schema/001_init.sql sets user_version = {declared} but INDEX_VERSION is \
+             {INDEX_VERSION}. Bump both in the same commit (ADR-0002)."
         );
 
         // And the value the DDL actually leaves behind, not just the text of it.
@@ -234,7 +243,7 @@ mod tests {
         let applied: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(applied, SCHEMA_VERSION);
+        assert_eq!(applied, INDEX_VERSION);
     }
 
     #[test]
@@ -342,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_schema_version_is_unusable() {
+    fn a_wrong_index_version_is_unusable() {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("index.db");
         {
@@ -354,7 +363,7 @@ mod tests {
         assert_eq!(
             inspect(&path).expect("inspect"),
             IndexState::Unusable {
-                reason: UnusableReason::SchemaVersion
+                reason: UnusableReason::IndexVersion
             }
         );
     }

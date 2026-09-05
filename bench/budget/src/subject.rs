@@ -294,8 +294,8 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, Str
     // Touching the crates keeps the dependency edge real, so the day the entry
     // point lands there is nothing to wire up but the call itself.
     Err(format!(
-        "serat-index (schema v{}, sqlite {}) exposes no rebuild entry point yet — task I4.\n\n{}",
-        serat_index::SCHEMA_VERSION,
+        "serat-index (index v{}, sqlite {}) exposes no rebuild entry point yet — task I4.\n\n{}",
+        serat_index::INDEX_VERSION,
         serat_index::sqlite_version(),
         REBUILD_ENTRY_POINT
     ))
