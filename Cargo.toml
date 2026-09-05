@@ -58,6 +58,10 @@ rayon = "1.12.0"
 
 # --- supporting ---
 serde = { version = "1.0.229", features = ["derive"] }
+# Inline field (key:: value) and tag (#tag) scanning in serat-parse. Neither is
+# CommonMark, so nothing upstream of this recognises them; regex is the plainest
+# way to write "a word, then ::" without hand-rolling a scanner for it.
+regex = "1.13.1"
 # Generates the front-end types from the Rust ones (ADR-0007). Used by the
 # contracts crate now and by serat-app when it arrives.
 ts-rs = "12.0.1"

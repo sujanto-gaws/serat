@@ -14,6 +14,10 @@ pub enum LinkKind {
     Embed,
     /// `[text](path.md)`.
     Markdown,
+    /// `#tag`. Names no note and never resolves to one — `dst_note` stays NULL by
+    /// construction (schema/001_init.sql's CHECK on this), not because resolution
+    /// failed.
+    Tag,
 }
 
 /// What a link points at, before resolution.
