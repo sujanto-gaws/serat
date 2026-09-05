@@ -89,7 +89,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 -- ============================================================================
 -- Tables
@@ -263,15 +263,19 @@ CREATE TABLE links (
 -- tasks — a task is a block, not a new mechanism (§10.4)
 -- ----------------------------------------------------------------------------
 CREATE TABLE tasks (
-    id       INTEGER PRIMARY KEY,
-    note_id  INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    block_id INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
-    status   TEXT    NOT NULL,             -- the raw marker: space, x, /, -, > ...
-    done     INTEGER NOT NULL CHECK (done IN (0,1)),
-    text     TEXT,                         -- task text with inline fields stripped
-    due      TEXT,                         -- from due::   (ISO-8601)
-    owner    TEXT,                         -- from owner::
-    est      REAL                          -- from est::   (the usual rollup target)
+    id         INTEGER PRIMARY KEY,
+    note_id    INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    block_id   INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE,
+    status     TEXT    NOT NULL,           -- the raw marker: space, x, /, -, > ...
+    done       INTEGER NOT NULL CHECK (done IN (0,1)),
+    text       TEXT,                       -- task text with inline fields stripped
+    due        TEXT,                       -- from due::   (ISO-8601)
+    owner      TEXT,                       -- from owner::
+    est        REAL,                       -- from est::   (the usual rollup target)
+    byte_start INTEGER,                    -- just the marker byte: the patch target
+    byte_end   INTEGER,
+    CHECK ((byte_start IS NULL) = (byte_end IS NULL)),
+    CHECK (byte_start IS NULL OR byte_end >= byte_start)
 );
 -- due, owner and est are denormalised from inline fields, and serat-index fills
 -- them from the field rows it is already writing — not serat-parse. Which keys
@@ -280,6 +284,13 @@ CREATE TABLE tasks (
 -- living in two places, and would give serat-parse domain knowledge that has
 -- nothing to do with Markdown. serat-index needs no Markdown knowledge for this
 -- either: it reads field keys off rows, never off a document.
+--
+-- byte_start/byte_end are Task::marker_range — just the character between the
+-- brackets, the smallest possible instance of ADR-0008 (F-237). Mirrors fields'
+-- pair rather than inventing a second shape for the same idea: a recorded range
+-- lets §6.1 step 3 verify the byte it is about to patch still holds what it
+-- claims, the same way it does for a field, instead of the P2 patcher re-locating
+-- a task marker by rescanning the block — a second definition of where it is.
 --
 -- Why both status and done: status keeps the author's marker, because a vault
 -- that uses / for in-progress must survive a round trip (C-01). done is the
@@ -424,7 +435,7 @@ END;
 -- ============================================================================
 -- state='building' until the first full rebuild commits. An index opened in this
 -- state was interrupted mid-build and is discarded (§3.4, NFR-REL-02).
-INSERT INTO index_meta (id, schema_version, state) VALUES (1, 1, 'building');
+INSERT INTO index_meta (id, schema_version, state) VALUES (1, 2, 'building');
 
 -- ============================================================================
 -- ANALYZE (architecture.md §4.3)
