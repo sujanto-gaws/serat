@@ -247,6 +247,12 @@ FR-VLT-01's fix rests on it. The walk is missed by 4.0x at 20,000 notes and 6.5x
 
 T-07 rests on the second half, for the reason the threat model gives.
 
+**What the read half costs, and the limit on that figure.** The containment check is O(path depth) `lstat` calls and sits on `NoteSource::load`, so a rebuild pays it once per file: **43,587 `lstat` calls over the 20,000-note vault, 1.08–1.37 s across four release runs**, 54–68 µs a file. A range rather than a point, because four runs do not support a point.
+
+**Treat that as a floor, not an estimate.** F-203 established on this machine that an isolated walk benchmark understates — **1.85 s isolated against 3.1 s in situ, a 1.7x gap** — because one measures the crate on an idle machine and the other measures it against the disk and cores the rest of the application is using. The same instrument shape produced this number, and a rebuild runs a parse phase and a writer thread alongside it. TC-020's `read_hash` phase is where the in-situ figure will appear.
+
+**The priority ruling does not depend on the number** — design goal 1 outranks 2 and 4, and narrowing the guard to the IPC path would restore the asymmetry it exists to remove. **The number matters for something else.** f12's strip removes about 1.42 s of a 1.85 s walk; this guard adds about as much back to the same rebuild, on the read side. They are different paths and different requirements — f12 is what makes FR-VLT-01 achievable and the guard does not touch it — but **for NFR-PRF-04 both land inside the same 30 s, and each was justified on its own.** That is F-212's argument arriving as arithmetic rather than as a caution, and it is the reason to hold the two figures side by side when NFR-PRF-04 is first measured.
+
 **The likely way to break it is a tidy-looking fix.** The read path must refuse symlinks (task #20), and the obvious way to make the two paths agree is to unify them. Unifying them by making the walk **follow** links satisfies the containment requirement and silently invalidates the lexical strip. Unify them the other way — both refuse — and one sentence covers both, which is checkable in a way *"the walk skips them and the reader canonicalises"* is not.
 
 ##### A note that cannot be parsed is still a note
