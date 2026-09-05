@@ -179,7 +179,8 @@ pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
     product_limit_ms: 50.0,
     ci_limit_ms: None,
     vault: "20k",
-    interval: "watcher event dequeued to the row being visible to a reader (see F-03)",
+    interval: "apply() submitted through flush() returning -- Serat's own save path, \
+               no watcher, no debounce (F-227, F-268; see check_save_path)",
 };
 
 /// NFR-PRF-04.
@@ -986,6 +987,34 @@ pub fn check_note_count(reported: usize, expected: usize) -> Result<(), String> 
     ))
 }
 
+/// Whether a save's timing came from Serat's own save path rather than the
+/// watcher.
+///
+/// P0 findings **F-227, F-229, F-268**. A save routed through the watcher
+/// carries FR-VLT-04's 500 ms budget and the 150 ms coalescing window;
+/// NFR-PRF-03's 50 ms can only mean the direct path `apply()` then `flush()`
+/// takes, since architecture §3.1.1/§3.2 mean no external change can reach
+/// the index inside the coalescing window at all. A number measured on the
+/// wrong path is not distinguishable from a real one by looking at it — that
+/// is what makes this check load-bearing rather than decorative, and it is
+/// exactly the shape F-268 found already inside the instrument meant to
+/// prevent it.
+///
+/// # Errors
+/// When `path` is not exactly `"save"`.
+pub fn check_save_path(path: &str) -> Result<(), String> {
+    if path == "save" {
+        return Ok(());
+    }
+    Err(format!(
+        "a save timing came from the {path:?} path, not \"save\". NFR-PRF-03 governs Serat's \
+         own save path (apply() then flush()), not a save observed through the watcher, which \
+         carries FR-VLT-04's 500 ms budget and the 150 ms coalescing window instead (F-227, \
+         F-229, F-268). Reporting this number against NFR-PRF-03 would be wrong by \
+         construction, not by a measurement error."
+    ))
+}
+
 /// Recompute the vault's tree digest from what is on disk, exactly as the
 /// generator computes it: SHA-256 over `path\0filehash\n` in sorted path order.
 ///
@@ -1288,22 +1317,56 @@ where
     Ok(Measurement::new(samples).with_phases(phases))
 }
 
-/// NFR-PRF-03's measurement: both of F-03's intervals, one asserted.
+/// NFR-PRF-03's measurement: the save-path interval, asserted, beside the two
+/// watcher-path intervals kept for FR-VLT-04 (F-227, F-268).
 ///
 /// # Errors
-/// Any failure of the save path.
+/// Any failure of the save path, or [`check_save_path`] rejecting a save
+/// measured on the watcher path rather than Serat's own.
 pub fn measure_save_to_index(
     vault: &VaultUnderTest,
     iterations: usize,
 ) -> Result<Measurement, String> {
+    measure_save_to_index_with(vault, iterations, |v, i, it| {
+        subject::save_to_index(v, i, it)
+    })
+}
+
+/// As [`measure_save_to_index`], against an injected save path.
+///
+/// Split out so `check_save_path` refusing a watcher-path measurement can be
+/// tested without the real seam existing yet (task I5) — the same reasoning
+/// as `measure_full_rebuild_with`, and forced by the same lesson: F-268 was a
+/// harness bug nothing exercised, because nothing could inject a `"watcher"`
+/// tag to prove the guard fires on it.
+///
+/// # Errors
+/// As [`measure_save_to_index`].
+pub fn measure_save_to_index_with<F>(
+    vault: &VaultUnderTest,
+    iterations: usize,
+    save_to_index: F,
+) -> Result<Measurement, String>
+where
+    F: FnOnce(&Path, &Path, usize) -> Result<subject::SaveSamples, String>,
+{
     let index_dir = vault.path.join(".serat-bench");
-    let both = subject::save_to_index(&vault.path, &index_dir, iterations)?;
-    Ok(Measurement::new(both.pipeline).reporting(
-        "F-03",
-        "End to end from the file being written, which includes the 150 ms coalescing window \
-         of architecture §3.1 step 1. F-03 ruled that interval is FR-VLT-04's, not this budget's.",
-        both.end_to_end,
-    ))
+    let samples = save_to_index(&vault.path, &index_dir, iterations)?;
+    check_save_path(samples.path)?;
+    Ok(Measurement::new(samples.save)
+        .reporting(
+            "watcher-write-to-visible",
+            "File written to row visible, via the watcher -- includes the 150 ms coalescing \
+             window of architecture §3.1 step 1. FR-VLT-04's interval, not this budget's \
+             (F-227).",
+            samples.end_to_end,
+        )
+        .reporting(
+            "watcher-dequeue-to-visible",
+            "Watcher event dequeued to row visible. Still a watcher-path interval despite the \
+             name -- not this budget's either (F-268).",
+            samples.pipeline,
+        ))
 }
 
 /// NFR-PRF-01's measurement: two marks from one set of cold starts.
@@ -1779,6 +1842,79 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- F-30
+
+    // ---------------------------------------------------- F-227/F-229/F-268
+
+    #[test]
+    fn check_save_path_accepts_only_save() {
+        check_save_path("save").expect("the direct save path is accepted");
+
+        let err = check_save_path("watcher").expect_err("a watcher-path save must be refused");
+        assert!(err.contains("watcher"), "{err}");
+        assert!(err.contains("NFR-PRF-03"), "{err}");
+        assert!(err.contains("F-227"), "{err}");
+        assert!(err.contains("F-229"), "{err}");
+        assert!(err.contains("F-268"), "{err}");
+
+        // SaveSamples::default()/SaveTiming::default() both give "" -- the
+        // guard must fail closed on the default, not open.
+        assert!(check_save_path("").is_err());
+    }
+
+    fn save_samples(path: &'static str) -> subject::SaveSamples {
+        let mut save = Samples::new();
+        save.push(Duration::from_millis(12));
+        let mut end_to_end = Samples::new();
+        end_to_end.push(Duration::from_millis(400));
+        let mut pipeline = Samples::new();
+        pipeline.push(Duration::from_millis(180));
+        subject::SaveSamples {
+            path,
+            save,
+            end_to_end,
+            pipeline,
+        }
+    }
+
+    #[test]
+    fn measure_save_to_index_asserts_the_save_interval_and_reports_the_watcher_ones() {
+        // F-268: this is the regression test for the defect the finding is
+        // about. Before the fix this measurement asserted `pipeline` -- a
+        // watcher-path interval -- and this test would have passed on the
+        // wrong series, silently, the same way the real bug did.
+        let m = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Ok(save_samples("save")))
+            .expect("a save-path measurement is accepted");
+        assert_eq!(m.samples.values(), &[12.0]);
+        assert_eq!(m.reported.len(), 2);
+        let labels: Vec<&str> = m.reported.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"watcher-write-to-visible"), "{labels:?}");
+        assert!(labels.contains(&"watcher-dequeue-to-visible"), "{labels:?}");
+        // Neither watcher-path series may be silently dropped, or FR-VLT-04
+        // loses the only measurement of the interval it actually governs.
+        assert_eq!(
+            m.reported
+                .iter()
+                .find(|r| r.label == "watcher-write-to-visible")
+                .expect("present")
+                .samples
+                .values(),
+            &[400.0]
+        );
+    }
+
+    #[test]
+    fn a_save_measured_on_the_watcher_path_is_refused_not_silently_asserted() {
+        let err = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Ok(save_samples("watcher")))
+            .expect_err("a watcher-path measurement must not become an NFR-PRF-03 number");
+        assert!(err.contains("watcher"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_save_measurement_propagates_rather_than_being_absorbed() {
+        let err = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Err("boom".into()))
+            .expect_err("a failed save path is not a measurement");
+        assert_eq!(err, "boom");
+    }
 
     // ------------------------------------------------ closing the survivors
 

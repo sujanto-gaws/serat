@@ -154,61 +154,134 @@ quickly is the failure a wall-clock number cannot see on its own.
 The phase durations are the whole content of open design question 1. The budget
 still asserts the total; the phases are recorded beside it.";
 
-/// Two intervals, because P0 finding F-03 showed that "save to index" has two
-/// defensible readings that differ by more than the budget itself.
+/// A save's timing, on the interval NFR-PRF-03 actually governs, plus the two
+/// watcher-path readings kept for FR-VLT-04 and for continuity.
+///
+/// **Corrected by F-268, one layer inward from F-227.** Both fields this
+/// struct used to have — `end_to_end` and `pipeline` — are watcher-path
+/// intervals: `end_to_end` is "file written to row visible" and its own doc
+/// said so (the 150 ms coalescing window is inside it); `pipeline` is
+/// "watcher event dequeued to row visible". §3.1.1's actual save path has no
+/// watcher and no dequeue at all — the buffer is written, the in-memory bytes
+/// go straight to the parse pool, submit, visible — so neither field is an
+/// interval NFR-PRF-03 can mean, and `measure_save_to_index` was asserting
+/// `pipeline` regardless. F-227 warned that *benchmarking against the current
+/// shell* would measure the watcher path by accident and report NFR-PRF-03
+/// missed by an order of magnitude; this was the same wrong number **by
+/// construction, inside the instrument built to prevent it**, and it read as
+/// correct because `pipeline` sounds like the pipeline's own cost.
+///
+/// `save` is the fix: §3.1.1's save path, from submit through
+/// `IndexHandle::apply()` to `writer().flush()` returning. It is what gets
+/// asserted now. `end_to_end` and `pipeline` stay, reported rather than
+/// asserted, because they are real numbers that answer a real question —
+/// FR-VLT-04's 500 ms, for a change that arrives through the watcher.
 #[derive(Clone, Debug, Default)]
 pub struct SaveSamples {
-    /// File written to row visible. What a user experiences, and what includes
-    /// the 150 ms per-path coalescing window of architecture section 3.1 step 1.
-    /// This reading cannot fit inside 50 ms by construction; measuring it anyway
-    /// is how the gate report shows *why*, rather than asserting it is impossible.
+    /// Which code path every sample in `save` was measured on. Must read
+    /// `"save"` — [`crate::check_save_path`] refuses anything else, the same
+    /// guard [`SaveTiming::path`] documents. Defaults to `""`, which fails
+    /// closed rather than open.
+    pub path: &'static str,
+    /// §3.1.1's save path: `apply()` submitted through `flush()` returning.
+    /// No watcher, no debounce, no dequeue. **The asserted series.**
+    pub save: Samples,
+    /// File written (via the watcher) to row visible, including the 150 ms
+    /// per-path coalescing window of architecture §3.1 step 1. FR-VLT-04's
+    /// interval, not NFR-PRF-03's. Reported, never asserted against this
+    /// budget (F-227).
     pub end_to_end: Samples,
-    /// Watcher event dequeued to row visible. The pipeline's own cost, with the
-    /// debounce excluded. The only reading of NFR-PRF-03 that is satisfiable under
-    /// the current design, and therefore the one asserted -- pending the
-    /// architect's ruling on F-03.
+    /// Watcher event dequeued to row visible: the pipeline's own cost with
+    /// the debounce excluded, but still a **watcher-path** interval — the
+    /// name is the reason this went unnoticed as long as it did (F-268).
+    /// Reported beside `end_to_end`, never asserted.
     pub pipeline: Samples,
 }
 
+/// A single save's timing, and which code path measured it.
+///
+/// **P0 finding F-229.** A wall-clock number cannot say on its own whether it
+/// came from Serat's own save path or from a save observed through the
+/// watcher — the two differ by an order of magnitude in what they are allowed
+/// to cost, and F-268 is what happens when the difference is invisible from
+/// inside the harness. `path` makes it a structural fact of the measurement
+/// rather than a name someone has to remember means something: it must read
+/// `"save"` — [`crate::check_save_path`] refuses anything else — because
+/// `"watcher"` (or any other value) means this timing carries FR-VLT-04's
+/// budget and the 150 ms coalescing window, not NFR-PRF-03's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SaveTiming {
+    /// Must read `"save"`. Defaults to `""`, which fails the check closed
+    /// rather than open.
+    pub path: &'static str,
+    /// How long reading and hashing the buffer took (§3.1 step 3).
+    pub read_hash: Duration,
+    /// How long parsing took, on the in-memory bytes just written — never a
+    /// re-read of the file (§3.1.1's explicit requirement).
+    pub parse: Duration,
+    /// `apply()` submitted through `flush()` returning. Single-threaded on
+    /// this path, so `read_hash + parse + write` **does** sum to the total,
+    /// unlike the rebuild's phases.
+    pub write: Duration,
+}
+
 /// What the harness needs before NFR-PRF-03 is measurable.
+///
+/// Corrected by **F-267**, which is itself a correction of F-230: this
+/// constant is a `&str`, not compiled code, so a stale call site here never
+/// broke the build the way F-230 assumed — it read as a plausible
+/// specification instead, which is the worse failure mode, because nothing
+/// forces a reader to notice. It instructed building `apply_and_wait`, which
+/// §2.2 ruled against (a barrier must stay visible where it is called); the
+/// real composition is `apply()` then `writer().flush()`, corrected below.
 pub const SAVE_ENTRY_POINT: &str = "\
-NFR-PRF-03 needs, from serat-index / serat-vault (task I5):
+NFR-PRF-03 needs, from serat-index (task I5):
 
-    // Open an already-built index over `vault`.
-    pub fn open(vault: &Path, index_dir: &Path) -> Result<IndexHandle, IndexError>;
+    let handle = IndexHandle::open(vault_root, index_dir)?;
+    let timing: SaveTiming =
+        handle.apply(&vault, &parser, &echo, &path)?;   // submits directly
+    handle.writer().flush()?;                            // the barrier, visible at the call
 
-    // Submit one changed file and block until it is visible to a reader.
-    // The budget is save -> queryable, so the harness must be able to observe
-    // the point at which a query would see the change (ADR-0001's flush, or an
-    // index.changed notification carrying the same guarantee).
-    pub fn apply_and_wait(&self, path: &VaultPath, bytes: &[u8]) -> Result<(), IndexError>;
+    // SaveTiming { path, read_hash, parse, write } -- single-threaded on this
+    // path, so read_hash + parse + write DOES sum to the total, unlike the
+    // rebuild's phases. `path` must read \"save\": this is Serat's own save
+    // path, with no watcher, no debounce, no dequeue, and it is the ONLY
+    // reading NFR-PRF-03 can mean (F-227, F-268) -- a save observed through
+    // the watcher instead carries FR-VLT-04's 500 ms budget and the 150 ms
+    // coalescing window, and the harness refuses to assert a number whose
+    // `path` does not read \"save\" (F-229, check_save_path).
 
-    // And, for F-03, the moment the watcher event left the queue, so the
-    // 150 ms coalescing window is reported separately from the work:
-    pub fn last_dequeued_at(&self) -> Instant;   // or a timestamped event
+apply() then flush(), NOT a combined apply_and_wait(): a barrier must stay
+visible where it is called (architecture §2.2). apply(); flush(); shows the
+wait; a combined call hides one and is a copy-paste from the save path where
+waiting is forbidden by design goal 2.
 
-The harness edits 1,000 distinct notes, one at a time, and reports BOTH
-intervals: file-written-to-visible, and dequeued-to-visible. Distinct notes
-rather than one note a thousand times, because re-saving one note measures a
-warm row and not the budget -- and the sample deliberately includes hub notes.
-With 25% of inbound links held by 1% of notes and a max in-degree of 679, a save
-that touches a hub does far more link-table work than the median, so a sample
-that misses the hubs posts a p95 the real vault does not honour.
-(rust-core-dev's point, and a good one.)
+The full signature is apply(&dyn NoteSource, &dyn NoteParser, &dyn EchoGuard,
+&VaultPath) then writer().flush(). NoteSource and NoteParser are the traits
+rebuild() already takes (architecture §2.1); EchoGuard is what makes echo
+suppression (§3.2) a parameter the harness can see rather than a private
+detail apply() reaches for on its own.
 
-apply_and_wait bypasses the watcher by design, and that is the honest way to
-measure this: no external change can reach the index in under the 150 ms
-coalescing window, so the 50 ms budget can only mean Serat's own save path,
-where the app submits directly rather than waiting to be told about its own
-write. flush() means every operation submitted before the call is committed;
-under WAL that is visible to a reader beginning a transaction afterwards, which
-is the guarantee worth measuring.
+One submit per flush. flush() drains the whole queue, so submitting fifty and
+flushing once would be a throughput figure wearing a latency label, and
+NFR-PRF-03 is a p95 of individual saves.
 
-F-03: end to end, the design misses 50 ms by construction, because the
-coalescing window alone is 150 ms. Until the architect rules on which interval
-the requirement means, the harness asserts the pipeline interval and prints the
-end-to-end figure beside it, so the gate report states which number the claim
-rests on instead of implying there was only ever one.";
+The harness edits 1,000 distinct notes, one at a time, and reports the save
+interval (asserted) beside the two watcher-path intervals (reported, F-227,
+F-268): file-written-to-visible via the watcher, and watcher-event-dequeued-
+to-visible. Distinct notes rather than one note a thousand times, because
+re-saving one note measures a warm row and not the budget -- and the sample
+deliberately includes hub notes. With 25% of inbound links held by 1% of notes
+and a max in-degree of 679, a save that touches a hub does far more link-table
+work than the median, so a sample that misses the hubs posts a p95 the real
+vault does not honour. (rust-core-dev's point, and a good one.)
+
+F-227, F-268: two paths, not one, and both must be visible in the result. A
+save made in Serat has no watcher and no debounce -- that is what the 50 ms
+governs, through apply()+flush(). An external change carries the watcher's
+150 ms coalescing window and is FR-VLT-04's 500 ms. SaveSamples.save is the
+former, asserted; .end_to_end and .pipeline are the latter, reported for
+FR-VLT-04 and never asserted against NFR-PRF-03.";
 
 /// What the harness needs before NFR-PRF-01 is measurable.
 pub const COLD_START_ENTRY_POINT: &str = "\
@@ -301,8 +374,9 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, Str
     ))
 }
 
-/// Time `iterations` single-note saves through to being visible in the index,
-/// on both of F-03's intervals.
+/// Time `iterations` single-note saves through to being visible in the
+/// index: the save-path interval NFR-PRF-03 governs, and the two watcher-path
+/// intervals reported beside it (F-227, F-268).
 ///
 /// # Errors
 /// Today: always, because the incremental save path does not exist yet.
@@ -443,6 +517,13 @@ mod tests {
 
         let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
         assert!(e.contains("task I5"), "{e}");
+        // F-267 corrected the entry point away from apply_and_wait, which §2.2
+        // ruled against; the request must name the real composition and the
+        // F-229 path discriminant, or a future implementer builds the wrong
+        // shape from a plausible-looking spec (F-267's own point).
+        assert!(e.contains("EchoGuard"), "{e}");
+        assert!(e.contains("\"save\""), "{e}");
+        assert!(e.contains("writer().flush()"), "{e}");
 
         let e = cold_start(vault, 20).expect_err("must not silently pass");
         assert!(e.contains("S1"), "{e}");
