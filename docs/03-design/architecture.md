@@ -513,7 +513,7 @@ An AST round-trip would be simpler to write and would lose the author's formatti
 
 ### Binary extraction
 
-The full contract is contracts/extractor.rs. An extractor turns a binary into the same block rows a Markdown parser emits, which is why search, backlinks, embeddings and citations work on a PDF with no parallel code path.
+The full contract will be `contracts/extractor.rs`. It is not written yet, so §7.1–§7.3 are the whole of the design until it is — stated in the future tense because the present tense here is what made five absent files read as existing ones (F-239). An extractor turns a binary into the same block rows a Markdown parser emits, which is why search, backlinks, embeddings and citations work on a PDF with no parallel code path.
 
 #### 7.1 Isolation
 
@@ -637,7 +637,7 @@ The remaining Must-priority requirements have designs that are the obvious ones,
 | FR-BIN-11, FR-BIN-12                       | Bundled PDF and image viewers in the webview, opened at the locator a search hit carries.                                                                                                                    |
 | FR-VLT-03, FR-VLT-08                       | Temp-file-and-rename in serat-vault, described in §6.1 step 5; assets are listed by the same walk that finds notes.                                                                                          |
 | FR-AIX-06, FR-AIX-11, FR-AIX-12            | One provider trait with two implementations; retrieval never depends on which. Absence of a provider disables generation and nothing else, and no model ships in the installer.                              |
-| NFR-CMP-02                                 | Falls out of the first design goal: everything Serat writes is Markdown, YAML or documented plain text.                                                                                                      |
+| NFR-CMP-01, NFR-CMP-02                     | `.obsidian/`, `.trash/` and `.serat/` are in serat-vault's ignore list — descended into by nothing, read by nothing, written by nothing — so an Obsidian vault opens unmodified and its configuration survives a session. And everything Serat does write is Markdown, YAML or documented plain text, which falls out of the first design goal. |
 
 Security enforcement mechanisms are also recorded in `threat-model.md`.
 
@@ -657,7 +657,9 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 
 ## Traceability
 
-Each design element and the requirements it satisfies. Every requirement of priority Must in the baseline has a design element here or in the repo-ready files; the four Won't-priority exclusions have none by construction.
+Each design element and the requirements it satisfies. Every requirement of priority Must in the baseline is accounted for — by a row here, by §10.1's distribution table, §10.2's security table or §10.4's conventional-design table, or by the short list below that says plainly where no design exists yet. The four Won't-priority exclusions have none by construction.
+
+A path in the Where column marked *(planned)* names a repo-ready file **that is not written yet**. The marker exists because a filename retires a question a blank cell would prompt: this table cited five files that did not exist, and for the conformance suite the file was the only thing the row named, so roughly twenty requirement IDs read as covered by an artefact nobody had written (F-239). Every unmarked path resolves today, and that is a property a check can assert.
 
 | Design element                          | Where                      | Satisfies                                                                     |
 |-----------------------------------------|----------------------------|-------------------------------------------------------------------------------|
@@ -669,21 +671,33 @@ Each design element and the requirements it satisfies. Every requirement of prio
 | Diff-based reconciliation               | §3.3                       | FR-VLT-05                                                                     |
 | Cold-start path and phase budgets       | §3.4                       | NFR-PRF-01, FR-VLT-01                                                         |
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
-| Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, NFR-PRF-05  |
+| Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, NFR-PRF-05 |
 | Rebuild-not-migrate                     | §4.3, ADR-02               | FR-VLT-02, NFR-REL-02                                                         |
-| SQ grammar and type rules               | §5, grammar/sq.ebnf        | FR-STR-06, FR-STR-07, FR-STR-09                                               |
-| Lowering algorithm                      | §5.2, grammar/lowering.md  | FR-STR-08, FR-STR-12, NFR-PRF-05                                              |
-| Conformance suite                       | grammar/conformance.md     | FR-STR-06, FR-STR-07, FR-STR-10, P2 gate                                      |
+| SQ grammar and type rules               | §5, grammar/sq.ebnf *(planned)* | FR-STR-06, FR-STR-07, FR-STR-09                                          |
+| Lowering algorithm                      | §5.2, grammar/lowering.md *(planned)* | FR-STR-08, FR-STR-12, NFR-PRF-05                                    |
+| Conformance suite                       | grammar/conformance.md *(planned — the whole of this row)* | FR-STR-06, FR-STR-07, FR-STR-10, P2 gate                |
 | Write-back patcher                      | §6, ADR-08                 | FR-VIW-05, FR-VIW-06, FR-VIW-07, FR-VIW-08, NFR-MNT-03                        |
-| Extractor trait and worker protocol     | §7, contracts/extractor.rs | FR-BIN-05..10, FR-BIN-16, NFR-SEC-03, NFR-REL-03                              |
+| Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, NFR-SEC-03, NFR-REL-03                    |
 | Extraction cache                        | §7.2                       | FR-BIN-08                                                                     |
+| Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
+| Chunking and incremental embedding      | §8.1                       | FR-AIX-02                                                                     |
 | Retrieval fusion                        | §8.2, Fig. 3               | FR-AIX-01, FR-AIX-03, FR-AIX-09, FR-AIX-10                                    |
 | Proposal lifecycle                      | §8.3, Fig. 6               | FR-AIX-05, FR-AIX-04, FR-MCP-03                                               |
-| MCP tool schemas                        | contracts/mcp-tools.json   | FR-MCP-01, FR-MCP-02, FR-MCP-04, NFR-SEC-05                                   |
+| MCP tool schemas                        | contracts/mcp-tools.json *(planned)* | FR-MCP-01, FR-MCP-02, FR-MCP-04, NFR-SEC-05                           |
 | IPC contract                            | contracts/ipc.rs           | FR-VLT-01, FR-VLT-09, FR-LNS-02, FR-LNS-04, NFR-USE-04                        |
 | Screen designs and interaction rules    | §9, Figs. 4–6              | FR-EDT-02, FR-STR-10, FR-NAV-04, FR-LNS-02, FR-VIW-05, NFR-USE-01, NFR-USE-04 |
 | Benchmark vault generator               | §10.3, bench/              | NFR-MNT-02                                                                    |
 | Budget jobs in CI, one per NFR-PRF      | §10.3, bench/, CI workflow | NFR-PRF-08                                                                    |
+
+### Musts with no design element yet
+
+Three, listed rather than mapped. Every one of them could be given a plausible row — §9 mentions a switcher, §3.4 mentions NFR-CMP-03 by name — and that is exactly the mistake to avoid, because **an entry naming the wrong section is worse than an absence: it retires the question instead of raising it.** This is the same failure as citing a file that does not exist, one level up.
+
+| Requirement | What is actually missing |
+|-------------|--------------------------|
+| **FR-NAV-01** quick switcher (Must, P1) | Nothing here designs it. §9's *lens switcher* is a different control — it changes role, not note — and the resemblance is why this went unnoticed. Most of the input exists: `notes.title`, `notes.path`, an `aliases` frontmatter field in `fields`, and headings as `blocks` with `kind = 'heading'`. **What has no home is the ranking.** FR-NAV-01 requires results ranked by *recency and frequency*, and nothing records either. That is a decision rather than a missing column, and C-02 is what makes it one: per-note open counts are state, and if they live only in `.serat/` then nothing may depend on them. The likely answer is that they live there and the ranking degrades to lexical after a rebuild, which is design goal 5 working as intended — but it has not been ruled, and the alternative is writing a file into the user's vault that they did not ask for. |
+| **NFR-PRF-06** switcher latency (Must, P1) | Follows FR-NAV-01 and cannot be designed before it. It also has no budget job, which is correct rather than overdue: `bench/budget`'s table is P0-scoped and says so. It becomes due the day the switcher is designed, and §10.3's rule is that a budget with no job is an aspiration. |
+| **NFR-CMP-03**, the *by default* half (Must, P1) | Its acceptance criterion — a fresh clone without `.serat/` builds a correct index on first open — **is** designed and covered, by §3.4 step 1 and ADR-02. The other half is not: nothing says who writes `.serat/` into a `.gitignore`. §3.4 names NFR-CMP-03, but naming a requirement is not designing it, and the same paragraph says *"whether the vault is a git repository is the user's business and not ours"* — which is in tension with shipping a default that edits the user's `.gitignore`. Resolve the tension rather than inheriting it. |
 
 ## Open design questions
 
@@ -697,4 +711,5 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
 | Does the 150ms watcher debounce hold for every sync tool?             | Observation during P1 against git, Syncthing and iCloud, which behave differently.                                             |
 | Should saved views live in .serat or in the vault as notes?           | Follows from whether a user wants views to sync with their vault. Leaning toward notes, for consistency with types and lenses. |
+| Where do the quick switcher's recency and frequency live?             | A P1 ruling, not a measurement. C-02 forbids depending on state that lives only in `.serat/`, and per-note open counts are state. Ranking that degrades to lexical after a rebuild satisfies C-02 and design goal 5; the alternative writes a file into the user's vault. See §Traceability, Musts with no design element yet. |
 | Does §3.2's redundant index contend with P2's write-back submits?     | A P2 measurement of writer-queue depth while patching under load. Reasoning settles the correctness half — a redundant index touches no vault byte — and settles nothing about backpressure (ADR-11). |
