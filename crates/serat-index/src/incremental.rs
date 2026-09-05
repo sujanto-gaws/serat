@@ -1,7 +1,4 @@
-//! The save-to-index path, and the parse pool that feeds a rebuild.
-//!
-//! Two things live here because they are the same pipeline at two scales: one note
-//! arriving from a save, and twenty thousand arriving from a walk.
+//! The save-to-index path (NFR-PRF-03).
 //!
 //! # Which interval NFR-PRF-03's 50 ms governs
 //!
@@ -24,50 +21,32 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use serat_core::{
     EchoGuard, IndexError, IndexOp, IndexWriter, LoadedNote, NoteKind, NoteParser, NoteSource,
-    SourceEntry, VaultPath,
+    VaultPath,
 };
 
 use crate::schema;
 use crate::writer::{DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
-/// How many notes are parsed in parallel before the batch is handed to the writer.
-///
-/// The pool has to stay ahead of the writer without holding the whole vault in memory:
-/// 20,000 parsed notes at once would be gigabytes, and one at a time would leave the
-/// cores idle. A few hundred is enough to keep every core busy while the writer drains
-/// the previous chunk.
-pub const PARSE_CHUNK: usize = 256;
-
-/// Size the parse pool at cores minus one.
+/// Size a parse pool at cores minus one.
 ///
 /// Architecture §2.2. Leaving a core free is what keeps the UI responsive during a
 /// rebuild — parsing is pure and CPU-bound, so a pool sized to every core competes
 /// with the thread the user is typing on, and design goal 2 says nothing may block the
 /// keystroke.
+///
+/// Sizing logic only: this crate's `rebuild()` does not currently run parsing across a
+/// pool built from this (its own `index_one` is sequential — a separate, already-
+/// merged implementation of I4 that this branch does not revisit). Kept because the
+/// number is architecture's answer regardless of who builds the pool, and a future
+/// caller — most plausibly whoever wires a real `NoteParser` in task #8/I3 and revisits
+/// NFR-PRF-04 — needs it unchanged from what §2.2 specifies.
 #[must_use]
 pub fn parse_pool_threads() -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get().saturating_sub(1).max(1))
         .unwrap_or(1)
-}
-
-/// Build the rayon pool the parse phase runs on.
-///
-/// # Errors
-///
-/// [`IndexError::Corrupt`] if the pool cannot be created, which in practice means the
-/// process cannot spawn threads.
-pub fn build_parse_pool() -> Result<rayon::ThreadPool, IndexError> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(parse_pool_threads())
-        .thread_name(|i| format!("serat-parse-{i}"))
-        .build()
-        .map_err(|err| IndexError::Corrupt {
-            message: format!("could not build the parse pool: {err}"),
-        })
 }
 
 /// An open index, kept open across saves.
@@ -161,6 +140,19 @@ impl IndexHandle {
     /// special recovery is needed on this path any more: nothing was recorded, so the
     /// watcher's own event for this write, whenever it arrives, indexes it normally.
     /// [`IndexError::WriterStopped`] if the writer is gone.
+    ///
+    /// # This does not resolve links (F-244)
+    ///
+    /// `upsert_note` is delete-then-insert, and `ON DELETE CASCADE` plus
+    /// `links.dst_note`'s `ON DELETE SET NULL` (schema/001_init.sql) mean every save
+    /// through this path nulls every inbound link to the note before re-inserting its
+    /// own rows — and nothing on this path calls `resolve_links`, which only the
+    /// rebuild path does. So a saved note's *outbound* links resolve normally, but any
+    /// note that already linked *to* it loses that edge in the index until the next
+    /// full rebuild. This is FR-NAV-04 (Backlinks, Must at P1) and is filed as task
+    /// #13, not fixed here: C-02 covers it (the index is disposable and a rebuild
+    /// repairs it, so nothing depends on the stale state surviving), which is what
+    /// keeps this a P1 gap rather than a P0 blocker.
     pub fn apply(
         &self,
         source: &dyn NoteSource,
@@ -257,57 +249,10 @@ fn build_op(
     }
 }
 
-/// Read and parse a chunk of notes across the pool, in order.
-///
-/// Order is preserved because a rebuild that visits files in a different order each
-/// run produces different rowids, and "delete the index, rebuild, get the same
-/// answers" is easier to assert when only the content varies.
-///
-/// Returns the operations and the time spent reading and parsing. The two are summed
-/// across threads, so on a pool of eight they can exceed the wall clock — which is the
-/// point: it is CPU time, and comparing it against the writer's is what answers
-/// architecture's open design question 1.
-pub(crate) fn parse_chunk(
-    pool: &rayon::ThreadPool,
-    source: &(dyn NoteSource + Sync),
-    parser: &(dyn NoteParser + Sync),
-    entries: &[SourceEntry],
-) -> (Vec<Option<IndexOp>>, Duration, Duration) {
-    pool.install(|| {
-        let results: Vec<(Option<IndexOp>, Duration, Duration)> = entries
-            .par_iter()
-            .map(|entry| {
-                let path = &entry.path;
-                let reading = Instant::now();
-                let loaded = source.load(path);
-                let read_hash = reading.elapsed();
-
-                match loaded {
-                    Ok(loaded) => match build_op(parser, path, loaded) {
-                        Some((op, parse)) => (Some(op), read_hash, parse),
-                        None => (None, read_hash, Duration::ZERO),
-                    },
-                    Err(_) => (None, read_hash, Duration::ZERO),
-                }
-            })
-            .collect();
-
-        let mut ops = Vec::with_capacity(results.len());
-        let mut read_hash = Duration::ZERO;
-        let mut parse = Duration::ZERO;
-        for (op, read, parsed) in results {
-            ops.push(op);
-            read_hash += read;
-            parse += parsed;
-        }
-        (ops, read_hash, parse)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serat_core::{ContentHash, NoteMeta, ParseError, ParsedNote, VaultError};
+    use serat_core::{ContentHash, NoteMeta, ParseError, ParsedNote, SourceEntry, VaultError};
     use std::sync::Mutex;
 
     /// A source with exactly one file, whose hash is fixed so a test can assert on it.
@@ -383,6 +328,37 @@ mod tests {
         }
     }
 
+    /// Accepts everything, and — the point of it — looks at `echo` from *inside*
+    /// `submit`, so the ordering between the two calls is observable rather than
+    /// merely asserted (F-243: the earlier version of this test only checked the hash
+    /// ended up recorded, which is true whether recording happens before or after
+    /// submit, and passed unchanged under a mutation that swapped the order).
+    struct OrderingWriter<'a> {
+        echo: &'a SpyEcho,
+        already_recorded_at_submit_time: Mutex<bool>,
+    }
+
+    impl<'a> OrderingWriter<'a> {
+        fn new(echo: &'a SpyEcho) -> Self {
+            Self {
+                echo,
+                already_recorded_at_submit_time: Mutex::new(false),
+            }
+        }
+    }
+
+    impl IndexWriter for OrderingWriter<'_> {
+        fn submit(&self, _op: IndexOp) -> Result<(), IndexError> {
+            let already = !self.echo.recorded.lock().expect("lock").is_empty();
+            *self.already_recorded_at_submit_time.lock().expect("lock") = already;
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<(), IndexError> {
+            Ok(())
+        }
+    }
+
     fn path(text: &str) -> VaultPath {
         VaultPath::new(text).expect("path")
     }
@@ -424,11 +400,18 @@ mod tests {
         // The mirror case: once the submit is accepted, the echo must be recorded so
         // the watcher drops its own event for the write that already indexed it —
         // otherwise every save is indexed twice, once here and once by the watcher.
+        //
+        // F-243: asserting only that the hash ends up recorded does not test the
+        // ordering the name promises — that is true whether `record_echo` runs before
+        // or after `submit`. `OrderingWriter` observes the echo set from inside
+        // `submit` itself, so a mutation that swapped the two calls would make this
+        // fail rather than pass unchanged.
         let hash = ContentHash::from_bytes([9u8; 32]);
         let echo = SpyEcho::default();
+        let writer = OrderingWriter::new(&echo);
 
         apply_via(
-            &AlwaysAccepts,
+            &writer,
             &OneFile { hash },
             &TrivialParser,
             &echo,
@@ -436,6 +419,10 @@ mod tests {
         )
         .expect("submit");
 
+        assert!(
+            !*writer.already_recorded_at_submit_time.lock().expect("lock"),
+            "the echo was recorded before submit ran, not after (F-243)"
+        );
         assert_eq!(
             *echo.recorded.lock().expect("lock"),
             vec![hash],

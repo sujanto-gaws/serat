@@ -196,21 +196,25 @@ fn a_save_keeps_the_full_text_index_in_step() {
 }
 
 #[test]
-fn the_parse_pool_leaves_a_core_free() {
+fn parse_pool_threads_leaves_a_core_free() {
     // Architecture §2.2: cores minus one. Parsing is CPU-bound, and a pool sized to
     // every core competes with the thread the user is typing on — design goal 2 says
     // nothing may block the keystroke, and a rebuild that saturates the machine does.
+    //
+    // This sizes a pool without yet feeding one: `rebuild()` runs sequentially today
+    // (a separate, already-merged I4 implementation this branch does not revisit), so
+    // the function is tested standalone rather than through `rebuild`'s output.
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     let threads = parse_pool_threads();
 
-    assert!(threads >= 1, "the pool must have at least one thread");
+    assert!(threads >= 1, "cores minus one must have at least one thread");
     if cores > 1 {
         assert_eq!(
             threads,
             cores - 1,
-            "the parse pool took every core; §2.2 says cores minus one"
+            "parse_pool_threads took every core; §2.2 says cores minus one"
         );
     } else {
         assert_eq!(threads, 1, "a single-core machine still needs one parser");
@@ -218,9 +222,9 @@ fn the_parse_pool_leaves_a_core_free() {
 }
 
 #[test]
-fn a_rebuild_across_the_pool_produces_the_same_index_as_the_notes_describe() {
-    // Parsing moved onto a pool, so the rebuild's output must not depend on how the
-    // work was divided. Two hundred notes is several chunks.
+fn two_rebuilds_of_the_same_notes_produce_the_same_index() {
+    // FR-VLT-02: delete the index, rebuild, get the same answers. Two hundred notes
+    // is enough to make a shape-dependent bug (e.g. a batch boundary) show up.
     let files: Vec<(String, String)> = (0..200)
         .map(|i| (format!("10-projects/note-{i:04}.md"), note_body(i)))
         .collect();
@@ -260,15 +264,15 @@ fn a_rebuild_across_the_pool_produces_the_same_index_as_the_notes_describe() {
             second.links,
             second.tasks
         ),
-        "two rebuilds across the pool produced different indexes"
+        "two rebuilds of the same notes produced different indexes"
     );
 }
 
 #[test]
-fn the_pool_preserves_the_order_the_walk_produced() {
-    // Rowids follow insertion order, and a rebuild that inserted in whatever order the
-    // pool happened to finish would make "delete the index, rebuild, get the same
-    // answers" (FR-VLT-02) far harder to assert than it needs to be.
+fn the_rebuild_preserves_the_order_the_walk_produced() {
+    // Rowids follow insertion order, and a rebuild that inserted out of the walk's
+    // order would make "delete the index, rebuild, get the same answers" (FR-VLT-02)
+    // far harder to assert than it needs to be.
     let files: Vec<(String, String)> = (0..300)
         .map(|i| (format!("10-projects/note-{i:04}.md"), note_body(i)))
         .collect();
