@@ -54,7 +54,7 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 |---|---|
 | NFR-PRF-01 window visible | process spawn to the first **composited frame** of the shell (architecture §3.4 row 1) |
 | NFR-PRF-01 vault usable | process spawn to the file tree rendered and the last-open buffer accepting keystrokes (§3.4 row 2) |
-| NFR-PRF-03 | watcher event dequeued to the row being visible to a reader |
+| NFR-PRF-03 | `apply()` submitted through `flush()` returning — Serat's own save path, no watcher, no debounce |
 | NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
 
 **F-10 and NFR-PRF-04: the aggregate is asserted, the breakdown is recorded.** NFR-PRF-04 is a wall-clock requirement and the budget still asserts one number. But one number cannot answer architecture.md's **open design question 1** — *does the parse pool or the index writer dominate rebuild time?* — and §1.2 says the parse pool exists precisely because that assumption is unmeasured. Reported as a single figure, "the index writer dominates" and "reading 39.4 MiB off disk dominates" are indistinguishable, and they imply completely different fixes.
@@ -82,14 +82,14 @@ The phases are allowed to sum to *less* than the wall clock. That is concurrency
 
 When T2 reports, this breakdown is not decoration. It is the evidence that closes the oldest open question in the design document.
 
-**F-03 and NFR-PRF-03.** "Save→index" has two defensible readings that differ by more than the budget itself:
+**F-227, F-268 and NFR-PRF-03: the asserted series must be Serat's own save path, not a save observed through the watcher.** §3.1.1's save path has no watcher and no dequeue at all — the buffer is written, the in-memory bytes go straight to the parse pool, submit, visible — so neither of the two watcher-path readings below is an interval NFR-PRF-03 can mean:
 
-- **End to end**, from the file being written. Includes the 150 ms per-path coalescing window of architecture §3.1 step 1, so it cannot fit inside 50 ms by construction — 150 > 50.
-- **Pipeline**, from the watcher event being dequeued. The only reading the current design can satisfy.
+- **End to end**, from the file being written *and re-detected by the watcher*. Includes the 150 ms per-path coalescing window of architecture §3.1 step 1, so it cannot fit inside 50 ms by construction — 150 > 50. FR-VLT-04's 500 ms, not this budget's.
+- **Pipeline**, from the watcher event being dequeued. Still a watcher-path interval despite the name — this is F-268, one layer inward from F-227: the harness asserted this series for exactly the reason it must not, because the name reads like the pipeline's own cost when it is a watcher-triggered one.
 
-The job measures **both** and asserts the pipeline interval, printing the end-to-end figure beside it as `F-03 … reported, not asserted`. That way the gate report states which number the 50 ms claim rests on instead of implying there was only ever one, and if the architect rules the other way the assertion moves one line. The seam asks I5 for a dequeue timestamp for exactly this reason.
+The job measures **all three** — `save`, the direct path through `IndexHandle::apply()` then `writer().flush()`, plus the two above — and asserts only `save`, printing the watcher-path figures beside it as `reported, not asserted`. `check_save_path` refuses to assert anything whose `SaveTiming.path`/`SaveSamples.path` does not read `"save"` (F-229): a save timed on the watcher path looks exactly like a real number, and this is what keeps that from becoming NFR-PRF-03's gate figure by accident, on top of the fact that neither watcher-path interval is bounded the way `save` is.
 
-This is a measurement decision, not a ruling: F-03 is the architect's to close and product-analyst's to re-baseline at Q1.
+F-03 itself — which of the two watcher-path readings FR-VLT-04 means — remains the architect's to close and product-analyst's to re-baseline at Q1; it no longer bears on this budget's asserted series.
 
 ### Cold start: four ways a trace is refused
 
@@ -186,7 +186,7 @@ The entry points the harness is waiting on:
 | Budget | Needs | From |
 |---|---|---|
 | NFR-PRF-04 | `rebuild(source: &dyn NoteSource, parser: &dyn NoteParser, index_dir: &Path) -> Result<RebuildReport, IndexError>`, callable from a plain binary with no Tauri app running, returning only after the writer has drained — plus the F-10 phase durations, `notes` (Markdown notes only, excluding assets) and `links_resolved` (links whose `dst_note` resolved) on `RebuildReport` | task I4, `serat-index` |
-| NFR-PRF-03 | `open(vault, index_dir)` plus a submit-one-file call the harness can observe completing — the budget is save → *queryable*, so it must be able to see the point a reader would see the change — **and** the moment the watcher event left the queue, so F-03's two intervals can be reported separately | task I5, `serat-index` / `serat-vault` |
+| NFR-PRF-03 | `IndexHandle::open(vault_root, index_dir)`, then `apply(&dyn NoteSource, &dyn NoteParser, &dyn EchoGuard, &VaultPath) -> SaveTiming` submitted directly (no watcher) followed by `writer().flush()` — `SaveTiming.path` must read `"save"`, refused otherwise (F-229, `check_save_path`) — **plus** a way to observe the watcher-path readings (last dequeue, row visible) so F-227/F-268's two intervals stay reported, not asserted | task I5, `serat-index` |
 | NFR-PRF-01 | `SERAT_STARTUP_TRACE=<file>` writing `{"t0_to_window_visible_ms":…, "t0_to_vault_usable_ms":…}` and exiting; t0 is process spawn measured by the harness, not an `Instant::now()` inside `main` | task D2 (definition), task S1 (`serat-app`) |
 
 **NFR-PRF-01 is no longer blocked on definition, only on S1.** D2 answered all three marks, and the warm-start integrity check is the stamp — `user_version`, `index_meta`, `count(*) notes` — measured at **2.4 ms** against 1150 ms for `quick_check` and 1310 ms for `integrity_check`, so it fits inside the budget with three orders of magnitude to spare. `quick_check` runs in the background only when a `-wal` file at open says the previous session ended badly.
