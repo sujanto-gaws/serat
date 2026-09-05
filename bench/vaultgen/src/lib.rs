@@ -469,6 +469,14 @@ impl Manifest {
         s.push_str("  \"content\": {\n");
         s.push_str(&format!("    \"links_out\": {},\n", self.content.links_out));
         s.push_str(&format!("    \"embeds\": {},\n", self.content.embeds));
+        s.push_str(&format!(
+            "    \"asset_embeds\": {},\n",
+            self.content.asset_embeds
+        ));
+        s.push_str(&format!(
+            "    \"asset_md_links\": {},\n",
+            self.content.asset_md_links
+        ));
         s.push_str(&format!("    \"tasks\": {},\n", self.content.tasks));
         s.push_str(&format!(
             "    \"tasks_done\": {},\n",

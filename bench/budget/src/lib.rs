@@ -409,6 +409,20 @@ pub struct VaultUnderTest {
     /// alone (F-247, test-engineer's). The 20k preset is 20,000 notes and 200
     /// assets; an oracle of 20,000 rejects every correct run.
     pub assets: usize,
+    /// `![[binary]]` embeds, from the manifest's `content.asset_embeds`.
+    ///
+    /// An asset is a row in `notes` with `kind='asset'` (ADR-0005), so a rebuild
+    /// resolves `![[report.pdf]]` like any other link — while `link_degree.edges`
+    /// counts note-to-note edges only. The oracle is therefore
+    /// `note_links + asset_embeds + asset_md_links`, or a correct rebuild is
+    /// refused for resolving more than the manifest admits to (F-319).
+    pub asset_embeds: usize,
+    /// `[title](assets/binary.pdf)` links, from `content.asset_md_links`.
+    ///
+    /// The other way a vault references a binary. Counted apart because it is a
+    /// different construct with the same consequence — the parser emits a
+    /// `kind='md'` link and it resolves to the asset row (F-320).
+    pub asset_md_links: usize,
 }
 
 /// A series the job measured but does not assert.
@@ -822,6 +836,12 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
     let format_version = json_number(&manifest, "format_version").unwrap_or(0.0) as u32;
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
     let note_links = json_number(&manifest, "edges").unwrap_or(0.0) as usize;
+    // Default 0 rather than failing, so a manifest generated before these
+    // counts existed still runs -- and then under-reports the oracle, which
+    // shows up as "resolved more than the manifest admits to" rather than as a
+    // silent pass. A stale fixture should be visible, not fatal (F-319).
+    let asset_embeds = json_number(&manifest, "asset_embeds").unwrap_or(0.0) as usize;
+    let asset_md_links = json_number(&manifest, "asset_md_links").unwrap_or(0.0) as usize;
 
     let actual = tree_digest(path)?;
     check_vault(
@@ -840,6 +860,8 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         notes: notes_in_manifest,
         note_links,
         assets: preset.assets,
+        asset_embeds,
+        asset_md_links,
     })
 }
 
@@ -1322,8 +1344,16 @@ where
         // time. Confirmed live: the first wired run reported 20,200 against an
         // oracle of 20,000 and was refused.
         check_note_count(timing.notes, vault.notes + vault.assets)?;
-        check_links_resolved(timing.links_resolved, vault.note_links)?;
-        check_analyze_freshness(recorded?, vault.notes)?;
+        check_links_resolved(
+            timing.links_resolved,
+            vault.note_links + vault.asset_embeds + vault.asset_md_links,
+        )?;
+        // The SAME sum, for the same reason: `sqlite_stat1`'s row count for
+        // `notes` covers assets too, because they live in that table. F-247
+        // corrected the note-count oracle above and left this one on `notes`
+        // alone, and the unit test's stub matched the wrong number, so the
+        // suite stayed green until the first real run (F-321).
+        check_analyze_freshness(recorded?, vault.notes + vault.assets)?;
         samples.push(timing.total);
         runs.push(timing);
     }
@@ -1462,6 +1492,8 @@ mod tests {
             notes: 20_000,
             note_links: 216_971,
             assets: 200,
+            asset_embeds: 2_004,
+            asset_md_links: 1_392,
         };
         let at_limit = Outcome {
             budget: PRF04_FULL_REBUILD,
@@ -1540,6 +1572,8 @@ mod tests {
             notes: 20_000,
             note_links: 216_971,
             assets: 200,
+            asset_embeds: 2_004,
+            asset_md_links: 1_392,
         }
     }
 
@@ -1953,7 +1987,10 @@ mod tests {
             subject::RebuildTiming {
                 total: Duration::from_millis(total_ms),
                 notes,
-                links_resolved: 216_971,
+                // 220,367: what a CORRECT rebuild resolves — the manifest's
+                // 216,971 note edges plus the 3,396 asset references the
+                // parser extracts and `link_degree` does not count (F-319).
+                links_resolved: 220_367,
                 phases: subject::RebuildPhases {
                     walk: Duration::from_millis(1),
                     read_hash: Duration::from_millis(2),
@@ -1969,7 +2006,7 @@ mod tests {
             &a_vault(),
             1,
             |_, _| Ok(timing(1, 10_000, 3)),
-            |_| Ok(20_000),
+            |_| Ok(20_200),
         )
         .expect_err("half a vault is not a passing budget");
         assert!(err.contains("not a passing budget"), "{err}");
@@ -1992,7 +2029,7 @@ mod tests {
                 // assets alike (F-247). 20,000 is the partial-index case below.
                 Ok(timing(1_000 * n, 20_200, [30, 10, 20][(n - 1) as usize]))
             },
-            |_| Ok(20_000),
+            |_| Ok(20_200),
         )
         .expect("three complete rebuilds");
 
@@ -2015,7 +2052,7 @@ mod tests {
                 t.links_resolved = 200_000;
                 Ok(t)
             },
-            |_| Ok(20_000),
+            |_| Ok(20_200),
         )
         .expect_err("links dropped");
         assert!(err.contains("dropped"), "{err}");

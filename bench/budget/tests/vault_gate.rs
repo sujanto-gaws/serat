@@ -166,3 +166,56 @@ fn a_missing_manifest_stops_the_clock() {
         .expect_err("no manifest, no attributable number");
     assert!(err.contains("reading"), "{err}");
 }
+
+// ------------------------------------------------------------------ F-320
+
+/// The link oracle, on a vault it was not derived from.
+///
+/// P0 findings **F-312**, **F-313**, **F-317** and **F-320** were all found and
+/// fixed against the 20k vault, and the final arithmetic
+/// (`edges + asset_embeds + asset_md_links`) closes there exactly. Two
+/// compensating errors would also close there exactly, so agreeing with the one
+/// fixture it was tuned on proves less than it appears to.
+///
+/// This runs the same rebuild against the smoke vault — a different seed draw,
+/// a different note/asset ratio, 400 notes instead of 20,000 — and asserts the
+/// same identity. It takes about a second, so the oracle is checked on every
+/// `cargo test` rather than only when someone spends 37 seconds on NFR-PRF-04.
+#[test]
+fn every_link_the_smoke_vault_generates_resolves_and_the_oracle_is_exact() {
+    let dir = TempDir::new("link-oracle");
+    let vault = dir.path().join("vault-smoke");
+    generate_smoke(&vault);
+
+    let under_test =
+        verify_vault_at(preset("smoke").expect("smoke"), &vault).expect("the smoke vault verifies");
+
+    // Outside the vault: an index directory inside it moves the tree digest,
+    // and a failed assertion below would strand it there (F-311).
+    let index = dir.path().join("index");
+    let timing = budget::subject::full_rebuild(&vault, &index).expect("rebuild the smoke vault");
+
+    let oracle = under_test.note_links + under_test.asset_embeds + under_test.asset_md_links;
+    assert_eq!(
+        timing.links_resolved,
+        oracle,
+        "resolved {} links; the manifest generated {} note edges, {} asset embeds and {} \
+         markdown asset links, summing to {oracle}",
+        timing.links_resolved,
+        under_test.note_links,
+        under_test.asset_embeds,
+        under_test.asset_md_links
+    );
+
+    // The counts the oracle is built from must be non-zero, or the identity
+    // above holds vacuously and would keep holding if `embed_block` stopped
+    // counting again. This is the assertion F-320 wishes had existed.
+    assert!(
+        under_test.asset_embeds > 0,
+        "the manifest counts no asset embeds"
+    );
+    assert!(
+        under_test.asset_md_links > 0,
+        "the manifest counts no markdown asset links"
+    );
+}

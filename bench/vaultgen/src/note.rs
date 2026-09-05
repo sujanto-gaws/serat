@@ -27,6 +27,23 @@ pub struct NoteStats {
     pub links_out: u32,
     /// `![[...]]` embeds, of notes and of assets.
     pub embeds: u32,
+    /// The subset of `embeds` that points at a binary rather than a note.
+    ///
+    /// Reported separately because an asset is a row in `notes` with
+    /// `kind='asset'` (ADR-0005), so a rebuild resolves `![[report.pdf]]` like
+    /// any other link — while `link_degree.edges` counts note-to-note edges
+    /// only. Without this the oracle is short by every asset embed and a
+    /// correct rebuild is refused (F-319).
+    pub asset_embeds: u32,
+    /// `[title](assets/binary.pdf)` — the other way a vault references a binary.
+    ///
+    /// Counted apart from `asset_embeds` because it is a different construct
+    /// with the same consequence: the parser emits a `kind='md'` link, it
+    /// resolves to the asset row, and `edges` counts neither. The original
+    /// `asset_embeds` design covered only the `![[…]]` half, which was right
+    /// when written and became incomplete once a real parser existed to
+    /// extract the other one (F-320).
+    pub asset_md_links: u32,
     /// Markdown checkboxes.
     pub tasks: u32,
     /// Checkboxes in the `[x]` state.
@@ -54,6 +71,8 @@ impl NoteStats {
         self.bytes += other.bytes;
         self.links_out += other.links_out;
         self.embeds += other.embeds;
+        self.asset_embeds += other.asset_embeds;
+        self.asset_md_links += other.asset_md_links;
         self.tasks += other.tasks;
         self.tasks_done += other.tasks_done;
         self.inline_fields += other.inline_fields;
@@ -613,9 +632,11 @@ fn embed_block(
             s.push_str(&a.file_name);
             s.push_str("]]\n\n");
             stats.embeds += 1;
+            stats.asset_embeds += 1;
         } else {
             // A Markdown link to a binary, the other way vaults reference them.
             s.push_str(&format!("[{}]({})\n\n", a.title, a.rel_path));
+            stats.asset_md_links += 1;
         }
     } else {
         let t = plan.sample_target(note.index, r);
