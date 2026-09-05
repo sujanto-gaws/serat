@@ -401,6 +401,14 @@ pub struct VaultUnderTest {
     /// Note-to-note link edges the generator produced, from the manifest's
     /// `link_degree.edges`. The oracle for `RebuildReport.links_resolved`.
     pub note_links: usize,
+    /// Binary asset files it contains, from the manifest's `counts.assets`.
+    ///
+    /// Needed because `RebuildReport::notes` counts every row in `notes` --
+    /// markdown notes and assets alike, `kind='asset'` per ADR-0005 -- so a
+    /// correct rebuild of this vault reports `notes + assets`, not `notes`
+    /// alone (F-247, test-engineer's). The 20k preset is 20,000 notes and 200
+    /// assets; an oracle of 20,000 rejects every correct run.
+    pub assets: usize,
 }
 
 /// A series the job measured but does not assert.
@@ -831,6 +839,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         format_version,
         notes: notes_in_manifest,
         note_links,
+        assets: preset.assets,
     })
 }
 
@@ -1296,7 +1305,13 @@ where
         let index_dir = vault.path.join(format!(".serat-bench-{i}"));
         let _ = std::fs::remove_dir_all(&index_dir);
         let timing = rebuild(&vault.path, &index_dir)?;
-        check_note_count(timing.notes, vault.notes)?;
+        // F-247, test-engineer's: `RebuildReport::notes` counts every row in
+        // `notes` -- markdown notes AND assets alike, `kind='asset'` per
+        // ADR-0005 -- so the oracle has to be the same sum, or a correct rebuild
+        // of any vault containing assets is rejected as a partial index every
+        // time. Confirmed live: the first wired run reported 20,200 against an
+        // oracle of 20,000 and was refused.
+        check_note_count(timing.notes, vault.notes + vault.assets)?;
         check_links_resolved(timing.links_resolved, vault.note_links)?;
         // Read before the directory goes away. F-47 is only visible here.
         let recorded = analyze(&index_dir);
@@ -1439,6 +1454,7 @@ mod tests {
             format_version: 1,
             notes: 20_000,
             note_links: 216_971,
+            assets: 200,
         };
         let at_limit = Outcome {
             budget: PRF04_FULL_REBUILD,
@@ -1516,6 +1532,7 @@ mod tests {
             format_version: vaultgen::VAULT_FORMAT_VERSION,
             notes: 20_000,
             note_links: 216_971,
+            assets: 200,
         }
     }
 

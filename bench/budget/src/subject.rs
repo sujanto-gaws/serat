@@ -355,15 +355,42 @@ pub fn stat1_note_rows(index_dir: &Path) -> Result<usize, String> {
 /// # Errors
 /// Today: always, because `serat-index` has no rebuild entry point yet.
 pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, String> {
-    let _ = (vault, index_dir);
-    // Touching the crates keeps the dependency edge real, so the day the entry
-    // point lands there is nothing to wire up but the call itself.
-    Err(format!(
-        "serat-index (index v{}, sqlite {}) exposes no rebuild entry point yet — task I4.\n\n{}",
-        serat_index::INDEX_VERSION,
-        serat_index::sqlite_version(),
-        REBUILD_ENTRY_POINT
-    ))
+    // I3 landed a real `NoteParser`, which is the one thing this seam was
+    // waiting for. Wiring it to serat-index's `cfg(test)` fake earlier would
+    // have answered open design question 1 -- parse pool versus index writer --
+    // by construction rather than by measurement (F-19, F-27), which is why the
+    // seam stayed an error rather than being wired to whatever was available.
+    let source = serat_vault::Vault::open(vault).map_err(|err| {
+        format!(
+            "could not open the vault under test at {}: {err}",
+            vault.display()
+        )
+    })?;
+    let parser = serat_parse::CommonMarkParser;
+
+    // `total` brackets `rebuild()` alone. Opening the vault is setup and
+    // generating the vault is not timed at all -- NFR-PRF-04 is judged on this.
+    let started = Instant::now();
+    let report = serat_index::rebuild(&source, &parser, index_dir)
+        .map_err(|err| format!("rebuild failed: {err}"))?;
+    let total = started.elapsed();
+
+    // Phases come from the rebuild rather than from wrapping calls here: the
+    // writer runs on its own thread, so only the rebuild can see where its own
+    // time went. `producer_wait` reads the opposite of the obvious way -- see
+    // RebuildPhases.
+    Ok(RebuildTiming {
+        total,
+        phases: RebuildPhases {
+            walk: report.walk,
+            read_hash: report.read_hash,
+            parse: report.parse,
+            producer_wait: report.producer_wait,
+            write_fts: report.write_fts,
+        },
+        notes: report.notes,
+        links_resolved: report.links_resolved,
+    })
 }
 
 /// Time `iterations` single-note saves through to being visible in the
