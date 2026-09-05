@@ -132,13 +132,19 @@ CREATE TABLE index_meta (
 CREATE TABLE notes (
     id           INTEGER PRIMARY KEY,
     path         TEXT    NOT NULL UNIQUE,  -- vault-relative, canonical, / separated
-    -- The file name without its extension. This is what a bare `[[wikilink]]`
-    -- names: Obsidian resolves a target with no `/` in it by FILE NAME anywhere
-    -- in the vault, not by path and not by frontmatter title (NFR-CMP-01). It is
-    -- a stored column rather than an expression because resolution joins on it
-    -- once per link -- 216,971 of them on the 20k vault -- and a computed
+    -- The file name WITH its extension. This is what a bare `[[wikilink]]` or
+    -- `![[embed]]` names: Obsidian resolves a target with no `/` in it by file
+    -- name anywhere in the vault, not by path and not by frontmatter title
+    -- (NFR-CMP-01). Stored rather than computed because resolution joins on it
+    -- once per link -- 212,378 of them on the 20k vault -- and a derived
     -- basename cannot use an index (F-312).
-    stem         TEXT,
+    --
+    -- With the extension rather than without, because one column then serves
+    -- both halves: a note link omits `.md` and matches `file_name = target ||
+    -- '.md'`, while an asset embed carries its own extension (`![[report.pdf]]`)
+    -- and matches `file_name = target` directly. Assets are linkable by §7.3,
+    -- so excluding them here silently drops every embed (F-313).
+    file_name    TEXT,
     title        TEXT,                     -- frontmatter title, else H1, else filename
     type         TEXT,                     -- declared type name; NULL = untyped (P2)
     lens         TEXT,                     -- role lens (P3)
@@ -335,7 +341,7 @@ CREATE INDEX ix_notes_kind ON notes(kind);
 -- Link resolution matches a bare `[[wikilink]]` against this. Without it the
 -- join is a full scan of notes per link and the rebuild does not finish inside
 -- NFR-PRF-04's budget (F-312).
-CREATE INDEX ix_notes_stem ON notes(stem) WHERE stem IS NOT NULL;
+CREATE INDEX ix_notes_file_name ON notes(file_name) WHERE file_name IS NOT NULL;
 
 -- The pivot join, one lookup per referenced field key per row (ADR-0003).
 -- val_text is carried so the common untyped projection is answered from the

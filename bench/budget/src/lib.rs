@@ -401,6 +401,14 @@ pub struct VaultUnderTest {
     /// Note-to-note link edges the generator produced, from the manifest's
     /// `link_degree.edges`. The oracle for `RebuildReport.links_resolved`.
     pub note_links: usize,
+    /// Binary asset files it contains, from the manifest's `counts.assets`.
+    ///
+    /// Needed because `RebuildReport::notes` counts every row in `notes` --
+    /// markdown notes and assets alike, `kind='asset'` per ADR-0005 -- so a
+    /// correct rebuild of this vault reports `notes + assets`, not `notes`
+    /// alone (F-247, test-engineer's). The 20k preset is 20,000 notes and 200
+    /// assets; an oracle of 20,000 rejects every correct run.
+    pub assets: usize,
 }
 
 /// A series the job measured but does not assert.
@@ -831,6 +839,7 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         format_version,
         notes: notes_in_manifest,
         note_links,
+        assets: preset.assets,
     })
 }
 
@@ -1296,7 +1305,13 @@ where
         let index_dir = vault.path.join(format!(".serat-bench-{i}"));
         let _ = std::fs::remove_dir_all(&index_dir);
         let timing = rebuild(&vault.path, &index_dir)?;
-        check_note_count(timing.notes, vault.notes)?;
+        // F-247, test-engineer's: `RebuildReport::notes` counts every row in
+        // `notes` -- markdown notes AND assets alike, `kind='asset'` per
+        // ADR-0005 -- so the oracle has to be the same sum, or a correct rebuild
+        // of any vault containing assets is rejected as a partial index every
+        // time. Confirmed live: the first wired run reported 20,200 against an
+        // oracle of 20,000 and was refused.
+        check_note_count(timing.notes, vault.notes + vault.assets)?;
         check_links_resolved(timing.links_resolved, vault.note_links)?;
         // Read before the directory goes away. F-47 is only visible here.
         let recorded = analyze(&index_dir);
@@ -1439,6 +1454,7 @@ mod tests {
             format_version: 1,
             notes: 20_000,
             note_links: 216_971,
+            assets: 200,
         };
         let at_limit = Outcome {
             budget: PRF04_FULL_REBUILD,
@@ -1516,6 +1532,7 @@ mod tests {
             format_version: vaultgen::VAULT_FORMAT_VERSION,
             notes: 20_000,
             note_links: 216_971,
+            assets: 200,
         }
     }
 
@@ -1964,7 +1981,9 @@ mod tests {
             3,
             |_, _| {
                 n += 1;
-                Ok(timing(1_000 * n, 20_000, [30, 10, 20][(n - 1) as usize]))
+                // 20,200: what a CORRECT rebuild of this vault reports, notes plus
+                // assets alike (F-247). 20,000 is the partial-index case below.
+                Ok(timing(1_000 * n, 20_200, [30, 10, 20][(n - 1) as usize]))
             },
             |_| Ok(20_000),
         )
@@ -1974,7 +1993,7 @@ mod tests {
         let err = measure_full_rebuild_with(
             &a_vault(),
             1,
-            |_, _| Ok(timing(1, 20_000, 3)),
+            |_, _| Ok(timing(1, 20_200, 3)),
             |_| Ok(19_968),
         )
         .expect_err("32 notes short of the finished index");
@@ -1985,7 +2004,7 @@ mod tests {
             &a_vault(),
             1,
             |_, _| {
-                let mut t = timing(1, 20_000, 3);
+                let mut t = timing(1, 20_200, 3);
                 t.links_resolved = 200_000;
                 Ok(t)
             },
