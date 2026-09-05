@@ -78,6 +78,11 @@ const POLICY: &[(&str, &[&str])] = &[
     // hole in the rule. The rule exists to keep the product graph acyclic, and a
     // crate nothing in the product depends on cannot put a cycle in it.
     ("budget", BUDGET_MAY_LINK),
+    // doclint (task #11, F-239) checks that paths cited in the design documents
+    // resolve. It reads Markdown, not the product, and takes no dependency at
+    // all -- the same reasoning as vaultgen: it must not need the product to
+    // build in order to say something about the product's documentation.
+    ("doclint", &[]),
 ];
 
 /// What the budget harness may link.

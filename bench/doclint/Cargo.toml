@@ -1,0 +1,28 @@
+# doclint — checks that repo-relative paths cited in the design documents
+# actually resolve. Serves F-239, F-238, NFR-MNT-01. See
+# docs/05-testing/design-doc-paths.md.
+#
+# No dependencies beyond the standard library: the extraction is a handful of
+# character-class rules over plain text, and pulling in `regex` for that would
+# be the tail wagging the dog (the same argument budget's own manifest reader
+# makes for not pulling in serde).
+[package]
+name = "doclint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Checks that paths cited in Serat's design documents resolve (F-239)"
+
+[lib]
+name = "doclint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "check-design-paths"
+path = "src/bin/check-design-paths.rs"
+
+[lints]
+workspace = true
