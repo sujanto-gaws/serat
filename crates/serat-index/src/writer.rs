@@ -62,9 +62,10 @@ enum Command {
     Analyze(SyncSender<Result<(), IndexError>>),
     /// Mark the index ready and record the vault it was built from.
     MarkReady(String, SyncSender<Result<(), IndexError>>),
-    /// Capture and drop the blocks_fts triggers before a bulk load.
+    /// Capture and drop the blocks_fts triggers and ix_links_unresolved before a bulk
+    /// load (F-373).
     BeginBulkLoad(SyncSender<Result<Vec<String>, IndexError>>),
-    /// Rebuild the FTS index in one pass and restore the captured triggers.
+    /// Rebuild the FTS index in one pass and restore what BeginBulkLoad dropped.
     EndBulkLoad(Vec<String>, SyncSender<Result<(), IndexError>>),
     /// Resolve every link whose target is now present.
     ResolveLinks(SyncSender<Result<usize, IndexError>>),
@@ -132,7 +133,8 @@ impl WriterHandle {
             .map_err(|_| IndexError::WriterStopped)
     }
 
-    /// Drop the `blocks_fts` triggers, returning their definitions.
+    /// Drop the `blocks_fts` triggers and `ix_links_unresolved`, returning their
+    /// definitions.
     ///
     /// Step 2 of the rebuild sequence in `schema/001_init.sql`. The definitions come
     /// out of `sqlite_master` rather than from a second copy of the DDL, so what is
@@ -143,6 +145,11 @@ impl WriterHandle {
     /// 0.32 s dropped-and-rebuilt, reproduced independently at 5.8x. The search index
     /// is identical either way, which is what makes the faster shape a free choice
     /// rather than a trade.
+    ///
+    /// `ix_links_unresolved` is the same trade for a different reason (F-373, task
+    /// #82): it is a per-row obligation SQLite discharges on every insert into
+    /// `links`, and no branch inside `apply::apply` can decline it. Measured at
+    /// 11.5 s of a 20k rebuild's writer time.
     ///
     /// # Errors
     ///
@@ -155,12 +162,14 @@ impl WriterHandle {
         answer.recv().map_err(|_| IndexError::WriterStopped)?
     }
 
-    /// Rebuild the FTS index in one pass and put the triggers back.
+    /// Rebuild the FTS index in one pass and put back everything
+    /// [`WriterHandle::begin_bulk_load`] dropped.
     ///
     /// # Errors
     ///
     /// As [`WriterHandle::begin_bulk_load`]. A failure here leaves the index without
-    /// its triggers, which is why the caller must not mark it ready.
+    /// its triggers and `ix_links_unresolved`, which is why the caller must not mark
+    /// it ready.
     pub fn end_bulk_load(&self, triggers: Vec<String>) -> Result<(), IndexError> {
         self.round_trip(|reply| Command::EndBulkLoad(triggers, reply))
     }
@@ -462,31 +471,63 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
     }
 }
 
-/// Capture the `blocks_fts` trigger definitions and drop them.
+/// Capture the `blocks_fts` trigger definitions and `ix_links_unresolved`, then drop
+/// them.
+///
+/// F-373 (task #82): a trigger is not the only per-row obligation a bulk load cannot
+/// afford. `ix_links_unresolved` is maintained by SQLite on every insert into `links`
+/// regardless of what `apply::apply`'s `bulk_load` branch chooses to skip — a partial
+/// index is still an index, and nothing inside `apply` can decline the write-time
+/// upkeep of one that exists. Measured at 11.5 s of a 20k rebuild's writer time.
+/// Dropping it here and rebuilding it once in [`end_bulk_load`] turns ~220,000
+/// incremental B-tree updates into one sorted build, the same trade this function
+/// already makes for `blocks_fts`'s triggers.
+///
+/// Both come out of `sqlite_master` rather than a second copy of the DDL, so what is
+/// restored is identical to what was delivered by construction rather than by a test
+/// that has to catch a stale copy.
 fn begin_bulk_load(conn: &Connection) -> Result<Vec<String>, IndexError> {
-    let definitions: Vec<String> = {
+    let definitions: Vec<(String, String)> = {
         let mut stmt = conn
             .prepare(
-                "SELECT sql FROM sqlite_master                  WHERE type = 'trigger' AND tbl_name = 'blocks' ORDER BY name",
+                "SELECT type, sql FROM sqlite_master
+                  WHERE (type = 'trigger' AND tbl_name = 'blocks')
+                     OR (type = 'index' AND name = 'ix_links_unresolved')
+                  ORDER BY type, name",
             )
             .map_err(sqlite)?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(sqlite)?;
         rows.collect::<Result<_, _>>().map_err(sqlite)?
     };
 
-    for definition in &definitions {
-        // The name is the third whitespace-separated token of CREATE TRIGGER <name>.
+    for (kind, definition) in &definitions {
+        // The name is the third whitespace-separated token of both
+        // CREATE TRIGGER <name> and CREATE INDEX <name>.
         if let Some(name) = definition.split_whitespace().nth(2) {
-            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            let drop_kind = match kind.as_str() {
+                "trigger" => "TRIGGER",
+                "index" => "INDEX",
+                // sqlite_master's own CHECK on `type` rules out anything else; the
+                // query above only ever asks for these two.
+                other => {
+                    return Err(IndexError::Corrupt {
+                        message: format!("sqlite_master named an unexpected type: {other}"),
+                    });
+                }
+            };
+            conn.execute_batch(&format!("DROP {drop_kind} IF EXISTS {name};"))
                 .map_err(sqlite)?;
         }
     }
-    Ok(definitions)
+    Ok(definitions.into_iter().map(|(_, sql)| sql).collect())
 }
 
-/// Build the FTS index in one pass and restore the triggers.
+/// Build the FTS index in one pass and restore the triggers and
+/// `ix_links_unresolved`.
 fn end_bulk_load(conn: &Connection, triggers: &[String]) -> Result<(), IndexError> {
     conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES('rebuild');")
         .map_err(sqlite)?;

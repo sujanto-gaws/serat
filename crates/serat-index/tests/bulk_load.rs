@@ -7,7 +7,7 @@
 //! produces a subtly different search index, which nothing else in the suite notices.
 
 use rusqlite::Connection;
-use serat_index::schema;
+use serat_index::{IndexActor, schema};
 
 /// Blocks used by both halves of the comparison. Deliberately awkward: diacritics (the
 /// tokenizer is `unicode61 remove_diacritics 2`), punctuation, casing, a term repeated
@@ -193,6 +193,55 @@ fn the_restored_triggers_still_fire_on_the_incremental_path() {
 
     conn.execute_batch("INSERT INTO blocks_fts(blocks_fts) VALUES ('integrity-check');")
         .expect("consistent after the round trip");
+}
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("query sqlite_master")
+        > 0
+}
+
+#[test]
+fn begin_bulk_load_drops_ix_links_unresolved_and_end_bulk_load_restores_it() {
+    // F-373 / task #82. `apply::apply`'s `bulk_load` gate can decline the per-row
+    // *query* against ix_links_unresolved, but not the per-row *write* SQLite performs
+    // to keep a partial index in step with every insert into `links`. Dropping the
+    // index around the bulk load and rebuilding it once, the same trade this file
+    // already documents for the blocks_fts triggers, is what actually removes that
+    // cost. This drives the real production path (`WriterHandle::begin_bulk_load` /
+    // `end_bulk_load`), not the manual reimplementation `load_in_bulk` above uses to
+    // isolate the trigger round trip.
+    let dir = tempfile::tempdir().expect("temp");
+    let path = serat_index::index_path(dir.path());
+    let conn = schema::open(&path).expect("open");
+    schema::bootstrap(&conn).expect("bootstrap");
+    let actor = IndexActor::with_connection(conn);
+    let writer = actor.handle();
+
+    let reader = schema::open(&path).expect("reader");
+    assert!(
+        index_exists(&reader, "ix_links_unresolved"),
+        "a freshly bootstrapped schema should carry ix_links_unresolved"
+    );
+
+    let dropped = writer.begin_bulk_load().expect("begin");
+    assert!(
+        !index_exists(&reader, "ix_links_unresolved"),
+        "begin_bulk_load left ix_links_unresolved in place; every insert into links \
+         during the load will pay to keep it in step"
+    );
+
+    writer.end_bulk_load(dropped).expect("end");
+    assert!(
+        index_exists(&reader, "ix_links_unresolved"),
+        "end_bulk_load did not restore ix_links_unresolved"
+    );
+
+    actor.shutdown().expect("shutdown");
 }
 
 #[test]
