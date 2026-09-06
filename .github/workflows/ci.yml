@@ -107,7 +107,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          results='${{ join(needs.*.result, " ") }}'
+          fmt_result='${{ needs.fmt.result }}'
+          clippy_result='${{ needs.clippy.result }}'
+          workspace_result='${{ needs.workspace.result }}'
+          li_result="${{ needs['location-independence'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $li_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then
