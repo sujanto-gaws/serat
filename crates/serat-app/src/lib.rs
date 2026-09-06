@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use serde::Serialize;
 use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 
+mod acl_manifest;
 pub mod cli;
 pub mod commands;
 pub mod error;
