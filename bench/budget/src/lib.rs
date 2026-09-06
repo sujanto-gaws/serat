@@ -749,32 +749,129 @@ pub struct JobArgs {
     /// Whether `iterations` differs from the acceptance criterion's count, in
     /// which case the result is indicative and must not be recorded.
     pub indicative: bool,
+    /// The caller asked what the flags are, so the job prints them and measures
+    /// nothing. A run that took 37 seconds to answer `--help` was the symptom
+    /// that started F-323.
+    pub help: bool,
+}
+
+/// What the flags are, for `--help` and for the refusal message.
+#[must_use]
+pub fn usage(budget: &Budget) -> String {
+    format!(
+        "usage: {id} [--profile reference|ci] [--iterations N] [--help]
+
+  --profile <name>    Which machine profile's threshold applies.
+                      One of: reference (default), ci.
+  --iterations <N>    How many iterations to run. Default {iterations}, which is
+                      what this budget's acceptance criterion names. Any other
+                      value marks the result indicative: it is printed, and it
+                      must not be recorded as a gate number.
+  --help, -h          Print this and measure nothing.
+
+Both value flags also accept the --flag=value form.
+
+Anything else is refused rather than ignored. A job that skipped a flag it did
+not recognise would take a DEFAULT measurement and report it as a configured
+one -- `--profile=ci` silently measured against the reference threshold, and a
+mistyped `--iteration 1` silently ran the full count (F-323).",
+        id = budget.id,
+        iterations = budget.iterations,
+    )
 }
 
 /// Parse the arguments every job shares.
 ///
+/// Every argument is either recognised or refused. The previous version scanned
+/// for `--profile` and `--iterations` by exact string and **discarded everything
+/// else without comment**, which is the wrong default for a harness whose whole
+/// purpose is that a number can be attributed (F-26, NFR-MNT-02). Three shapes it
+/// accepted and silently mishandled: `--help` ran the full 37-second job;
+/// `--profile=ci` is not the string `--profile`, so it was dropped and the run
+/// used the reference threshold; and a mistyped `--iteration 1` ran the default
+/// count. Each produced a real measurement, correctly reported as whatever it
+/// actually did -- so the report was honest and the operator's intent was gone
+/// (F-323).
+///
+/// A repeated flag is refused rather than resolved. First-wins and last-wins are
+/// both defensible and neither is guessable from the command line.
+///
 /// # Errors
-/// A malformed flag, as a sentence.
+/// An unknown argument, a flag without its value, a value the flag cannot take,
+/// or the same flag twice -- each as a sentence, with the usage text.
 pub fn parse_args(budget: &Budget, args: &[String]) -> Result<JobArgs, String> {
-    let mut profile = Profile::Reference;
-    if let Some(i) = args.iter().position(|a| a == "--profile") {
-        let value = args
-            .get(i + 1)
-            .ok_or_else(|| "--profile needs a value".to_string())?;
-        profile = Profile::parse(value)?;
+    let mut profile: Option<Profile> = None;
+    let mut iterations: Option<usize> = None;
+    let mut help = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        // `--flag=value` splits here so that both forms reach the same code. The
+        // equals form is what most tools accept, which is exactly why silently
+        // ignoring it was dangerous rather than merely unhelpful.
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (arg, None),
+        };
+
+        match name {
+            "--help" | "-h" => {
+                help = true;
+                i += 1;
+            }
+            "--profile" | "--iterations" => {
+                let value = match inline {
+                    Some(value) => {
+                        i += 1;
+                        value
+                    }
+                    None => {
+                        let value = args
+                            .get(i + 1)
+                            .cloned()
+                            .ok_or_else(|| format!("{name} needs a value\n\n{}", usage(budget)))?;
+                        i += 2;
+                        value
+                    }
+                };
+                if name == "--profile" {
+                    if profile.is_some() {
+                        return Err(format!(
+                            "--profile given more than once; which one did you mean?\n\n{}",
+                            usage(budget)
+                        ));
+                    }
+                    profile = Some(Profile::parse(&value)?);
+                } else {
+                    if iterations.is_some() {
+                        return Err(format!(
+                            "--iterations given more than once; which one did you mean?\n\n{}",
+                            usage(budget)
+                        ));
+                    }
+                    iterations = Some(value.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(
+                        || {
+                            format!(
+                                "--iterations needs a positive integer, not {value:?}\n\n{}",
+                                usage(budget)
+                            )
+                        },
+                    )?);
+                }
+            }
+            other => {
+                return Err(format!("unknown argument {other:?}\n\n{}", usage(budget)));
+            }
+        }
     }
-    let mut iterations = budget.iterations;
-    if let Some(i) = args.iter().position(|a| a == "--iterations") {
-        iterations = args
-            .get(i + 1)
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| "--iterations needs a positive integer".to_string())?;
-    }
+
+    let iterations = iterations.unwrap_or(budget.iterations);
     Ok(JobArgs {
-        profile,
+        profile: profile.unwrap_or(Profile::Reference),
         iterations,
         indicative: iterations != budget.iterations,
+        help,
     })
 }
 
@@ -1189,6 +1286,23 @@ pub fn run_job<F>(budget: &Budget, args: &[String], measure: F) -> std::process:
 where
     F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
 {
+    // Parsed here as well as inside `decide`, so `--help` prints without opening a
+    // vault or taking a measurement. Parsing is pure and costs nothing; the
+    // alternative is a third return shape on `decide` for the one case that
+    // measures nothing.
+    match parse_args(budget, args) {
+        Ok(parsed) if parsed.help => {
+            println!("{}", usage(budget));
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Not a FAIL of the budget: nothing was measured. Printing this as a
+            // budget failure would put a breach in the log that never happened.
+            eprintln!("budget: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     match decide(budget, args, measure) {
         Ok(outcome) => {
             report(&outcome);
@@ -1219,6 +1333,10 @@ where
     F: FnOnce(&VaultUnderTest, usize) -> Result<(Measurement, Measurement), String>,
 {
     let parsed = match parse_args(first, args) {
+        Ok(p) if p.help => {
+            println!("{}", usage(first));
+            return std::process::ExitCode::SUCCESS;
+        }
         Ok(p) => p,
         Err(e) => {
             eprintln!("budget: {e}");
@@ -1899,6 +2017,69 @@ mod tests {
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into()]).is_err());
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--iterations".into(), "0".into()]).is_err());
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into(), "laptop".into()]).is_err());
+    }
+
+    // --------------------------------------------------------------- F-323
+
+    #[test]
+    fn an_argument_the_job_does_not_know_is_refused_rather_than_ignored() {
+        // Each of these produced a real, correctly-reported measurement before,
+        // against settings the operator did not ask for. The report was honest
+        // about what it did; the intent was silently gone.
+        let refuse = |args: &[&str]| -> String {
+            let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            parse_args(&PRF04_FULL_REBUILD, &owned).expect_err(&format!("{args:?} must be refused"))
+        };
+
+        // `--help` used to run the full 37-second rebuild. It is now a flag.
+        for flag in ["--help", "-h"] {
+            let parsed = parse_args(&PRF04_FULL_REBUILD, &[flag.to_string()])
+                .unwrap_or_else(|e| panic!("{flag} must parse: {e}"));
+            assert!(parsed.help, "{flag} must ask for usage");
+        }
+
+        // The equals form is not the string `--profile`, so it was dropped and
+        // the run used the reference threshold while the operator had asked for
+        // ci. It is now the same flag.
+        let eq = parse_args(&PRF04_FULL_REBUILD, &["--profile=ci".into()]).expect("equals form");
+        assert_eq!(eq.profile, Profile::Ci);
+        let eq = parse_args(&PRF04_FULL_REBUILD, &["--iterations=1".into()]).expect("equals form");
+        assert_eq!(eq.iterations, 1);
+        assert!(eq.indicative, "a short run stays indicative in either form");
+
+        // A typo is the case that matters most: it looks like it configured the
+        // run and did not. The message must name the argument, or the reader is
+        // told only that something was wrong.
+        let err = refuse(&["--profil", "ci"]);
+        assert!(err.contains("--profil"), "{err}");
+        assert!(
+            err.contains("--profile"),
+            "the usage text must show the real flag: {err}"
+        );
+        assert!(refuse(&["--iteration", "1"]).contains("--iteration"));
+
+        // A bare value with no flag, and a flag with no value.
+        assert!(refuse(&["20k"]).contains("20k"));
+        assert!(refuse(&["--profile"]).contains("needs a value"));
+        assert!(refuse(&["--iterations"]).contains("needs a value"));
+
+        // A bad value reaches its flag's own error in both forms.
+        assert!(refuse(&["--profile", "laptop"]).contains("laptop"));
+        assert!(refuse(&["--profile=laptop"]).contains("laptop"));
+        assert!(refuse(&["--iterations", "0"]).contains("positive integer"));
+        assert!(refuse(&["--iterations=x"]).contains("positive integer"));
+
+        // Repeated flags are refused rather than resolved: first-wins and
+        // last-wins are both defensible and neither is guessable.
+        assert!(refuse(&["--profile", "ci", "--profile", "reference"]).contains("more than once"));
+        assert!(refuse(&["--iterations", "1", "--iterations=2"]).contains("more than once"));
+
+        // And the combination CI actually runs still works.
+        let ci = parse_args(&PRF04_FULL_REBUILD, &["--profile".into(), "ci".into()])
+            .expect("the form .github/workflows/budgets.yml uses");
+        assert_eq!(ci.profile, Profile::Ci);
+        assert!(!ci.help);
+        assert!(!ci.indicative);
     }
 
     // ---------------------------------------------------------------- F-30
