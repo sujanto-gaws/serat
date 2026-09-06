@@ -33,7 +33,7 @@ When two goals conflict, the higher one wins. This ordering is the tie-breaker f
 
 ### 1.2 What P0 may invalidate
 
-The performance figures this design is shaped around are targets, not measurements. Three structures exist specifically because of a number that has not yet been measured: the single-writer index actor assumes write contention is the bottleneck; the parse pool assumed parsing dominates rebuild time — **the assumption stands and the mechanism has been removed pending the measurement that tests it (§2.2)**; brute-force vector search assumes 200,000 chunks scan fast enough. If P0 contradicts any of them, this document is re-baselined before P1 rather than quietly amended.
+The performance figures this design is shaped around are targets, not measurements. Three structures exist specifically because of a number that has not yet been measured: the single-writer index actor assumes write contention is the bottleneck; the parse pool assumed parsing dominates rebuild time — **measured at P0 and contradicted: parsing is about 17% of a 20,000-note rebuild, and the pool is not built (§2.2)**; brute-force vector search assumes 200,000 chunks scan fast enough. If P0 contradicts any of them, this document is re-baselined before P1 rather than quietly amended.
 
 ## Components & responsibilities
 
@@ -95,7 +95,23 @@ Why the parse pool is described in the past tense
 
 **Recorded rather than quietly amended, because §1.2 names the parse pool as one of three structures P0 exists to test, and deleting a mechanism is not the same as testing the assumption behind it.** A rebuild number taken today measures the sequential design; presenting it as evidence about the architecture in this section would be a number honest about what it measured and misleading about what it means.
 
-**The measurement is better without the pool, which is why it is not being reinstated first.** Open design question 1 asks whether parsing or the writer dominates a rebuild. A *sequential* run answers that directly, because `RebuildReport` separates walk, read-and-hash, parse and write, and the ratio between those phases is the ratio of the **work** — which is the thing the question is about. Measuring a pooled rebuild would instead report the ratio *after* one side had already been optimised, which tells you what the pool achieved and not whether it was needed. So the pool gets built if and only if the number says parsing dominates, and it will be built against a figure rather than an assumption.
+The measurement was taken without the pool, deliberately: a *sequential* run reports the ratio of the **work**, where a pooled one would report the ratio after one side had already been optimised — what the pool achieved rather than whether it was needed.
+
+##### Open design question 1, answered: neither
+
+**The answer is that at P0 scale neither structure is the constraint, and finding that out required going one level below the question.**
+
+The first run named the writer: `producer_wait` was **45–51%** of the wall clock against **11–12%** for parse. Read carefully that says less than it appears to — `producer_wait` measures **the producer being blocked**, not what writing cost, so it means the writer could not keep up, and nothing about why.
+
+**Why it could not keep up was none of the three things this design nominated.** Not the actor, not the transaction boundaries, and not `BATCH_SIZE`, whose own doc comment calls batching *"the whole of the tuning, and the number open design question 1 will move if the writer turns out to dominate."* The writer did dominate and batching was not the answer. A probe inside `commit()` put **16.0 s of a ~21 s writer inside `apply` itself**: eight `INSERT` statements issued through `tx.execute`, which re-prepares on every call, sitting in per-row loops over blocks, fields, links and tasks — **roughly a million redundant prepares per rebuild.** `prepare_cached` took `apply` to 6.6 s and the rebuild from **27.1 s to 17.5 s**, same build, same minute (F-324). Suppressing the opportunistic `ANALYZE` during a bulk load removed another 2.8 s of work that every later batch superseded (F-325).
+
+With that gone the phases are **walk 9%, read-and-hash 16%, parse 17%, `producer_wait` 19%, FTS build 10%** — no phase above a fifth, and the rebuild 42% under NFR-PRF-04's budget. Those five do not sum to the wall clock and are not meant to: the gap is the producer and the writer overlapping, which is the actor doing its job.
+
+**So the pool is still not built, and now for a measured reason rather than a deferred one.** It would attack 17% of the clock; eliminating parsing outright would save less than removing one implementation defect did. That is a stronger argument than the first number gave, because the first number's 45–51% was itself inflated by the defect.
+
+**The methodological result is the one to carry, and it is F-10's own lesson one level up.** The phase split was built so the writer could be told from the parser, and it did exactly that. It cannot see inside the phase it names — and every hypothesis about what was inside was wrong. **Which phase and which line are different questions, and a phase split answers only the first.**
+
+**One caveat that bounds all of the above (F-327).** The absolute figures move about 35% between sessions on unchanged code — 36.4 s, 37.6 s, 27.1 s, 24.4 s and 19.0 s have all been measured on the same binary and the same pinned vault. The **shares** are the durable result and the milliseconds are not, and a budget whose measurement noise exceeds its own margin is not yet a gate.
 
 **What was given up, stated because the pool existed for a reason:** wall-clock rebuild time on a many-core machine, if parsing does turn out to dominate. Nothing else — and notably not this table's own stated reason for the pool. *"Leaving a core free is what keeps the UI responsive during a rebuild"* is a justification for a **bound on** parallelism rather than for parallelism, and a sequential rebuild satisfies it completely.
 
@@ -751,11 +767,11 @@ Three, listed rather than mapped. Every one of them could be given a plausible r
 
 ## Open design questions
 
-Recorded rather than resolved, because resolving them now would mean guessing. Each names what would settle it.
+Recorded rather than resolved, because resolving them now would mean guessing. Each names what would settle it. **Question 1 has left this table** — it was answered by TC-020 and the answer lives in §2.2, because an answered question belongs beside the design it settles rather than in a list of things nobody knows.
 
 | Question                                                              | Settled by                                                                                                                     |
 |-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| Does parsing or the index writer dominate rebuild time?               | TC-020 on the sequential rebuild, reading `RebuildReport`'s walk / read-and-hash / parse / write split. If the writer dominates, batching strategy changes. **If parsing dominates, that is the argument for building the parse pool §2.2 no longer has** — the question now decides whether a mechanism exists rather than how it is sized. |
+| At what vault size does parsing become the dominant phase?            | The 50,000-note preset, comparing phase shares against the 20,000 figures in §2.2. This is what open design question 1 became once it was answered — at 20,000 the answer was *neither*, parse sitting at 17%, so the question that would revive the parse pool is no longer *whether* but *when*. Compare shares rather than milliseconds (F-327). |
 | Is brute-force vector search fast enough at 200,000 chunks?           | A P4 benchmark on the synthetic vault. ADR-09 is written to be reversed cheaply.                                               |
 | Which PDF extractor gives usable layout fidelity on the real archive? | Blueprint move 5 — spike one extractor against actual contracts and papers before committing to the pillar.                    |
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
