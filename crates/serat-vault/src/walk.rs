@@ -1,6 +1,7 @@
 //! Walking the vault.
 
 use std::fs::{self, Metadata};
+use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use serat_core::{NoteKind, SourceEntry, VaultError, VaultPath};
@@ -14,8 +15,8 @@ use crate::{Vault, ignore::is_note_file};
 /// (FR-VLT-02, and the T1 rebuild-equivalence test) is easier to assert when the only
 /// thing that varies is the content.
 ///
-/// No symlink is followed, directory or file (`link_stat.is_symlink()` below skips
-/// both, not only directories as an earlier version of this comment claimed). A vault
+/// No symlink is followed, directory or file (`stat.is_symlink()` below skips both,
+/// not only directories as an earlier version of this comment claimed). A vault
 /// containing a link to its own parent would otherwise walk forever, and Serat indexes
 /// the folder the user pointed it at rather than everything reachable from it — the
 /// same rule [`Vault::resolve`] enforces for a path that arrives without going through
@@ -37,14 +38,13 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
 
         for entry in listing.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // symlink_metadata, not metadata: a symlink to a directory must be
-            // recognised as a symlink rather than followed into a cycle.
+            // One stat, not two. DirEntry::metadata does not follow symlinks on either
+            // platform, so is_symlink here is the same answer fs::symlink_metadata
+            // would have given — and the second call was a syscall per file on the
+            // enumeration path.
             let Ok(stat) = entry.metadata() else { continue };
-            let Ok(link_stat) = fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
 
-            if link_stat.is_symlink() {
+            if stat.is_symlink() {
                 continue;
             }
 
@@ -59,9 +59,21 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
                 continue;
             }
 
-            let path = match vault.relativise(&entry.path()) {
-                Ok(path) => path,
-                Err(_) => continue,
+            // F-12. relativise canonicalises, which costs a syscall per entry and
+            // measured 1.42 s of the 1.85 s this walk took on the 20k vault — and
+            // tauri-app-dev then measured what that thread does to a cold start: 1410 ms
+            // against 821 ms with the walk moved, because it contends for the disk and
+            // the cores WebView2 is starting on.
+            //
+            // There is nothing left for canonicalisation to resolve. This loop built
+            // every path itself by joining onto an already-canonical root, and it has
+            // already skipped symlinks above, so stripping the known prefix lexically
+            // gives the same answer. relativise stays for paths arriving from outside
+            // the process — watcher events, arguments, drag-and-drop — which is what
+            // its documentation says it is for.
+            let path = match relativise_walked(vault, &entry.path()) {
+                Some(path) => path,
+                None => continue,
             };
             entries.push(SourceEntry {
                 kind: if is_note_file(&name) {
@@ -78,6 +90,16 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Strip the vault root lexically from a path this walk built.
+///
+/// Only sound for paths the walk constructed by joining onto `vault.root()`, which is
+/// already canonical, and only after symlinks have been excluded. Anything arriving
+/// from outside the process goes through [`Vault::relativise`], which canonicalises.
+fn relativise_walked(vault: &Vault, path: &Path) -> Option<VaultPath> {
+    let relative = path.strip_prefix(vault.root()).ok()?;
+    VaultPath::new(relative.to_string_lossy()).ok()
 }
 
 /// Modification time in milliseconds since the Unix epoch.
@@ -220,5 +242,67 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let vault = Vault::open(dir.path()).expect("open");
         assert!(vault.walk().expect("walk").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lexical_tests {
+    use super::*;
+    use crate::Vault;
+
+    fn write(root: &Path, relative: &str, bytes: &[u8]) {
+        let target = root.join(relative);
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        fs::write(target, bytes).expect("write");
+    }
+
+    #[test]
+    fn the_lexical_strip_agrees_with_canonicalising_relativise() {
+        // F-12's correctness condition. The walk stopped canonicalising per entry
+        // because it builds every path itself by joining onto an already-canonical
+        // root and has already excluded symlinks — so the two must give the same
+        // answer for every path the walk produces. If they ever diverge, the walk and
+        // the watcher would disagree about a file's identity and the same note would
+        // index twice under two spellings.
+        let dir = tempfile::tempdir().expect("temp");
+        let root = dir.path();
+        for relative in [
+            "note.md",
+            "10-projects/serat.md",
+            "10-projects/notes/deep/meeting.md",
+            "40-refs/contract.pdf",
+            "spaces in the name/and here.md",
+            "Mixed-Case/README.markdown",
+        ] {
+            write(root, relative, b"body");
+        }
+
+        let vault = Vault::open(root).expect("open");
+        let entries = vault.walk().expect("walk");
+        assert_eq!(entries.len(), 6);
+
+        for entry in &entries {
+            let absolute = vault.resolve(&entry.path).expect("resolve a path the walk produced");
+            let canonical = vault
+                .relativise(&absolute)
+                .expect("relativise a path the walk produced");
+            assert_eq!(
+                entry.path, canonical,
+                "the lexical strip and relativise disagree about {}",
+                entry.path
+            );
+        }
+    }
+
+    #[test]
+    fn the_walk_still_refuses_to_leave_the_vault() {
+        // Stripping a prefix lexically is only safe because the walk never descends
+        // into a symlink. This pins the second half of that: a path that does not
+        // start with the root produces nothing rather than a path built from whatever
+        // strip_prefix left behind.
+        let dir = tempfile::tempdir().expect("temp");
+        let vault = Vault::open(dir.path()).expect("open");
+        let outside = dir.path().parent().expect("parent").join("elsewhere.md");
+        assert!(relativise_walked(&vault, &outside).is_none());
     }
 }
