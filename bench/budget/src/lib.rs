@@ -1048,6 +1048,32 @@ impl Drop for VaultGenerationLock {
 /// # Errors
 /// A missing or unreadable manifest, or any of [`check_vault`]'s refusals.
 pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, String> {
+    // F-372 / task #78, checked first and reported on its own: a scratch
+    // directory a killed benchmark left behind reads, downstream, as a tree-
+    // digest mismatch -- which is what "the vault does not match its
+    // manifest" *actually means* here, and it is not what it sounds like. That
+    // message names corruption and offers regeneration; the true cause is one
+    // stray directory and the true fix is `rm -rf` on it. Checking here, ahead
+    // of the digest comparison, means the caller is told the cheap fix instead
+    // of reasoning backward from a hash mismatch to a directory listing --
+    // which is exactly the four runs it cost the first time (F-371/F-372).
+    let stray = stray_scratch_entries(path);
+    if !stray.is_empty() {
+        return Err(format!(
+            "found {} at the vault's top level, which a killed benchmark run leaves behind \
+             (F-372, task #78) -- this is almost certainly the whole problem, not vault \
+             corruption. Delete it and re-run before doing anything more expensive:\n    {}\n  \
+             vault {}",
+            stray.join(", "),
+            stray
+                .iter()
+                .map(|name| format!("rm -rf {}", path.join(name).display()))
+                .collect::<Vec<_>>()
+                .join("\n    "),
+            path.display()
+        ));
+    }
+
     let manifest_path = vaultgen::manifest_path_for(path);
     let manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
@@ -1311,6 +1337,33 @@ pub fn tree_digest(root: &Path) -> Result<String, String> {
         tree.update(b"\n");
     }
     Ok(vaultgen::hash::hex(&tree.finish()))
+}
+
+/// Top-level entries a killed benchmark run leaves inside a fixture vault
+/// (F-372, task #78).
+///
+/// `measure_full_rebuild_with` and `measure_save_to_index_with` used to build
+/// their scratch indexes at `vault.path.join(".serat-bench-<n>")` and
+/// `vault.path.join(".serat-bench")` -- both *inside* the fixture. A run that
+/// completes cleans up; one that is killed does not, and what it leaves moves
+/// the vault's tree digest for every caller after it, silently, until someone
+/// reads `verify_vault_at`'s error as corruption and regenerates 20,000 notes
+/// to fix one stray directory. Both call sites now build in `temp_dir()`
+/// instead, so this should find nothing on a tree this crate produced itself
+/// -- but it stays, because the failure mode it caught once was exactly a
+/// change that "should" have been unreachable, and a one-`read_dir` check
+/// costs nothing next to what reading the wrong error cost.
+fn stray_scratch_entries(path: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        // Whatever is wrong with `path` here is `verify_vault_at`'s to report,
+        // not this function's -- it has nothing more specific to add.
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.starts_with(".serat-bench"))
+        .collect()
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
@@ -1627,18 +1680,26 @@ where
         // A fresh index directory per iteration: a rebuild over a warm index is
         // not a rebuild, and reusing the directory would measure the second run
         // of something the requirement describes as the first.
-        let index_dir = vault.path.join(format!(".serat-bench-{i}"));
+        //
+        // Outside the vault, deliberately (F-372, task #78 -- the same lesson
+        // task #68's `measure_the_open_check_on_the_20k_vault` learned first,
+        // one file over in subject.rs). This used to be
+        // `vault.path.join(format!(".serat-bench-{i}"))`: a run that died
+        // between here and the cleanup below left `.serat-bench-0/` sitting
+        // inside the fixture vault, which moved its tree digest and failed
+        // every canonicality check after it -- for every caller, not just this
+        // one -- with a message that named neither the cause nor the one-line
+        // fix. `temp_dir()` carries no such obligation: nothing this loop does
+        // can poison the vault, cleanup or no cleanup.
+        let index_dir =
+            std::env::temp_dir().join(format!("serat-bench-rebuild-{}-{i}", std::process::id()));
         let _ = std::fs::remove_dir_all(&index_dir);
         let timing = rebuild(&vault.path, &index_dir)?;
         // Read before the directory goes away. F-47 is only visible here.
         let recorded = analyze(&index_dir);
-        // F-311: remove it BEFORE the checks, not after. Every check below exits
-        // with `?`, and this directory lives *inside* the vault -- so a failing
-        // check left it behind, the vault stopped matching its manifest, and the
-        // NEXT run died at F-26's canonicality gate with a message blaming the
-        // vault and advising regeneration, which would have destroyed the
-        // evidence of the real failure. The failure of one guard silently
-        // disarmed another, and it cost four runs before it was fixed.
+        // Still removed before the checks below, so a slow disk doesn't carry
+        // 20,000 notes' worth of index across iterations -- but no longer load-
+        // bearing for the vault's own integrity the way it was at F-311.
         let _ = std::fs::remove_dir_all(&index_dir);
         // F-247, test-engineer's: `RebuildReport::notes` counts every row in
         // `notes` -- markdown notes AND assets alike, `kind='asset'` per
@@ -1707,8 +1768,14 @@ pub fn measure_save_to_index_with<F>(
 where
     F: FnOnce(&Path, &Path, usize) -> Result<subject::SaveSamples, String>,
 {
-    let index_dir = vault.path.join(".serat-bench");
+    // Outside the vault: the same fix as `measure_full_rebuild_with`, for the
+    // same reason (F-372, task #78). No `{i}` suffix needed -- there is one
+    // scratch directory for the whole call, not one per iteration -- but the
+    // pid still guards against two concurrent `prf03` runs colliding.
+    let index_dir = std::env::temp_dir().join(format!("serat-bench-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&index_dir);
     let samples = save_to_index(&vault.path, &index_dir, iterations)?;
+    let _ = std::fs::remove_dir_all(&index_dir);
     check_save_path(samples.path)?;
     Ok(Measurement::new(samples.save)
         .reporting(
@@ -2215,6 +2282,101 @@ mod tests {
         let err = check_vault(p, "aaa", p.digest, vaultgen::VAULT_FORMAT_VERSION, p.notes)
             .expect_err("hand-edited vault");
         assert!(err.contains("does not match its manifest"), "{err}");
+    }
+
+    // ---------------------------------------------------------------- F-372 / #78
+
+    #[test]
+    fn a_stray_scratch_directory_is_named_rather_than_read_as_corruption() {
+        // The reproduction, standing in for what killing `prf04` actually did:
+        // a directory that was never part of the vault, sitting at its top
+        // level. verify_vault_at must catch this BEFORE it reaches the digest
+        // comparison and reports something that reads as corruption.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-stray-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".serat-bench-0")).expect("scratch dir");
+        std::fs::write(dir.join(".serat-bench-0").join("index.db"), b"leftover")
+            .expect("leftover file");
+        std::fs::write(dir.join(".vaultgen"), b"stamp").expect("stamp");
+
+        let p = preset("20k").expect("20k exists");
+        let err = verify_vault_at(p, &dir).expect_err("a stray scratch dir must be refused");
+
+        assert!(
+            err.contains(".serat-bench-0"),
+            "must name the directory: {err}"
+        );
+        assert!(
+            err.contains("killed benchmark"),
+            "must say what leaves it behind: {err}"
+        );
+        assert!(
+            err.contains("rm -rf"),
+            "must offer the cheap repair, not just the expensive one: {err}"
+        );
+        // The whole point: this must not be reachable through the "does not
+        // match its manifest" / "not the canonical vault" messages, which name
+        // regeneration as the fix and say nothing about the real cause.
+        assert!(
+            !err.contains("does not match its manifest") && !err.contains("Regenerate it"),
+            "a stray scratch directory is not corruption and must not read as any: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_vault_with_no_stray_directory_is_not_flagged_by_the_new_check() {
+        // The negative case for the test above: an ordinary manifest mismatch
+        // (no `.serat-bench*` present) must still reach check_vault's own
+        // message unchanged, not the stray-directory branch.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-clean-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("vault dir");
+        std::fs::write(dir.join(".vaultgen"), b"stamp").expect("stamp");
+        std::fs::write(
+            vaultgen::manifest_path_for(&dir),
+            format!(
+                r#"{{"format_version": {}, "tree_digest_sha256": "not-the-real-digest", "counts": {{"notes": 1, "assets": 0}}}}"#,
+                vaultgen::VAULT_FORMAT_VERSION
+            ),
+        )
+        .expect("manifest");
+
+        let p = preset("20k").expect("20k exists");
+        let err = verify_vault_at(p, &dir).expect_err("digest deliberately wrong");
+        assert!(err.contains("does not match its manifest"), "{err}");
+        assert!(!err.contains(".serat-bench"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stray_scratch_entries_ignores_ordinary_vault_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-ordinary-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("notes")).expect("notes dir");
+        std::fs::write(dir.join(".vaultgen"), b"stamp").expect("stamp");
+        std::fs::write(dir.join("notes").join("a.md"), b"# a").expect("note");
+
+        assert!(
+            stray_scratch_entries(&dir).is_empty(),
+            "an ordinary vault tree must not be flagged"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
