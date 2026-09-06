@@ -14,9 +14,12 @@
 //! # What P0 has, and does not
 //!
 //! The thread, the channel, the published state, the throttle and the event are all
-//! real and tested. The stamp check itself is task I6 and is not written: `serat-index`
-//! on this branch is the I1 scaffold. [`SeratIndexOpen`] therefore publishes
-//! [`IndexState::Unavailable`] naming I6, which is the honest state — search and
+//! real and tested. The stamp check itself is written and landed — I6 is on main
+//! as `serat_index::open_or_rebuild` — but **this crate has not been wired to it**,
+//! and that is not a one-line change: `open_or_rebuild` takes a `NoteSource` and a
+//! `NoteParser`, and this file constructs neither. [`SeratIndexOpen`] therefore
+//! still publishes [`IndexState::Unavailable`] naming I6, which remains the honest
+//! state — search and
 //! queries are unavailable and the vault is fully editable, which is design goal 1
 //! doing its job. It is deliberately not a fabricated `Ready`: a shell that claimed an
 //! index it does not have would make the cold-start number meaningless and would be
@@ -238,16 +241,20 @@ pub trait IndexOpen: Send + 'static {
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState));
 }
 
-/// The real open check — or rather, the place it will be.
+/// The seam where the real open check goes — still a seam, but no longer for want
+/// of the check.
 ///
 /// Architecture §3.4 specifies six ordered steps over `user_version`, `index_meta` and
 /// `count(*) FROM notes`, measured at 2.4 ms on the 20k fixture. Every one of them
 /// reads SQLite, so every one of them belongs to `serat-index` (§2.1: `serat-app` owns
-/// no domain logic). That is task I6, and it is not written.
+/// no domain logic). That is task I6, and it **is** written: `open_or_rebuild` landed
+/// on main (F-366). What is still missing is the wiring, not the check.
 ///
-/// Until it is, this publishes [`IndexState::Unavailable`] with a message that names
-/// the task. The alternative — a stamp check re-implemented in the app crate — would
-/// put schema knowledge in the wrong crate and would have to be deleted when I6 lands.
+/// Until that wiring lands, this publishes [`IndexState::Unavailable`] with a message
+/// that says so. The alternative — a stamp check re-implemented in the app crate —
+/// would put schema knowledge in the wrong crate, and I6 having landed does not weaken
+/// that argument but strengthens it: the check now exists in the crate that owns it, so
+/// a second copy here would be a divergence rather than a stopgap.
 #[derive(Debug, Default)]
 pub struct SeratIndexOpen;
 
@@ -255,9 +262,10 @@ impl IndexOpen for SeratIndexOpen {
     fn open(&mut self, _vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
         publish(IndexState::Unavailable {
             message: format!(
-                "no index open check yet (task I6, architecture §3.4). serat-index is at index \
-                 v{} on sqlite {}, and exposes no open-or-rebuild entry point. Search and queries \
-                 are unavailable; the vault is fully editable.",
+                "index open check not wired up yet (task I6 has landed in serat-index; this \
+                 app crate is not connected to it yet). serat-index is at index v{} on \
+                 sqlite {}, and does expose serat_index::open_or_rebuild. Search and \
+                 queries are unavailable; the vault is fully editable.",
                 serat_index::INDEX_VERSION,
                 serat_index::sqlite_version(),
             ),
