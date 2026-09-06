@@ -719,6 +719,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0009 — Brute-force vector search in v1 (serves FR-AIX-03, NFR-PRF-07)
 - ADR-0010 — One SQL statement per query (serves FR-STR-08, FR-STR-09, NFR-PRF-05)
 - ADR-0011 — Which producer the index queue may drop (serves FR-VLT-04, NFR-PRF-03, NFR-REL-01)
+- ADR-0012 — Declare the Tauri app ACL manifest, and grant only the commands the webview calls (serves NFR-SEC-02, T-02, FR-BIN-19) *(proposed)*
 
 ## Traceability
 
