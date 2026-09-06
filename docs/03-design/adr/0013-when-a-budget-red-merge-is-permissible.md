@@ -59,9 +59,30 @@ A merge may proceed with a performance budget red **only when all five hold**:
 
 **What the merge then owes.** Condition 3 names a task; that task settling changes what has
 been established. #13 merged on the understanding that #83 settles which parse figure is
-representative. **If #83 concludes the 31.3s reading was real rather than contention, #13's
-residual must be re-examined against a green baseline** rather than treated as settled by
-F-375. A budget-red merge is a deferral with a named creditor, not a discharge.
+representative, and this ADR first wrote the trigger as: *if #83 concludes the 31.3s reading
+was real rather than contention, #13's residual must be re-examined against a green
+baseline.* A budget-red merge is a deferral with a named creditor, not a discharge.
+
+**That trigger did not fire, the deferral survived anyway, and the ADR was wrong about how.**
+#83 concluded the opposite — parse reads a 3332ms median at `concurrent_build_processes = 0`,
+1.3% spread — so the named condition was not met and #13 stays merged on the grounds it was
+merged on. But #83's finding undermines the *instrument* rather than the verdict: the A/B that
+cleared #13 was itself taken on a machine now known to be heavily contended. Both halves ran
+under that contention, which is exactly what makes a same-session A/B admissible, and it is
+still not evidence about a quiet machine. **The direction is not neutral.** Under contention
+`producer waited` was 1–3%, because CPU starvation made the producer the constraint and the
+writer never became one; a low-contention run showed it at 10,496ms, 32%. #13's cost is
+writer-side, so it was measured under precisely the conditions least able to see it, and a
+quiet-machine A/B could show the residual **larger**. Task #87 carries the deferral now.
+
+**The lesson for this rule, and it is the first thing its Tested against field asked for.**
+The trigger was written as *one task's conclusion* rather than as the condition that
+conclusion was standing in for. What condition 2 actually needs is a residual measured on an
+**attested** machine; #83 concluding "contention" satisfies the letter of the trigger while
+leaving that need unmet. **A creditor should be named by the condition it discharges, not by
+the task expected to discharge it** — tasks close, get superseded, and conclude things their
+author did not anticipate, and a deferral pinned to one of them can look settled while the
+question it stood for is still open.
 
 ## Consequences
 
@@ -95,7 +116,9 @@ recording in other forms.
 ## Tested against
 
 **One case, and it is the case that produced the rule rather than an independent one — which
-is the weakness to state plainly.** Task #13 met all five: same-session A/B (main 54,826ms
+is the weakness to state plainly. It has since been tested once, sooner than expected and not
+by a merge: #83's conclusion exercised the deferral clause and found the trigger too narrow
+(see §What the merge then owes). The five conditions themselves are still untested.** Task #13 met all five: same-session A/B (main 54,826ms
 vs branch 60,714ms, parse 31,257 vs 31,316ms, identical); residual +5.9s at n=1 against a
 37.9% machine spread; baseline red for a named reason owned by #83; a correctness fix under
 FR-NAV-04; and the measurement recorded with its conditions, including that two earlier
