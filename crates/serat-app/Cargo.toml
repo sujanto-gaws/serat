@@ -42,5 +42,14 @@ dirs = "6.0.0"
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
+# `tauri`'s "test" feature (`tauri::test`, `MockRuntime`) is a target-specific
+# dev-dependency rather than a plain one: `tests/acl_behaviour.rs` is
+# `#[cfg(not(windows))]`'d out (task #53, F-345 -- the OS loader crashes on this
+# feature's runtime-wry/webview2 linkage before any Rust code runs, which
+# `#[ignore]` cannot prevent), so there is no reason for a Windows dev build to
+# compile the mock runtime in at all.
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2.11.5", features = ["custom-protocol", "test"] }
+
 [lints]
 workspace = true

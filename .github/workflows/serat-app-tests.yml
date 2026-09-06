@@ -1,0 +1,58 @@
+# serat-app on Linux — task #53, F-345.
+#
+# `ci.yml`'s `workspace`/`crate` matrix is supposed to be where this runs, but
+# every run of `ci.yml` on this repository -- push and pull_request alike, back
+# through its whole history -- completes in 0 seconds with 0 jobs and a
+# "workflow file issue" (GitHub's own wording; the exact validation error is not
+# exposed to the REST API, and reproducing it needs someone with dashboard
+# access). That is a separate, standing defect, reported alongside this PR
+# rather than fixed inside it -- a 55-run-old failure of the project's single
+# required gate deserves its own look, not a rushed diagnosis bolted onto an
+# unrelated task.
+#
+# Until that is fixed, serat-app's tests have **never** run on Linux in CI,
+# which is exactly the question task #53 needed answered: does
+# `tauri::test::mock_app()` (crashes with `STATUS_ENTRYPOINT_NOT_FOUND` on at
+# least one Windows toolchain, F-345) work on ubuntu-latest at all? This
+# five-line job is the smallest thing that can answer it, mirroring the working
+# pattern `budgets.yml` and `design-docs.yml` already use rather than `ci.yml`'s.
+# Delete this file once `ci.yml` is fixed and its `crate` matrix covers
+# serat-app on ubuntu-latest again -- it would be a second, redundant copy at
+# that point, and this register keeps finding that a redundant check is not a
+# free one.
+#
+# Owner: test-engineer.
+
+name: serat-app-linux
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  serat-app:
+    name: cargo test -p serat-app (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p serat-app --all-targets
+      - name: Report whether the F-345 behavioural test actually ran
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tests/acl_behaviour.rs is #[cfg(not(windows))]'d in -- if the step \
+                above passed and this job is green, mock_app()-shaped code just ran \
+                on ubuntu-latest, which is the answer F-345 asked CI for."
