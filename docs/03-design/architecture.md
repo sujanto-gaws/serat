@@ -219,6 +219,16 @@ Found by reading the design against itself
 
 The save path is not a new mechanism invented to close a gap; it was already required by §3.2, and this document simply never said so. Echo suppression **drops** the watcher event for Serat's own write. If the index were fed only by the watcher, a note saved in Serat would therefore never be indexed at all, and the mechanism that exists to prevent duplicated work would instead prevent all of it. Echo suppression is only coherent if the write path has already submitted the rows itself — which §3.2's ordering now *enforces* rather than assumes, since nothing is recorded, and so nothing can be suppressed, until a submit has succeeded. F-03 did not find a missing 100ms; it found a missing paragraph.
 
+##### A third caller shares this code, and its budget is the one that breaks
+
+**The table above has two rows; `serat-index`'s row-writing path has three callers.** The save path and the watcher path each write one note's rows under a budget measured in milliseconds. The full rebuild drives the same `apply` over 20,000 notes under NFR-PRF-04's 30 seconds. So **a per-row cost added there is paid once by a save and about forty thousand times by a rebuild**, and it is the ratio rather than the cost that decides whether it matters. This section's own framing — two paths, two budgets — is what let that go unsaid.
+
+**F-371 is the case, and it was measured rather than argued.** Task #13's link resolution is correct for the path it targets and lands on the shared one: a 20k rebuild gained roughly 40,000 `UPDATE`s, each carrying a correlated subquery whose `OR`-chain over `n.path` and `file_name` no index can serve. `prf04-full-rebuild --iterations 1` on the standing 20k fixture burned **1,269 seconds of CPU without producing a result**, against 30 seconds budgeted and the 21–27 seconds the same job took after F-324. That is a lower bound rather than a number: the process was still running when it was killed.
+
+**Why this is a property of the design and not an incident to record elsewhere: no test could have caught it.** `serat-index` went from 76 passing tests to 77, the new test is mutation-verified, and nothing in the suite exercises more than a handful of notes. **A per-row cost is invisible in every test that writes one row, by construction.** Only the budget job sees it, which is what C-06 and the working agreement's rule — a change that adds an index write path adds or updates the benchmark that measures it — exist for.
+
+**The rule this leaves.** When adding work to the row-writing path, say which of the three callers pays it and how many times. If the answer is *the rebuild, once per note*, then the budget job is not optional and reasoning about the per-row cost is not sufficient. F-371 also records what makes the remedy scoping rather than reverting: the rebuild already runs one full `resolve_links` pass at the end, which its author kept deliberately, so the per-row work is **redundant** during a rebuild rather than merely expensive.
+
 ##### 3.1.1 The save path
 
 Serat knows what it wrote, so it does not wait to be told.
