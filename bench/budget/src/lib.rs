@@ -396,21 +396,10 @@ pub struct VaultUnderTest {
     pub digest: String,
     /// The generator format version that produced it.
     pub format_version: u32,
-    /// Markdown notes it contains, from the manifest's `counts.notes`.
+    /// Notes it contains.
     pub notes: usize,
-    /// Binary asset files it contains, from the manifest's `counts.assets`.
-    ///
-    /// Kept separate from `notes` for the same reason as `asset_embeds` below:
-    /// `serat_index::RebuildReport::notes` counts every row in the `notes`
-    /// table, and an asset is a row there too (`kind='asset'`, ADR-0005), so a
-    /// correct rebuild of this vault reports `notes + assets`, not `notes`
-    /// alone. The 20k preset is 20,000 markdown notes and 200 assets; a check
-    /// against `notes` alone would reject every correct rebuild — the exact
-    /// failure `REBUILD_ENTRY_POINT`'s call-site comment warns against, found
-    /// while wiring `full_rebuild()` for real.
-    pub assets: usize,
     /// Note-to-note link edges the generator produced, from the manifest's
-    /// `link_degree.edges`.
+    /// `link_degree.edges`. The oracle for `RebuildReport.links_resolved`.
     pub note_links: usize,
     /// Binary asset files it contains, from the manifest's `counts.assets`.
     ///

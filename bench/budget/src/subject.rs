@@ -259,12 +259,6 @@ pub struct SaveSamples {
     /// name is the reason this went unnoticed as long as it did (F-268).
     /// Reported beside `end_to_end`, never asserted.
     pub pipeline: Samples,
-    /// Submit to the `index.changed` event arriving — what the UI learns from,
-    /// throttled to ten per second and therefore up to 100 ms later than the
-    /// drain (F-99). Reported, not asserted: only this end is what a person
-    /// experiences, and which end the requirement means is product-analyst's to
-    /// settle at Q1.
-    pub notified: Samples,
 }
 
 /// What the harness needs before NFR-PRF-03 is measurable.
@@ -367,15 +361,22 @@ blocked rather than guessed at.";
 /// # Errors
 /// When the index cannot be found or read.
 pub fn stat1_note_rows(index_dir: &Path) -> Result<usize, String> {
-    // `serat_index::index_path(index_dir)` is the right call and replaces this
-    // the moment I4 merges. Until then the name is matched exactly rather than
-    // globbed: the rebuild also writes `index.db-wal` and `index.db-shm`, and a
-    // `*.db*` glob would find three files while a `*.db` glob is one WAL-mode
-    // change away from finding the wrong one.
-    let db = index_dir.join("index.db");
-    if !db.exists() {
-        return Err(format!("no index at {}", db.display()));
-    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(index_dir)
+        .map_err(|e| format!("reading {}: {e}", index_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "db"))
+        .collect();
+    candidates.sort();
+    let db = match candidates.len() {
+        1 => candidates.remove(0),
+        0 => return Err(format!("no .db file in {}", index_dir.display())),
+        n => {
+            return Err(format!(
+                "{n} .db files in {}; the harness cannot tell which is the index",
+                index_dir.display()
+            ));
+        }
+    };
 
     let conn =
         rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -719,21 +720,9 @@ mod tests {
         assert!(e.contains("\"save\""), "{e}");
         assert!(e.contains("writer().flush()"), "{e}");
 
-        // Cold start branches on whether the application exists yet. Before S1
-        // merges, the seam itself refuses and names the task. After it merges,
-        // the binary refuses -- `--vault nowhere` cannot be opened -- and the
-        // message is the app's rather than the seam's. Asserting only the first
-        // would turn tauri-app-dev landing S1 into a red test in my crate.
         let e = cold_start(vault, 20).expect_err("must not silently pass");
-        if app_binary().is_err() {
-            assert!(e.contains("S1"), "{e}");
-            assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
-        } else {
-            assert!(
-                !e.is_empty(),
-                "an unopenable vault must refuse with a sentence, not silently"
-            );
-        }
+        assert!(e.contains("S1"), "{e}");
+        assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
     }
 
     // ------------------------------------------------------ T-07 / task #30

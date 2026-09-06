@@ -62,12 +62,13 @@ pub struct StartupTrace {
     pub vault: String,
     /// The note the shell actually rendered, or empty when none was.
     ///
-    /// `--exit-after-ready` refuses to start without `--open`, but that guard
-    /// covers "no note was configured" and not "the configured note failed to
-    /// read". In the second case the shell still becomes usable — the editor
-    /// takes keystrokes — and the trace honestly records a null. Honest, and
-    /// not a number to record: a `vault usable` figure over a shell that
-    /// rendered nothing is not what NFR-PRF-01 is about.
+    /// Empty on every cold-start run the harness itself takes: task #52 ruled
+    /// that `t_usable` is §3.4's four preconditions -- index state known, file
+    /// tree delivered, watcher settled, window painted -- and none of them is
+    /// "a note is rendered", so the harness no longer passes `--open` at all
+    /// (task #54). Recorded rather than dropped because a user session that
+    /// did restore a note still reports it here, and because a non-empty value
+    /// on a harness run would itself be worth noticing.
     pub last_open: String,
 }
 
@@ -156,15 +157,6 @@ impl StartupTrace {
                     later.0, later.1, earlier.0, earlier.1
                 ));
             }
-        }
-        if self.last_open.is_empty() {
-            return Err(
-                "the trace records no last_open, so the shell became usable without rendering \
-                 a note. --exit-after-ready refuses when none is configured, so this is the \
-                 other case: the note was configured and failed to read. The figure is honest \
-                 and is not a gate number."
-                    .to_string(),
-            );
         }
         if self.paint_gap_ms() < MIN_PAINT_GAP_MS {
             return Err(format!(
@@ -273,13 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_that_rendered_no_note_is_not_a_gate_number() {
-        // --exit-after-ready covers "no note configured"; this covers "the
-        // configured note failed to read", where the shell still becomes usable
-        // and the trace honestly records a null.
+    fn an_empty_last_open_is_the_normal_case_now_and_parses_fine() {
+        // Task #52: no note is a precondition for "vault usable", so the
+        // harness no longer passes --open at all (task #54) and every real
+        // trace it takes has an empty last_open. An earlier version of this
+        // check rejected that as "rendered nothing" -- which would have failed
+        // every cold-start run once the harness stopped opening a note.
         let line = good().replace("\"last_open\": \"_types/Project.md\", ", "");
-        let err = StartupTrace::parse(&line).expect_err("a null last_open must not pass");
-        assert!(err.contains("without rendering"), "{err}");
+        let trace = StartupTrace::parse(&line).expect("an empty last_open is not a failure");
+        assert_eq!(trace.last_open, "");
     }
 
     #[test]
