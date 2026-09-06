@@ -940,10 +940,22 @@ pub fn repo_root() -> PathBuf {
 /// Make sure the preset vault exists, generating it if it does not, then verify
 /// that what is on disk is what the manifest says it is.
 ///
+/// A cross-process lock guards the check-then-generate window (task #70):
+/// `cargo test --workspace` runs every budget test binary as a
+/// separate process, several of which call this for the same preset, and the
+/// `.vaultgen` stamp is written only once generation finishes -- seconds,
+/// for the 20k preset. Without the lock, a second process can find the
+/// directory non-empty and stampless mid-generation by the first and hit
+/// vaultgen's own refusal to touch an un-stamped, non-empty directory,
+/// rather than the number-or-error a caller is waiting for. Same shape as
+/// task #28's `FAIL_NEXT_COMMIT` race, one level up: shared mutable state on
+/// a fixed path, concurrent execution, passing in isolation and failing
+/// under load.
+///
 /// # Errors
-/// If generation fails, if the manifest is missing, or if the vault on disk does
-/// not match its manifest — in which case the number that would follow is
-/// attributable to nothing and must not be taken.
+/// If generation fails, if the manifest is missing, if the vault on disk does
+/// not match its manifest, or if another process holds the lock past the
+/// timeout below.
 pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
     let preset = preset(name)?;
     let (notes, assets) = (preset.notes, preset.assets);
@@ -951,21 +963,79 @@ pub fn ensure_vault(name: &str) -> Result<VaultUnderTest, String> {
     let manifest_path = vaultgen::manifest_path_for(&path);
 
     if !path.join(".vaultgen").exists() || !manifest_path.exists() {
-        eprintln!("budget: generating {name} vault at {}", path.display());
-        let opts = vaultgen::Options {
-            seed: vaultgen::DEFAULT_SEED,
-            notes,
-            assets,
-            out: path.clone(),
-            manifest: None,
-            jobs: None,
-            force: true,
-            quiet: true,
-        };
-        vaultgen::generate(&opts).map_err(|e| format!("generating the vault: {e}"))?;
+        let _lock = VaultGenerationLock::acquire(&path)?;
+        // Re-check now that the lock is held: the process that held it before
+        // us may have just finished generating, in which case there is
+        // nothing left to do and no reason to regenerate.
+        if !path.join(".vaultgen").exists() || !manifest_path.exists() {
+            eprintln!("budget: generating {name} vault at {}", path.display());
+            let opts = vaultgen::Options {
+                seed: vaultgen::DEFAULT_SEED,
+                notes,
+                assets,
+                out: path.clone(),
+                manifest: None,
+                jobs: None,
+                force: true,
+                quiet: true,
+            };
+            vaultgen::generate(&opts).map_err(|e| format!("generating the vault: {e}"))?;
+        }
     }
 
     verify_vault_at(preset, &path)
+}
+
+/// A cross-process advisory lock over one vault preset's generation.
+///
+/// Backed by atomic file creation rather than an OS file lock: `create_new`
+/// failing when the file already exists is the one filesystem operation both
+/// Windows and POSIX guarantee is atomic, and this crate otherwise has no
+/// reason to add a locking dependency for one narrow race. A process that
+/// finds the lock held polls rather than blocking indefinitely and gives up
+/// well past the slowest real generation this project has measured (the 20k
+/// preset, under nine seconds), so a genuinely stuck lock still surfaces as
+/// an error naming the file to remove rather than a silent hang.
+struct VaultGenerationLock {
+    lock_path: PathBuf,
+}
+
+impl VaultGenerationLock {
+    fn acquire(vault_path: &Path) -> Result<Self, String> {
+        let lock_path = vault_path.with_extension("vaultgen-lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "another process has held the vault-generation lock at {} for over \
+                             120s -- if the process that created it is gone, remove the file by \
+                             hand",
+                            lock_path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(format!("creating lock file {}: {e}", lock_path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for VaultGenerationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
 }
 
 /// Verify a vault that already exists, wherever it is.
@@ -1325,6 +1395,40 @@ where
         );
     }
     let vault = ensure_vault(budget.vault)?;
+    decide_with_vault(budget, parsed, vault, measure)
+}
+
+/// The measure-and-judge half of [`decide`], taking a vault rather than
+/// acquiring one.
+///
+/// Split out for task #70: a test exercising only "does `decide` propagate a
+/// measurement error rather than swallowing it" does not need a real 20,000-
+/// note vault on disk to do that, and `decide`'s own shape made getting one
+/// unavoidable -- `ensure_vault` ran before the measurement closure got a
+/// chance to fail, so a test passing an always-`Err` closure still paid for
+/// (and could race on) real vault generation. `cargo test --workspace` runs
+/// every budget test binary as a separate process, several of which reach
+/// `ensure_vault` for the same 20k preset; the generation stamp is written
+/// only at the end, so a process finding the directory non-empty and
+/// stampless mid-generation by another process hit vaultgen's own
+/// non-empty-directory refusal instead of the error the test was checking
+/// for. Same shape as task #28's race, one level up: shared mutable state on
+/// a fixed path, concurrent execution, passes in isolation and fails under
+/// load. This makes the failure structurally impossible for tests that have
+/// no reason to touch disk at all, rather than merely rarer.
+///
+/// # Errors
+/// A failed measurement, a measurement that produced no samples, or a phase
+/// breakdown that does not add up.
+pub fn decide_with_vault<F>(
+    budget: &Budget,
+    parsed: JobArgs,
+    vault: VaultUnderTest,
+    measure: F,
+) -> Result<Outcome, String>
+where
+    F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
+{
     let measurement = measure(&vault, parsed.iterations)?;
     outcome_from(budget, parsed.profile, vault, measurement)
 }
@@ -2146,14 +2250,83 @@ mod tests {
     #[test]
     fn a_job_cannot_swallow_the_seam_error_and_post_a_number() {
         // The mutation: `subject::full_rebuild(..)?` becomes
-        // `.unwrap_or_default()`, and a fabricated 1 ms number passes. decide()
-        // returns the error rather than an Outcome, so there is nothing to
-        // swallow that a test cannot see.
-        let err = decide(&PRF04_FULL_REBUILD, &[], |_, _| {
+        // `.unwrap_or_default()`, and a fabricated 1 ms number passes.
+        // `decide_with_vault` returns the error rather than an Outcome, so
+        // there is nothing to swallow that a test cannot see.
+        //
+        // Deliberately `decide_with_vault` with `a_vault()`, not `decide`
+        // with a real preset (task #70): this test checks error propagation
+        // and has no reason to generate or even open a real 20,000-note
+        // vault to do that. Going through `decide` here used to mean this
+        // test raced every other budget test binary over the same 20k
+        // fixture path under `cargo test --workspace`'s concurrent
+        // processes -- passing in isolation, failing under load, the same
+        // shape as task #28's race one level up.
+        let parsed = JobArgs {
+            profile: Profile::Reference,
+            iterations: PRF04_FULL_REBUILD.iterations,
+            indicative: false,
+            help: false,
+        };
+        let err = decide_with_vault(&PRF04_FULL_REBUILD, parsed, a_vault(), |_, _| {
             Err("serat-index exposes no rebuild entry point yet — task I4".to_string())
         })
         .expect_err("a failed measurement is not a passing budget");
         assert!(err.contains("task I4"), "{err}");
+    }
+
+    #[test]
+    fn the_vault_generation_lock_excludes_a_second_holder_and_releases_on_drop() {
+        // Task #70's other half: ensure_vault's check-then-generate window is
+        // now guarded by VaultGenerationLock, and this proves the lock itself
+        // does what it claims rather than trusting create_new's semantics by
+        // reading them. Real mutual exclusion, not a mock: the second
+        // acquire attempt genuinely fails while the first is held, on the
+        // same lock file two processes would use.
+        let dir =
+            std::env::temp_dir().join(format!("serat-vault-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(dir.with_extension("vaultgen-lock"));
+
+        let held = VaultGenerationLock::acquire(&dir).expect("first acquire must succeed");
+        assert!(
+            dir.with_extension("vaultgen-lock").exists(),
+            "the lock file must exist on disk while held -- that is the whole \
+             mechanism a second process checks"
+        );
+
+        // A second acquire on the same path must not succeed while the first
+        // is still held: prove it can fail (F-58, F-27) by giving it a short
+        // deadline rather than waiting out the real 120s timeout.
+        let second = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dir.with_extension("vaultgen-lock"))
+                {
+                    Ok(_) => return true, // acquired -- the exclusion failed
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => return false, // correctly excluded
+                }
+            }
+        })
+        .join()
+        .expect("the checking thread must not panic");
+        assert!(
+            !second,
+            "a second holder acquired the lock while the first was still held"
+        );
+
+        let lock_path = held.lock_path.clone();
+        drop(held);
+        assert!(
+            !lock_path.exists(),
+            "dropping the lock must remove the file, or the next real process to want \
+             this vault waits out the full 120s timeout for nothing"
+        );
     }
 
     #[test]
