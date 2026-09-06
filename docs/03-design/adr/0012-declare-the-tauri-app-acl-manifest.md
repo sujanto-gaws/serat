@@ -1,5 +1,5 @@
 # ADR-0012: Declare the Tauri app ACL manifest, and grant only the commands the webview calls
-**Status:** accepted · **Date:** 2026-09-06 (accepted after the run named below) · **Serves:** NFR-SEC-02, T-02, FR-BIN-19, design goal 5
+**Status:** accepted · **Date:** 2026-09-06 (accepted after the run named below) · **Serves:** NFR-SEC-06, T-08, design goal 5 (corrected by task #50; see the correction below)
 
 ## Context
 
@@ -85,7 +85,7 @@ whoever needs it.
 
 ## Consequences
 
-**Positive.** `open_vault` stops being reachable from the webview. `windows: ["main"]`
+**Positive.** `open_vault` stops being reachable from the webview — **which is worth more than the "one command with no caller" framing above admits, and the framing is the fault of this ADR rather than of the change.** `open_vault` takes an arbitrary absolute root and nothing checks it against the root already open, so it is the one registered command able to **relocate the containment boundary** that NFR-SEC-06 and T-07 are written about; the other five operate within whatever boundary is in force. Withholding it is therefore a containment control, not tidiness (task #50, T-08). `windows: ["main"]`
 becomes enforcement instead of documentation. A second window in P1 arrives with the
 allowlisting mechanism already engaged and tested, so the question it raises is "which
 commands does this window get", answered in a capability file, rather than "is anything
@@ -109,8 +109,48 @@ revisiting is the mechanism working, not a defect in it.
 investigation after one does. Design goal 5 — capability degrades, nothing breaks —
 argues for engaging the mechanism while there is nothing to break.
 
+## Correction, task #50: what this decision serves
+
+**This ADR was accepted with a `Serves:` line naming three IDs it does not serve, and
+omitting the one it does.** The header now reads NFR-SEC-06 and T-08; it read NFR-SEC-02,
+T-02 and FR-BIN-19. The previous wording is kept here rather than quietly replaced,
+because a traceability link is a claim like any other and the way it failed is reusable.
+
+The test that settles it is F-40's, asked of a link rather than of a guard: **if reverting
+the decision cannot change the requirement's acceptance evidence, the decision does not
+serve the requirement.**
+
+- **NFR-SEC-02** is *no unconfigured network*, and its acceptance is a network capture
+  confirming silence. Not one of the six commands opens a socket. Reverting the manifest
+  changes no capture.
+- **T-02** *is* NFR-SEC-02 in the threat table — the row reads "No unconfigured network
+  — violation of NFR-SEC-02" — and its own ADR column reads "—". The link existed in
+  one direction only, and that direction was the wrong one.
+- **FR-BIN-19** is *binaries are never rewritten*, and its acceptance is asset content
+  hashes unchanged. `write_file` is granted; the non-Markdown refusal lives in
+  `write_atomic` and in the IPC check, neither of which the ACL touches.
+
+**NFR-SEC-06 passes the same test, through the grant that was withheld.**
+`OpenVaultArgs { root: String }` is an arbitrary absolute host path, `open_vault_with`
+hands it to `Vault::open` and refuses only a root that does not exist or cannot be read,
+and nothing compares it with the root already open. A webview able to invoke `open_vault`
+therefore **moves the vault root**, and every subsequent read and write is contained
+inside a root the user did not choose. T-07's mitigation column already states the rule as
+*"nothing resolves to a path outside the root **the user opened**"*, which is what makes
+this NFR-SEC-06 in substance and not by analogy.
+
+**Why the wrong ID looked right, which is the part worth keeping.** The threat model had
+no row for the webview's IPC reach at all — it lived only in §Trust boundaries prose —
+so the nearest row on the same boundary was T-02, and citing the requirement behind it
+read as locating the decision rather than mis-stating it. **An absent ID is filled by the
+nearest present one**, and the nearest is chosen by adjacency rather than by
+consequence. T-08 now exists, so the next decision on this boundary has a right answer to
+find.
+
 ## Objections recorded
 (from teammates consulted)
+
+**On the task #50 correction, recorded in the tense it happened in.** tauri-app-dev was consulted before the correction was written, because the NFR-SEC-06 claim is a claim about their crate. **At the time of writing they had not replied, and the question that could have changed the correction was settled by reading the crate rather than by waiting for them (F-343).** It was whether anything in `serat-app` already refuses a webview-initiated relocation of the root: `AppState::open_vault_with` takes `args.root`, hands it to `Vault::open`, maps only a missing or unreadable directory to `VaultNotFound`, and compares it with nothing. There is no such refusal. Their answer will be recorded here when it arrives, and if it contradicts the reading above then this section changes rather than the reading being defended.
 
 tauri-app-dev was consulted before this was written. **The one question that could have
 changed the decision rather than its wording was answered before they replied, and
