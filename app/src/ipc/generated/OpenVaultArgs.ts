@@ -16,8 +16,9 @@
  *
  * **It does not wait for the open check either**, and the ordinary value of
  * `VaultOpened::index` is therefore `IndexState::Opening`. The check is only
- * 2.4 ms on a warm index, which is what makes waiting for it tempting — but it
- * is 2.4 ms *when the index is healthy*, and the cases that take longer are
+ * 5-8 ms on a warm index (task #68), which is what makes waiting for it
+ * tempting — but it is 5-8 ms *when the index is healthy*, and the cases that
+ * take longer are
  * exactly the ones where the window must already be up. Rule 1 has no
  * exceptions, including small ones.
  */
