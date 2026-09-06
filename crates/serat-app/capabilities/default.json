@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The P0 shell. Core event listening only. Every Serat capability arrives as an application command rather than a plugin, so this file grants none of them -- not because Tauri cannot (per-window/per-webview allowlisting of application commands exists once an app ACL manifest is declared, via AppManifest::commands() in build.rs or a permissions/ directory; see docs/03-design/threat-model.md), but because Serat has not opted in. That is a choice, cheap to reverse before a second window exists and expensive after (F-280, F-336). Widening this set, or declaring an app manifest, is a threat-model decision, not a convenience.",
+  "description": "The P0 shell. build.rs declares an app ACL manifest (ADR-0012) naming all six commands in generate_handler!, so this file's grant is now enforcement, not documentation: it names the five commands crates/serat-app/webview/boot.js actually invokes -- read_file, write_file, index_status, mark_first_paint, mark_vault_usable. open_vault is deliberately withheld; nothing in the webview calls it (F-342), it is invoked only from Rust inside setup, and granting it here would reopen surface removing it was meant to close. Widening this set is a threat-model decision, not a convenience -- see docs/03-design/adr/0012-declare-the-tauri-app-acl-manifest.md.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-read-file",
+    "allow-write-file",
+    "allow-index-status",
+    "allow-mark-first-paint",
+    "allow-mark-vault-usable"
+  ]
 }

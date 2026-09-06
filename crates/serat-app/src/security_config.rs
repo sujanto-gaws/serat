@@ -18,10 +18,16 @@
 //!
 //! # What this is not
 //!
-//! None of this is enforced by Tauri on Serat's behalf — see F-280: capability
-//! resolution is skipped entirely for local, unmanifested application commands, so
-//! `capabilities/default.json` currently constrains none of the six commands in
-//! `generate_handler!`. These tests exist so a change to either file is a decision
+//! Historically none of this was enforced by Tauri on Serat's behalf — F-280/F-336
+//! found that capability resolution was skipped entirely for local, unmanifested
+//! application commands, so `capabilities/default.json` constrained none of the six
+//! commands in `generate_handler!`. ADR-0012 changed that: `build.rs` now declares an
+//! app ACL manifest, so the `permissions` list this module checks is real enforcement
+//! for five of the six commands (`open_vault` deliberately withheld, F-342). See
+//! `acl_manifest.rs` for the guard that keeps `generate_handler!`, `build.rs`'s
+//! manifest and this file's grants from drifting apart — a concern this module's tests
+//! do not cover, because they check values within *one* file at a time rather than
+//! agreement across three. These tests exist so a change to either file is a decision
 //! someone makes on purpose, not a side effect nobody notices — the F-40 question
 //! ("which of these guards can be removed without a test going red") answered for all
 //! five settings rather than for none of them.
@@ -91,12 +97,15 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_still_grant_only_core_default() {
+    fn capabilities_still_grant_exactly_core_default_and_the_five_adr_0012_commands() {
         // capabilities/default.json's own `description` says widening this list is a
-        // threat-model decision, not a convenience. Nothing previously checked that the
-        // list stayed narrow; this pins it to exactly the one permission set that grants
-        // no application command (NFR-SEC-02, NFR-SEC-05).
-        let permissions: Vec<String> = capabilities_default()["permissions"]
+        // threat-model decision, not a convenience. ADR-0012 widened it once, on
+        // purpose, from ["core:default"] to core:default plus the five commands
+        // boot.js invokes; this pins the *new* narrow set so the next widening is
+        // equally deliberate. acl_manifest.rs checks the granted set against
+        // generate_handler! and build.rs directly — this test only guards against the
+        // list drifting silently within this one file.
+        let mut permissions: Vec<String> = capabilities_default()["permissions"]
             .as_array()
             .expect("capabilities/default.json must have a permissions array")
             .iter()
@@ -107,13 +116,26 @@ mod tests {
                     .to_owned()
             })
             .collect();
+        permissions.sort();
+        let mut expected: Vec<String> = vec![
+            "allow-index-status",
+            "allow-mark-first-paint",
+            "allow-mark-vault-usable",
+            "allow-read-file",
+            "allow-write-file",
+            "core:default",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        expected.sort();
         assert_eq!(
-            permissions,
-            vec!["core:default".to_owned()],
-            "capabilities/default.json's permissions changed from [\"core:default\"] to \
-             {permissions:?} — its own description says widening this is a threat-model \
-             decision; if that decision was made deliberately, update this assertion in \
-             the same commit as the reasoning"
+            permissions, expected,
+            "capabilities/default.json's permissions are {permissions:?}, expected \
+             {expected:?} (ADR-0012's five commands plus core:default) — its own \
+             description says widening this is a threat-model decision; if that \
+             decision was made deliberately, update this assertion in the same commit \
+             as the reasoning"
         );
     }
 
