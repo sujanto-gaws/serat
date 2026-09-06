@@ -1,12 +1,18 @@
 //! The opportunistic `ANALYZE`, and the one condition that switches it off.
 //!
-//! Its own binary rather than a unit test in `writer.rs`. `FAIL_NEXT_COMMIT` is a
-//! process-wide static, and the test that injects through it says in its own comment
-//! that a second test sharing the process races it — "one test's injected failure
-//! surfaces in the other". These tests commit dozens of batches, so they consumed
-//! that injection and the other test saw `Ok(())` instead of the failure it had
-//! asked for. An integration test gets its own binary, so there is no shared static
-//! to race (task #28).
+//! Its own binary rather than a unit test in `writer.rs`. The original reason was
+//! `FAIL_NEXT_COMMIT`: it was a process-wide static, the test that injected through
+//! it said in its own comment that a second test sharing the process races it, and
+//! these tests commit dozens of batches, so as a unit test they would have consumed
+//! that injection and left the other test seeing `Ok(())` instead of the failure it
+//! asked for.
+//!
+//! **That reason is gone.** Task #28 replaced the static with a per-`IndexActor`
+//! `FaultInjector`, so nothing here can reach another test's armed fault and these
+//! tests could now be unit tests without racing anything. They stay integration
+//! tests on a smaller but still real ground: they drive `IndexActor` and
+//! `schema` through the public API, which is the surface a caller actually has, and
+//! moving a passing test to chase a retired rationale is churn rather than upkeep.
 
 use std::path::Path;
 
