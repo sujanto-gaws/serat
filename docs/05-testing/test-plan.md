@@ -123,6 +123,10 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-099 | NFR-PRF-03, F-229 — a save measured on the watcher path is refused rather than silently becoming an NFR-PRF-03 number | unit | `bench/budget/src/lib.rs::a_save_measured_on_the_watcher_path_is_refused_not_silently_asserted` | pass |
 | TC-100 | NFR-PRF-03, F-267 — `SAVE_ENTRY_POINT` names the real composition (`apply(&dyn NoteSource, &dyn NoteParser, &dyn EchoGuard, &VaultPath)` then `writer().flush()`) and the `"save"` path discriminant, not the rejected `apply_and_wait` shape | unit | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
 | TC-101 | T-07, F-279 — `Vault::resolve`'s symlink guard costs measured against the real 20k vault (43,587 lstat calls, ~1.1-1.4 s, F-138's range not a point), not estimated; a sanity bound (not a budget) catches the guard becoming pathologically slow | unit | `bench/budget/src/subject.rs::measure_resolve_overhead_on_the_20k_vault` | pass |
+| TC-102 | F-303, NFR-MNT-01 — a PRD requirement table row is parsed for ID and priority, and the PRD's own traceability appendix (same row shape) is excluded by zone rather than by looking different | unit | `bench/doclint/src/prd_join.rs` | pass |
+| TC-103 | F-303 — a plain ID, an `ID · label` cell, a comma-separated list and a bolded ID inside prose are all found; a `..` range expands to every ID zero-padded; trailing non-ID text and story/assumption/ADR IDs are ignored | unit | `bench/doclint/src/prd_join.rs` | pass |
+| TC-104 | F-303, F-58, F-27, F-304 — a Must with no citation anywhere is reported; a citation naming an ID the PRD no longer declares is reported; a Must cited in any one of the five places is accounted for; the join fails on a synthetic tree with a Must deliberately removed from the table | unit | `bench/doclint/src/prd_join.rs` | pass |
+| TC-105 | F-303 — the real PRD and architecture.md join cleanly today (87 Musts, all accounted for, no stale citations); asserted as a property, not a pinned count, so it keeps meaning something as both documents evolve | unit | `bench/doclint/src/prd_join.rs::the_real_documents_join_cleanly` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a **truncated** index is detected at open and rebuilt without user action | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 | TC-060 | NFR-REL-02 — corruption the open check cannot catch routes to rebuild, not to an error dialog | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
@@ -147,7 +151,7 @@ Three workflows, because they answer different questions and fail for different 
 |---|---|---|
 | `.github/workflows/ci.yml` | The three commands CLAUDE.md's definition of done names: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | test-engineer (task B3) |
 | `.github/workflows/budgets.yml` | One asserting job per NFR-PRF budget; a breach fails the build (NFR-PRF-08) | test-engineer (task B2) |
-| `.github/workflows/design-docs.yml` | Every path a design document cites resolves or is marked `*(planned)*` (F-239) | test-engineer (task #11) |
+| `.github/workflows/design-docs.yml` | Every path a design document cites resolves or is marked `*(planned)*` (F-239, task #11); every PRD Must is accounted for in architecture.md and vice versa (F-303, task #33) | test-engineer |
 
 Four things in `ci.yml` are deliberate:
 

@@ -542,10 +542,20 @@ impl ResolveOverhead {
 ///
 /// Uses the real `Vault::walk` and `Vault::resolve` — not a synthetic loop —
 /// so the count and the timing are the same call a rebuild will make once
-/// `NoteSource::load` reaches this path (I3, task #8). `walk` already skips
-/// symlinks as it discovers them, so every entry resolves successfully; a
-/// resolve failure here means the vault changed under the walk, not that the
-/// guard fired, and is reported as an error rather than silently excluded.
+/// `NoteSource::load` reaches this path. `walk` already skips symlinks as it
+/// discovers them, so every entry resolves successfully; a resolve failure
+/// here means the vault changed under the walk, not that the guard fired,
+/// and is reported as an error rather than silently excluded.
+///
+/// **This is a floor, not an estimate of the in-situ cost (F-203).** F-203
+/// found that an isolated walk benchmark on this machine understates a
+/// rebuild's real cost by 1.7x (1.85 s isolated against 3.1 s in situ),
+/// because an isolated run has the disk and every core to itself while a
+/// rebuild's parse phase and writer thread are running alongside it. This
+/// function is the same instrument shape — nothing else is running while it
+/// times `resolve()` — so its number is a lower bound on what `resolve()`
+/// costs inside a real rebuild, not a prediction of it. `TC-020`'s
+/// `read_hash` phase is where the in-situ figure will actually appear.
 ///
 /// # Errors
 /// A walk failure, or a resolve failure on a path the walk just reported.
