@@ -184,6 +184,20 @@ jobs:
   # CLAUDE.md's definition of done names three commands. This job is the single
   # required check: it is green only when all of them are, across every matrix
   # leg, so a branch protection rule has one thing to point at.
+  #
+  # Task #55, F-354: `needs.*.result` -- GitHub Actions' object-filter syntax,
+  # documented for arrays -- is what made every run of this workflow complete
+  # in 0 seconds with 0 jobs, across its entire history, on both push and
+  # pull_request. `needs` is a map keyed by job id, not an array, so the
+  # filter is a schema violation GitHub's validator rejects at parse time,
+  # before a single job is scheduled -- invisible to `pyyaml` (which only
+  # checks YAML, not the Actions expression grammar inside `${{ }}` strings)
+  # and invisible to a human reading a workflow that "looks" like every other
+  # working use of `needs.*`. Bisected by pushing a minimal version of this
+  # file with jobs added back one at a time (this exact job was the only one
+  # that reintroduced the failure) rather than guessing from the YAML alone.
+  # Named references below, the documented and unambiguous way to read a
+  # `needs` result.
   gate:
     name: definition of done
     needs: [fmt, clippy, workspace, crate, location-independence]
@@ -194,7 +208,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          results='${{ join(needs.*.result, " ") }}'
+          fmt_result='${{ needs.fmt.result }}'
+          clippy_result='${{ needs.clippy.result }}'
+          workspace_result='${{ needs.workspace.result }}'
+          crate_result='${{ needs.crate.result }}'
+          li_result="${{ needs['location-independence'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then
