@@ -145,14 +145,11 @@ pub fn extract_accounted_ids(architecture_text: &str) -> Result<BTreeSet<String>
     Ok(out)
 }
 
-fn scan_zone(
-    text: &str,
-    start: &str,
-    end: &str,
-    out: &mut BTreeSet<String>,
-) -> Result<(), String> {
+fn scan_zone(text: &str, start: &str, end: &str, out: &mut BTreeSet<String>) -> Result<(), String> {
     let zone = slice_between(text, start, end).ok_or_else(|| {
-        format!("architecture.md is missing the {start:?} .. {end:?} span extract_accounted_ids needs")
+        format!(
+            "architecture.md is missing the {start:?} .. {end:?} span extract_accounted_ids needs"
+        )
     })?;
     for id in extract_id_tokens(zone) {
         out.insert(id);
@@ -239,7 +236,11 @@ fn expand_range(token: &str) -> Option<Vec<String>> {
     if end < start {
         return None;
     }
-    Some((start..=end).map(|n| format!("{stem}-{n:0width$}")).collect())
+    Some(
+        (start..=end)
+            .map(|n| format!("{stem}-{n:0width$}"))
+            .collect(),
+    )
 }
 
 /// Trimmed, non-empty cells of one Markdown table row, or `None` if `line` is
@@ -255,7 +256,10 @@ fn table_row_cells(line: &str) -> Option<Vec<&str>> {
         .split('|')
         .map(str::trim)
         .collect();
-    if cells.iter().all(|c| !c.is_empty() && c.bytes().all(|b| matches!(b, b'-' | b':'))) {
+    if cells
+        .iter()
+        .all(|c| !c.is_empty() && c.bytes().all(|b| matches!(b, b'-' | b':')))
+    {
         return None;
     }
     Some(cells)
@@ -473,7 +477,12 @@ not scanned
         assert_eq!(
             extract_id_tokens(text),
             vec![
-                "FR-BIN-05", "FR-BIN-06", "FR-BIN-07", "FR-BIN-08", "FR-BIN-09", "FR-BIN-10",
+                "FR-BIN-05",
+                "FR-BIN-06",
+                "FR-BIN-07",
+                "FR-BIN-08",
+                "FR-BIN-09",
+                "FR-BIN-10",
                 "FR-BIN-16",
             ]
         );
@@ -491,7 +500,10 @@ not scanned
 
     #[test]
     fn a_story_id_is_not_a_requirement_id() {
-        assert_eq!(extract_id_tokens("US-01, A-06, C-02, ADR-0002"), Vec::<String>::new());
+        assert_eq!(
+            extract_id_tokens("US-01, A-06, C-02, ADR-0002"),
+            Vec::<String>::new()
+        );
     }
 
     // -------------------------------------------------------------- judge

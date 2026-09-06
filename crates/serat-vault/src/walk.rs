@@ -282,7 +282,9 @@ mod lexical_tests {
         assert_eq!(entries.len(), 6);
 
         for entry in &entries {
-            let absolute = vault.resolve(&entry.path).expect("resolve a path the walk produced");
+            let absolute = vault
+                .resolve(&entry.path)
+                .expect("resolve a path the walk produced");
             let canonical = vault
                 .relativise(&absolute)
                 .expect("relativise a path the walk produced");
