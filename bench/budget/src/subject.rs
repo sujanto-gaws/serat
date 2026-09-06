@@ -516,23 +516,20 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// `spawn()` and handed to the app, so everything before `main` is inside the
 /// number; every trace is validated before it becomes a sample.
 ///
-/// `open_note` is a vault-relative note the shell opens. `--exit-after-ready`
-/// refuses without one, and rightly: "vault usable" over a shell that rendered
-/// nothing is not the number NFR-PRF-01 is about. It is a fixed note rather
-/// than an arbitrary one so the figure is reproducible between runs.
+/// No note is opened. Task #52 ruled that `t_usable` is §3.4's four
+/// preconditions -- index state known, file tree delivered, watcher settled,
+/// window painted -- none of which is "a note is rendered": `--open` is
+/// session restore for a user, not a readiness precondition, and stays in the
+/// CLI rather than in this harness.
 ///
 /// # Errors
 /// When the application does not exist, when a run fails or times out, or when
 /// a trace is rejected by any of the checks in [`crate::trace`].
-pub fn cold_start(
-    vault: &Path,
-    open_note: &str,
-    iterations: usize,
-) -> Result<(Samples, Samples), String> {
+pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
     let mut visible = Samples::new();
     let mut usable = Samples::new();
     for run in 0..iterations {
-        let trace = cold_start_once(vault, open_note, run)?;
+        let trace = cold_start_once(vault, run)?;
         visible.push(trace.window_visible());
         usable.push(trace.vault_usable());
     }
@@ -551,7 +548,7 @@ pub fn cold_start(
 ///
 /// # Errors
 /// As [`cold_start`].
-pub fn cold_start_once(vault: &Path, open_note: &str, run: usize) -> Result<StartupTrace, String> {
+pub fn cold_start_once(vault: &Path, run: usize) -> Result<StartupTrace, String> {
     let binary = app_binary()?;
     {
         let trace_path =
@@ -570,12 +567,6 @@ pub fn cold_start_once(vault: &Path, open_note: &str, run: usize) -> Result<Star
         let status = Command::new(&binary)
             .arg("--vault")
             .arg(vault)
-            // --exit-after-ready refuses without a note to open, and rightly:
-            // "vault usable" over a shell that rendered nothing is not the
-            // number NFR-PRF-01 is about. A fixed note rather than an arbitrary
-            // one, so the figure is reproducible across runs.
-            .arg("--open")
-            .arg(open_note)
             .arg("--exit-after-ready")
             .env("SERAT_STARTUP_TRACE", &trace_path)
             .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string())
@@ -733,7 +724,7 @@ mod tests {
         // the binary refuses -- `--vault nowhere` cannot be opened -- and the
         // message is the app's rather than the seam's. Asserting only the first
         // would turn tauri-app-dev landing S1 into a red test in my crate.
-        let e = cold_start(vault, "_types/Project.md", 20).expect_err("must not silently pass");
+        let e = cold_start(vault, 20).expect_err("must not silently pass");
         if app_binary().is_err() {
             assert!(e.contains("S1"), "{e}");
             assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");

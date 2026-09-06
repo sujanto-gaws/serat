@@ -996,7 +996,6 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         .ok_or_else(|| format!("{} has no tree digest", manifest_path.display()))?;
     let format_version = json_number(&manifest, "format_version").unwrap_or(0.0) as u32;
     let notes_in_manifest = json_number(&manifest, "notes").unwrap_or(0.0) as usize;
-    let assets_in_manifest = json_number(&manifest, "assets").unwrap_or(0.0) as usize;
     let note_links = json_number(&manifest, "edges").unwrap_or(0.0) as usize;
     // Default 0 rather than failing, so a manifest generated before these
     // counts existed still runs -- and then under-reports the oracle, which
@@ -1020,7 +1019,6 @@ pub fn verify_vault_at(preset: &Preset, path: &Path) -> Result<VaultUnderTest, S
         digest: actual,
         format_version,
         notes: notes_in_manifest,
-        assets: assets_in_manifest,
         note_links,
         assets: preset.assets,
         asset_embeds,
@@ -1839,8 +1837,7 @@ pub fn run_scale_check(iterations: usize) -> bool {
         iterations,
         || Ok((ensure_vault("20k")?, ensure_vault("50k")?)),
         |vault, run| {
-            subject::cold_start_once(&vault.path, &vault.open_note, run)
-                .map(|trace| trace.window_visible_ms)
+            subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
         },
     );
     match verdict {
@@ -1863,7 +1860,7 @@ pub fn measure_cold_start(
     vault: &VaultUnderTest,
     iterations: usize,
 ) -> Result<(Measurement, Measurement), String> {
-    let (visible, usable) = subject::cold_start(&vault.path, &vault.open_note, iterations)?;
+    let (visible, usable) = subject::cold_start(&vault.path, iterations)?;
     Ok((Measurement::new(visible), Measurement::new(usable)))
 }
 
@@ -1922,7 +1919,6 @@ mod tests {
             digest: "d".into(),
             format_version: 1,
             notes: 20_000,
-            assets: 200,
             note_links: 216_971,
             assets: 200,
             asset_embeds: 2_004,
@@ -2003,7 +1999,6 @@ mod tests {
             digest: "d".into(),
             format_version: vaultgen::VAULT_FORMAT_VERSION,
             notes: 20_000,
-            assets: 200,
             note_links: 216_971,
             assets: 200,
             asset_embeds: 2_004,
