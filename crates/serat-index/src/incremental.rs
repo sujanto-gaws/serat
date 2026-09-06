@@ -102,6 +102,40 @@ impl IndexHandle {
         &self.index_dir
     }
 
+    /// How many rows `notes` holds — the count `IndexState::Ready`'s own invariant
+    /// already trusts, not one recomputed here.
+    ///
+    /// Reads `index_meta.note_count` directly rather than `count(*) FROM notes`: the
+    /// two are already asserted equal on every open by `schema::inspect`'s
+    /// `CountMismatch` check (a disagreement between them means a torn transaction,
+    /// not a live vault), so recomputing would spend a table scan re-deriving a number
+    /// the open check already stands behind. `count(*)` includes assets as well as
+    /// notes (`apply::sync_note_count`'s query has no `kind` filter), which is what
+    /// `contracts/ipc.rs`'s `IndexState::Ready.note_count` documents itself as.
+    ///
+    /// A short-lived read connection rather than the writer (ADR-0001): a plain
+    /// `SELECT` needs none of the single-writer's ordering guarantees, and routing it
+    /// through the writer's channel would be a round trip to answer a question the
+    /// writer has no better view of than any other connection does.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if the database cannot be opened or the row is missing —
+    /// the latter should not happen against an index `schema::inspect` reported
+    /// `Ready`, since `index_meta` always has exactly one row (`schema/001_init.sql`).
+    pub fn note_count(&self) -> Result<u32, IndexError> {
+        let path = crate::index_path(&self.index_dir);
+        let conn = schema::open(&path)?;
+        let count: i64 = conn
+            .query_row("SELECT note_count FROM index_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .map_err(schema::sqlite)?;
+        // Saturating rather than erroring: a vault holding more than u32::MAX notes
+        // is not a case this contract needs to represent faithfully, only harmlessly.
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Index one note. Submits and returns; it does **not** wait.
     ///
     /// This is the save path of architecture §3.1.1, and not waiting is the whole of

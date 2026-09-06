@@ -44,6 +44,35 @@ fn a_save_is_visible_to_a_reader_once_the_writer_has_been_flushed() {
 }
 
 #[test]
+fn note_count_reads_the_invariant_the_open_check_already_trusts() {
+    // contracts/ipc.rs's IndexState::Ready.note_count, and #65's blocker: nothing on
+    // IndexHandle answered this without a caller re-deriving it and risking drift from
+    // the count schema::inspect's CountMismatch check already stands behind.
+    let dir = tempfile::tempdir().expect("temp");
+    let vault = vault_fixture();
+    let parser = LineParser::default();
+    let echo = support::SpyEcho::default();
+    let handle = IndexHandle::open(dir.path()).expect("open");
+
+    handle
+        .apply(&vault, &parser, &echo, &path("10-projects/serat.md"))
+        .expect("save");
+    handle.writer().flush().expect("flush");
+
+    assert_eq!(
+        handle.note_count().expect("note_count"),
+        1,
+        "note_count did not see the flushed save"
+    );
+    assert_eq!(
+        handle.note_count().expect("note_count") as i64,
+        note_count(dir.path()),
+        "note_count disagreed with a plain count(*) over notes"
+    );
+    handle.close().expect("close");
+}
+
+#[test]
 fn a_save_does_not_wait_for_the_writer() {
     // Design goal 2, and the reason apply_and_wait does not exist. A save that blocked
     // on the writer would put the index back on the keystroke path. The queue is one
