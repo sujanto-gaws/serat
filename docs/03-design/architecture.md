@@ -252,7 +252,7 @@ Two consequences, stated because each looks like a bug otherwise. If another pro
 
 One rule with two enforcement points, written here rather than inside either of them, because **each is a reason the other exists and neither implementation says so.**
 
-- **The walk never sees one.** It `lstat`s every entry and skips any symlink, so a linked file is never enumerated and never indexed.
+- **The walk never sees one.** It `lstat`s every entry and skips any symlink, so a linked file is never enumerated and never indexed. **Nothing asserts this.** Deleting the skip leaves `cargo test -p serat-vault` fully green — 64 passed, `walk_cost` included — so the rule below about who will be looking at what is a warning with no test behind it. Task #62 adds one, on every platform rather than `#[cfg(unix)]`; threat-model.md's T-07 carries the accounting.
 - **The read path must refuse one for the same reason**, and it enforces the rule at `Vault::resolve` rather than at each caller — the narrowest point every filesystem access in serat-vault passes through, so `read` and `write_atomic` inherit it and a future caller cannot forget it. Components are checked from the root down with `symlink_metadata`, never `metadata`, which would follow the very thing being checked for. **Deliberately not a `canonicalize`:** that does more syscalls and returns a path which then has to be compared back against the root, which is a second mechanism for the same question.
 
   Both halves are now enforced; the read half arrived second, and T-07 in the threat model carries the history of the gap between them. A security document should carry the gap, a design document should carry the rule.
