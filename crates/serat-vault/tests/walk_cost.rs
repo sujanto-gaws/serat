@@ -55,8 +55,9 @@ fn the_walk_does_not_canonicalise_every_entry() {
         let started = Instant::now();
         let mut count = 0usize;
         for entry in &entries {
-            let absolute = vault.resolve(&entry.path);
-            if vault.relativise(&absolute).is_ok() {
+            if let Ok(absolute) = vault.resolve(&entry.path)
+                && vault.relativise(&absolute).is_ok()
+            {
                 count += 1;
             }
         }

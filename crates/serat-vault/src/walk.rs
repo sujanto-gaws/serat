@@ -15,8 +15,8 @@ use crate::{Vault, ignore::is_note_file};
 /// (FR-VLT-02, and the T1 rebuild-equivalence test) is easier to assert when the only
 /// thing that varies is the content.
 ///
-/// No symlink is followed, directory or file (`link_stat.is_symlink()` below skips
-/// both, not only directories as an earlier version of this comment claimed). A vault
+/// No symlink is followed, directory or file (`stat.is_symlink()` below skips both,
+/// not only directories as an earlier version of this comment claimed). A vault
 /// containing a link to its own parent would otherwise walk forever, and Serat indexes
 /// the folder the user pointed it at rather than everything reachable from it — the
 /// same rule [`Vault::resolve`] enforces for a path that arrives without going through
@@ -282,7 +282,7 @@ mod lexical_tests {
         assert_eq!(entries.len(), 6);
 
         for entry in &entries {
-            let absolute = vault.resolve(&entry.path);
+            let absolute = vault.resolve(&entry.path).expect("resolve a path the walk produced");
             let canonical = vault
                 .relativise(&absolute)
                 .expect("relativise a path the walk produced");
