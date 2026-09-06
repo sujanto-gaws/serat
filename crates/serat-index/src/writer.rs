@@ -618,7 +618,7 @@ fn commit(
     let tx = conn.unchecked_transaction().map_err(sqlite)?;
     let mut touched = 0usize;
     for op in pending.iter() {
-        let applied = apply::apply(&tx, op)?;
+        let applied = apply::apply(&tx, op, bulk_load)?;
         touched += applied.notes + applied.removed;
     }
     apply::sync_note_count(&tx)?;

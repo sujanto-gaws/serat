@@ -36,17 +36,26 @@ pub struct Applied {
 }
 
 /// Apply one operation.
-pub(crate) fn apply(tx: &Transaction<'_>, op: &IndexOp) -> Result<Applied, IndexError> {
+///
+/// `bulk_load` is `true` only while a rebuild is loading (writer.rs's `commit`, driven
+/// by `begin_bulk_load`/`end_bulk_load`). It exists solely to gate the per-row link
+/// resolve in `upsert_note`/`upsert_asset` — see F-371 on `upsert_note` for why a
+/// rebuild must not pay that cost per row.
+pub(crate) fn apply(
+    tx: &Transaction<'_>,
+    op: &IndexOp,
+    bulk_load: bool,
+) -> Result<Applied, IndexError> {
     match op {
         IndexOp::UpsertNote { meta, parsed } => {
-            upsert_note(tx, meta, parsed)?;
+            upsert_note(tx, meta, parsed, bulk_load)?;
             Ok(Applied {
                 notes: 1,
                 removed: 0,
             })
         }
         IndexOp::UpsertAsset { meta } => {
-            upsert_asset(tx, meta)?;
+            upsert_asset(tx, meta, bulk_load)?;
             Ok(Applied {
                 notes: 1,
                 removed: 0,
@@ -73,10 +82,28 @@ pub(crate) fn apply(tx: &Transaction<'_>, op: &IndexOp) -> Result<Applied, Index
 /// note's rows inside a transaction that is open anyway is cheaper than being clever.
 /// `ON DELETE CASCADE` takes the blocks, fields, links and tasks with the note row,
 /// and the FTS triggers follow the blocks.
+///
+/// # F-371: `bulk_load` gates the per-row resolve below
+///
+/// Task #13's `resolve_inbound`/`resolve_outbound` calls are correct and necessary for
+/// the path they were written for — one save, one note, an `IN (...)` lookup served by
+/// `ix_links_unresolved`. They are also shared code (this function is the rebuild's
+/// only way to write a note too — architecture.md §3.1's "two paths", corrected by
+/// F-371 to name the third), so a cost added here is paid once by a save and roughly
+/// forty thousand times by a rebuild over the 20k vault. Measured: `prf04-full-rebuild`
+/// burned over 1,269 CPU-seconds without finishing, against a 30 s budget and the
+/// ~21–27 s the same job took before this call existed (F-324's baseline).
+///
+/// The rebuild already runs one full `resolve_links` pass over the whole table after
+/// every note is loaded (`rebuild.rs`, after `end_bulk_load`), so the per-row work is
+/// not merely expensive there — it is redundant. `bulk_load` skips it for exactly that
+/// caller; the save and watcher paths (`bulk_load == false`) are unaffected and still
+/// resolve as task #13 intended.
 fn upsert_note(
     tx: &Transaction<'_>,
     meta: &NoteMeta,
     parsed: &ParsedNote,
+    bulk_load: bool,
 ) -> Result<(), IndexError> {
     remove(tx, &meta.path)?;
 
@@ -133,13 +160,19 @@ fn upsert_note(
     // cascade could see -- including links this very save is about to restore, since
     // the note comes back under a new rowid. Without this, only a full rebuild ever
     // repairs a backlink to a note that was saved incrementally even once.
-    resolve_inbound(tx, &meta.path)?;
-    // The note's own outbound links, inserted unresolved just above: point them at
-    // whatever they name that already exists. Symmetric with resolve_inbound, and
-    // both are needed -- one fixes what this save broke, the other finishes what it
-    // could not have done at insert time (a link's own rows do not yet have a
-    // dst_note to compare against until they are in the table).
-    resolve_outbound(tx, note_id)?;
+    //
+    // Skipped during a bulk load (F-371): see this function's doc comment. The
+    // rebuild's own full resolve_links pass at the end covers what this would have
+    // done, at a fraction of the cost.
+    if !bulk_load {
+        resolve_inbound(tx, &meta.path)?;
+        // The note's own outbound links, inserted unresolved just above: point them at
+        // whatever they name that already exists. Symmetric with resolve_inbound, and
+        // both are needed -- one fixes what this save broke, the other finishes what it
+        // could not have done at insert time (a link's own rows do not yet have a
+        // dst_note to compare against until they are in the table).
+        resolve_outbound(tx, note_id)?;
+    }
 
     Ok(())
 }
@@ -253,7 +286,7 @@ fn resolve_outbound(tx: &Transaction<'_>, note_id: i64) -> Result<(), IndexError
 /// Design goal 5. Until an extractor claims it (P2, architecture §7) it has a row, a
 /// path and a hash, so it is linkable and queryable even though nothing can search
 /// inside it.
-fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError> {
+fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Result<(), IndexError> {
     remove(tx, &meta.path)?;
     // Assets carry a file_name too: `![[report.pdf]]` names one, and §7.3
     // says an asset stays typed, linkable and queryable. Omitting it here
@@ -276,7 +309,11 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError>
     // an embed can name an asset, so an asset's own inbound backlinks are as real a
     // gap as a note's. Assets have no outbound links, so there is no
     // resolve_outbound counterpart here.
-    resolve_inbound(tx, &meta.path)?;
+    //
+    // Skipped during a bulk load (F-371) -- see upsert_note's doc comment.
+    if !bulk_load {
+        resolve_inbound(tx, &meta.path)?;
+    }
 
     Ok(())
 }
@@ -653,6 +690,83 @@ mod tests {
         }
     }
 
+    fn note_named(path: &str, links: Vec<Link>) -> (NoteMeta, ParsedNote) {
+        let meta = NoteMeta {
+            path: VaultPath::new(path).expect("path"),
+            hash: ContentHash::from_bytes([1u8; 32]),
+            kind: NoteKind::Note,
+            size: 0,
+            mtime_ms: 0,
+        };
+        let parsed = ParsedNote {
+            links,
+            ..ParsedNote::default()
+        };
+        (meta, parsed)
+    }
+
+    fn link_to(target: &str) -> Link {
+        Link {
+            kind: LinkKind::Wikilink,
+            target: serat_core::LinkTarget {
+                note: target.to_owned(),
+                heading: None,
+                block_ref: None,
+                alias: None,
+            },
+            range: ByteRange::new(0, 1),
+            block_ord: None,
+        }
+    }
+
+    fn unresolved_link_count(tx: &Transaction<'_>) -> i64 {
+        tx.query_row(
+            "SELECT count(*) FROM links WHERE dst_note IS NULL AND kind <> 'tag'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count")
+    }
+
+    #[test]
+    fn a_bulk_load_leaves_the_per_row_resolve_to_the_rebuilds_final_pass() {
+        // F-371 / task #77. upsert_note's resolve_inbound/resolve_outbound calls are a
+        // per-row cost, and this crate has exactly one caller for whom "per row" means
+        // "roughly forty thousand times" (a full rebuild). During a bulk load
+        // (bulk_load == true) they must not run at all -- correctness there is the
+        // rebuild's own full resolve_links pass at the end, not this function. This
+        // test is the guard against silently dropping the `if !bulk_load` gate: with
+        // it removed, both links below would resolve immediately and the two
+        // assertions after the bulk-load inserts would fail.
+        let conn = open_in_memory().expect("open");
+        bootstrap(&conn).expect("bootstrap");
+        let tx = conn.unchecked_transaction().expect("tx");
+
+        let (meta_a, parsed_a) = note_named("a.md", vec![link_to("b")]);
+        let (meta_b, parsed_b) = note_named("b.md", vec![link_to("a")]);
+
+        upsert_note(&tx, &meta_a, &parsed_a, true).expect("upsert a (bulk)");
+        upsert_note(&tx, &meta_b, &parsed_b, true).expect("upsert b (bulk)");
+        assert_eq!(
+            unresolved_link_count(&tx),
+            2,
+            "a bulk load resolved links per row instead of leaving that to the \
+             rebuild's own full pass"
+        );
+
+        // Off bulk load, the same shape resolves immediately, as task #13 intended.
+        let (meta_c, parsed_c) = note_named("c.md", vec![link_to("d")]);
+        let (meta_d, parsed_d) = note_named("d.md", vec![link_to("c")]);
+        upsert_note(&tx, &meta_c, &parsed_c, false).expect("upsert c (incremental)");
+        upsert_note(&tx, &meta_d, &parsed_d, false).expect("upsert d (incremental)");
+        assert_eq!(
+            unresolved_link_count(&tx),
+            2,
+            "expected exactly the two bulk-load links still unresolved; the \
+             incremental pair above should have resolved each other"
+        );
+    }
+
     #[test]
     fn a_task_records_its_marker_range() {
         // F-237. Task::marker_range exists and is written by nobody until this;
@@ -662,7 +776,7 @@ mod tests {
         let tx = conn.unchecked_transaction().expect("tx");
 
         let (meta, parsed) = note(Vec::new(), vec![task(0, ByteRange::new(6, 7))]);
-        upsert_note(&tx, &meta, &parsed).expect("upsert");
+        upsert_note(&tx, &meta, &parsed, false).expect("upsert");
 
         let (start, end): (i64, i64) = tx
             .query_row(
@@ -689,7 +803,7 @@ mod tests {
             field("est", FieldValue::Num(2.5), 0),
         ];
         let (meta, parsed) = note(fields, vec![task(0, ByteRange::new(6, 7))]);
-        upsert_note(&tx, &meta, &parsed).expect("upsert");
+        upsert_note(&tx, &meta, &parsed, false).expect("upsert");
 
         let (due, owner, est): (String, String, f64) = tx
             .query_row(
@@ -713,7 +827,7 @@ mod tests {
 
         let fields = vec![field("due", FieldValue::Date("2024-01-01".to_owned()), 1)];
         let (meta, parsed) = note_with_blocks(2, fields, vec![task(0, ByteRange::new(6, 7))]);
-        upsert_note(&tx, &meta, &parsed).expect("upsert");
+        upsert_note(&tx, &meta, &parsed, false).expect("upsert");
 
         let due: Option<String> = tx
             .query_row(
@@ -732,7 +846,7 @@ mod tests {
         let tx = conn.unchecked_transaction().expect("tx");
 
         let (meta, parsed) = note(Vec::new(), vec![task(0, ByteRange::new(6, 7))]);
-        upsert_note(&tx, &meta, &parsed).expect("upsert");
+        upsert_note(&tx, &meta, &parsed, false).expect("upsert");
 
         let (due, owner, est): (Option<String>, Option<String>, Option<f64>) = tx
             .query_row(
