@@ -127,9 +127,11 @@ impl IndexHandle {
         let path = crate::index_path(&self.index_dir);
         let conn = schema::open(&path)?;
         let count: i64 = conn
-            .query_row("SELECT note_count FROM index_meta WHERE id = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT note_count FROM index_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
             .map_err(schema::sqlite)?;
         // Saturating rather than erroring: a vault holding more than u32::MAX notes
         // is not a case this contract needs to represent faithfully, only harmlessly.
