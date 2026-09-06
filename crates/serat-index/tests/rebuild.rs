@@ -20,7 +20,13 @@ use support::{FakeVault, LineParser, meta, vault_fixture};
 #[test]
 fn a_rebuild_indexes_every_file_and_counts_what_landed() {
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     // Three files: two notes and one asset. The asset is a row without blocks.
     assert_eq!(report.notes, 3);
@@ -36,7 +42,13 @@ fn the_report_counts_rows_that_exist_rather_than_operations_sent() {
     // The failure this guards: a rebuild that submits 20,000 notes, loses some, and
     // still reports 20,000 would post a fast benchmark number for half a vault.
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     let conn = schema::open(&rebuild_path(dir.path())).expect("open");
     let actual: i64 = conn
@@ -50,7 +62,13 @@ fn an_unreadable_file_is_skipped_rather_than_fatal() {
     // Design goal 5. One bad file must not stop a vault indexing.
     let dir = tempfile::tempdir().expect("temp");
     let vault = vault_fixture().unreadable("20-systems/indexing.md");
-    let report = rebuild(&vault, &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault,
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     assert_eq!(report.skipped, 1);
     assert_eq!(report.notes, 2, "the other two files still indexed");
@@ -66,7 +84,13 @@ fn a_file_the_parser_refuses_is_skipped_rather_than_fatal() {
         .expect("lock")
         .push("10-projects/serat.md".to_owned());
 
-    let report = rebuild(&vault_fixture(), &parser, dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &parser,
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
     assert_eq!(report.skipped, 1);
     assert_eq!(report.notes, 2);
 }
@@ -76,8 +100,20 @@ fn a_rebuild_over_an_existing_index_replaces_it_rather_than_merging() {
     // ADR-0002: there is no repair. A second rebuild must produce the same index, not
     // a doubled one.
     let dir = tempfile::tempdir().expect("temp");
-    let first = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("first");
-    let second = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("second");
+    let first = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("first");
+    let second = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("second");
 
     // Counts only. The phase durations differ run to run by construction, so comparing
     // whole reports would be asserting that a clock is deterministic.
@@ -105,7 +141,13 @@ fn a_rebuild_over_an_existing_index_replaces_it_rather_than_merging() {
 #[test]
 fn a_rebuild_leaves_the_index_ready_and_the_note_count_true() {
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     // The cold-start check treats a note_count that disagrees with count(*) as
     // corruption, so a rebuild that left them out of step would make every subsequent
@@ -175,6 +217,7 @@ type:: project
     let report = serat_index::rebuild_with_queue_depth(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
         8,
     )
@@ -206,7 +249,13 @@ type:: project
 #[test]
 fn the_full_text_index_is_searchable_after_a_rebuild() {
     let dir = tempfile::tempdir().expect("temp");
-    rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     let conn = schema::open(&rebuild_path(dir.path())).expect("open");
     let hits: i64 = conn
@@ -223,7 +272,13 @@ fn the_full_text_index_is_searchable_after_a_rebuild() {
 fn an_asset_indexes_without_being_parsed() {
     let dir = tempfile::tempdir().expect("temp");
     let parser = LineParser::default();
-    rebuild(&vault_fixture(), &parser, dir.path()).expect("rebuild");
+    rebuild(
+        &vault_fixture(),
+        &parser,
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     assert_eq!(
         parser.calls.load(Ordering::Relaxed),
@@ -271,6 +326,7 @@ fn a_rebuild_of_a_thousand_notes_indexes_all_of_them() {
     let report = rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("rebuild");
@@ -430,7 +486,13 @@ fn submitting_to_a_stopped_writer_is_an_error_rather_than_a_panic() {
 #[test]
 fn a_rename_keeps_inbound_links_that_a_delete_would_have_severed() {
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
     assert_eq!(report.links, 2);
 
     let path = rebuild_path(dir.path());
@@ -560,6 +622,7 @@ fn a_rebuild_loses_nothing_when_it_outruns_the_writer() {
     let report = serat_index::rebuild_with_queue_depth(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
         4,
     )
@@ -583,7 +646,13 @@ fn the_rebuild_leaves_the_fts_triggers_in_place() {
     // every later save would be silently absent from search — so the check that
     // matters is that an insert made *after* the rebuild is findable.
     let dir = tempfile::tempdir().expect("temp");
-    rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     let path = rebuild_path(dir.path());
     let conn = schema::open(&path).expect("open");
@@ -629,7 +698,13 @@ fn links_are_resolved_once_every_note_exists() {
     // The second pass the foreign key forces. A link can name a note that has not been
     // inserted yet, so dst_note starts NULL and is filled at the end.
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault_fixture(), &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault_fixture(),
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     assert_eq!(report.links, 2);
     assert_eq!(
@@ -658,7 +733,13 @@ fn a_link_to_a_note_that_does_not_exist_stays_unresolved_rather_than_wrong() {
         "# Serat\n[[20-systems/does-not-exist]]\n",
     )]);
     let dir = tempfile::tempdir().expect("temp");
-    let report = rebuild(&vault, &LineParser::default(), dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault,
+        &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
 
     assert_eq!(report.links, 1);
     assert_eq!(
@@ -696,6 +777,7 @@ fn the_report_breaks_the_rebuild_into_phases() {
     let report = rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("rebuild");
@@ -746,6 +828,7 @@ fn write_fts_times_the_trigger_rebuild_and_analyze_rather_than_nothing() {
     let report = rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("rebuild");

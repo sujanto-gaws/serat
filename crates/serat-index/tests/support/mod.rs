@@ -21,6 +21,11 @@ pub struct FakeVault {
     pub files: Vec<(VaultPath, Vec<u8>)>,
     /// Paths whose read fails, to exercise the skip path.
     unreadable: Vec<String>,
+    /// Refuse `entries()` outright, which is the one failure a rebuild cannot skip.
+    refuse_entries: bool,
+    /// How many times `entries()` has been called, so a test can tell whether any
+    /// rebuild work has started yet.
+    entries_calls: AtomicUsize,
 }
 
 impl FakeVault {
@@ -36,7 +41,21 @@ impl FakeVault {
                 })
                 .collect(),
             unreadable: Vec::new(),
+            refuse_entries: false,
+            entries_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Refuse to enumerate, so a rebuild cannot run at all.
+    #[must_use]
+    pub fn refusing_to_enumerate(mut self) -> Self {
+        self.refuse_entries = true;
+        self
+    }
+
+    /// How many times the source has been asked to enumerate.
+    pub fn entries_called(&self) -> usize {
+        self.entries_calls.load(Ordering::Relaxed)
     }
 
     pub fn unreadable(mut self, path: &str) -> Self {
@@ -47,6 +66,13 @@ impl FakeVault {
 
 impl NoteSource for FakeVault {
     fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
+        self.entries_calls.fetch_add(1, Ordering::Relaxed);
+        if self.refuse_entries {
+            return Err(VaultError::Io {
+                path: "<vault root>".to_owned(),
+                message: "permission denied".to_owned(),
+            });
+        }
         Ok(self
             .files
             .iter()

@@ -61,6 +61,11 @@ pub enum UnusableReason {
     Corrupt,
     /// `state` is still 'building': a rebuild was interrupted.
     RebuildInterrupted,
+    /// The index was built from a different vault.
+    ///
+    /// §3.4 step 5. Not corruption — the database is perfectly sound — but every path
+    /// in it describes files that are not there, so it is as useless as if it were.
+    VaultMoved,
     /// `note_count` disagrees with `count(*)` on notes.
     ///
     /// The DDL makes this an invariant maintained inside each transaction, so a
@@ -160,6 +165,18 @@ pub fn bootstrap_if_empty(conn: &Connection) -> Result<(), IndexError> {
 /// Never returns an error for a bad database; a database it cannot make sense of is
 /// [`IndexState::Unusable`], which is a value and not a failure.
 pub fn inspect(path: &Path) -> Result<IndexState, IndexError> {
+    inspect_for(path, None)
+}
+
+/// As [`inspect`], and also check the index was built from `vault_root`.
+///
+/// §3.4 step 5. Passing `None` skips that step, which is what a caller with no vault in
+/// hand — a test, or a tool inspecting a database — actually wants.
+///
+/// # Errors
+///
+/// As [`inspect`].
+pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, IndexError> {
     if !path.exists() {
         return Ok(IndexState::Absent);
     }
@@ -191,6 +208,21 @@ pub fn inspect(path: &Path) -> Result<IndexState, IndexError> {
         Ok("ready") => {}
         Ok(_) => return unusable(UnusableReason::RebuildInterrupted),
         Err(_) => return unusable(UnusableReason::Corrupt),
+    }
+
+    // §3.4 step 5, before the count check because it is cheaper and more likely: an
+    // index built from another vault is sound and entirely wrong.
+    if let Some(expected) = vault_root {
+        let recorded: Result<Option<String>, _> = conn.query_row(
+            "SELECT vault_root FROM index_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        );
+        match recorded {
+            Ok(Some(found)) if found == expected => {}
+            Ok(_) => return unusable(UnusableReason::VaultMoved),
+            Err(_) => return unusable(UnusableReason::Corrupt),
+        }
     }
 
     // The invariant the DDL asks serat-index to maintain: note_count is updated in

@@ -146,7 +146,13 @@ fn a_save_after_a_rebuild_updates_the_note_rather_than_adding_one() {
     let parser = LineParser::default();
     let echo = support::SpyEcho::default();
 
-    let report = rebuild(&vault, &parser, dir.path()).expect("rebuild");
+    let report = rebuild(
+        &vault,
+        &parser,
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
     assert_eq!(report.notes, 3);
 
     let handle = IndexHandle::open(dir.path()).expect("open");
@@ -248,6 +254,7 @@ fn two_rebuilds_of_the_same_notes_produce_the_same_index() {
     let first = rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("first");
@@ -255,6 +262,7 @@ fn two_rebuilds_of_the_same_notes_produce_the_same_index() {
     let second = rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("second");
@@ -296,6 +304,7 @@ fn the_rebuild_preserves_the_order_the_walk_produced() {
     rebuild(
         &FakeVault::with(&borrowed),
         &LineParser::default(),
+        std::path::Path::new("C:/vaults/serat"),
         dir.path(),
     )
     .expect("rebuild");

@@ -98,9 +98,10 @@ pub struct RebuildReport {
 pub fn rebuild(
     source: &dyn NoteSource,
     parser: &dyn NoteParser,
+    vault_root: &Path,
     index_dir: &Path,
 ) -> Result<RebuildReport, IndexError> {
-    rebuild_with_queue_depth(source, parser, index_dir, DEFAULT_QUEUE_DEPTH)
+    rebuild_with_queue_depth(source, parser, vault_root, index_dir, DEFAULT_QUEUE_DEPTH)
 }
 
 /// A rebuild whose writer queue holds at most `queue_depth` operations.
@@ -118,6 +119,7 @@ pub fn rebuild(
 pub fn rebuild_with_queue_depth(
     source: &dyn NoteSource,
     parser: &dyn NoteParser,
+    vault_root: &Path,
     index_dir: &Path,
     queue_depth: usize,
 ) -> Result<RebuildReport, IndexError> {
@@ -200,7 +202,7 @@ pub fn rebuild_with_queue_depth(
     writer.analyze()?;
     let write_fts = end_bulk_load + analyze_started.elapsed();
 
-    writer.mark_ready(&index_dir.to_string_lossy())?;
+    writer.mark_ready(&vault_root.to_string_lossy())?;
     actor.shutdown()?;
 
     let mut report = count(&path, skipped)?;

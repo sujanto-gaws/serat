@@ -429,7 +429,7 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, Str
     // `total` brackets `rebuild()` alone. Opening the vault is setup and
     // generating the vault is not timed at all -- NFR-PRF-04 is judged on this.
     let started = Instant::now();
-    let report = serat_index::rebuild(&source, &parser, index_dir)
+    let report = serat_index::rebuild(&source, &parser, vault, index_dir)
         .map_err(|err| format!("rebuild failed: {err}"))?;
     let total = started.elapsed();
 
