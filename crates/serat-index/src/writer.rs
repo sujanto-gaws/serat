@@ -38,8 +38,13 @@ pub const DEFAULT_QUEUE_DEPTH: usize = 4_096;
 ///
 /// A transaction per note would fsync per note; one transaction for everything would
 /// hold a write lock for the length of a rebuild and lose all of it on a crash.
-/// Batching is the whole of the tuning, and it is the number open design question 1
-/// will move if the writer turns out to dominate rebuild time.
+///
+/// Batching is one of the tunables, and the obvious one. It was **not** what made the
+/// writer dominate at P0 — that was SQL text being re-prepared inside per-row loops
+/// (F-324), which no batch size would have reached. If the writer dominates again,
+/// probe inside `commit()` before reaching for this number: *which phase* and *which
+/// line* are different questions. (Open design question 1 is answered, not open; see
+/// architecture §2.2.)
 pub const BATCH_SIZE: usize = 512;
 
 /// Rerun `ANALYZE` when a batch touched more than this share of the notes table.
@@ -201,6 +206,14 @@ impl WriterHandle {
 pub struct IndexActor {
     handle: WriterHandle,
     join: Option<JoinHandle<()>>,
+    // Read back only by tests, through `fault_injector()`. Kept as a real field
+    // rather than a `#[cfg(test)]` one: it is the same `FaultInjector` `commit`
+    // consults on every run in every build, not a test-only shim, so a production
+    // build genuinely never reads it back -- only ever hands a clone to the writer
+    // thread at construction. The allow is for that write-only shape, not for
+    // sloppiness.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fault: FaultInjector,
 }
 
 impl IndexActor {
@@ -239,15 +252,41 @@ impl IndexActor {
             "a writer queue with no capacity accepts nothing"
         );
         let (tx, rx) = sync_channel(capacity);
+        let fault = FaultInjector::default();
+        let actor_fault = fault.clone();
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
-            .spawn(move || run(conn, &rx))
+            .spawn(move || run(conn, &rx, &actor_fault))
             .expect("spawn the index writer");
 
         Self {
             handle: WriterHandle { tx },
             join: Some(join),
+            fault,
         }
+    }
+
+    /// A handle to make this actor's *next* commit fail once, for tests.
+    ///
+    /// Scoped to this one actor (task #28). The seam used to be a single
+    /// process-wide static, which raced every other test in the same binary that
+    /// also drove a commit: cargo runs a crate's unit tests concurrently by
+    /// default, so a test elsewhere with its own `IndexActor` could reach
+    /// `commit` first and consume the flag this test had just set, before this
+    /// actor's own writer thread ever saw it. Reproduced once in some runs and
+    /// not others, which is exactly the shape a shared global produces and a
+    /// per-instance one cannot. Owned by the actor instead, so setting it can
+    /// only ever race *this* actor's own writer thread — the ordering the test
+    /// is actually trying to prove.
+    ///
+    /// Not itself `#[cfg(test)]`: `pub(crate)` already keeps it out of every
+    /// other crate, and [`FaultInjector::fail_next_commit`] — the only method
+    /// that can make it do anything — is the part gated to tests. A production
+    /// build has no caller for this one, which is the same write-only shape as
+    /// the field it reads; see the `allow` there.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn fault_injector(&self) -> FaultInjector {
+        self.fault.clone()
     }
 
     /// A handle to send work on.
@@ -290,7 +329,7 @@ impl Drop for IndexActor {
 /// answers any barrier that arrives. A batch ends when the queue is empty, the batch
 /// is full, or a command needs an answer — so a quiet vault commits immediately and a
 /// rebuild commits in batches.
-fn run(conn: Connection, rx: &Receiver<Command>) {
+fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
     let mut pending: Vec<IndexOp> = Vec::with_capacity(BATCH_SIZE);
     let mut since_analyze = 0usize;
     // Whether the blocks_fts triggers are currently off, which is the writer's only
@@ -312,7 +351,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
+                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
                     return;
                 }
             },
@@ -353,9 +392,9 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             // false on exactly that route and panicked the writer in every debug build,
             // at the moment the index was already in trouble. An assertion is a claim
             // about all paths; a test claims less and is therefore safe to get partly
-            // wrong. FAIL_NEXT_COMMIT is the seam that makes the real route testable.
+            // wrong. FaultInjector is the seam that makes the real route testable.
             Command::BeginBulkLoad(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
                     .and_then(|()| begin_bulk_load(&conn));
                 // Only once the triggers are actually off. Setting it before would
                 // suppress ANALYZE for a bulk load that failed to start.
@@ -364,7 +403,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                 continue;
             }
             Command::EndBulkLoad(triggers, reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
                     .and_then(|()| end_bulk_load(&conn, &triggers));
                 // Cleared either way: a failed end_bulk_load leaves the index without
                 // its triggers and the caller must not mark it ready, but the writer
@@ -374,13 +413,13 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                 continue;
             }
             Command::ResolveLinks(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load)
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
                     .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);
                 continue;
             }
             Command::Stop => {
-                let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
+                let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
                 return;
             }
         }
@@ -395,7 +434,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
                     barrier = Some((reply, Barrier::MarkReady(root)));
                 }
                 Ok(Command::Stop) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
+                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
                     return;
                 }
                 Ok(other) => {
@@ -406,7 +445,7 @@ fn run(conn: Connection, rx: &Receiver<Command>) {
             }
         }
 
-        let mut result = commit(&conn, &mut pending, &mut since_analyze, bulk_load);
+        let mut result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
 
         if let Some((reply, extra)) = barrier {
             if result.is_ok() {
@@ -526,29 +565,51 @@ enum Barrier {
     MarkReady(String),
 }
 
-/// Apply a batch in one transaction, keeping `note_count` in step inside it.
-/// Makes the next `commit` fail once, so a test can reach the code that runs when a
-/// batch is left in hand.
+/// Makes an actor's next commit fail once, so a test can reach the code that runs
+/// when a batch is left in hand.
 ///
 /// A commit failure cannot be provoked from outside — it needs SQLite to refuse — and
 /// the path it opens is the one that turned an assertion into a panic in every debug
 /// build. A one-line seam is a smaller price than leaving that route untested.
-#[cfg(test)]
-pub(crate) static FAIL_NEXT_COMMIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+///
+/// One per [`IndexActor`] rather than one process-wide static (task #28). The static
+/// version raced every other test in the same binary that also drove a commit: cargo
+/// runs a crate's unit tests concurrently by default, and any test elsewhere with its
+/// own actor could reach `commit` first and consume the flag this test had just set,
+/// before this actor's own writer thread ever saw it — reproducing once in some runs
+/// and passing in others, which is exactly the shape a shared global produces. Cloning
+/// this shares the same underlying flag with the writer thread it was made for and no
+/// other.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FaultInjector(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl FaultInjector {
+    /// Make the next commit through this handle's actor fail once.
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Consume the injected failure, if one is armed. Always false in production: the
+    /// only way to arm it is [`FaultInjector::fail_next_commit`], which does not exist
+    /// outside `#[cfg(test)]`.
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 fn commit(
     conn: &Connection,
     pending: &mut Vec<IndexOp>,
     since_analyze: &mut usize,
     bulk_load: bool,
+    fault: &FaultInjector,
 ) -> Result<(), IndexError> {
     if pending.is_empty() {
         return Ok(());
     }
 
-    #[cfg(test)]
-    if FAIL_NEXT_COMMIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if fault.take() {
         return Err(IndexError::Corrupt {
             message: "simulated commit failure".to_owned(),
         });
@@ -607,7 +668,6 @@ fn mark_ready(conn: &Connection, vault_root: &str) -> Result<(), IndexError> {
 mod tests {
     use super::*;
     use serat_core::{ContentHash, NoteKind, NoteMeta, VaultPath};
-    use std::sync::atomic::Ordering;
 
     fn asset(path: &str) -> IndexOp {
         let path = VaultPath::new(path).expect("path");
@@ -634,10 +694,12 @@ mod tests {
         // the actor stays alive, the next command drains what was left, and no work is
         // lost.
         //
-        // One test rather than two, because the seam is a process-wide static and two
-        // tests sharing it race — the first version of this had one test's injected
-        // failure surface in the other, which is a test that fails for a reason that
-        // says nothing about the code.
+        // The fault is scoped to this actor (task #28): earlier this was a
+        // process-wide static, and cargo runs a crate's unit tests concurrently by
+        // default, so any other test's actor reaching `commit` first could consume
+        // the flag this test had just armed, before this actor's own writer thread
+        // ever saw it — a test that fails for a reason that says nothing about the
+        // code, and only some of the time.
         // File-backed rather than in-memory, so a second connection can observe what
         // the actor has committed between one command and the next. That is what makes
         // the drain observable: with it removed, resolve_links returns Ok(0) either
@@ -651,7 +713,7 @@ mod tests {
         let writer = actor.handle();
 
         writer.submit(asset("assets/a.pdf")).expect("submit");
-        FAIL_NEXT_COMMIT.store(true, Ordering::SeqCst);
+        actor.fault_injector().fail_next_commit();
 
         let failed = writer.flush();
         assert!(
