@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The P0 shell. Core event listening only: every Serat capability arrives as an application command, not as a plugin, so there is no plugin permission to grant. Widening this set is a threat-model decision (docs/03-design/threat-model.md), not a convenience.",
+  "description": "The P0 shell. Core event listening only. Every Serat capability arrives as an application command rather than a plugin, so this file grants none of them -- not because Tauri cannot (per-window/per-webview allowlisting of application commands exists once an app ACL manifest is declared, via AppManifest::commands() in build.rs or a permissions/ directory; see docs/03-design/threat-model.md), but because Serat has not opted in. That is a choice, cheap to reverse before a second window exists and expensive after (F-280, F-336). Widening this set, or declaring an app manifest, is a threat-model decision, not a convenience.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }
