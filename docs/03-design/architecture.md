@@ -765,6 +765,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0010 — One SQL statement per query (serves FR-STR-08, FR-STR-09, NFR-PRF-05)
 - ADR-0011 — Which producer the index queue may drop (serves FR-VLT-04, NFR-PRF-03, NFR-REL-01)
 - ADR-0012 — Declare the Tauri app ACL manifest, and grant only the commands the webview calls (serves NFR-SEC-06, T-08)
+- ADR-0013 — When a merge may proceed with a performance budget red (serves C-06, NFR-PRF-04, NFR-MNT-01)
 
 ## Traceability
 
@@ -793,6 +794,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
 | Path containment: one rule, two enforcement points | §*A symlink is not a vault file*, threat-model.md T-07 | NFR-SEC-06 |
 | IPC command allowlisting: the handler list, the app manifest and the capability must agree | threat-model.md T-08 and §Trust boundaries, ADR-0012 | NFR-SEC-06 |
+| Budget enforcement, and the five conditions under which a red one may be merged past | ADR-0013, §Open design questions | C-06, NFR-PRF-04 |
 | Chunking and incremental embedding      | §8.1                       | FR-AIX-02                                                                     |
 | Retrieval fusion                        | §8.2, Fig. 3               | FR-AIX-01, FR-AIX-03, FR-AIX-09, FR-AIX-10                                    |
 | Proposal lifecycle                      | §8.3, Fig. 6               | FR-AIX-05, FR-AIX-04, FR-MCP-03                                               |
