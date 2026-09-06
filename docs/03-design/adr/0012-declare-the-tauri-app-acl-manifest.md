@@ -1,5 +1,5 @@
 # ADR-0012: Declare the Tauri app ACL manifest, and grant only the commands the webview calls
-**Status:** proposed · **Date:** 2026-09-06 · **Serves:** NFR-SEC-02, T-02, FR-BIN-19, design goal 5
+**Status:** accepted · **Date:** 2026-09-06 (accepted after the run named below) · **Serves:** NFR-SEC-02, T-02, FR-BIN-19, design goal 5
 
 ## Context
 
@@ -135,21 +135,35 @@ covers the first; the second would need this ADR revisited. **The mechanism is
 `serat-app`'s to choose and this is an existence proof, not a specification** — what
 matters to the ruling is only that a satisfying test can exist, and it can.
 
-tauri-app-dev's objections are still wanted and still go here under their name, including
-if they argue against declaring the manifest at all. What has changed is that their reply
-is no longer load-bearing for the *decision*.
+**tauri-app-dev raised no objection and implemented the ruling as written** (3960bdf,
+task #48), including the five-not-six grant. They chose their own mechanism for the
+condition — `crates/serat-app/src/acl_manifest.rs`, four textual guards comparing
+`generate_handler!`, `build.rs`'s manifest and `capabilities/default.json` against each
+other — which is what "an existence proof, not a specification" was for.
+
+**One thing they found that this ADR did not anticipate, and it is the reason the
+verification below is a manual run rather than an automated test.** `tauri::test::mock_app()`,
+the crate's own documented minimal example, crashes with `STATUS_ENTRYPOINT_NOT_FOUND` on
+this toolchain with no Serat code involved. So the settling evidence could not be left
+behind as a test, and that is stated here rather than quietly enjoyed.
 
 ## Tested against
 
-**Not yet, and the case is named.** The reasoning here was checked against the framework
-source at the versions `Cargo.lock` resolves and against the tree — the invoke path's
-three disjuncts, `resolve_access`'s window and webview filtering, the absence of
-`__app-acl__` from `crates/serat-app/gen/schemas/acl-manifests.json`, and the five
-`invoke(...)` call sites in `boot.js` against the six in `generate_handler!`. **All of
-that tests the premise, not the decision.**
+**Run, by tauri-app-dev, against the running app — which is why this is `accepted`.**
+The premise was checked against framework source and the tree (the invoke path's three
+disjuncts, `resolve_access`'s window and webview filtering, the absence of `__app-acl__`
+from the generated manifests, and `boot.js`'s five `invoke(...)` sites against the six in
+`generate_handler!`). **That tested the premise. The decision was tested by the run.**
 
-What would test the decision is one run of the implementing change: declare the manifest,
-grant the five, and confirm that `read_file` still works from the webview and
-`open_vault` is refused. **tauri-app-dev should supply it**, because it needs the app
-running and this ADR's author has only read the code. Until that exists this decision is
-`proposed`, not `accepted` — the distinction being exactly what this field is for.
+A temporary `boot.js` probe invoking `open_vault` after the real boot sequence recorded
+the framework's refusal verbatim in the startup trace — *"open_vault not allowed.
+Permissions associated with this command: allow-open-vault"* — while `read_file`,
+`index_status`, `mark_first_paint` and `mark_vault_usable` continued to work **through
+the same run**. Both halves in one execution is what makes it evidence rather than two
+anecdotes: a build where nothing worked would also have refused `open_vault`.
+
+**What the run did not cover, stated because four of five is not five.** `write_file` is
+granted and was **not** exercised by the probe. Its grant rests on the same
+`acl_manifest.rs` guards as the others and on the framework behaviour the other four
+demonstrated, which is good but is not the same as having been observed. If a cheap
+write-side probe becomes available, it is worth one run.
