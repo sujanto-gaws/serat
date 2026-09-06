@@ -96,3 +96,22 @@ jobs:
             | (cd "$dest" && tar -xf -)
           cd "$dest"
           cargo test --workspace
+
+  gate:
+    name: definition of done
+    needs: [fmt, clippy, workspace, location-independence]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job did not succeed
+        shell: bash
+        run: |
+          set -euo pipefail
+          results='${{ join(needs.*.result, " ") }}'
+          echo "upstream results: ${results}"
+          for r in $results; do
+            if [ "$r" != "success" ]; then
+              echo "definition of done not met: an upstream job reported '${r}'"
+              exit 1
+            fi
+          done
