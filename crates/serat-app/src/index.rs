@@ -1,7 +1,7 @@
 //! The index actor thread, and the status it publishes.
 //!
 //! Architecture §3.4, first row: **the main thread never opens the index.** The actor
-//! opens it on its own thread (ADR-0001) and runs the 2.4 ms stamp check there; the
+//! opens it on its own thread (ADR-0001) and runs the 5–8ms stamp check there (task #68); the
 //! shell paints with whatever state the actor has last published. No command in
 //! `contracts/ipc.rs` blocks on any of it — `index_status` reads the published value
 //! and returns, which is what makes it callable from a render path.
@@ -244,7 +244,7 @@ pub trait IndexOpen: Send + 'static {
 /// The real open check, wired to the vault and the production parser.
 ///
 /// Architecture §3.4 specifies six ordered steps over `user_version`, `index_meta` and
-/// `count(*) FROM notes`, measured at 2.4 ms on the 20k fixture; every one of them
+/// `count(*) FROM notes`, measured at 5–8ms on the 20k fixture (task #68); every one of them
 /// reads SQLite, so every one of them lives in `serat-index` (§2.1: `serat-app` owns
 /// no domain logic) as [`serat_index::open_or_rebuild`]. This type is the wiring, not
 /// a second copy of the check: it opens the one production [`serat_vault::Vault`] as
