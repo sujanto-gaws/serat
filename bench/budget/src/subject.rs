@@ -451,6 +451,60 @@ pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, Str
     })
 }
 
+/// One `open_or_rebuild` call, timed, and what it found.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenCheckTiming {
+    /// Wall-clock time inside `open_or_rebuild`, start to return -- the
+    /// number NFR-PRF-01's `t_usable` pays whenever the index is opened.
+    pub elapsed: Duration,
+    /// Whether the index was usable as-is. `false` means a rebuild ran, so
+    /// `elapsed` includes it and is not the open-check number by itself.
+    pub was_ready: bool,
+}
+
+/// Time one `open_or_rebuild` call against the index at `index_dir`, for the
+/// vault at `vault_path`.
+///
+/// Task #68, following #61's removal of `PRAGMA integrity_check` from the
+/// open path: architecture.md §3.4's four-candidate table has real numbers
+/// for the three rejected checks (1310ms, 1150ms, and the walk) and none for
+/// the six stamp steps that actually ship. This is that number. The caller
+/// puts the index at `index_dir` into whatever state it wants measured --
+/// a real `Ready` index, an absent directory, a hand-edited `index_meta` row
+/// -- so the same seam measures every §3.4 candidate on the same fixture.
+///
+/// # Errors
+/// If a triggered rebuild fails, or the vault at `vault_path` cannot be
+/// opened.
+pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenCheckTiming, String> {
+    let source = serat_vault::Vault::open(vault_path)
+        .map_err(|e| format!("opening {}: {e}", vault_path.display()))?;
+    let parser = serat_parse::CommonMarkParser;
+    let was_ready = std::cell::Cell::new(true);
+    let on_status = |status: serat_index::IndexStatus| {
+        if !matches!(
+            status,
+            serat_index::IndexStatus::Opening | serat_index::IndexStatus::Ready
+        ) {
+            was_ready.set(false);
+        }
+    };
+
+    let started = Instant::now();
+    let (handle, _report) =
+        serat_index::open_or_rebuild(vault_path, index_dir, &source, &parser, &on_status)
+            .map_err(|e| format!("open_or_rebuild: {e}"))?;
+    let elapsed = started.elapsed();
+    handle
+        .close()
+        .map_err(|e| format!("closing the index just opened: {e}"))?;
+
+    Ok(OpenCheckTiming {
+        elapsed,
+        was_ready: was_ready.get(),
+    })
+}
+
 /// Time `iterations` single-note saves through to being visible in the
 /// index: the save-path interval NFR-PRF-03 governs, and the two watcher-path
 /// intervals reported beside it (F-227, F-268).
@@ -806,5 +860,161 @@ mod tests {
             overhead.lstat_calls,
             overhead.files
         );
+    }
+
+    // -------------------------------------------------------- open / task #68
+
+    #[test]
+    fn measure_the_open_check_on_the_20k_vault() {
+        // Task #68, following #61: architecture.md §3.4's four-candidate table
+        // has real numbers for the three rejected checks and none for the six
+        // stamp steps that actually ship. This is that number, plus a sanity
+        // check on the four rebuild-triggering states next to it -- if any of
+        // those cost real time, the ruling that they "fail early" needs a
+        // second look, not just this test.
+        let vault = crate::ensure_vault("20k").expect("the 20k vault is available");
+
+        // Outside the vault, deliberately (F-311's lesson, and task #70's
+        // live instance of it): a scratch directory *inside* vault.path
+        // moves the tree digest, so a panic before cleanup here would leave
+        // the vault failing its own canonicality gate for every test after
+        // this one, on a shared machine, silently. temp_dir() carries no
+        // such obligation.
+        let scratch =
+            std::env::temp_dir().join(format!("serat-bench-open-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        // Build once, unmeasured: the first call finds the index Absent and
+        // rebuilds it for real, which is NFR-PRF-04's number, not this one.
+        let built = measure_open_check(&vault.path, &scratch).expect("first build");
+        assert!(
+            !built.was_ready,
+            "the scratch dir was just cleared; this must be the rebuild"
+        );
+
+        // THE HEADLINE NUMBER: open_or_rebuild against a real, Ready index --
+        // the six stamp steps and nothing else, on the same 20k fixture that
+        // produced integrity_check's 1310ms and quick_check's 1150ms.
+        let ready = measure_open_check(&vault.path, &scratch).expect("second open, now Ready");
+        assert!(
+            ready.was_ready,
+            "a second open_or_rebuild against an index this one just built and closed \
+             cleanly must find it Ready, not trigger a second rebuild"
+        );
+        let ready_ms = ready.elapsed.as_secs_f64() * 1000.0;
+
+        // The four rebuild-triggering states, measured at the check alone
+        // (schema::inspect_for), not through a full open_or_rebuild -- that
+        // would pay for an actual rebuild and measure NFR-PRF-04 by accident.
+        // What #68 asks whether these "fail early", and inspect_for is where
+        // that failure happens.
+        let index_path = serat_index::index_path(&scratch);
+
+        let absent_started = Instant::now();
+        let absent = serat_index::schema::inspect_for(&scratch.join("no-such-index.db"), None);
+        let absent_ms = absent_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            matches!(absent, Ok(serat_index::IndexState::Absent)),
+            "a path with nothing at it must report Absent: {absent:?}"
+        );
+
+        // Three copies of the real Ready database, each mutated to trigger one
+        // specific UnusableReason, so the check alone -- not a rebuild -- is
+        // what gets timed.
+        let root = vault.path.to_string_lossy().into_owned();
+        let mutate = |name: &str, sql: &str| -> std::path::PathBuf {
+            let copy = scratch.join(name);
+            std::fs::copy(&index_path, &copy).expect("copy the ready index");
+            let conn = rusqlite::Connection::open(&copy).expect("open the copy");
+            conn.execute(sql, []).expect("mutate index_meta");
+            copy
+        };
+
+        // inspect_for checks `PRAGMA user_version`, not the index_meta.schema_version
+        // column (which is diagnostic-only, per schema.rs's own doc comment on it).
+        let schema_changed = mutate("schema-changed.db", "PRAGMA user_version = 999999");
+        let schema_started = Instant::now();
+        let schema_result = serat_index::schema::inspect_for(&schema_changed, Some(&root));
+        let schema_ms = schema_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            matches!(
+                schema_result,
+                Ok(serat_index::IndexState::Unusable {
+                    reason: serat_index::UnusableReason::IndexVersion
+                })
+            ),
+            "a schema_version this wrong must report IndexVersion: {schema_result:?}"
+        );
+
+        let interrupted = mutate("interrupted.db", "UPDATE index_meta SET state = 'building'");
+        let interrupted_started = Instant::now();
+        let interrupted_result = serat_index::schema::inspect_for(&interrupted, Some(&root));
+        let interrupted_ms = interrupted_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            matches!(
+                interrupted_result,
+                Ok(serat_index::IndexState::Unusable {
+                    reason: serat_index::UnusableReason::RebuildInterrupted
+                })
+            ),
+            "state='building' must report RebuildInterrupted: {interrupted_result:?}"
+        );
+
+        let moved = mutate(
+            "moved.db",
+            "UPDATE index_meta SET vault_root = 'C:/nowhere/not-the-real-vault'",
+        );
+        let moved_started = Instant::now();
+        let moved_result = serat_index::schema::inspect_for(&moved, Some(&root));
+        let moved_ms = moved_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            matches!(
+                moved_result,
+                Ok(serat_index::IndexState::Unusable {
+                    reason: serat_index::UnusableReason::VaultMoved
+                })
+            ),
+            "a vault_root that does not match must report VaultMoved: {moved_result:?}"
+        );
+
+        eprintln!(
+            "NFR-PRF-01 open check (task #68, following #61's integrity_check removal), \
+             20k fixture (index.db ~124.2MB):\n\
+             \x20 Ready (open_or_rebuild, the six stamp steps, THE HEADLINE NUMBER): {ready_ms:.2} ms\n\
+             \x20 Absent (inspect_for only):        {absent_ms:.3} ms\n\
+             \x20 SchemaChanged (inspect_for only):  {schema_ms:.3} ms\n\
+             \x20 Interrupted (inspect_for only):    {interrupted_ms:.3} ms\n\
+             \x20 VaultMoved (inspect_for only):     {moved_ms:.3} ms\n\
+             (for comparison, architecture.md §3.4: integrity_check 1310ms, quick_check 1150ms, rejected)"
+        );
+
+        // A sanity bound, not a budget: no NFR governs the rejected-candidate
+        // side of this number. The claim under test is "fails early", not a
+        // specific figure -- task #44's lesson applies here as much as it did
+        // to a wall-clock assert on shared CI hardware. Observed under
+        // concurrent load on this machine: low single digits idle, up to
+        // ~37ms contended. 300ms is generous for a check that reads one row
+        // even under load, and still an order of magnitude under the
+        // cheapest rejected candidate (FTS5 integrity-check, 390ms).
+        for (label, ms) in [
+            ("Absent", absent_ms),
+            ("SchemaChanged", schema_ms),
+            ("Interrupted", interrupted_ms),
+            ("VaultMoved", moved_ms),
+        ] {
+            assert!(
+                ms < 300.0,
+                "{label} took {ms:.2} ms -- 'fails early' should mean well under the \
+                 cheapest rejected candidate (390ms) for a check that reads one row, \
+                 not something worth a rebuild-shaped number"
+            );
+        }
+        // The headline number itself is reported, not bounded: there is no
+        // budget for it yet (that is the residual #68 leaves named), and
+        // asserting an arbitrary threshold here would be the register's own
+        // F-138 mistake -- a point where a range belongs.
+        let _ = ready_ms;
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
