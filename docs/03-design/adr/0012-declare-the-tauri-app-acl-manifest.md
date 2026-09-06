@@ -112,11 +112,32 @@ argues for engaging the mechanism while there is nothing to break.
 ## Objections recorded
 (from teammates consulted)
 
-*Pending tauri-app-dev, consulted before this was written. Their answer to one question
-can change the decision rather than its wording: whether the `generate_handler!` command
-list is reachable from a test at all. If it is not, the condition above is not
-satisfiable as stated and option 1 becomes the honest ruling, because option 3 without
-the test is worse than doing nothing.*
+tauri-app-dev was consulted before this was written and has not yet replied. **The one
+question that could have changed the decision rather than its wording has since been
+answered, and answered by measurement rather than by waiting.**
+
+The question was whether the `generate_handler!` command list is reachable from a test at
+all — because if it is not, the condition above is unsatisfiable and option 1 becomes the
+honest ruling. `generate_handler!` is a proc macro over function *paths*
+(`tauri-macros-2.6.3`), so it cannot read a `const` array and the list is not available
+as data. **But the file can read itself.** A test in the same crate may `include_str!`
+its own source and extract the block textually, which is `security_config.rs`'s existing
+principle — the bytes under test are the bytes that ship — applied one file over. Built
+as a standalone crate and run before this paragraph was written: the test extracts the
+command names and passes; there is no circularity, because `include_str!` is a byte read
+at compile time rather than a macro expansion.
+
+**Its limits, stated because selling the technique as airtight is how the next F-305
+happens.** It is a textual match, not a semantic one. It would be fooled by the literal
+`generate_handler![` appearing earlier in a comment or a string, and by any future
+handler list that is itself macro-generated. Asserting that the block occurs exactly once
+covers the first; the second would need this ADR revisited. **The mechanism is
+`serat-app`'s to choose and this is an existence proof, not a specification** — what
+matters to the ruling is only that a satisfying test can exist, and it can.
+
+tauri-app-dev's objections are still wanted and still go here under their name, including
+if they argue against declaring the manifest at all. What has changed is that their reply
+is no longer load-bearing for the *decision*.
 
 ## Tested against
 
