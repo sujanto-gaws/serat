@@ -566,13 +566,24 @@ mod tests {
         // §3.4's load-bearing property, at the boundary rather than at the seam: no IPC
         // command blocks on the index. Add a `join` to `open_vault_with` and this fails
         // by a factor of four.
+        //
+        // Detection power and robustness are independent knobs here, and both bounds
+        // below are chosen to buy both at once (task #45, sibling of #44's wall-clock
+        // flake in a different crate): a blocking call takes the full sleep, so the
+        // *ratio* of sleep to threshold is what catches it, while the threshold's
+        // *absolute* size is what has to survive a loaded CI runner's scheduling
+        // jitter. The two constants below move together on purpose -- widening the
+        // threshold alone without raising the sleep would let a fully blocking call
+        // pass, which is exactly the failure mode a future "fix the flaky test" pass
+        // could introduce if it touches only one side of this pair.
         struct Slow;
         impl IndexOpen for Slow {
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(2_000));
                 publish(IndexState::Ready { note_count: 1 });
             }
         }
+        const NONBLOCKING_THRESHOLD: Duration = Duration::from_millis(500);
 
         let dir = fixture("nonblocking");
         let state = AppState::with_settings(
@@ -593,7 +604,7 @@ mod tests {
         let cost = started.elapsed();
 
         assert!(
-            cost < Duration::from_millis(60),
+            cost < NONBLOCKING_THRESHOLD,
             "open_vault waited {cost:?} for the index actor"
         );
         assert_eq!(
@@ -604,7 +615,12 @@ mod tests {
         // And index_status, called immediately, must also not block.
         let started = Instant::now();
         let polled = state.index_status();
-        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(
+            started.elapsed() < NONBLOCKING_THRESHOLD,
+            "index_status waited {:?} -- it reads a published value and must never block \
+             on the actor",
+            started.elapsed()
+        );
         assert_eq!(polled.vault_id, opened.vault_id);
 
         let _ = std::fs::remove_dir_all(&dir);
