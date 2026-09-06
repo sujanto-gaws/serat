@@ -112,9 +112,10 @@ argues for engaging the mechanism while there is nothing to break.
 ## Objections recorded
 (from teammates consulted)
 
-tauri-app-dev was consulted before this was written and has not yet replied. **The one
-question that could have changed the decision rather than its wording has since been
-answered, and answered by measurement rather than by waiting.**
+tauri-app-dev was consulted before this was written. **The one question that could have
+changed the decision rather than its wording was answered before they replied, and
+answered by measurement rather than by waiting** — their reply, when it came, was the
+implementation itself (below).
 
 The question was whether the `generate_handler!` command list is reachable from a test at
 all — because if it is not, the condition above is unsatisfiable and option 1 becomes the
