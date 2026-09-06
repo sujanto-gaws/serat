@@ -177,18 +177,19 @@ impl IndexHandle {
     /// watcher's own event for this write, whenever it arrives, indexes it normally.
     /// [`IndexError::WriterStopped`] if the writer is gone.
     ///
-    /// # This does not resolve links (F-244)
+    /// # Links resolve on this path too (task #13, closing F-244)
     ///
     /// `upsert_note` is delete-then-insert, and `ON DELETE CASCADE` plus
     /// `links.dst_note`'s `ON DELETE SET NULL` (schema/001_init.sql) mean every save
-    /// through this path nulls every inbound link to the note before re-inserting its
-    /// own rows — and nothing on this path calls `resolve_links`, which only the
-    /// rebuild path does. So a saved note's *outbound* links resolve normally, but any
-    /// note that already linked *to* it loses that edge in the index until the next
-    /// full rebuild. This is FR-NAV-04 (Backlinks, Must at P1) and is filed as task
-    /// #13, not fixed here: C-02 covers it (the index is disposable and a rebuild
-    /// repairs it, so nothing depends on the stale state surviving), which is what
-    /// keeps this a P1 gap rather than a P0 blocker.
+    /// through this path used to null every inbound link to the note before
+    /// re-inserting its own rows, with nothing to put them back until the next full
+    /// rebuild — FR-NAV-04 (Backlinks, Must at P1), filed as F-244 and fixed as task
+    /// #13. `apply::upsert_note` and `apply::upsert_asset` now each call
+    /// `resolve_inbound` after re-inserting, scoped to the one note that just changed
+    /// rather than the rebuild's full-table `resolve_links`, and `upsert_note` also
+    /// calls `resolve_outbound` for its own just-inserted links. Both cost an indexed
+    /// lookup (`ix_links_unresolved`, schema/001_init.sql) rather than a table scan,
+    /// so this stays inside NFR-PRF-03's 50 ms rather than growing with vault size.
     pub fn apply(
         &self,
         source: &dyn NoteSource,

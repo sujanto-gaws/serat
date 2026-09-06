@@ -128,6 +128,123 @@ fn upsert_note(
         }
     }
 
+    // task #13 (FR-NAV-04). The `remove` above deleted the previous row under this
+    // path, if there was one, and `ON DELETE SET NULL` nulled every inbound link the
+    // cascade could see -- including links this very save is about to restore, since
+    // the note comes back under a new rowid. Without this, only a full rebuild ever
+    // repairs a backlink to a note that was saved incrementally even once.
+    resolve_inbound(tx, &meta.path)?;
+    // The note's own outbound links, inserted unresolved just above: point them at
+    // whatever they name that already exists. Symmetric with resolve_inbound, and
+    // both are needed -- one fixes what this save broke, the other finishes what it
+    // could not have done at insert time (a link's own rows do not yet have a
+    // dst_note to compare against until they are in the table).
+    resolve_outbound(tx, note_id)?;
+
+    Ok(())
+}
+
+/// Point every currently-unresolved link that could name `path` at the note it now
+/// identifies.
+///
+/// Scoped by `dst_path`, not a pass over the whole `links` table: an incremental save
+/// touches one note, and paying for a full scan on every save is what left this path
+/// silently skipping FR-NAV-04 in the first place (see `IndexHandle::apply`'s doc
+/// comment on the gap this closes). `ix_links_unresolved` (schema/001_init.sql) is
+/// what keeps the `IN` lookup cheap rather than a table scan wearing an index's name.
+///
+/// The four candidates are `writer::resolve_links`'s matching rule read in reverse:
+/// a link's `dst_path` matches a note `n` when `n.path` equals it exactly, equals it
+/// with `.md` appended, or -- when the written target has no `/`, i.e. names a file
+/// rather than a path (F-312) -- `n.file_name` equals it either way. So the spellings
+/// that could name *this* note are its own path, its path without a trailing `.md`,
+/// its file name, and its file name without a trailing `.md`; always four slots, with
+/// a duplicate where a candidate does not apply (an asset's path never ends in
+/// `.md`), so this always prepares the same SQL text rather than one shape per call
+/// (`schema::STATEMENT_CACHE`'s whole point).
+fn resolve_inbound(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexError> {
+    const RESOLVE_INBOUND: &str = "
+        UPDATE links
+           SET dst_note = (
+                SELECT n.id FROM notes n
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
+              ORDER BY length(n.path), n.path
+                 LIMIT 1
+           )
+         WHERE dst_note IS NULL
+           AND kind <> 'tag'
+           AND dst_path IN (?1, ?2, ?3, ?4)
+           AND EXISTS (
+                SELECT 1 FROM notes n
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
+           )";
+
+    let whole = path.as_str();
+    let name = path.file_name();
+    let candidates = [
+        whole,
+        whole.strip_suffix(".md").unwrap_or(whole),
+        name,
+        name.strip_suffix(".md").unwrap_or(name),
+    ];
+
+    tx.prepare_cached(RESOLVE_INBOUND)
+        .map_err(sqlite)?
+        .execute(params![
+            candidates[0],
+            candidates[1],
+            candidates[2],
+            candidates[3]
+        ])
+        .map_err(sqlite)?;
+    Ok(())
+}
+
+/// Point `note_id`'s own unresolved outbound links at whatever they name that already
+/// exists.
+///
+/// The mirror of `resolve_inbound`, scoped by `src_note` instead of `dst_path` for
+/// the same reason: this note's rows are the only ones this save could have made
+/// resolvable, so the general pass over every unresolved link in the vault
+/// (`writer::resolve_links`, the rebuild's one full pass) is not needed here.
+fn resolve_outbound(tx: &Transaction<'_>, note_id: i64) -> Result<(), IndexError> {
+    const RESOLVE_OUTBOUND: &str = "
+        UPDATE links
+           SET dst_note = (
+                SELECT n.id FROM notes n
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
+              ORDER BY length(n.path), n.path
+                 LIMIT 1
+           )
+         WHERE dst_note IS NULL
+           AND kind <> 'tag'
+           AND src_note = ?1
+           AND dst_path IS NOT NULL
+           AND EXISTS (
+                SELECT 1 FROM notes n
+                 WHERE n.path = links.dst_path
+                    OR n.path = links.dst_path || '.md'
+                    OR (instr(links.dst_path, '/') = 0
+                        AND (n.file_name = links.dst_path
+                             OR n.file_name = links.dst_path || '.md'))
+           )";
+
+    tx.prepare_cached(RESOLVE_OUTBOUND)
+        .map_err(sqlite)?
+        .execute(params![note_id])
+        .map_err(sqlite)?;
     Ok(())
 }
 
@@ -153,6 +270,14 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta) -> Result<(), IndexError>
         meta.hash.to_hex()
     ])
     .map_err(sqlite)?;
+
+    // task #13. The remove() above nulled every inbound link the cascade could see,
+    // same as upsert_note -- and F-313 is exactly why an asset needs this call too:
+    // an embed can name an asset, so an asset's own inbound backlinks are as real a
+    // gap as a note's. Assets have no outbound links, so there is no
+    // resolve_outbound counterpart here.
+    resolve_inbound(tx, &meta.path)?;
+
     Ok(())
 }
 

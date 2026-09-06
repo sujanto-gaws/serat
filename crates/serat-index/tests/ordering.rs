@@ -114,10 +114,23 @@ fn begin_bulk_load_applies_operations_before_the_triggers_come_off() {
 }
 
 #[test]
-fn resolve_links_sees_notes_that_were_still_queued() {
-    // A link resolves against notes that exist. Rows still queued when the resolve
-    // pass runs are not there yet, so their links stay NULL for ever — the rebuild
-    // reports a smaller resolved count and the backlinks pane is quietly incomplete.
+fn resolve_links_drains_the_queue_before_querying_it() {
+    // F-74's guard: resolve_links commits before running its own query, so unflushed
+    // work is visible to it rather than invisible.
+    //
+    // Task #13 changed what this test can observe. apply::upsert_note now resolves a
+    // link the moment both ends exist, as a side effect of the transaction that
+    // inserts them — not held back for a caller who remembers to call resolve_links
+    // separately. A same-batch pair like this one is therefore fully resolved by the
+    // commit alone, and the explicit resolve_links query correctly finds nothing left
+    // to do. That is progress, not a hole, but it does mean the resolved *count* this
+    // test used to assert (2) no longer distinguishes "the guard ran" from "the guard
+    // was skipped": either way, the final `flush` inside `shutdown()` below would
+    // apply the pending ops regardless, and per-note resolution would then resolve
+    // both links whether or not resolve_links's own drain ever ran. What still
+    // isolates the guard is whether the commit happened *before* resolve_links
+    // returns — which a separate connection, read right here rather than after
+    // shutdown, can see directly.
     let dir = tempfile::tempdir().expect("temp");
     let (actor, path) = open_index(dir.path());
     let writer = actor.handle();
@@ -145,23 +158,31 @@ fn resolve_links_sees_notes_that_were_still_queued() {
             .expect("submit");
     }
 
-    // No flush. resolve_links must drain first or it resolves against an empty table.
-    let resolved = writer.resolve_links().expect("resolve");
-    assert_eq!(
-        resolved, 2,
-        "resolve_links ran before the notes it resolves against had been applied"
-    );
+    // No flush. If resolve_links queried before draining, a reader right after this
+    // call would see an index with neither note in it yet.
+    writer.resolve_links().expect("resolve");
 
-    actor.shutdown().expect("shutdown");
-    let conn = schema::open(&path).expect("reader");
-    let unresolved: i64 = conn
+    let reader = schema::open(&path).expect("reader");
+    let notes: i64 = reader
+        .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        notes, 2,
+        "resolve_links returned before the queued notes were committed"
+    );
+    let unresolved: i64 = reader
         .query_row(
             "SELECT count(*) FROM links WHERE dst_note IS NULL AND kind <> 'tag'",
             [],
             |row| row.get(0),
         )
         .expect("count");
-    assert_eq!(unresolved, 0);
+    assert_eq!(
+        unresolved, 0,
+        "a link between two notes committed in the same batch was not resolved"
+    );
+
+    actor.shutdown().expect("shutdown");
 }
 
 #[test]

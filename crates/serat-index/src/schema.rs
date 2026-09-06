@@ -33,7 +33,7 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 /// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
 /// [`DDL`], which is asserted by a test rather than remembered by two people — under
 /// ADR-0002 a silent drift costs every user a full reindex.
-pub const INDEX_VERSION: i64 = 4;
+pub const INDEX_VERSION: i64 = 5;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

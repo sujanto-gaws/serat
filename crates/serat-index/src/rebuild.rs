@@ -30,7 +30,12 @@ pub struct RebuildReport {
     pub links: usize,
     /// Rows in `tasks`.
     pub tasks: usize,
-    /// Links that now point at a note, filled by the second pass.
+    /// Links that point at a note, out of `links`.
+    ///
+    /// Counted from the database, like every other field here, rather than from
+    /// `writer::resolve_links`'s return value: since task #13 that pass is one of
+    /// two ways a link resolves, not the only one, and its own delta only sees what
+    /// it personally changed.
     pub links_resolved: usize,
     /// How long enumerating the vault took.
     ///
@@ -189,11 +194,18 @@ pub fn rebuild_with_queue_depth(
     writer.end_bulk_load(triggers)?;
     let end_bulk_load = fts_started.elapsed();
 
-    // The second pass the foreign key forces. Not part of write_fts: it is its own
-    // phase (resolving links, not building the FTS index), and it is small enough
-    // relative to the others that it is left in the untimed remainder rather than
-    // given a sixth field nobody has asked to see split out yet.
-    let links_resolved = writer.resolve_links()?;
+    // The safety-net pass. Every note upserted during this rebuild already resolved
+    // its own inbound and outbound links as it was inserted (task #13,
+    // apply::upsert_note/upsert_asset), so this should ordinarily have nothing left
+    // to do -- it stays as defense in depth rather than being removed, because
+    // IndexOp::Rename (unused today, but a defined op nothing prevents a future
+    // caller from producing) does not call the scoped resolve, and a bug in the
+    // scoped calls would otherwise go unnoticed by anything but a rebuild-equivalence
+    // check. It is small enough relative to the other phases that it is left in the
+    // untimed remainder rather than given a sixth field nobody has asked to see split
+    // out yet. Its own return value is not the report's links_resolved (see that
+    // field's doc comment) -- discarded here, `?` kept for the error.
+    writer.resolve_links()?;
 
     // Step 6, and only after everything above has committed: marking the index ready
     // is what makes a crash mid-rebuild recoverable, because a rebuild that died
@@ -206,7 +218,6 @@ pub fn rebuild_with_queue_depth(
     actor.shutdown()?;
 
     let mut report = count(&path, skipped)?;
-    report.links_resolved = links_resolved;
     report.walk = walk;
     report.read_hash = timing.read_hash;
     report.parse = timing.parse;
@@ -280,6 +291,16 @@ fn count(path: &Path, skipped: usize) -> Result<RebuildReport, IndexError> {
         blocks: one("SELECT count(*) FROM blocks")?,
         fields: one("SELECT count(*) FROM fields")?,
         links: one("SELECT count(*) FROM links")?,
+        // Not writer.resolve_links()'s return value (task #13): apply::upsert_note
+        // and upsert_asset now resolve a link the moment both ends exist, as part of
+        // the same commit that inserts them, so by the time the explicit pass at the
+        // end of a rebuild runs, most links are already resolved and its delta
+        // undercounts what actually happened -- the same anti-pattern this struct's
+        // own doc comment rules out for every other field ("counted from the
+        // database after the writer has drained, not accumulated as we go").
+        links_resolved: one(
+            "SELECT count(*) FROM links WHERE dst_note IS NOT NULL AND kind <> 'tag'",
+        )?,
         tasks: one("SELECT count(*) FROM tasks")?,
         skipped,
         ..RebuildReport::default()

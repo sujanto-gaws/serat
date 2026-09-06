@@ -239,6 +239,71 @@ fn a_save_keeps_the_full_text_index_in_step() {
 }
 
 #[test]
+fn an_incremental_save_does_not_break_the_backlink_it_did_not_touch() {
+    // F-244 / FR-NAV-04 / task #13. upsert_note is delete-then-insert, and
+    // ON DELETE SET NULL means re-inserting a note used to null every inbound link to
+    // it before this fix, permanently: nothing on the incremental path called
+    // resolve_links, which only the rebuild path did. Reproduced exactly as it was
+    // found -- resolved after a full rebuild, then after incrementally saving each
+    // side of the pair in turn.
+    let dir = tempfile::tempdir().expect("temp");
+    let vault = FakeVault::with(&[("a.md", "# A\n[[b]]\n"), ("b.md", "# B\n[[a]]\n")]);
+    let parser = LineParser::default();
+
+    rebuild(
+        &vault,
+        &parser,
+        std::path::Path::new("C:/vaults/serat"),
+        dir.path(),
+    )
+    .expect("rebuild");
+    assert_eq!(
+        resolved_link_count(dir.path()),
+        2,
+        "the rebuild did not resolve the mutual link"
+    );
+
+    let echo = support::SpyEcho::default();
+    let handle = IndexHandle::open(dir.path()).expect("open");
+
+    // Re-saving a.md deletes and re-inserts it, which used to null b.md's inbound
+    // link to it via ON DELETE SET NULL -- and a.md's own outbound link to b.md,
+    // rebuilt fresh, was never resolved by anything on this path either.
+    handle
+        .apply(&vault, &parser, &echo, &path("a.md"))
+        .expect("save a");
+    handle.writer().flush().expect("flush");
+    assert_eq!(
+        resolved_link_count(dir.path()),
+        2,
+        "saving a.md left a link unresolved that a full rebuild had already resolved"
+    );
+
+    // Then b.md, the other half of the pair.
+    handle
+        .apply(&vault, &parser, &echo, &path("b.md"))
+        .expect("save b");
+    handle.writer().flush().expect("flush");
+    assert_eq!(
+        resolved_link_count(dir.path()),
+        2,
+        "saving b.md left a link unresolved that a full rebuild had already resolved"
+    );
+
+    handle.close().expect("close");
+}
+
+fn resolved_link_count(index_dir: &std::path::Path) -> i64 {
+    let conn = schema::open(&serat_index::index_path(index_dir)).expect("open");
+    conn.query_row(
+        "SELECT count(*) FROM links WHERE dst_note IS NOT NULL AND kind <> 'tag'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("count")
+}
+
+#[test]
 fn parse_pool_threads_leaves_a_core_free() {
     // Architecture §2.2: cores minus one. Parsing is CPU-bound, and a pool sized to
     // every core competes with the thread the user is typing on — design goal 2 says

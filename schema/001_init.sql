@@ -89,7 +89,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 
 -- ============================================================================
 -- Tables
@@ -259,14 +259,10 @@ CREATE TABLE links (
 -- rust-core-dev reading the DDL against its own comment before any code
 -- depended on it.
 --
--- P1 adds the index that makes the predicate cheap and keeps it in one place,
--- which is where the re-resolution pass must read it from:
---
---     CREATE INDEX ix_links_unresolved ON links(dst_path)
---         WHERE dst_note IS NULL AND kind <> 'tag';
---
--- It is not here because P0 does not re-resolve links, and an index P0 never
--- reads would still cost P0's rebuild benchmark (NFR-PRF-04) to build.
+-- P1 (task #13, FR-NAV-04) adds the re-resolution pass this predicate was written
+-- for, and with it ix_links_unresolved (below, with the other links indexes) so the
+-- predicate is cheap where it now runs on every incremental save, not only during a
+-- rebuild's one full pass.
 --
 -- ON DELETE SET NULL on dst_note is what makes deleting a note mark every
 -- inbound link unresolved in the same statement, so the index can never hold a
@@ -373,6 +369,13 @@ CREATE INDEX ix_fields_key_text ON fields(key, val_text) WHERE val_text IS NOT N
 -- Rollups read src; the backlinks pane reads dst (FR-NAV-04).
 CREATE INDEX ix_links_src ON links(src_note);
 CREATE INDEX ix_links_dst ON links(dst_note);
+
+-- What the re-resolution pass reads (task #13): scoped by dst_path when a note is
+-- saved, so it can find every link that might now name it without a table scan, and
+-- kept partial on the predicate the comment above CREATE TABLE links pins as the
+-- correct one -- dst_note IS NULL AND kind <> 'tag' -- so a tag never enters it.
+CREATE INDEX ix_links_unresolved ON links(dst_path)
+    WHERE dst_note IS NULL AND kind <> 'tag';
 
 -- Every open-task query, and it is always ordered by due date. Partial on
 -- done = 0, which is the only side anyone queries: a vault accumulates done
