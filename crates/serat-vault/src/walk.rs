@@ -296,6 +296,146 @@ mod lexical_tests {
         }
     }
 
+    /// Create a symlink, or say why we could not.
+    ///
+    /// Mirrors `serat-app`'s helper (task #29) rather than the `#[cfg(all(test, unix))]`
+    /// gate this crate's own `symlink_tests` module uses, and the reason is specific to
+    /// this guard rather than a general objection to that gate. **The claim being tested
+    /// is itself cross-platform**: `walk`'s comment states that `DirEntry::metadata`
+    /// "does not follow symlinks on either platform", and that is what makes one stat
+    /// sufficient where two were used before (task #24). A test compiled on one platform
+    /// cannot check a sentence about both.
+    ///
+    /// On Unix a failure is a real error, not a platform limit (F-306). On Windows the
+    /// privilege may genuinely be absent, and then this says so out loud rather than
+    /// passing having asserted nothing (F-58).
+    fn make_symlink(
+        target: &std::path::Path,
+        link: &std::path::Path,
+        dir: bool,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            std::os::unix::fs::symlink(target, link).expect(
+                "symlink creation on Unix needs no privilege; a failure here is a real \
+                 error, not a reason to skip a containment test",
+            );
+            Ok::<(), String>(())
+        }
+        #[cfg(windows)]
+        {
+            let made = if dir {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            };
+            made.map_err(|err| {
+                format!(
+                    "symlink creation failed ({err}) -- Windows needs Developer Mode or \
+                     an elevated process, which a test runner cannot assume"
+                )
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link, dir);
+            Err("no symlink primitive is wired for this platform".to_owned())
+        }
+    }
+
+    /// `cargo test` has no third outcome for a plain `#[test]`, so this is the loudest
+    /// signal short of failing outright -- and failing outright would redden the suite
+    /// on every unprivileged Windows machine for a platform limit rather than a defect.
+    fn skip_loudly(test_name: &str, reason: &str) {
+        eprintln!("SKIPPED {test_name}: {reason}");
+    }
+
+    #[test]
+    fn the_walk_does_not_enumerate_a_symlink_out_of_the_vault() {
+        // The FIRST half of what the test below calls "the second half of that", and
+        // until now nothing pinned it: `walk.rs`'s `stat.is_symlink()` skip could be
+        // deleted and this crate's whole suite stayed green at 64/64 (F-362). Three
+        // artifacts cite that line -- the invariant task #27 landed so a changer would
+        // read it, this module's lexical-strip soundness argument, and the threat
+        // model's T-07 "walk.rs skips every symlink, so a link is never indexed" -- and
+        // none of them executed it.
+        //
+        // Deleting the skip makes this fail with the link in the output, which is the
+        // only thing that makes the three citations mean anything.
+        let dir = tempfile::tempdir().expect("temp");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.md");
+        fs::write(&secret, b"outside the vault").expect("write outside");
+
+        let vault = Vault::open(dir.path()).expect("open");
+        write(dir.path(), "real.md", b"# inside");
+
+        if let Err(reason) = make_symlink(&secret, &dir.path().join("escape.md"), false) {
+            skip_loudly(
+                "the_walk_does_not_enumerate_a_symlink_out_of_the_vault",
+                &reason,
+            );
+            return;
+        }
+
+        let entries = walk(&vault).expect("walk");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        assert!(
+            !paths.iter().any(|p| p.contains("escape")),
+            "the walk enumerated a symlink pointing outside the vault: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("real")),
+            "the walk skipped the ordinary note as well, so this proves nothing: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn the_walk_does_not_descend_through_a_symlinked_directory() {
+        // The other half of the invariant's own wording -- "no symlink is followed,
+        // directory or file" -- and the half that makes a vault containing a link to
+        // its own parent terminate rather than walk forever.
+        let dir = tempfile::tempdir().expect("temp");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("hidden.md"), b"outside").expect("write outside");
+
+        let vault = Vault::open(dir.path()).expect("open");
+        write(dir.path(), "real.md", b"# inside");
+
+        if let Err(reason) = make_symlink(outside.path(), &dir.path().join("linked"), true) {
+            skip_loudly(
+                "the_walk_does_not_descend_through_a_symlinked_directory",
+                &reason,
+            );
+            return;
+        }
+
+        let entries = walk(&vault).expect("walk");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        // Assert on the LINK, not on what is behind it. An earlier version of this
+        // asserted `hidden.md` was absent and passed with the guard DELETED, because a
+        // symlinked directory reports `is_symlink() == true` and `is_dir() == false`,
+        // so the walk never descends into it either way -- non-descent comes from the
+        // `is_dir()` branch rather than from the skip. That made it a near-miss dressed
+        // as coverage, the shape F-315 records. What the skip actually decides is
+        // whether the link ITSELF is enumerated.
+        assert!(
+            !paths.iter().any(|p| p.contains("linked")),
+            "the walk enumerated a symlinked directory as an entry: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("hidden")),
+            "the walk descended through a symlinked directory: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("real")),
+            "the walk found nothing at all, so this proves nothing: {paths:?}"
+        );
+    }
+
     #[test]
     fn the_walk_still_refuses_to_leave_the_vault() {
         // Stripping a prefix lexically is only safe because the walk never descends
