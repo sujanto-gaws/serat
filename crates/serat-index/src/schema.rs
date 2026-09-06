@@ -57,7 +57,19 @@ pub enum UnusableReason {
     /// Built by a different index version — the DDL or what the indexer extracts from
     /// unchanged input, or both (F-134).
     IndexVersion,
-    /// `PRAGMA integrity_check` or the FTS integrity check failed.
+    /// A row this check needs to read (`index_meta.state`, `.vault_root` or the
+    /// `notes`/`index_meta` count pair) could not be read at all.
+    ///
+    /// Not `PRAGMA integrity_check` (task #61): that ran on this path once, at
+    /// 1310ms against NFR-PRF-01's 400ms window — three times the whole budget,
+    /// and rejected for exactly that cost in architecture.md §3.4's four-candidate
+    /// table before this line was written to run it anyway. C-02 is why the
+    /// residual is acceptable here: the corruption this variant no longer catches
+    /// degrades to wrong query results until the next rebuild, never to a lost
+    /// byte, because the index is disposable and the vault is not. §3.4 still
+    /// wants that coverage back — as a background or on-demand `quick_check`, not
+    /// on the open path — and #58 has that as a named home with nothing built in
+    /// it yet.
     Corrupt,
     /// `state` is still 'building': a rebuild was interrupted.
     RebuildInterrupted,
@@ -192,12 +204,6 @@ pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, 
         Ok(found) if found == INDEX_VERSION => {}
         Ok(_) => return unusable(UnusableReason::IndexVersion),
         Err(_) => return unusable(UnusableReason::Unopenable),
-    }
-
-    let integrity: Result<String, _> =
-        conn.query_row("PRAGMA integrity_check", [], |row| row.get(0));
-    if integrity.as_deref() != Ok("ok") {
-        return unusable(UnusableReason::Corrupt);
     }
 
     let state: Result<String, _> =
