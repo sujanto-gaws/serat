@@ -157,35 +157,24 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             // why. Deliberately not `return Err(...)` from `setup`: Tauri turns a setup
             // failure into a panic, and a budget job reading exit code 101 and a
             // backtrace learns nothing it can act on. Exit 2 with a sentence instead.
-            if state.boot.exit_after_ready {
-                let refusal = if vault_root.is_none() {
-                    Some(format!(
-                        "--vault {} could not be opened, so there is no cold start to measure",
-                        state
-                            .boot
-                            .vault
-                            .as_ref()
-                            .map_or_else(|| "<none>".to_owned(), |v| v.display().to_string())
-                    ))
-                } else if note.is_none() {
-                    Some(
-                        concat!(
-                            "--exit-after-ready needs --open <note.md>. \"Vault usable\" ",
-                            "over a shell that rendered nothing is not the number ",
-                            "NFR-PRF-01 is about, and the settings file is deliberately ",
-                            "not consulted here: a benchmark that fell back to ",
-                            "per-machine state would pass on a developer machine and ",
-                            "fail in CI (F-169)"
-                        )
-                        .to_owned(),
-                    )
-                } else {
-                    None
-                };
-                if let Some(refusal) = refusal {
-                    setup_exit_code.store(2, Ordering::SeqCst);
-                    exit_now(2, &refusal);
-                }
+            //
+            // A missing `--open` is not refused here (task #59, F-359): task #52 ruled
+            // that cold start does not open a note, so t_usable is taken over an empty
+            // buffer and that is exactly what NFR-PRF-01 measures. `note_to_open` still
+            // declines the settings-file fallback under `--exit-after-ready` (F-169) —
+            // that is what makes an absent `--open` safe to allow rather than something
+            // silently answered from per-machine state.
+            if state.boot.exit_after_ready && vault_root.is_none() {
+                let refusal = format!(
+                    "--vault {} could not be opened, so there is no cold start to measure",
+                    state
+                        .boot
+                        .vault
+                        .as_ref()
+                        .map_or_else(|| "<none>".to_owned(), |v| v.display().to_string())
+                );
+                setup_exit_code.store(2, Ordering::SeqCst);
+                exit_now(2, &refusal);
             }
 
             let boot_info = serde_json::to_string(&BootInfo {
