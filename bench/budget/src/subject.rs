@@ -681,14 +681,27 @@ mod tests {
         // A sanity bound, not a budget: no NFR governs this, and the doc
         // comment's ruling is not relitigated here. This exists only to catch
         // resolve() becoming pathologically slow -- canonicalize() instead of
-        // symlink_metadata, say -- which the doc comment explicitly rejected
-        // for exactly this reason.
+        // symlink_metadata, say, which resolves every path component and
+        // would multiply calls per file by roughly the directory depth.
+        //
+        // F-335: this used to assert a wall-clock bound (elapsed < 5 s), and
+        // it failed once under full-workspace load at 6.3 s with an
+        // unchanged tree -- a definition-of-done suite is not supposed to
+        // contain an assertion that can go red because the machine was busy.
+        // The syscall count is what the comment above actually claims,
+        // deterministic and load-independent: 43,587 lstat calls over 20,200
+        // files is ~2.16 per file, and a regression to canonicalize() would
+        // multiply that by the vault's path depth, not add noise to it.
+        // Timing stays in the eprintln above as a diagnostic, unasserted.
+        let calls_per_file = overhead.lstat_calls as f64 / overhead.files.max(1) as f64;
         assert!(
-            overhead.elapsed < Duration::from_secs(5),
-            "resolve() over the whole 20k vault took {:?}, far more than the handful of \
-             lstat calls per file this is supposed to cost -- worth a second look even \
-             though no budget governs it",
-            overhead.elapsed
+            calls_per_file < 4.0,
+            "resolve() made {:.2} lstat calls per file, well above the ~1-3 a vault this deep \
+             should need -- worth a second look even though no budget governs it \
+             ({} calls over {} files)",
+            calls_per_file,
+            overhead.lstat_calls,
+            overhead.files
         );
     }
 }
