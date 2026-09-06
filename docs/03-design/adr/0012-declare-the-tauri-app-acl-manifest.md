@@ -242,7 +242,16 @@ the gate the definition of done names.**
 error this paragraph exists to avoid.** The Windows exclusion is untouched — the file is
 still `#[cfg(not(windows))]`, so a green `windows-latest` job would add nothing, and the
 remedy remains making `mock_app()` work there rather than any amount of CI. And `ci.yml`
-is **not** green today: the `definition of done` gate is red on `cargo test --workspace
-(windows-latest)`, tracked as task #70. It has passed end to end at least once on `main`
-(run 34044835359), so “it runs” and “it passes” are separate claims and only the first
-is being made here.
+runs without passing: the `definition of done` gate fails on `cargo test --workspace
+(windows-latest)`, **intermittently**, which task #70 has since settled as a real
+cross-process race on the shared 20k vault path.
+
+**This paragraph first offered “it has passed end to end at least once on `main`” as the
+balancing fact, and F-370 says that reading is itself the error.** The alternation is the
+race's signature rather than noise around it — run 34044208361 failed on `windows-latest`
+and 34044835359, the next commit and a doc-comment change, passed. A stale directory or a
+wrong path would fail every run alike; a fixture caught mid-generation fails only when the
+interleaving lands wrong. So **a green run after a red one is not evidence the bug is
+gone**, and citing one here as reassurance is how a race becomes permanent. The fix is
+structural, of the kind task #28 met, and it is #70's. “It runs” and “it passes” remain
+separate claims and only the first is made here.
