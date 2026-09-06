@@ -68,8 +68,18 @@ pub struct Environment {
 }
 
 impl Environment {
-    /// Detect it.
+    /// Detect it, once per process.
+    ///
+    /// Cached because detection shells out to PowerShell twice and the answer
+    /// cannot change during a run — without the cache the harness's own test
+    /// suite spent most of its time asking Windows the same two questions.
     pub fn detect() -> Environment {
+        static CACHED: std::sync::OnceLock<Environment> = std::sync::OnceLock::new();
+        CACHED.get_or_init(Environment::detect_uncached).clone()
+    }
+
+    /// Detect it, ignoring the cache.
+    pub fn detect_uncached() -> Environment {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(0);

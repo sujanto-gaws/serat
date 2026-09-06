@@ -91,6 +91,22 @@ Those generation figures were taken with the scanner **off**, and are recorded a
 
 If this drifts by more than ~30% the machine, its power plan or its scanner configuration has changed, and previously recorded budget numbers are no longer directly comparable.
 
+## No cold-start figure on this machine is a cold-*vault* figure
+
+A bound on what P0 can establish, not a footnote, and it belongs beside `gate_eligible: false` in every cold-start report.
+
+Every cold-start measurement spawns the application repeatedly against one vault. After the first iteration the Windows page cache holds it, so the walk is CPU-bound rather than I/O-bound for every sample that follows. **A user's cold start reads a cold vault.** The figure NFR-PRF-01 is asserted against is therefore a warm-vault figure, and the gap between it and the thing the requirement describes is unmeasured.
+
+It is unmeasured because it could not be measured here, and the attempt is worth recording rather than the conclusion alone. A freshly generated vault is *write*-cached rather than cold: measuring against fresh 20k vaults gave +42.9 ms (n = 12 per arm) against a **null control of +15.9 ms with the same binary on both arms** — the control was run precisely because the first result looked too clean, and most of the apparent effect was the harness measuring itself. Dropping the Windows page cache outright needs privileges the measuring account does not have.
+
+**What would fix it**, in order of preference:
+
+1. Drop the standby list between spawns (`RAMMap -Et`, or an equivalent that can be scripted) and re-take the series. If RM-1 can be given that privilege, this is a materially better measurement than anything taken so far and it is worth the setup.
+2. Failing that, measure the *first* spawn against a freshly written vault and report it separately with its own null control, so the number is at least labelled as what it is.
+3. Failing both, the gate report says the budget was validated against a warm vault and that the cold-vault case is untested. That is the current state.
+
+The same caveat applies to the proportionality comparison, and the scale-check report line carries it.
+
 ## Machines that are not the reference machine
 
 CI runners are not RM-1 and never will be. NFR-PRF-08 requires every budget to be asserted in CI and a regression to fail the build; that is a *regression gate*, and its thresholds are a property of the runner. The product budgets in NFR-PRF-01/03/04 are the numbers RM-1 must meet. Both are real, they are not the same number, and B2 keeps them in separate columns.
@@ -101,7 +117,7 @@ A GitHub-hosted Windows runner does have real-time protection enabled, so a CI n
 
 | ID | How this file serves it |
 |---|---|
-| NFR-PRF-01 | Names the "reference machine" the acceptance criterion refers to. |
+| NFR-PRF-01 | Names the "reference machine" the acceptance criterion refers to, and records that its cold-start figures are warm-vault figures. |
 | NFR-PRF-03 | Same, for save→index p95. |
 | NFR-PRF-04 | Same, for full rebuild wall clock; sets the rule that the gate figure is the scanner-enabled one. |
 | NFR-PRF-08 | Separates product budgets on RM-1 from regression thresholds in CI. |

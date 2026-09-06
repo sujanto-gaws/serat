@@ -1076,9 +1076,10 @@ pub fn check_vault(
 /// and nothing in a wall-clock figure can see that.
 ///
 /// It is worth a check rather than a comment because of what the regression
-/// costs: architect measured about 6x - 26,000 blocks at 2.1 s with
-/// the triggers live, against 0.32 s for the same shape at 26,000 blocks with
-/// them dropped (F-32). This is also the phase breakdown justifying its own
+/// costs: with the FTS triggers live a bulk load costs about **6x** on the
+/// phase that has to fit inside a 30 s budget — 26,000 blocks at 2.1 s live
+/// against 0.32 s dropped, independently reproduced at 5.8x with an identical
+/// resulting search index (F-32). This is also the phase breakdown justifying its own
 /// existence — the aggregate cannot distinguish these two worlds.
 ///
 /// # Errors
@@ -1095,8 +1096,9 @@ pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), Stri
         return Err(
             "the rebuild wrote rows but reports no FTS build time. blocks_fts is built once at \
              the end of the bulk load, so a zero here means the load went through the FTS \
-             triggers instead — which shows as a better-looking breakdown and a worse total, \
-             and cost about 6x when it was last measured: 2.1 s against 0.32 s at 26,000 blocks (F-32)."
+             triggers instead — which shows as a better-looking breakdown and a worse total. \
+             Loading through the triggers cost about 6x when it was measured: 26,000 blocks at \
+             2.1 s live against 0.32 s dropped (F-32)."
                 .to_string(),
         );
     }
@@ -1107,11 +1109,27 @@ pub fn check_bulk_load_shape(phases: &subject::RebuildPhases) -> Result<(), Stri
 ///
 /// P0 finding **F-47**. `sqlite_stat1` is read from the index directly, so this
 /// is an independent oracle rather than a number the rebuild reports about
-/// itself.
+/// itself. `sqlite_stat1` describes the whole `notes` table, so `expected` must
+/// be `vault.notes + vault.assets`, the same correction [`check_note_count`]
+/// needs and for the same reason (ADR-0005: an asset is a row in `notes` too).
 ///
 /// # Errors
-/// When the recorded row count is not the vault's note count.
+/// When the recorded row count is not the vault's total row count.
 pub fn check_analyze_freshness(recorded: usize, expected: usize) -> Result<(), String> {
+    // The precondition, stated rather than assumed (P0 finding F-128). This is
+    // the only place in the project where the defect is visible at all: below
+    // roughly 10,000 notes the opportunistic 5% re-ANALYZE fires on the last
+    // batch every time, the explicit analyze() becomes unobservable, and this
+    // check silently stops guarding while still passing. A green result here on
+    // a small vault means nothing was tested, not that nothing is wrong.
+    if expected < 10_000 {
+        return Err(format!(
+            "the ANALYZE check needs a vault of at least 10,000 notes to mean anything and this \
+             one has {expected}. Below that the opportunistic 5% re-ANALYZE fires every batch \
+             and the explicit call cannot be observed. Refusing rather than passing, because a \
+             guard that quietly stops guarding is worse than one that is absent."
+        ));
+    }
     if recorded == expected {
         return Ok(());
     }
@@ -1127,11 +1145,13 @@ pub fn check_analyze_freshness(recorded: usize, expected: usize) -> Result<(), S
 
 /// Whether every link the vault contains was resolved.
 ///
-/// The vault's manifest records the exact number of note-to-note link edges it
-/// generated, and a test asserts every wikilink in it resolves. So a rebuild
-/// reporting fewer has dropped links, and one reporting more has counted rows
-/// touched rather than links resolved — the bug rust-core-dev hit while writing
-/// the second pass, which is the rebuild-backpressure shape one layer up.
+/// The expected count is `note_links + asset_embeds`: the manifest records the
+/// note-to-note edges it generated and, separately, the `![[binary]]` embeds,
+/// and an asset is a row in `notes` so a rebuild resolves both (F-129). A
+/// rebuild reporting fewer has dropped links; one reporting more has counted
+/// rows touched rather than links resolved — the bug rust-core-dev hit while
+/// writing the second pass, which is the rebuild-backpressure shape one layer
+/// up.
 ///
 /// # Errors
 /// When the counts disagree.
@@ -1155,6 +1175,12 @@ pub fn check_links_resolved(reported: usize, expected: usize) -> Result<(), Stri
 /// A fast number over a partially indexed vault is the shape of a false pass,
 /// and a wall clock cannot see it (P0 finding F-19). Extracted from the job so
 /// that deleting it fails a test rather than passing silently (F-27).
+///
+/// `expected` must be `vault.notes + vault.assets`, not `vault.notes` alone:
+/// `RebuildReport::notes` counts every row in the `notes` table, and an asset
+/// is a row there too (`kind='asset'`, ADR-0005). Passing `vault.notes` on its
+/// own rejects every correct rebuild of a vault that has any assets at all —
+/// the 20k preset always would have, at 20,000 against 20,200.
 ///
 /// # Errors
 /// When the counts disagree.
@@ -1594,6 +1620,225 @@ where
              name -- not this budget's either (F-268).",
             samples.pipeline,
         ))
+}
+
+/// The window-painted mark at two vault sizes, measured in interleaved pairs.
+#[derive(Clone, Debug)]
+pub struct ScaleCheck {
+    /// Median at the 20k vault.
+    pub small_ms: f64,
+    /// Median at the 50k vault.
+    pub large_ms: f64,
+    /// p95 at the 20k vault. **This is what the judgement compares**, because
+    /// it is what the budget itself asserts.
+    pub small_p95_ms: f64,
+    /// p95 at the 50k vault.
+    pub large_p95_ms: f64,
+    /// How many pairs were taken.
+    pub pairs: usize,
+    /// **Median** of `large - small` within each pair.
+    ///
+    /// A rank statistic rather than a mean, because these distributions are
+    /// heavy-tailed and a mean under-detects: in the run that produced F-141,
+    /// the mean's confidence interval included zero while the sign test gave
+    /// p ≈ 0.04 and the p95 ratio was 1.20. A mean would have called a real
+    /// effect noise.
+    pub median_diff_ms: f64,
+    /// How many pairs had the larger vault slower.
+    pub larger_slower: usize,
+    /// Two-sided sign-test p for that count against a fair coin.
+    pub sign_test_p: f64,
+}
+
+/// Two-sided sign test: the probability of a split at least this lopsided if
+/// the two arms were exchangeable.
+///
+/// Exact rather than normal-approximated, since the harness runs tens of pairs
+/// rather than hundreds.
+pub fn sign_test_p(pairs: usize, successes: usize) -> f64 {
+    if pairs == 0 {
+        return 1.0;
+    }
+    let n = pairs;
+    let k = successes.min(n - successes);
+    // Sum the two tails: P(X <= k) + P(X >= n-k), which for a symmetric
+    // binomial is 2 * P(X <= k), capped at 1.
+    let mut tail = 0.0f64;
+    let mut coeff = 1.0f64; // C(n, 0)
+    for i in 0..=k {
+        if i > 0 {
+            coeff = coeff * ((n - i + 1) as f64) / (i as f64);
+        }
+        tail += coeff;
+    }
+    let total = 2.0f64.powi(n as i32);
+    ((2.0 * tail) / total).min(1.0)
+}
+
+/// Measure the window-painted mark at both vault sizes, **interleaved**.
+///
+/// Lifted out of `prf01-cold-start.rs` because P0 finding **F-81** was
+/// `assert_scale_independent` being well tested while its only caller — a
+/// function living in a binary — could be short-circuited with nothing going
+/// red. The guard was tested and nothing asked it.
+///
+/// The sampling is interleaved rather than blocked because of **F-109/F-123**.
+/// The within-arm spread on the reference machine is about five times the
+/// effect being tested for, so two blocks of twenty are contaminated by
+/// whatever the machine was doing during each block — which is how a
+/// 20,000-note vault measured *faster* than a 2-note one. Alternating the two
+/// arms spawn by spawn, and alternating which goes first, puts slow drift on
+/// both arms so it cancels in the paired difference. Same number of spawns,
+/// strictly more information: at 30 pairs the paired 95% CI came out
+/// [-123, +45] ms against a 179 ms tolerance, which decides the claim that
+/// blocked sampling could not.
+///
+/// Medians rather than p95 for the ratio: a p95 over twenty samples is a noisier
+/// estimator than the quantity it estimates. The *budget* stays a p95, because
+/// that is what NFR-PRF-01 says; only this comparison uses the median.
+///
+/// # Errors
+/// Any failure to take a measurement.
+pub fn measure_scale_independence<F>(
+    small: &VaultUnderTest,
+    large: &VaultUnderTest,
+    pairs: usize,
+    mut measure_one: F,
+) -> Result<ScaleCheck, String>
+where
+    F: FnMut(&VaultUnderTest, usize) -> Result<f64, String>,
+{
+    // The vaults are arguments rather than fetched here, so a test can drive
+    // this without generating 98 MiB and hashing it. `ensure_vault` has its own
+    // tests, in tests/vault_gate.rs, against a real vault on disk.
+    if pairs == 0 {
+        return Err("a scale check needs at least one pair".to_string());
+    }
+    let mut small_ms = Vec::with_capacity(pairs);
+    let mut large_ms = Vec::with_capacity(pairs);
+    let mut diffs = Vec::with_capacity(pairs);
+
+    for i in 0..pairs {
+        // Alternate which arm goes first, so any within-pair ordering effect —
+        // a warm page cache, a thermal ramp — falls on both arms equally.
+        let (a, b) = if i % 2 == 0 {
+            (small, large)
+        } else {
+            (large, small)
+        };
+        let first = measure_one(a, i)?;
+        let second = measure_one(b, i)?;
+        let (s_ms, l_ms) = if i % 2 == 0 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        small_ms.push(s_ms);
+        large_ms.push(l_ms);
+        diffs.push(l_ms - s_ms);
+    }
+
+    let larger_slower = diffs.iter().filter(|d| **d > 0.0).count();
+    Ok(ScaleCheck {
+        small_ms: median_of(&small_ms),
+        large_ms: median_of(&large_ms),
+        small_p95_ms: percentile_of(&small_ms, 0.95),
+        large_p95_ms: percentile_of(&large_ms, 0.95),
+        pairs,
+        median_diff_ms: median_of(&diffs),
+        larger_slower,
+        sign_test_p: sign_test_p(pairs, larger_slower),
+    })
+}
+
+/// Nearest-rank percentile of a slice of milliseconds, matching
+/// `Samples::percentile` exactly so the two cannot drift apart.
+fn percentile_of(xs: &[f64], q: f64) -> f64 {
+    let mut sorted = xs.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = ((q * sorted.len() as f64).ceil().max(1.0) as usize).min(sorted.len());
+    sorted[rank - 1]
+}
+
+/// Nearest-rank median, matching `Samples::median`.
+fn median_of(xs: &[f64]) -> f64 {
+    percentile_of(xs, 0.50)
+}
+
+/// Turn a scale measurement into the line a gate report carries.
+///
+/// # Errors
+/// When the critical path grew with the vault.
+pub fn judge_scale(check: &ScaleCheck) -> Result<String, String> {
+    // The comparison is on p95, because that is the statistic the budget
+    // asserts. The median and the sign test are reported beside it: they are
+    // the sensitive detectors, and the p95 is the one that means something
+    // against NFR-PRF-01. Judging on the mean would under-detect on these
+    // heavy-tailed distributions, and judging on the median alone would assert
+    // something the budget does not care about.
+    assert_scale_independent(check.small_p95_ms, check.large_p95_ms)?;
+    Ok(format!(
+        "PASS  NFR-PRF-01 · scale independence\n  window painted p95 {:.1} ms at 20k, {:.1} ms \
+         at 50k over {} interleaved pairs (median {:.1} / {:.1})\n  paired median difference \
+         {:+.1} ms, larger vault slower in {}/{} pairs, sign test p = {:.3} — vault size does \
+         not inflate the mark beyond the {:.0}% tolerance (§3.4). This bounds the effect; it \
+         does not claim there is none.\n  caveat: every iteration reads a page-cached vault, so \
+         no figure here is a cold-VAULT figure",
+        check.small_p95_ms,
+        check.large_p95_ms,
+        check.pairs,
+        check.small_ms,
+        check.large_ms,
+        check.median_diff_ms,
+        check.larger_slower,
+        check.pairs,
+        check.sign_test_p,
+        SCALE_TOLERANCE * 100.0
+    ))
+}
+
+/// Measure both vaults and judge the result, as one composable step.
+///
+/// Split from [`run_scale_check`] because a mutation that stopped
+/// [`judge_scale`] being called at all survived the sweep: the pieces were
+/// tested and the composition was not. This is F-69 one level further out than
+/// F-81 found it, and the same fix applies — everything but the I/O and the
+/// printing lives where a test can drive it.
+///
+/// # Errors
+/// A vault that cannot be prepared, a measurement that fails, or a critical
+/// path that grew with the vault.
+pub fn scale_verdict<V, F>(iterations: usize, vaults: V, measure: F) -> Result<String, String>
+where
+    V: FnOnce() -> Result<(VaultUnderTest, VaultUnderTest), String>,
+    F: FnMut(&VaultUnderTest, usize) -> Result<f64, String>,
+{
+    let (small, large) = vaults()?;
+    let check = measure_scale_independence(&small, &large, iterations, measure)?;
+    judge_scale(&check)
+}
+
+/// Architecture §3.4's load-bearing claim, measured and judged.
+///
+/// Returns whether it held, having printed the verdict either way.
+pub fn run_scale_check(iterations: usize) -> bool {
+    let verdict = scale_verdict(
+        iterations,
+        || Ok((ensure_vault("20k")?, ensure_vault("50k")?)),
+        |vault, run| {
+            subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
+        },
+    );
+    match verdict {
+        Ok(line) => {
+            println!("{line}");
+            true
+        }
+        Err(e) => {
+            println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
+            false
+        }
+    }
 }
 
 /// NFR-PRF-01's measurement: two marks from one set of cold starts.
@@ -2294,6 +2539,11 @@ mod tests {
             }
         }
 
+        // a_vault() is 20,000 notes and 200 assets; RebuildReport::notes and
+        // sqlite_stat1 both count the whole `notes` table, so the oracle every
+        // one of these closures is judged against is 20,200, not 20,000
+        // (found the hard way while wiring full_rebuild(), see check_note_count).
+
         // A rebuild that indexed half the vault must not post a fast number.
         let err = measure_full_rebuild_with(
             &a_vault(),
@@ -2306,7 +2556,7 @@ mod tests {
 
         // A failing rebuild propagates rather than being absorbed.
         let err =
-            measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()), |_| Ok(20_000))
+            measure_full_rebuild_with(&a_vault(), 1, |_, _| Err("boom".into()), |_| Ok(20_200))
                 .expect_err("a failed rebuild is not a measurement");
         assert_eq!(err, "boom");
 
@@ -2333,7 +2583,7 @@ mod tests {
             |_, _| Ok(timing(1, 20_200, 3)),
             |_| Ok(19_968),
         )
-        .expect_err("32 notes short of the finished index");
+        .expect_err("32 rows short of the finished index");
         assert!(err.contains("ix_notes_type"), "{err}");
 
         // As does a link count that does not match the vault.
@@ -2360,6 +2610,143 @@ mod tests {
     }
 
     #[test]
+    fn the_scale_check_interleaves_the_arms_and_rejects_a_path_that_grew() {
+        // F-81: assert_scale_independent was well tested and its only caller
+        // could be short-circuited with nothing going red. F-109/F-123: blocked
+        // sampling could not decide the claim at all, so the arms interleave.
+        let small = a_vault();
+        let mut large = a_vault();
+        large.notes = 50_000;
+
+        // The arms must alternate, and which one goes first must alternate too.
+        let mut order: Vec<usize> = Vec::new();
+        let check = measure_scale_independence(&small, &large, 4, |vault, _| {
+            order.push(vault.notes);
+            Ok(if vault.notes == 20_000 { 300.0 } else { 310.0 })
+        })
+        .expect("four pairs measured");
+        assert_eq!(
+            order,
+            vec![
+                20_000, 50_000, 50_000, 20_000, 20_000, 50_000, 50_000, 20_000
+            ],
+            "the arms must interleave, and the leading arm must alternate — blocked \
+             sampling is what made this claim undecidable"
+        );
+        assert_eq!(check.pairs, 4);
+        assert_eq!(check.small_ms, 300.0);
+        assert_eq!(check.large_ms, 310.0);
+        assert!(
+            (check.median_diff_ms - 10.0).abs() < 1e-9,
+            "paired median difference"
+        );
+        assert_eq!(
+            check.larger_slower, 4,
+            "the larger vault was slower every time"
+        );
+        assert!(
+            check.sign_test_p < 0.13,
+            "4/4 one way: p = {}",
+            check.sign_test_p
+        );
+
+        let line = judge_scale(&check).expect("3% growth is within tolerance");
+        assert!(line.contains("PASS"), "{line}");
+        assert!(line.contains("interleaved pairs"), "{line}");
+        assert!(
+            line.contains("does not claim there is none"),
+            "the claim is a bound on the effect, not its absence: {line}"
+        );
+
+        // The paired difference is what survives machine drift: both arms move
+        // together, and the difference does not.
+        let mut i = 0;
+        let drifting = measure_scale_independence(&small, &large, 6, |vault, _| {
+            i += 1;
+            // A ramp of 100 ms per spawn, on top of a flat 5 ms real effect.
+            let drift = f64::from(i) * 100.0;
+            Ok(drift + if vault.notes == 20_000 { 300.0 } else { 305.0 })
+        })
+        .expect("six pairs");
+        assert!(
+            drifting.median_diff_ms.abs() < 106.0,
+            "drift must not read as an effect: {:?}",
+            drifting
+        );
+
+        // A tail-only regression: the median is flat and the p95 is not. The
+        // judgement must fail. This is the case tauri-app-dev warned about --
+        // the real walk-deferral effect was in the tail, with a p95 ratio of
+        // 1.20 while the median barely moved -- and a judgement on the median
+        // or the mean would call it noise.
+        let mut n = 0;
+        let tail_only = measure_scale_independence(&small, &large, 20, |vault, _| {
+            if vault.notes == 20_000 {
+                return Ok(300.0);
+            }
+            n += 1;
+            // Four slow spawns in twenty: the median is untouched, the p95 is not.
+            Ok(if n > 16 { 900.0 } else { 300.0 })
+        })
+        .expect("twenty pairs");
+        assert_eq!(tail_only.large_ms, 300.0, "the median is flat");
+        assert_eq!(tail_only.small_p95_ms, 300.0);
+        assert_eq!(tail_only.large_p95_ms, 900.0, "the tail is not");
+        let err = judge_scale(&tail_only)
+            .expect_err("a tail-only regression must fail; the budget is a p95");
+        assert!(err.contains("proportional to vault size"), "{err}");
+
+        // The shape a path proportional to vault size would produce.
+        let grew = ScaleCheck {
+            small_ms: 300.0,
+            large_ms: 750.0,
+            small_p95_ms: 300.0,
+            large_p95_ms: 750.0,
+            pairs: 30,
+            median_diff_ms: 450.0,
+            larger_slower: 30,
+            sign_test_p: 0.0,
+        };
+        let err = judge_scale(&grew).expect_err("2.5x must fail the job");
+        assert!(err.contains("proportional to vault size"), "{err}");
+
+        // Zero pairs is a failure, not an empty pass.
+        let err = measure_scale_independence(&small, &large, 0, |_, _| Ok(300.0))
+            .expect_err("no pairs is not a passing scale check");
+        assert!(err.contains("at least one pair"), "{err}");
+
+        // And a failure to measure propagates rather than being absorbed.
+        let err = measure_scale_independence(&small, &large, 4, |_, _| Err("no app".into()))
+            .expect_err("a failed measurement is not a passing scale check");
+        assert_eq!(err, "no app");
+
+        // The composition, because a mutation that stopped judge_scale being
+        // called at all survived when only the pieces were tested.
+        // The two vaults must be distinguishable, or a closure keyed on call
+        // order rather than on the vault would pass for the wrong reason -- as
+        // this test did until the interleaving made it visible.
+        let vaults = || {
+            let mut fifty = a_vault();
+            fifty.notes = 50_000;
+            Ok((a_vault(), fifty))
+        };
+        let line = scale_verdict(4, vaults, |_, _| Ok(300.0)).expect("a flat critical path passes");
+        assert!(line.starts_with("PASS"), "{line}");
+        assert!(line.contains("300.0 ms at 20k"), "{line}");
+
+        let err = scale_verdict(4, vaults, |vault, _| {
+            Ok(if vault.notes == 20_000 { 300.0 } else { 750.0 })
+        })
+        .expect_err("2.5x growth must not produce a PASS line");
+        assert!(err.contains("proportional to vault size"), "{err}");
+
+        // A vault that cannot be prepared is a failure, not a pass.
+        let err = scale_verdict(4, || Err("no 50k vault".to_string()), |_, _| Ok(300.0))
+            .expect_err("no vault, no verdict");
+        assert_eq!(err, "no 50k vault");
+    }
+
+    #[test]
     fn stale_analyze_statistics_are_caught() {
         // F-47: the only scale at which this is visible is the real vault.
         // 20000 % 512 = 32, and 32 never crosses the 5% (1,000-note) threshold.
@@ -2370,12 +2757,22 @@ mod tests {
     }
 
     #[test]
+    fn the_analyze_check_refuses_a_vault_too_small_to_show_the_defect() {
+        // F-128. Below ~10,000 notes the opportunistic re-ANALYZE fires every
+        // batch, so a green result would mean nothing was tested. Refusing beats
+        // passing: a guard that quietly stops guarding is worse than none.
+        let err = check_analyze_freshness(400, 400).expect_err("the smoke vault cannot show it");
+        assert!(err.contains("at least 10,000 notes"), "{err}");
+        check_analyze_freshness(20_000, 20_000).expect("the 20k vault can");
+    }
+
+    #[test]
     fn dropped_or_over_counted_links_are_caught() {
-        check_links_resolved(216_971, 216_971).expect("every link resolved");
-        let dropped = check_links_resolved(200_000, 216_971).expect_err("links lost");
+        check_links_resolved(218_975, 218_975).expect("every link resolved");
+        let dropped = check_links_resolved(200_000, 218_975).expect_err("links lost");
         assert!(dropped.contains("dropped"), "{dropped}");
         // The bug rust-core-dev hit: rows touched counted as links resolved.
-        let over = check_links_resolved(230_000, 216_971).expect_err("over-counted");
+        let over = check_links_resolved(230_000, 218_975).expect_err("over-counted");
         assert!(over.contains("other than resolved links"), "{over}");
     }
 

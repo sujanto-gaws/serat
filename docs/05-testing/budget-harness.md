@@ -70,13 +70,17 @@ The five phases will not sum to the wall clock, and the gap is the producer and 
 
 **F-47: `ANALYZE` must describe the finished index, and only this vault can show it.** `commit()` re-runs `ANALYZE` when a batch touches more than 5% of the notes. At test scale 5% is smaller than one batch, so the opportunistic path fires on the last batch every time and the rebuild's explicit `analyze()` is unobservable — which is why deleting it changed nothing in `serat-index`'s own tests. At 20,000 notes the threshold is 1,000 against a batch of 512, so the tail of `20000 % 512` = **32 notes** never crosses it. Remove or reorder the explicit call and the planner's statistics describe the index as it was 32 notes ago; architecture §4.3 records what follows — `ix_notes_kind` over `ix_notes_type`, and every typed query a full scan. That is the defect that otherwise surfaces as "queries are slow on my real vault but fine in the tests" three months into P2.
 
+**This check has a precondition, and it refuses rather than passing when it is unmet.** Below roughly 10,000 notes the opportunistic 5% re-ANALYZE fires on the last batch every time, the explicit `analyze()` becomes unobservable, and a green result would mean nothing was tested rather than that nothing is wrong (F-128). So `check_analyze_freshness` returns an error on a vault that small: a guard that quietly stops guarding is worse than one that is absent, and this is the only place in the project where the defect is visible at all.
+
 So after each rebuild the harness reads `sqlite_stat1` **out of the index itself** and asserts the row count it records for `notes` equals the vault's note count. Reading the database rather than trusting a number the rebuild reports is the same argument as recomputing the vault digest: an oracle the code under test does not supply.
 
-**Links resolved are checked against the manifest too.** The generator records exactly how many note-to-note edges it produced, and a test asserts every wikilink in the vault resolves — so a rebuild reporting fewer has dropped links, and one reporting *more* has counted rows touched rather than links resolved. That second case is not hypothetical: rust-core-dev hit it while writing the second pass, and a dangling link came back reported as resolved. It is the rebuild-backpressure shape one layer up — a wrong number that looks right.
+**Links resolved are checked against the manifest too, at `edges + asset_embeds`.** An asset is a row in `notes` with `kind='asset'` (ADR-0005), so a rebuild resolves `![[report.pdf]]` like any other link — while the manifest's `link_degree.edges` counts only note-to-note edges. Rather than either side bending a number to match the other, the generator now records `content.asset_embeds` separately and the harness adds them: **the manifest is the oracle and the rebuild's count is the thing under test, so the oracle is the one that has to be derivable** (F-129). Adding the field changed no vault byte — the canonical digests are unchanged, because the manifest lives outside the vault.
 
-**F-38: `write-FTS` must be non-zero.** `write_rows` and `write_fts` are only comparable across runs if both were measured on the bulk-load shape — triggers dropped, `blocks_fts` built once at the end. A rebuild that regressed to loading *through* the triggers would report `write_fts` at roughly zero with `write_rows` absorbing the cost: **the breakdown would look better while the total got worse**, and no wall-clock figure can see that. Given F-32 — 2.1 s at 26,000 blocks with the triggers live against 0.32 s with them dropped, about 6x, reproduced independently at 5.8x — it is the rebuild regression most worth catching, and it is the phase breakdown justifying its own existence.
+A rebuild reporting fewer has dropped links, and one reporting *more* has counted rows touched rather than links resolved. That second case is not hypothetical: rust-core-dev hit it while writing the second pass, and a dangling link came back reported as resolved. It is the rebuild-backpressure shape one layer up — a wrong number that looks right.
 
-So the job records five phases beside the total — **walk, read+hash, parse, producer waited, FTS build** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. `write` is split on the architect's evidence: 3.7 s of bulk row insert against 1.9 s of `blocks_fts` build at 259,971 blocks, and with the FTS triggers left live the same shape cost 2.1-10.3 s at 26,000 blocks against 0.32 s dropped. Reported as one figure those are indistinguishable and the fixes differ, which is the same argument as F-10 itself, one level down. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
+**F-38: `write-FTS` must be non-zero.** `write_rows` and `write_fts` are only comparable across runs if both were measured on the bulk-load shape — triggers dropped, `blocks_fts` built once at the end. A rebuild that regressed to loading *through* the triggers would report `write_fts` at roughly zero with `write_rows` absorbing the cost: **the breakdown would look better while the total got worse**, and no wall-clock figure can see that. Given F-32 — about **6x**, 26,000 blocks at 2.1 s with the triggers live against 0.32 s dropped, independently reproduced at 5.8x with an identical resulting search index — it is the rebuild regression most worth catching, and it is the phase breakdown justifying its own existence.
+
+So the job records five phases beside the total — **walk, read+hash, parse, producer waited, FTS build** — as milliseconds and as a share of the wall clock, in the report and in the result JSON. `write` is split on the architect's evidence: on the dropped-trigger load, 3.7 s of bulk row insert against 1.9 s of `blocks_fts` build at 259,971 blocks; with the triggers left live, the same shape cost 2.1 s at 26,000 blocks against 0.32 s dropped. Reported as one figure those are indistinguishable and the fixes differ, which is the same argument as F-10 itself, one level down. The walk enumerates without reading contents, so the split is real rather than notional. Phases are the per-phase median across runs, not the phases of the median run: one slow run should not decide where the time went.
 
 The phases are allowed to sum to *less* than the wall clock. That is concurrency between the parse pool and the writer, not an error, and the report says so rather than leaving a reader to wonder — a sum that exceeded the total would be the thing worth investigating.
 
@@ -102,15 +106,48 @@ D2 has landed, so NFR-PRF-01 is measurable. The app writes one line of JSON to `
 3. **The marks are out of order.** `main` ≤ `window_created` ≤ `window_visible` ≤ `vault_usable`. Out of order means the wall clock moved under the run, and a sample that survived a clock step is not a sample.
 4. **`window_visible - window_created < 5 ms`.** This is the blank-rectangle check. §3.4 measures the *painted shell*, not window creation, and the two differ by the cost of loading and compositing the webview bundle — far more than 5 ms. A paint mark rewired to fire at window creation collapses that gap to about zero, passes 400 ms, and ships a blank rectangle. The threshold is a mutation detector, not a performance floor; tauri-app-dev asked the harness to own it, and if it ever fires on an honest run that is a more interesting result than the job passing.
 
+**No note is opened, and none is required.** Task #52 ruled that "vault usable" is architecture.md §3.4's four preconditions — index state known, file tree delivered, watcher settled, window painted — and none of them is "a note is rendered": `--open` is session restore for a user, not a readiness precondition, so the harness stopped passing it (task #54). The trace still carries `last_open` for a real user session that did restore one, but the harness's own cold-start runs report it empty, and an empty `last_open` is not treated as a failure.
+
 The app has no Rust-side path that stamps the paint mark — it comes only from a double `requestAnimationFrame` after the shell's first render — so a shell that paints nothing never marks, the run times out, and the job goes red. There is no fast path for a blank rectangle.
 
 **Two honesty notes for the gate report**, from tauri-app-dev: until S2 lands the webview is a placeholder page rather than the Vue app, so the P0 figure is the shell's cold start with a trivial front end and S2 will move it; and `--exit-after-ready` exits after the usable mark, so every iteration is genuinely cold.
+
+### Every cold-start figure is a warm-vault figure
+
+Stated in the report line itself, not only here. Each iteration spawns against the same vault, so after the first the page cache holds it and the walk is CPU-bound; a user's cold start reads a cold vault. The gap is unmeasured because dropping the Windows page cache needs privileges the measuring account lacks, and a freshly generated vault is write-cached rather than cold — measuring that way gave +42.9 ms against a **null control of +15.9 ms with the same binary on both arms**, so most of the apparent effect was the harness measuring itself. `reference-machine.md` records what would fix it. Until then this is a stated bound on what P0 established.
 
 ### Scale independence: §3.4's load-bearing claim, as a test
 
 Architecture §3.4 states that **nothing on the critical path is proportional to vault size** — the main thread never opens the index, and the file tree renders from one query over `notes(path)` rather than from the walk. That is a claim, so it gets a test rather than a paragraph.
 
-`prf01-cold-start` runs the same measurement against the 20k and the 50k vault and asserts the window-painted p95 did not grow by more than **20%**. If the critical path were proportional to vault size, 2.5x the notes would show up as roughly 2.5x the time; 20% sits far below that and comfortably above run-to-run noise, so the check fails on the thing it is for and not on a warm afternoon. `--skip-scale` omits it for a quick local run.
+`prf01-cold-start` runs the same measurement against the 20k and the 50k vault and asserts the window-painted **median** did not grow by more than **20%**. If the critical path were proportional to vault size, 2.5x the notes would show up as roughly 2.5x the time; 20% sits far below that, so the check fails on the thing it is for. `--skip-scale` omits it for a quick local run.
+
+**The arms are interleaved, not blocked, and that is what makes the claim decidable.** Measured as two blocks of twenty, the comparison could not resolve anything: the within-arm spread on the reference machine is about five times the effect being tested for, so each block carries whatever the machine was doing during it — which is how a 20,000-note vault came out *faster* than a 2-note one, and why the claim was briefly recorded as undecidable (F-109). It is not undecidable; the design was wrong. Alternating the arms spawn by spawn, and alternating which arm leads, puts slow drift on both and cancels it in the paired difference. Same number of spawns, strictly more information: at 30 pairs the paired 95% CI came out **[-123, +45] ms against a 179 ms tolerance**, which excludes an effect the size of the tolerance (F-123).
+
+Three consequences, each of which the harness states rather than assumes:
+
+- **The comparison is judged on p95 and reported with rank statistics.** The judgement compares the two p95s, because that is the statistic NFR-PRF-01 itself asserts. Beside it the report carries the paired **median** difference and a **sign test** — rank statistics, because these distributions are heavy-tailed and a mean under-detects: in the run behind F-141 the mean's confidence interval included zero while the sign test gave p ≈ 0.04 and the p95 ratio was 1.20. A mean would have called a real effect noise.
+- **The tolerance stays at 20%.** Widening it would trade away the detection it was sized for. The instrument was the problem, not the threshold — and architect, who set it, said so themselves after measuring the noise they had not measured when they set it.
+
+  It is worth knowing how little headroom that leaves for one specific regression. Removing the walk deferral costs a **p95 ratio of 1.20** — measured paired, after the same blocked-sampling error inflated the original estimate by about ten times. So this assertion would sit exactly on its threshold for that defect rather than clearly failing, which is a further argument for judging on the p95 the budget cares about rather than on a mean that would miss it entirely.
+- **The claim is stated as a bound, not as an absence.** The report says "vault size does not inflate the mark beyond the tolerance … This bounds the effect; it does not claim there is none." The CI excludes an effect as large as the tolerance; it does not exclude a small real one, and the budget is about the former.
+
+Blocked runs remain fine for the absolute budget p95s — a budget is a threshold and needs no pairing. Only the comparison between vault sizes does.
+
+### F-99: which end of the save path, and nobody has the number
+
+F-03 settled which *path* NFR-PRF-03 governs — Serat's own save, not the watcher path with its 150 ms coalescing window. **F-99 asks which *end* of that path, and the two differ by more than the budget:**
+
+| End | What it is |
+|---|---|
+| submit → `flush()` returns | the index has committed; a reader opening a transaction now sees the change |
+| submit → `index.changed` arrives | what the **UI** learns from, throttled to ten per second — so up to **100 ms** later, twice the entire 50 ms budget |
+
+Only the second is what a person experiences. The harness measures both, asserts the drained one, and reports the notified one beside it — the same treatment F-03's two intervals get, for the same reason. Which end the requirement *means* is product-analyst's at Q1; making the ambiguity visible is the harness's job, and a passing 50 ms figure against the wrong end would describe nothing a user could notice.
+
+**The seam asks for `submit()` then `flush()`, not a combined `apply_and_wait()`.** Architect's ruling, and the reason is better than the one I would have given: a barrier must stay visible where it is called. `submit(); flush();` shows the wait; `apply_and_wait()` is a verb that reads like a write and hides one, and it is a single copy-paste from the save path where the wait is forbidden by design goal 2. It is also a better seam — the two calls are separately timeable, so if a number ever looks wrong you can see whether the cost is in the submit or in the drain.
+
+One submit per flush. `flush()` drains the whole queue, so submitting fifty and flushing once would be a throughput figure wearing a latency label, and NFR-PRF-03 is a p95 of individual saves.
 
 ### p95 is nearest-rank
 
@@ -139,11 +176,36 @@ cargo run --release -p budget --bin environment
 
 It prints the scanner state, power plan and core count, and exits non-zero when the environment cannot produce a gate number — so a script can refuse to take the gate figure in the wrong conditions.
 
+## The five phases do not share a unit, and the labels are load-bearing
+
+This is the part of the rebuild report most likely to be misread, so the report says it out loud:
+
+| Phase | Unit |
+|---|---|
+| `walk` | **wall clock**, single-threaded |
+| `read_hash` | **CPU time, summed across the parse pool** — can exceed the wall clock, and on eight cores should |
+| `parse` | **CPU time, summed across the parse pool** — same |
+| `producer waited` | **how long the producer was blocked**, plus the final drain. Not the writer's cost |
+| `fts build` | **wall clock**, writer-side |
+
+A reader adding them expecting a total is wrong twice over: once by a figure that is too small, and twice by two that are too large. None of them is a share of anything.
+
+**Why the harness labels rather than normalises.** `parse` as CPU time read against `producer waited` is precisely what settles architecture.md's open design question 1:
+
+- **parse-dominated** — `parse` several times the wall clock (the pool busy on every core), `producer waited` near zero (the writer never made anyone wait). The fix is pool sizing.
+- **writer-dominated** — `parse` at or below the wall clock (cores idle, waiting on the queue), `producer waited` large. The fix is batching.
+
+Those are opposite conclusions from the same two columns. Dividing the phases by the wall clock so they added up would destroy the one number P0 was built to produce. The parse pool is sized at cores minus one (§2.2), so `serat_index::parse_pool_threads()` belongs in the gate report beside the figures — a rebuild number without the pool width is not comparable between machines.
+
+`SaveTiming`'s three phases (NFR-PRF-03) *do* sum, because one save is single-threaded. That inconsistency between the two structures is deliberate and worth knowing rather than discovering.
+
 ## Which of these guards can be removed without a test going red
 
 The harness exists to stop a number being believed when it should not be, so it is the component where a test that cannot fail does the most damage. Reading a test does not tell you whether it can fail — the assertion looks right either way. The only way to find out is to change the code and watch.
 
 `bench/budget` is therefore swept by mutation: apply one change to a scratch copy, run the suite, record whether anything went red. **The current sweep is 27 mutations, all caught.** It is not a fixture in the repository, because a mutation harness that runs in CI becomes a thing to satisfy rather than a thing to learn from; it is a technique, and the record of what it found belongs in the gate report.
+
+**A mutation only tells you something if you did not write the test with that mutation in mind.** Without that rule the technique produces a number that certifies itself. It is why the first round below is reported and then discarded.
 
 The first two rounds are the useful part, because they failed:
 
@@ -239,3 +301,6 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-091 | F-49 — dropped or over-counted resolved links are caught | `…::dropped_or_over_counted_links_are_caught` | pass |
 | TC-092 | F-46 — the producer-wait phase is labelled for what it measures | `…::the_producer_wait_phase_is_labelled_for_what_it_measures` | pass |
 | TC-093 | F-38 — the FTS check still covers a run where the writer kept up | `…::the_fts_check_still_covers_a_run_where_the_writer_kept_up` | pass |
+| TC-109 | F-81, F-109, F-123 — the scale check interleaves the arms, cancels drift, and rejects a path that grew | `…::the_scale_check_interleaves_the_arms_and_rejects_a_path_that_grew` | pass |
+| TC-110 | F-128 — the ANALYZE check refuses a vault too small to show the defect | `…::the_analyze_check_refuses_a_vault_too_small_to_show_the_defect` | pass |
+| TC-111 | S1, task #52 — an empty `last_open` is the normal case (no note is a precondition) and parses fine | `bench/budget/src/trace.rs::an_empty_last_open_is_the_normal_case_now_and_parses_fine` | pass |

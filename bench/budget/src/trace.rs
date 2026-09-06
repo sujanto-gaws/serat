@@ -60,6 +60,16 @@ pub struct StartupTrace {
     /// The vault the app says it opened, so a run against the wrong vault is
     /// visible rather than merely fast.
     pub vault: String,
+    /// The note the shell actually rendered, or empty when none was.
+    ///
+    /// Empty on every cold-start run the harness itself takes: task #52 ruled
+    /// that `t_usable` is §3.4's four preconditions -- index state known, file
+    /// tree delivered, watcher settled, window painted -- and none of them is
+    /// "a note is rendered", so the harness no longer passes `--open` at all
+    /// (task #54). Recorded rather than dropped because a user session that
+    /// did restore a note still reports it here, and because a non-empty value
+    /// on a harness run would itself be worth noticing.
+    pub last_open: String,
 }
 
 impl StartupTrace {
@@ -100,6 +110,7 @@ impl StartupTrace {
             t0_source: text("t0_source")?,
             profile: text("profile")?,
             vault: string(line, "vault").unwrap_or_default(),
+            last_open: string(line, "last_open").unwrap_or_default(),
         };
         trace.validate()?;
         Ok(trace)
@@ -189,8 +200,8 @@ mod tests {
         r#"{"t0_to_window_visible_ms": 312.4, "t0_to_vault_usable_ms": 803.1,
             "t0_to_main_ms": 41.2, "t0_to_window_created_ms": 96.8,
             "t0_source": "harness", "profile": "release",
-            "vault": "bench/vaults/vault-20k", "notes_rendered": 20200,
-            "schema_version": 1}"#
+            "vault": "bench/vaults/vault-20k", "last_open": "_types/Project.md",
+            "notes_walked": null, "schema_version": 1}"#
             .replace('\n', " ")
     }
 
@@ -251,6 +262,18 @@ mod tests {
         let negative = good().replace("\"t0_to_main_ms\": 41.2", "\"t0_to_main_ms\": -3.0");
         let err = StartupTrace::parse(&negative).expect_err("a negative mark must not pass");
         assert!(err.contains("not a duration"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_last_open_is_the_normal_case_now_and_parses_fine() {
+        // Task #52: no note is a precondition for "vault usable", so the
+        // harness no longer passes --open at all (task #54) and every real
+        // trace it takes has an empty last_open. An earlier version of this
+        // check rejected that as "rendered nothing" -- which would have failed
+        // every cold-start run once the harness stopped opening a note.
+        let line = good().replace("\"last_open\": \"_types/Project.md\", ", "");
+        let trace = StartupTrace::parse(&line).expect("an empty last_open is not a failure");
+        assert_eq!(trace.last_open, "");
     }
 
     #[test]

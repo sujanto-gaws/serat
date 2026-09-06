@@ -1,26 +1,20 @@
 //! The seam — the only module in the harness that touches a Serat crate.
 //!
-//! Everything measured enters through one of the three functions below. They
-//! return an error today because something they need does not exist yet.
+//! Everything measured enters through one of the three functions below.
 //!
-//! **I4 (rebuild) and I5 (incremental apply) have both landed** on
-//! `serat-index`. What is missing from both `full_rebuild()` and
-//! `save_to_index()` is the same thing: a production `NoteParser`.
-//! `serat-parse` (task I3) is still the I1 scaffold, and neither seam can be
-//! assembled without excluding real parse cost from its total — which for
-//! `save_to_index()` specifically would also mean asserting a number `apply()`
-//! never actually produced, since parsing is on its critical path. See
-//! [`SAVE_ENTRY_POINT`] and [`REBUILD_ENTRY_POINT`].
+//! **All three are wired and landing red is no longer their default state.**
+//! `full_rebuild()` (I4, I3) and `save_to_index()` (I5, I3) both call the real
+//! `serat-index`/`serat-parse` seams; the entry-point constants below are kept
+//! as history of what each one asked for while it was still an error, not as
+//! a current status. `cold_start()` spawns the real `serat-app` binary (S1)
+//! and reads `--exit-after-ready`'s trace; task #52 settled the one open
+//! question about what it waits for -- see [`COLD_START_ENTRY_POINT`] below,
+//! which is current rather than aspirational.
 //!
-//! `cold_start()` waits on S1 once architect's D2 defines the vault-usable
-//! mark. **The jobs therefore land red on purpose.** A budget job that skips
-//! when the thing it measures is absent is worse than no job, because a green
-//! build then means nothing.
-//!
-//! Keeping the seam in one file is deliberate: when a function's last blocker
-//! lands, only that function's body changes and no measurement code moves.
-//! The signatures in the `*_ENTRY_POINT` constants below are the request to
-//! `rust-core-dev` — anything that satisfies them satisfies the harness.
+//! Keeping the seam in one file is deliberate: when a function's blockers
+//! land, only that function's body changes and no measurement code moves.
+//! The signatures in the `*_ENTRY_POINT` constants below are what
+//! `rust-core-dev` was asked for, kept for the record even after landing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,11 +37,31 @@ use crate::trace::StartupTrace;
 /// notional: four phases, four durations, reported beside the total.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RebuildPhases {
-    /// Enumerating the vault. No file contents read.
+    /// **Wall clock.** Enumerating the vault, single-threaded. No contents read.
     pub walk: Duration,
-    /// Reading bytes and hashing them for the change gate (§3.1 step 3).
+    /// **CPU time, summed across the parse pool.** Reading bytes and hashing
+    /// them for the change gate (§3.1 step 3).
+    ///
+    /// Can legitimately exceed the rebuild's wall clock — on eight cores it
+    /// should. It is not a share of anything.
     pub read_hash: Duration,
-    /// Markdown to blocks, fields, links, tasks, on the rayon pool.
+    /// **CPU time, summed across the parse pool.** Markdown to blocks, fields,
+    /// links and tasks.
+    ///
+    /// Can legitimately exceed the wall clock, and this is the number that
+    /// settles architecture.md's open design question 1 when read against
+    /// `producer_wait`:
+    ///
+    /// * **parse-dominated** — `parse` several times the wall clock (the pool
+    ///   busy on every core) and `producer_wait` near zero (the writer never
+    ///   made anyone wait). The fix is pool sizing.
+    /// * **writer-dominated** — `parse` at or below the wall clock (cores idle,
+    ///   waiting on the queue) and `producer_wait` large. The fix is batching.
+    ///
+    /// Those are opposite conclusions from the same two columns, which is why
+    /// the harness labels rather than normalises. Dividing these by the wall
+    /// clock to make the five phases add up would destroy the one number P0 was
+    /// built to produce.
     pub parse: Duration,
     /// **How long the producer was blocked, not what the writer cost.**
     ///
@@ -67,19 +81,32 @@ pub struct RebuildPhases {
     pub producer_wait: Duration,
     /// Building `blocks_fts` with the FTS5 `rebuild` command after the bulk
     /// load, plus the final ANALYZE. Architect measured 1.9 s for 259,971
-    /// blocks. Unlike `producer_wait` this is real writer-side work.
+    /// blocks on the dropped-trigger load (architecture 4.4). Unlike
+    /// `producer_wait` this is real writer-side work.
     ///
-    /// Split from `write_rows` because the two have different fixes and
-    /// reporting them together hides a 6x: with the triggers left live, the same
-    /// insert cost 2.1-10.3 s at 26,000 blocks against 0.32 s with them dropped,
-    /// against 0.32 s with them dropped - about 6x, reproduced independently at 5.8x.
+    /// Split from the producer's wait because the two have different fixes and
+    /// reporting them together hides a 6x: with the FTS triggers left live the
+    /// same insert cost 2.1 s at 26,000 blocks against 0.32 s with them
+    /// dropped, independently reproduced at 5.8x.
+    ///
+    /// **Not yet obtainable from `serat_index::RebuildReport` as landed.** I4
+    /// shipped one combined `write: Duration` (`submit_blocking` waits plus the
+    /// final flush) and does not time `end_bulk_load`/`analyze` separately at
+    /// all — that time is real and inside the wall clock, attributed to
+    /// nothing. Asked rust-core-dev to add this field; until it exists,
+    /// [`full_rebuild`] must keep refusing rather than report a zero here,
+    /// which would trip [`crate::check_bulk_load_shape`] (F-38) on every real
+    /// run and make the guard indistinguishable from an actual regression.
     pub write_fts: Duration,
 }
 
 impl RebuildPhases {
-    /// The four phases summed. Not the same as the wall clock, and deliberately
-    /// so: phases overlap when the parse pool and the writer run concurrently,
-    /// and a sum that exceeded the total would be the first evidence of that.
+    /// The phases summed. **Not comparable with the wall clock**, and
+    /// deliberately so: `walk` is wall clock, `read_hash` and `parse` are CPU
+    /// time across the pool, `producer_wait` is a wait rather than a cost, and
+    /// `write_fts` is writer-side wall clock. A reader adding them expecting a
+    /// total is wrong twice over — once by a figure that is too small and twice
+    /// by two that are too large.
     pub fn sum(&self) -> Duration {
         self.walk + self.read_hash + self.parse + self.producer_wait + self.write_fts
     }
@@ -113,55 +140,79 @@ pub struct RebuildTiming {
     pub links_resolved: usize,
 }
 
-/// What the harness needs from `serat-index` before NFR-PRF-04 is measurable.
-pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-index (task I4):
+/// What the harness still needs before NFR-PRF-04 is measurable.
+///
+/// **Half of this landed.** `serat_index::rebuild` (task I4) is real, on main,
+/// with this exact shape:
+///
+/// ```text
+/// pub fn rebuild(
+///     source: &dyn NoteSource,
+///     parser: &dyn NoteParser,
+///     index_dir: &Path,
+/// ) -> Result<RebuildReport, IndexError>;
+///
+/// pub struct RebuildReport {
+///     pub notes: usize,   // every row in `notes` -- notes AND assets
+///                         // (kind='asset', ADR-0005). NOT markdown-only,
+///                         // which the harness's own oracle now accounts
+///                         // for: `vault.notes + vault.assets`.
+///     pub blocks: usize, pub fields: usize, pub links: usize,
+///     pub tasks: usize,
+///     pub links_resolved: usize,
+///     pub walk: Duration, pub read_hash: Duration, pub parse: Duration,
+///     pub write: Duration,  // submit_blocking waits + the final flush --
+///                           // NOT split into producer_wait/write_fts as
+///                           // this crate's RebuildPhases wants (F-10,
+///                           // F-38). end_bulk_load/analyze aren't timed
+///                           // at all; that cost is real and inside the
+///                           // wall clock, attributed to nothing. Asked
+///                           // rust-core-dev to add `write_fts`.
+///     pub skipped: usize,
+/// }
+/// ```
+///
+/// And `serat_vault::Vault` already implements `NoteSource`
+/// (`serat-vault/src/lib.rs:607`, exercised by its own
+/// `the_vault_satisfies_the_trait_the_index_rebuilds_through`).
+///
+/// **What is still missing is `NoteParser`.** `serat-parse` (task I3) is still
+/// the I1 scaffold: no type in it implements the trait. The only
+/// implementations anywhere are test fakes private to `serat-index`'s own test
+/// suite (`serat-index/tests/support/mod.rs::LineParser`), not importable from
+/// here and not a stand-in for real Markdown cost regardless. Wiring this seam
+/// against a throwaway parser would report a total that excludes exactly the
+/// cost architecture.md's open design question 1 asks about -- whether the
+/// parse pool or the index writer dominates a rebuild -- so the number would
+/// be the flattering-by-omission kind this harness exists to refuse.
+pub const REBUILD_ENTRY_POINT: &str = "NFR-PRF-04 needs, from serat-parse (task I3):
 
-    // Dependencies injected as serat-core traits, because a rebuild walks,
-    // parses and writes, and no product crate may depend on two of those
-    // (architecture 2.1). Shape confirmed by rust-core-dev; the exact spelling
-    // is provisional until architect rules on where rebuild orchestration
-    // lives. NoteSource is new in I4; NoteParser already exists.
-    pub fn rebuild(
-        source: &dyn NoteSource,
-        parser: &dyn NoteParser,
-        index_dir: &Path,
-    ) -> Result<RebuildReport, IndexError>;
-
-    pub struct RebuildReport {
-        // notes counts MARKDOWN NOTES ONLY, excluding the 200 assets, so it can
-        // be compared directly with the vault manifest's counts.notes. The 20k
-        // vault holds 20,200 indexable files; if this returned 20,200 the
-        // harness would reject every correct rebuild.
-        pub notes: usize, pub blocks: usize, pub links: usize, // ...
-        // F-10: the phases, so open design question 1 can be answered.
-        // write is split because architect measured the FTS build as a
-        // separate cost with a separate fix -- 3.7 s of row insert against
-        // 1.9 s of FTS build at 259,971 blocks, and 6x worse with the
-        // triggers left live.
-        pub walk: Duration, pub read_hash: Duration, pub parse: Duration,
-        // producer_wait is time blocked on submit_blocking plus the final
-        // drain -- how long the producer WAITED, not what the writer cost.
-        pub producer_wait: Duration, pub write_fts: Duration,
-
-        // The oracles the harness checks against the vault manifest.
-        pub notes: usize,           // Markdown notes only, excluding assets
-        pub links_resolved: usize,  // links whose dst_note resolved to a note
+    // The comrak-based implementation of NoteParser -- blocks with byte
+    // ranges, YAML frontmatter and inline key:: value fields, wikilinks and
+    // embeds, tasks. serat_index::rebuild (I4) and serat_vault::Vault's
+    // NoteSource impl are already on main; this is the one piece left.
+    impl serat_core::NoteParser for /* I3's type, name not yet settled */ {
+        fn parse(&self, path: &VaultPath, bytes: &[u8]) -> Result<ParsedNote, ParseError>;
     }
 
-Call site:
+Call site once I3 lands:
 
     let vault  = serat_vault::Vault::open(vault_path)?;
-    let parser = serat_parse::CommonMarkParser::new();
+    let parser = serat_parse::???::new();
     let report = serat_index::rebuild(&vault, &parser, index_dir)?;
 
 Callable from a plain binary with no Tauri app running, returning only after the
 writer has drained and ANALYZE has run. The harness times the call with a
 monotonic clock, does not time the vault generation, and asserts the returned
 note count against the vault manifest -- a rebuild that indexed half the vault
-quickly is the failure a wall-clock number cannot see on its own.
+quickly is the failure a wall-clock number cannot see on its own. That check is
+`vault.notes + vault.assets`, not `vault.notes` alone, because an asset is a row
+in `notes` too.
 
-The phase durations are the whole content of open design question 1. The budget
-still asserts the total; the phases are recorded beside it.";
+The phase durations are the whole content of open design question 1 (F-10). The
+budget still asserts the total; the phases are recorded beside it -- once
+RebuildReport splits write_fts out of write (see the doc comment above this
+constant), which is a second, separate ask of rust-core-dev, not I3's.";
 
 /// A save's timing, on the interval NFR-PRF-03 actually governs, plus the two
 /// watcher-path readings kept for FR-VLT-04 and for continuity.
@@ -353,7 +404,14 @@ pub fn stat1_note_rows(index_dir: &Path) -> Result<usize, String> {
 /// including the phase breakdown F-10 asks for.
 ///
 /// # Errors
-/// Today: always, because `serat-index` has no rebuild entry point yet.
+/// Today: always. `serat_index::rebuild` (I4) and `serat_vault::Vault`'s
+/// `NoteSource` are both real, but there is no production `NoteParser` to hand
+/// them — `serat-parse` (task I3) is still the I1 scaffold. See
+/// [`REBUILD_ENTRY_POINT`] for exactly what is and is not landed. Refusing
+/// rather than wiring against a throwaway parser: doing that would exclude
+/// real parse cost from the total and answer NFR-PRF-04 with a number that
+/// looks fine and means nothing, the shape every finding in this phase's
+/// register has been about.
 pub fn full_rebuild(vault: &Path, index_dir: &Path) -> Result<RebuildTiming, String> {
     // I3 landed a real `NoteParser`, which is the one thing this seam was
     // waiting for. Wiring it to serat-index's `cfg(test)` fake earlier would
@@ -459,15 +517,41 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// `spawn()` and handed to the app, so everything before `main` is inside the
 /// number; every trace is validated before it becomes a sample.
 ///
+/// No note is opened. Task #52 ruled that `t_usable` is §3.4's four
+/// preconditions -- index state known, file tree delivered, watcher settled,
+/// window painted -- none of which is "a note is rendered": `--open` is
+/// session restore for a user, not a readiness precondition, and stays in the
+/// CLI rather than in this harness.
+///
 /// # Errors
 /// When the application does not exist, when a run fails or times out, or when
 /// a trace is rejected by any of the checks in [`crate::trace`].
 pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
-    let binary = app_binary()?;
     let mut visible = Samples::new();
     let mut usable = Samples::new();
-
     for run in 0..iterations {
+        let trace = cold_start_once(vault, run)?;
+        visible.push(trace.window_visible());
+        usable.push(trace.vault_usable());
+    }
+    Ok((visible, usable))
+}
+
+/// One cold start, validated.
+///
+/// Separate from [`cold_start`] so the proportionality check can **interleave**
+/// vault sizes spawn by spawn rather than running them as two blocks. The
+/// within-arm spread on this machine is about five times the effect being
+/// tested for, so a blocked comparison is contaminated by whatever the machine
+/// was doing during each block — which is how a 20,000-note vault came out
+/// faster than a 2-note one (F-109). Interleaved, slow drift lands on both arms
+/// and cancels in the paired difference.
+///
+/// # Errors
+/// As [`cold_start`].
+pub fn cold_start_once(vault: &Path, run: usize) -> Result<StartupTrace, String> {
+    let binary = app_binary()?;
+    {
         let trace_path =
             std::env::temp_dir().join(format!("serat-startup-{}-{run}.json", std::process::id()));
         let _ = std::fs::remove_file(&trace_path);
@@ -500,10 +584,8 @@ pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples),
         let trace = StartupTrace::parse(line.trim()).map_err(|e| format!("run {run}: {e}"))?;
         let _ = std::fs::remove_file(&trace_path);
 
-        visible.push(trace.window_visible());
-        usable.push(trace.vault_usable());
+        Ok(trace)
     }
-    Ok((visible, usable))
 }
 
 /// What `Vault::resolve`'s symlink guard (T-07) costs across a whole vault.
