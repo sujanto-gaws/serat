@@ -14,22 +14,22 @@
 //! # What P0 has, and does not
 //!
 //! The thread, the channel, the published state, the throttle and the event are all
-//! real and tested. The stamp check itself is written and landed — I6 is on main
-//! as `serat_index::open_or_rebuild` — but **this crate has not been wired to it**,
-//! and that is not a one-line change: `open_or_rebuild` takes a `NoteSource` and a
-//! `NoteParser`, and this file constructs neither. [`SeratIndexOpen`] therefore
-//! still publishes [`IndexState::Unavailable`] naming I6, which remains the honest
-//! state — search and
-//! queries are unavailable and the vault is fully editable, which is design goal 1
-//! doing its job. It is deliberately not a fabricated `Ready`: a shell that claimed an
-//! index it does not have would make the cold-start number meaningless and would be
-//! exactly the kind of test that cannot fail.
+//! real and tested. The stamp check itself is written and landed — I6 is
+//! `serat_index::open_or_rebuild` — and task #65 is what wires this crate to it:
+//! [`SeratIndexOpen`] now constructs the one production [`serat_core::NoteSource`]
+//! (`serat_vault::Vault`) and [`serat_core::NoteParser`] (`serat_parse::CommonMarkParser`)
+//! `open_or_rebuild` needs and were the reason the wiring was more than a one-line
+//! change. [`IndexState::Ready`] is a state the app can now genuinely reach, and
+//! [`IndexState::Unavailable`] means what it says: a rebuild failed, or the index
+//! could not be reopened after one succeeded. It is still never a fabricated `Ready`
+//! — a shell that claimed an index it does not have would make the cold-start number
+//! meaningless and would be exactly the kind of test that cannot fail.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ipc::{IndexState, IndexStatus};
+use crate::ipc::{IndexState, IndexStatus, RebuildReason};
 use crate::startup::Startup;
 
 /// Minimum gap between two `index://status` emissions that do not change the kind of
@@ -241,36 +241,130 @@ pub trait IndexOpen: Send + 'static {
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState));
 }
 
-/// The seam where the real open check goes — still a seam, but no longer for want
-/// of the check.
+/// The real open check, wired to the vault and the production parser.
 ///
 /// Architecture §3.4 specifies six ordered steps over `user_version`, `index_meta` and
-/// `count(*) FROM notes`, measured at 2.4 ms on the 20k fixture. Every one of them
-/// reads SQLite, so every one of them belongs to `serat-index` (§2.1: `serat-app` owns
-/// no domain logic). That is task I6, and it **is** written: `open_or_rebuild` landed
-/// on main (F-366). What is still missing is the wiring, not the check.
+/// `count(*) FROM notes`, measured at 2.4 ms on the 20k fixture; every one of them
+/// reads SQLite, so every one of them lives in `serat-index` (§2.1: `serat-app` owns
+/// no domain logic) as [`serat_index::open_or_rebuild`]. This type is the wiring, not
+/// a second copy of the check: it opens the one production [`serat_vault::Vault`] as
+/// the [`serat_core::NoteSource`] and hands `open_or_rebuild` the one production
+/// [`serat_parse::CommonMarkParser`] as the [`serat_core::NoteParser`], because a
+/// rebuild has no other way to read or parse a note and duplicating either here would
+/// be exactly the divergence §2.1 rules out.
 ///
-/// Until that wiring lands, this publishes [`IndexState::Unavailable`] with a message
-/// that says so. The alternative — a stamp check re-implemented in the app crate —
-/// would put schema knowledge in the wrong crate, and I6 having landed does not weaken
-/// that argument but strengthens it: the check now exists in the crate that owns it, so
-/// a second copy here would be a divergence rather than a stopgap.
+/// The [`serat_index::IndexHandle`] `open_or_rebuild` returns is not kept past this
+/// call: nothing on this branch submits incremental writes to it (that is task I5's
+/// app-side wiring, tracked separately, not this task's scope), so holding it open
+/// would cost a writer thread for no writer. What the handle is used for here is
+/// [`serat_index::IndexHandle::note_count`] — read once, to answer the one question
+/// [`IndexState::Ready`] carries that `open_or_rebuild`'s status stream does not.
 #[derive(Debug, Default)]
 pub struct SeratIndexOpen;
 
 impl IndexOpen for SeratIndexOpen {
-    fn open(&mut self, _vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
-        publish(IndexState::Unavailable {
-            message: format!(
-                "index open check not wired up yet (task I6 has landed in serat-index; this \
-                 app crate is not connected to it yet). serat-index is at index v{} on \
-                 sqlite {}, and does expose serat_index::open_or_rebuild. Search and \
-                 queries are unavailable; the vault is fully editable.",
-                serat_index::INDEX_VERSION,
-                serat_index::sqlite_version(),
-            ),
+    fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
+        let source = match serat_vault::Vault::open(vault_root) {
+            Ok(vault) => vault,
+            Err(err) => {
+                // The caller already opened this same root successfully before
+                // spawning the actor (`AppState::open_vault_with`); reaching this
+                // arm means the directory went away or became unreadable in the
+                // gap, which is design goal 5's territory, not a bug to unwrap past.
+                publish(IndexState::Unavailable {
+                    message: format!(
+                        "could not reopen the vault to check its index: {err}. Search and \
+                         queries are unavailable; the vault may still be editable if the \
+                         underlying problem clears."
+                    ),
+                    path: index_dir.display().to_string(),
+                });
+                return;
+            }
+        };
+        let parser = serat_parse::CommonMarkParser;
+
+        let result =
+            serat_index::open_or_rebuild(vault_root, index_dir, &source, &parser, &|status| {
+                // `Ready` is deliberately not published from here: `open_or_rebuild`
+                // reaches it before the `IndexHandle` it is about to return exists
+                // (see the function's own ordering guarantee), so there is nothing to
+                // read `note_count` from yet. The real `Ready` — carrying a real count
+                // — is published below, once the handle is in hand. Skipping it here
+                // does not reorder anything §3.4 depends on: the load-bearing ordering
+                // this task must preserve is `Rebuilding` before the rebuild starts,
+                // which this closure still forwards immediately, and untouched.
+                if let Some(state) = map_open_status(status, index_dir) {
+                    publish(state);
+                }
+            });
+
+        match result {
+            Ok((handle, _report)) => match handle.note_count() {
+                Ok(note_count) => publish(IndexState::Ready { note_count }),
+                Err(err) => publish(IndexState::Unavailable {
+                    message: format!(
+                        "the index opened but its note count could not be read: {err}"
+                    ),
+                    path: index_dir.display().to_string(),
+                }),
+            },
+            Err(err) => publish(IndexState::Unavailable {
+                message: format!(
+                    "the index could not be opened or rebuilt: {err}. Search and queries \
+                     are unavailable for the rest of this session; the vault remains fully \
+                     editable."
+                ),
+                path: index_dir.display().to_string(),
+            }),
+        }
+    }
+}
+
+/// Map one [`serat_index::IndexStatus`] onto the contract's [`IndexState`], or
+/// `None` for the one variant this file answers itself (see [`SeratIndexOpen::open`]).
+///
+/// Exhaustive by construction — no wildcard arm — because `serat_index::IndexStatus`
+/// and `IndexState` are deliberately the same outcomes under two names (§2.1:
+/// `serat-index` may not link `contracts/`), and this match is the one place the two
+/// could silently drift if a variant were ever added to one and not mapped here.
+fn map_open_status(status: serat_index::IndexStatus, index_dir: &Path) -> Option<IndexState> {
+    match status {
+        serat_index::IndexStatus::Opening => Some(IndexState::Opening),
+        serat_index::IndexStatus::Rebuilding { reason } => Some(IndexState::Rebuilding {
+            reason: map_rebuild_reason(reason),
+            // `open_or_rebuild` does not report walk/index progress yet — there is
+            // no producer of it on this branch — so these are an honest "unknown",
+            // not a fabricated count. A future progress-reporting task widens
+            // `open_or_rebuild`'s status stream, not this mapping.
+            done: 0,
+            total: 0,
+            walk_complete: false,
+        }),
+        serat_index::IndexStatus::Ready => None,
+        serat_index::IndexStatus::Unavailable => Some(IndexState::Unavailable {
+            message: "the rebuild failed; search and queries are unavailable for the rest \
+                       of this session, and the vault remains fully editable"
+                .to_owned(),
             path: index_dir.display().to_string(),
-        });
+        }),
+    }
+}
+
+/// Map one [`serat_index::RebuildReason`] onto the contract's [`RebuildReason`].
+///
+/// Exhaustive by construction, for the same reason as [`map_open_status`]:
+/// `serat-index` cannot depend on `contracts/` (§2.1), so this file is the one place
+/// the two enumerations are asserted to agree. `UserRequested` has no `serat_index`
+/// counterpart — the open check cannot produce it, only a future manual-rebuild
+/// command can — so it is not a case this match needs to cover.
+fn map_rebuild_reason(reason: serat_index::RebuildReason) -> RebuildReason {
+    match reason {
+        serat_index::RebuildReason::NoIndex => RebuildReason::NoIndex,
+        serat_index::RebuildReason::Corrupt => RebuildReason::Corrupt,
+        serat_index::RebuildReason::SchemaChanged => RebuildReason::IndexVersion,
+        serat_index::RebuildReason::Interrupted => RebuildReason::Interrupted,
+        serat_index::RebuildReason::VaultMoved => RebuildReason::VaultMoved,
     }
 }
 
@@ -522,27 +616,83 @@ mod tests {
         assert_eq!(recorder.taken().len(), 2);
     }
 
+    /// A throwaway, empty vault directory, unique per test run.
+    ///
+    /// Real directories rather than `.` or a fixed name: task #65's wiring runs a
+    /// genuine `open_or_rebuild` (real SQLite file, real `.serat/`), and a fixed or
+    /// relative root would create that state in whatever directory `cargo test`
+    /// happens to run from — the failure this replaces (`PathBuf::from(".")` against
+    /// the crate's own source tree) rather than merely a narrower one.
+    fn throwaway_vault(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture");
+        dir
+    }
+
     #[test]
-    fn the_p0_open_check_says_it_is_missing_rather_than_claiming_an_index() {
-        // The state that would make the cold-start number meaningless is a fabricated
-        // `Ready`. Assert that this is not it.
+    fn the_p0_open_check_now_reaches_a_real_ready_over_an_empty_vault() {
+        // #65: SeratIndexOpen is wired to the real check. An empty vault has no
+        // `.serat/`, so the check reaches `NoIndex`, `open_or_rebuild` runs a
+        // (trivial) rebuild, and the state that would make the cold-start number
+        // meaningless — a fabricated `Ready` — is exactly what this is not: the
+        // count came from a database `open_or_rebuild` actually built.
+        let root = throwaway_vault("ready");
         let (publisher, _) = publisher(Duration::ZERO);
         let mut actor = IndexActor::spawn(
             Arc::clone(&publisher),
             SeratIndexOpen,
-            PathBuf::from("."),
-            index_dir_for(Path::new(".")),
+            root.clone(),
+            index_dir_for(&root),
         )
         .expect("spawn");
         actor.join();
 
-        match publisher.status().state {
-            IndexState::Unavailable { message, path } => {
-                assert!(message.contains("I6"), "{message}");
-                assert!(path.ends_with(".serat"), "{path}");
-            }
-            other => panic!("P0 must not claim an index it does not have: {other:?}"),
-        }
+        assert_eq!(
+            publisher.status().state,
+            IndexState::Ready { note_count: 0 },
+            "an empty vault should index to zero notes, not stay Unavailable"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_wiring_publishes_rebuilding_before_the_rebuild_starts_and_ready_after() {
+        // The ordering `open_or_rebuild`'s own doc calls load-bearing (§3.4:
+        // `t_usable` waits for the index state to be *known*, and `Rebuilding`
+        // settles that as much as `Ready` does): reordering or swallowing it here
+        // would let the window's cold-start budget silently start including a full
+        // reindex. `on_publish` sees every state, throttled or not, so this pins
+        // the sequence rather than only the final value.
+        let root = throwaway_vault("ordering");
+        let (publisher, _) = publisher(Duration::from_secs(60));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        publisher.on_publish(move |state| sink.lock().expect("not poisoned").push(state.clone()));
+
+        let mut actor = IndexActor::spawn(
+            Arc::clone(&publisher),
+            SeratIndexOpen,
+            root.clone(),
+            index_dir_for(&root),
+        )
+        .expect("spawn");
+        actor.join();
+
+        assert_eq!(
+            seen.lock().expect("not poisoned").clone(),
+            vec![
+                IndexState::Opening,
+                IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 0,
+                    walk_complete: false,
+                },
+                IndexState::Ready { note_count: 0 },
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -2899,6 +2899,7 @@ dependencies = [
  "dirs",
  "serat-core",
  "serat-index",
+ "serat-parse",
  "serat-vault",
  "serde",
  "serde_json",

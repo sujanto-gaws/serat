@@ -20,10 +20,13 @@ path = "src/lib.rs"
 
 [dependencies]
 # Every capability comes from a crate that owns it (architecture §2.1). serat-app
-# adds none of its own; serat-parse and serat-index arrive on the pipeline branches.
+# adds none of its own.
 serat-core = { workspace = true }
 serat-vault = { path = "../serat-vault" }
 serat-index = { path = "../serat-index" }
+# The only production NoteParser (task I3): open_or_rebuild (task #65) needs one to
+# drive a rebuild, and serat-app owns no parsing logic of its own.
+serat-parse = { path = "../serat-parse" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
