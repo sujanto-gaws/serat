@@ -1,42 +1,8 @@
-# The three commands the definition of done names (CLAUDE.md), run on every push.
-#
-# Task B3. Serves NFR-MNT-01 and C-06's spirit; the performance budgets have
-# their own workflow in budgets.yml, one job per budget (NFR-PRF-08).
-#
-# Owner: test-engineer.
-#
-# Three things here are deliberate and easy to mistake for over-engineering:
-#
-# 1. `workspace` and `crate` both run the tests. The workspace run is the gate
-#    the definition of done names. The per-crate matrix exists because a
-#    workspace-wide gate couples every teammate's completion to every other
-#    teammate's crate compiling at that instant — P0 finding F-07 says the real
-#    cost of this project so far has been coordination, not Rust, and this is
-#    one of the places that cost shows up. When the workspace job is red, the
-#    matrix says whose crate it is without anyone reading a log.
-#
-# 2. `location-independence` runs the same suite from a git worktree. It exists
-#    because a real defect shipped that way: the dependency-rule check matched
-#    the substring ".worktrees" anywhere in an absolute path, so it passed at
-#    the repository root and failed one directory over, in exactly the layout
-#    coding-standards.md tells every teammate to use. A suite whose result
-#    depends on which directory it ran in is a measurement that reports success
-#    because of where it was taken rather than what it measured — which is the
-#    class of defect this whole harness exists to prevent. CI is where "it
-#    passes on my machine" is supposed to die.
-#
-# 3. The crate matrix is derived from `cargo metadata`, not typed out. A hand-
-#    written list of members drifts silently the first time somebody adds a
-#    crate, and a matrix that quietly stops covering a crate is worse than no
-#    matrix.
-#
-# A fourth thing, found while rebasing this branch onto the main serat-app
-# landed on: every ubuntu-latest job that compiles the workspace now compiles
-# serat-app, and Tauri v2 needs webkit2gtk and friends from apt to link on
-# Linux — nothing in this repository (dev-setup.md included) says so yet,
-# because this branch was cut before serat-app existed. Added below rather
-# than left for the first Linux CI run to discover as a red build with an
-# unhelpful linker error.
+# Task #55 bisection probe (test-engineer): minimal ci.yml with the dynamic
+# matrix (members/crate) and the gate job's needs.*.result filter both
+# removed, to test whether either of those two least-common constructs is
+# what makes every real ci.yml run complete in 0 seconds with 0 jobs.
+# Temporary -- restored (or fixed for real) once this answers the question.
 
 name: ci
 
@@ -82,10 +48,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the reference machine's platform and the one the P0 numbers
-        # come from; Linux is what CI would otherwise only ever see. Serat ships
-        # on macOS too (FR-PLT-01), and that runner joins when packaging does —
-        # adding it now would buy a third copy of the same failure.
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -100,51 +62,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # The member list, read from cargo rather than typed out, so the matrix below
-  # cannot drift away from the workspace.
-  members:
-    name: enumerate workspace members
-    runs-on: ubuntu-latest
-    outputs:
-      names: ${{ steps.list.outputs.names }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - id: list
-        shell: bash
-        run: |
-          set -euo pipefail
-          names=$(cargo metadata --no-deps --format-version 1 \
-            | jq -c '[.packages[].name] | sort')
-          echo "names=${names}" >> "$GITHUB_OUTPUT"
-          echo "matrix will cover: ${names}"
-
-  crate:
-    name: cargo test -p ${{ matrix.crate }}
-    needs: members
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: ${{ fromJSON(needs.members.outputs.names) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Tauri's Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf libssl-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ${{ matrix.crate }} --all-targets
-
   location-independence:
     name: the suite passes outside the repository root
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # A worktree needs real history; the default shallow clone has none.
           fetch-depth: 0
       - name: Install Tauri's Linux build dependencies
         run: |
@@ -157,9 +80,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Reproduces the layout coding-standards.md mandates: every teammate
-          # works in .worktrees/<role>, and a check that only holds at the
-          # repository root would be broken for all of them and green here.
           git config user.email ci@example.invalid
           git config user.name ci
           git worktree add .worktrees/ci HEAD
@@ -169,36 +89,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # A worktree still lives under the repository. A plain copy elsewhere
-          # catches anything that depends on the repository root being an
-          # ancestor at all — an absolute path baked into a test, say.
           dest="${RUNNER_TEMP}/serat-elsewhere"
           rm -rf "$dest"
           mkdir -p "$dest"
-          # -a would drag .git and the worktree along with it.
           tar --exclude=./.git --exclude=./target --exclude=./.worktrees -cf - . \
             | (cd "$dest" && tar -xf -)
           cd "$dest"
           cargo test --workspace
-
-  # CLAUDE.md's definition of done names three commands. This job is the single
-  # required check: it is green only when all of them are, across every matrix
-  # leg, so a branch protection rule has one thing to point at.
-  gate:
-    name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail if any required job did not succeed
-        shell: bash
-        run: |
-          set -euo pipefail
-          results='${{ join(needs.*.result, " ") }}'
-          echo "upstream results: ${results}"
-          for r in $results; do
-            if [ "$r" != "success" ]; then
-              echo "definition of done not met: an upstream job reported '${r}'"
-              exit 1
-            fi
-          done
