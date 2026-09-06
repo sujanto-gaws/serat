@@ -720,9 +720,44 @@ mod tests {
         assert!(e.contains("\"save\""), "{e}");
         assert!(e.contains("writer().flush()"), "{e}");
 
+        // `cold_start` is no longer among the seams either, for the same reason
+        // and by the same route. Task #59 removed the `--open` refusal that #52
+        // ruled against, and S1's binary builds and runs -- so asserting it
+        // errors naming S1 would assert the opposite of the truth, exactly as
+        // `full_rebuild`'s I4 assertions would above.
+        //
+        // What replaces it is the same shape: it must fail on the *vault*, not
+        // on a seam, and it must still refuse rather than time a window over
+        // nothing. Note the asymmetry with `full_rebuild`, which never launches
+        // a process and so reports the vault itself: here the app is launched,
+        // refuses the missing vault, and exits non-zero, so the harness reports
+        // the exit rather than the cause. Both are refusals; only one can name
+        // the reason.
         let e = cold_start(vault, 20).expect_err("must not silently pass");
-        assert!(e.contains("S1"), "{e}");
-        assert!(e.contains("SERAT_STARTUP_TRACE"), "{e}");
+        // Deliberately weaker than `full_rebuild`'s assertion above, and the
+        // reason is a property of the harness rather than of the app. This is
+        // the only seam whose subject is a SEPARATELY BUILT BINARY, so what it
+        // reports depends on whether `target/release/serat.exe` happens to
+        // exist at this moment: with it present the app launches and refuses
+        // the missing vault; without it the entry-point check fires first and
+        // names S1. Both are correct refusals of the same call, and which one
+        // you get is decided by whether anyone has run `cargo build --release`
+        // -- `cargo clippy --all-targets` and a debug test build churn the
+        // same directory, so it changes between invocations of the very suite
+        // this test lives in.
+        //
+        // Asserting either message specifically therefore asserts build state,
+        // not behaviour. An earlier version of this comment asserted the S1
+        // message was now stale; that was wrong, because on a clean checkout
+        // and in CI the binary genuinely is absent and S1 is the right answer.
+        // What must hold in every case is that the call REFUSES and says
+        // something actionable -- never a number over nothing.
+        let e = cold_start(vault, 20).expect_err("must not silently pass");
+        assert!(
+            e.contains("S1") || e.contains("exit code") || e.contains("vault"),
+            "cold_start must refuse and name either the absent binary or the \
+             absent vault, not fail opaquely: {e}"
+        );
     }
 
     // ------------------------------------------------------ T-07 / task #30
