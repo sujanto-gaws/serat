@@ -223,8 +223,26 @@ and a Windows developer's `cargo test --workspace` therefore carries no ACL beha
 coverage at all. `mock_app()` still crashes there with `STATUS_ENTRYPOINT_NOT_FOUND`, in
 an OS-loader fault that happens before any Rust code runs, which is why `#[ignore]` cannot
 prevent it and `#[cfg]` is load-bearing: **`#[ignore]` skips a test; only `#[cfg]` stops
-one existing.** So this evidence rests entirely on one CI job,
-`.github/workflows/serat-app-tests.yml`, which exists only because `ci.yml` has produced
+one existing.** So this evidence rested entirely on one CI job,
+`.github/workflows/serat-app-tests.yml`, which existed only because `ci.yml` had produced
 zero jobs across its whole history (F-354). A security claim standing on a single small
-workflow, in a repository whose main workflow has never once run, is a claim worth
-re-checking the day either changes.
+workflow, in a repository whose main workflow has never once run, was called here **a
+claim worth re-checking the day either changes**.
+
+**That day arrived, and this is the re-check.** Task #55 found why `ci.yml` scheduled
+nothing — `needs.*.result` is an object filter over `needs`, which is a map keyed by job
+id rather than an array, so the expression was rejected at parse time before any job
+existed — and fixed it at `4741956`. `ci.yml` now schedules its jobs, and its crate
+matrix runs `cargo test -p serat-app` on `ubuntu-latest`, which compiles and executes
+`tests/acl_behaviour.rs` alongside `serat-app-tests.yml`'s job. **So the evidence no
+longer stands on one small workflow; it stands on two, in different files, one of them
+the gate the definition of done names.**
+
+**Two things that did not change, and rounding either into the good news would be the
+error this paragraph exists to avoid.** The Windows exclusion is untouched — the file is
+still `#[cfg(not(windows))]`, so a green `windows-latest` job would add nothing, and the
+remedy remains making `mock_app()` work there rather than any amount of CI. And `ci.yml`
+is **not** green today: the `definition of done` gate is red on `cargo test --workspace
+(windows-latest)`, tracked as task #70. It has passed end to end at least once on `main`
+(run 34044835359), so “it runs” and “it passes” are separate claims and only the first
+is being made here.
