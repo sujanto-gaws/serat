@@ -493,6 +493,44 @@ impl Outcome {
         self.environment.gate_eligible()
     }
 
+    /// How far the samples of this one run disagree, as a percentage of the
+    /// fastest.
+    ///
+    /// Printed on every result because it is the only in-run evidence of how
+    /// steady the machine was, and F-327 is about a number that was tight,
+    /// confident and nine seconds wrong.
+    #[must_use]
+    pub fn spread_pct(&self) -> f64 {
+        let min = self.samples.min();
+        if min <= 0.0 {
+            return 0.0;
+        }
+        (self.samples.max() - min) / min * 100.0
+    }
+
+    /// Whether this run actually settled the question it was asked.
+    ///
+    /// **The rule has no tunable constant in it, deliberately.** If every sample
+    /// is under the limit the answer is pass; if every sample is over it the
+    /// answer is fail; and if the samples straddle the limit then **this run
+    /// observed both outcomes** and reporting either one as the verdict is a
+    /// coin toss dressed as a measurement. The median can sit comfortably below
+    /// a limit that a third of the samples exceeded.
+    ///
+    /// Chosen after measuring the alternative and rejecting it. A calibration
+    /// yardstick -- fixed work, pinned reference, refuse when the machine is off
+    /// its reference speed -- is the obvious fix for F-327 and does not survive
+    /// contact with this machine: a fixed 3-5 second storage workload varied by
+    /// 25-108% within a single run, so the yardstick was noisier than the drift
+    /// it was meant to detect (F-332). Nothing inside one process can attest a
+    /// machine that unsteady. What a run *can* say honestly is whether its own
+    /// samples agreed, and that is what this reports.
+    #[must_use]
+    pub fn determinate(&self) -> bool {
+        let limit = self.limit_ms();
+        self.samples.max() <= limit || self.samples.min() > limit
+    }
+
     /// The phase breakdown must not claim more time than the clock measured.
     ///
     /// The report already tells a reader that a sum *below* the wall clock is
@@ -528,7 +566,11 @@ impl Outcome {
     /// Human-readable report. Printed by the job, pasted into a gate report.
     pub fn to_report(&self) -> String {
         let mut s = String::new();
-        let verdict = if self.passed() { "PASS" } else { "FAIL" };
+        let verdict = match (self.determinate(), self.passed()) {
+            (false, _) => "INDETERMINATE",
+            (true, true) => "PASS",
+            (true, false) => "FAIL",
+        };
         let _ = writeln!(
             s,
             "{verdict}  {} · {}",
@@ -546,12 +588,23 @@ impl Outcome {
         );
         let _ = writeln!(
             s,
-            "  samples     n={}  min {:.1}  mean {:.1}  max {:.1} ms",
+            "  samples     n={}  min {:.1}  mean {:.1}  max {:.1} ms  spread {:.1}%",
             self.samples.len(),
             self.samples.min(),
             self.samples.mean(),
-            self.samples.max()
+            self.samples.max(),
+            self.spread_pct(),
         );
+        if !self.determinate() {
+            let _ = writeln!(
+                s,
+                "  undecided   the samples straddle the {:.1} ms limit -- this run observed \
+                 both a pass and a fail, so it has not settled the question. Re-run with more \
+                 iterations, or on a machine steady enough to answer it. Reported as a failure \
+                 because a run that decided nothing must not go green.",
+                self.limit_ms(),
+            );
+        }
         let _ = writeln!(
             s,
             "  vault       {} ({} notes, generator v{})",
@@ -1306,7 +1359,9 @@ where
     match decide(budget, args, measure) {
         Ok(outcome) => {
             report(&outcome);
-            if outcome.passed() {
+            // Indeterminate is not success. A run whose samples straddled the
+            // limit saw the budget breached and would go green on the median.
+            if outcome.passed() && outcome.determinate() {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::FAILURE
@@ -1365,7 +1420,7 @@ where
         match outcome_from(budget, parsed.profile, vault.clone(), measurement) {
             Ok(outcome) => {
                 report(&outcome);
-                ok &= outcome.passed();
+                ok &= outcome.passed() && outcome.determinate();
             }
             Err(e) => {
                 eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
@@ -2017,6 +2072,63 @@ mod tests {
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into()]).is_err());
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--iterations".into(), "0".into()]).is_err());
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--profile".into(), "laptop".into()]).is_err());
+    }
+
+    // --------------------------------------------------------------- F-332
+
+    #[test]
+    fn a_run_whose_samples_straddle_the_limit_has_not_decided_anything() {
+        let outcome = |values: &[f64]| Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(values),
+            reported: Vec::new(),
+            phases: None,
+        };
+
+        // Every sample under the limit: the run agreed with itself.
+        let clear_pass = outcome(&[29_000.0, 29_500.0, 29_900.0]);
+        assert!(clear_pass.determinate());
+        assert!(clear_pass.passed());
+        assert!(clear_pass.to_report().starts_with("PASS"));
+
+        // Every sample over it: also decided, the other way.
+        let clear_fail = outcome(&[30_100.0, 31_000.0, 32_000.0]);
+        assert!(clear_fail.determinate());
+        assert!(!clear_fail.passed());
+        assert!(clear_fail.to_report().starts_with("FAIL"));
+
+        // The case this exists for. One sample of three breached 30 s, and the
+        // MEDIAN is comfortably under it -- so `passed()` says true and the job
+        // would have gone green over a run that watched the budget break.
+        let straddling = outcome(&[28_000.0, 29_000.0, 31_000.0]);
+        assert!(
+            straddling.passed(),
+            "the median really is under the limit; that is the trap, not a typo"
+        );
+        assert!(
+            !straddling.determinate(),
+            "a run that observed both a pass and a fail has not settled the question"
+        );
+        let report = straddling.to_report();
+        assert!(report.starts_with("INDETERMINATE"), "{report}");
+        assert!(report.contains("straddle"), "{report}");
+
+        // The boundary is inclusive on the passing side, matching `passed()`.
+        let exactly_at = outcome(&[30_000.0, 30_000.0, 30_000.0]);
+        assert!(exactly_at.determinate());
+        assert!(exactly_at.passed());
+
+        // And the spread is reported whether or not it decided anything, because
+        // it is the only in-run evidence of how steady the machine was.
+        assert!(
+            (straddling.spread_pct() - 10.714).abs() < 0.01,
+            "{}",
+            straddling.spread_pct()
+        );
+        assert!(report.contains("spread"), "{report}");
     }
 
     // --------------------------------------------------------------- F-323
