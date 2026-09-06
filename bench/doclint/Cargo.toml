@@ -28,5 +28,9 @@ path = "src/bin/check-design-paths.rs"
 name = "check-prd-join"
 path = "src/bin/check-prd-join.rs"
 
+[[bin]]
+name = "check-table-structure"
+path = "src/bin/check-table-structure.rs"
+
 [lints]
 workspace = true

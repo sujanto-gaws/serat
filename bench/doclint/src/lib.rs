@@ -30,6 +30,7 @@
 //! itself undetected.
 
 pub mod prd_join;
+pub mod table_structure;
 
 use std::path::{Path, PathBuf};
 
