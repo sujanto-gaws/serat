@@ -65,6 +65,25 @@ pub struct Environment {
     /// The active Windows power plan, by name. Boost behaviour and therefore
     /// single-thread throughput ride on it, and on a laptop so do thermals.
     pub power_plan: Option<String>,
+    /// Windows' own view of total CPU load at the moment of detection, 0-100.
+    /// `None` where it does not apply or could not be determined.
+    ///
+    /// F-375, task #83: parse alone read 31 s in one session on this fixture
+    /// and 4.1 s in another, same code, same vault. `cores` alone cannot
+    /// distinguish "this machine is slower" from "this machine was busy" --
+    /// this can, at least as a snapshot taken beside the number rather than
+    /// reconstructed after the fact from memory.
+    pub cpu_load_percent: Option<u32>,
+    /// How many other CPU-bound Rust build processes (`rustc`, `link`) were
+    /// running elsewhere on the machine at the moment of detection. `None`
+    /// where it does not apply or could not be determined.
+    ///
+    /// The concrete instance of task #83's contention hypothesis: several
+    /// agent sessions compile on this host concurrently, parse is the most
+    /// CPU-bound phase the budget measures, and it is the phase that absorbs
+    /// contention first. A process count taken beside the number that read
+    /// 31 s turns "probably contention" into a comparable fact.
+    pub concurrent_build_processes: Option<usize>,
 }
 
 impl Environment {
@@ -90,16 +109,24 @@ impl Environment {
         } else {
             Os::Linux
         };
-        let (realtime_scanner, power_plan) = if cfg!(target_os = "windows") {
-            (windows_defender_realtime(), windows_power_plan())
-        } else {
-            (None, None)
-        };
+        let (realtime_scanner, power_plan, cpu_load_percent, concurrent_build_processes) =
+            if cfg!(target_os = "windows") {
+                (
+                    windows_defender_realtime(),
+                    windows_power_plan(),
+                    windows_cpu_load_percent(),
+                    windows_concurrent_build_processes(),
+                )
+            } else {
+                (None, None, None, None)
+            };
         Environment {
             os,
             cores,
             realtime_scanner,
             power_plan,
+            cpu_load_percent,
+            concurrent_build_processes,
         }
     }
 
@@ -149,8 +176,15 @@ impl Environment {
             None => "unknown",
         };
         let plan = self.power_plan.as_deref().unwrap_or("unknown");
+        let load = self
+            .cpu_load_percent
+            .map_or_else(|| "unknown".to_owned(), |p| format!("{p}%"));
+        let builds = self
+            .concurrent_build_processes
+            .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
         format!(
-            "{} · {} cores · realtime scanner {scanner} · power plan {plan}",
+            "{} · {} cores · realtime scanner {scanner} · power plan {plan} · cpu load {load} \
+             · concurrent rustc/link processes {builds}",
             self.os.label(),
             self.cores
         )
@@ -190,6 +224,29 @@ fn windows_power_plan() -> Option<String> {
     }
 }
 
+/// Task #83 / F-375: a snapshot of total CPU load, taken beside the number
+/// rather than reconstructed afterward from whoever remembers what else was
+/// running.
+fn windows_cpu_load_percent() -> Option<u32> {
+    let raw = powershell(
+        "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage \
+         -Average).Average",
+    )?;
+    raw.trim().parse().ok()
+}
+
+/// Task #83 / F-375: how many `rustc`/`link` processes -- the two that
+/// actually burn CPU during a build -- were running elsewhere on the machine.
+/// `cargo` itself mostly waits on them, so it is not counted; a `cargo test`
+/// or `cargo build` sitting idle on a lock is not the contention this exists
+/// to catch.
+fn windows_concurrent_build_processes() -> Option<usize> {
+    let raw = powershell(
+        "(Get-Process -Name rustc,link -ErrorAction SilentlyContinue | Measure-Object).Count",
+    )?;
+    raw.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +258,30 @@ mod tests {
         assert!(!env.summary().is_empty());
     }
 
+    // ---------------------------------------------------------------- F-375 / #83
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detection_reports_load_and_build_contention() {
+        // Task #83: the same parse-phase measurement read 31 s in one session
+        // and 4.1 s in another, same code and vault, and the leading
+        // hypothesis is concurrent compiles on a shared host. A number that
+        // cannot be checked is not evidence, so this pins that the two new
+        // fields actually come back populated on this platform rather than
+        // silently staying None the way an untested PowerShell call would.
+        let env = Environment::detect_uncached();
+        assert!(
+            env.cpu_load_percent.is_some(),
+            "Win32_Processor.LoadPercentage must be readable on Windows"
+        );
+        assert!(
+            env.concurrent_build_processes.is_some(),
+            "Get-Process must be able to count rustc/link on Windows, even when the count is 0"
+        );
+        assert!(env.summary().contains("cpu load"));
+        assert!(env.summary().contains("concurrent rustc/link processes"));
+    }
+
     #[test]
     fn a_scanner_disabled_windows_run_is_not_gate_eligible() {
         // The rule the lead set for B2, asserted rather than remembered.
@@ -209,6 +290,8 @@ mod tests {
             cores: 8,
             realtime_scanner: Some(false),
             power_plan: Some("Energy Star".into()),
+            cpu_load_percent: None,
+            concurrent_build_processes: None,
         };
         assert!(!off.gate_eligible());
         assert!(off.ineligibility_reason().unwrap().contains("best case"));
@@ -235,6 +318,8 @@ mod tests {
             cores: 4,
             realtime_scanner: None,
             power_plan: None,
+            cpu_load_percent: None,
+            concurrent_build_processes: None,
         };
         assert!(linux.gate_eligible());
 

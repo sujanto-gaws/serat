@@ -3211,6 +3211,8 @@ mod tests {
             cores: 16,
             realtime_scanner: Some(false),
             power_plan: Some("Energy Star".into()),
+            cpu_load_percent: None,
+            concurrent_build_processes: None,
         };
         let outcome = Outcome {
             budget: PRF04_FULL_REBUILD,
