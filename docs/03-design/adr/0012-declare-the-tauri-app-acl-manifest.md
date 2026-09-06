@@ -203,8 +203,28 @@ Permissions associated with this command: allow-open-vault"* — while `read_fil
 the same run**. Both halves in one execution is what makes it evidence rather than two
 anecdotes: a build where nothing worked would also have refused `open_vault`.
 
-**What the run did not cover, stated because four of five is not five.** `write_file` is
-granted and was **not** exercised by the probe. Its grant rests on the same
+**What the run did not cover, stated because four of five is not five.** `write_file` was
+granted and **not** exercised by the probe. Its grant rested on the same
 `acl_manifest.rs` guards as the others and on the framework behaviour the other four
-demonstrated, which is good but is not the same as having been observed. If a cheap
-write-side probe becomes available, it is worth one run.
+demonstrated, which is good but is not the same as having been observed.
+
+**Both of those gaps are closed, by task #53, and the hand-run above is kept because it
+is what this ADR was accepted on rather than because it is still the best evidence.**
+`crates/serat-app/tests/acl_behaviour.rs` builds the real application — `mock_builder()`,
+the real `generate_context!()`, the real `capabilities/default.json`, the same
+`generate_handler!` list `lib.rs` registers — and asserts that `open_vault` is refused by
+the ACL while the five granted commands are not. **`write_file` is now exercised rather
+than reasoned about: it writes, then reads the bytes back off disk.** Verified on
+`ubuntu-latest` in a run log (F-356).
+
+**The residual moved rather than vanished, and it is worth more than a footnote.** The
+file is `#[cfg(not(windows))]`, so on Windows it does not *exist* — not skipped, absent —
+and a Windows developer's `cargo test --workspace` therefore carries no ACL behavioural
+coverage at all. `mock_app()` still crashes there with `STATUS_ENTRYPOINT_NOT_FOUND`, in
+an OS-loader fault that happens before any Rust code runs, which is why `#[ignore]` cannot
+prevent it and `#[cfg]` is load-bearing: **`#[ignore]` skips a test; only `#[cfg]` stops
+one existing.** So this evidence rests entirely on one CI job,
+`.github/workflows/serat-app-tests.yml`, which exists only because `ci.yml` has produced
+zero jobs across its whole history (F-354). A security claim standing on a single small
+workflow, in a repository whose main workflow has never once run, is a claim worth
+re-checking the day either changes.
