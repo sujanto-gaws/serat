@@ -1,12 +1,20 @@
 ---
 project: Serat
-artifact: Design-document path check
+artifact: Design-document consistency checks
 phase: 05-testing
 owner: test-engineer
-serves: F-239, F-238, C-03, FR-STR-08, FR-STR-09, FR-STR-10, NFR-MNT-01
+serves: F-239, F-238, F-303, C-03, FR-STR-08, FR-STR-09, FR-STR-10, NFR-MNT-01
 ---
 
-# Design-document path check
+# Design-document consistency checks
+
+Two checks, one crate (`bench/doclint`): F-239 (below) is about a document
+citing evidence that is not there; F-303 (at the end of this file) is about
+two documents making a claim that depends on each other and nothing checking
+the join. Both are mechanical for the same reason — neither failure is visible
+from inside one document read alone.
+
+## F-239: does every cited path resolve?
 
 **P0 finding F-239.** `docs/03-design/architecture.md` names seven "repo-ready"
 companion files by path, in the present tense — "the full contract is
@@ -74,16 +82,48 @@ cargo test -p doclint
 Exit code 1 and a non-empty report mean at least one citation does not resolve
 and is not marked planned. `cargo test -p doclint` runs in every
 `cargo test --workspace`, including
-[`the_real_design_documents_fail_on_exactly_f_239s_five_paths`](../../bench/doclint/src/lib.rs),
-which proves the check can fail before trusting it (F-58, F-27): it runs the
-real check against the real repository and requires the result to name
-exactly F-239's five paths, not fewer (a regression in the extraction) and not
-more (a false positive). That test is expected to start failing — in the sense
-that its hard-coded expectation goes stale — the moment task #7's markers or
-task #10's files land on the branch it runs against; updating it then is the
-maintenance both mechanisms exist for.
+[`the_real_design_documents_have_no_unmarked_missing_paths`](../../bench/doclint/src/lib.rs),
+which asserts the property against the real repository: every cited path
+resolves or is marked planned, plus a floor on how many citations were found
+at all (F-27's lesson — "0 missing" and "checked nothing" are the same
+one-line PASS unless the count is in it). The can-it-fail proof (F-58, F-27)
+lives on synthetic fixtures instead, deliberately: a real-tree test asserting
+F-239's exact five missing paths was tried first and broke the moment task #7
+marked them planned (F-255, F-265) — proof-of-failure belongs on a fixture
+that does not depend on the repository staying broken.
+
+## F-303: does the PRD's Must list agree with architecture.md's accounting?
+
+architecture.md's §Traceability preamble makes a claim about a file it does
+not live in: *"Every requirement of priority Must in the baseline is
+accounted for."* The baseline is `docs/02-requirements/prd.md`, and the two
+documents have different owners who cannot see each other's edits — NFR-SEC-06
+was allocated in the PRD at v1.1 and the claim went stale the moment
+product-analyst committed.
+
+`cargo run -p doclint --bin check-prd-join` extracts every Must from the PRD's
+requirement-definition tables (scoped to exclude the PRD's *own* traceability
+appendix, which has the identical row shape and would otherwise double-count),
+extracts every requirement ID cited across architecture.md's five accounting
+places — the main Traceability table, §10.1, §10.2, §10.4, and the "Musts with
+no design element yet" subsection, which counts as accounting for a Must by
+naming the gap plainly — and asserts the two sets match. It reports both
+directions: a Must with no citation anywhere, and a citation naming an ID the
+PRD no longer declares at any priority.
+
+**What it does not cover.** It checks that IDs are *accounted for*, not that
+the design element cited is real or adequate — F-239 already showed a table
+citing five files that did not exist, and this check would have called that
+row accounted for too. A green join is not a green design review.
+
+`bench/doclint/src/prd_join.rs::the_real_documents_join_cleanly` asserts the
+join holds today (87 Musts, all accounted for) as a property, not a pinned
+count, since both documents are expected to keep changing together. The
+can-it-fail proof is a synthetic PRD and a synthetic architecture.md with one
+Must deliberately absent from every accounting place (F-58, F-27, F-304).
 
 ## CI
 
-`.github/workflows/design-docs.yml` runs `cargo test -p doclint` on every pull
-request and push to `main`.
+`.github/workflows/design-docs.yml` runs `cargo test -p doclint` (covering
+both checks, since they are one crate) on every pull request and push to
+`main`, and prints each binary's report so a failure names which check failed.

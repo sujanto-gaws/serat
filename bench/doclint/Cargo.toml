@@ -24,5 +24,9 @@ path = "src/lib.rs"
 name = "check-design-paths"
 path = "src/bin/check-design-paths.rs"
 
+[[bin]]
+name = "check-prd-join"
+path = "src/bin/check-prd-join.rs"
+
 [lints]
 workspace = true

@@ -1,11 +1,13 @@
-# Design-document path check — F-239, F-238, NFR-MNT-01. See
+# Design-document consistency checks — F-239, F-238, F-303, NFR-MNT-01. See
 # docs/05-testing/design-doc-paths.md.
 #
 # A citation to a file that is not there reads as complete and stops anyone
-# from looking. This job makes that mechanical: every path the design
-# documents cite as fact must resolve, unless the document marks it
-# `*(planned)*`. It is a plain `cargo test`, not release-profile timed work,
-# so it runs on every push and PR rather than only on a schedule.
+# from looking, and so does a table whose claim depends on a file it does not
+# live in. Both jobs are mechanical for that reason: `cargo test -p doclint`
+# covers both (they are one crate), and each job also prints its own report so
+# a failure names which check failed without anyone reading a log. Plain
+# `cargo test`, not release-profile timed work, so this runs on every push and
+# PR rather than only on a schedule.
 #
 # Owner: test-engineer.
 
@@ -32,3 +34,15 @@ jobs:
       - name: Print the report either way
         if: always()
         run: cargo run -p doclint --bin check-design-paths
+
+  prd-architecture-join:
+    name: "F-303 · every PRD Must is accounted for in architecture.md, and vice versa"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p doclint
+      - name: Print the report either way
+        if: always()
+        run: cargo run -p doclint --bin check-prd-join

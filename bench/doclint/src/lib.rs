@@ -29,6 +29,8 @@
 //! having none, and the whole point of F-239 was a document disagreeing with
 //! itself undetected.
 
+pub mod prd_join;
+
 use std::path::{Path, PathBuf};
 
 /// Top-level directories the design documents cite as fact. A run of
