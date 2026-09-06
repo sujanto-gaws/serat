@@ -861,6 +861,59 @@ mod permission_tests {
         vault.write_atomic(&path, b"# New\n").expect("write");
         assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
     }
+
+    /// Creates an NTFS directory junction with `mklink /J`.
+    ///
+    /// Not `std::os::windows::fs::symlink_dir`: a symlink needs Developer Mode or an
+    /// elevated process on Windows, which `threat-model.md`'s T-07 section already
+    /// records as the reason the Unix symlink suite below cannot run unconditionally
+    /// on this platform. Task #76's probe measured `mklink /J` needing neither — so
+    /// this, unlike the tests in `symlink_tests`, can run on an ordinary Windows CI
+    /// runner without `#[ignore]` standing in for a privilege check nobody wrote.
+    #[cfg(windows)]
+    fn make_junction(target: &Path, link: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("running mklink");
+        assert!(
+            status.success(),
+            "mklink /J {} {} failed",
+            link.display(),
+            target.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_directory_component_is_refused() {
+        // T-07 / task #76. Architect's probe (threat-model.md, task/75-cfg-gating-
+        // ruling) measured, on this platform: `mklink /J` needs no elevation,
+        // `symlink_metadata().is_symlink()` reports `true` for the mount point, and
+        // reading through it succeeds when nothing refuses it -- so this asserts the
+        // conclusion that probe reached rather than re-deriving it, and turns an
+        // observation into a check that fails on a regression. Setup reaches the
+        // path being tested (F-58): without `resolve`'s component-by-component
+        // check, this read returns `Ok` carrying "outside", the escape the check
+        // exists to close -- not some incidental error.
+        let (dir, vault) = vault();
+        let outside = tempfile::tempdir().expect("outside");
+        fs::create_dir_all(outside.path().join("nested")).expect("mkdir outside");
+        fs::write(outside.path().join("nested/secret.md"), b"outside").expect("write outside");
+
+        make_junction(outside.path(), &dir.path().join("synced"));
+
+        let path = VaultPath::new("synced/nested/secret.md").expect("path");
+        let result = vault.read(&path);
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "a junctioned ancestor directory was followed instead of refused: {result:?}"
+        );
+    }
 }
 
 // Unix-only: creating a real symlink on Windows needs Developer Mode or an
