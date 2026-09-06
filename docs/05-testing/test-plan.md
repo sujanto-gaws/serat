@@ -127,6 +127,9 @@ The P0 gate is: full index of 20,000 notes < 30 s · save→index < 50 ms p95 ·
 | TC-103 | F-303 — a plain ID, an `ID · label` cell, a comma-separated list and a bolded ID inside prose are all found; a `..` range expands to every ID zero-padded; trailing non-ID text and story/assumption/ADR IDs are ignored | unit | `bench/doclint/src/prd_join.rs` | pass |
 | TC-104 | F-303, F-58, F-27, F-304 — a Must with no citation anywhere is reported; a citation naming an ID the PRD no longer declares is reported; a Must cited in any one of the five places is accounted for; the join fails on a synthetic tree with a Must deliberately removed from the table | unit | `bench/doclint/src/prd_join.rs` | pass |
 | TC-105 | F-303 — the real PRD and architecture.md join cleanly today (87 Musts, all accounted for, no stale citations); asserted as a property, not a pinned count, so it keeps meaning something as both documents evolve | unit | `bench/doclint/src/prd_join.rs::the_real_documents_join_cleanly` | pass |
+| TC-106 | F-346, F-348 — a stray unescaped pipe inside a cell (task #49's `[[Target\|Alias]]` and shell `\|\|` shapes) is caught by a row's pipe count no longer matching its header's; an escaped `\|` does not count and a matching column count is not flagged | unit | `bench/doclint/src/table_structure.rs` | pass |
+| TC-107 | F-346, F-348 — a header row with no delimiter beneath it is an orphan row; a table row followed by prose with no blank line ends the table and is flagged; a blank line ends a table cleanly, and an ATX heading immediately after the last row is not flagged (TEMPLATE-test-report.md's own shape, a deliberate false-positive exclusion) | unit | `bench/doclint/src/table_structure.rs` | pass |
+| TC-108 | F-346, F-348, F-58, F-27 — the check run against the real docs tree finds zero table-structure problems, plus a floor on files scanned (F-27's "0 missing" vs "checked nothing" lesson); the can-it-fail proof lives on synthetic fixtures only, per F-255 | unit | `bench/doclint/src/table_structure.rs::the_check_can_fail_and_the_real_docs_tree_is_clean` | pass |
 | TC-024 | FR-VLT-02, NFR-REL-02, US-01, US-07 — delete `.serat/`, rebuild, identical results | integration | `crates/serat-index/tests` (T1) | blocked on I4, I6 |
 | TC-025 | NFR-REL-02, US-07 — a **truncated** index is detected at open and rebuilt without user action | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
 | TC-060 | NFR-REL-02 — corruption the open check cannot catch routes to rebuild, not to an error dialog | integration | `crates/serat-index/tests` (T1) | blocked on I6 |
@@ -151,7 +154,7 @@ Three workflows, because they answer different questions and fail for different 
 |---|---|---|
 | `.github/workflows/ci.yml` | The three commands CLAUDE.md's definition of done names: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | test-engineer (task B3) |
 | `.github/workflows/budgets.yml` | One asserting job per NFR-PRF budget; a breach fails the build (NFR-PRF-08) | test-engineer (task B2) |
-| `.github/workflows/design-docs.yml` | Every path a design document cites resolves or is marked `*(planned)*` (F-239, task #11); every PRD Must is accounted for in architecture.md and vice versa (F-303, task #33) | test-engineer |
+| `.github/workflows/design-docs.yml` | Every path a design document cites resolves or is marked `*(planned)*` (F-239, task #11); every PRD Must is accounted for in architecture.md and vice versa (F-303, task #33); every table in the design documents renders as a table (F-346/F-348, task #51) | test-engineer |
 
 Four things in `ci.yml` are deliberate:
 

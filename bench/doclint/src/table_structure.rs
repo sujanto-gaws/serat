@@ -34,9 +34,11 @@ use std::path::{Path, PathBuf};
 /// One place a table does not render the way its source suggests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableProblem {
+    /// Repo-relative path of the document containing the problem.
     pub file: PathBuf,
     /// 1-based line number.
     pub line: usize,
+    /// Human-readable explanation of what breaks the table.
     pub reason: String,
 }
 
@@ -82,6 +84,16 @@ pub fn check_table_structure(text: &str, source_file: &Path) -> Vec<TableProblem
                     });
                 }
             } else if s.is_empty() {
+                in_table = false;
+            } else if s.starts_with('#') {
+                // An ATX heading is unambiguous to every Markdown parser
+                // regardless of the blank line either side of it -- ordinary
+                // prose sharing a line boundary with a table is genuinely
+                // ambiguous and worth flagging, a heading is not. Narrowing
+                // this by hand rather than leaving the stricter rule in:
+                // TEMPLATE-test-report.md's own header+delimiter-then-heading
+                // (no body rows) renders correctly everywhere and flagging it
+                // would be exactly the false alarm that gets a check disabled.
                 in_table = false;
             } else {
                 // Prose immediately after a row, with no blank line between,
@@ -144,7 +156,10 @@ pub fn to_report(problems: &[TableProblem]) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     if problems.is_empty() {
-        let _ = writeln!(s, "PASS  every table in the scanned documents renders as written");
+        let _ = writeln!(
+            s,
+            "PASS  every table in the scanned documents renders as written"
+        );
     } else {
         let _ = writeln!(
             s,
@@ -161,9 +176,13 @@ pub fn to_report(problems: &[TableProblem]) -> String {
 /// Run the check against every `.md` file under `docs/` in the real
 /// repository.
 ///
+/// Returns the number of files scanned alongside the problems found, so a
+/// caller can tell "0 problems" from "checked nothing" (F-27) -- the same
+/// distinction `Report::checked` draws for the path-citation check.
+///
 /// # Errors
 /// A filesystem failure while walking or reading.
-pub fn check_repo_docs(repo_root: &Path) -> Result<Vec<TableProblem>, String> {
+pub fn check_repo_docs(repo_root: &Path) -> Result<(usize, Vec<TableProblem>), String> {
     let mut files = Vec::new();
     collect_markdown(&repo_root.join("docs"), &mut files)
         .map_err(|e| format!("walking docs: {e}"))?;
@@ -175,7 +194,8 @@ pub fn check_repo_docs(repo_root: &Path) -> Result<Vec<TableProblem>, String> {
         let rel = PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
         with_text.push((rel, text));
     }
-    Ok(check_files(&with_text))
+    let scanned = with_text.len();
+    Ok((scanned, check_files(&with_text)))
 }
 
 fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -326,11 +346,17 @@ Ordinary prose, well separated.
         let broken = "| A | B |\n| x|y |\n";
         assert!(!check_table_structure(broken, Path::new("x.md")).is_empty());
 
-        let problems = check_repo_docs(&crate::repo_root()).expect("docs tree reads");
+        let (scanned, problems) = check_repo_docs(&crate::repo_root()).expect("docs tree reads");
         assert!(
             problems.is_empty(),
             "table-structure problems in the real docs tree:\n{}",
             to_report(&problems)
+        );
+        // F-27 one level up: "0 problems" and "checked nothing" render as the
+        // same PASS unless the count is asserted too.
+        assert!(
+            scanned > 10,
+            "suspiciously few markdown files scanned: {scanned}"
         );
     }
 }

@@ -3,16 +3,18 @@ project: Serat
 artifact: Design-document consistency checks
 phase: 05-testing
 owner: test-engineer
-serves: F-239, F-238, F-303, C-03, FR-STR-08, FR-STR-09, FR-STR-10, NFR-MNT-01
+serves: F-239, F-238, F-303, F-346, F-348, C-03, FR-STR-08, FR-STR-09, FR-STR-10, NFR-MNT-01
 ---
 
 # Design-document consistency checks
 
-Two checks, one crate (`bench/doclint`): F-239 (below) is about a document
-citing evidence that is not there; F-303 (at the end of this file) is about
-two documents making a claim that depends on each other and nothing checking
-the join. Both are mechanical for the same reason — neither failure is visible
-from inside one document read alone.
+Three checks, one crate (`bench/doclint`): F-239 (below) is about a document
+citing evidence that is not there; F-303 is about two documents making a claim
+that depends on each other and nothing checking the join; F-346/F-348 (at the
+end of this file) is about a table that stops rendering as a table while every
+word in it is still true. All three are mechanical for the same reason —
+none of these failures is visible from inside one document read alone, or
+even from a careful read of the raw source in the F-346/F-348 case.
 
 ## F-239: does every cited path resolve?
 
@@ -72,13 +74,6 @@ A path marked planned that now resolves on disk is reported as a note, not a
 failure — the artefact landed, which is what "planned" was for — naming where
 the now-stale marker was written so it can be dropped.
 
-## Running it
-
-```text
-cargo run -p doclint --bin check-design-paths
-cargo test -p doclint
-```
-
 Exit code 1 and a non-empty report mean at least one citation does not resolve
 and is not marked planned. `cargo test -p doclint` runs in every
 `cargo test --workspace`, including
@@ -122,8 +117,57 @@ count, since both documents are expected to keep changing together. The
 can-it-fail proof is a synthetic PRD and a synthetic architecture.md with one
 Must deliberately absent from every accounting place (F-58, F-27, F-304).
 
+## F-346/F-348: does every table render as a table?
+
+**P0 finding F-346/F-348 (task #49, #51).** Task #49 found the threat model's
+STRIDE table broken below T-05 for seven commits across six passes, two of
+them edits to that exact section: a stray unescaped `|` inside a cell —
+`[[Target|Alias]]`, `file_name = target || '.md'`, a shell `||` — splits a GFM
+table row at the pipe, silently truncating everything after it and pushing
+every following cell one column left. Neither F-239 nor F-303 would ever have
+caught this: every cited path still resolved and every cited ID was still in
+the raw text, because both checks read the source, not the rendering. The
+table simply stopped showing its content where a reader would look, and stayed
+that way through two edits of the surrounding prose.
+
+`cargo run -p doclint --bin check-table-structure` scans every `.md` file
+under `docs/` and checks two properties of every table it finds, neither about
+content:
+
+1. Every row's unescaped-pipe count matches its header's. `\|` does not count
+   — GFM splits on a raw `|` even inside inline code, so an escaped one is the
+   only way to put a literal pipe in a cell.
+2. No line starting with `|` sits outside a table: a header row with no
+   delimiter row beneath it, or a row-shaped line with prose immediately above
+   and no blank line to separate them, is not a table to a GFM renderer even
+   though it reads as one on a naive glance at the source.
+
+**What it does not cover.** It checks that a table renders as *a* table — the
+right number of cells, in the right place — not that its *content* is
+correct. A column count that has always matched proves nothing about whether
+the header names the right thing; that is F-303's and a human reviewer's job,
+not this check's.
+
+`bench/doclint/src/table_structure.rs::the_check_can_fail_and_the_real_docs_tree_is_clean`
+asserts the property holds today against the real tree (every table renders),
+plus a floor on how many markdown files were scanned (F-27's lesson again).
+The can-it-fail proofs are all synthetic fixtures — the stray-pipe shape task
+#49 found, the shell-`||` shape, an orphan header, prose ending a table with no
+blank line — for the same reason F-239's and F-303's do: a real-tree
+proof-of-failure breaks the day someone fixes the thing it was pinned to
+(F-255).
+
+## Running it
+
+```text
+cargo run -p doclint --bin check-design-paths
+cargo run -p doclint --bin check-prd-join
+cargo run -p doclint --bin check-table-structure
+cargo test -p doclint
+```
+
 ## CI
 
-`.github/workflows/design-docs.yml` runs `cargo test -p doclint` (covering
-both checks, since they are one crate) on every pull request and push to
+`.github/workflows/design-docs.yml` runs `cargo test -p doclint` (covering all
+three checks, since they are one crate) on every pull request and push to
 `main`, and prints each binary's report so a failure names which check failed.
