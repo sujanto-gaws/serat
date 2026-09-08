@@ -198,17 +198,11 @@ fn start(vault_root: &Path, index_dir: &Path) -> Option<RebuildReason> {
     let vault = DiskVault::new(vault_root);
     let parser = LineParser::default();
     let reason = std::cell::Cell::new(None);
-    let (handle, _report) = open_or_rebuild(
-        vault_root,
-        index_dir,
-        &vault,
-        &parser,
-        &|status| {
-            if let serat_index::IndexStatus::Rebuilding { reason: why } = status {
-                reason.set(Some(why));
-            }
-        },
-    )
+    let (handle, _report) = open_or_rebuild(vault_root, index_dir, &vault, &parser, &|status| {
+        if let serat_index::IndexStatus::Rebuilding { reason: why } = status {
+            reason.set(Some(why));
+        }
+    })
     .expect("open_or_rebuild");
     // Closing is the other half of "a real restart": it stops the writer thread and
     // drops every connection this process holds, so the next `start()` opens the
@@ -265,7 +259,10 @@ fn a_vault_recovered_after_deleting_serat_answers_every_query_the_same_way() {
     // actually exercised.
     assert!(!before.notes.is_empty(), "the fixture indexed nothing");
     assert!(!before.links.is_empty(), "the fixture produced no links");
-    assert!(!before.fts_hits.is_empty(), "the fixture produced no FTS hits");
+    assert!(
+        !before.fts_hits.is_empty(),
+        "the fixture produced no FTS hits"
+    );
 }
 
 #[test]
@@ -284,7 +281,10 @@ fn a_truncated_index_recovers_the_same_vault_on_the_next_start() {
 
     let path = index_path(index_dir.path());
     let size = fs::metadata(&path).expect("stat").len();
-    assert!(size > 8_192, "the fixture index is too small to truncate a page from");
+    assert!(
+        size > 8_192,
+        "the fixture index is too small to truncate a page from"
+    );
     let file = fs::OpenOptions::new()
         .write(true)
         .open(&path)
