@@ -111,6 +111,10 @@ Make it fail for the right reason before making it pass — delete a row or corr
 
 **What is genuinely blocked and should stay blocked:** #94 behind #111's rebase, #95 behind #94, #107 behind #104 and #106, #110 behind the CI outage (F-384, with the owner). Do not start those.
 
+**Ruling: NFR-PRF-03's figure is not quoted until code-reviewer has mutated the instrument that produced it.** #94 builds the instrument and #95 takes the number, and **the instrument has already been wrong twice in ways that flattered it** — F-402 (the bucketing could be bypassed with 94/94 green) and F-412 (the counter the bucketing reads could lie with 96/96 green). Both were found by mutation and neither by reading. code-reviewer asked for this themselves before being asked, and the reason is exact: *"I would want to mutate that one before any figure is quoted from it, for the same reason F-402 existed."*
+
+**So the order is: #94 built → code-reviewer mutates → #95 measured → #101 quotes it.** Not #95 then review. **A number taken with an unmutated instrument is not a gate number here**, and this project has the receipts: three of the four defects that would have corrupted the original gate result (F-19, F-25, F-26, F-27) were in the measurement apparatus rather than in the product, every one flattering the figure. **The same rule applies to any re-run of NFR-PRF-01 or NFR-PRF-04 if their instruments change.**
+
 **#101 starts now, and its dependency row understates what is available.** Two of the four numbers are **final and will not change**: NFR-PRF-04 **PASS** at 27,693.5 ms against 30,000 (3.2% spread, attested), and NFR-PRF-01 **FAIL** at `window_visible` p95 1575.6 ms against 400 and `vault_usable` p95 1577.2 ms against 1000 (INDETERMINATE on straddle). Draft against those and leave NFR-PRF-03 and NFR-PRF-08 **explicitly blank with what would fill them** — the same method that made #96's window produce a verdict instead of a debate. **Do not estimate NFR-PRF-03.**
 
 Five things the report must carry that a reader will not reconstruct:
