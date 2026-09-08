@@ -335,8 +335,36 @@ not control is fair, and whether an inner mark is needed to separate WebView2's 
 from our mount. **A mark added now is cheap and after #104 is not**, so their answer can
 still change the partition. *(Consulted 2026-09-08; awaiting their answer.)*
 
-**tauri-app-dev, consulted on the basis of the phase-table figures and on `P_builder`'s
-side of the line.** They measured the table this ADR partitions, and §Decision 2's caveat
+**tauri-app-dev answered on `P_builder`, and the objection is a confirmation.** Their words:
+watching rather than budgeting it *"is right for P0: `generate_handler!` currently lists 6
+commands, and nothing about #105 or #98 grows that list, so there's no reason to expect it
+to move this wave. If a P1 command surface grows materially I'll flag it rather than let it
+hide in the platform column — agreed with your caveat as written."* §Decision 2's caveat
+stands unchanged, now with a count attached to it.
+
+**An objection raised *by* this ADR against #105's proposed mechanism (F-388), recorded here
+because it bears directly on `S_shell`'s meaning.** tauri-app-dev proposed replacing `boot.js`'s
+double `requestAnimationFrame` with a `PerformanceObserver` gate on the
+`first-contentful-paint` entry, on the ground that a mark which cannot fire before a real
+paint makes F-377's mutations structurally inapplicable rather than merely detected. **The
+evidence half is right and the replacement half is not.** `first-contentful-paint` attests
+that *something* painted, not that *our shell* painted, and the two coincide only while the
+document renders nothing before the framework mounts. **They already do not coincide here
+and by design:** `crates/serat-app/webview/index.html` carries the entire shell as static
+markup — wordmark, vault label, editor, status bar — because §3.4 requires the editor to
+accept keystrokes from the first paint, *"a property of the document rather than a
+promise"*, and that file instructs #98 to preserve it. So FCP fires on the static skeleton,
+**before Vue and CodeMirror mount**, and a mark gated on FCP alone would move `t_visible`
+earlier by the whole cost of the mount — which is `S_shell`, the term this ADR makes
+binding. **That is mutation B's exact effect arriving legitimately, through the fix for
+mutation B**, and F-386 says the sum identity would not see it.
+
+The resolution is **conjunction rather than replacement**: keep the gate that ties the mark
+to our shell having rendered, and add the paint entry as the evidence that cannot be
+fabricated. Each covers the other's blind spot — a frame gate alone is forgeable, which is
+F-377; a paint entry alone is satisfiable by a skeleton, which is the above.
+
+**tauri-app-dev, still awaited on the basis of the phase-table figures.** They measured the table this ADR partitions, and §Decision 2's caveat
 about `generate_handler!` is a question only they have watched move. *(Consulted
 2026-09-08; awaiting their answer.)*
 
