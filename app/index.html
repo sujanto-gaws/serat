@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Serat</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <!--
+    Task #98's replacement for the P0 placeholder shell (crates/serat-app/webview/).
+    Two things carried over from it and still load-bearing — see app/README.md and
+    src/startup.ts for where they now live:
+
+      * boot.js (built from src/main.ts) takes the NFR-PRF-01 marks. mark_first_paint
+        is called from inside a double requestAnimationFrame — after the frame is
+        composited, never at script start and never from Rust.
+      * The editor is created synchronously when Vue mounts, in the same script
+        execution that produces the first paint, so "the editor accepts keystrokes
+        from the first paint" (architecture §3.4) still holds — though it now holds
+        because mount is synchronous and unblocked by IPC, not because the markup is
+        static. See app/README.md's "What mounting a framework costs" for why that
+        distinction matters and is not free.
+  -->
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

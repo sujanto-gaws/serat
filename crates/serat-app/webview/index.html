@@ -3,44 +3,25 @@
   <head>
     <meta charset="utf-8" />
     <title>Serat</title>
-    <link rel="stylesheet" href="shell.css" />
+    <script type="module" crossorigin src="./boot.js"></script>
+    <link rel="stylesheet" crossorigin href="./shell.css">
   </head>
   <!--
-    The P0 placeholder shell. Task S2 (vue-frontend-dev) replaces this with the Vue
-    application and CodeMirror 6; a cold-start number taken against this page is the
-    shell's, not the product's.
+    Task #98's replacement for the P0 placeholder shell (crates/serat-app/webview/).
+    Two things carried over from it and still load-bearing — see app/README.md and
+    src/startup.ts for where they now live:
 
-    Two things here are load-bearing and must survive that replacement:
-
-      * boot.js takes the NFR-PRF-01 marks. `mark_first_paint` is called from inside a
-        double requestAnimationFrame — after the frame is composited, never at script
-        start and never from Rust — and `mark_vault_usable` is called once the buffer
-        is rendered. Move either and the budget stops measuring what it claims to.
-      * The editor is in the static markup and is focusable before any IPC returns, so
-        "the editor accepts keystrokes from the first paint" (architecture §3.4) is a
-        property of the document rather than a promise.
+      * boot.js (built from src/main.ts) takes the NFR-PRF-01 marks. mark_first_paint
+        is called from inside a double requestAnimationFrame — after the frame is
+        composited, never at script start and never from Rust.
+      * The editor is created synchronously when Vue mounts, in the same script
+        execution that produces the first paint, so "the editor accepts keystrokes
+        from the first paint" (architecture §3.4) still holds — though it now holds
+        because mount is synchronous and unblocked by IPC, not because the markup is
+        static. See app/README.md's "What mounting a framework costs" for why that
+        distinction matters and is not free.
   -->
   <body>
-    <header class="titlebar">
-      <span class="wordmark">Serat</span>
-      <span id="vault" class="vault">no vault</span>
-    </header>
-
-    <main class="workspace">
-      <textarea
-        id="editor"
-        class="editor"
-        spellcheck="false"
-        autofocus
-        placeholder="P0 shell — a plain text box. Live preview is P1 (ADR-0006)."
-      ></textarea>
-    </main>
-
-    <footer class="statusbar">
-      <span id="index" class="index">index: opening</span>
-      <span id="marks" class="marks"></span>
-    </footer>
-
-    <script src="boot.js"></script>
+    <div id="app"></div>
   </body>
 </html>
