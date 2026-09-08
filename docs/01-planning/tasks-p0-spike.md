@@ -98,6 +98,14 @@ Make it fail for the right reason before making it pass — delete a row or corr
 
 **#113 is confirmed and cleared to commit on a fresh branch off current main** — main already has `Option<f64>`, `raf1_ms`/`raf2_ms` and `validate_paint_evidence()`; it lacks `AppState::mark_first_paint`. Land the port and the `mark_first_paint_forwards_the_real_argument_not_a_hardcoded_one` test; it closes F-397, which is live on main and was live when #100 was measured.
 
+**Unblocked work for test-engineer while #111 and F-411 are held: code-reviewer's three SHOULD-FIXes on `task/91-93-97-test-recovery`.** None changes a number, all are yours, and one is a real defect of the class this wave keeps recording:
+
+- **`a_guard_taken_before_a_pre_existing_dot_serat_is_created_still_protects_it` asserts the opposite of what its own comment claims.** Measured with a probe: a `.serat/` created by another party *after* `watch()` **is** deleted at drop, while the comment says the guard *"must still answer 'I did not create this'"*. No mutation kills this test that tests 1 and 3 do not already kill, so it adds no coverage and it misdescribes the behaviour — **F-107's shape, the text meaning something the code does not.** Either make the code match the comment or make the comment match the code, and say which you chose.
+- **`cargo fmt --check` is red on the new bin** (two hunks).
+- The branch touches `trace.rs` (+12, additive `paint_evidence_ms`), which an earlier ruling scoped to #106. **Same owner role and clearly needed — flagged rather than objected to, and it stands.**
+
+**What is genuinely blocked and should stay blocked:** #94 behind #111's rebase, #95 behind #94, #107 behind #104 and #106, #110 behind the CI outage (F-384, with the owner). Do not start those.
+
 **#101 starts now, and its dependency row understates what is available.** Two of the four numbers are **final and will not change**: NFR-PRF-04 **PASS** at 27,693.5 ms against 30,000 (3.2% spread, attested), and NFR-PRF-01 **FAIL** at `window_visible` p95 1575.6 ms against 400 and `vault_usable` p95 1577.2 ms against 1000 (INDETERMINATE on straddle). Draft against those and leave NFR-PRF-03 and NFR-PRF-08 **explicitly blank with what would fill them** — the same method that made #96's window produce a verdict instead of a debate. **Do not estimate NFR-PRF-03.**
 
 Five things the report must carry that a reader will not reconstruct:
