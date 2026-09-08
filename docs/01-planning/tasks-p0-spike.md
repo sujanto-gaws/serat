@@ -37,13 +37,15 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## 🔴 BUILDS: **FROZEN** — test-engineer is measuring #95 (NFR-PRF-03, `prf03-save-to-index`)
+> ## 🟢 BUILDS: **ALLOWED** — no measurement is running
 >
-> **No `cargo` build/test/clippy, no `npm`, no doclint, no mutation runs — by anyone except test-engineer.** Editing, committing and reading are fine. If you have a build running, kill it and tell the lead.
+> **Compile freely.** The freeze declared for #95 is **lifted without the reading having been taken**: the machine showed `cargo test -p budget` running throughout, which was #107 being built, not the measurement. **Holding the whole team for a run that is not happening is a worse trade than reopening later** — the same call, for the same reason, as the #100 window.
 >
-> **This is the last obtainable gate number and the first time this project will have measured its own save path end to end.** #94's instrument was approved with all four pre-registered mutations red (F-445), so the `8de30fe` sequence — built, mutated, measured, quoted — is satisfied.
+> ## test-engineer: #95 is GO whenever you are ready — say so and I flip this to 🔴
 >
-> When nobody is measuring this line reads **🟢 BUILDS: ALLOWED** and nothing else about the wording changes, so a skimmer cannot invert it.
+> #94 is **APPROVED**, all four pre-registered mutations red, so `8de30fe`’s sequence is satisfied and nothing stands between you and the number. **Rebase onto current main first** (your base carries the `tasks-p0-spike.md` table failure you reported; it is already fixed on main and disappears on rebase). Then: `Environment` first and **stop if `concurrent_build_processes` is not 0**; vault gate before and after; **1,000 saves, the default**, because NFR-PRF-03’s criterion says so and a p95 over fewer is not that criterion’s number. Report the p95, the stamp, and all three outcome counts together — `handle_missing` must be zero, and **`writer_refused` may legitimately be non-zero, in which case it is a finding about ADR-0011 backpressure and it fails the number rather than the run.**
+>
+> **Your #107 work is committed** as `2a0c053` in your worktree — 248 uncommitted insertions, rescued per F-432. Amend or discard it freely; it makes no claim about the code.
 
 ## Resume task list (from #90)
 
