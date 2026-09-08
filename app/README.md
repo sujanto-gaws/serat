@@ -72,6 +72,26 @@ the *ordering* guarantee holds, the *zero-JS-dependency* property of the placeho
 does not, and only #100's measurement says whether the difference is visible against
 NFR-PRF-01's budget.
 
+## The paint mark's guard (task #108)
+
+`crates/serat-app/src/lib.rs`'s marks test only asserts that `boot.js` contains the
+substrings `mark_first_paint`, `mark_vault_usable` and `requestAnimationFrame`
+somewhere — it cannot see whether the call happens *inside* the double rAF or is
+hoisted to script start with a no-op rAF left behind to satisfy the grep
+(code-reviewer's F-377 mutation; both mutations still pass `cargo test -p serat-app`,
+86/86). `src/startup.ts`'s `schedulePaintMark` now sends `PaintEvidence` alongside
+the call — `raf1_ms`/`raf2_ms` are the two callbacks' own `DOMHighResTimeStamp`
+arguments, and `nav_dom_content_loaded_ms` is `PerformanceNavigationTiming`'s own
+field, which this file cannot fabricate because it is the browser's instrumentation,
+not ours. `crates/serat-app`'s guard (task #105, tauri-app-dev + architect) is what
+actually rejects implausible evidence; this half only has to produce evidence a
+rewrite of this file could not fake without literally waiting for two real frames.
+See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning, and
+ADR-0014 (`S_shell`) for why `nav_dom_content_loaded_ms` exists at all — it is the
+inner mark that ADR-0014's open objection to vue-frontend-dev asked for, splitting
+`S_shell` into WebView2's navigation cost and this bundle's mount cost, without a
+second IPC round trip that would perturb the very interval it measures.
+
 ## Layout
 
 ```

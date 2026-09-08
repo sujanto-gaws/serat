@@ -41,12 +41,49 @@ export function indexStatus(): Promise<IndexStatus> {
 }
 
 /**
+ * Evidence that `mark_first_paint` was really taken from inside a double
+ * `requestAnimationFrame`, not merely asserted by calling it — task #108, closing
+ * F-377 (`crates/serat-app`'s guard, task #105, is what actually rejects implausible
+ * evidence; this type only has to match its parameter names).
+ *
+ * Field names are snake_case, matching this file's one existing convention for wire
+ * shapes (e.g. `WriteFileArgs.base_hash`) even though `mark_first_paint` sits outside
+ * `contracts/ipc.rs` and this type is hand-written rather than ts-rs'd — the two
+ * instrumentation commands are documented as "not in the contract"
+ * (`commands.rs`), not as exempt from its wire convention.
+ */
+export interface PaintEvidence {
+  /**
+   * The **first** `requestAnimationFrame` callback's own `DOMHighResTimeStamp`
+   * argument. Deliberately not a second `performance.now()` call inside the
+   * callback: the value is the one the browser's scheduler produced for that
+   * callback, not one this file computed after the fact.
+   */
+  raf1_ms: number;
+  /** The second callback's timestamp — taken after the frame reached the compositor. */
+  raf2_ms: number;
+  /**
+   * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded
+   * one. Unlike the two fields above, this is the platform's own instrumentation: a
+   * rewrite of this file cannot move it, which is exactly why it is worth reporting
+   * — it is the anchor ADR-0014's open objection to vue-frontend-dev asked for, and
+   * splits `S_shell` into WebView2's navigation cost and this bundle's mount cost.
+   * `null` when the entry is absent, which some engines or navigation types can
+   * legitimately produce. Diagnostic only: the guard does not gate on it.
+   */
+  nav_dom_content_loaded_ms: number | null;
+}
+
+/**
  * The paint mark (NFR-PRF-01). Call this from inside a double
  * `requestAnimationFrame` and nowhere else — see `src/startup.ts`. Returns
  * milliseconds since t0, which `serat-app` computed and is not re-derived here.
+ *
+ * Can reject: `crates/serat-app`'s guard (task #105) is expected to refuse evidence
+ * that could not have come from two real, distinct composited frames.
  */
-export function markFirstPaint(): Promise<number> {
-  return invoke("mark_first_paint");
+export function markFirstPaint(evidence: PaintEvidence): Promise<number> {
+  return invoke("mark_first_paint", { ...evidence });
 }
 
 /**

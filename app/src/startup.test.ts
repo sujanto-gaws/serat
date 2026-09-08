@@ -18,16 +18,18 @@ const { hydrateBuffer, schedulePaintMark } = await import("./startup");
 
 /**
  * A double `requestAnimationFrame`, faked with microtasks rather than real frames
- * so the test does not depend on a browser's paint scheduler. What matters for this
- * test is only that the mark is not taken synchronously — the same property
- * crates/serat-app/src/startup.rs's `mark_first_paint` test asserts on the Rust
- * side ("Nothing here is a product feature" — this is purely a scheduling contract).
+ * so the test does not depend on a browser's paint scheduler. Each call gets a
+ * distinct, increasing timestamp (10, 20, 30, ...) so `schedulePaintMark`'s tests can
+ * tell `raf1_ms` and `raf2_ms` apart rather than both landing on the same stub value
+ * — the same property crates/serat-app/src/startup.rs's `mark_first_paint` test
+ * asserts on the Rust side ("Nothing here is a product feature" — this is purely a
+ * scheduling contract).
  */
 function stubDoubleRaf() {
   let calls = 0;
   vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
     calls += 1;
-    queueMicrotask(() => cb(0));
+    queueMicrotask(() => cb(calls * 10));
     return calls;
   });
 }
@@ -59,6 +61,51 @@ describe("schedulePaintMark", () => {
     const ms = await schedulePaintMark(store);
     expect(ms).toBe(12.5);
     expect(store.marksText).toBe("painted 12.5 ms");
+  });
+
+  it("sends the two callbacks' own timestamps as evidence, not a recomputed pair", async () => {
+    // task #108 / F-377: the point of PaintEvidence is that raf1_ms and raf2_ms are
+    // the browser's own callback arguments. If schedulePaintMark ever starts calling
+    // performance.now() a second time instead of using the callback argument, this
+    // still passes as long as the two values it sends came from the two distinct
+    // scheduled callbacks in order — which is the property that matters for the
+    // guard (task #105) to check a gap against.
+    markFirstPaint.mockResolvedValue(1.0);
+    const store = useVaultStore();
+    await schedulePaintMark(store);
+
+    expect(markFirstPaint).toHaveBeenCalledTimes(1);
+    const evidence = markFirstPaint.mock.calls[0][0] as {
+      raf1_ms: number;
+      raf2_ms: number;
+      nav_dom_content_loaded_ms: number | null;
+    };
+    expect(evidence.raf1_ms).toBe(10);
+    expect(evidence.raf2_ms).toBe(20);
+    expect(evidence.raf2_ms).toBeGreaterThan(evidence.raf1_ms);
+  });
+
+  it("reports the navigation-timing anchor when the webview recorded one", async () => {
+    const entry = { domContentLoadedEventEnd: 42 } as PerformanceNavigationTiming;
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([entry]);
+    markFirstPaint.mockResolvedValue(1.0);
+
+    const store = useVaultStore();
+    await schedulePaintMark(store);
+
+    const evidence = markFirstPaint.mock.calls[0][0] as { nav_dom_content_loaded_ms: number | null };
+    expect(evidence.nav_dom_content_loaded_ms).toBe(42);
+  });
+
+  it("reports null rather than throwing when there is no navigation entry", async () => {
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([]);
+    markFirstPaint.mockResolvedValue(1.0);
+
+    const store = useVaultStore();
+    await schedulePaintMark(store);
+
+    const evidence = markFirstPaint.mock.calls[0][0] as { nav_dom_content_loaded_ms: number | null };
+    expect(evidence.nav_dom_content_loaded_ms).toBeNull();
   });
 
   it("resolves with null and records the failure rather than throwing", async () => {

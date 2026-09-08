@@ -15,11 +15,34 @@
 //                       by App.vue's CodeMirrorEditor, independent of this module.
 //
 // Nothing here is a product feature (charter: "no product features" for P0).
+//
+// Task #108 (F-377, ADR-0014): the double rAF above is a promise this file makes,
+// not one the Rust side could ever check — `crates/serat-app/src/lib.rs`'s marks
+// test only greps `boot.js` for the substring `requestAnimationFrame`, and
+// code-reviewer's mutation at F-377 showed exactly what that misses: hoist the
+// `invoke` to script start, leave a no-op `requestAnimationFrame(() => {})` behind
+// to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below now sends
+// `PaintEvidence` — the two callbacks' own timestamps, plus a browser-instrumented
+// navigation-timing anchor neither callback could fake — so `crates/serat-app`'s
+// guard (task #105) has something to check the call against rather than trusting
+// that it happened. See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field
+// reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
 import type { useVaultStore } from "@/stores/vault";
 
 type VaultStore = ReturnType<typeof useVaultStore>;
+
+/**
+ * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded a
+ * navigation entry — see `PaintEvidence.nav_dom_content_loaded_ms`. Its own function
+ * only so `schedulePaintMark` reads as "gather evidence, then call", rather than
+ * burying the one fallible read among timestamps that cannot fail.
+ */
+function navDomContentLoadedMs(): number | null {
+  const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
+  return entry ? entry.domContentLoadedEventEnd : null;
+}
 
 /**
  * Schedules the paint mark from inside a double `requestAnimationFrame` and returns
@@ -33,16 +56,23 @@ type VaultStore = ReturnType<typeof useVaultStore>;
  */
 export function schedulePaintMark(store: VaultStore): Promise<number | null> {
   return new Promise((resolve) => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        markFirstPaint().then(
+    requestAnimationFrame((raf1) => {
+      requestAnimationFrame((raf2) => {
+        markFirstPaint({
+          raf1_ms: raf1,
+          raf2_ms: raf2,
+          nav_dom_content_loaded_ms: navDomContentLoadedMs(),
+        }).then(
           (ms) => {
             store.setMark(`painted ${ms.toFixed(1)} ms`);
             resolve(ms);
           },
           (err: unknown) => {
             // Never silently swallowed: an unhandled rejection here would look
-            // identical to a shell that painted nothing.
+            // identical to a shell that painted nothing. It is also, now, the guard
+            // actually firing rather than only a transport failure — a rejection here
+            // can mean the evidence looked implausible (task #105), and the message
+            // says which.
             store.setMark(`paint mark failed: ${JSON.stringify(err)}`);
             resolve(null);
           },
