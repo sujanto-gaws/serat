@@ -3,18 +3,25 @@
 //! Everything measured enters through one of the three functions below.
 //!
 //! **All three are wired and landing red is no longer their default state.**
-//! `full_rebuild()` (I4, I3) and `save_to_index()` (I5, I3) both call the real
-//! `serat-index`/`serat-parse` seams; the entry-point constants below are kept
-//! as history of what each one asked for while it was still an error, not as
-//! a current status. `cold_start()` spawns the real `serat-app` binary (S1)
-//! and reads `--exit-after-ready`'s trace; task #52 settled the one open
-//! question about what it waits for -- see [`COLD_START_ENTRY_POINT`] below,
-//! which is current rather than aspirational.
+//! `full_rebuild()` (I4, I3) calls the real `serat-index`/`serat-parse` seams
+//! directly; the `REBUILD_ENTRY_POINT` constant below is kept as history of
+//! what it asked for while it was still an error, not as a current status.
+//! `cold_start()` and `save_to_index_via_app()` (task #94, following #111)
+//! both spawn the real `serat-app` binary (S1) rather than linking it — the
+//! dependency rule (architecture §2.1) runs the other way, `bench/budget` may
+//! not depend on `serat-app` — and read one line of JSON it writes on exit.
+//! Task #52 settled the one open question about what `cold_start` waits for;
+//! see [`COLD_START_ENTRY_POINT`] below, which is current rather than
+//! aspirational. `save_to_index_via_app` was the last of the three to make
+//! this trade: an earlier version called `IndexHandle::apply()`/`flush()`
+//! straight into `serat-index`, which skipped `AppState` entirely and so
+//! could not see the one thing NFR-PRF-03's harness exists to catch — see its
+//! own doc comment.
 //!
 //! Keeping the seam in one file is deliberate: when a function's blockers
 //! land, only that function's body changes and no measurement code moves.
-//! The signatures in the `*_ENTRY_POINT` constants below are what
-//! `rust-core-dev` was asked for, kept for the record even after landing.
+//! The signature in `REBUILD_ENTRY_POINT` is what `rust-core-dev` was asked
+//! for, kept for the record even after landing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -214,117 +221,103 @@ budget still asserts the total; the phases are recorded beside it -- once
 RebuildReport splits write_fts out of write (see the doc comment above this
 constant), which is a second, separate ask of rust-core-dev, not I3's.";
 
-/// A save's timing, on the interval NFR-PRF-03 actually governs, plus the two
-/// watcher-path readings kept for FR-VLT-04 and for continuity.
+/// The directories vaultgen assigns to its highest `hub_boost` kinds
+/// (`bench/vaultgen/src/plan.rs::Kind::hub_boost`): `_types` (TypeDef, 4.0),
+/// `areas` (Area, 6.0 — "the heaviest hubs in the vault"), `projects`
+/// (Project, 3.5), `people` (Person, 3.0). [`select_save_sample`]'s proxy for
+/// "is this a hub note" — fixed by the generator's own directory layout, not
+/// derived from a per-note in-degree the manifest does not publish
+/// (`link_degree` is aggregate-only: edges, max, p50/p90/p99, orphans,
+/// `top_1pct_share`). Cheapest honest signal available without re-deriving
+/// vaultgen's private hub-selection RNG, which is `bench/budget`'s call to
+/// make (`crates/serat-app/src/cli.rs`'s own doc on `bench_save_list`: "a
+/// sampling decision over the vault's own link-degree distribution —
+/// `bench/budget`'s domain, not this crate's").
+const HUB_DIRECTORIES: &[&str] = &["_types", "areas", "projects", "people"];
+
+/// Choose `iterations` distinct vault-relative Markdown paths for
+/// `--bench-save-list`.
 ///
-/// **Corrected by F-268, one layer inward from F-227.** Both fields this
-/// struct used to have — `end_to_end` and `pipeline` — are watcher-path
-/// intervals: `end_to_end` is "file written to row visible" and its own doc
-/// said so (the 150 ms coalescing window is inside it); `pipeline` is
-/// "watcher event dequeued to row visible". §3.1.1's actual save path has no
-/// watcher and no dequeue at all — the buffer is written, the in-memory bytes
-/// go straight to the parse pool, submit, visible — so neither field is an
-/// interval NFR-PRF-03 can mean, and `measure_save_to_index` was asserting
-/// `pipeline` regardless. F-227 warned that *benchmarking against the current
-/// shell* would measure the watcher path by accident and report NFR-PRF-03
-/// missed by an order of magnitude; this was the same wrong number **by
-/// construction, inside the instrument built to prevent it**, and it read as
-/// correct because `pipeline` sounds like the pipeline's own cost.
+/// Stratified rather than a plain random or first-N sample, for the reason
+/// this task was given in review: *"a save that touches a hub does far more
+/// link-table work than the median, so a sample that misses the hubs posts a
+/// p95 the real vault does not honour"* (rust-core-dev, with the 20k vault's
+/// own numbers: 25% of inbound links held by 1% of notes, max in-degree 679).
+/// Up to a fifth of the sample is drawn from [`HUB_DIRECTORIES`], capped by
+/// how many exist; the rest is spread evenly across every other Markdown note
+/// so the sample is not exclusively cold long-tail notes either.
 ///
-/// `save` is the fix: §3.1.1's save path, from submit through
-/// `IndexHandle::apply()` to `writer().flush()` returning. It is what gets
-/// asserted now. `end_to_end` and `pipeline` stay, reported rather than
-/// asserted, because they are real numbers that answer a real question —
-/// FR-VLT-04's 500 ms, for a change that arrives through the watcher.
-#[derive(Clone, Debug, Default)]
-pub struct SaveSamples {
-    /// Which code path every sample in `save` was measured on. Must read
-    /// `"save"` — [`crate::check_save_path`] refuses anything else. This is
-    /// the harness's own claim about how it measured, since `apply()` returns
-    /// `Result<(), IndexError>` and hands back no discriminant of its own
-    /// (F-229) — the guard is a self-check on the measurement code, the same
-    /// role `check_bulk_load_shape` plays for the rebuild. Defaults to `""`,
-    /// which fails closed rather than open.
-    pub path: &'static str,
-    /// §3.1.1's save path: `apply()` submitted through `flush()` returning.
-    /// No watcher, no debounce, no dequeue. **The asserted series.**
-    pub save: Samples,
-    /// File written (via the watcher) to row visible, including the 150 ms
-    /// per-path coalescing window of architecture §3.1 step 1. FR-VLT-04's
-    /// interval, not NFR-PRF-03's. Reported, never asserted against this
-    /// budget (F-227).
-    pub end_to_end: Samples,
-    /// Watcher event dequeued to row visible: the pipeline's own cost with
-    /// the debounce excluded, but still a **watcher-path** interval — the
-    /// name is the reason this went unnoticed as long as it did (F-268).
-    /// Reported beside `end_to_end`, never asserted.
-    pub pipeline: Samples,
+/// Deterministic over a fixed vault: both partitions are sorted before
+/// sampling, so two runs against the same vault ask for the same notes in the
+/// same order — same reasoning as `PRESETS`' pinned digests, a number is only
+/// comparable with another number taken under the same conditions.
+///
+/// # Errors
+/// The vault could not be opened or walked, or it does not hold `iterations`
+/// distinct Markdown notes to sample from.
+fn select_save_sample(vault: &Path, iterations: usize) -> Result<Vec<String>, String> {
+    let opened = serat_vault::Vault::open(vault)
+        .map_err(|e| format!("opening {} to select a save sample: {e}", vault.display()))?;
+    let entries = opened
+        .walk()
+        .map_err(|e| format!("walking {} to select a save sample: {e}", vault.display()))?;
+
+    let mut hub: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    for entry in &entries {
+        if !entry.path.is_markdown() {
+            continue;
+        }
+        let path = entry.path.as_str().to_string();
+        let top = path.split('/').next().unwrap_or("");
+        if HUB_DIRECTORIES.contains(&top) {
+            hub.push(path);
+        } else {
+            rest.push(path);
+        }
+    }
+    hub.sort();
+    rest.sort();
+
+    let total = hub.len() + rest.len();
+    if total < iterations {
+        return Err(format!(
+            "{} asks for {iterations} distinct notes but the vault only has {total} Markdown \
+             notes ({} hub, {} other)",
+            vault.display(),
+            hub.len(),
+            rest.len()
+        ));
+    }
+
+    let hub_target = (iterations / 5).min(hub.len());
+    let rest_target = iterations - hub_target;
+    if rest.len() < rest_target {
+        return Err(format!(
+            "{} needs {rest_target} non-hub notes to fill out a {iterations}-note sample but \
+             only has {}",
+            vault.display(),
+            rest.len()
+        ));
+    }
+
+    let mut sample = evenly_spaced(&hub, hub_target);
+    sample.extend(evenly_spaced(&rest, rest_target));
+    Ok(sample)
 }
 
-/// What the harness needs before NFR-PRF-03 is measurable.
-///
-/// **I5 landed** (`crates/serat-index/src/incremental.rs`), and its own module
-/// doc states F-268's split independently: *"A save made in Serat goes
-/// bytes → hash → parse → writer, with no watcher and no debounce. That is
-/// what `IndexHandle::apply` serves and what NFR-PRF-03's 50 ms governs...
-/// An external change goes through the watcher's 150 ms coalescing window...
-/// That interval is FR-VLT-04's, whose criterion is 500 ms."* What is missing
-/// is `NoteParser` — `apply()` takes one, and `serat-parse` (task I3) still
-/// has none, the same blocker [`crate::full_rebuild`] is waiting on.
-///
-/// Corrected by **F-267** (itself a correction of F-230) and then again once
-/// I5's real shape was visible: this constant is a `&str`, not compiled code,
-/// so a stale call site here never broke the build — it read as a plausible
-/// specification instead, the worse failure mode, because nothing forces a
-/// reader to notice. Two things this text got wrong before I5 landed:
-/// `IndexHandle::open` takes one argument, not `(vault_root, index_dir)`; and
-/// `apply()` returns `Result<(), IndexError>`, not a timing struct — it does
-/// not instrument itself, so the harness must time the call from the outside,
-/// the same way it already times `rebuild()`'s wall clock.
-pub const SAVE_ENTRY_POINT: &str = "\
-NFR-PRF-03 needs, from serat-parse (task I3) -- serat-index's own half landed:
-
-    let handle = IndexHandle::open(index_dir)?;
-    let started = Instant::now();
-    handle.apply(&vault, &parser, &echo, &path)?;   // submits directly, no watcher
-    handle.writer().flush()?;                        // the barrier, visible at the call
-    let elapsed = started.elapsed();                 // the harness's own timing; apply()
-                                                       // returns () and instruments nothing
-
-apply() then flush(), NOT a combined apply_and_wait(): a barrier must stay
-visible where it is called (architecture §2.2). apply(); flush(); shows the
-wait; a combined call hides one and is a copy-paste from the save path where
-waiting is forbidden by design goal 2. There is no apply_and_wait anywhere in
-serat-index -- it was never built, only ever the wrong entry this text used
-to request (F-267, correcting F-230).
-
-The full, landed signature is apply(&dyn NoteSource, &dyn NoteParser,
-&dyn EchoGuard, &VaultPath) -> Result<(), IndexError>, then writer().flush().
-NoteSource and NoteParser are the traits rebuild() already takes (architecture
-§2.1); EchoGuard is what makes echo suppression (§3.2) a parameter the harness
-can see rather than a private detail apply() reaches for on its own.
-
-One submit per flush. flush() drains the whole queue, so submitting fifty and
-flushing once would be a throughput figure wearing a latency label, and
-NFR-PRF-03 is a p95 of individual saves.
-
-The harness edits 1,000 distinct notes, one at a time, and reports the save
-interval (asserted, tagged path = \"save\" -- crate::check_save_path refuses
-anything else, F-229) beside the two watcher-path intervals (reported, F-227,
-F-268): file-written-to-visible via the watcher, and watcher-event-dequeued-
-to-visible. Distinct notes rather than one note a thousand times, because
-re-saving one note measures a warm row and not the budget -- and the sample
-deliberately includes hub notes. With 25% of inbound links held by 1% of notes
-and a max in-degree of 679, a save that touches a hub does far more link-table
-work than the median, so a sample that misses the hubs posts a p95 the real
-vault does not honour. (rust-core-dev's point, and a good one.)
-
-F-227, F-268: two paths, not one, and both must be visible in the result. A
-save made in Serat has no watcher and no debounce -- that is what the 50 ms
-governs, through apply()+flush(). An external change carries the watcher's
-150 ms coalescing window and is FR-VLT-04's 500 ms. SaveSamples.save is the
-former, asserted; .end_to_end and .pipeline are the latter, reported for
-FR-VLT-04 and never asserted against NFR-PRF-03.";
+/// `n` entries spread evenly across `from`, in order — not the first `n`,
+/// which would sample only one corner of a sorted (and so path-clustered)
+/// list.
+fn evenly_spaced(from: &[String], n: usize) -> Vec<String> {
+    if n == 0 || from.is_empty() {
+        return Vec::new();
+    }
+    if n >= from.len() {
+        return from.to_vec();
+    }
+    (0..n).map(|i| from[i * from.len() / n].clone()).collect()
+}
 
 /// What the harness needs before NFR-PRF-01 is measurable.
 pub const COLD_START_ENTRY_POINT: &str = "\
@@ -505,28 +498,89 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
     })
 }
 
-/// Time `iterations` single-note saves through to being visible in the
-/// index: the save-path interval NFR-PRF-03 governs, and the two watcher-path
-/// intervals reported beside it (F-227, F-268).
+/// Save `iterations` distinct notes through the real application, driving the
+/// compiled binary via `--bench-save-list` (task #94, following #111).
+///
+/// **Why the compiled binary, not `IndexHandle::apply()` + `flush()` directly
+/// against `serat-index`.** An earlier version of this function called
+/// straight into `serat-index`, which is §3.1.1's save path in name only: it
+/// never enters `AppState::write_file`, so it never touches the empty-
+/// handle-slot race `AppState::save_path_outcomes` exists to count (F-382) or
+/// the writer-refused backpressure ADR-0011 sanctions. A harness that
+/// bypasses the slot cannot detect that the slot degraded — precisely the
+/// shape F-19 already caught once, in the rebuild job's own history, where a
+/// fast number was posted over a partially indexed vault because nothing
+/// measured the thing that dropped work. Driving the real process is the
+/// same trade [`cold_start_once`] already made for NFR-PRF-01, for the same
+/// reason: this is the only seam that measures `serat-app`, which `bench/
+/// budget` may not link under architecture §2.1's dependency rule.
+///
+/// Selects the sample with [`select_save_sample`], writes it to a scratch
+/// list file, spawns the binary the same way [`cold_start_once`] does — `t0`
+/// stamped by the harness immediately before `spawn()`, handed in through
+/// `SERAT_STARTUP_T0_UNIX_NANOS` — and parses
+/// [`crate::trace::SaveBenchmarkTrace`] out of the one line the run writes to
+/// `SERAT_STARTUP_TRACE`.
 ///
 /// # Errors
-/// Today: always. `IndexHandle::apply` (I5) is real, on main, but there is no
-/// production `NoteParser` to hand it — `serat-parse` (task I3) is still the
-/// I1 scaffold, the same blocker [`full_rebuild`] is waiting on. See
-/// [`SAVE_ENTRY_POINT`].
-pub fn save_to_index(
+/// The application binary is absent (task S1's message), the vault cannot
+/// supply `iterations` distinct notes, the run exits non-zero (the process's
+/// own contract: abort rather than report a shorter series than was asked
+/// for), or the exit report cannot be parsed.
+pub fn save_to_index_via_app(
     vault: &Path,
-    index_dir: &Path,
     iterations: usize,
-) -> Result<SaveSamples, String> {
-    let _ = (vault, index_dir, iterations);
-    // serat-vault's hash gate is the first step of the path being measured
-    // (architecture §3.1 step 3); calling it here proves the link, and the
-    // measurement will use it for real.
-    let _gate = serat_vault::hash_bytes(b"---\ntype: note\n---\n");
-    Err(format!(
-        "serat-parse exposes no NoteParser implementation yet — task I3.\n\n{SAVE_ENTRY_POINT}"
-    ))
+) -> Result<crate::trace::SaveBenchmarkTrace, String> {
+    let binary = app_binary()?;
+    let paths = select_save_sample(vault, iterations)?;
+
+    let list_path =
+        std::env::temp_dir().join(format!("serat-bench-save-list-{}.txt", std::process::id()));
+    std::fs::write(&list_path, paths.join("\n"))
+        .map_err(|e| format!("writing the save list to {}: {e}", list_path.display()))?;
+
+    let trace_path = std::env::temp_dir().join(format!(
+        "serat-bench-save-trace-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+
+    // F-401: the same hazard `cold_start`'s guard exists for, and for the same
+    // reason -- this spawns the real app against `vault`, which creates
+    // `.serat/` inside it as an ordinary side effect of indexing. One guard for
+    // the whole run, taken before the spawn and dropped after this function
+    // returns on every exit path including `?`.
+    let _guard = ColdStartVaultGuard::watch(vault);
+
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("the system clock is before the epoch: {e}"))?
+        .as_nanos();
+
+    let status = Command::new(&binary)
+        .arg("--vault")
+        .arg(vault)
+        .arg("--bench-save-list")
+        .arg(&list_path)
+        .env("SERAT_STARTUP_TRACE", &trace_path)
+        .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string())
+        .status()
+        .map_err(|e| format!("spawning {}: {e}", binary.display()))?;
+    let _ = std::fs::remove_file(&list_path);
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&trace_path);
+        return Err(format!(
+            "the --bench-save-list run exited with {status}. A non-zero exit means the run \
+             aborted before reporting anything -- run_save_benchmark's own contract is to abort \
+             rather than report a shorter series than the {iterations} notes asked for."
+        ));
+    }
+
+    let line = std::fs::read_to_string(&trace_path)
+        .map_err(|e| format!("reading {}: {e}", trace_path.display()))?;
+    let _ = std::fs::remove_file(&trace_path);
+    crate::trace::SaveBenchmarkTrace::parse(line.trim())
 }
 
 /// Locate the application binary the cold-start job drives.
@@ -849,17 +903,18 @@ mod tests {
         assert_eq!(phases.sum(), Duration::from_millis(1_160));
         assert_eq!(phases.write(), Duration::from_millis(560));
 
-        let e = save_to_index(vault, index, 10).expect_err("must not silently pass");
-        // I5 (apply/flush) is real on main; I3 (NoteParser) has now landed too,
-        // so this seam is next and its request must stay legible.
-        assert!(e.contains("task I3") || e.contains("I5"), "{e}");
-        // F-267 corrected the entry point away from apply_and_wait, which §2.2
-        // ruled against; the request must name the real composition and the
-        // F-229 path discriminant, or a future implementer builds the wrong
-        // shape from a plausible-looking spec (F-267's own point).
-        assert!(e.contains("EchoGuard"), "{e}");
-        assert!(e.contains("\"save\""), "{e}");
-        assert!(e.contains("writer().flush()"), "{e}");
+        // `save_to_index_via_app` is now in the same category as `cold_start`
+        // below, not `full_rebuild` above: it drives a SEPARATELY BUILT BINARY
+        // (task #94, following #111), so its refusal names either the absent
+        // binary (S1, on a clean checkout) or the absent vault (once a binary
+        // exists) -- both correct, and which one you get depends on build
+        // state, not on this seam's own correctness.
+        let e = save_to_index_via_app(vault, 10).expect_err("must not silently pass");
+        assert!(
+            e.contains("S1") || e.contains("opening") || e.contains("vault"),
+            "save_to_index_via_app must refuse and name either the absent binary or the \
+             absent vault, not fail opaquely: {e}"
+        );
 
         // Deliberately weaker than `full_rebuild`'s assertion above, and the
         // reason is a property of the harness rather than of the app. This is
@@ -994,6 +1049,133 @@ mod tests {
     // batch's own side effect, not arbitrary concurrent writers), so a test claiming it
     // "protects" the concurrent case would be asserting a property that does not hold, which is
     // worse than asserting nothing.
+
+    // ---------------------------------------------------------------- #94
+
+    fn write_note(dir: &Path, rel: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dirs");
+        }
+        std::fs::write(&path, format!("---\ntitle: {rel}\n---\nbody")).expect("write note");
+    }
+
+    /// A tiny vault with the same directory shape vaultgen uses for its
+    /// highest-`hub_boost` kinds, so `select_save_sample` has something real
+    /// to stratify. Not a fixture the generator produced -- this crate's own
+    /// digest gate would reject a hand-built tree -- just the shape
+    /// `HUB_DIRECTORIES` looks for.
+    fn hub_shaped_vault(label: &str, hub_notes: usize, other_notes: usize) -> PathBuf {
+        let dir = scratch_vault_dir(label);
+        for i in 0..hub_notes {
+            // Spread across all four hub directories, not just one, so a test
+            // asserting "at least one hub directory shows up" cannot pass by
+            // accident on a sample that only ever finds `_types`.
+            let top = HUB_DIRECTORIES[i % HUB_DIRECTORIES.len()];
+            write_note(&dir, &format!("{top}/hub-{i}.md"));
+        }
+        for i in 0..other_notes {
+            write_note(&dir, &format!("notes/other-{i}.md"));
+        }
+        dir
+    }
+
+    #[test]
+    fn evenly_spaced_is_empty_for_zero_and_the_whole_slice_when_n_meets_or_exceeds_it() {
+        let from: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        assert!(evenly_spaced(&from, 0).is_empty());
+        assert!(evenly_spaced(&[], 5).is_empty());
+        assert_eq!(evenly_spaced(&from, 10), from);
+        assert_eq!(
+            evenly_spaced(&from, 20),
+            from,
+            "n > len must not panic or truncate wrongly"
+        );
+    }
+
+    #[test]
+    fn evenly_spaced_returns_n_distinct_entries_spread_across_the_slice() {
+        let from: Vec<String> = (0..100).map(|i| format!("{i:03}")).collect();
+        let picked = evenly_spaced(&from, 10);
+        assert_eq!(picked.len(), 10);
+        let mut sorted = picked.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 10, "every pick must be distinct: {picked:?}");
+        // Spread, not clustered at one end: the first and last picks should
+        // sit near the two ends of a 100-entry slice sampled ten ways.
+        assert!(picked[0].parse::<usize>().unwrap() < 20, "{picked:?}");
+        assert!(picked[9].parse::<usize>().unwrap() >= 80, "{picked:?}");
+    }
+
+    #[test]
+    fn select_save_sample_draws_up_to_a_fifth_from_hub_directories() {
+        // 20 hub notes (5 per HUB_DIRECTORIES entry) and 200 plain ones -- the
+        // 20k vault's own proportions are far more skewed than this, but the
+        // point under test is the 1-in-5 cap and the stratification, not a
+        // realistic ratio.
+        let vault = hub_shaped_vault("select-sample-basic", 20, 200);
+        let sample = select_save_sample(&vault, 50).expect("50 of 220 notes");
+
+        assert_eq!(sample.len(), 50, "must return exactly what was asked for");
+        let mut sorted = sample.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 50, "every entry must be distinct: {sample:?}");
+
+        let hub_count = sample
+            .iter()
+            .filter(|p| HUB_DIRECTORIES.contains(&p.split('/').next().unwrap_or("")))
+            .count();
+        // hub_target = (50 / 5).min(20) = 10 exactly, by construction.
+        assert_eq!(
+            hub_count, 10,
+            "expected the 1-in-5 cap (min(50/5, 20 available)) to draw exactly 10 hub notes: \
+             {sample:?}"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn select_save_sample_is_capped_by_however_many_hub_notes_actually_exist() {
+        // Only 4 hub notes exist (one per directory) against a target of
+        // 100/5 = 20 -- the cap must yield to what is actually there rather
+        // than erroring or padding with duplicates.
+        let vault = hub_shaped_vault("select-sample-scarce-hub", 4, 200);
+        let sample = select_save_sample(&vault, 100).expect("100 of 204 notes");
+        assert_eq!(sample.len(), 100);
+        let hub_count = sample
+            .iter()
+            .filter(|p| HUB_DIRECTORIES.contains(&p.split('/').next().unwrap_or("")))
+            .count();
+        assert_eq!(
+            hub_count, 4,
+            "capped by availability, not by the 1-in-5 target: {sample:?}"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn select_save_sample_refuses_a_vault_smaller_than_the_request() {
+        let vault = hub_shaped_vault("select-sample-too-small", 2, 3);
+        let err =
+            select_save_sample(&vault, 1_000).expect_err("5 notes cannot fill a 1,000-note sample");
+        assert!(err.contains('5'), "{err}");
+        assert!(err.contains("1000") || err.contains("1,000"), "{err}");
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn select_save_sample_ignores_non_markdown_entries() {
+        let vault = hub_shaped_vault("select-sample-assets", 5, 8);
+        write_note(&vault, "assets/report.pdf");
+        let sample = select_save_sample(&vault, 10).expect("10 markdown notes exist");
+        assert!(
+            sample.iter().all(|p| p.ends_with(".md")),
+            "an asset must never be handed to --bench-save-list: {sample:?}"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
 
     // ------------------------------------------------------ T-07 / task #30
 
