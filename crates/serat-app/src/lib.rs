@@ -83,6 +83,28 @@ struct BootInfo {
     exit_after_ready: bool,
 }
 
+/// What `--exit-after-ready` writes to [`crate::startup::TRACE_ENV`] (task #111).
+///
+/// The startup trace, flattened, plus a snapshot of [`AppState::save_path_outcomes`]
+/// taken at the same moment — process-lifetime totals of a counter `bench/budget` has
+/// no other way to reach (F-391): it may not link `serat-app` under the dependency
+/// rule (architecture §2.1), and there is no IPC command for it either, because that
+/// would mean granting a benchmark-only command the ACL surface a shipped webview
+/// never calls (ADR-0012's "exactly the five commands boot.js invokes"). The trace
+/// file is already the diagnostic channel a harness reads that a user's session never
+/// takes, so this rides the same line rather than opening a second one.
+///
+/// A run over an untouched vault reports every field `0` — not the absence of a
+/// measurement, the true count for a process that never called `write_file`. A
+/// harness measuring the real save path (task #94) diffs two of these, the way
+/// [`AppState::save_path_outcomes`]'s own doc says to.
+#[derive(Debug, Serialize)]
+struct BenchmarkExitReport<'a> {
+    #[serde(flatten)]
+    trace: &'a startup::Trace,
+    save_path_outcomes: state::SavePathOutcomes,
+}
+
 /// Build and run the application. Returns only when the window closes.
 ///
 /// The order here is architecture §3.4's first row, and the order is the point:
@@ -232,6 +254,12 @@ fn spawn_benchmark_exit(
     handle: &tauri::AppHandle,
     exit_code: Arc<AtomicI32>,
 ) {
+    // The whole state, not just `startup` (task #111): `save_path_outcomes()` is a
+    // method on `AppState`, and this is the one place in the process that reads it on
+    // the way out, so a harness driving real `write_file` calls before this thread's
+    // wait resolves gets a snapshot of what they did, not the zero every prior benchmark
+    // run reported (F-391 -- the counters existed and nothing external could read them).
+    let state = Arc::clone(state);
     let startup = Arc::clone(&state.startup);
     let trace_path = state.boot.trace.clone();
     let timeout = state.boot.ready_timeout;
@@ -251,13 +279,19 @@ fn spawn_benchmark_exit(
                 startup.wait_for_walk_complete(timeout);
             }
             let code = match startup.trace() {
-                Ok(trace) => match write_trace(&trace, trace_path.as_deref()) {
-                    Ok(()) => 0,
-                    Err(err) => {
-                        eprintln!("serat: the startup trace could not be written: {err}");
-                        2
+                Ok(trace) => {
+                    let report = BenchmarkExitReport {
+                        trace: &trace,
+                        save_path_outcomes: state.save_path_outcomes(),
+                    };
+                    match write_trace(&report, trace_path.as_deref()) {
+                        Ok(()) => 0,
+                        Err(err) => {
+                            eprintln!("serat: the startup trace could not be written: {err}");
+                            2
+                        }
                     }
-                },
+                }
                 Err(incomplete) => {
                     // The guard that makes a blank window a failure rather than a fast
                     // number. There is no fallback mark to fall back to.
@@ -299,10 +333,16 @@ fn exit_now(code: i32, message: &str) -> ! {
 }
 
 /// One line of JSON to the trace file, or to stdout if there is none.
-fn write_trace(trace: &startup::Trace, path: Option<&std::path::Path>) -> std::io::Result<()> {
-    let line = trace
-        .to_line()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
+///
+/// Generic rather than `&startup::Trace` specifically (task #111) so
+/// [`BenchmarkExitReport`] — the trace plus [`state::SavePathOutcomes`] — can go
+/// through the same one-line-of-JSON, same env-var-named-file channel, rather than a
+/// second output mechanism next to it. `Trace::to_line` used to own this; the two are
+/// now the same call, `serde_json::to_string`, so there is nothing left for a
+/// `Trace`-specific method to do that this function does not already do generically.
+fn write_trace<T: Serialize>(value: &T, path: Option<&std::path::Path>) -> std::io::Result<()> {
+    let line =
+        serde_json::to_string(value).map_err(|err| std::io::Error::other(err.to_string()))?;
     match path {
         Some(path) => {
             if let Some(parent) = path
@@ -447,5 +487,74 @@ mod tests {
         );
         assert!(written.contains("t0_to_window_visible_ms"), "{written}");
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn the_benchmark_exit_report_carries_save_path_outcomes_beside_the_trace() {
+        // Task #111 / F-391: the trace and the save-path counters ride the same line
+        // rather than two separate output mechanisms. `#[serde(flatten)]` on `trace`
+        // is what makes this one JSON object, not two nested ones -- assert that
+        // shape directly, since a flatten that silently stopped working would still
+        // produce valid, plausible-looking JSON.
+        let startup = Startup::begin_with(None);
+        startup.mark_window_created();
+        startup.mark_first_paint();
+        startup.mark_index_settled();
+        startup.mark_watcher(startup::WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+        let trace = startup.trace().expect("complete");
+
+        let report = BenchmarkExitReport {
+            trace: &trace,
+            save_path_outcomes: state::SavePathOutcomes {
+                handle_missing: 1,
+                writer_refused: 2,
+                submitted: 997,
+            },
+        };
+        let line = serde_json::to_string(&report).expect("json");
+        assert!(
+            line.contains("\"t0_to_window_visible_ms\""),
+            "the trace fields must be flattened into the top level: {line}"
+        );
+        assert!(
+            !line.contains("\"trace\":"),
+            "flatten must not leave a nested \"trace\" object: {line}"
+        );
+        assert!(
+            line.contains(
+                r#""save_path_outcomes":{"handle_missing":1,"writer_refused":2,"submitted":997}"#
+            ),
+            "the save-path counters must be present verbatim, not summarised: {line}"
+        );
+
+        // And through the real write path, not just serde in isolation.
+        let path = std::env::temp_dir()
+            .join(format!(
+                "serat-benchmark-exit-report-{}",
+                std::process::id()
+            ))
+            .join("prf03.json");
+        write_trace(&report, Some(&path)).expect("file");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written.trim_end(),
+            line,
+            "the file carries the same one line"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn an_untouched_vault_reports_every_save_path_counter_as_a_true_zero() {
+        // The doc comment's claim, checked: a process that never called write_file
+        // must report 0/0/0, not omit the field or report something that reads as
+        // "no measurement". A harness diffing two reports needs a real starting value.
+        let outcomes = state::SavePathOutcomes::default();
+        let json = serde_json::to_string(&outcomes).expect("json");
+        assert_eq!(
+            json,
+            r#"{"handle_missing":0,"writer_refused":0,"submitted":0}"#
+        );
     }
 }
