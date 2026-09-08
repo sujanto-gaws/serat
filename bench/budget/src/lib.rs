@@ -1428,6 +1428,23 @@ pub fn check_save_completeness(trace: &trace::SaveBenchmarkTrace) -> Result<(), 
             trace.writer_refused
         ));
     }
+    // F-445's first SHOULD-FIX: a run this counters agree on is still one with
+    // no p95 to report if nothing was ever submitted -- every attempt landed in
+    // writer_refused. Left unhandled, that reaches Samples::percentile with an
+    // empty series and panics on its own "no samples" assertion (outcome_from's
+    // guard catches an empty Measurement generically, but the specific reason
+    // -- every save refused -- is exactly the message a reader most needs and
+    // the one a generic panic or a generic "no samples" Err both discard). A
+    // named refusal here is the last point before that reason is lost.
+    if trace.submitted_ms.is_empty() && trace.attempted > 0 {
+        return Err(format!(
+            "all {} attempted saves were refused by the writer (ADR-0011 backpressure) -- there \
+             is no p95 to compute over zero submitted saves. This is a finding about the queue \
+             being saturated well beyond a single save's workload, not a shorter series to \
+             quietly accept.",
+            trace.attempted
+        ));
+    }
     Ok(())
 }
 
@@ -1613,7 +1630,25 @@ pub fn decide_with_vault<F>(
 where
     F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
 {
-    let measurement = measure(&vault, parsed.iterations)?;
+    let mut measurement = measure(&vault, parsed.iterations)?;
+    // F-445's second SHOULD-FIX: `decide`'s own eprintln! says this result must
+    // not be recorded as a gate number, and stops there -- the `Outcome` (and
+    // its `to_json()`, which is what a trend tool or a pasted report actually
+    // reads back) carried no trace of it. `degraded` is the carrier task #94
+    // built for exactly this shape ("real measurement, must not read as a
+    // pass"), so an indicative run rides the same field a backpressure finding
+    // does, rather than a warning that only ever reached stderr.
+    if parsed.indicative {
+        let note = format!(
+            "running {} iterations, not the {} the acceptance criterion names; this result is \
+             indicative only and must not be recorded as a gate number",
+            parsed.iterations, budget.iterations
+        );
+        measurement.degraded = Some(match measurement.degraded.take() {
+            Some(existing) => format!("{note}; also: {existing}"),
+            None => note,
+        });
+    }
     outcome_from(budget, parsed.profile, vault, measurement)
 }
 
@@ -2798,6 +2833,71 @@ mod tests {
         assert!(err.contains("task I4"), "{err}");
     }
 
+    // --------------------------------------------------------------- F-445
+
+    #[test]
+    fn an_indicative_run_carries_the_warning_into_degraded_not_only_stderr() {
+        // F-445's second SHOULD-FIX. Before this fix `decide`'s eprintln! was
+        // the only record of "must not be recorded as a gate number" -- it
+        // never reached the Outcome, so a fast in-budget reading from a short
+        // local run could still print PASS and a JSON result with no trace of
+        // the warning that made it meaningless.
+        let parsed = JobArgs {
+            profile: Profile::Reference,
+            iterations: 1,
+            indicative: true,
+            help: false,
+        };
+        let outcome = decide_with_vault(&PRF04_FULL_REBUILD, parsed, a_vault(), |_, _| {
+            let mut s = Samples::new();
+            s.push(Duration::from_millis(100));
+            Ok(Measurement::new(s))
+        })
+        .expect("an indicative run with real samples is still a real Outcome");
+
+        assert!(
+            outcome.value_ms() <= outcome.limit_ms(),
+            "the timing alone would pass -- that is what makes this test meaningful"
+        );
+        let reason = outcome
+            .degraded
+            .as_ref()
+            .expect("indicative must set degraded, not only print to stderr");
+        assert!(reason.contains("indicative"), "{reason}");
+        assert!(
+            !outcome.passed(),
+            "an indicative reading must never report PASS"
+        );
+        assert!(
+            outcome.to_json().contains("\"degraded\":"),
+            "{}",
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn an_indicative_run_combines_with_an_existing_degraded_reason_rather_than_overwriting_it() {
+        let parsed = JobArgs {
+            profile: Profile::Reference,
+            iterations: 1,
+            indicative: true,
+            help: false,
+        };
+        let outcome = decide_with_vault(&PRF04_FULL_REBUILD, parsed, a_vault(), |_, _| {
+            let mut s = Samples::new();
+            s.push(Duration::from_millis(100));
+            Ok(Measurement::new(s).degraded("a pre-existing finding"))
+        })
+        .expect("a degraded measurement is still a real Outcome");
+
+        let reason = outcome.degraded.expect("degraded must still be set");
+        assert!(reason.contains("indicative"), "{reason}");
+        assert!(
+            reason.contains("a pre-existing finding"),
+            "neither reason may silently replace the other: {reason}"
+        );
+    }
+
     #[test]
     fn the_vault_generation_lock_excludes_a_second_holder_and_releases_on_drop() {
         // Task #70's other half: ensure_vault's check-then-generate window is
@@ -3188,6 +3288,30 @@ mod tests {
             .expect_err("an unaccounted-for save must refuse the run");
         assert!(err.contains("3 attempted"), "{err}");
         assert!(err.contains("1 submitted, 0 refused"), "{err}");
+    }
+
+    #[test]
+    fn check_save_completeness_refuses_an_all_refused_run_by_name_not_by_a_generic_panic() {
+        // F-445's first SHOULD-FIX. Conservation alone passes here -- 0
+        // submitted + 3 refused == 3 attempted -- and without this branch that
+        // Ok would have reached Samples::percentile with an empty asserted
+        // series, whose own "no samples" assertion panics rather than naming
+        // the actual reason (every save was refused by the writer). The
+        // specific message is the one worth reading; a panic or a generic
+        // empty-measurement Err both discard it.
+        let err = check_save_completeness(&save_trace(3, &[], 0, 3, &[0.1, 0.2, 0.3]))
+            .expect_err("an all-refused run has no p95 to compute and must say so by name");
+        assert!(err.contains("all 3 attempted saves were refused"), "{err}");
+        assert!(err.contains("ADR-0011"), "{err}");
+    }
+
+    #[test]
+    fn measure_save_to_index_propagates_the_specific_all_refused_reason() {
+        let err = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[], 0, 3, &[0.1, 0.2, 0.3]))
+        })
+        .expect_err("an all-refused run must not silently produce an empty-samples measurement");
+        assert!(err.contains("all 3 attempted saves were refused"), "{err}");
     }
 
     #[test]
