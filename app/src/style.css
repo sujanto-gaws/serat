@@ -1,0 +1,86 @@
+/* The P0 shell's styling, in the brand palette (docs/03-design/ui/serat-identity.md
+   §Palette). Carried over from the placeholder's shell.css: four colours and a
+   layout, so the shell that gets timed for NFR-PRF-01 is recognisably Serat and not
+   an unstyled document. frontend-designer owns tokens and full components; P1 brings
+   the real screens (live preview, lens switcher, file tree). */
+
+:root {
+  --indigo: #24457e;
+  --brass: #c08a47;
+  --ink: #16191b;
+  --paper: #f3f4f1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.titlebar {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.5rem 0.9rem;
+  background: var(--indigo);
+  color: var(--paper);
+}
+
+.wordmark {
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.vault {
+  font-size: 12px;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  display: flex;
+  min-height: 0;
+}
+
+/* The CodeMirror 6 host. CM6 manages its own scrolling and content box; this rule
+   only sets the frame it fills. Editor-internal styling (font, tab size, gutters)
+   lives in src/editor/CodeMirrorEditor.vue, next to the extensions that need it. */
+.cm-editor-host {
+  flex: 1;
+  min-width: 0;
+}
+
+.statusbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.35rem 0.9rem;
+  border-top: 1px solid rgba(22, 25, 27, 0.12);
+  font-size: 12px;
+  color: rgba(22, 25, 27, 0.7);
+}
+
+.marks {
+  color: var(--brass);
+  white-space: nowrap;
+}

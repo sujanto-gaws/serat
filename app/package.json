@@ -1,0 +1,33 @@
+{
+  "name": "serat-app-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Serat's Vue 3 frontend. Builds into crates/serat-app/webview, which tauri.conf.json's frontendDist points at. Task #98 (P0/impl): CodeMirror 6 mounted as a plain text box, no live preview. See app/README.md.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.43.11",
+    "@tauri-apps/api": "^2.11.1",
+    "codemirror": "^6.0.2",
+    "pinia": "^3.0.3",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.5.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.0.2",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.3.11"
+  }
+}
