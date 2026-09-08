@@ -2,19 +2,30 @@
 //
 // Two marks, and where they are taken is the whole point (see crates/serat-app/src/startup.rs):
 //
-//   mark_first_paint   from inside a double requestAnimationFrame. A single rAF
-//                      callback runs *before* the frame is painted; the second one
-//                      runs after it has been handed to the compositor, which is the
-//                      earliest moment a browser can honestly say something was drawn.
-//                      Taking this at script start, or in Rust at window creation,
-//                      would pass 400 ms over a blank rectangle — which is exactly the
-//                      failure test-engineer asked us to make impossible.
+//   mark_first_paint   carries evidence, not just a call. F-377: a rAF-counting
+//                      version of this mark passed a substring test under two
+//                      mutations — collapsing a double requestAnimationFrame to one,
+//                      and hoisting the invoke() call to script start with a no-op
+//                      rAF left behind — because rAF depth is something a script
+//                      controls regardless of whether anything was ever composited.
+//                      This version instead waits for the browser's own
+//                      `first-contentful-paint` PerformancePaintTiming entry, which
+//                      the Paint Timing API cannot report before the frame has
+//                      actually reached the compositor, and sends its `startTime` as
+//                      the command's argument. `mark_first_paint` (Rust side) rejects
+//                      anything that is not a positive, finite number — a call with
+//                      no real entry to read has nothing to send, and nothing is
+//                      accepted in its place. If the platform does not support the
+//                      Paint Timing API at all, the same rule applies: no fabricated
+//                      substitute, no mark, the trace is honestly incomplete rather
+//                      than fast.
 //
 //   mark_vault_usable  once the last-open buffer is in the editor. The editor accepts
 //                      keystrokes before this, because it is in the static markup.
 //
 // Nothing here is a product feature. Task S2 replaces this file; it must keep both
-// marks, and crates/serat-app/src/lib.rs has a test that fails if it does not.
+// marks — mark_first_paint carrying real Paint Timing evidence, not a rAF count — and
+// crates/serat-app/src/lib.rs has a test that fails if it does not.
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -60,25 +71,67 @@ if (boot.vault) {
 // The paint mark. Scheduled before the file read is awaited, so a slow disk cannot
 // delay it — the two are independent, which is what §3.4's second row describes.
 //
-// A single rAF callback runs *before* the frame is painted; the second runs after it
-// has gone to the compositor. Nothing else may call this.
+// Gated on the browser's own `first-contentful-paint` entry, not on how many
+// requestAnimationFrame callbacks ran (F-377): rAF depth is under this script's
+// control and proves nothing about whether anything was composited, but the Paint
+// Timing API cannot report the entry before it was. Nothing else may call
+// mark_first_paint, and nothing here may send it anything but that entry's
+// `startTime`.
+function firstContentfulPaintEntry() {
+  return performance
+    .getEntriesByType("paint")
+    .find((entry) => entry.name === "first-contentful-paint");
+}
+
 const painted = new Promise((resolve) => {
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      invoke("mark_first_paint").then(
-        (ms) => {
-          marksLabel.textContent = `painted ${ms.toFixed(1)} ms`;
-          resolve(ms);
-        },
-        (err) => {
-          // Never silently swallowed: an unhandled rejection here would look
-          // identical to a shell that painted nothing.
-          marksLabel.textContent = `paint mark failed: ${JSON.stringify(err)}`;
-          resolve(null);
-        },
-      );
-    });
+  function reportFailure(detail) {
+    // Never silently swallowed: an unhandled failure here would look identical to a
+    // shell that painted nothing. The shell itself still works — the buffer already
+    // read and rendered independently of this mark (design goal 5) — only the
+    // cold-start measurement is unavailable, which is the honest outcome of nothing
+    // real to send rather than a fabricated one.
+    marksLabel.textContent = `paint mark unavailable: ${detail}`;
+    resolve(null);
+  }
+
+  function sendEvidence(entry) {
+    invoke("mark_first_paint", { firstContentfulPaintMs: entry.startTime }).then(
+      (ms) => {
+        marksLabel.textContent = `painted ${ms.toFixed(1)} ms`;
+        resolve(ms);
+      },
+      (err) => reportFailure(JSON.stringify(err)),
+    );
+  }
+
+  if (
+    typeof PerformanceObserver === "undefined" ||
+    !(PerformanceObserver.supportedEntryTypes || []).includes("paint")
+  ) {
+    // Missing evidence is a rejection, never a default: this platform has nothing
+    // this script could honestly call evidence, so nothing is sent.
+    reportFailure("PerformancePaintTiming is not supported on this platform");
+    return;
+  }
+
+  // The entry may already be in the performance timeline by the time this script
+  // runs `buffered: true` catches that; the observer catches it otherwise.
+  const existing = firstContentfulPaintEntry();
+  if (existing) {
+    sendEvidence(existing);
+    return;
+  }
+
+  const observer = new PerformanceObserver((list) => {
+    const entry = list
+      .getEntriesByType("paint")
+      .find((candidate) => candidate.name === "first-contentful-paint");
+    if (entry) {
+      observer.disconnect();
+      sendEvidence(entry);
+    }
   });
+  observer.observe({ type: "paint", buffered: true });
 });
 
 async function openBuffer() {

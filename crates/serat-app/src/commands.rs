@@ -18,6 +18,7 @@ use crate::ipc::{
     FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, VaultOpened,
     WriteFileArgs,
 };
+use crate::startup;
 use crate::state::AppState;
 
 /// `open_vault(args) -> Result<VaultOpened, IpcError>`
@@ -70,17 +71,28 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
 
 /// The webview has composited its first frame.
 ///
-/// Called from inside a double `requestAnimationFrame`, which is the earliest point at
-/// which the browser can honestly say a frame went to the compositor. Returns the mark
-/// in milliseconds since t0 so the shell can show its own number.
+/// `first_contentful_paint_ms` must be the `startTime` of the browser's own
+/// `first-contentful-paint` `PerformancePaintTiming` entry — the Paint Timing API does
+/// not report one until content has actually been painted, which is what makes this
+/// argument evidence rather than a timestamp we simply trust (F-377; see
+/// [`crate::startup`] and `webview/boot.js`). Returns the mark in milliseconds since
+/// t0, on this process's own clock, so the shell can show its own number.
 ///
 /// **This is the only way `t0_to_window_visible_ms` is ever set.** Nothing in Rust
-/// stamps it; see [`crate::startup`] for why that matters.
+/// stamps it, and this command refuses to stamp it from anything but genuine evidence.
+///
+/// # Errors
+///
+/// [`startup::PaintEvidenceRejected`] if the argument is not a positive, finite value —
+/// a call with nothing real to send is refused rather than defaulted, including on a
+/// platform where the Paint Timing API does not exist at all.
 #[tauri::command]
-#[must_use]
-pub fn mark_first_paint(state: State<'_, Arc<AppState>>) -> f64 {
-    state.startup.mark_first_paint();
-    state.startup.elapsed_ms()
+pub fn mark_first_paint(
+    state: State<'_, Arc<AppState>>,
+    first_contentful_paint_ms: f64,
+) -> Result<f64, startup::PaintEvidenceRejected> {
+    state.startup.mark_first_paint(first_contentful_paint_ms)?;
+    Ok(state.startup.elapsed_ms())
 }
 
 /// The file tree has been delivered: in P0, the last-open buffer is rendered and the
