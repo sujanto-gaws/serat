@@ -806,24 +806,48 @@ impl PaintEvidenceRejected {
             ),
         }
     }
+}
 
-    /// Task #112, F-396(b): the frame gate passed — two real, increasing frame
-    /// timestamps — but the second one precedes the paint entry by more than
-    /// clock-quantisation noise can explain. This is the shape F-388's original
-    /// argument (vue-frontend-dev's, not F-388's own reasoning, which F-396(a) found
-    /// false) describes: a mutation that honestly schedules two real frames, just too
-    /// early, before this shell has painted anything visible. `first-contentful-paint`
-    /// alone cannot see this; comparing it against the frames the caller claims
-    /// produced it can.
-    fn frame_precedes_paint(raf2_ms: f64, first_contentful_paint_ms: f64) -> Self {
-        Self {
-            reason: format!(
-                "mark_first_paint refused: the second requestAnimationFrame timestamp \
-                 ({raf2_ms:?}) precedes the first-contentful-paint entry \
-                 ({first_contentful_paint_ms:?}) by more than clock-quantisation noise \
-                 can explain — these were not the frames that painted this shell"
-            ),
-        }
+/// F-406: what [`validate_paint_evidence`] prints when the second requestAnimationFrame
+/// timestamp precedes the paint entry by more than its tolerance — a *diagnostic*, not
+/// [`PaintEvidenceRejected`]'s reason text, because this shape is no longer refused. See
+/// [`validate_paint_evidence`]'s own doc comment for why.
+///
+/// Returns `Option<String>` rather than always building the message, F-424: a version
+/// that always returns `String` and lets the caller decide whether to print it makes
+/// the decision "does this shape still get reported" observable only by reading
+/// stderr, and deleting the whole `eprintln!` call at the site below left every test
+/// green (code-reviewer, by deletion mutation). Returning `None` when the tolerance
+/// holds is the thing a test can assert on without capturing output.
+fn frame_precedes_paint_diagnostic(raf2_ms: f64, first_contentful_paint_ms: f64) -> Option<String> {
+    // Empirically set, not theoretical, and the two are far apart: the first version
+    // of this check used 2ms, reasoned from clock-quantisation noise on the
+    // assumption that the second rAF callback should land at or after the paint
+    // entry. A real WebView2 run rejected every honest launch — measured, over three
+    // separate cold starts against the same real binary, raf2 legitimately precedes
+    // first-contentful-paint by 51.4, 56.7 and 63.4 ms. WebView2's renderer process
+    // and its GPU-compositor "the frame actually displayed" signal are not the same
+    // clock tick; rAF fires on the renderer's own schedule, Paint Timing measures the
+    // compositor's, and the two are consistently ~50-65ms apart on this platform,
+    // not ~2ms. 200ms is set with real margin over that measured range.
+    //
+    // F-406: with FCP measured at ~184ms on this shell, this condition is
+    // arithmetically unreachable as a rejection — it would need `raf2_ms < -16`.
+    // Kept as a diagnostic rather than deleted: the arithmetic is a property of
+    // *this* shell's current content, not a law, and a future page with more to
+    // paint before FCP could make the gap wide enough for this to mean something
+    // again. Reporting it costs one `eprintln!` at the call site and keeps the
+    // measurement running; deleting it would lose the one signal that could ever
+    // tell a future reader the threshold has become meaningful.
+    const FRAME_PRECEDES_PAINT_TOLERANCE_MS: f64 = 200.0;
+    if raf2_ms + FRAME_PRECEDES_PAINT_TOLERANCE_MS < first_contentful_paint_ms {
+        Some(format!(
+            "mark_first_paint: the second requestAnimationFrame timestamp ({raf2_ms:?}) \
+             precedes the first-contentful-paint entry ({first_contentful_paint_ms:?}) by \
+             more than clock-quantisation noise can explain (F-406, reported not refused)"
+        ))
+    } else {
+        None
     }
 }
 
@@ -857,9 +881,31 @@ impl std::error::Error for PaintEvidenceRejected {}
 ///
 /// # Errors
 ///
-/// [`PaintEvidenceRejected`], naming which check failed: the entry is absent; the two
-/// frame timestamps are not strictly increasing; or the second frame precedes the
-/// paint entry by more than clock-quantisation noise can explain.
+/// [`PaintEvidenceRejected`], naming which check failed: the entry is absent, or the
+/// two frame timestamps are not strictly increasing.
+///
+/// # F-406 — the frame-precedes-paint check is a diagnostic, not a rejection
+///
+/// A third check used to live here: refuse when the second requestAnimationFrame
+/// timestamp precedes the paint entry by more than a clock-quantisation tolerance
+/// (F-388's shape — two honestly-composited frames scheduled before this shell painted
+/// anything visible). ADR-0014 pre-committed the fallback for exactly this situation,
+/// before the data existed: **a rejection if an honest run showed the ordering holding
+/// with room, a reported diagnostic if it did not.**
+///
+/// F-393 measured `first_contentful_paint_ms` at ~184 ms on this shell. Rejection
+/// requires `raf2_ms < first_contentful_paint_ms − 200`, which at that FCP needs
+/// `raf2_ms < −16` — impossible on a monotonic clock, for *any* `raf2_ms` a caller
+/// could honestly or dishonestly send. The honest measured gap is 51–65 ms and the
+/// widest gap the check could ever act on tops out at FCP itself (~184 ms); separating
+/// an attack from noise would need a threshold around 65–130 ms, and three samples
+/// against F-327's ~35% session-to-session drift cannot establish one. The pre-
+/// committed condition did not hold, so per ADR-0014 this became a diagnostic
+/// ([`frame_precedes_paint_diagnostic`], printed to stderr): the check still runs and
+/// still names what it found, but no longer refuses the call for it. A check that
+/// cannot fire is worse than no check, because it reads as coverage — this is the
+/// tenth guard-that-cannot-fail on record, and the first found by its own designer's
+/// advance criterion rather than by a reviewer's mutation.
 pub(crate) fn validate_paint_evidence(
     first_contentful_paint_ms: Option<f64>,
     raf1_ms: f64,
@@ -876,30 +922,8 @@ pub(crate) fn validate_paint_evidence(
     if !raf1_ms.is_finite() || !raf2_ms.is_finite() || raf2_ms <= raf1_ms {
         return Err(PaintEvidenceRejected::frame_gate_failed(raf1_ms, raf2_ms));
     }
-    // Empirically set, not theoretical, and the two are far apart: the first version
-    // of this check used 2ms, reasoned from clock-quantisation noise on the
-    // assumption that the second rAF callback should land at or after the paint
-    // entry. A real WebView2 run rejected every honest launch — measured, over three
-    // separate cold starts against the same real binary, raf2 legitimately precedes
-    // first-contentful-paint by 51.4, 56.7 and 63.4 ms. WebView2's renderer process
-    // and its GPU-compositor "the frame actually displayed" signal are not the same
-    // clock tick; rAF fires on the renderer's own schedule, Paint Timing measures the
-    // compositor's, and the two are consistently ~50-65ms apart on this platform,
-    // not ~2ms. 200ms is set with real margin over that measured range — three
-    // samples is not nearly enough to bound the tail (F-327: 35% session-to-session
-    // movement on unchanged code is this project's own recorded experience), so this
-    // is deliberately generous rather than tight. **What it has not been checked
-    // against is a real mutation**: the accepted manual WebView2 mutation run
-    // (F-377/F-392) needs to confirm 200ms still catches F-388's described attack —
-    // two honestly-composited frames scheduled from window-creation time, before this
-    // shell mounted anything — now that the honest range is known to be measured in
-    // tens of milliseconds, not single digits.
-    const FRAME_PRECEDES_PAINT_TOLERANCE_MS: f64 = 200.0;
-    if raf2_ms + FRAME_PRECEDES_PAINT_TOLERANCE_MS < first_contentful_paint_ms {
-        return Err(PaintEvidenceRejected::frame_precedes_paint(
-            raf2_ms,
-            first_contentful_paint_ms,
-        ));
+    if let Some(diagnostic) = frame_precedes_paint_diagnostic(raf2_ms, first_contentful_paint_ms) {
+        eprintln!("serat: {diagnostic}");
     }
     Ok(first_contentful_paint_ms)
 }
@@ -1409,19 +1433,51 @@ mod tests {
     }
 
     #[test]
-    fn two_real_frames_scheduled_before_the_paint_entry_are_rejected() {
-        // The mutation the frame check exists to catch: two honestly-composited
-        // frames, honestly reported, just scheduled before this shell painted
-        // anything visible — F-388's original argument, unaffected by F-396(a)'s
-        // correction of F-388's own reasoning. The gap here (480ms) is well past the
-        // measured honest range (51-63ms, see FRAME_PRECEDES_PAINT_TOLERANCE_MS's own
-        // comment) and past its 200ms tolerance, standing in for frames captured near
-        // window creation, long before this shell painted anything.
-        let err = validate_paint_evidence(Some(500.0), 10.0, 20.0)
-            .expect_err("frames far earlier than the paint entry must be refused");
-        assert!(
-            err.reason.contains("first-contentful-paint"),
-            "the rejection must name the paint entry it compared against: {err}"
+    fn two_real_frames_scheduled_before_the_paint_entry_are_a_diagnostic_not_a_rejection() {
+        // F-388's original argument, unaffected by F-396(a)'s correction of F-388's
+        // own reasoning: two honestly-composited frames, honestly reported, just
+        // scheduled before this shell painted anything visible. The gap here (480ms)
+        // is well past the measured honest range (51-63ms) and past the 200ms
+        // tolerance — the exact shape the frame-precedes-paint check was written to
+        // catch.
+        //
+        // F-406: it no longer can, on this shell. FCP measures ~184ms in practice, and
+        // rejecting this shape needs `raf2_ms < first_contentful_paint_ms - 200`, which
+        // at that FCP needs a negative `raf2_ms` -- impossible on a monotonic clock,
+        // for any input. ADR-0014's pre-committed fallback applies: a diagnostic, not
+        // a rejection, is what this shape gets now. The evidence is still accepted --
+        // the call is still `mark_first_paint`'s -- because refusing it would be
+        // rejecting on a check this project's own arithmetic shows cannot mean
+        // anything at these numbers.
+        let evidence = 500.0;
+        assert_eq!(
+            validate_paint_evidence(Some(evidence), 10.0, 20.0),
+            Ok(evidence),
+            "F-406: this shape is reported, not refused, so the call must still succeed"
+        );
+    }
+
+    #[test]
+    fn frame_precedes_paint_diagnostic_pins_the_threshold_and_that_it_still_runs() {
+        // F-424: deleting the whole diagnostic (the `eprintln!` call in
+        // validate_paint_evidence, or this function itself) left the workspace green
+        // -- nothing asserted the check still ran or still named what it found. These
+        // two cases pin the decision as a return value rather than as an observed
+        // side effect, so removing either arm goes red without stderr capture.
+        //
+        // Some(_): the 480ms shape the test above already uses, past the 200ms
+        // tolerance -- both values must be legible in the message.
+        let diagnostic = frame_precedes_paint_diagnostic(20.0, 500.0)
+            .expect("a gap past the tolerance must still produce a diagnostic");
+        assert!(diagnostic.contains("20.0"), "{diagnostic}");
+        assert!(diagnostic.contains("500.0"), "{diagnostic}");
+
+        // None: the measured honest range (task #112, F-406) -- raf2 precedes FCP by
+        // tens of milliseconds, well inside the 200ms tolerance, so no diagnostic.
+        assert_eq!(
+            frame_precedes_paint_diagnostic(170.0, 184.0),
+            None,
+            "the honest measured gap must not produce a diagnostic"
         );
     }
 
