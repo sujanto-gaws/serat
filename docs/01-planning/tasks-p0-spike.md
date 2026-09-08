@@ -37,13 +37,13 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## 🟢 BUILDS: **ALLOWED** — no measurement is running
+> ## 🔴 BUILDS: **FROZEN** — test-engineer is measuring #100 (`prf01-cold-start`)
 >
-> **Compile, test, clippy, doclint and mutate freely.** Nobody is measuring right now.
+> **No `cargo` build/test/clippy, no `npm` build/test, no doclint, no mutation runs — by anyone except test-engineer.** Editing, committing, reading and writing documents are fine. If you have a build running, kill it and tell the lead.
 >
-> **Read this line as being about builds, not about windows.** It previously said *"MEASUREMENT WINDOW: CLOSED"*, which at least one teammate read as *"a freeze is in force"* — the exact opposite of what it meant, and it cost real verification: work was committed deliberately uncompiled while building was permitted the whole time. **A status line has to name the thing it governs, in the reader's terms, not the lead's.** When a measurement starts this line will read **🔴 BUILDS: FROZEN**, and nothing else about the wording will change.
+> **Read this line as being about builds.** When nobody is measuring it reads **🟢 BUILDS: ALLOWED**, and nothing else about the wording changes, so a skimmer cannot invert it. An earlier version said *"MEASUREMENT WINDOW: CLOSED"* and a teammate read the headline as a freeze and withheld verification for hours while building was permitted the whole time.
 >
-> **When frozen, the freeze binds everyone except the measuring teammate**, because a concurrent `cargo` process moves the number — F-327's 35% drift, and F-367's second cause. It is discoverable here because a message-only freeze covers exactly the set of people someone remembered: in the last one the lead told two of six and four teammates built inside it in good faith. **That is what an unenforceable rule looks like when it is working as designed** (architect's phrasing). A cargo-level marker that refuses is the real fix and is P1 work.
+> **The freeze binds everyone except the measuring teammate**, because a concurrent `cargo` process moves the number — F-327's 35% drift, F-367's second cause. It lives here because a message-only freeze covers exactly the set of people someone remembered: in an earlier one the lead told two of six and four teammates built inside it in good faith. **That is what an unenforceable rule looks like when it is working as designed** (architect's phrasing). A cargo-level marker that refuses is the real fix and is P1 work.
 
 ## Resume task list (from #90)
 
