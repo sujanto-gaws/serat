@@ -396,7 +396,19 @@ is precisely when nobody will be looking at it. Neither half is redundant, and d
 either one later on the grounds that it never fires would be removing the half that is doing
 its job by not needing to.
 
-**vue-frontend-dev, consulted because `S_shell` is theirs and #98 is inside it.** The
+**vue-frontend-dev answered the fairness question, and answered it against their own
+interest.** Their words: a budget on `S_shell` is *"fair, under the ADR's own attribution rule
+— bundle size, mount strategy, and which CodeMirror extensions we load at start are all
+changes confined to `app/` that measurably move `S_shell`, so it's ours even though part of
+the interval's floor is WebView2's own navigation cost we can't move. That's exactly why an
+inner mark is worth it: `S_shell` as defined conflates an unavoidable floor with our
+controllable mount cost, and a persistently large floor would bury a real regression in
+noise."* **That is a better argument for the inner mark than the one this ADR made**, which
+reached the same place from fairness rather than from detection. They also declined a second
+IPC round trip on the ground that it would perturb the interval it measures — right, and it
+is why the evidence rides on the existing call.
+
+**vue-frontend-dev, originally consulted because `S_shell` is theirs and #98 is inside it.** The
 question put to them was whether a budget on an interval measured inside a renderer they do
 not control is fair, and whether an inner mark is needed to separate WebView2's navigation
 from our mount. **A mark added now is cheap and after #104 is not**, so their answer can
@@ -416,22 +428,55 @@ double `requestAnimationFrame` with a `PerformanceObserver` gate on the
 paint makes F-377's mutations structurally inapplicable rather than merely detected. **The
 evidence half is right and the replacement half is not.** `first-contentful-paint` attests
 that *something* painted, not that *our shell* painted, and the two coincide only while the
-document renders nothing before the framework mounts. **They already do not coincide here
-and by design:** `crates/serat-app/webview/index.html` carries the entire shell as static
+document renders nothing before the framework mounts. **They did not coincide in the shell this
+objection was raised against, and by design:** `crates/serat-app/webview/index.html` — the
+S1 placeholder, still on main as this is written — carries the entire shell as static
 markup — wordmark, vault label, editor, status bar — because §3.4 requires the editor to
 accept keystrokes from the first paint, *"a property of the document rather than a
-promise"*, and that file instructs #98 to preserve it. So FCP fires on the static skeleton,
+promise"*, and that file instructs #98 to preserve it. So against that shell FCP fires on the static skeleton,
 **before Vue and CodeMirror mount**, and a mark gated on FCP alone would move `t_visible`
 earlier by the whole cost of the mount — which is `S_shell`, the term this ADR makes
 binding. **That is mutation B's exact effect arriving legitimately, through the fix for
 mutation B**, and F-386 says the sum identity would not see it.
+
+**#98 resolved it the other way, and the objection stands anyway.** vue-frontend-dev did not
+preserve the static markup: `app/`'s `index.html` is an empty `#app` div, so nothing paints
+until Vue mounts and FCP cannot fire early *on that shell*. That is a better answer than the
+one asked for — §3.4's property still holds, because the first paint now **is** the mounted
+shell — and the hazard described above never materialised. **It also means the mechanism's
+safety now rests on a markup decision rather than on the mechanism**, which is what the
+paragraph on F-393 below is about.
 
 The resolution is **conjunction rather than replacement**: keep the gate that ties the mark
 to our shell having rendered, and add the paint entry as the evidence that cannot be
 fabricated. Each covers the other's blind spot — a frame gate alone is forgeable, which is
 F-377; a paint entry alone is satisfiable by a skeleton, which is the above.
 
-**tauri-app-dev, still awaited on the basis of the phase-table figures.** They measured the table this ADR partitions, and §Decision 2's caveat
+**tauri-app-dev on the basis of the phase-table figures: it cannot be reconstructed, and
+that absence is the answer.** Asked twice, and the honest reply was that they have no record
+of taking those measurements — the cold-start phase table predates or sits outside anything
+the session that would have produced it can reach. **Treated as a finding rather than as a
+gap to be filled with a plausible guess**, which is what §Decision 6 exists to prevent.
+
+**What is known and what is not, kept separate because they are not the same.** §3.4 records
+that the table is twenty spawns per figure, release build, scanner off. **What no longer
+exists is whether each cell is a median or a p95, whether all seven rows came from one
+session on one set of spawns or were composed across runs, and what the machine's contention
+was** — the three things #83 made mandatory afterwards and F-327 showed are worth 35% of a
+number.
+
+**So the table may be quoted for its *shape* and not for its *values*, and this ADR quotes it
+that way from here.** An 865 ms term beside a 5 ms term is not a claim any statistic decides;
+which terms dominate, and therefore where the split's boundaries belong, survives the missing
+basis entirely. **Every figure in this document is provisional against task #100 for exactly
+this reason, and always was** — §Decision 5 sets the budget from `s95` measured after #98
+rather than from anything above. The structure was written so the figures slot in, and this
+is the first case where that mattered rather than being a precaution.
+
+**What this must not become is a precedent for quoting them anyway.** These figures travelled
+into three documents before anyone asked what they were. That they can no longer be attested,
+and that nobody noticed until the question was put twice, is a stronger argument for
+§Decision 6 than the rule's original justification was. They measured the table this ADR partitions, and §Decision 2's caveat
 about `generate_handler!` is a question only they have watched move. *(Consulted
 2026-09-08; awaiting their answer.)*
 
