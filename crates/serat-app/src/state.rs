@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use serde::Serialize;
+
 use serat_core::{ContentHash, VaultError, VaultPath};
 use serat_parse::CommonMarkParser;
 use serat_vault::Vault;
@@ -121,7 +123,7 @@ struct OpenVault {
 /// totals a caller diffs across a run (`before`/`after`), not an event a subscriber
 /// needs told about -- there is no product decision that turns on one save's outcome,
 /// only a harness's need to audit many of them.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SavePathOutcomes {
     /// The slot had no handle yet (or ever) when `write_file` looked. Falls back to
     /// the watcher's own event for this file; nothing was recorded for echo

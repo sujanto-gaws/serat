@@ -1,10 +1,11 @@
 //! What the process was asked to do.
 //!
-//! Four flags, three of which exist for the cold-start budget rather than for a user.
-//! The budget harness spawns this binary (`bench/budget/src/subject.rs`), so the
-//! command line is part of the NFR-PRF-01 contract and is parsed by hand: a spike shell
-//! with four flags does not need an argument-parsing crate, and the dependency would
-//! land in every teammate's build for it.
+//! Five flags, four of which exist for a budget job rather than for a user. The
+//! NFR-PRF-01 harness spawns this binary (`bench/budget/src/subject.rs`) with the
+//! first four; task #111 adds the fifth for NFR-PRF-03's harness. The command line is
+//! part of both contracts, so it is parsed by hand: a spike shell with five flags does
+//! not need an argument-parsing crate, and the dependency would land in every
+//! teammate's build for it.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,6 +42,21 @@ pub struct Boot {
     pub ready_timeout: Duration,
     /// `SERAT_STARTUP_TRACE`: where the trace line goes.
     pub trace: Option<PathBuf>,
+    /// `--bench-save-list <file>` (task #111, F-391): once the vault is usable, save
+    /// each vault-relative path in this file, in order, through the real save path
+    /// (`AppState::write_file`, no watcher, no debounce), then report the outcome
+    /// alongside the startup trace and exit. Implies `--exit-after-ready`, for the
+    /// same reason `--exit-after-walk` does — a save benchmark with none of that
+    /// mode's guards would silently measure whatever `--open`/settings-fallback
+    /// state the machine happened to be in.
+    ///
+    /// A file, not a repeated flag: NFR-PRF-03's acceptance criterion is 1,000
+    /// distinct notes and the list must include hub notes for the p95 to mean
+    /// anything (`bench/subject.rs`'s `SAVE_ENTRY_POINT`), which is a sampling
+    /// decision over the vault's own link-degree distribution — `bench/budget`'s
+    /// domain, not this crate's. `serat-app` saves exactly what it is told, in the
+    /// order it is told, and picks no notes of its own.
+    pub bench_save_list: Option<PathBuf>,
 }
 
 impl Default for Boot {
@@ -52,6 +68,7 @@ impl Default for Boot {
             exit_after_walk: false,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             trace: None,
+            bench_save_list: None,
         }
     }
 }
@@ -105,6 +122,13 @@ impl Boot {
                         .parse()
                         .map_err(|_| format!("--ready-timeout-ms wants a number, got {raw:?}"))?;
                     boot.ready_timeout = Duration::from_millis(ms);
+                }
+                // As `--exit-after-walk`: implies the ready behaviour, for the same
+                // reason -- every guard written against `--exit-after-ready` must apply
+                // here too, or it silently does not.
+                "--bench-save-list" => {
+                    boot.bench_save_list = Some(PathBuf::from(value("--bench-save-list")?));
+                    boot.exit_after_ready = true;
                 }
                 other => return Err(format!("unknown argument {other:?}")),
             }
@@ -172,6 +196,35 @@ mod tests {
 
         // And it is refused for the same reasons.
         assert!(Boot::parse(&args(&["--exit-after-walk"]), None).is_err());
+    }
+
+    #[test]
+    fn saving_a_list_implies_waiting_for_ready() {
+        // As `waiting_for_the_walk_implies_waiting_for_ready`, and for the same
+        // reason: every guard --exit-after-ready carries must apply to this mode too.
+        let boot = Boot::parse(
+            &args(&[
+                "--vault",
+                "d:/v",
+                "--open",
+                "a.md",
+                "--bench-save-list",
+                "saves.txt",
+            ]),
+            None,
+        )
+        .expect("parse");
+        assert_eq!(boot.bench_save_list, Some(PathBuf::from("saves.txt")));
+        assert!(
+            boot.exit_after_ready,
+            "--bench-save-list must inherit every guard --exit-after-ready carries"
+        );
+
+        // And it is refused for the same reasons.
+        assert!(
+            Boot::parse(&args(&["--bench-save-list", "saves.txt"]), None).is_err(),
+            "no vault to save into"
+        );
     }
 
     #[test]

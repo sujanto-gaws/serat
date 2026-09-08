@@ -83,6 +83,139 @@ struct BootInfo {
     exit_after_ready: bool,
 }
 
+/// What `--exit-after-ready` writes to [`crate::startup::TRACE_ENV`] (task #111).
+///
+/// The startup trace, flattened, plus a snapshot of [`AppState::save_path_outcomes`]
+/// taken at the same moment — process-lifetime totals of a counter `bench/budget` has
+/// no other way to reach (F-391): it may not link `serat-app` under the dependency
+/// rule (architecture §2.1), and there is no IPC command for it either, because that
+/// would mean granting a benchmark-only command the ACL surface a shipped webview
+/// never calls (ADR-0012's "exactly the five commands boot.js invokes"). The trace
+/// file is already the diagnostic channel a harness reads that a user's session never
+/// takes, so this rides the same line rather than opening a second one.
+///
+/// A run over an untouched vault reports every field `0` — not the absence of a
+/// measurement, the true count for a process that never called `write_file`. A
+/// harness measuring the real save path (task #94) diffs two of these, the way
+/// [`AppState::save_path_outcomes`]'s own doc says to.
+///
+/// The `save_*` fields below are `--bench-save-list`'s (test-engineer's contract for
+/// #94, agreed 2026-09-08): outcome-keyed, not a flat timing series, because a
+/// refused submit fails fast inside `apply()` and mixing its near-instant elapsed
+/// time into the asserted series would deflate the p95 NFR-PRF-03 is judged on
+/// (F-19/F-382's failure shape, the reason this whole task exists). Zero on a run
+/// that did not pass `--bench-save-list` — the same "true count, not an absence"
+/// rule as `save_path_outcomes` above.
+#[derive(Debug, Serialize)]
+struct BenchmarkExitReport<'a> {
+    #[serde(flatten)]
+    trace: &'a startup::Trace,
+    save_path_outcomes: state::SavePathOutcomes,
+    /// How many paths `--bench-save-list` named — the attempted denominator #94's
+    /// assertion is against, not just a symptom count.
+    save_attempted: usize,
+    /// Elapsed milliseconds of every save whose outcome was `submitted`. **This is
+    /// the series NFR-PRF-03's p95 is asserted against.**
+    save_submitted_ms: Vec<f64>,
+    /// How many attempted saves found no index handle. Test-engineer's rule: must be
+    /// a hard zero for a valid run. `serat-app` only reports the count; the
+    /// assertion that a non-zero value invalidates the run is `bench/budget`'s.
+    save_handle_missing: u64,
+    /// How many attempted saves were refused by the writer — ordinary backpressure
+    /// (ADR-0011), not necessarily zero, and not asserted against the p95.
+    save_writer_refused: u64,
+    /// Elapsed milliseconds of every refused save, reported for diagnosing the
+    /// queue and excluded from `save_submitted_ms` for the reason stated there.
+    save_writer_refused_ms: Vec<f64>,
+}
+
+/// What [`run_save_benchmark`] measured, before it is folded into
+/// [`BenchmarkExitReport`] beside the startup trace.
+#[derive(Debug, Default)]
+struct SaveBenchmarkResult {
+    attempted: usize,
+    submitted_ms: Vec<f64>,
+    handle_missing: u64,
+    writer_refused: u64,
+    writer_refused_ms: Vec<f64>,
+}
+
+/// Save every vault-relative path in `list_path`, in order, through the real save
+/// path (`AppState::write_file` — no watcher, no debounce, §3.1.1), timing each one
+/// and bucketing it by which of [`state::SavePathOutcomes`]'s three counters moved.
+///
+/// Each path is read first and written back with its own current text and hash: a
+/// real `write_file` call, submitted to the index unconditionally regardless of
+/// whether the bytes changed (`AppState::write_file`'s own body confirms this), so
+/// the save path is genuinely exercised without the benchmark vault growing a byte
+/// on every run — a vault the next run cannot reproduce is worse than a synthetic
+/// edit (test-engineer confirmed this reading: NFR-PRF-03 is "a single note save
+/// reflected in the index", not a content diff).
+///
+/// # Errors
+///
+/// The list could not be read, or a single save in it returned an `Err` rather than
+/// a degraded-but-successful outcome — a stale hash, a missing note, a non-Markdown
+/// path. Those are harness bugs (a list built against a different vault snapshot, or
+/// naming a file `--bench-save-list` was never meant to touch), not backpressure, and
+/// the whole run aborts rather than silently reporting a shorter series than
+/// `--bench-save-list` asked for.
+fn run_save_benchmark(
+    state: &AppState,
+    list_path: &std::path::Path,
+) -> Result<SaveBenchmarkResult, String> {
+    let list = std::fs::read_to_string(list_path)
+        .map_err(|err| format!("--bench-save-list {}: {err}", list_path.display()))?;
+    let paths: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let before_all = state.save_path_outcomes();
+    let mut submitted_ms = Vec::with_capacity(paths.len());
+    let mut writer_refused_ms = Vec::new();
+
+    for path in &paths {
+        let before = state.save_path_outcomes();
+        let read = state
+            .read_file(ipc::ReadFileArgs {
+                path: (*path).to_owned(),
+            })
+            .map_err(|err| {
+                format!("--bench-save-list: reading {path} before saving it: {err:?}")
+            })?;
+
+        let started = std::time::Instant::now();
+        let written = state.write_file(ipc::WriteFileArgs {
+            path: (*path).to_owned(),
+            text: read.text,
+            base_hash: Some(read.hash),
+        });
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        written.map_err(|err| format!("--bench-save-list: saving {path}: {err:?}"))?;
+
+        let after = state.save_path_outcomes();
+        if after.submitted > before.submitted {
+            submitted_ms.push(elapsed_ms);
+        } else if after.writer_refused > before.writer_refused {
+            writer_refused_ms.push(elapsed_ms);
+        }
+        // A handle_missing outcome leaves nothing to bucket beyond the write itself
+        // -- its count is the delta computed below, on the same clock as the other
+        // two, not a per-save timing series.
+    }
+
+    let after_all = state.save_path_outcomes();
+    Ok(SaveBenchmarkResult {
+        attempted: paths.len(),
+        submitted_ms,
+        handle_missing: after_all.handle_missing - before_all.handle_missing,
+        writer_refused: after_all.writer_refused - before_all.writer_refused,
+        writer_refused_ms,
+    })
+}
+
 /// Build and run the application. Returns only when the window closes.
 ///
 /// The order here is architecture §3.4's first row, and the order is the point:
@@ -232,10 +365,17 @@ fn spawn_benchmark_exit(
     handle: &tauri::AppHandle,
     exit_code: Arc<AtomicI32>,
 ) {
+    // The whole state, not just `startup` (task #111): `save_path_outcomes()` is a
+    // method on `AppState`, and this is the one place in the process that reads it on
+    // the way out, so a harness driving real `write_file` calls before this thread's
+    // wait resolves gets a snapshot of what they did, not the zero every prior benchmark
+    // run reported (F-391 -- the counters existed and nothing external could read them).
+    let state = Arc::clone(state);
     let startup = Arc::clone(&state.startup);
     let trace_path = state.boot.trace.clone();
     let timeout = state.boot.ready_timeout;
     let wait_for_walk = state.boot.exit_after_walk;
+    let save_list = state.boot.bench_save_list.clone();
     let handle = handle.clone();
 
     std::thread::Builder::new()
@@ -250,23 +390,55 @@ fn spawn_benchmark_exit(
                 // correct for the budget it measures.
                 startup.wait_for_walk_complete(timeout);
             }
-            let code = match startup.trace() {
-                Ok(trace) => match write_trace(&trace, trace_path.as_deref()) {
-                    Ok(()) => 0,
-                    Err(err) => {
-                        eprintln!("serat: the startup trace could not be written: {err}");
+
+            // Task #111: driven after the vault is usable, so the index actor and
+            // writer are running, and before the trace is written, so the save
+            // numbers ride the same line rather than a second report. A run with no
+            // --bench-save-list attempted zero saves, reported as that rather than
+            // omitted (BenchmarkExitReport's own doc).
+            let save_result = if arrived {
+                match &save_list {
+                    Some(list_path) => run_save_benchmark(&state, list_path),
+                    None => Ok(SaveBenchmarkResult::default()),
+                }
+            } else {
+                Ok(SaveBenchmarkResult::default())
+            };
+
+            let code = match save_result {
+                Err(problem) => {
+                    eprintln!("serat: {problem}");
+                    2
+                }
+                Ok(save) => match startup.trace() {
+                    Ok(trace) => {
+                        let report = BenchmarkExitReport {
+                            trace: &trace,
+                            save_path_outcomes: state.save_path_outcomes(),
+                            save_attempted: save.attempted,
+                            save_submitted_ms: save.submitted_ms,
+                            save_handle_missing: save.handle_missing,
+                            save_writer_refused: save.writer_refused,
+                            save_writer_refused_ms: save.writer_refused_ms,
+                        };
+                        match write_trace(&report, trace_path.as_deref()) {
+                            Ok(()) => 0,
+                            Err(err) => {
+                                eprintln!("serat: the startup trace could not be written: {err}");
+                                2
+                            }
+                        }
+                    }
+                    Err(incomplete) => {
+                        // The guard that makes a blank window a failure rather than a
+                        // fast number. There is no fallback mark to fall back to.
+                        eprintln!(
+                            "serat: no startup trace after {timeout:?} ({}): {incomplete}",
+                            if arrived { "usable" } else { "timed out" }
+                        );
                         2
                     }
                 },
-                Err(incomplete) => {
-                    // The guard that makes a blank window a failure rather than a fast
-                    // number. There is no fallback mark to fall back to.
-                    eprintln!(
-                        "serat: no startup trace after {timeout:?} ({}): {incomplete}",
-                        if arrived { "usable" } else { "timed out" }
-                    );
-                    2
-                }
             };
             exit_code.store(code, Ordering::SeqCst);
             if code == 0 {
@@ -299,10 +471,16 @@ fn exit_now(code: i32, message: &str) -> ! {
 }
 
 /// One line of JSON to the trace file, or to stdout if there is none.
-fn write_trace(trace: &startup::Trace, path: Option<&std::path::Path>) -> std::io::Result<()> {
-    let line = trace
-        .to_line()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
+///
+/// Generic rather than `&startup::Trace` specifically (task #111) so
+/// [`BenchmarkExitReport`] — the trace plus [`state::SavePathOutcomes`] — can go
+/// through the same one-line-of-JSON, same env-var-named-file channel, rather than a
+/// second output mechanism next to it. `Trace::to_line` used to own this; the two are
+/// now the same call, `serde_json::to_string`, so there is nothing left for a
+/// `Trace`-specific method to do that this function does not already do generically.
+fn write_trace<T: Serialize>(value: &T, path: Option<&std::path::Path>) -> std::io::Result<()> {
+    let line =
+        serde_json::to_string(value).map_err(|err| std::io::Error::other(err.to_string()))?;
     match path {
         Some(path) => {
             if let Some(parent) = path
@@ -447,5 +625,409 @@ mod tests {
         );
         assert!(written.contains("t0_to_window_visible_ms"), "{written}");
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn the_benchmark_exit_report_carries_save_path_outcomes_beside_the_trace() {
+        // Task #111 / F-391: the trace and the save-path counters ride the same line
+        // rather than two separate output mechanisms. `#[serde(flatten)]` on `trace`
+        // is what makes this one JSON object, not two nested ones -- assert that
+        // shape directly, since a flatten that silently stopped working would still
+        // produce valid, plausible-looking JSON.
+        let startup = Startup::begin_with(None);
+        startup.mark_window_created();
+        startup
+            .mark_first_paint(42.0)
+            .expect("valid paint evidence");
+        startup.mark_index_settled();
+        startup.mark_watcher(startup::WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+        let trace = startup.trace().expect("complete");
+
+        let report = BenchmarkExitReport {
+            trace: &trace,
+            save_path_outcomes: state::SavePathOutcomes {
+                handle_missing: 1,
+                writer_refused: 2,
+                submitted: 997,
+            },
+            save_attempted: 1000,
+            save_submitted_ms: vec![12.5, 8.3],
+            save_handle_missing: 1,
+            save_writer_refused: 2,
+            save_writer_refused_ms: vec![0.4, 0.6],
+        };
+        let line = serde_json::to_string(&report).expect("json");
+        assert!(
+            line.contains("\"t0_to_window_visible_ms\""),
+            "the trace fields must be flattened into the top level: {line}"
+        );
+        assert!(
+            !line.contains("\"trace\":"),
+            "flatten must not leave a nested \"trace\" object: {line}"
+        );
+        assert!(
+            line.contains(
+                r#""save_path_outcomes":{"handle_missing":1,"writer_refused":2,"submitted":997}"#
+            ),
+            "the save-path counters must be present verbatim, not summarised: {line}"
+        );
+        // test-engineer's contract (2026-09-08): outcome-keyed fields at the top
+        // level, not nested under save_path_outcomes -- these are #94's own asserted
+        // series and must be readable without unpacking a second object.
+        assert!(
+            line.contains(r#""save_attempted":1000"#),
+            "the attempted count must be present: {line}"
+        );
+        assert!(
+            line.contains(r#""save_submitted_ms":[12.5,8.3]"#),
+            "the asserted p95 series must be present verbatim: {line}"
+        );
+        assert!(
+            line.contains(r#""save_handle_missing":1"#),
+            "the hard-zero-or-invalid counter must be present: {line}"
+        );
+        assert!(
+            line.contains(r#""save_writer_refused":2"#),
+            "the backpressure counter must be present: {line}"
+        );
+        assert!(
+            line.contains(r#""save_writer_refused_ms":[0.4,0.6]"#),
+            "the backpressure timings must be present, separate from the asserted series: {line}"
+        );
+
+        // And through the real write path, not just serde in isolation.
+        let path = std::env::temp_dir()
+            .join(format!(
+                "serat-benchmark-exit-report-{}",
+                std::process::id()
+            ))
+            .join("prf03.json");
+        write_trace(&report, Some(&path)).expect("file");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written.trim_end(),
+            line,
+            "the file carries the same one line"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn an_untouched_vault_reports_every_save_path_counter_as_a_true_zero() {
+        // The doc comment's claim, checked: a process that never called write_file
+        // must report 0/0/0, not omit the field or report something that reads as
+        // "no measurement". A harness diffing two reports needs a real starting value.
+        let outcomes = state::SavePathOutcomes::default();
+        let json = serde_json::to_string(&outcomes).expect("json");
+        assert_eq!(
+            json,
+            r#"{"handle_missing":0,"writer_refused":0,"submitted":0}"#
+        );
+    }
+
+    /// Same fixture and wait-for-`Ready` idiom as
+    /// `state::tests::a_save_through_write_file_reaches_the_index_without_the_watcher`
+    /// (`crates/serat-app/src/state.rs`), since `run_save_benchmark` drives the same
+    /// real save path that test proved reaches the index without the watcher. Not
+    /// reused directly: that helper is private to `state.rs`'s own test module.
+    fn open_fixture_for_save_benchmark(name: &str) -> (std::path::PathBuf, AppState) {
+        let dir = std::env::temp_dir().join(format!("serat-app-lib-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
+        std::fs::write(dir.join("10-projects/a.md"), "# A\n").expect("fixture");
+        std::fs::write(dir.join("10-projects/b.md"), "# B\n").expect("fixture");
+
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            cli::Boot::default(),
+            settings::Settings::default(),
+        );
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+
+        // As state.rs's own comment on this idiom: writing before the vault is
+        // `Ready` races the fixture's own rebuild reading the same bytes, and the
+        // race can index either version -- indistinguishable from outside.
+        let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !matches!(state.index_status().state, ipc::IndexState::Ready { .. }) {
+            assert!(
+                std::time::Instant::now() < ready_by,
+                "the fixture vault never reached IndexState::Ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        (dir, state)
+    }
+
+    #[test]
+    fn run_save_benchmark_attempts_every_listed_path_and_buckets_it_submitted() {
+        let (dir, state) = open_fixture_for_save_benchmark("save-bench-happy");
+
+        let list_path = dir.join("save-list.txt");
+        // A blank line and surrounding whitespace, deliberately: the parser must
+        // skip the former and trim the latter rather than trying to save `""` or
+        // `" 10-projects/a.md"` (which read_file would refuse as NotFound).
+        std::fs::write(&list_path, "10-projects/a.md\n\n  10-projects/b.md  \n").expect("list");
+
+        let result = run_save_benchmark(&state, &list_path).expect("benchmark");
+        assert_eq!(result.attempted, 2, "blank lines must not be attempts");
+        assert_eq!(
+            result.submitted_ms.len(),
+            2,
+            "a warm index with its own writer running must submit every save, not \
+             fall back to handle_missing or writer_refused: {result:?}"
+        );
+        assert_eq!(result.handle_missing, 0);
+        assert_eq!(result.writer_refused, 0);
+        assert!(
+            result.writer_refused_ms.is_empty(),
+            "no refused save means nothing to time in that bucket"
+        );
+        for ms in &result.submitted_ms {
+            assert!(*ms >= 0.0 && ms.is_finite(), "{result:?}");
+        }
+
+        // The content on disk must be exactly what it was -- run_save_benchmark
+        // writes each note back with its own bytes, precisely so a benchmark vault
+        // does not grow a byte on every run.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("10-projects/a.md")).expect("read back"),
+            "# A\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("10-projects/b.md")).expect("read back"),
+            "# B\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_save_benchmark_aborts_on_a_path_that_does_not_exist() {
+        // A harness bug (a list built against a different vault snapshot), not
+        // backpressure -- the whole run must abort with a clear reason rather than
+        // silently reporting a shorter series than the list asked for.
+        let (dir, state) = open_fixture_for_save_benchmark("save-bench-bad-path");
+
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(
+            &list_path,
+            "10-projects/a.md\n10-projects/does-not-exist.md\n",
+        )
+        .expect("list");
+
+        let err = run_save_benchmark(&state, &list_path)
+            .expect_err("a note that does not exist must abort the run");
+        assert!(
+            err.contains("does-not-exist.md"),
+            "the error must name the offending path: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_save_benchmark_refuses_a_list_file_that_is_not_there() {
+        let missing = std::env::temp_dir().join(format!(
+            "serat-app-lib-save-bench-missing-list-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            cli::Boot::default(),
+            settings::Settings::default(),
+        );
+        let err = run_save_benchmark(&state, &missing).expect_err("the list file is not there");
+        assert!(err.contains("--bench-save-list"), "{err}");
+    }
+
+    /// An opener whose handle keeps a one-deep write queue
+    /// (`serat_index::IndexHandle::with_queue_depth`), the same device F-115's
+    /// `a_save_does_not_wait_for_the_writer` (`crates/serat-index/tests/incremental.rs`)
+    /// uses to make a refusal reachable at all: the default depth (4,096,
+    /// `writer::DEFAULT_QUEUE_DEPTH`) makes `IndexError::QueueFull` practically
+    /// unreachable from a test that submits far fewer ops than that.
+    ///
+    /// Also hands out a [`serat_index::WriterHandle`] clone the moment the handle
+    /// opens, over `writer_tx` -- see the test below for why a second submitter needs
+    /// one of these rather than going through `AppState::write_file` a second time.
+    #[derive(Default)]
+    struct ShallowQueue {
+        handle: Option<serat_index::IndexHandle>,
+        writer_tx: Option<std::sync::mpsc::Sender<serat_index::WriterHandle>>,
+    }
+
+    impl index::IndexOpen for ShallowQueue {
+        fn open(
+            &mut self,
+            _root: &std::path::Path,
+            dir: &std::path::Path,
+            publish: &dyn Fn(ipc::IndexState),
+        ) {
+            match serat_index::IndexHandle::with_queue_depth(dir, 1) {
+                Ok(handle) => {
+                    if let Some(tx) = &self.writer_tx {
+                        let _ = tx.send(handle.writer());
+                    }
+                    publish(ipc::IndexState::Ready { note_count: 0 });
+                    self.handle = Some(handle);
+                }
+                Err(err) => publish(ipc::IndexState::Unavailable {
+                    message: format!("could not open a one-deep index for the test: {err}"),
+                    path: dir.display().to_string(),
+                }),
+            }
+        }
+
+        fn into_handle(self) -> Option<serat_index::IndexHandle> {
+            self.handle
+        }
+    }
+
+    #[test]
+    fn run_save_benchmark_excludes_a_writer_refusal_from_submitted_ms() {
+        // F-402, code-reviewer's mutation: an unconditional push into `submitted_ms`
+        // regardless of outcome left every existing test green (94 passed, 0 failed --
+        // identical to control), because nothing here ever drove a real refusal. A run
+        // where every save was refused would then post a fast, clean p95 for saves that
+        // never reached the writer -- F-19/F-382's exact failure shape, on the one
+        // series NFR-PRF-03's p95 is asserted against.
+        //
+        // A one-shot race against a one-deep queue is unreliable here the way F-115's
+        // own bare `apply()` loop is reliable: that loop pays for a repeated *read* of
+        // an already-cached file and nothing else, so it can far outrun the writer.
+        // `run_save_benchmark`'s loop pays for a real `read_file` and a real
+        // `write_atomic` per path -- disk I/O on the calling thread, which gives the
+        // writer time to drain a one-deep queue between iterations far more often than
+        // not (measured: no refusal in 40 real saves against a lone contender). So a
+        // second thread hammers the *same* queue directly through a cloned
+        // `WriterHandle::submit`, bypassing the vault entirely -- no read, no write,
+        // nothing but the submit itself -- which is what makes it fast enough to
+        // contend continuously for the single slot for the run's whole duration.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-app-lib-save-bench-refusal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
+
+        const LISTED: usize = 40;
+        let mut list = String::new();
+        for i in 0..LISTED {
+            let rel = format!("10-projects/note-{i}.md");
+            std::fs::write(dir.join(&rel), format!("# note {i}\n")).expect("fixture");
+            list.push_str(&rel);
+            list.push('\n');
+        }
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(&list_path, &list).expect("list");
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let state = Arc::new(AppState::with_settings(
+            Arc::new(Startup::begin()),
+            cli::Boot::default(),
+            settings::Settings::default(),
+        ));
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                ShallowQueue {
+                    handle: None,
+                    writer_tx: Some(writer_tx),
+                },
+            )
+            .expect("open");
+        let hammer_writer = writer_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("ShallowQueue::open must hand out a writer for the one-deep queue");
+
+        let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !matches!(state.index_status().state, ipc::IndexState::Ready { .. }) {
+            assert!(
+                std::time::Instant::now() < ready_by,
+                "the fixture vault never reached IndexState::Ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // As `a_save_through_write_file_reaches_the_index_without_the_watcher`
+        // (state.rs): `Ready` publishes slightly before the `IndexHandleSlot` is
+        // filled. Setup slack, not measurement.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Hammer the same one-deep queue from another thread for the run's duration,
+        // submitting the same synthetic asset repeatedly (F-115's own idiom: identity
+        // does not matter, only that the queue's single slot stays contended).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer_stop = Arc::clone(&stop);
+        let hammer = std::thread::spawn(move || {
+            use serat_core::{IndexOp, IndexWriter as _, NoteKind, NoteMeta, VaultPath};
+            let op = IndexOp::UpsertAsset {
+                meta: NoteMeta {
+                    path: VaultPath::new("bulk/hammer.md").expect("path"),
+                    hash: serat_core::ContentHash::from_bytes([7u8; 32]),
+                    kind: NoteKind::Asset,
+                    size: 0,
+                    mtime_ms: 0,
+                },
+            };
+            while !hammer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Refused submissions are exactly the point; nothing to do with the
+                // result either way.
+                let _ = hammer_writer.submit(op.clone());
+            }
+        });
+
+        let result = run_save_benchmark(&state, &list_path).expect("benchmark");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hammer.join().expect("hammer thread");
+
+        assert_eq!(result.attempted, LISTED);
+        assert_eq!(
+            result.handle_missing, 0,
+            "the handle was installed and waited for before the run started: {result:?}"
+        );
+        assert!(
+            result.writer_refused >= 1,
+            "a one-deep queue contended by a second thread throughout the run produced \
+             no refusal at all -- the contention this test relies on did not happen: \
+             {result:?}"
+        );
+        assert_eq!(
+            result.writer_refused as usize,
+            result.writer_refused_ms.len(),
+            "the refused count and its timing series must agree: {result:?}"
+        );
+        assert_eq!(
+            result.submitted_ms.len() + result.writer_refused_ms.len(),
+            LISTED,
+            "every attempted, non-handle-missing save must land in exactly one bucket: \
+             {result:?}"
+        );
+        for ms in &result.writer_refused_ms {
+            assert!(*ms >= 0.0 && ms.is_finite(), "{result:?}");
+        }
+        // The load-bearing assertion: a refused save's near-instant timing must not be
+        // among the samples NFR-PRF-03's p95 is judged on. Mutation-verified against
+        // `else if after.writer_refused > before.writer_refused` replaced with an
+        // unconditional push into `submitted_ms` -- that mutation makes this fail by
+        // widening `submitted_ms.len()` past `LISTED - writer_refused_ms.len()`.
+        assert_eq!(
+            result.submitted_ms.len(),
+            LISTED - result.writer_refused as usize,
+            "a refused save's timing leaked into submitted_ms, the series NFR-PRF-03's \
+             p95 is asserted against: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
