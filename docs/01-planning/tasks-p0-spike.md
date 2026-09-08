@@ -50,12 +50,12 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 |---|---|---|---|---|---|---|
 | 90 | `[P0/impl] Land the save path wiring through apply() and flush()` | NFR-PRF-03 · ADR-0001 | tauri-app-dev | `crates/serat-app` | — | pending |
 | 91 | `[P0/test] Recover or discard the uncommitted bench/budget env work` | NFR-PRF-08 | test-engineer | `bench/budget` | — | pending |
-| 92 | `[P0/impl] Resolve the uncommitted serat-app/state.rs one-liner` | NFR-PRF-03 | rust-core-dev | `crates/serat-app` | — | pending |
+| 92 | `[P0/impl] Resolve the uncommitted serat-app/state.rs one-liner` | T-06, FR-BIN-19 | rust-core-dev | `crates/serat-app` | — | **RESOLVED by lead ruling — discard, no ack needed. See Lead rulings below.** |
 | 93 | `[P0/test] Close the cross-process race on the shared 20k vault` | NFR-PRF-08 · F-369/F-370 | test-engineer | `bench/`, CI | — | pending |
 | 94 | `[P0/test] Make prf03-save-to-index measure the real save path at p95` | NFR-PRF-03, NFR-PRF-08, US-35 | test-engineer | `bench/budget/src/bin/prf03-save-to-index.rs` | 90 | pending |
 | 95 | `[P0/test] Take and record NFR-PRF-03 on #83's attested method` | NFR-PRF-03, US-35 | test-engineer | `docs/05-testing/reports/` | 94, 93 | pending |
 | 96 | `[P0/test] Rule whether NFR-PRF-04 has a gate-quality measurement` | NFR-PRF-04, C-06 · ADR-0013 · F-327 | test-engineer | `docs/05-testing/` | 91, 93 | pending |
-| 97 | `[P0/test] T1 rebuild-equivalence: delete .serat/, assert identical results` | FR-VLT-02, NFR-REL-02, US-01, US-07 · ADR-0002 | test-engineer | `crates/serat-index/tests` | — | pending |
+| 97 | `[P0/test] T1 rebuild-equivalence: delete .serat/, assert identical results` | FR-VLT-02, NFR-REL-02, US-01, US-07 · ADR-0002 · F-136 | rust-core-dev **leads**, with test-engineer | `crates/serat-index/tests` | — | claimed — see Lead rulings |
 | 98 | `[P0/impl] Mount Vue 3 + CodeMirror 6, keeping both startup marks` | NFR-PRF-01 · ADR-0006, ADR-0007 | vue-frontend-dev | `app/`, `crates/serat-app/webview/` | — | pending |
 | 99 | `[P0/design] Attest the cold-start term split for the re-baseline` | NFR-PRF-01, C-07 · ADR-0013 | architect | `docs/03-design/architecture.md` §3.4 | — | pending |
 | 100 | `[P0/test] Re-measure cold start with the real frontend mounted` | NFR-PRF-01, US-35 | test-engineer | `docs/05-testing/reports/` | 98 | pending |
@@ -63,6 +63,19 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 | 102 | `[P0/review] R1: final sweep against C-01..C-07 and every cited ADR` | all P0 IDs | code-reviewer | review notes | 101 | pending |
 | 103 | `[P0/design] D4: close §1.2's remaining assumptions with the numbers` | NFR-PRF-03, NFR-PRF-04 · ADR-0001 | architect | `docs/03-design/architecture.md` | 101 | pending |
 | 104 | `[P0/req] Q1: re-baseline NFR-PRF-01 as a split, and the other targets` | NFR-PRF-01/03/04, US-35 | product-analyst | `docs/02-requirements/prd.md` | 101, 103, 99 | pending |
+
+### Lead rulings, 2026-09-08 (this file is the authority; act on it without further ack)
+
+**#92 — discard the line, do not land it, and do not wait for tauri-app-dev.** The uncommitted one-liner in `.worktrees/rust-core` is `if !path.is_markdown()` → `if false`, which disables the **T-06 / FR-BIN-19** binary-write guard outright. It is **an abandoned mutation probe**, not unfinished work — a previous session's own testing, left behind when that session ended before reverting. Main's guard at `566149d` is correct and **T-06 was never exposed on any landed commit**. rust-core-dev: discard, rebase onto main, proceed. tauri-app-dev's agreement is no longer a precondition; the lead has taken the decision and informed them.
+
+**The standing rule needs its other half, and this is it.** This wave opened by telling every teammate to recover the uncommitted work in their worktree, aimed at the three dirty worktrees found at resume. Applied blindly, that instruction would have committed a deliberately disabled security guard onto a branch under a message describing it as recovered work. **An uncommitted diff does not announce which kind of change it is**: some of it is unfinished work whose value is in being kept, and some is a probe whose entire value was in being reverted. The two are indistinguishable from the diff alone. So when recovering a dirty worktree, ask of every hunk whether it is a *deliberate weakening* — a guard turned off, a condition inverted, an early return inserted, a constant set so a test passes trivially. Those read as ordinary lines and are invisible once committed. rust-core-dev is recording this as a finding under its own F-number.
+
+**#97 — rust-core-dev leads the design, test-engineer collaborates.** The existing `a_rebuild_over_an_existing_index_replaces_it_rather_than_merging` is not T1 and does not become it. Two gaps, both binding:
+
+- **Counts are not equivalence.** Two indexes can agree on how many notes, blocks, fields and links they hold and disagree on every row. T1 asserts the *results* are identical — the rows a query returns, not the number of them. State in the test what the comparison does and does not cover.
+- **Same-process is not the recovery path.** NFR-REL-02's criterion is a user restarting the application: delete or truncate the index, start, detect, rebuild, recover the same vault. A rebuild-twice in one process never exercises detection, never re-opens, and never reaches `open_or_rebuild`. **F-136 is the open caveat here** — I6's tests run against a fake vault, so classification and ordering are proven and real-disk behaviour is not. **T1 is where that closes**, so it runs against a real vault on real disk.
+
+Make it fail for the right reason before making it pass — delete a row or corrupt one field after the rebuild and confirm it goes red. Six recorded instances in this project of an assertion that was correct while the setup never reached the path.
 
 **The measurement window rule, which is a scheduling constraint and not advice.** #83 attested its figures with `concurrent_build_processes: 0`, and F-327 records 35% session-to-session movement on unchanged code. **Tasks 95, 96 and 100 are measurements; no other teammate runs a cargo build while one is in progress.** The lead declares the window and holds it. This is RISK-002's real shape (F-07): the workspace is one shared object with many owners, and the cost scales with teammates rather than lines of code.
 
