@@ -4,11 +4,16 @@
 # regression shall fail the build." One job per budget, so a failure names the
 # requirement it broke instead of saying "benchmarks failed".
 #
-# These jobs are RED today, on purpose. serat-index has no rebuild entry point
-# (task I4), no incremental save path (I5), and there is no application to start
-# (D2, S1). A budget job that skips when the thing it measures is absent is worse
-# than no job at all: the build goes green and nobody notices the budget is
-# unasserted. Each job prints exactly which task unblocks it.
+# These jobs cannot currently run at all, and it is not the reason this header
+# used to give. Rebuild (I4), the incremental save path (I5) and the application
+# (D2, S1) all exist on main now — the blocker is F-384: ci.yml and budgets.yml
+# stopped being scheduled runner-side on 2026-09-06 (every run since completes in
+# 1-4s with zero steps, consistent with exhausted included Actions minutes on this
+# private repo), and that needs the repository owner, not a code change. A budget
+# job that skips when the thing it measures is absent is worse than no job at
+# all: the build goes green and nobody notices the budget is unasserted. Each job
+# still prints exactly which task unblocks it, for whichever failure mode is live
+# when it next actually runs.
 #
 # Owner: test-engineer. Thresholds live in bench/budget/src/lib.rs next to the
 # requirement they come from, and are never weakened to make a build pass — a
