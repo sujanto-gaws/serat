@@ -24,19 +24,25 @@
 // to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below sends
 // `PaintEvidence` alongside the call.
 //
-// **Open question, not yet resolved between this file and task #105.** F-388's
-// ratified resolution was "conjunction, not replacement": a frame gate alone
-// (raf1Ms/raf2Ms) is forgeable by a mutation that honestly waits for two real frames
-// scheduled too early, before this app has mounted anything visible, so the paint
-// entry was meant to be checked *against* the frame timestamps, not instead of them.
-// `task/105-paint-mark-evidence-guard` (unmerged at the time of writing) drops the
-// frame gate entirely and accepts `firstContentfulPaintMs` alone, gated only on
-// `is_finite() && > 0.0` plus a source-shape check counting `boot.js`'s call sites —
-// the latter being exactly the family of guard the lead's ratification said to drop.
-// Raised with architect/tauri-app-dev-2 rather than resolved here. raf1Ms/raf2Ms are
-// still sent regardless of how that lands: harmless if unused, immediately available
-// if the guard grows a frame-gap check back in. See `PaintEvidence` in
-// `src/ipc/client.ts` for the field-by-field reasoning.
+// Task #112 (F-396, ADR-0014): F-388's original reason for the conjunction was
+// wrong — it assumed `index.html` still carried static skeleton markup that FCP
+// could fire on before mount, and #98 replaced that guarantee with an empty `#app`
+// div. But the conjunction survives on a better reason, and code-reviewer's F-396
+// states it precisely: **`first-contentful-paint` alone is sound only as long as
+// `app/index.html` stays contentless — a property nothing asserts, and one that
+// lives in a different file (and a different crate's worth of trust) from the
+// guard that depends on it.** A splash screen or loading skeleton, an entirely
+// ordinary addition, would silently degrade the FCP-alone guard to F-377's
+// mutation B with nothing going red. `raf1Ms`/`raf2Ms` are what make the guard's
+// soundness independent of what `index.html` happens to contain today: both
+// timestamps and `firstContentfulPaintMs` are on this page's own `performance.now()`
+// clock, so `crates/serat-app` can validate `raf2Ms >= firstContentfulPaintMs`
+// (the second frame did not precede the paint it is supposed to confirm) without
+// needing to reconcile clocks. Proposed to tauri-app-dev-2 for the Rust half;
+// `first_contentful_paint_ms` also needs to become `Option<f64>` there so a
+// genuinely absent entry (no Paint Timing support) is a typed rejection rather
+// than a raw deserialisation failure that produces no trace and no explanation.
+// See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
 import type { useVaultStore } from "@/stores/vault";
