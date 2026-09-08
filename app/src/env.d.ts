@@ -22,8 +22,6 @@ interface SeratBoot {
 
 declare global {
   interface Window {
-    /** Present because `tauri.conf.json` sets `app.withGlobalTauri: true`. */
-    __TAURI__?: unknown;
     __SERAT_BOOT__?: SeratBoot;
   }
 }
