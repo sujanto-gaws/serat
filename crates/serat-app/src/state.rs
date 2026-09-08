@@ -107,6 +107,35 @@ struct OpenVault {
     _walk: VaultThread,
 }
 
+/// Which of §3.1.1's three outcomes a `write_file` call's index submission took.
+///
+/// F-382: an empty [`IndexHandleSlot`] is indistinguishable, from `write_file`'s own
+/// return value, between a legitimate startup race, an opener that never produces a
+/// handle, and an open that failed -- all three fall back silently to the watcher path,
+/// and a benchmark measuring "the real save path" (task #94) cannot tell that from a
+/// genuine submission unless something counts them apart. This is F-19 one level up:
+/// a fast p95 over saves that never reached the writer is exactly the flattering
+/// number that finding is named for.
+///
+/// Snapshotted rather than streamed, because the three counters are process-lifetime
+/// totals a caller diffs across a run (`before`/`after`), not an event a subscriber
+/// needs told about -- there is no product decision that turns on one save's outcome,
+/// only a harness's need to audit many of them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SavePathOutcomes {
+    /// The slot had no handle yet (or ever) when `write_file` looked. Falls back to
+    /// the watcher's own event for this file; nothing was recorded for echo
+    /// suppression, so nothing is lost, only slower (design goal 5).
+    pub handle_missing: u64,
+    /// A handle was found and `IndexHandle::apply`'s submit was refused --
+    /// ordinary backpressure (`IndexError::QueueFull`) or a writer already gone
+    /// (`WriterStopped`). Also falls back to the watcher.
+    pub writer_refused: u64,
+    /// A handle was found and the submit was accepted. This is the count NFR-PRF-03
+    /// actually governs.
+    pub submitted: u64,
+}
+
 /// Everything the shell owns.
 pub struct AppState {
     /// The cold-start timeline. Public because `main` and the window builder mark it.
@@ -119,6 +148,12 @@ pub struct AppState {
     settings_path: Option<PathBuf>,
     open: RwLock<Option<OpenVault>>,
     vaults_opened: AtomicU64,
+    /// Backing counters for [`AppState::save_path_outcomes`] (F-382). Process
+    /// lifetime, not per-vault: a benchmark diffs two snapshots around its own run
+    /// rather than needing them reset on `open_vault`.
+    save_handle_missing: AtomicU64,
+    save_writer_refused: AtomicU64,
+    save_submitted: AtomicU64,
 }
 
 impl std::fmt::Debug for AppState {
@@ -146,6 +181,9 @@ impl AppState {
             settings_path: loaded.path,
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
+            save_handle_missing: AtomicU64::new(0),
+            save_writer_refused: AtomicU64::new(0),
+            save_submitted: AtomicU64::new(0),
         };
         (state, loaded.problem)
     }
@@ -161,6 +199,9 @@ impl AppState {
             settings_path: None,
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
+            save_handle_missing: AtomicU64::new(0),
+            save_writer_refused: AtomicU64::new(0),
+            save_submitted: AtomicU64::new(0),
         }
     }
 
@@ -522,26 +563,76 @@ impl AppState {
     ///
     /// A no-op, not an error, in two cases that architecture already accounts for:
     /// the index actor has not yet produced a handle (`IndexHandleSlot`'s doc comment
-    /// -- `open_vault` returns before the open check finishes), or the writer refuses
-    /// under backpressure (`IndexHandle::apply`'s own doc comment). Both degrade to
-    /// the watcher's slower path rather than failing the save (design goal 5) -- the
-    /// watcher was never told to suppress this write's echo, since nothing here
-    /// recorded one, so its own event for this file indexes it a moment later.
+    /// -- `open_vault` returns before the open check finishes, or the opener never
+    /// produced one at all), or the writer refuses under backpressure
+    /// (`IndexHandle::apply`'s own doc comment). Both degrade to the watcher's slower
+    /// path rather than failing the save (design goal 5) -- the watcher was never told
+    /// to suppress this write's echo, since nothing here recorded one, so its own
+    /// event for this file indexes it a moment later. F-382: those two cases (and a
+    /// third, an open that failed outright) are indistinguishable from each other and
+    /// from success at the call site -- `write_file` returns `Ok` in all of them -- so
+    /// each branch below counts itself into [`AppState::save_path_outcomes`] rather
+    /// than only being distinguishable by reading this function.
+    ///
+    /// **Echo ordering.** This function does not decide when a write is recorded for
+    /// echo suppression -- it decides only whether `apply` is called at all. Ordering
+    /// is entirely `apply_via`'s (`serat-index/src/incremental.rs`): the echo hash is
+    /// recorded only once `writer.submit(op)` has returned `Ok` (F-224/F-226), never
+    /// before and never on a path this function takes if the submit failed. Calling
+    /// the same, unmodified `IndexHandle::apply` rather than reimplementing any part
+    /// of it is what makes that guarantee travel here unchanged: there is no second
+    /// place that could get the ordering wrong.
+    ///
+    /// **Lock contention, accepted at P0 (F-382).** `serat_index::IndexHandle` is not
+    /// `Clone`, so the slot's `Mutex` is held for the duration of `apply` below --
+    /// which reads the file and parses it, not only submits. That is not a §2.2
+    /// barrier (no waiting on the writer occurs), but it is lock contention on a path
+    /// §2.2 otherwise keeps lock-free by ownership. At P0, with one buffer editing one
+    /// note at a time, two saves cannot actually contend for it. It stops being free
+    /// the day two saves can be in flight together, and the fix is not this function's
+    /// to make: `serat_index::writer::WriterHandle` is already `Clone` and cheap
+    /// (`writer.rs:82-84`), and `apply_via` already takes one as `&dyn IndexWriter`
+    /// rather than the whole `IndexHandle` -- but neither is reachable from outside
+    /// `serat-index` today. Cloning a `WriterHandle` out of the slot once, under the
+    /// lock, and dropping the lock before parsing is the fix once that seam exists.
     fn submit_to_index(&self, vault: &Vault, path: &VaultPath) {
         let slot = match self.open_lock().as_ref() {
             Some(open) => Arc::clone(&open.index_handle),
-            None => return,
+            None => {
+                self.save_handle_missing.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
         let guard = slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handle) = guard.as_ref() {
-            let parser = CommonMarkParser::new();
-            // Errors are deliberately swallowed here, for the same reason there is no
-            // barrier: `write_file`'s contract answers for the vault write, not for
-            // whether the index heard about it, and a write that reached disk must
-            // never be reported as failed because the index writer was busy.
-            let _ = handle.apply(vault, &parser, vault, path);
+        let Some(handle) = guard.as_ref() else {
+            self.save_handle_missing.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let parser = CommonMarkParser::new();
+        // The `Err` case is deliberately not propagated to `write_file`'s caller, for
+        // the same reason there is no barrier: the command's contract answers for the
+        // vault write, not for whether the index heard about it, and a write that
+        // reached disk must never be reported as failed because the index writer was
+        // busy. It is still counted (F-382), which is the difference between
+        // "swallowed" and "unobserved".
+        match handle.apply(vault, &parser, vault, path) {
+            Ok(()) => self.save_submitted.fetch_add(1, Ordering::Relaxed),
+            Err(_) => self.save_writer_refused.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// A snapshot of how many `write_file` calls have taken each branch of the save
+    /// path so far (F-382). Diff two snapshots around a benchmark run rather than
+    /// reading this mid-write: it answers "how many, of what kind, since the process
+    /// started", not "what just happened".
+    #[must_use]
+    pub fn save_path_outcomes(&self) -> SavePathOutcomes {
+        SavePathOutcomes {
+            handle_missing: self.save_handle_missing.load(Ordering::Relaxed),
+            writer_refused: self.save_writer_refused.load(Ordering::Relaxed),
+            submitted: self.save_submitted.load(Ordering::Relaxed),
         }
     }
 
@@ -1301,6 +1392,8 @@ mod tests {
             })
             .expect("read the fixture note");
 
+        let before = state.save_path_outcomes();
+
         let written = state
             .write_file(WriteFileArgs {
                 path: "10-projects/serat.md".into(),
@@ -1308,6 +1401,21 @@ mod tests {
                 base_hash: Some(read.hash),
             })
             .expect("write");
+
+        // F-382: the same claim the hash poll below checks against the database, made
+        // against the observable counters instead -- this save must count as a real
+        // submission, not as one of the two silent degradations.
+        let after = state.save_path_outcomes();
+        assert_eq!(
+            after.submitted,
+            before.submitted + 1,
+            "a save with the handle ready must count as submitted: {after:?}"
+        );
+        assert_eq!(
+            (after.handle_missing, after.writer_refused),
+            (before.handle_missing, before.writer_refused),
+            "waiting for Ready means this save had no reason to degrade: {after:?}"
+        );
 
         // No barrier on the save path (§2.2), so the row may not be visible the
         // instant write_file returns -- the poll below is the harness serialising
@@ -1340,6 +1448,64 @@ mod tests {
             "a note saved through write_file must reach .serat/index.db well inside the \
              watcher's own 150ms coalescing window, carrying the hash write_file itself \
              returned -- which only the direct submit path in `write_file` can manage"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_with_no_index_handle_is_counted_not_silent() {
+        // F-382: `write_file` returns `Ok` identically whether the save reached the
+        // writer or the slot was empty, and the empty-slot case covers two of F-382's
+        // three situations at once here -- an opener whose `into_handle` is never
+        // overridden (the trait default, silent by construction) reproduces both "no
+        // handle yet" and "no handle ever" without needing to win a real race.
+        struct NeverProducesAHandle;
+        impl IndexOpen for NeverProducesAHandle {
+            fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
+                publish(IndexState::Ready { note_count: 1 });
+                // into_handle() is not overridden: the trait default returns None.
+            }
+        }
+
+        let dir = fixture("no-handle");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                NeverProducesAHandle,
+            )
+            .expect("open");
+
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        state
+            .write_file(WriteFileArgs {
+                path: "10-projects/serat.md".into(),
+                text: "# edited with no handle to submit through\n".into(),
+                base_hash: Some(read.hash),
+            })
+            .expect("write_file still succeeds -- the vault write is real regardless");
+
+        let outcomes = state.save_path_outcomes();
+        assert_eq!(
+            outcomes,
+            SavePathOutcomes {
+                handle_missing: 1,
+                writer_refused: 0,
+                submitted: 0,
+            },
+            "a save with no handle to submit through must be counted as degraded, not \
+             merely absent from the submitted count"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
