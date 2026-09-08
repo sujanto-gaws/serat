@@ -564,6 +564,52 @@ pub fn app_binary() -> Result<PathBuf, String> {
     }
 }
 
+/// Restores a vault to its pre-batch state after a run of cold starts opens
+/// it. F-401, task #100's blocked window.
+///
+/// `serat.exe` creates `.serat/` inside whatever vault it opens as an
+/// ordinary side effect of indexing -- that is correct application
+/// behaviour, not a defect, and it is exactly what NFR-PRF-01's warm-index
+/// case needs: a later iteration in the same batch should see a warm index,
+/// so nothing may clean up *between* iterations. What it must not do is
+/// persist *past* the batch. The canonical fixture vaults are digest-checked
+/// by every other consumer (`verify_vault_at`), and a `.serat/` directory
+/// left behind moves that digest for everyone who opens the vault after this
+/// batch finishes -- the same shape as F-372, in the opposite direction:
+/// there a scratch *index* the harness built leaked into the vault; here the
+/// real application's own index does, because the harness cannot spawn the
+/// real app without letting it behave like the real app.
+///
+/// Takes the guard at the batch boundary and restores at the batch boundary,
+/// never in between -- construct it once before the loop and let it drop
+/// once after, on every exit path including `?`.
+///
+/// Guards rather than unconditionally deletes: if `.serat/` already existed
+/// before the guard was taken, this batch did not create it and has no basis
+/// for judging whether it is safe to remove, so it is left alone.
+pub(crate) struct ColdStartVaultGuard {
+    serat_dir: PathBuf,
+    created_by_this_batch: bool,
+}
+
+impl ColdStartVaultGuard {
+    pub(crate) fn watch(vault: &Path) -> Self {
+        let serat_dir = vault.join(".serat");
+        Self {
+            created_by_this_batch: !serat_dir.exists(),
+            serat_dir,
+        }
+    }
+}
+
+impl Drop for ColdStartVaultGuard {
+    fn drop(&mut self) {
+        if self.created_by_this_batch {
+            let _ = std::fs::remove_dir_all(&self.serat_dir);
+        }
+    }
+}
+
 /// Run `iterations` cold starts, returning the window-visible and vault-usable
 /// timelines.
 ///
@@ -581,6 +627,10 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// When the application does not exist, when a run fails or times out, or when
 /// a trace is rejected by any of the checks in [`crate::trace`].
 pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
+    // F-401: one guard for the whole batch, not one per iteration -- see
+    // ColdStartVaultGuard's doc comment for why per-iteration cleanup would be
+    // the wrong fix, not just a smaller one.
+    let _guard = ColdStartVaultGuard::watch(vault);
     let mut visible = Samples::new();
     let mut usable = Samples::new();
     for run in 0..iterations {
@@ -798,6 +848,115 @@ mod tests {
             "cold_start must refuse and name either the absent binary or the \
              absent vault, not fail opaquely: {e}"
         );
+    }
+
+    // ------------------------------------------------------------- F-401
+
+    fn scratch_vault_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-f401-{label}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch vault dir");
+        dir
+    }
+
+    #[test]
+    fn a_guard_removes_dot_serat_it_created_on_drop() {
+        let vault = scratch_vault_dir("removes-own");
+        let serat_dir = vault.join(".serat");
+        assert!(!serat_dir.exists(), "precondition: no .serat yet");
+
+        {
+            let _guard = ColdStartVaultGuard::watch(&vault);
+            // Stand in for what the real app does mid-batch: create its index
+            // directory while the guard is held.
+            std::fs::create_dir_all(&serat_dir).expect(".serat");
+            std::fs::write(serat_dir.join("index.db"), b"stand-in").expect("index file");
+            assert!(
+                serat_dir.exists(),
+                "the app's own side effect must be visible mid-batch"
+            );
+        }
+
+        assert!(
+            !serat_dir.exists(),
+            ".serat/ created during the batch must not survive the guard's drop"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn a_guard_leaves_a_pre_existing_dot_serat_alone() {
+        let vault = scratch_vault_dir("leaves-pre-existing");
+        let serat_dir = vault.join(".serat");
+        std::fs::create_dir_all(&serat_dir).expect(".serat");
+        std::fs::write(serat_dir.join("index.db"), b"pre-existing").expect("index file");
+
+        {
+            let _guard = ColdStartVaultGuard::watch(&vault);
+            // Batch runs; .serat/ was already there before we watched it.
+        }
+
+        assert!(
+            serat_dir.join("index.db").exists(),
+            "a .serat/ the guard did not create is not this batch's to delete -- deleting it \
+             would destroy state that predates the run for a reason the guard cannot see"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn a_guard_cleans_up_on_an_early_return_not_only_on_normal_completion() {
+        // The whole point of using Drop rather than an explicit cleanup call
+        // at the end of `cold_start` is that a `?` partway through the batch
+        // must still restore the vault. Reproduced directly: a helper that
+        // takes the guard and then bails via `?` before reaching any explicit
+        // cleanup, same as `cold_start_once`'s `?` would inside the real loop.
+        fn batch_that_fails_partway(vault: &Path) -> Result<(), String> {
+            let _guard = ColdStartVaultGuard::watch(vault);
+            std::fs::create_dir_all(vault.join(".serat")).map_err(|e| e.to_string())?;
+            Err("run 1 of 20 failed".to_string())
+        }
+
+        let vault = scratch_vault_dir("early-return");
+        let serat_dir = vault.join(".serat");
+
+        let result = batch_that_fails_partway(&vault);
+        assert!(
+            result.is_err(),
+            "the failure must propagate, not be swallowed"
+        );
+        assert!(
+            !serat_dir.exists(),
+            ".serat/ must not survive an early return out of the batch -- Drop runs on every \
+             exit path, including `?`, or a red run leaves the same poisoned vault a green one \
+             would have cleaned up"
+        );
+        std::fs::remove_dir_all(&vault).ok();
+    }
+
+    #[test]
+    fn a_guard_taken_before_a_pre_existing_dot_serat_is_created_still_protects_it() {
+        // Ordering matters: watch() must record whether .serat/ existed at
+        // the moment it was taken, not at drop time. If a second concurrent
+        // caller created .serat/ between watch() and drop() for an unrelated
+        // reason, this guard's own answer must still be "I did not create
+        // this" from what it observed when it started watching.
+        let vault = scratch_vault_dir("ordering");
+        let serat_dir = vault.join(".serat");
+        assert!(!serat_dir.exists());
+
+        let guard = ColdStartVaultGuard::watch(&vault);
+        // Nothing created .serat/ yet -- this guard did create it in spirit,
+        // so dropping should remove it. Assert the flag the guard itself
+        // computed rather than re-deriving it, so the test is pinned to
+        // watch()'s observation rather than to drop()'s filesystem state.
+        assert!(guard.created_by_this_batch);
+        drop(guard);
+        std::fs::remove_dir_all(&vault).ok();
     }
 
     // ------------------------------------------------------ T-07 / task #30

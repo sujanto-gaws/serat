@@ -1993,13 +1993,29 @@ where
 ///
 /// Returns whether it held, having printed the verdict either way.
 pub fn run_scale_check(iterations: usize) -> bool {
-    let verdict = scale_verdict(
-        iterations,
-        || Ok((ensure_vault("20k")?, ensure_vault("50k")?)),
-        |vault, run| {
-            subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
-        },
-    );
+    // F-401: this check calls `cold_start_once` directly, spawn by spawn,
+    // interleaved across both vaults (the doc comment on `cold_start_once`
+    // explains why) -- so no single call is "the batch" the way it is inside
+    // `cold_start`. The batch is the whole check, both vaults, every pair, and
+    // the guards below are taken before the first spawn and held across all of
+    // them, dropping only once `scale_verdict` has returned. Vaults are
+    // resolved before `scale_verdict` runs specifically so the guards can be
+    // taken on their paths first; `ensure_vault` errors surface through the
+    // same `?` a bare fetch would have used.
+    let vaults = (|| -> Result<(VaultUnderTest, VaultUnderTest), String> {
+        Ok((ensure_vault("20k")?, ensure_vault("50k")?))
+    })();
+    let verdict = vaults.and_then(|(small, large)| {
+        let _small_guard = subject::ColdStartVaultGuard::watch(&small.path);
+        let _large_guard = subject::ColdStartVaultGuard::watch(&large.path);
+        scale_verdict(
+            iterations,
+            || Ok((small, large)),
+            |vault, run| {
+                subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
+            },
+        )
+    });
     match verdict {
         Ok(line) => {
             println!("{line}");
