@@ -91,6 +91,20 @@ impl IndexHandle {
     }
 
     /// A writer handle, for callers that want to submit without waiting.
+    ///
+    /// F-40's guard — that `submit_blocking` cannot be reached because it is off
+    /// `IndexWriter` — protects a caller holding `&dyn IndexWriter`, which is what
+    /// [`apply`] takes. It does **not** protect a caller holding the concrete
+    /// `WriterHandle` this method returns: `submit_blocking` is a public inherent
+    /// method on `WriterHandle` itself (code-reviewer, reviewing #90's adoption of
+    /// the clone-then-drop-the-lock pattern this method exists for). Nothing here
+    /// needs to change today — the trait boundary is exactly as strong as claimed
+    /// for a caller that passes the handle straight to `apply`, and every current
+    /// caller does — but a save path that instead reaches for `submit_blocking` on
+    /// the handle it got from here would be F-19 on a third path, and the type
+    /// system would not stop it. The type is public for a reason: it is also how
+    /// `rebuild()` reaches `submit_blocking` on purpose. What stops the save path
+    /// from doing the same is this comment, not the compiler.
     #[must_use]
     pub fn writer(&self) -> WriterHandle {
         self.actor.handle()
@@ -190,6 +204,15 @@ impl IndexHandle {
     /// calls `resolve_outbound` for its own just-inserted links. Both cost an indexed
     /// lookup (`ix_links_unresolved`, schema/001_init.sql) rather than a table scan,
     /// so this stays inside NFR-PRF-03's 50 ms rather than growing with vault size.
+    /// A caller holding `IndexHandle` behind a lock (a `Mutex<Option<IndexHandle>>`,
+    /// the shape serat-app's save path uses to keep the writer alive across saves)
+    /// does not have to hold that lock for the length of this call. [`apply`] is the
+    /// same body, public, taking the writer as `&dyn IndexWriter` — clone a
+    /// [`WriterHandle`] out via [`IndexHandle::writer`], drop the lock, then call
+    /// `apply(&writer, ...)`. `WriterHandle` is documented cheap and shareable for
+    /// exactly this reason. Nothing here changes what's on `IndexWriter`:
+    /// `submit_blocking` stays off the trait (F-19/F-40), so a caller holding only a
+    /// `WriterHandle` still cannot reach for it, whichever route it came from.
     pub fn apply(
         &self,
         source: &dyn NoteSource,
@@ -197,7 +220,7 @@ impl IndexHandle {
         echo: &dyn EchoGuard,
         path: &VaultPath,
     ) -> Result<(), IndexError> {
-        apply_via(&self.actor.handle(), source, parser, echo, path)
+        apply(&self.actor.handle(), source, parser, echo, path)
     }
 
     /// Stop the writer, applying anything queued.
@@ -210,14 +233,32 @@ impl IndexHandle {
     }
 }
 
-/// The body of [`IndexHandle::apply`], taking the writer as a trait object.
+/// [`IndexHandle::apply`]'s body, public and taking the writer as a trait object
+/// rather than requiring the whole `IndexHandle`.
 ///
-/// Split out so the ordering it implements — submit, then record the echo only on
-/// success — can be tested against a writer that always refuses and one that always
-/// accepts, deterministically and without racing the real writer thread's draining
-/// speed (F-58: a test that cannot reliably reach the refusal branch proves nothing
-/// about it).
-fn apply_via(
+/// Two reasons this is its own function rather than staying private, both settled
+/// with code-reviewer against #90's wiring rather than assumed:
+///
+/// - **Splitting the writer from the handle removes a lock from the save path.** A
+///   caller that must keep `IndexHandle` alive behind a `Mutex` (dropping it stops
+///   the writer, so something has to own it) does not have to hold that mutex
+///   across a file read, a parse and a submit — clone a [`WriterHandle`] out via
+///   [`IndexHandle::writer`] (cheap; documented `Clone` on the handle itself), drop
+///   the lock, and call this with the clone. `IndexHandle::apply` still exists and
+///   still does the lock-free thing internally; this is for a caller who needs to
+///   do it without going through a live `IndexHandle` reference at all.
+/// - **Testability**, the original reason this was split out before it was public:
+///   the ordering it implements — submit, then record the echo only on success —
+///   can be tested against a writer that always refuses and one that always
+///   accepts, deterministically and without racing the real writer thread's
+///   draining speed (F-58: a test that cannot reliably reach the refusal branch
+///   proves nothing about it).
+///
+/// Exposing this does not weaken F-19/F-40's structural guard: `submit_blocking`
+/// stays off `IndexWriter`, so a caller holding a `WriterHandle` through this route
+/// still cannot reach for it — no test deletion undoes that, and this function
+/// gives out no new way to.
+pub fn apply(
     writer: &dyn IndexWriter,
     source: &dyn NoteSource,
     parser: &dyn NoteParser,
@@ -299,7 +340,7 @@ mod tests {
 
     impl NoteSource for OneFile {
         fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
-            unimplemented!("apply_via never enumerates; only load")
+            unimplemented!("apply never enumerates; only load")
         }
 
         fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
@@ -316,7 +357,7 @@ mod tests {
         }
     }
 
-    /// Parses nothing; just proves `apply_via` reached the submit step.
+    /// Parses nothing; just proves `apply` reached the submit step.
     struct TrivialParser;
 
     impl NoteParser for TrivialParser {
@@ -413,7 +454,7 @@ mod tests {
         let hash = ContentHash::from_bytes([9u8; 32]);
         let echo = SpyEcho::default();
 
-        let result = apply_via(
+        let result = apply(
             &AlwaysFull,
             &OneFile { hash },
             &TrivialParser,
@@ -447,7 +488,7 @@ mod tests {
         let echo = SpyEcho::default();
         let writer = OrderingWriter::new(&echo);
 
-        apply_via(
+        apply(
             &writer,
             &OneFile { hash },
             &TrivialParser,
@@ -484,7 +525,7 @@ mod tests {
         }
 
         let echo = SpyEcho::default();
-        apply_via(
+        apply(
             &AlwaysAccepts,
             &Gone,
             &TrivialParser,
