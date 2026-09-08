@@ -37,11 +37,13 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## ✅ MEASUREMENT WINDOW: **CLOSED** — builds are released
+> ## 🟢 BUILDS: **ALLOWED** — no measurement is running
 >
-> **Everyone may build, test, clippy, run doclint and run mutation checks again.** The window opened for #100 (`prf01-cold-start`) and is closed without the reading having been taken: the machine was checked and showed **zero cargo, rustc, link and serat processes**, with no new output in `bench/out/budgets/`. **Holding five teammates idle for a measurement that was not running is a worse trade than reopening later**, so the freeze is lifted and #100 gets a fresh window when test-engineer says they are ready to start.
+> **Compile, test, clippy, doclint and mutate freely.** Nobody is measuring right now.
 >
-> **Check this line before you compile.** It is the only place a teammate can discover a freeze without being individually messaged. During the last window the lead told two of six and then wrote that everyone was held off the CPU; four teammates ran builds inside it in good faith. **That is what an unenforceable rule looks like when it is working as designed** (architect's phrasing, and the accurate one) — the coverage of a message-only freeze is exactly the set of people someone remembered. A cargo-level mechanism that reads a marker in the tree and refuses is the real fix, and it is P1 work.
+> **Read this line as being about builds, not about windows.** It previously said *"MEASUREMENT WINDOW: CLOSED"*, which at least one teammate read as *"a freeze is in force"* — the exact opposite of what it meant, and it cost real verification: work was committed deliberately uncompiled while building was permitted the whole time. **A status line has to name the thing it governs, in the reader's terms, not the lead's.** When a measurement starts this line will read **🔴 BUILDS: FROZEN**, and nothing else about the wording will change.
+>
+> **When frozen, the freeze binds everyone except the measuring teammate**, because a concurrent `cargo` process moves the number — F-327's 35% drift, and F-367's second cause. It is discoverable here because a message-only freeze covers exactly the set of people someone remembered: in the last one the lead told two of six and four teammates built inside it in good faith. **That is what an unenforceable rule looks like when it is working as designed** (architect's phrasing). A cargo-level marker that refuses is the real fix and is P1 work.
 
 ## Resume task list (from #90)
 
