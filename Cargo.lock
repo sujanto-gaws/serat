@@ -2897,6 +2897,7 @@ name = "serat-app"
 version = "0.0.0"
 dependencies = [
  "dirs",
+ "rusqlite",
  "serat-core",
  "serat-index",
  "serat-parse",

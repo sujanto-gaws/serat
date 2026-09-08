@@ -45,6 +45,14 @@ dirs = "6.0.0"
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
+# task #89: verifying the save path reaches the index means reading `.serat/index.db`
+# with something that is not this crate's own reader, the way task #65's own
+# end-to-end check did -- a bug in the wiring must not also be able to hide the
+# assertion that would catch it. Dev-only: no production code opens the database
+# directly (§2.1 -- that is serat-index's job).
+[dev-dependencies]
+rusqlite = { workspace = true }
+
 # `tauri`'s "test" feature (`tauri::test`, `MockRuntime`) is a target-specific
 # dev-dependency rather than a plain one: `tests/acl_behaviour.rs` is
 # `#[cfg(not(windows))]`'d out (task #53, F-345 -- the OS loader crashes on this
