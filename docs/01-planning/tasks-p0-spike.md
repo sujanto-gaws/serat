@@ -37,6 +37,12 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
+> ## ✅ MEASUREMENT WINDOW: **CLOSED** — builds are released
+>
+> **Everyone may build, test, clippy, run doclint and run mutation checks again.** The window opened for #100 (`prf01-cold-start`) and is closed without the reading having been taken: the machine was checked and showed **zero cargo, rustc, link and serat processes**, with no new output in `bench/out/budgets/`. **Holding five teammates idle for a measurement that was not running is a worse trade than reopening later**, so the freeze is lifted and #100 gets a fresh window when test-engineer says they are ready to start.
+>
+> **Check this line before you compile.** It is the only place a teammate can discover a freeze without being individually messaged. During the last window the lead told two of six and then wrote that everyone was held off the CPU; four teammates ran builds inside it in good faith. **That is what an unenforceable rule looks like when it is working as designed** (architect's phrasing, and the accurate one) — the coverage of a message-only freeze is exactly the set of people someone remembered. A cargo-level mechanism that reads a marker in the tree and refuses is the real fix, and it is P1 work.
+
 ## Resume task list (from #90)
 
 Two rulings by the owner, taken 2026-09-08, set this wave's shape.
@@ -69,7 +75,7 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 | 108 | `[P0/impl] Emit the post-composite paint evidence from the Vue mount` | NFR-PRF-01, NFR-PRF-08 · F-377, F-386 · ADR-0006, ADR-0014 | vue-frontend-dev | `app/src/startup.ts` | 98 | **done**, in review — `task/108-paint-evidence` @ `19fb1d0`, stacked on #98 |
 | 110 | `[P0/test] Run app/ in CI: npm test, and rebuild-and-diff the committed bundle` | NFR-MNT-01, NFR-PRF-08, C-06 · ADR-0007 · F-54 · blocked by F-384 | test-engineer | `.github/workflows/` | 98, 108 | pending |
 | 111 | `[P0/impl] Make save_path_outcomes reachable by a budget job` | NFR-PRF-03, NFR-PRF-08 · F-382, F-390 · ADR-0001 | tauri-app-dev-2 | `crates/serat-app` (trace field or IPC command) | 90 | **pending — #94 has nothing to assert against without it** |
-| 112 | `[P0/impl] Make the absent-paint-entry case an explicit contract, not a deserialise failure` | NFR-PRF-01, NFR-PRF-08 · F-396 · ADR-0014 | tauri-app-dev-2 with vue-frontend-dev | `crates/serat-app`, `app/src/startup.ts` | — | **pending — decide the null contract and whether `raf1Ms`/`raf2Ms` are checked or dropped** |
+| 112 | `[P0/impl] Make the absent-paint-entry case an explicit contract, not a deserialise failure` | NFR-PRF-01, NFR-PRF-08 · F-396 · ADR-0014 | **vue-frontend-dev, both halves** (bounded exception, not a crate transfer); tauri-app-dev-2 reviews | `app/src/startup.ts` **and** `crates/serat-app` | — | **in progress — write and commit, do NOT compile while the window is open** |
 
 ### Lead rulings, 2026-09-08 (this file is the authority; act on it without further ack)
 
@@ -83,6 +89,8 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 - **Same-process is not the recovery path.** NFR-REL-02's criterion is a user restarting the application: delete or truncate the index, start, detect, rebuild, recover the same vault. A rebuild-twice in one process never exercises detection, never re-opens, and never reaches `open_or_rebuild`. **F-136 is the open caveat here** — I6's tests run against a fake vault, so classification and ordering are proven and real-disk behaviour is not. **T1 is where that closes**, so it runs against a real vault on real disk.
 
 Make it fail for the right reason before making it pass — delete a row or corrupt one field after the rebuild and confirm it goes red. Six recorded instances in this project of an assertion that was correct while the setup never reached the path.
+
+**#112's ownership, ruled because the handover was costing more than it saved.** vue-frontend-dev takes **both halves**, including the Rust side that is normally tauri-app-dev-2's. They found the casing bug, built the evidence side, and proposed the design F-396(b) concluded is robust; tauri-app-dev-2 is occupied with #111 and reviews rather than races it. **A bounded exception for one change, not a transfer of `crates/serat-app`.** Scope is exactly F-396(c): `first_contentful_paint_ms` → `Option<f64>` so an absent entry is a **typed, recorded rejection** a reader can tell apart from "the guard was never reached", plus the `raf1Ms`/`raf2Ms` check — `raf2Ms > raf1Ms` and `raf2Ms` at-or-after `firstContentfulPaintMs`, all on the webview's own clock so nothing needs cross-clock reconciliation. `PaintEvidenceRejected`'s shape and the two F-377 mutation-shape tests stay as they are.
 
 **Merge order for the paint-mark stack, and it is blocked on F-395.** #98, #105 and #108 all touch the same guard and cannot merge until the duplication is resolved: **#105's `webview/boot.js` half is deleted in favour of #108's `app/src/startup.ts` gate**, since the former is build output and the latter is source. #105's Rust half stays exactly as it is. Then the order is **#98 → #108 → #105**, or all three together. **#100 cannot run until this lands**, because it measures the mounted frontend, so this is the critical path to the only cold-start number the wave can still produce.
 
