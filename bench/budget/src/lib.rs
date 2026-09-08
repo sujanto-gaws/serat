@@ -1369,6 +1369,24 @@ fn stray_scratch_entries(path: &Path) -> Vec<String> {
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
+        // C-02: the index is disposable, and its own existence is not vault content.
+        // vaultgen never writes .serat/ -- it is entirely the product's own doing, the
+        // instant anything opens the vault for real -- so it never enters the digest
+        // this compares against, and this recompute must not treat its mere presence
+        // as a difference either. F-401: this bit the shared 20k vault twice in one
+        // session, once through cold_start_once (fixed by CleanIndexOnDrop) and once
+        // through some other real invocation of the app against it directly, which no
+        // per-caller cleanup can fully guard against -- excluding it here does, for
+        // every caller, present and future, without relying on anyone remembering to
+        // clean up after themselves. Root only (`vault_root.join(".serat")`,
+        // crates/serat-app/src/index.rs) -- a nested directory that happens to share
+        // the name is real vault content and must still be seen.
+        if dir == root
+            && path.is_dir()
+            && path.file_name().and_then(|n| n.to_str()) == Some(".serat")
+        {
+            continue;
+        }
         if path.is_dir() {
             collect(root, &path, out)?;
         } else {

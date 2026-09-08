@@ -586,7 +586,13 @@ pub fn app_binary() -> Result<PathBuf, String> {
 ///
 /// Guards rather than unconditionally deletes: if `.serat/` already existed
 /// before the guard was taken, this batch did not create it and has no basis
-/// for judging whether it is safe to remove, so it is left alone.
+/// for judging whether it is safe to remove, so it is left alone. This is
+/// the resolved half of a duplication (F-NEXT/f401-guard-duplicated): main's
+/// independently written `CleanIndexOnDrop` deleted `.serat/` unconditionally
+/// on drop, which would destroy a pre-existing index that predates the batch
+/// for a reason the guard cannot see -- its own doc comment named that exact
+/// hazard one paragraph before doing it anyway. Kept this version because it
+/// is strictly safer and ships with tests exercising both branches.
 pub(crate) struct ColdStartVaultGuard {
     serat_dir: PathBuf,
     created_by_this_batch: bool,
