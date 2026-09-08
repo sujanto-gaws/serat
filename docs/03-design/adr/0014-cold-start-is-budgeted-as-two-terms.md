@@ -368,15 +368,33 @@ appears — it cannot expose F-388's mutation and would re-open exactly the hole
 identified. The paint anchor is `first-contentful-paint`; DOMContentLoaded is the `S_shell`
 split. Two fields, two purposes, and the failure of confusing them is silent.
 
-**A pre-committed decision, so it is not made under pressure later.** Nobody has yet
-confirmed that `first-contentful-paint` populates inside a real Tauri/WebView2 window;
-vue-frontend-dev raised it and the manual mutation run now has to check it. **If it does not
-populate, the guard must not silently degrade to the frame gate alone** — that gate is
-forgeable and is the whole of F-377. Two options are available and the choice is this
-document's when the data arrives: another signal that cannot exist before layout, or
-accepting the frame gate with its weakness recorded as a stated bound. **What is ruled out
-now is the third option nobody would write down but everyone drifts into: keeping the check,
-losing the evidence, and keeping the confidence.**
+**A decision was pre-committed here against `first-contentful-paint` failing to populate in
+a real WebView2 window — vue-frontend-dev's flag, and F-107's shape, since a guard built on
+an entry that never arrives rejects every honest mark instead of the dishonest one. F-393
+closed it by measurement and the contingency did not fire:** the entry populates, at
+`startTime` 184 ms against `domContentLoadedEventEnd` 129.8 ms, over the Chrome DevTools
+Protocol against the real binary. **129.8 < 184 is the ordering the conjunction argument
+depends on**, so F-388's rejection of DOMContentLoaded as the anchor is now confirmed by
+measurement rather than by reading the spec. The pre-commitment is kept in this record
+rather than deleted, because a contingency that did not fire is the cheapest kind to have
+written and the record is what makes the next one worth writing.
+
+**What that measurement also shows is a fragility nobody has yet had to think about, and it
+is one line of HTML away.** F-393 found `#app` holding real rendered content when FCP fired
+— so on today's shell FCP *is* our mount, because the document renders nothing before Vue
+fills it. **That is a property of #98's current markup, not of the mechanism.** Add a
+loading skeleton, a spinner, or a static titlebar to `index.html` and FCP moves ahead of the
+mount, F-388's hole reopens, and **the guard keeps passing** — the change that breaks it is
+a one-line improvement made by someone with no reason to read this ADR.
+
+**The conjunction is what absorbs that, and this is the evidence it was not belt-and-braces.**
+Its two halves cover two different futures: the paint entry catches a mark hoisted before any
+paint (F-377's mutation B), and the post-mount frame gate catches a paint entry that fires on
+content which is not ours (F-388). **Only the first is exercised today.** The second is
+dormant and becomes load-bearing the moment anyone adds markup that paints before Vue — which
+is precisely when nobody will be looking at it. Neither half is redundant, and dropping
+either one later on the grounds that it never fires would be removing the half that is doing
+its job by not needing to.
 
 **vue-frontend-dev, consulted because `S_shell` is theirs and #98 is inside it.** The
 question put to them was whether a budget on an interval measured inside a renderer they do
