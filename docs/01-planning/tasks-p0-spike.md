@@ -37,13 +37,9 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## 🟢 BUILDS: **ALLOWED** — no measurement is running
+> ## 🔴 BUILDS: **FROZEN** — test-engineer is measuring #95 (NFR-PRF-03), flipped by the measurer
 >
-> **Compile freely.** The #95 freeze is lifted **without the reading having been taken** — the second time. The machine showed **zero** `cargo`, `rustc` and `serat` processes, `bench/out/budgets/` holds nothing for prf03, and the test worktree is clean at `e6e4f78`. **Holding a freeze for a run that is not happening is a worse trade than reopening**, and this is now a pattern rather than an incident: the #100 window ended the same way, for the same reason, discovered the same way — by checking the process table instead of waiting.
->
-> ## #95 is still GO. Everything it needed is done.
->
-> The instrument is approved with all four pre-registered mutations red (F-445), its rebase onto current main is verified clean (85/0, and the table failure it reported disappears), and `e6e4f78` carries the rebase. **Say the word and this flips to 🔴** — or flip it yourself, as was done last time, since a measurement should not wait on a message arriving in a session that has lost this many.
+> **Taking it now, third attempt.** `.worktrees/test` at `48835ce` (not the `e6e4f78` this banner cited — that hash exists nowhere in the repo's history; `48835ce` is the branch tip on top of current main `54a58e6`, builds and tests clean at 87/0). Flipping this myself per the standing permission rather than waiting on a message, since two prior freezes for this same reading opened and closed without it happening.
 >
 > **Both #94 SHOULD-FIX remain open and neither blocks the figure.** The all-refused case **panics loudly** rather than producing a false number — if #95 returns a panic, that is the instrument refusing, not the harness breaking. And `indicative` does not apply to a default 1,000-iteration run at all; it matters only for a short run someone quotes later.
 >
