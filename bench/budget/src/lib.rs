@@ -2414,6 +2414,45 @@ mod tests {
     }
 
     #[test]
+    fn tree_digest_ignores_a_top_level_serat_directory_but_not_real_content() {
+        // F-401: cold_start_once spawns the real app directly against a vault, and
+        // the app's own index at <vault>/.serat -- correct, ordinary production
+        // behaviour -- is not vault content and must not move the digest this test
+        // is named after. Bit the shared 20k vault twice in one session before this
+        // landed; the exclusion is scoped to the root only, so a real edit two lines
+        // down still must not be masked by it.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-serat-exclusion-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("notes")).expect("notes dir");
+        std::fs::write(dir.join("notes").join("a.md"), b"# a").expect("note");
+
+        let before = tree_digest(&dir).expect("digest of a clean tree");
+
+        std::fs::create_dir_all(dir.join(".serat")).expect(".serat dir");
+        std::fs::write(dir.join(".serat").join("index.db"), b"not vault content")
+            .expect("index file");
+        assert_eq!(
+            tree_digest(&dir).expect("digest with .serat present"),
+            before,
+            "a real .serat/ index must not move the digest"
+        );
+
+        // The exclusion must not swallow a genuine change made at the same time.
+        std::fs::write(dir.join("notes").join("a.md"), b"# a, edited").expect("edit");
+        assert_ne!(
+            tree_digest(&dir).expect("digest after a real edit"),
+            before,
+            "a real content change must still move the digest, .serat/ notwithstanding"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn the_wrong_note_count_or_format_version_is_refused() {
         let p = preset("20k").expect("20k exists");
         let err = check_vault(p, p.digest, p.digest, vaultgen::VAULT_FORMAT_VERSION, 400)
