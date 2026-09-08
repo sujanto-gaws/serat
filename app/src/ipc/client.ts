@@ -41,12 +41,69 @@ export function indexStatus(): Promise<IndexStatus> {
 }
 
 /**
+ * Evidence for `mark_first_paint` — task #108, closing F-377/F-388
+ * (`crates/serat-app`'s guard, task #105, is what actually rejects implausible
+ * evidence; this type only has to match its parameter names).
+ *
+ * **Field names are camelCase, not this file's usual snake_case.** Every other wire
+ * shape here is a nested struct field (`WriteFileArgs.base_hash` and friends), which
+ * ts-rs preserves verbatim from Rust and Tauri deserialises with no renaming. These
+ * are **top-level command parameters**, and Tauri v2 renames a command's own
+ * parameters to camelCase by default before matching them against the JS call —
+ * confirmed against task #105's actual Rust signature
+ * (`crates/serat-app/src/commands.rs`, branch `task/105-paint-mark-evidence-guard`),
+ * which takes `first_contentful_paint_ms: f64` and is only reachable by sending
+ * `firstContentfulPaintMs`. Sending the snake_case form here silently fails to match
+ * the parameter — a bug this file shipped for one revision before catching it
+ * against the real branch.
+ */
+export interface PaintEvidence {
+  /**
+   * `PerformancePaintTiming`'s `first-contentful-paint` entry, if the webview
+   * recorded one — the browser's own record of when it painted actual content
+   * (text, image, non-white canvas/SVG), which this app's `#app` div cannot produce
+   * before Vue mounts. This is the argument task #105's guard checks: a call with
+   * nothing real to send has nothing to offer in its place (`PaintEvidenceRejected`
+   * on the Rust side). `null` only if the entry genuinely never landed — task #105's
+   * current signature takes a plain `f64`, not an `Option`, so sending `null` should
+   * be rare in practice (by the time the double `requestAnimationFrame` below
+   * resolves, two frames have already elapsed and FCP will ordinarily have fired)
+   * and is flagged to tauri-app-dev/architect as a case worth a decision rather than
+   * assumed here.
+   */
+  firstContentfulPaintMs: number | null;
+  /**
+   * The **first** `requestAnimationFrame` callback's own `DOMHighResTimeStamp`
+   * argument. Not part of task #105's landed guard (that branch dropped the frame
+   * gate entirely in favour of the paint entry alone — see `src/startup.ts`'s module
+   * note for the open question this raises against F-388's "conjunction, not
+   * replacement" ratification). Sent anyway: harmless if unused, and immediately
+   * available if the guard grows a frame-gap check back in.
+   */
+  raf1Ms: number;
+  /** The second callback's timestamp — taken after the frame reached the compositor. */
+  raf2Ms: number;
+  /**
+   * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded
+   * one. Fires on HTML parse completion, before any script (including Vue's mount)
+   * has run — it is not paint evidence and plays no part in any guard. Kept because
+   * it is the inner mark ADR-0014's open objection to vue-frontend-dev asked for,
+   * splitting `S_shell` into WebView2's navigation cost and this bundle's mount
+   * cost. `null` when the entry is absent. Diagnostic only.
+   */
+  navDomContentLoadedMs: number | null;
+}
+
+/**
  * The paint mark (NFR-PRF-01). Call this from inside a double
  * `requestAnimationFrame` and nowhere else — see `src/startup.ts`. Returns
  * milliseconds since t0, which `serat-app` computed and is not re-derived here.
+ *
+ * Can reject: `crates/serat-app`'s guard (task #105) refuses evidence that could not
+ * have come from a real composited frame.
  */
-export function markFirstPaint(): Promise<number> {
-  return invoke("mark_first_paint");
+export function markFirstPaint(evidence: PaintEvidence): Promise<number> {
+  return invoke("mark_first_paint", { ...evidence });
 }
 
 /**

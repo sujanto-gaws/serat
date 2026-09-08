@@ -15,11 +15,56 @@
 //                       by App.vue's CodeMirrorEditor, independent of this module.
 //
 // Nothing here is a product feature (charter: "no product features" for P0).
+//
+// Task #108 (F-377, F-388, ADR-0014): the double rAF above is a promise this file
+// makes, not one the Rust side could ever check — `crates/serat-app/src/lib.rs`'s
+// marks test only greps `boot.js` for the substring `requestAnimationFrame`, and
+// code-reviewer's mutation at F-377 showed exactly what that misses: hoist the
+// `invoke` to script start, leave a no-op `requestAnimationFrame(() => {})` behind
+// to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below sends
+// `PaintEvidence` alongside the call.
+//
+// **Open question, not yet resolved between this file and task #105.** F-388's
+// ratified resolution was "conjunction, not replacement": a frame gate alone
+// (raf1Ms/raf2Ms) is forgeable by a mutation that honestly waits for two real frames
+// scheduled too early, before this app has mounted anything visible, so the paint
+// entry was meant to be checked *against* the frame timestamps, not instead of them.
+// `task/105-paint-mark-evidence-guard` (unmerged at the time of writing) drops the
+// frame gate entirely and accepts `firstContentfulPaintMs` alone, gated only on
+// `is_finite() && > 0.0` plus a source-shape check counting `boot.js`'s call sites —
+// the latter being exactly the family of guard the lead's ratification said to drop.
+// Raised with architect/tauri-app-dev-2 rather than resolved here. raf1Ms/raf2Ms are
+// still sent regardless of how that lands: harmless if unused, immediately available
+// if the guard grows a frame-gap check back in. See `PaintEvidence` in
+// `src/ipc/client.ts` for the field-by-field reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
 import type { useVaultStore } from "@/stores/vault";
 
 type VaultStore = ReturnType<typeof useVaultStore>;
+
+/**
+ * `PerformancePaintTiming`'s `first-contentful-paint` entry, if the webview recorded
+ * one — see `PaintEvidence.firstContentfulPaintMs` for why this, and not
+ * `navDomContentLoadedMs` below, is paint evidence.
+ */
+function readFirstContentfulPaintMs(): number | null {
+  const entry = performance
+    .getEntriesByType("paint")
+    .find((candidate) => candidate.name === "first-contentful-paint");
+  return entry ? entry.startTime : null;
+}
+
+/**
+ * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded a
+ * navigation entry — see `PaintEvidence.navDomContentLoadedMs`. Its own function
+ * only so `schedulePaintMark` reads as "gather evidence, then call", rather than
+ * burying the fallible reads among timestamps that cannot fail.
+ */
+function readNavDomContentLoadedMs(): number | null {
+  const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
+  return entry ? entry.domContentLoadedEventEnd : null;
+}
 
 /**
  * Schedules the paint mark from inside a double `requestAnimationFrame` and returns
@@ -33,16 +78,24 @@ type VaultStore = ReturnType<typeof useVaultStore>;
  */
 export function schedulePaintMark(store: VaultStore): Promise<number | null> {
   return new Promise((resolve) => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        markFirstPaint().then(
+    requestAnimationFrame((raf1) => {
+      requestAnimationFrame((raf2) => {
+        markFirstPaint({
+          firstContentfulPaintMs: readFirstContentfulPaintMs(),
+          raf1Ms: raf1,
+          raf2Ms: raf2,
+          navDomContentLoadedMs: readNavDomContentLoadedMs(),
+        }).then(
           (ms) => {
             store.setMark(`painted ${ms.toFixed(1)} ms`);
             resolve(ms);
           },
           (err: unknown) => {
             // Never silently swallowed: an unhandled rejection here would look
-            // identical to a shell that painted nothing.
+            // identical to a shell that painted nothing. It is also, now, the guard
+            // actually firing rather than only a transport failure — a rejection here
+            // can mean the evidence looked implausible (task #105), and the message
+            // says which.
             store.setMark(`paint mark failed: ${JSON.stringify(err)}`);
             resolve(null);
           },
