@@ -33,7 +33,21 @@ When two goals conflict, the higher one wins. This ordering is the tie-breaker f
 
 ### 1.2 What P0 may invalidate
 
-The performance figures this design is shaped around are targets, not measurements. Three structures exist specifically because of a number that has not yet been measured: the single-writer index actor assumes write contention is the bottleneck; the parse pool assumed parsing dominates rebuild time — **measured at P0 and contradicted: parsing is about 17% of a 20,000-note rebuild, and the pool is not built (§2.2)**; brute-force vector search assumes 200,000 chunks scan fast enough. If P0 contradicts any of them, this document is re-baselined before P1 rather than quietly amended.
+The performance figures this design was shaped around were targets rather than measurements, and three structures existed because of a number nobody had taken. **P0 has now settled two of the three, and settled the first in a way the question did not anticipate.** Closed at task #103 against the final P0 numbers; the third is P4's.
+
+**The parse pool — contradicted, and the pool is not built.** Parsing is 14–17% of a 20,000-note rebuild across two attested sessions (#83 and #96, both at `concurrent_build_processes: 0`). Eliminating parsing outright would save less than removing one implementation defect did. §2.2 carries the reasoning and open design question 1's answer.
+
+**The single-writer actor — the assumption §1.2 nominated is not the one the actor rests on, and as stated it is unfalsifiable within this design.** Two things, and the second matters more.
+
+*It cannot be tested here.* "Write contention is the bottleneck" is a claim about what happens when writers contend, and this design permits **exactly one writer by construction**. There is no contention to observe, so no P0 measurement could confirm or refute it. A structure that eliminates a phenomenon cannot also be evidence about it.
+
+*And the actor never rested on it.* §2.2's own justification is lock ordering, handle poisoning, a single queue to reason about, natural backpressure and crash isolation — and it states outright that a shared connection behind a mutex has **the same throughput**. So the actor is justified by failure modes rather than by throughput, and **would stand unchanged if contention turned out to be irrelevant.** §1.2 attributed to it a dependency it does not have.
+
+*What P0 did establish, which is narrower and real.* The writer was the dominant phase — `producer_wait` 45–51% of wall clock on the first run — and its cost was **internal rather than structural**: eight `INSERT`s through `tx.execute`, re-preparing on every call, roughly a million redundant prepares per rebuild (F-324). `prepare_cached` took the rebuild from 27.1 s to 17.5 s and left `producer_wait` at 19%. That is evidence the **actor** was not the problem, and no evidence at all about the counterfactual it was nominated to answer.
+
+**Brute-force vector search at 200,000 chunks — untouched, and correctly so.** A P4 question on a P4 structure; ADR-09 was written to be reversed cheaply and nothing has tested it. It stays open rather than being closed by silence.
+
+The re-baseline this section promised has happened: NFR-PRF-01 is split into a platform term and a Serat term (ADR-0014), on the strength of P0 numbers rather than quietly amended.
 
 ## Components & responsibilities
 
