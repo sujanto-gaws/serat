@@ -1,7 +1,7 @@
 # Does NFR-PRF-04 have a gate-quality measurement? (task #96)
 
-**Status:** ruling drafted, number pending · **Owner:** test-engineer · **Serves:** NFR-PRF-04,
-C-06 · **Cites:** ADR-0013, F-327, F-375, task #83
+**Status:** closed — gate-quality PASS, 27,693.5 ms · **Owner:** test-engineer · **Serves:**
+NFR-PRF-04, C-06 · **Cites:** ADR-0013, F-327, F-375, task #83
 
 ## The question, precisely
 
@@ -54,9 +54,9 @@ is that none of the five readings above were taken with that instrument present.
 after the fact, as an unloaded-machine reading or a contended one. A number cannot be
 gate-quality retroactively; the attestation has to exist at the moment it is taken.
 
-## Ruling
+## Ruling (as it stood before the attested run below closed the question)
 
-**No — NFR-PRF-04 does not currently have a gate-quality measurement**, for a reason narrower
+**No — at the time of writing, NFR-PRF-04 did not have a gate-quality measurement**, for a reason narrower
 than "the noise is too large": the noise is *unattributed* on every reading taken so far,
 because the instrument that could attribute it did not exist when they were taken. This is not
 a restatement of F-327; it is F-327 plus #83, applied: the tool to tell a slow machine from a
@@ -80,14 +80,34 @@ with `concurrent_build_processes: 0` in its own `Environment` line. If that read
 a reading; the standing rule ("no gate number without a declared window", resume-list
 scheduling constraint) applies, and test-engineer has requested the window from the lead.
 
-## Number, once taken
+## Number, taken 2026-09-08 under a declared measurement window
 
 | Field | Value |
 |---|---|
-| Reading (ms) | *pending* |
-| `concurrent_build_processes` | *pending* |
-| `cpu_load_percent` | *pending* |
-| `spread_pct()` (n=3) | *pending* |
-| `determinate()` | *pending* |
-| Verdict | *pending* |
-| Taken | *pending* |
+| Reading (median of 3, ms) | 27,693.5 |
+| Samples (ms) | 26,858.4 / 27,693.5 / 27,713.7 |
+| Limit (ms) | 30,000.0 |
+| `concurrent_build_processes` | 0 |
+| `cpu_load_percent` | 22% |
+| `spread_pct()` (n=3) | 3.2% |
+| `determinate()` | true (`max_ms` 27,713.7 ≤ `limit_ms` 30,000 — no sample straddled the limit) |
+| Verdict | **PASS, gate-quality** |
+| `gate_eligible` | false — real-time scanner off (RISK-012); best-case/comparable figure, not the charter-gate figure, same convention every reading in this project has used |
+| Vault digest | `35fcb867…` — matches the canonical 20k manifest; not F-372-poisoned |
+| Taken | window declared and held by the lead; every other teammate off the CPU for the duration |
+
+**This closes the ruling above.** An attested run — `concurrent_build_processes: 0`, determinate,
+3.2% spread, an order of magnitude tighter than the 98% spread across F-327's five unattributed
+readings — is exactly what the ruling said would settle the question, and it settled it as a
+pass: NFR-PRF-04 now has a gate-quality wall-clock measurement, 27,693.5 ms against a 30,000 ms
+limit.
+
+**One distinction for #103 and #101 to keep separate, at architect's request.** *"NFR-PRF-04 has
+a gate-quality measurement"* (this document, a wall-clock PASS/FAIL) and *"parse is ~17% of the
+rebuild"* (#83, a phase **share** within one session, 1.3% spread across four readings) are both
+true and are not the same statistic. A share is computed within one run and tends to survive the
+machine moving better than a wall clock does — this run's own phase table shows parse at 14% of
+27,694 ms (3,942 ms), a different session from #83's and a different number, which is expected
+and is not a disagreement between the two: shares are session-relative too (F-375's lesson,
+carried). Neither figure supersedes the other; they answer different questions and #103 should
+cite both without treating one as a refinement of the other.
