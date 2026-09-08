@@ -35,6 +35,39 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 | D4 | `[P0/design] Close open design question 1 and §1.2 with the P0 numbers` | NFR-PRF-03, NFR-PRF-04 · ADR-0001 | architect | `docs/03-design/architecture.md` | T2 | pending |
 | Q1 | `[P0/req] Re-baseline the NFR-PRF targets from the P0 measurements` | NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, US-35 | product-analyst | `docs/02-requirements/prd.md` | T2, D4 | pending |
 
+> **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
+
+## Resume task list (from #90)
+
+Two rulings by the owner, taken 2026-09-08, set this wave's shape.
+
+1. **S2 is in the P0 gate.** The charter's P0 deliverable names "CodeMirror 6 mounted"; `app/` holds only generated bindings and `crates/serat-app/webview/` is a static shell. A cold-start figure taken against a shell with no editor framework in it is the flattering measurement, and this spike's own recorded lesson is about those.
+2. **NFR-PRF-01 is re-baselined with the webview term rather than opening C-07.** The diagnosis on record is that the requirement was written without a webview-startup term in it, not that the implementation is slow: Serat's own main-thread work is 4.7-5.6 ms against 596-865 ms inside `WebviewWindowBuilder::build`. **The re-baseline is therefore a split, not a slackening** - a budget on the platform term and a budget on Serat's term - and it lands *after* the frontend is mounted and cold start re-measured, so the new number is not set against the shell S2 replaces. It is bounded to one platform (F-96: WebView2 is one of three webviews).
+
+**Where the four gate numbers stand at resume:** full rebuild **measured, passes on the best readings but not gate-quality** (19.0 s, against 24.4/27.1/36.4/37.6 s on the same binary and vault - F-327's noise exceeds the margin); save-to-index **unmeasured**, the only one; cold start **measured and missed** (`vault_usable` p95 1094 ms against 1000 ms, `window_visible` p95 1088 ms against 400 ms), warm-vault and scanner-disabled on both counts; the 50k run is not a charter clause. `cargo test --workspace` on `main` at `3f44a80`: **455 passed, 0 failed across 40 test binaries.**
+
+| # | Subject | IDs / ADRs | Owner | Artifact | Depends on | Status |
+|---|---|---|---|---|---|---|
+| 90 | `[P0/impl] Land the save path wiring through apply() and flush()` | NFR-PRF-03 · ADR-0001 | tauri-app-dev | `crates/serat-app` | — | pending |
+| 91 | `[P0/test] Recover or discard the uncommitted bench/budget env work` | NFR-PRF-08 | test-engineer | `bench/budget` | — | pending |
+| 92 | `[P0/impl] Resolve the uncommitted serat-app/state.rs one-liner` | NFR-PRF-03 | rust-core-dev | `crates/serat-app` | — | pending |
+| 93 | `[P0/test] Close the cross-process race on the shared 20k vault` | NFR-PRF-08 · F-369/F-370 | test-engineer | `bench/`, CI | — | pending |
+| 94 | `[P0/test] Make prf03-save-to-index measure the real save path at p95` | NFR-PRF-03, NFR-PRF-08, US-35 | test-engineer | `bench/budget/src/bin/prf03-save-to-index.rs` | 90 | pending |
+| 95 | `[P0/test] Take and record NFR-PRF-03 on #83's attested method` | NFR-PRF-03, US-35 | test-engineer | `docs/05-testing/reports/` | 94, 93 | pending |
+| 96 | `[P0/test] Rule whether NFR-PRF-04 has a gate-quality measurement` | NFR-PRF-04, C-06 · ADR-0013 · F-327 | test-engineer | `docs/05-testing/` | 91, 93 | pending |
+| 97 | `[P0/test] T1 rebuild-equivalence: delete .serat/, assert identical results` | FR-VLT-02, NFR-REL-02, US-01, US-07 · ADR-0002 | test-engineer | `crates/serat-index/tests` | — | pending |
+| 98 | `[P0/impl] Mount Vue 3 + CodeMirror 6, keeping both startup marks` | NFR-PRF-01 · ADR-0006, ADR-0007 | vue-frontend-dev | `app/`, `crates/serat-app/webview/` | — | pending |
+| 99 | `[P0/design] Attest the cold-start term split for the re-baseline` | NFR-PRF-01, C-07 · ADR-0013 | architect | `docs/03-design/architecture.md` §3.4 | — | pending |
+| 100 | `[P0/test] Re-measure cold start with the real frontend mounted` | NFR-PRF-01, US-35 | test-engineer | `docs/05-testing/reports/` | 98 | pending |
+| 101 | `[P0/test] T2: write the gate report with all four numbers` | NFR-PRF-01/03/04/08, US-35 | test-engineer | `docs/05-testing/reports/` | 95, 96, 97, 100 | pending |
+| 102 | `[P0/review] R1: final sweep against C-01..C-07 and every cited ADR` | all P0 IDs | code-reviewer | review notes | 101 | pending |
+| 103 | `[P0/design] D4: close §1.2's remaining assumptions with the numbers` | NFR-PRF-03, NFR-PRF-04 · ADR-0001 | architect | `docs/03-design/architecture.md` | 101 | pending |
+| 104 | `[P0/req] Q1: re-baseline NFR-PRF-01 as a split, and the other targets` | NFR-PRF-01/03/04, US-35 | product-analyst | `docs/02-requirements/prd.md` | 101, 103, 99 | pending |
+
+**The measurement window rule, which is a scheduling constraint and not advice.** #83 attested its figures with `concurrent_build_processes: 0`, and F-327 records 35% session-to-session movement on unchanged code. **Tasks 95, 96 and 100 are measurements; no other teammate runs a cargo build while one is in progress.** The lead declares the window and holds it. This is RISK-002's real shape (F-07): the workspace is one shared object with many owners, and the cost scales with teammates rather than lines of code.
+
+**Commit before your session ends.** Three worktrees were found carrying uncommitted work at resume - the same failure the last two sessions recorded. An uncommitted branch is indistinguishable from work never done.
+
 ## Out of scope for P0
 
 No product features (charter). No live preview (P1, ADR-0006), no wikilink resolution UI, no SQ, no extraction, no AI, no packaging. Nothing on the charter's "deliberately not" list is touched.
