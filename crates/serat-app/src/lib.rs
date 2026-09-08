@@ -636,7 +636,9 @@ mod tests {
         // produce valid, plausible-looking JSON.
         let startup = Startup::begin_with(None);
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(42.0)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -844,5 +846,188 @@ mod tests {
         );
         let err = run_save_benchmark(&state, &missing).expect_err("the list file is not there");
         assert!(err.contains("--bench-save-list"), "{err}");
+    }
+
+    /// An opener whose handle keeps a one-deep write queue
+    /// (`serat_index::IndexHandle::with_queue_depth`), the same device F-115's
+    /// `a_save_does_not_wait_for_the_writer` (`crates/serat-index/tests/incremental.rs`)
+    /// uses to make a refusal reachable at all: the default depth (4,096,
+    /// `writer::DEFAULT_QUEUE_DEPTH`) makes `IndexError::QueueFull` practically
+    /// unreachable from a test that submits far fewer ops than that.
+    ///
+    /// Also hands out a [`serat_index::WriterHandle`] clone the moment the handle
+    /// opens, over `writer_tx` -- see the test below for why a second submitter needs
+    /// one of these rather than going through `AppState::write_file` a second time.
+    #[derive(Default)]
+    struct ShallowQueue {
+        handle: Option<serat_index::IndexHandle>,
+        writer_tx: Option<std::sync::mpsc::Sender<serat_index::WriterHandle>>,
+    }
+
+    impl index::IndexOpen for ShallowQueue {
+        fn open(
+            &mut self,
+            _root: &std::path::Path,
+            dir: &std::path::Path,
+            publish: &dyn Fn(ipc::IndexState),
+        ) {
+            match serat_index::IndexHandle::with_queue_depth(dir, 1) {
+                Ok(handle) => {
+                    if let Some(tx) = &self.writer_tx {
+                        let _ = tx.send(handle.writer());
+                    }
+                    publish(ipc::IndexState::Ready { note_count: 0 });
+                    self.handle = Some(handle);
+                }
+                Err(err) => publish(ipc::IndexState::Unavailable {
+                    message: format!("could not open a one-deep index for the test: {err}"),
+                    path: dir.display().to_string(),
+                }),
+            }
+        }
+
+        fn into_handle(self) -> Option<serat_index::IndexHandle> {
+            self.handle
+        }
+    }
+
+    #[test]
+    fn run_save_benchmark_excludes_a_writer_refusal_from_submitted_ms() {
+        // F-402, code-reviewer's mutation: an unconditional push into `submitted_ms`
+        // regardless of outcome left every existing test green (94 passed, 0 failed --
+        // identical to control), because nothing here ever drove a real refusal. A run
+        // where every save was refused would then post a fast, clean p95 for saves that
+        // never reached the writer -- F-19/F-382's exact failure shape, on the one
+        // series NFR-PRF-03's p95 is asserted against.
+        //
+        // A one-shot race against a one-deep queue is unreliable here the way F-115's
+        // own bare `apply()` loop is reliable: that loop pays for a repeated *read* of
+        // an already-cached file and nothing else, so it can far outrun the writer.
+        // `run_save_benchmark`'s loop pays for a real `read_file` and a real
+        // `write_atomic` per path -- disk I/O on the calling thread, which gives the
+        // writer time to drain a one-deep queue between iterations far more often than
+        // not (measured: no refusal in 40 real saves against a lone contender). So a
+        // second thread hammers the *same* queue directly through a cloned
+        // `WriterHandle::submit`, bypassing the vault entirely -- no read, no write,
+        // nothing but the submit itself -- which is what makes it fast enough to
+        // contend continuously for the single slot for the run's whole duration.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-app-lib-save-bench-refusal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
+
+        const LISTED: usize = 40;
+        let mut list = String::new();
+        for i in 0..LISTED {
+            let rel = format!("10-projects/note-{i}.md");
+            std::fs::write(dir.join(&rel), format!("# note {i}\n")).expect("fixture");
+            list.push_str(&rel);
+            list.push('\n');
+        }
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(&list_path, &list).expect("list");
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let state = Arc::new(AppState::with_settings(
+            Arc::new(Startup::begin()),
+            cli::Boot::default(),
+            settings::Settings::default(),
+        ));
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                ShallowQueue {
+                    handle: None,
+                    writer_tx: Some(writer_tx),
+                },
+            )
+            .expect("open");
+        let hammer_writer = writer_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("ShallowQueue::open must hand out a writer for the one-deep queue");
+
+        let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !matches!(state.index_status().state, ipc::IndexState::Ready { .. }) {
+            assert!(
+                std::time::Instant::now() < ready_by,
+                "the fixture vault never reached IndexState::Ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // As `a_save_through_write_file_reaches_the_index_without_the_watcher`
+        // (state.rs): `Ready` publishes slightly before the `IndexHandleSlot` is
+        // filled. Setup slack, not measurement.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Hammer the same one-deep queue from another thread for the run's duration,
+        // submitting the same synthetic asset repeatedly (F-115's own idiom: identity
+        // does not matter, only that the queue's single slot stays contended).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer_stop = Arc::clone(&stop);
+        let hammer = std::thread::spawn(move || {
+            use serat_core::{IndexOp, IndexWriter as _, NoteKind, NoteMeta, VaultPath};
+            let op = IndexOp::UpsertAsset {
+                meta: NoteMeta {
+                    path: VaultPath::new("bulk/hammer.md").expect("path"),
+                    hash: serat_core::ContentHash::from_bytes([7u8; 32]),
+                    kind: NoteKind::Asset,
+                    size: 0,
+                    mtime_ms: 0,
+                },
+            };
+            while !hammer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Refused submissions are exactly the point; nothing to do with the
+                // result either way.
+                let _ = hammer_writer.submit(op.clone());
+            }
+        });
+
+        let result = run_save_benchmark(&state, &list_path).expect("benchmark");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hammer.join().expect("hammer thread");
+
+        assert_eq!(result.attempted, LISTED);
+        assert_eq!(
+            result.handle_missing, 0,
+            "the handle was installed and waited for before the run started: {result:?}"
+        );
+        assert!(
+            result.writer_refused >= 1,
+            "a one-deep queue contended by a second thread throughout the run produced \
+             no refusal at all -- the contention this test relies on did not happen: \
+             {result:?}"
+        );
+        assert_eq!(
+            result.writer_refused as usize,
+            result.writer_refused_ms.len(),
+            "the refused count and its timing series must agree: {result:?}"
+        );
+        assert_eq!(
+            result.submitted_ms.len() + result.writer_refused_ms.len(),
+            LISTED,
+            "every attempted, non-handle-missing save must land in exactly one bucket: \
+             {result:?}"
+        );
+        for ms in &result.writer_refused_ms {
+            assert!(*ms >= 0.0 && ms.is_finite(), "{result:?}");
+        }
+        // The load-bearing assertion: a refused save's near-instant timing must not be
+        // among the samples NFR-PRF-03's p95 is judged on. Mutation-verified against
+        // `else if after.writer_refused > before.writer_refused` replaced with an
+        // unconditional push into `submitted_ms` -- that mutation makes this fail by
+        // widening `submitted_ms.len()` past `LISTED - writer_refused_ms.len()`.
+        assert_eq!(
+            result.submitted_ms.len(),
+            LISTED - result.writer_refused as usize,
+            "a refused save's timing leaked into submitted_ms, the series NFR-PRF-03's \
+             p95 is asserted against: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
