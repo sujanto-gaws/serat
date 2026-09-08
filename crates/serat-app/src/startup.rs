@@ -54,7 +54,7 @@
 //!    `mark_first_paint` IPC command, which the webview invokes.
 //! 2. **The call must carry evidence a script cannot have before the frame is
 //!    composited.** The argument is the `startTime` of the browser's own
-//!    `first-contentful-paint` `PerformancePaintTiming` entry (`webview/boot.js`),
+//!    `first-contentful-paint` `PerformancePaintTiming` entry (`app/src/startup.ts`),
 //!    which the Paint Timing API does not report until content has actually been
 //!    painted — not a value derived from counting `requestAnimationFrame` callbacks,
 //!    which a script can call as many or as few times as it likes regardless of
@@ -62,7 +62,11 @@
 //!    (returns [`PaintEvidenceRejected`], sets nothing) a non-finite or non-positive
 //!    value rather than defaulting — a call with nothing genuine to send has nothing
 //!    accepted, on any platform, including one where the Paint Timing API does not
-//!    exist at all.
+//!    exist at all. Task #112, F-396(b): the paint entry alone is sound only as long
+//!    as `app/index.html` stays contentless, a property nothing in this crate
+//!    asserts, so [`validate_paint_evidence`] additionally checks the two
+//!    `requestAnimationFrame` timestamps the caller sends against the paint entry,
+//!    before either reaches this function.
 //! 3. **There is no other way to set it.** No Rust path stamps it: not `main`, not the
 //!    window builder, not a `WindowEvent`. A shell that paints nothing, or whose
 //!    evidence is rejected, never marks, so [`Startup::trace`] fails with
@@ -743,6 +747,57 @@ impl PaintEvidenceRejected {
             ),
         }
     }
+
+    /// Task #112, F-396(c): the caller sent no paint entry at all —
+    /// `first_contentful_paint_ms: None`. Distinct from [`PaintEvidenceRejected::new`],
+    /// whose message is about an implausible *value*; this is about the complete
+    /// absence of one, which a mandatory `f64` parameter used to turn into a raw IPC
+    /// deserialisation failure the caller could not tell apart from "the guard was
+    /// never reached" (F-396(c)). `None` is legitimate — a platform with no Paint
+    /// Timing API has nothing else to send — and the correct outcome is still no
+    /// mark, recorded as the reason it is missing rather than as an opaque wire error.
+    fn missing_entry() -> Self {
+        Self {
+            reason: "mark_first_paint refused: no first-contentful-paint entry was sent. \
+                      Either the Paint Timing API is unavailable on this platform, or \
+                      the call ran before the browser recorded one — both are refusals, \
+                      not defaults (F-377)."
+                .to_owned(),
+        }
+    }
+
+    /// Task #112, F-396(b): the two `requestAnimationFrame` timestamps the caller also
+    /// sends are not two distinct, increasing frames. F-377's mutation A (the double
+    /// rAF collapsed to one) and a fabricated pair computed synchronously in one
+    /// callback both produce this shape.
+    fn frame_gate_failed(raf1_ms: f64, raf2_ms: f64) -> Self {
+        Self {
+            reason: format!(
+                "mark_first_paint refused: the second requestAnimationFrame timestamp \
+                 ({raf2_ms:?}) did not follow the first ({raf1_ms:?}) — that is not two \
+                 distinct composited frames"
+            ),
+        }
+    }
+
+    /// Task #112, F-396(b): the frame gate passed — two real, increasing frame
+    /// timestamps — but the second one precedes the paint entry by more than
+    /// clock-quantisation noise can explain. This is the shape F-388's original
+    /// argument (vue-frontend-dev's, not F-388's own reasoning, which F-396(a) found
+    /// false) describes: a mutation that honestly schedules two real frames, just too
+    /// early, before this shell has painted anything visible. `first-contentful-paint`
+    /// alone cannot see this; comparing it against the frames the caller claims
+    /// produced it can.
+    fn frame_precedes_paint(raf2_ms: f64, first_contentful_paint_ms: f64) -> Self {
+        Self {
+            reason: format!(
+                "mark_first_paint refused: the second requestAnimationFrame timestamp \
+                 ({raf2_ms:?}) precedes the first-contentful-paint entry \
+                 ({first_contentful_paint_ms:?}) by more than clock-quantisation noise \
+                 can explain — these were not the frames that painted this shell"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for PaintEvidenceRejected {
@@ -752,6 +807,75 @@ impl std::fmt::Display for PaintEvidenceRejected {
 }
 
 impl std::error::Error for PaintEvidenceRejected {}
+
+/// Validates a `mark_first_paint` call's full evidence bundle before any of it reaches
+/// [`Startup::mark_first_paint`] — task #112, F-396(c). Two things this checks that
+/// `Startup::mark_first_paint`'s single `f64` cannot: that a genuinely absent Paint
+/// Timing entry is a typed rejection rather than a parameter a mandatory `f64` would
+/// have refused to deserialise at all, and that the two `requestAnimationFrame`
+/// timestamps the caller also sends are internally consistent with the paint entry
+/// they are meant to corroborate.
+///
+/// F-396(b): `first-contentful-paint` alone is sound only as long as `app/index.html`
+/// stays contentless, a property nothing in this crate asserts and that lives in a
+/// different file from this guard — a splash screen or loading skeleton, an entirely
+/// ordinary future addition, would silently degrade an FCP-only guard to F-377's
+/// mutation B with nothing going red. Checking the frame timestamps against the paint
+/// entry makes this guard's soundness independent of what `index.html` happens to
+/// contain today.
+///
+/// All three inputs are on the *webview's own* `performance.now()` clock, never this
+/// process's `elapsed_ms` — they only ever need to be compared to each other, which is
+/// all this function does; nothing here needs cross-clock reconciliation.
+///
+/// # Errors
+///
+/// [`PaintEvidenceRejected`], naming which check failed: the entry is absent; the two
+/// frame timestamps are not strictly increasing; or the second frame precedes the
+/// paint entry by more than clock-quantisation noise can explain.
+pub(crate) fn validate_paint_evidence(
+    first_contentful_paint_ms: Option<f64>,
+    raf1_ms: f64,
+    raf2_ms: f64,
+) -> Result<f64, PaintEvidenceRejected> {
+    let first_contentful_paint_ms =
+        first_contentful_paint_ms.ok_or_else(PaintEvidenceRejected::missing_entry)?;
+    // Written as three explicit conditions rather than `!(raf2_ms > raf1_ms)`: `f64` is
+    // only partially ordered, and a negated `>` would let a NaN pair slip through
+    // (`!(NaN > x)` is true, matching "reject", but `NaN <= x` is false — the two are
+    // not equivalent, which is exactly what clippy's `neg_cmp_op_on_partial_ord`
+    // flags). Spelling out "finite and strictly increasing" says what is actually
+    // required and rejects NaN by name rather than by the coincidence of `!`.
+    if !raf1_ms.is_finite() || !raf2_ms.is_finite() || raf2_ms <= raf1_ms {
+        return Err(PaintEvidenceRejected::frame_gate_failed(raf1_ms, raf2_ms));
+    }
+    // Empirically set, not theoretical, and the two are far apart: the first version
+    // of this check used 2ms, reasoned from clock-quantisation noise on the
+    // assumption that the second rAF callback should land at or after the paint
+    // entry. A real WebView2 run rejected every honest launch — measured, over three
+    // separate cold starts against the same real binary, raf2 legitimately precedes
+    // first-contentful-paint by 51.4, 56.7 and 63.4 ms. WebView2's renderer process
+    // and its GPU-compositor "the frame actually displayed" signal are not the same
+    // clock tick; rAF fires on the renderer's own schedule, Paint Timing measures the
+    // compositor's, and the two are consistently ~50-65ms apart on this platform,
+    // not ~2ms. 200ms is set with real margin over that measured range — three
+    // samples is not nearly enough to bound the tail (F-327: 35% session-to-session
+    // movement on unchanged code is this project's own recorded experience), so this
+    // is deliberately generous rather than tight. **What it has not been checked
+    // against is a real mutation**: the accepted manual WebView2 mutation run
+    // (F-377/F-392) needs to confirm 200ms still catches F-388's described attack —
+    // two honestly-composited frames scheduled from window-creation time, before this
+    // shell mounted anything — now that the honest range is known to be measured in
+    // tens of milliseconds, not single digits.
+    const FRAME_PRECEDES_PAINT_TOLERANCE_MS: f64 = 200.0;
+    if raf2_ms + FRAME_PRECEDES_PAINT_TOLERANCE_MS < first_contentful_paint_ms {
+        return Err(PaintEvidenceRejected::frame_precedes_paint(
+            raf2_ms,
+            first_contentful_paint_ms,
+        ));
+    }
+    Ok(first_contentful_paint_ms)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1213,6 +1337,82 @@ mod tests {
             Some(517.25),
             "the raw evidence is kept so a trace can be audited against it"
         );
+    }
+
+    // Task #112, F-396(c) and F-396(b): `validate_paint_evidence` is the layer above
+    // `Startup::mark_first_paint` that turns a missing paint entry into a typed
+    // rejection instead of a raw IPC deserialisation failure, and checks the two
+    // requestAnimationFrame timestamps against the paint entry rather than trusting
+    // it alone — F-396(b)'s "conjunction is robust" conclusion, against the mutation
+    // vue-frontend-dev's own argument describes: two real, honestly-scheduled frames,
+    // just too early, before the shell painted anything.
+
+    #[test]
+    fn a_genuinely_absent_paint_entry_is_a_typed_rejection_not_a_deserialise_failure() {
+        let err = validate_paint_evidence(None, 10.0, 20.0)
+            .expect_err("None must be refused, not defaulted");
+        assert!(
+            err.reason.contains("first-contentful-paint"),
+            "the rejection must say what was missing: {err}"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_or_fabricated_frame_pair_fails_the_gate() {
+        for (raf1_ms, raf2_ms) in [(20.0, 20.0), (20.0, 10.0)] {
+            validate_paint_evidence(Some(517.25), raf1_ms, raf2_ms)
+                .expect_err("raf2 must strictly follow raf1");
+        }
+    }
+
+    #[test]
+    fn two_real_frames_scheduled_before_the_paint_entry_are_rejected() {
+        // The mutation the frame check exists to catch: two honestly-composited
+        // frames, honestly reported, just scheduled before this shell painted
+        // anything visible — F-388's original argument, unaffected by F-396(a)'s
+        // correction of F-388's own reasoning. The gap here (480ms) is well past the
+        // measured honest range (51-63ms, see FRAME_PRECEDES_PAINT_TOLERANCE_MS's own
+        // comment) and past its 200ms tolerance, standing in for frames captured near
+        // window creation, long before this shell painted anything.
+        let err = validate_paint_evidence(Some(500.0), 10.0, 20.0)
+            .expect_err("frames far earlier than the paint entry must be refused");
+        assert!(
+            err.reason.contains("first-contentful-paint"),
+            "the rejection must name the paint entry it compared against: {err}"
+        );
+    }
+
+    #[test]
+    fn a_frame_within_tolerance_of_the_paint_entry_is_accepted() {
+        // The paint entry itself, and a frame timestamp equal to it, is the boundary
+        // case: FCP is reported for the frame it painted in, so the confirming frame
+        // arriving at or after it — never strictly before — is the legitimate shape.
+        assert_eq!(
+            validate_paint_evidence(Some(184.0), 170.0, 184.0),
+            Ok(184.0)
+        );
+        // A frame a hair after the entry, inside the clock-quantisation tolerance.
+        assert_eq!(
+            validate_paint_evidence(Some(184.0), 170.0, 185.5),
+            Ok(184.0)
+        );
+        // The measured honest shape (task #112): raf2 legitimately precedes the
+        // paint entry by tens of milliseconds on WebView2 — one of the three real
+        // gaps this file's tolerance is set against (see
+        // FRAME_PRECEDES_PAINT_TOLERANCE_MS's comment), not a boundary value chosen
+        // to make the test pass.
+        assert_eq!(
+            validate_paint_evidence(Some(264.0), 150.0, 200.6),
+            Ok(264.0)
+        );
+    }
+
+    #[test]
+    fn genuine_evidence_survives_the_full_validation_and_marks_the_shell() {
+        let startup = in_process();
+        let evidence = validate_paint_evidence(Some(184.0), 170.0, 184.0).expect("valid evidence");
+        assert!(startup.mark_first_paint(evidence).expect("accepted"));
+        assert_eq!(startup.lock().paint_evidence_ms, Some(184.0));
     }
 
     #[test]

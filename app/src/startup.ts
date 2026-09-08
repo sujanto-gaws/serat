@@ -38,10 +38,11 @@
 // timestamps and `firstContentfulPaintMs` are on this page's own `performance.now()`
 // clock, so `crates/serat-app` can validate `raf2Ms >= firstContentfulPaintMs`
 // (the second frame did not precede the paint it is supposed to confirm) without
-// needing to reconcile clocks. Proposed to tauri-app-dev-2 for the Rust half;
-// `first_contentful_paint_ms` also needs to become `Option<f64>` there so a
-// genuinely absent entry (no Paint Timing support) is a typed rejection rather
-// than a raw deserialisation failure that produces no trace and no explanation.
+// needing to reconcile clocks. Implemented on the Rust side too
+// (`crates/serat-app/src/startup.rs::validate_paint_evidence`, task #112):
+// `first_contentful_paint_ms` is `Option<f64>` there, so a genuinely absent entry
+// (no Paint Timing support) is a typed, recorded rejection rather than a raw
+// deserialisation failure that produces no trace and no explanation.
 // See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
@@ -62,6 +63,55 @@ function readFirstContentfulPaintMs(): number | null {
 }
 
 /**
+ * Resolves once the browser has actually recorded a `first-contentful-paint` entry,
+ * or resolves `null` if this platform cannot ever produce one.
+ *
+ * **Not a synchronous read inside the double rAF — measured, and the measurement is
+ * why this exists.** The first version of this file called
+ * {@link readFirstContentfulPaintMs} synchronously from inside the second rAF
+ * callback, on the reasoning that raf2 fires after the compositor has the frame, so
+ * the paint entry should already be recorded by then. A real WebView2 run showed
+ * that reasoning wrong: `performance.getEntriesByType("paint")` was still empty at
+ * that point even though the frame had genuinely painted (confirmed separately, over
+ * the DevTools Protocol, that the entry existed moments later with `#app` already
+ * holding real content) — the entry's *availability to script* lags its *own
+ * `startTime`*, which is not the same thing. `PerformanceObserver` with
+ * `buffered: true` is the correct tool for exactly this gap: it either has the entry
+ * already (a paint that beat this call) or delivers it the moment the browser
+ * records one, rather than this file guessing how many frames the delay takes.
+ *
+ * Resolves `null`, rather than hanging, when `PerformanceObserver` or its `"paint"`
+ * entry type is unavailable — the platform has nothing to ever deliver, so waiting
+ * for it would wait forever (F-377: a missing capability is a refusal, not a stall).
+ */
+function whenFirstContentfulPaint(): Promise<number | null> {
+  return new Promise((resolve) => {
+    const existing = readFirstContentfulPaintMs();
+    if (existing !== null) {
+      resolve(existing);
+      return;
+    }
+    if (
+      typeof PerformanceObserver === "undefined" ||
+      !(PerformanceObserver.supportedEntryTypes ?? []).includes("paint")
+    ) {
+      resolve(null);
+      return;
+    }
+    const observer = new PerformanceObserver((list) => {
+      const entry = list
+        .getEntriesByType("paint")
+        .find((candidate) => candidate.name === "first-contentful-paint");
+      if (entry) {
+        observer.disconnect();
+        resolve(entry.startTime);
+      }
+    });
+    observer.observe({ type: "paint", buffered: true });
+  });
+}
+
+/**
  * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded a
  * navigation entry — see `PaintEvidence.navDomContentLoadedMs`. Its own function
  * only so `schedulePaintMark` reads as "gather evidence, then call", rather than
@@ -72,43 +122,56 @@ function readNavDomContentLoadedMs(): number | null {
   return entry ? entry.domContentLoadedEventEnd : null;
 }
 
+/** The two `requestAnimationFrame` callbacks' own timestamps — see `PaintEvidence.raf1Ms`. */
+function whenDoubleRaf(): Promise<{ raf1Ms: number; raf2Ms: number }> {
+  return new Promise((resolve) => {
+    requestAnimationFrame((raf1Ms) => {
+      requestAnimationFrame((raf2Ms) => {
+        resolve({ raf1Ms, raf2Ms });
+      });
+    });
+  });
+}
+
 /**
- * Schedules the paint mark from inside a double `requestAnimationFrame` and returns
- * a promise that resolves once `mark_first_paint` has round-tripped.
+ * Schedules the paint mark and returns a promise that resolves once
+ * `mark_first_paint` has round-tripped.
  *
  * Call this once, as early as possible after the app mounts — scheduling it before
  * the buffer read is awaited means a slow disk cannot delay it; the two are
  * independent, matching architecture §3.4's second table row. **Nothing else may
  * call `markFirstPaint`**: it is the only source of `t0_to_window_visible_ms`, and a
  * second caller would just be a second way to get the ordering wrong.
+ *
+ * Waits for **both** the double rAF and the `first-contentful-paint` entry — see
+ * {@link whenFirstContentfulPaint} for why the entry needs an actual wait rather than
+ * a synchronous read at the second rAF callback. Both start immediately and run
+ * concurrently; the call fires once whichever is slower resolves.
  */
 export function schedulePaintMark(store: VaultStore): Promise<number | null> {
-  return new Promise((resolve) => {
-    requestAnimationFrame((raf1) => {
-      requestAnimationFrame((raf2) => {
-        markFirstPaint({
-          firstContentfulPaintMs: readFirstContentfulPaintMs(),
-          raf1Ms: raf1,
-          raf2Ms: raf2,
-          navDomContentLoadedMs: readNavDomContentLoadedMs(),
-        }).then(
-          (ms) => {
-            store.setMark(`painted ${ms.toFixed(1)} ms`);
-            resolve(ms);
-          },
-          (err: unknown) => {
-            // Never silently swallowed: an unhandled rejection here would look
-            // identical to a shell that painted nothing. It is also, now, the guard
-            // actually firing rather than only a transport failure — a rejection here
-            // can mean the evidence looked implausible (task #105), and the message
-            // says which.
-            store.setMark(`paint mark failed: ${JSON.stringify(err)}`);
-            resolve(null);
-          },
-        );
-      });
-    });
-  });
+  return Promise.all([whenDoubleRaf(), whenFirstContentfulPaint()]).then(
+    ([{ raf1Ms, raf2Ms }, firstContentfulPaintMs]) =>
+      markFirstPaint({
+        firstContentfulPaintMs,
+        raf1Ms,
+        raf2Ms,
+        navDomContentLoadedMs: readNavDomContentLoadedMs(),
+      }).then(
+        (ms) => {
+          store.setMark(`painted ${ms.toFixed(1)} ms`);
+          return ms;
+        },
+        (err: unknown) => {
+          // Never silently swallowed: an unhandled rejection here would look
+          // identical to a shell that painted nothing. It is also, now, the guard
+          // actually firing rather than only a transport failure — a rejection here
+          // can mean the evidence looked implausible (task #105/#112), and the
+          // message says which.
+          store.setMark(`paint mark failed: ${JSON.stringify(err)}`);
+          return null;
+        },
+      ),
+  );
 }
 
 /** What `App.vue`'s CodeMirrorEditor exposes — see `defineExpose` there. */

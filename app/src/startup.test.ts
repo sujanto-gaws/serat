@@ -58,6 +58,11 @@ function stubPerformanceEntries(byType: Partial<Record<string, PerformanceEntry[
 beforeEach(() => {
   setActivePinia(createPinia());
   stubDoubleRaf();
+  // Deterministic default: no PerformanceObserver at all, so `whenFirstContentfulPaint`
+  // takes its "platform cannot ever produce one" branch unless a test stubs otherwise.
+  // Real jsdom's own support for the Paint Timing API is not something this suite
+  // should depend on incidentally.
+  vi.stubGlobal("PerformanceObserver", undefined);
   markFirstPaint.mockReset();
   markVaultUsable.mockReset();
   readFile.mockReset();
@@ -134,7 +139,10 @@ describe("schedulePaintMark", () => {
     expect(evidence.firstContentfulPaintMs).toBe(17);
   });
 
-  it("reports null for first-contentful-paint rather than throwing when the entry is absent", async () => {
+  it("reports null for first-contentful-paint when the platform has no PerformanceObserver", async () => {
+    // Set explicitly by this test even though beforeEach already does — the property
+    // under test is that "no way to ever get one" resolves null rather than hanging.
+    vi.stubGlobal("PerformanceObserver", undefined);
     stubPerformanceEntries({});
     markFirstPaint.mockResolvedValue(1.0);
 
@@ -143,6 +151,45 @@ describe("schedulePaintMark", () => {
 
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
     expect(evidence.firstContentfulPaintMs).toBeNull();
+  });
+
+  it("waits for the entry rather than reading it too early — the real bug this file shipped once", async () => {
+    // A real WebView2 run found that a synchronous performance.getEntriesByType
+    // check inside the second rAF callback was too early: the entry was not yet in
+    // the buffer even though the frame had genuinely painted. This fakes exactly
+    // that shape — nothing available synchronously, PerformanceObserver delivers the
+    // entry on its own schedule — and asserts markFirstPaint is not called until it
+    // does, with the delivered value.
+    stubPerformanceEntries({});
+    let deliverEntry!: (entries: PerformanceEntry[]) => void;
+    class FakePaintObserver {
+      static supportedEntryTypes = ["paint"];
+      #callback: PerformanceObserverCallback;
+      constructor(callback: PerformanceObserverCallback) {
+        this.#callback = callback;
+      }
+      observe() {
+        deliverEntry = (entries) => {
+          this.#callback({ getEntries: () => entries, getEntriesByType: () => entries } as never, this as never);
+        };
+      }
+      disconnect() {}
+    }
+    vi.stubGlobal("PerformanceObserver", FakePaintObserver);
+    markFirstPaint.mockResolvedValue(1.0);
+
+    const store = useVaultStore();
+    const done = schedulePaintMark(store);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(markFirstPaint).not.toHaveBeenCalled();
+
+    deliverEntry([{ name: "first-contentful-paint", startTime: 184 } as PerformancePaintTiming]);
+    await done;
+
+    const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
+    expect(evidence.firstContentfulPaintMs).toBe(184);
   });
 
   it("reports the navigation-timing anchor when the webview recorded one", async () => {
