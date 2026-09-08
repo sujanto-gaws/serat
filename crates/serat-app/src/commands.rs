@@ -93,13 +93,17 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
 /// asserts and that lives in a different file from this guard. See
 /// [`startup::validate_paint_evidence`] for what the check actually verifies.
 ///
+/// A one-line delegate to [`AppState::mark_first_paint`], like every other command
+/// here (module doc) — F-397, task #113: the earlier version reached into
+/// `state.startup` and called `validate_paint_evidence` itself, which put the
+/// forwarding logic nowhere a test could drive it (`tauri::State` has no public
+/// constructor outside the framework), and a mutation discarding the caller's
+/// arguments for a hardcoded constant left every existing test green.
+/// `AppState::mark_first_paint` is what a test now drives.
+///
 /// # Errors
 ///
-/// [`startup::PaintEvidenceRejected`] if the paint entry is absent, if the two frame
-/// timestamps are not two distinct frames, or if the second frame precedes the paint
-/// entry by more than clock-quantisation noise can explain — a call with nothing real
-/// to send, or nothing consistent to send, is refused rather than defaulted, including
-/// on a platform where the Paint Timing API does not exist at all.
+/// As [`AppState::mark_first_paint`].
 #[tauri::command]
 pub fn mark_first_paint(
     state: State<'_, Arc<AppState>>,
@@ -107,9 +111,7 @@ pub fn mark_first_paint(
     raf1_ms: f64,
     raf2_ms: f64,
 ) -> Result<f64, startup::PaintEvidenceRejected> {
-    let evidence = startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)?;
-    state.startup.mark_first_paint(evidence)?;
-    Ok(state.startup.elapsed_ms())
+    state.mark_first_paint(first_contentful_paint_ms, raf1_ms, raf2_ms)
 }
 
 /// The file tree has been delivered: in P0, the last-open buffer is rendered and the

@@ -35,7 +35,7 @@ use crate::ipc::{
     VaultOpened, WriteFileArgs,
 };
 use crate::settings::Settings;
-use crate::startup::{Startup, WatcherOutcome};
+use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
 use crate::vault::{Stage, VaultThread};
 
 /// Where `index://status` goes.
@@ -456,6 +456,35 @@ impl AppState {
         }
     }
 
+    /// `mark_first_paint`. NFR-PRF-01, NFR-PRF-08 (F-397, task #113).
+    ///
+    /// Moved out of `commands.rs` for the reason every other command's logic already
+    /// lives here (module doc): so the call site is assertable without a running
+    /// application. `commands::mark_first_paint` cannot be driven directly —
+    /// `tauri::State` has no public constructor outside the framework, and
+    /// `tauri::test`'s `MockRuntime` crashes on this toolchain (F-345) — which is
+    /// exactly how the F-377 guard shipped with its own call site untested: every
+    /// `f_377_*` test drives [`Startup::mark_first_paint`] directly, and a call site
+    /// that discarded its arguments and passed a hardcoded constant left all of them
+    /// green. This method is what a test can drive; `commands::mark_first_paint` is
+    /// now the one-line delegate the module doc always asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`PaintEvidenceRejected`], as [`startup::validate_paint_evidence`] and
+    /// [`Startup::mark_first_paint`].
+    pub fn mark_first_paint(
+        &self,
+        first_contentful_paint_ms: Option<f64>,
+        raf1_ms: f64,
+        raf2_ms: f64,
+    ) -> Result<f64, PaintEvidenceRejected> {
+        let evidence =
+            startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)?;
+        self.startup.mark_first_paint(evidence)?;
+        Ok(self.startup.elapsed_ms())
+    }
+
     // -- settings -----------------------------------------------------------
 
     /// The note to restore for the open vault: `--open` if given, else the settings
@@ -701,6 +730,57 @@ mod tests {
             })
             .expect_err("must not open");
         assert!(matches!(err, IpcError::VaultNotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn mark_first_paint_forwards_the_real_argument_not_a_hardcoded_one() {
+        // F-397 (task #113): the earlier `commands::mark_first_paint` reached into
+        // `state.startup` and called `validate_paint_evidence` itself, which put the
+        // forwarding logic nowhere a test could drive it — `tauri::State` has no
+        // public constructor outside the framework — and a mutation that discarded
+        // the caller's arguments and passed a hardcoded constant instead left every
+        // existing test green. `AppState::mark_first_paint` is now that logic, and no
+        // vault or running application is needed to exercise it. Each case below is
+        // refused as the value actually sent — its own number legible in the
+        // rejection — which a version substituting a hardcoded value could not
+        // produce.
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        let err = state
+            .mark_first_paint(None, 10.0, 20.0)
+            .expect_err("None must be forwarded and refused, not replaced by a valid entry");
+        assert!(
+            err.reason.contains("no first-contentful-paint entry"),
+            "{err:?}"
+        );
+
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        let err = state
+            .mark_first_paint(Some(50.0), 20.0, 10.0)
+            .expect_err("a non-increasing raf pair must be forwarded and refused");
+        assert!(err.reason.contains("10.0"), "{err:?}");
+        assert!(err.reason.contains("20.0"), "{err:?}");
+
+        // The positive control: genuinely valid, internally consistent evidence is
+        // still accepted, so the two rejections above are rejections of real values
+        // crossing the call site, not a version of this method that refuses
+        // everything.
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        assert!(
+            state.mark_first_paint(Some(50.0), 10.0, 20.0).is_ok(),
+            "genuinely valid, internally consistent evidence must still be accepted"
+        );
     }
 
     #[test]
