@@ -125,7 +125,11 @@ fn main() -> ExitCode {
         ));
     }
 
-    println!("prf01-cold-start-terms -- {} runs against {}", traces.len(), vault.path.display());
+    println!(
+        "prf01-cold-start-terms -- {} runs against {}",
+        traces.len(),
+        vault.path.display()
+    );
     println!("ADR-0014 seven-term partition (t0 -> vault_usable):");
     report_line("P_load", &p_load);
     report_line("S_pre", &s_pre);
@@ -164,7 +168,10 @@ fn main() -> ExitCode {
     let body = raw_lines.join("\n") + "\n";
     match std::fs::write(&out_path, &body) {
         Ok(()) => println!("  raw per-run terms  {}", out_path.display()),
-        Err(e) => eprintln!("prf01-cold-start-terms: could not write {}: {e}", out_path.display()),
+        Err(e) => eprintln!(
+            "prf01-cold-start-terms: could not write {}: {e}",
+            out_path.display()
+        ),
     }
 
     ExitCode::SUCCESS
