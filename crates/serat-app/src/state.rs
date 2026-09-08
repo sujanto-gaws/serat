@@ -483,7 +483,7 @@ impl AppState {
     ) -> Result<f64, PaintEvidenceRejected> {
         let evidence =
             startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)?;
-        self.startup.mark_first_paint(evidence)?;
+        self.startup.mark_first_paint(evidence, raf2_ms)?;
         Ok(self.startup.elapsed_ms())
     }
 

@@ -605,7 +605,7 @@ mod tests {
         let startup = Startup::begin_with(None);
         startup.mark_window_created();
         startup
-            .mark_first_paint(42.0)
+            .mark_first_paint(42.0, 20.0)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
@@ -637,7 +637,7 @@ mod tests {
         let startup = Startup::begin_with(None);
         startup.mark_window_created();
         startup
-            .mark_first_paint(42.0)
+            .mark_first_paint(42.0, 20.0)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);

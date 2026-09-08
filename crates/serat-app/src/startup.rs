@@ -196,6 +196,14 @@ struct Marks {
     /// the browser's navigation-origin clock, not this process's `t0`, and is never
     /// compared against another mark. See [`PaintEvidenceRejected`].
     paint_evidence_ms: Option<f64>,
+    /// The second `requestAnimationFrame` timestamp the webview sent alongside
+    /// `paint_evidence_ms`, already validated against it by
+    /// [`validate_paint_evidence`] before this call — kept here for the same reason
+    /// `paint_evidence_ms` is: audit, on the same navigation-origin clock, never
+    /// compared against another mark in this struct. Task #115 (F-403, F-411, F-416):
+    /// `bench/budget`'s `frame_to_paint_gap_ms()` diagnostic has had a place to read
+    /// this from since #106, and nothing wrote it until now — every trace read `None`.
+    raf2_ms: Option<f64>,
     watcher: Option<(f64, WatcherOutcome)>,
     buffer_rendered: Option<f64>,
     walk_complete: Option<f64>,
@@ -354,6 +362,12 @@ impl Startup {
     /// real to send — script-start, a mutated callback, any path that runs before the
     /// frame is composited — has no positive, finite value to offer and is refused.
     ///
+    /// `raf2_ms` is the second `requestAnimationFrame` timestamp the caller also
+    /// validated `first_contentful_paint_ms` against (task #112's
+    /// [`validate_paint_evidence`]). This method does not re-check it — that already
+    /// happened — it only records it, so [`Trace::raf2_ms`] can carry a real value
+    /// instead of the `None` every trace reported before task #115.
+    ///
     /// # Errors
     ///
     /// [`PaintEvidenceRejected`] if `first_contentful_paint_ms` is not finite and
@@ -367,6 +381,7 @@ impl Startup {
     pub fn mark_first_paint(
         &self,
         first_contentful_paint_ms: f64,
+        raf2_ms: f64,
     ) -> Result<bool, PaintEvidenceRejected> {
         if !first_contentful_paint_ms.is_finite() || first_contentful_paint_ms <= 0.0 {
             return Err(PaintEvidenceRejected::new(first_contentful_paint_ms));
@@ -378,6 +393,7 @@ impl Startup {
         }
         marks.window_visible = Some(now);
         marks.paint_evidence_ms = Some(first_contentful_paint_ms);
+        marks.raf2_ms = Some(raf2_ms);
         drop(marks);
         self.usable.notify_all();
         Ok(true)
@@ -572,6 +588,7 @@ impl Startup {
         Ok(Trace {
             t0_to_window_visible_ms: window_visible,
             paint_evidence_ms: marks.paint_evidence_ms,
+            raf2_ms: marks.raf2_ms,
             t0_to_vault_usable_ms: marks.vault_usable().expect("every term was just unwrapped"),
             t0_to_main_ms: self.main_ms,
             t0_to_state_ready_ms: marks.state_ready,
@@ -624,6 +641,16 @@ pub struct Trace {
     /// for audit only: every trace with a `t0_to_window_visible_ms` has one, because
     /// [`Startup::mark_first_paint`] cannot set the former without the latter.
     pub paint_evidence_ms: Option<f64>,
+    /// The second `requestAnimationFrame` timestamp `paint_evidence_ms` was validated
+    /// against (task #112). Same navigation-origin clock as `paint_evidence_ms`,
+    /// **not** `t0` — never compare this against another field in this struct except
+    /// `paint_evidence_ms` itself, which is what `bench/budget`'s
+    /// `frame_to_paint_gap_ms()` does (F-403, F-411, F-416: a diagnostic with no
+    /// assertion on it, reported because the gap is currently unmeasured, not because
+    /// a threshold is known — see F-406). `None` on any trace taken before task #115
+    /// wired this through, or on a platform with no Paint Timing API to validate
+    /// against in the first place.
+    pub raf2_ms: Option<f64>,
     /// t0 to the vault being usable. NFR-PRF-01's 1 s. The later of
     /// `t0_to_buffer_rendered_ms` and `t0_to_watcher_ms`.
     pub t0_to_vault_usable_ms: f64,
@@ -885,6 +912,12 @@ mod tests {
     /// taken but are not exercising [`PaintEvidenceRejected`] itself.
     const FCP_MS: f64 = 42.0;
 
+    /// A plausible second `requestAnimationFrame` timestamp to go with `FCP_MS`, for
+    /// the same tests. `Startup::mark_first_paint` does not itself validate the
+    /// relationship between the two — that is `validate_paint_evidence`'s job, one
+    /// layer up — so any finite value works here.
+    const RAF2_MS: f64 = 20.0;
+
     fn in_process() -> Startup {
         Startup::begin_with(None)
     }
@@ -893,7 +926,7 @@ mod tests {
     fn complete(startup: &Startup) {
         startup.mark_window_created();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
@@ -924,7 +957,7 @@ mod tests {
         let startup = in_process();
         startup.mark_window_created();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
@@ -942,7 +975,7 @@ mod tests {
         let startup = in_process();
         startup.mark_window_created();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_buffer_rendered();
@@ -979,7 +1012,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(3));
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         let trace = startup.trace().expect("complete");
         assert!(
@@ -998,7 +1031,7 @@ mod tests {
         // `Marks::vault_usable` and this fails.
         let startup = in_process();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -1023,7 +1056,7 @@ mod tests {
         // all, so it would never report usable.
         let startup = in_process();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -1037,7 +1070,7 @@ mod tests {
         // test that only ever exercised one of them.
         let watcher_last = in_process();
         watcher_last
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         watcher_last.mark_index_settled();
         std::thread::sleep(Duration::from_millis(2));
@@ -1054,7 +1087,7 @@ mod tests {
 
         let buffer_last = in_process();
         buffer_last
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         buffer_last.mark_index_settled();
         std::thread::sleep(Duration::from_millis(2));
@@ -1076,7 +1109,7 @@ mod tests {
         // taken in that state must say so.
         let startup = in_process();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Failed);
@@ -1101,7 +1134,7 @@ mod tests {
         startup.mark_window_created();
         std::thread::sleep(Duration::from_millis(6));
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
@@ -1130,7 +1163,7 @@ mod tests {
         startup.mark_setup_done();
         startup.mark_window_created();
         startup
-            .mark_first_paint(FCP_MS)
+            .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
@@ -1171,6 +1204,7 @@ mod tests {
         let complete_trace = Trace {
             t0_to_window_visible_ms: 800.0,
             paint_evidence_ms: Some(798.0),
+            raf2_ms: Some(750.0),
             t0_to_vault_usable_ms: 805.0,
             t0_to_main_ms: 60.0,
             t0_to_state_ready_ms: Some(65.0),
@@ -1249,7 +1283,7 @@ mod tests {
         let startup = in_process();
         assert!(
             startup
-                .mark_first_paint(FCP_MS)
+                .mark_first_paint(FCP_MS, RAF2_MS)
                 .expect("valid paint evidence")
         );
         let first = startup.lock().window_visible.expect("marked");
@@ -1257,7 +1291,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         assert!(
             !startup
-                .mark_first_paint(FCP_MS)
+                .mark_first_paint(FCP_MS, RAF2_MS)
                 .expect("valid paint evidence"),
             "a second paint must be refused"
         );
@@ -1298,7 +1332,7 @@ mod tests {
         let startup = in_process();
         for bogus in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let err = startup
-                .mark_first_paint(bogus)
+                .mark_first_paint(bogus, RAF2_MS)
                 .expect_err("a non-finite value is not evidence of a real paint");
             assert!(
                 err.reason.contains("first-contentful-paint"),
@@ -1318,7 +1352,7 @@ mod tests {
         let startup = in_process();
         for bogus in [0.0, -1.0, -0.001] {
             startup
-                .mark_first_paint(bogus)
+                .mark_first_paint(bogus, RAF2_MS)
                 .expect_err("zero or negative is not evidence of a real paint");
         }
         assert!(startup.trace().is_err());
@@ -1329,13 +1363,22 @@ mod tests {
         let startup = in_process();
         assert!(
             startup
-                .mark_first_paint(517.25)
+                .mark_first_paint(517.25, 488.5)
                 .expect("a positive, finite value is evidence")
         );
+        let marks = startup.lock();
         assert_eq!(
-            startup.lock().paint_evidence_ms,
+            marks.paint_evidence_ms,
             Some(517.25),
             "the raw evidence is kept so a trace can be audited against it"
+        );
+        // Task #115: raf2_ms is kept verbatim too, and distinctly from
+        // paint_evidence_ms -- a version that stored one value for both, or dropped
+        // raf2_ms on the floor, would not be caught by asserting only the first.
+        assert_eq!(
+            marks.raf2_ms,
+            Some(488.5),
+            "raf2_ms must be kept so bench/budget's frame_to_paint_gap_ms can read it"
         );
     }
 
@@ -1410,9 +1453,17 @@ mod tests {
     #[test]
     fn genuine_evidence_survives_the_full_validation_and_marks_the_shell() {
         let startup = in_process();
-        let evidence = validate_paint_evidence(Some(184.0), 170.0, 184.0).expect("valid evidence");
-        assert!(startup.mark_first_paint(evidence).expect("accepted"));
-        assert_eq!(startup.lock().paint_evidence_ms, Some(184.0));
+        let raf2_ms = 184.0;
+        let evidence =
+            validate_paint_evidence(Some(184.0), 170.0, raf2_ms).expect("valid evidence");
+        assert!(
+            startup
+                .mark_first_paint(evidence, raf2_ms)
+                .expect("accepted")
+        );
+        let marks = startup.lock();
+        assert_eq!(marks.paint_evidence_ms, Some(184.0));
+        assert_eq!(marks.raf2_ms, Some(raf2_ms));
     }
 
     #[test]
@@ -1485,7 +1536,7 @@ mod tests {
             signaller.mark_watcher(WatcherOutcome::Registered);
             signaller.mark_index_settled();
             signaller
-                .mark_first_paint(FCP_MS)
+                .mark_first_paint(FCP_MS, RAF2_MS)
                 .expect("valid paint evidence");
             std::thread::sleep(Duration::from_millis(10));
             signaller.mark_buffer_rendered();
