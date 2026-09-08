@@ -19,15 +19,22 @@ const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 
 onMounted(async () => {
-  // Installed before anything else async, so the first transition the actor
-  // publishes is not lost — mirrors `run`'s ordering in crates/serat-app/src/lib.rs.
+  // The paint mark, first and synchronous — code-reviewer's SHOULD-FIX on #98's
+  // review. This used to run after `await onIndexStatus(...)` below, which is an IPC
+  // round trip: the double requestAnimationFrame this schedules could miss the frame
+  // that actually painted first and mark a later one, inflating S_shell — ADR-0014's
+  // binding Serat term — with time that has nothing to do with painting. Scheduling
+  // is synchronous (the rAF pair is registered before this call returns); only
+  // *waiting* on the promise it returns happens later, in `hydrateBuffer` below.
+  const paintMark = schedulePaintMark(store);
+
+  // Installed next so the first transition the actor publishes is not lost — mirrors
+  // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
+  // concurrently with the rAF pair above, not before it: nothing here can delay a
+  // mark that was already scheduled on the line above.
   unlistenIndexStatus = await onIndexStatus((status) => store.setIndexState(status.state));
 
   store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
-
-  // The paint mark. Scheduled independently of the buffer read — see
-  // src/startup.ts for why a slow disk must not delay it.
-  const paintMark = schedulePaintMark(store);
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
