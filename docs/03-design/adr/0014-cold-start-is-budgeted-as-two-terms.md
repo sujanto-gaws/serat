@@ -240,6 +240,26 @@ cost rather than a presentational one.
   one. The cheap fix is in the harness rather than the app: **a trace missing any of the
   seven marks is a rejection, not an `Option`**, which makes them required in the only
   place that has to read them. That belongs in task #106 beside the sum identity.
+- **`S_front` has one post-mount reading and it supports the allocation, weakly.**
+  vue-frontend-dev's #98 smoke test measured `window_created → window_visible` — which is
+  `S_shell` — at **~176 ms**, against ~130 ms for the static shell it replaces. **Basis, and
+  it is not a gate basis: debug build, one-note vault, an end-to-end WebView2 run rather
+  than a unit test, offered as an order of magnitude and explicitly not as a finding.** It
+  lands near 200 ms rather than near 600, so §Decision 4's split of the Serat term between
+  `S_main` and `S_front` survives on the evidence available today and is not rewritten
+  before #104. **It must be confirmed against #100's release-mode figure on the 20k vault
+  before this ADR moves to accepted** — a debug build over one note is not the basis
+  §Decision 6 asks to travel with a number, and quoting it as though it were is the exact
+  error §Context is about.
+
+  It carries a second use worth recording. **A ~176 ms gap is the shape a real paint delay
+  produces and a hoisted mark would not**, so it is positive evidence that #98's marks are
+  honest — and it is precisely the kind of evidence F-386 says the sum identity cannot
+  supply. **It is not a substitute for #105's mechanism**: an argument from plausible
+  magnitude is weaker than evidence that cannot be fabricated, and it degrades to nothing
+  the moment anyone changes what the shell does before first paint. Until #105 lands it is
+  the only empirical check on mark honesty that exists, which is a statement about how thin
+  the coverage is rather than about how good this reading is.
 - **The sum identity does not catch a misplaced mark, and cannot (F-386).** Asked deliberately
   rather than hoped: does the partition catch F-377's surviving mutation — `mark_first_paint`
   hoisted to script start — on its own? **No, and the reason is structural.**
