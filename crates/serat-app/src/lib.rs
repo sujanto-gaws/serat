@@ -382,56 +382,30 @@ mod tests {
         // that it still calls both marks — deleting either from the page is exactly how
         // a green cold-start job would start measuring nothing.
         //
-        // F-377: a substring check alone stops here and cannot decide *when* the mark
-        // is taken, which is a temporal property no text search can see. Two mutations
-        // survived exactly that version of this test (`cargo test -p serat-app`: 86
-        // passed, 0 failed, both times) — collapsing a double `requestAnimationFrame`
-        // to one, and hoisting `invoke("mark_first_paint")` to script start behind a
-        // no-op rAF. This test now also checks the *mechanism*: that the argument sent
-        // is syntactically tied to a real `first-contentful-paint` Paint Timing entry
-        // rather than a bare, unconditional call. That is still a textual check and
-        // cannot prove the mechanism fires at the right instant on its own — the
-        // runtime guarantee is `Startup::mark_first_paint`'s rejection of anything that
-        // is not a positive, finite value (`startup::tests::f_377_mutation_a_shape_*`
-        // and `f_377_mutation_b_shape_*`), which is what actually stands between a
-        // reintroduced mutation and a passing job.
+        // F-395: this crate no longer owns verifying *how* the paint mark is taken.
+        // `crates/serat-app/webview/` becomes task #98's Vite build output, and #108
+        // puts the mechanism guard in `app/src/startup.test.ts`, against the source
+        // that actually produces the bundle rather than a copy this crate could only
+        // watch go stale the next `npm run build`. An earlier version of this test
+        // asserted the mechanism itself (F-377/F-392's fix) directly against
+        // `boot.js`; that assertion belongs beside the source now, not beside a
+        // generated artefact, so it moved rather than being duplicated. What stays
+        // here is the same shallow check this test has always done: the bundle
+        // exists and still names both marks. `Startup::mark_first_paint`'s rejection
+        // of non-finite/non-positive evidence (`startup::tests::f_377_mutation_a_shape_*`,
+        // `f_377_mutation_b_shape_*`) is the load-bearing, Rust-side half of F-377's
+        // fix and lives in this crate regardless of which front end calls it.
         let index = webview_bundle().join("index.html");
         assert!(index.is_file(), "{} is missing", index.display());
         let boot = webview_bundle().join("boot.js");
         let script = std::fs::read_to_string(&boot).expect("boot.js");
         assert!(
+            script.contains("mark_first_paint"),
+            "boot.js stopped marking the paint"
+        );
+        assert!(
             script.contains("mark_vault_usable"),
             "boot.js stopped marking usability"
-        );
-        assert!(
-            script.contains(r#""first-contentful-paint""#),
-            "the paint mark must be gated on the browser's own Paint Timing entry, \
-             not on requestAnimationFrame count alone"
-        );
-        assert!(
-            script.contains("PerformanceObserver"),
-            "an entry already in the timeline before this script ran is not the only \
-             case: a shell that runs before it paints must still wait for one"
-        );
-        assert!(
-            script.contains(
-                r#"invoke("mark_first_paint", { firstContentfulPaintMs: entry.startTime })"#
-            ),
-            "the argument sent to mark_first_paint must be the Paint Timing entry's \
-             own startTime, not a literal, a default, or a value computed without it"
-        );
-        // Checked separately from the assertion above, and measured rather than
-        // assumed sufficient on its own: a mutation that *adds* a second, hoisted
-        // `invoke("mark_first_paint", ...)` call carrying a fabricated value alongside
-        // the correct one leaves the assertion above satisfied — the correct call is
-        // still there, verbatim — and would otherwise pass this test. Counting the
-        // call sites is what actually catches it.
-        assert_eq!(
-            script.matches(r#"invoke("mark_first_paint""#).count(),
-            1,
-            "mark_first_paint must be called from exactly one place in this file — a \
-             second call site, however it is reached, can send evidence the first one \
-             did not vouch for"
         );
     }
 
