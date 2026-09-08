@@ -4,7 +4,7 @@ artifact: T2 — the four P0 gate benchmarks, reported together (task #101)
 phase: 05-testing
 owner: test-engineer
 serves: NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-08, US-35
-cites: ADR-0001, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-392, F-402
+cites: ADR-0001, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-392, F-402, F-417, F-418
 ---
 
 # T2 — the four P0 gate benchmarks, reported together
@@ -94,6 +94,13 @@ have different noise characters, and only one of them is currently understood.**
 **Standing bounds, unchanged from #100's report:** warm vault (F-154, page cache cannot be dropped on this machine);
 `gate_eligible: false` (real-time scanner off, RISK-012).
 
+**One more bound, found after this figure was taken and not yet resolved (F-417, code-reviewer's #102 sweep,
+reasoned rather than measured).** `S_shell` (196/229 ms) — the term ADR-0014 budgets and #104 set 350 ms against — may
+have been measured against a shell that never applied CodeMirror's own stylesheet: `style-src 'self'` has no nonce,
+and `style-mod` (CodeMirror's runtime styling) creates an inline `<style>` element, which that CSP refuses. If
+confirmed, `S_shell` did not pay for work a styled editor would actually do. Task #116 verifies before fixing; this
+report's `S_shell`/`S`/`S_front` figures should be read as provisional until it closes.
+
 ## NFR-PRF-03 — save → index < 50 ms p95 — **unmeasured, blank by design**
 
 Not estimated, per the lead's instruction. What would fill this row:
@@ -116,6 +123,26 @@ but **"unsatisfiable as things stand, for a reason unrelated to the code"**:
 | CI enforcement | **`ci.yml` and `budgets.yml` cannot currently be scheduled at all (F-384).** Every run since commit `abc71409` (2026-09-06) has completed in 1-4 seconds with zero steps and no runner assigned, on both `push` and `pull_request`. The one job that does get a runner (`gate`, which has no toolchain to install) correctly reads five `needs.*.result` values that are all `failure` and exits 1 — the file parses and schedules; specific jobs within it do not get runners. Consistent with (not confirmed — the investigating token's scope returns 403 on the billing endpoint) exhausted included Actions minutes on this private repo, given `windows-latest` runners bill at 2x and this session pushed to `main` roughly every 3-8 minutes for over two hours. |
 | What would close it | The repository owner (spending limit / payment method / minutes reset). **Nothing in `bench/` or `docs/05-testing/` can fix this** — recorded per F-384 rather than guessed past, because treating forty red checks as noise and continuing to push is the exact failure mode F-354 already named. |
 | Verdict | **Not satisfiable by test-engineer's own work.** The jobs exist and are correct locally; the Must fails on infrastructure the code does not control. |
+
+## C-01..C-07, per code-reviewer's #102 sweep against `main`
+
+F-418 (code-reviewer, `df73b0d`): the sweep found **no BLOCKING breach**, and three of its results were not yet carried
+anywhere this report's readers would find them. Stated here rather than left implicit, per that finding's own close.
+
+| Constraint | Status | Basis |
+|---|---|---|
+| **C-01** files stay plain Markdown | Clean | `write_file` writes the buffer verbatim; nothing normalises line endings or adds a trailing newline. |
+| **C-02** the index is disposable | Clean, positively evidenced | No longer only argued: #97's T1 deletes `.serat/` on real disk and asserts row-level equivalence through `open_or_rebuild`. Settings live in the platform config dir, not `.serat/`. |
+| **C-03** no JavaScript in the query path | Vacuous, not satisfied | There is no `serat-sq` yet. A constraint with nothing to breach is not evidence the constraint holds once the crate exists. |
+| **C-04** writes patch byte ranges | No breach, with a bound | Nothing re-serialises today because there is no parse→render round trip on the write path — P0 writes the whole buffer. The byte-range patcher itself is P2 scope. |
+| **C-05** no AI write lands without diff review | Vacuous, not satisfied | There is no `serat-ai`/`serat-mcp` yet, same shape as C-03. |
+| **C-06** performance budgets binding, enforced in CI | Not satisfied, on infrastructure | See the NFR-PRF-08 section above (F-384) — CI cannot schedule at all. `.github/workflows/budgets.yml`'s own header was stale (still said the jobs were "RED today, on purpose" because rebuild/save-path/the application did not exist — all three now do); corrected in this task alongside this report to say the real reason is F-384, not absent implementation. |
+| **C-07** Tauri v2 + Vue 3 fixed | Now satisfied on both halves, **measured** | In a scratch worktree, `npm ci && npm run build` reproduces the committed `webview/` bundle **byte-identical** (`git diff` empty) — a dated observation (this session), not a standing property, and the local equivalent of #110's CI check, still blocked by F-384. Closes F-380's note that the Vue half was previously unverified. |
+
+**F-379 carried as a trend to watch, not a breach.** *"No domain logic in `serat-app`"* has no mechanical guard, and two
+tasks now add non-product code to that crate by design — #113's validation move and #111's `run_save_benchmark`/
+`--bench-save-list`. Neither is a breach (instrumentation in the product is how NFR-PRF-01 is measurable at all), but
+the trend has no guard and a clean sweep must not be read as an enforced one.
 
 ## Findings carried, not adopted, into P0 scope
 
