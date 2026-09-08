@@ -111,3 +111,15 @@ machine moving better than a wall clock does — this run's own phase table show
 and is not a disagreement between the two: shares are session-relative too (F-375's lesson,
 carried). Neither figure supersedes the other; they answer different questions and #103 should
 cite both without treating one as a refinement of the other.
+
+**Corroborating evidence from the same day, from a different instrument.** While this window was
+open, two wall-clock-deadline tests elsewhere in the suite — `a_save_through_write_file_reaches_
+the_index_without_the_watcher` and `the_wiring_publishes_rebuilding_before_the_rebuild_starts_
+and_ready_after` — failed under full-workspace-build contention and passed 1/1 in isolation. This
+is the same underlying fact this ruling argues from F-327's historical 35% drift, showing up in a
+different place: this machine's timings move enough under load to flip a deadline-sensitive
+verdict, unprompted and on the same day, in code that has nothing to do with the benchmark
+harness. It is not needed to carry this ruling — the attested run above already closes the
+question on its own — but it is independent confirmation of the mechanism the ruling assumes,
+and it is worth keeping on record because it is exactly the kind of evidence F-327 predicted
+without anyone going looking for it.
