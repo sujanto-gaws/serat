@@ -68,9 +68,10 @@ mod tests {
         // directive, `connect-src` falls back to `default-src`, so `default-src 'self'`
         // is what stops a page reaching an attacker's server. `script-src 'self'` is
         // also load-bearing on its own: F-281 found it is what makes `window.__TAURI__`
-        // (exposed by `withGlobalTauri`, below) hard for injected script to reach —
-        // CSP does not gate `initialization_script` at all, so this is the only CSP
-        // term that finding depends on.
+        // hard for injected script to reach when `withGlobalTauri` was `true` — CSP
+        // does not gate `initialization_script` at all, so this was the only CSP term
+        // that finding depended on (moot now that `withGlobalTauri` is `false`, below,
+        // but the directive stays pinned regardless).
         let csp = tauri_conf()["app"]["security"]["csp"]
             .as_str()
             .expect("app.security.csp must be a string")
@@ -84,8 +85,19 @@ mod tests {
         assert!(
             directives.contains(&"script-src 'self'"),
             "tauri.conf.json's CSP no longer pins script-src to 'self' (was {csp:?}) — \
-             F-281 found this is what makes window.__TAURI__ (withGlobalTauri) hard for \
-             injected script to reach; CSP does not gate initialization_script directly"
+             F-281 found this is what made window.__TAURI__ hard for injected script to \
+             reach while withGlobalTauri was true; CSP does not gate initialization_script \
+             directly"
+        );
+        assert!(
+            directives.contains(&"style-src 'self'"),
+            "tauri.conf.json's CSP no longer pins style-src to 'self' (was {csp:?}) — \
+             F-417/task #116 (measured over the DevTools Protocol against a real \
+             WebView2 window) found this directive genuinely blocks CodeMirror's own \
+             runtime stylesheet unless the editor is mounted into a shadow root \
+             (src/editor/CodeMirrorEditor.vue); before this test existed, a later \
+             'unsafe-inline' added to work around that would have landed with nothing \
+             going red"
         );
         assert!(
             !csp.contains("connect-src"),
@@ -170,22 +182,24 @@ mod tests {
     }
 
     #[test]
-    fn with_global_tauri_and_its_covering_reason_both_still_hold() {
-        // F-281: `withGlobalTauri: true` is sound only because `script-src 'self'`
-        // (asserted above) makes `window.__TAURI__` hard for injected script to reach.
-        // A red test here means that pairing needs re-checking, not that the setting is
-        // wrong on its own — flipping it to `false` would be a strictly safer change
-        // that this test would still (correctly) flag, so a reviewer re-confirms the
-        // finding is now moot rather than the assumption silently going stale.
+    fn with_global_tauri_is_off_now_that_nothing_reads_it() {
+        // F-281 closed `withGlobalTauri: true` as sound (the load-bearing control was
+        // `boot_info`'s JSON escaping, not the CSP), but sound is not the same as
+        // needed. Task #116's sweep found the built bundle contains zero `__TAURI__`
+        // occurrences — the frontend goes through `@tauri-apps/api`'s module IPC
+        // exclusively, since #98 replaced the pre-#98 plain-script `boot.js` that
+        // needed the global. Turning it off removes the object F-281's reasoning had
+        // to defend, strictly narrows the surface, and costs nothing this codebase
+        // uses. A red test here means something started reading `window.__TAURI__`
+        // again — re-open F-281 rather than flip this assertion back without asking
+        // why.
         let with_global_tauri = tauri_conf()["app"]["withGlobalTauri"]
             .as_bool()
             .expect("app.withGlobalTauri must be a bool");
         assert!(
-            with_global_tauri,
-            "app.withGlobalTauri changed to false — not a regression (it narrows the \
-             surface), but F-281's finding was written against `true`; if this is now \
-             false, close F-281 as moot instead of leaving it referring to a setting \
-             that no longer exists"
+            !with_global_tauri,
+            "app.withGlobalTauri is back to true — confirm something actually reads \
+             window.__TAURI__ before restoring it; task #116 found nothing did"
         );
     }
 

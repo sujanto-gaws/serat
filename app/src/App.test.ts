@@ -50,9 +50,13 @@ describe("App", () => {
   it("mounts a focusable editor before any IPC round trip has resolved", () => {
     const wrapper = mount(App, { global: { plugins: [createPinia()] } });
 
-    const content = wrapper.find(".cm-content");
-    expect(content.exists()).toBe(true);
-    expect(content.attributes("contenteditable")).toBe("true");
+    // CodeMirror mounts into a shadow root (code-reviewer-2's CSP finding), so
+    // `wrapper.find` — light-DOM only, like `querySelector` — cannot see `.cm-content`
+    // directly; go through the host element's own `shadowRoot`.
+    const host = wrapper.find(".cm-editor-host").element as HTMLElement;
+    const content = host.shadowRoot?.querySelector(".cm-content");
+    expect(content).not.toBeNull();
+    expect(content?.getAttribute("contenteditable")).toBe("true");
   });
 
   it("schedules the paint mark synchronously, ahead of the index-status subscription", () => {

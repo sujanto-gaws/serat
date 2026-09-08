@@ -28,8 +28,22 @@ export default defineConfig({
   build: {
     outDir: fileURLToPath(new URL("../crates/serat-app/webview", import.meta.url)),
     emptyOutDir: true,
-    // No inline script and no CDN, so `tauri.conf.json`'s
-    // "script-src 'self'; style-src 'self'" is satisfiable with no changes.
+    // No inline script and no CDN, so `tauri.conf.json`'s "script-src 'self'" is
+    // satisfiable with no changes — but that claim used to be made for "style-src
+    // 'self'" too, and it was wrong (F-417/task #116, measured over the DevTools
+    // Protocol against a real WebView2 window): this build's *own* CSS is a static
+    // file served from 'self' and is fine, but CodeMirror styles itself at *runtime*
+    // through style-mod, which — for a mount parented directly into the document —
+    // creates a `<style>` element and sets `textContent`. That is an inline
+    // stylesheet, and the CSP has no `'unsafe-inline'`, nonce or hash for it, so the
+    // console showed "Applying inline style violates ... style-src 'self'" and the
+    // editor rendered with none of its own styling. Nothing in this file could have
+    // caught it: the violation is a runtime DOM write, not present in the build
+    // output vite.config.ts's comment was reasoning about. The fix lives in
+    // src/editor/CodeMirrorEditor.vue: CodeMirror is mounted into a shadow root,
+    // where style-mod uses `adoptedStyleSheets` instead — constructed
+    // programmatically, not "inline style" under CSP at all, so no CSP change was
+    // needed or made.
     cssCodeSplit: false,
     rollupOptions: {
       output: {

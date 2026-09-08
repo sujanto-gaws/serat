@@ -11,6 +11,21 @@
   that produces the page's first paint, not after an IPC round trip. See
   src/startup.ts and app/README.md for why that property is load-bearing rather
   than cosmetic.
+
+  Mounted into a shadow root rather than directly into `host` (code-reviewer-2's
+  #102 finding, confirmed live over the DevTools Protocol against a real WebView2
+  window: a console error, "Applying inline style violates ... style-src 'self'").
+  CodeMirror applies its own runtime CSS through style-mod, which chooses between two
+  mechanisms depending on whether its mount root has a `.head` — a `<style>` tag with
+  `textContent` set (an inline style, refused outright by `tauri.conf.json`'s CSP,
+  which has no `'unsafe-inline'`, nonce or hash for it) when mounted into the
+  document, or `adoptedStyleSheets` (constructed programmatically, not "inline style"
+  under CSP at all) when mounted into a `ShadowRoot`, which has no `.head`. Refused
+  silently: the DOM still gets a `<style>` tag with real content, so nothing throws,
+  but none of its rules apply — no gutter layout, no line white-space, no cursor
+  styling. A shadow root needs no CSP change, which is why it is the fix taken here
+  rather than adding `'unsafe-inline'` to `style-src` (a real weakening) or a nonce
+  Tauri does not emit for runtime-created style tags.
 -->
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from "vue";
@@ -34,8 +49,12 @@ onMounted(() => {
   if (!host.value) {
     return;
   }
+  // `mode: "open"` only affects whether *other* script can reach in via
+  // `host.shadowRoot` — CSP's style-src is about where a style came from, not
+  // whether the shadow tree is inspectable, so this choice is cosmetic here.
+  const shadowRoot = host.value.attachShadow({ mode: "open" });
   view = new EditorView({
-    parent: host.value,
+    parent: shadowRoot,
     state: EditorState.create({
       doc: "",
       extensions: [
