@@ -564,6 +564,38 @@ pub fn app_binary() -> Result<PathBuf, String> {
     }
 }
 
+/// Removes `<vault>/.serat` on drop -- F-401.
+///
+/// `cold_start_once` spawns the real application directly against a vault,
+/// and the app's own index directory is ordinary, correct production
+/// behaviour, not a harness artefact. Left behind, it moves the vault's tree
+/// digest and fails `the_canonical_vault_passes_the_gate` for every other
+/// consumer that checks against the shared 20k/50k fixtures next -- a
+/// different shape of the hazard F-372 named (there, a scratch directory the
+/// harness itself wrote into the vault by mistake; here, the product doing
+/// exactly what it should, aimed at a fixture it should not be pointed at
+/// without cleanup).
+///
+/// **Constructed once per batch, held for the whole batch, dropped after the
+/// last spawn -- never per spawn.** NFR-PRF-01's "warm index" basis (ADR-0014
+/// §Decision 6, F-154) needs `.serat/` to persist *across* a batch's own
+/// iterations: only the very first spawn should ever see a cold (absent)
+/// index, and cleaning up between spawns would silently turn every
+/// iteration into an unwanted rebuild, measuring a different and much larger
+/// quantity than the one NFR-PRF-01 asks for.
+///
+/// `Drop` runs on the early-return path through `?` as well as on success, so
+/// a run that fails partway still leaves the vault clean for whoever checks
+/// it next -- which is the property that matters, since a failed run is
+/// exactly when nobody is looking.
+pub(crate) struct CleanIndexOnDrop<'a>(pub(crate) &'a Path);
+
+impl Drop for CleanIndexOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0.join(".serat"));
+    }
+}
+
 /// Run `iterations` cold starts, returning the window-visible and vault-usable
 /// timelines.
 ///
@@ -581,6 +613,7 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// When the application does not exist, when a run fails or times out, or when
 /// a trace is rejected by any of the checks in [`crate::trace`].
 pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples), String> {
+    let _cleanup = CleanIndexOnDrop(vault);
     let mut visible = Samples::new();
     let mut usable = Samples::new();
     for run in 0..iterations {

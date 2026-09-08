@@ -1993,13 +1993,26 @@ where
 ///
 /// Returns whether it held, having printed the verdict either way.
 pub fn run_scale_check(iterations: usize) -> bool {
-    let verdict = scale_verdict(
-        iterations,
-        || Ok((ensure_vault("20k")?, ensure_vault("50k")?)),
-        |vault, run| {
-            subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
-        },
-    );
+    // F-401: cold_start_once spawns the real app against these vaults, and the
+    // app's own .serat/ is left behind unless something removes it. Fetched here
+    // rather than inside scale_verdict's `vaults` closure so both guards can be
+    // held for the whole interleaved run and dropped together after the last
+    // spawn against either vault -- not per spawn, which would defeat the
+    // warm-index case this check exists to measure (subject::CleanIndexOnDrop's
+    // doc comment has the full reasoning).
+    let verdict = (|| -> Result<String, String> {
+        let small = ensure_vault("20k")?;
+        let large = ensure_vault("50k")?;
+        let _clean_small = subject::CleanIndexOnDrop(&small.path);
+        let _clean_large = subject::CleanIndexOnDrop(&large.path);
+        scale_verdict(
+            iterations,
+            || Ok((small.clone(), large.clone())),
+            |vault, run| {
+                subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
+            },
+        )
+    })();
     match verdict {
         Ok(line) => {
             println!("{line}");
