@@ -326,7 +326,13 @@ P0 cannot distinguish the two futures that follow, and both are P1's:
   structurally unmeetable is a constraint being tested rather than a budget being missed.
 
 **Neither is being decided now, and neither may be quietly dropped.** What settles it is
-measuring the same seven-term partition on the other two webviews. That is one row in
+measuring the same seven-term partition on the other two webviews. **#112 is a precondition of
+that plan and was not visible when it was written:** #108 types the paint field
+`number | null` while #105 takes a bare `f64`, so a genuine null produces **no trace at all**.
+On any webview without Paint Timing, cold start therefore becomes **unmeasurable rather than
+merely unguarded** — and "run the partition on WKWebView and WebKitGTK" assumes a trace can be
+taken there. It does not block P0, since F-393 measured the entry landing on WebView2, but the
+P1 plan above is contingent on #112 and should be read that way. That is one row in
 §Open design questions and it should stay there until someone has run it.
 
 ## Objections recorded
@@ -351,7 +357,64 @@ mean anything, going red for no reason and getting disabled by the third person 
 spread as data rather than assuming one — so my answer to the second half is that the
 question is #100's to answer, not mine to guess at now. *(Answered 2026-09-08.)*
 
-**vue-frontend-dev, consulted because `S_shell` is theirs and #98 is inside it.** The
+**The inner-mark question is answered, and by a field added for another purpose.** This ADR
+asked vue-frontend-dev whether `S_shell` needs a mark separating WebView2's navigation from
+our mount, and offered three ways to take it. **The answer is the third — reported, not
+budgeted.** #108's frontend evidence carries `nav_dom_content_loaded_ms`, which is
+`PerformanceNavigationTiming`'s DOMContentLoaded and therefore fires when HTML parsing
+completes, **before any script runs**. That is exactly the boundary the question was about:
+`window_created → DOMContentLoaded` is navigation and parse, `DOMContentLoaded →
+window_visible` is our mount. It is **diagnostic and carries no budget** — `S_shell` stays
+whole and stays ours under §Decision 2, so a front-end regression still lands on a term
+someone owns, and the split exists to say *which half* moved when it does.
+
+**That field must never be mistaken for the paint anchor, and it was once.** DOMContentLoaded
+fires before Vue mounts, so a mark gated on it is early regardless of when real content
+appears — it cannot expose F-388's mutation and would re-open exactly the hole F-388
+identified. The paint anchor is `first-contentful-paint`; DOMContentLoaded is the `S_shell`
+split. Two fields, two purposes, and the failure of confusing them is silent.
+
+**A decision was pre-committed here against `first-contentful-paint` failing to populate in
+a real WebView2 window — vue-frontend-dev's flag, and F-107's shape, since a guard built on
+an entry that never arrives rejects every honest mark instead of the dishonest one. F-393
+closed it by measurement and the contingency did not fire:** the entry populates, at
+`startTime` 184 ms against `domContentLoadedEventEnd` 129.8 ms, over the Chrome DevTools
+Protocol against the real binary. **129.8 < 184 is the ordering the conjunction argument
+depends on**, so F-388's rejection of DOMContentLoaded as the anchor is now confirmed by
+measurement rather than by reading the spec. The pre-commitment is kept in this record
+rather than deleted, because a contingency that did not fire is the cheapest kind to have
+written and the record is what makes the next one worth writing.
+
+**What that measurement also shows is a fragility nobody has yet had to think about, and it
+is one line of HTML away.** F-393 found `#app` holding real rendered content when FCP fired
+— so on today's shell FCP *is* our mount, because the document renders nothing before Vue
+fills it. **That is a property of #98's current markup, not of the mechanism.** Add a
+loading skeleton, a spinner, or a static titlebar to `index.html` and FCP moves ahead of the
+mount, F-388's hole reopens, and **the guard keeps passing** — the change that breaks it is
+a one-line improvement made by someone with no reason to read this ADR.
+
+**The conjunction is what absorbs that, and this is the evidence it was not belt-and-braces.**
+Its two halves cover two different futures: the paint entry catches a mark hoisted before any
+paint (F-377's mutation B), and the post-mount frame gate catches a paint entry that fires on
+content which is not ours (F-388). **Only the first is exercised today.** The second is
+dormant and becomes load-bearing the moment anyone adds markup that paints before Vue — which
+is precisely when nobody will be looking at it. Neither half is redundant, and dropping
+either one later on the grounds that it never fires would be removing the half that is doing
+its job by not needing to.
+
+**vue-frontend-dev answered the fairness question, and answered it against their own
+interest.** Their words: a budget on `S_shell` is *"fair, under the ADR's own attribution rule
+— bundle size, mount strategy, and which CodeMirror extensions we load at start are all
+changes confined to `app/` that measurably move `S_shell`, so it's ours even though part of
+the interval's floor is WebView2's own navigation cost we can't move. That's exactly why an
+inner mark is worth it: `S_shell` as defined conflates an unavoidable floor with our
+controllable mount cost, and a persistently large floor would bury a real regression in
+noise."* **That is a better argument for the inner mark than the one this ADR made**, which
+reached the same place from fairness rather than from detection. They also declined a second
+IPC round trip on the ground that it would perturb the interval it measures — right, and it
+is why the evidence rides on the existing call.
+
+**vue-frontend-dev, originally consulted because `S_shell` is theirs and #98 is inside it.** The
 question put to them was whether a budget on an interval measured inside a renderer they do
 not control is fair, and whether an inner mark is needed to separate WebView2's navigation
 from our mount. **A mark added now is cheap and after #104 is not**, so their answer can
@@ -371,22 +434,114 @@ double `requestAnimationFrame` with a `PerformanceObserver` gate on the
 paint makes F-377's mutations structurally inapplicable rather than merely detected. **The
 evidence half is right and the replacement half is not.** `first-contentful-paint` attests
 that *something* painted, not that *our shell* painted, and the two coincide only while the
-document renders nothing before the framework mounts. **They already do not coincide here
-and by design:** `crates/serat-app/webview/index.html` carries the entire shell as static
+document renders nothing before the framework mounts. **They did not coincide in the shell this
+objection was raised against, and by design:** `crates/serat-app/webview/index.html` — the
+S1 placeholder, still on main as this is written — carries the entire shell as static
 markup — wordmark, vault label, editor, status bar — because §3.4 requires the editor to
 accept keystrokes from the first paint, *"a property of the document rather than a
-promise"*, and that file instructs #98 to preserve it. So FCP fires on the static skeleton,
+promise"*, and that file instructs #98 to preserve it. So against that shell FCP fires on the static skeleton,
 **before Vue and CodeMirror mount**, and a mark gated on FCP alone would move `t_visible`
 earlier by the whole cost of the mount — which is `S_shell`, the term this ADR makes
 binding. **That is mutation B's exact effect arriving legitimately, through the fix for
 mutation B**, and F-386 says the sum identity would not see it.
+
+**#98 resolved it the other way, and the objection stands anyway.** vue-frontend-dev did not
+preserve the static markup: `app/`'s `index.html` is an empty `#app` div, so nothing paints
+until Vue mounts and FCP cannot fire early *on that shell*. That is a better answer than the
+one asked for — §3.4's property still holds, because the first paint now **is** the mounted
+shell — and the hazard described above never materialised. **It also means the mechanism's
+safety now rests on a markup decision rather than on the mechanism**, which is what the
+paragraph on F-393 below is about.
+
+**F-396 checked that against #98's actual tree and made the survival reason stronger than the
+one given here.** `app/index.html` and the built output both carry an empty `<div id="app">`,
+and `shell.css` paints only a background colour — which the Paint Timing spec excludes from
+*contentful* paint by definition. **So on this tree FCP does attest that our shell rendered**,
+and the hazard argued above is not merely unrealised, it is absent. What survives is a
+different and better objection: **#105's guard lives in `crates/serat-app` and its soundness
+depends on a property of `app/index.html` that nothing asserts** — that the document stays
+contentless until Vue fills it. That is a cross-crate implicit dependency with no check
+across the boundary, and it is a stronger reason to keep the conjunction than the one this
+ADR originally gave, because it survives someone adding a splash screen where "FCP fires on
+the skeleton" only described a tree that no longer exists.
+
+**Ruling for #112, and it corrects the phrase "a guard split across crates" that this ADR
+used a paragraph ago.** The defect is not that an assertion would live in another crate — it
+is that the precondition is asserted **nowhere**. A check on `app/index.html` placed in `app/`
+is correct placement, not a split. Four properties have to hold and they do not have one
+enforcer between them:
+
+| Property | Enforced today | To be enforced by #112 |
+|---|---|---|
+| Two genuinely distinct frames occurred | **nothing** | `raf2_ms > raf1_ms`, in `crates/serat-app` |
+| The paint value is the browser's entry, not a substitute clock read | **nothing** | `first_contentful_paint_ms <= raf2_ms`, same place, **subject to the condition below** |
+| The frames were scheduled *after our mount* | **Nothing, and nothing can.** Not recoverable from these timestamps in Rust or anywhere else; frontend review only | — |
+| `app/index.html` stays contentless, so the paint entry means *our* paint | **nothing** | A **static** check over that file |
+
+**The "today" column is not padding, and it is the reason this table has two columns instead
+of one.** Checked against the tree rather than assumed: `raf1`/`raf2` appear in **no Rust file**
+on main or on either #112 branch, and `mark_first_paint` takes `first_contentful_paint_ms: f64`
+alone. The frontend has sent `raf1Ms`/`raf2Ms` since #108 and **Tauri silently drops both**,
+because the command has no parameter to receive them.
+
+**So both halves of the conjunction appear to exist and the conjunction is in force nowhere.**
+The frontend gathers the frame evidence; the Rust side has a guard; nothing joins them. That is
+the most dangerous state this mechanism could be in, because every individual file reads as
+though the work is done — and F-388's entire history is people reasoning correctly from a
+plausible reading of one file. A single-column table headed *"Enforced by"* would have said
+exactly that, in the document that makes the rule against it. Found by code-reviewer at #109.
+
+**The third row is the boundary worth stating rather than papering over.** Whether the frames
+were scheduled after Vue mounted is not recoverable from three numbers, so `serat-app` cannot
+enforce it however the arithmetic is arranged. What it can enforce is the **internal
+consistency of the evidence**, which rows 1 and 2 do. Claiming more than that for a runtime
+guard is how a check comes to be trusted for something it never did.
+
+**The fourth row gets a static check and deliberately not a runtime one.** A bound on
+`raf2_ms − first_contentful_paint_ms` would technically detect a skeleton — a large gap means
+the paint preceded the frames — but it is a magnitude argument, and this section has already
+ruled that magnitude is weaker than evidence which cannot be fabricated. Worse, the threshold
+would be indistinguishable from a slow mount. The property is static, so it is checked
+statically.
+
+**And row 2 lands only after its margin is measured.** `first_contentful_paint_ms <= raf2_ms`
+catches the realistic mutation the others miss — reading the clock instead of the entry, which
+lands after `raf2` — but its false-positive risk depends on when the frames are scheduled
+relative to DOM insertion, and nobody has measured that margin. **It becomes a rejection if an
+honest run shows the ordering holding with room, and a reported diagnostic if it does not.**
+A guard that can fire on an honest run is worse than no guard, because it gets disabled
+(F-107).
 
 The resolution is **conjunction rather than replacement**: keep the gate that ties the mark
 to our shell having rendered, and add the paint entry as the evidence that cannot be
 fabricated. Each covers the other's blind spot — a frame gate alone is forgeable, which is
 F-377; a paint entry alone is satisfiable by a skeleton, which is the above.
 
-**tauri-app-dev, still awaited on the basis of the phase-table figures.** They measured the table this ADR partitions, and §Decision 2's caveat
+**tauri-app-dev on the basis of the phase-table figures: it cannot be reconstructed, and
+that absence is the answer.** Asked twice, and the honest reply was that they have no record
+of taking those measurements — the cold-start phase table predates or sits outside anything
+the session that would have produced it can reach. **Treated as a finding rather than as a
+gap to be filled with a plausible guess**, which is what §Decision 6 exists to prevent.
+
+**What is known and what is not, kept separate because they are not the same.** §3.4 records
+that the table is twenty spawns per figure, release build, scanner off. **What no longer
+exists is whether each cell is a median or a p95, whether all seven rows came from one
+session on one set of spawns or were composed across runs, and what the machine's contention
+was** — the three things #83 made mandatory afterwards and F-327 showed are worth 35% of a
+number.
+
+**So the table may be quoted for its *shape* and not for its *values*, and this ADR quotes it
+that way from here.** An 865 ms term beside a 5 ms term is not a claim any statistic decides;
+which terms dominate, and therefore where the split's boundaries belong, survives the missing
+basis entirely. **Every figure in this document is provisional against task #100 for exactly
+this reason, and always was** — §Decision 5 sets the budget from `s95` measured after #98
+rather than from anything above. The structure was written so the figures slot in, and this
+is the first case where that mattered rather than being a precaution.
+
+**What this must not become is a precedent for quoting them anyway.** These figures travelled
+into three documents before anyone asked what they were. That they can no longer be attested,
+and that nobody noticed until the question was put twice, is a stronger argument for
+§Decision 6 than the rule's original justification was. They measured the table this ADR partitions, and §Decision 2's caveat
 about `generate_handler!` is a question only they have watched move. *(Consulted
 2026-09-08; awaiting their answer.)*
 
