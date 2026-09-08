@@ -41,18 +41,34 @@
 //! # Why the paint mark cannot be the creation mark
 //!
 //! test-engineer's standing objection: if "window painted" is instrumented at window
-//! *creation*, the budget passes and the product ships a blank rectangle. Three things
-//! answer it, and the second is the one that matters:
+//! *creation*, the budget passes and the product ships a blank rectangle. F-377 found
+//! that a call **taken from the right place could still say the wrong thing** — a
+//! substring test asserted `boot.js` mentions the mark and calls it from inside a
+//! `requestAnimationFrame`, and two mutations survived it: collapsing the double rAF
+//! to one (the mark then lands before the compositor has the frame), and hoisting the
+//! `invoke` call out of both callbacks to script start with a no-op rAF left behind to
+//! satisfy the substring. Four things answer it now, and the third is the one that
+//! matters:
 //!
 //! 1. [`Startup::mark_first_paint`] is called from exactly one place — the
-//!    `mark_first_paint` IPC command, which the webview invokes from inside a double
-//!    `requestAnimationFrame` after the shell's first render, i.e. after the frame has
-//!    been composited.
-//! 2. **There is no other way to set it.** No Rust path stamps it: not `main`, not the
-//!    window builder, not a `WindowEvent`. A shell that paints nothing never marks, so
-//!    [`Startup::trace`] fails with [`TraceIncomplete`] and `--exit-after-ready` exits
-//!    non-zero. A blank rectangle is a red job, not a fast one.
-//! 3. `t0_to_window_created_ms` is emitted beside it, and the budget job fails a run
+//!    `mark_first_paint` IPC command, which the webview invokes.
+//! 2. **The call must carry evidence a script cannot have before the frame is
+//!    composited.** The argument is the `startTime` of the browser's own
+//!    `first-contentful-paint` `PerformancePaintTiming` entry (`webview/boot.js`),
+//!    which the Paint Timing API does not report until content has actually been
+//!    painted — not a value derived from counting `requestAnimationFrame` callbacks,
+//!    which a script can call as many or as few times as it likes regardless of
+//!    whether anything was ever composited. [`Startup::mark_first_paint`] rejects
+//!    (returns [`PaintEvidenceRejected`], sets nothing) a non-finite or non-positive
+//!    value rather than defaulting — a call with nothing genuine to send has nothing
+//!    accepted, on any platform, including one where the Paint Timing API does not
+//!    exist at all.
+//! 3. **There is no other way to set it.** No Rust path stamps it: not `main`, not the
+//!    window builder, not a `WindowEvent`. A shell that paints nothing, or whose
+//!    evidence is rejected, never marks, so [`Startup::trace`] fails with
+//!    [`TraceIncomplete`] and `--exit-after-ready` exits non-zero. A blank rectangle is
+//!    a red job, not a fast one.
+//! 4. `t0_to_window_created_ms` is emitted beside it, and the budget job fails a run
 //!    where the gap is under 5 ms — test-engineer's threshold, a mutation detector
 //!    rather than a performance floor.
 //!
@@ -171,6 +187,11 @@ struct Marks {
     index_settled: Option<f64>,
     window_created: Option<f64>,
     window_visible: Option<f64>,
+    /// The raw `first-contentful-paint` `PerformancePaintTiming` `startTime` the
+    /// webview sent as evidence for `window_visible`, kept only for audit — it is on
+    /// the browser's navigation-origin clock, not this process's `t0`, and is never
+    /// compared against another mark. See [`PaintEvidenceRejected`].
+    paint_evidence_ms: Option<f64>,
     watcher: Option<(f64, WatcherOutcome)>,
     buffer_rendered: Option<f64>,
     walk_complete: Option<f64>,
@@ -320,19 +341,42 @@ impl Startup {
 
     /// The first frame has been composited, as reported by the webview.
     ///
-    /// Returns `false` if the mark was already set. A repeat is ignored rather than
+    /// `first_contentful_paint_ms` must be the `startTime` of the browser's own
+    /// `first-contentful-paint` `PerformancePaintTiming` entry (see `webview/boot.js`
+    /// and the module note above). It is evidence, not a timestamp this function
+    /// trusts on its own clock — the mark itself is still taken from
+    /// [`Startup::elapsed_ms`] at the moment this call arrives, so every mark in the
+    /// trace stays on one clock. What the argument buys is that a call with nothing
+    /// real to send — script-start, a mutated callback, any path that runs before the
+    /// frame is composited — has no positive, finite value to offer and is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`PaintEvidenceRejected`] if `first_contentful_paint_ms` is not finite and
+    /// positive. **Rejection, not a default**: on a platform where the Paint Timing API
+    /// does not exist at all, the caller has nothing to send either, and the correct
+    /// behaviour is the same — no mark, not a fabricated one (F-377).
+    ///
+    /// Returns `Ok(false)` if the mark was already set. A repeat is ignored rather than
     /// refused: a webview that reloads must not be able to move a mark that has already
     /// been taken, and it must not crash the shell for trying either.
-    pub fn mark_first_paint(&self) -> bool {
+    pub fn mark_first_paint(
+        &self,
+        first_contentful_paint_ms: f64,
+    ) -> Result<bool, PaintEvidenceRejected> {
+        if !first_contentful_paint_ms.is_finite() || first_contentful_paint_ms <= 0.0 {
+            return Err(PaintEvidenceRejected::new(first_contentful_paint_ms));
+        }
         let now = self.elapsed_ms();
         let mut marks = self.lock();
         if marks.window_visible.is_some() {
-            return false;
+            return Ok(false);
         }
         marks.window_visible = Some(now);
+        marks.paint_evidence_ms = Some(first_contentful_paint_ms);
         drop(marks);
         self.usable.notify_all();
-        true
+        Ok(true)
     }
 
     /// Block until the shell has painted, or `timeout` elapses. Returns whether it
@@ -523,6 +567,7 @@ impl Startup {
 
         Ok(Trace {
             t0_to_window_visible_ms: window_visible,
+            paint_evidence_ms: marks.paint_evidence_ms,
             t0_to_vault_usable_ms: marks.vault_usable().expect("every term was just unwrapped"),
             t0_to_main_ms: self.main_ms,
             t0_to_state_ready_ms: marks.state_ready,
@@ -569,6 +614,12 @@ pub const USABLE_DEFINITION: &str =
 pub struct Trace {
     /// t0 to the first composited frame. NFR-PRF-01's 400 ms.
     pub t0_to_window_visible_ms: f64,
+    /// The `first-contentful-paint` `startTime` the webview sent as evidence for
+    /// `t0_to_window_visible_ms` (F-377). On the browser's navigation-origin clock,
+    /// **not** `t0` — never compare this against another field in this struct. Present
+    /// for audit only: every trace with a `t0_to_window_visible_ms` has one, because
+    /// [`Startup::mark_first_paint`] cannot set the former without the latter.
+    pub paint_evidence_ms: Option<f64>,
     /// t0 to the vault being usable. NFR-PRF-01's 1 s. The later of
     /// `t0_to_buffer_rendered_ms` and `t0_to_watcher_ms`.
     pub t0_to_vault_usable_ms: f64,
@@ -667,9 +718,48 @@ impl std::fmt::Display for TraceIncomplete {
 
 impl std::error::Error for TraceIncomplete {}
 
+/// A `mark_first_paint` call was refused because it did not carry a positive, finite
+/// `first-contentful-paint` `startTime` — the only thing this argument may
+/// legitimately hold. F-377: the earlier `mark_first_paint(&self) -> bool` accepted
+/// any call unconditionally, so a call taken before the frame was ever composited
+/// passed exactly like a real one. No mark is set when this is returned; the IPC
+/// command's caller sees the rejection instead of the milliseconds it would otherwise
+/// hand back to the webview.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaintEvidenceRejected {
+    /// A human-readable account of what was sent instead, built with `{:?}` so `NaN`
+    /// and the infinities are legible rather than causing this type to fail to
+    /// serialise at the IPC boundary the way a raw non-finite `f64` field would.
+    pub reason: String,
+}
+
+impl PaintEvidenceRejected {
+    fn new(sent: f64) -> Self {
+        Self {
+            reason: format!(
+                "mark_first_paint refused {sent:?} as first-contentful-paint evidence: \
+                 it is not a positive, finite timestamp a real PerformancePaintTiming \
+                 entry could report"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for PaintEvidenceRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for PaintEvidenceRejected {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plausible `first-contentful-paint` `startTime` for tests that need the mark
+    /// taken but are not exercising [`PaintEvidenceRejected`] itself.
+    const FCP_MS: f64 = 42.0;
 
     fn in_process() -> Startup {
         Startup::begin_with(None)
@@ -678,7 +768,9 @@ mod tests {
     /// A start that did everything except the mark under test.
     fn complete(startup: &Startup) {
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -707,7 +799,9 @@ mod tests {
     fn a_shell_that_paints_but_renders_nothing_has_no_trace_either() {
         let startup = in_process();
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
 
@@ -723,7 +817,9 @@ mod tests {
         // `Marks::vault_usable` and this fails.
         let startup = in_process();
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_buffer_rendered();
 
@@ -758,7 +854,9 @@ mod tests {
         );
 
         std::thread::sleep(Duration::from_millis(3));
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         let trace = startup.trace().expect("complete");
         assert!(
             (trace.t0_to_vault_usable_ms - trace.t0_to_window_visible_ms).abs() < f64::EPSILON,
@@ -775,7 +873,9 @@ mod tests {
         // requirement it claims to measure. Delete the `index_settled` term from
         // `Marks::vault_usable` and this fails.
         let startup = in_process();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
 
@@ -798,7 +898,9 @@ mod tests {
         // vault where the window most needs to be up — and P0 never reaches `Ready` at
         // all, so it would never report usable.
         let startup = in_process();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
         startup.mark_index_settled();
@@ -810,7 +912,9 @@ mod tests {
         // Both orders, because taking the first rather than the later one would pass a
         // test that only ever exercised one of them.
         let watcher_last = in_process();
-        watcher_last.mark_first_paint();
+        watcher_last
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         watcher_last.mark_index_settled();
         std::thread::sleep(Duration::from_millis(2));
         watcher_last.mark_buffer_rendered();
@@ -825,7 +929,9 @@ mod tests {
         );
 
         let buffer_last = in_process();
-        buffer_last.mark_first_paint();
+        buffer_last
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         buffer_last.mark_index_settled();
         std::thread::sleep(Duration::from_millis(2));
         buffer_last.mark_watcher(WatcherOutcome::Registered);
@@ -845,7 +951,9 @@ mod tests {
         // Design goal 5: a vault with no watcher is stale, not broken. But a number
         // taken in that state must say so.
         let startup = in_process();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Failed);
         startup.mark_buffer_rendered();
@@ -868,7 +976,9 @@ mod tests {
         let startup = in_process();
         startup.mark_window_created();
         std::thread::sleep(Duration::from_millis(6));
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -895,7 +1005,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         startup.mark_setup_done();
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(FCP_MS)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
@@ -934,6 +1046,7 @@ mod tests {
 
         let complete_trace = Trace {
             t0_to_window_visible_ms: 800.0,
+            paint_evidence_ms: Some(798.0),
             t0_to_vault_usable_ms: 805.0,
             t0_to_main_ms: 60.0,
             t0_to_state_ready_ms: Some(65.0),
@@ -1010,17 +1123,95 @@ mod tests {
     #[test]
     fn a_mark_is_taken_once_and_a_repeat_moves_nothing() {
         let startup = in_process();
-        assert!(startup.mark_first_paint());
+        assert!(
+            startup
+                .mark_first_paint(FCP_MS)
+                .expect("valid paint evidence")
+        );
         let first = startup.lock().window_visible.expect("marked");
 
         std::thread::sleep(Duration::from_millis(2));
         assert!(
-            !startup.mark_first_paint(),
+            !startup
+                .mark_first_paint(FCP_MS)
+                .expect("valid paint evidence"),
             "a second paint must be refused"
         );
         assert!(
             (startup.lock().window_visible.expect("still marked") - first).abs() < f64::EPSILON,
             "a webview reload moved a mark that had already been taken"
+        );
+    }
+
+    // F-377: `the_placeholder_bundle_exists_and_carries_the_two_marks`
+    // (`crates/serat-app/src/lib.rs`) asserted only that `mark_first_paint`,
+    // `mark_vault_usable` and `requestAnimationFrame` appear *somewhere* in
+    // `boot.js`, and two mutations survived `cargo test -p serat-app` against it:
+    //
+    //   A. the double `requestAnimationFrame` collapsed to a single one, taking the
+    //      mark before the frame reached the compositor;
+    //   B. `invoke("mark_first_paint")` hoisted out of both callbacks to script start,
+    //      with a no-op `requestAnimationFrame(() => {})` left behind to satisfy the
+    //      substring.
+    //
+    // The fix replaces frame-counting with evidence: the argument must be the
+    // `startTime` of a real `first-contentful-paint` `PerformancePaintTiming` entry,
+    // which the Paint Timing API does not report before the frame is composited. Under
+    // either mutation reapplied to that mechanism, the script has nothing genuine at
+    // its call site — `performance.getEntriesByType("paint")` is still empty, so the
+    // value it can send is `undefined` (crossing as a missing/non-finite argument) or,
+    // if a developer defensively coalesces the missing entry to a sentinel, `0` or
+    // less. The two tests below are exactly those two shapes, asserted red at the
+    // point the old test could not reach: `Startup::mark_first_paint` itself, not
+    // `boot.js`'s text. (The literal mutations still need a mutated `boot.js` run
+    // against the real binary to confirm end to end — this crate has no JS runtime to
+    // automate that — but the failure mode they both reduce to is asserted here on
+    // every `cargo test -p serat-app`.)
+    #[test]
+    fn f_377_mutation_a_shape_a_call_with_nothing_composited_yet_is_rejected() {
+        // What `undefined?.startTime` becomes once it crosses the IPC boundary as a
+        // mandatory `f64`: not a number at all.
+        let startup = in_process();
+        for bogus in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = startup
+                .mark_first_paint(bogus)
+                .expect_err("a non-finite value is not evidence of a real paint");
+            assert!(
+                err.reason.contains("first-contentful-paint"),
+                "the rejection must say what it refused: {err}"
+            );
+        }
+        assert!(
+            startup.trace().is_err(),
+            "a rejected call must leave window_visible unset, not stamp a wrong one"
+        );
+    }
+
+    #[test]
+    fn f_377_mutation_b_shape_a_defaulted_sentinel_is_rejected() {
+        // What a script defensively coalescing a missing paint-timing entry to a
+        // placeholder looks like: zero or negative, never a real startTime.
+        let startup = in_process();
+        for bogus in [0.0, -1.0, -0.001] {
+            startup
+                .mark_first_paint(bogus)
+                .expect_err("zero or negative is not evidence of a real paint");
+        }
+        assert!(startup.trace().is_err());
+    }
+
+    #[test]
+    fn genuine_paint_evidence_is_accepted_and_kept_verbatim_for_audit() {
+        let startup = in_process();
+        assert!(
+            startup
+                .mark_first_paint(517.25)
+                .expect("a positive, finite value is evidence")
+        );
+        assert_eq!(
+            startup.lock().paint_evidence_ms,
+            Some(517.25),
+            "the raw evidence is kept so a trace can be audited against it"
         );
     }
 
@@ -1093,7 +1284,9 @@ mod tests {
         std::thread::spawn(move || {
             signaller.mark_watcher(WatcherOutcome::Registered);
             signaller.mark_index_settled();
-            signaller.mark_first_paint();
+            signaller
+                .mark_first_paint(FCP_MS)
+                .expect("valid paint evidence");
             std::thread::sleep(Duration::from_millis(10));
             signaller.mark_buffer_rendered();
         });
