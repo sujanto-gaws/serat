@@ -79,18 +79,21 @@ substrings `mark_first_paint`, `mark_vault_usable` and `requestAnimationFrame`
 somewhere — it cannot see whether the call happens *inside* the double rAF or is
 hoisted to script start with a no-op rAF left behind to satisfy the grep
 (code-reviewer's F-377 mutation; both mutations still pass `cargo test -p serat-app`,
-86/86). `src/startup.ts`'s `schedulePaintMark` now sends `PaintEvidence` alongside
-the call — `raf1_ms`/`raf2_ms` are the two callbacks' own `DOMHighResTimeStamp`
-arguments, and `nav_dom_content_loaded_ms` is `PerformanceNavigationTiming`'s own
-field, which this file cannot fabricate because it is the browser's instrumentation,
-not ours. `crates/serat-app`'s guard (task #105, tauri-app-dev + architect) is what
-actually rejects implausible evidence; this half only has to produce evidence a
-rewrite of this file could not fake without literally waiting for two real frames.
-See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning, and
-ADR-0014 (`S_shell`) for why `nav_dom_content_loaded_ms` exists at all — it is the
-inner mark that ADR-0014's open objection to vue-frontend-dev asked for, splitting
-`S_shell` into WebView2's navigation cost and this bundle's mount cost, without a
-second IPC round trip that would perturb the very interval it measures.
+86/86). `src/startup.ts`'s `schedulePaintMark` sends `PaintEvidence` alongside the
+call, and it is **two kinds of evidence, not one, per F-388**: a frame gate alone is
+still forgeable by a mutation that honestly waits for two real frames but schedules
+them too early — before this app has mounted anything visible — so `raf1_ms`/
+`raf2_ms` (the two callbacks' own `DOMHighResTimeStamp` arguments) are checked
+against `first_contentful_paint_ms` (`PerformancePaintTiming`'s own record of when
+the browser painted actual content), which an early-frame mutation cannot move.
+`nav_dom_content_loaded_ms` is a third, unrelated field — HTML-parse-complete, not
+paint — kept for ADR-0014's open objection to vue-frontend-dev rather than for the
+guard: it is the inner mark that splits `S_shell` into WebView2's navigation cost and
+this bundle's mount cost, without a second IPC round trip that would perturb the very
+interval it measures. `crates/serat-app`'s guard (task #105, tauri-app-dev +
+architect) is what actually rejects implausible evidence; this half only has to
+produce evidence a rewrite of this file could not fake. See `PaintEvidence` in
+`src/ipc/client.ts` for the field-by-field reasoning.
 
 ## Layout
 

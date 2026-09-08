@@ -63,13 +63,32 @@ export interface PaintEvidence {
   /** The second callback's timestamp — taken after the frame reached the compositor. */
   raf2_ms: number;
   /**
+   * `PerformancePaintTiming`'s `first-contentful-paint` entry, if the webview
+   * recorded one — **this is F-388's "paint entry", the half of the conjunction that
+   * `raf1_ms`/`raf2_ms` alone cannot provide.** A frame gate proves two real,
+   * distinct frames occurred; it does not prove *what* was on screen when they did.
+   * A mutation could genuinely wait for two real early frames — say, two frames of
+   * a blank `#app` before Vue mounts anything — and pass a frame-gap check with
+   * honestly-sourced timestamps that are simply too early. FCP is the browser's own
+   * record of when it first painted visible content (text, image, non-white
+   * canvas/SVG); this file's `#app` div is empty until Vue mounts, so FCP cannot
+   * fire before real content exists, and comparing it against `raf2_ms` on the Rust
+   * side (task #105) is what makes that early-frame mutation visible. `null` only
+   * if the entry genuinely never landed — since P0's `index.html` has no content
+   * before mount, that should not happen on a shell that actually painted, and the
+   * guard should treat `null` here as a hard rejection rather than "no anchor".
+   */
+  first_contentful_paint_ms: number | null;
+  /**
    * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded
-   * one. Unlike the two fields above, this is the platform's own instrumentation: a
-   * rewrite of this file cannot move it, which is exactly why it is worth reporting
-   * — it is the anchor ADR-0014's open objection to vue-frontend-dev asked for, and
-   * splits `S_shell` into WebView2's navigation cost and this bundle's mount cost.
-   * `null` when the entry is absent, which some engines or navigation types can
-   * legitimately produce. Diagnostic only: the guard does not gate on it.
+   * one. **Not the paint entry above** — this fires on HTML parse completion, before
+   * any script (including Vue's mount) has run, so it cannot distinguish a genuine
+   * paint from an early one and plays no part in the guard. It exists for a
+   * different reason: it is the platform's own instrumentation, so a rewrite of this
+   * file cannot move it, and it is the inner mark ADR-0014's open objection to
+   * vue-frontend-dev asked for — splitting `S_shell` into WebView2's navigation cost
+   * and this bundle's mount cost. `null` when the entry is absent, which some
+   * engines or navigation types can legitimately produce. Diagnostic only.
    */
   nav_dom_content_loaded_ms: number | null;
 }

@@ -16,17 +16,19 @@
 //
 // Nothing here is a product feature (charter: "no product features" for P0).
 //
-// Task #108 (F-377, ADR-0014): the double rAF above is a promise this file makes,
-// not one the Rust side could ever check — `crates/serat-app/src/lib.rs`'s marks
-// test only greps `boot.js` for the substring `requestAnimationFrame`, and
+// Task #108 (F-377, F-388, ADR-0014): the double rAF above is a promise this file
+// makes, not one the Rust side could ever check — `crates/serat-app/src/lib.rs`'s
+// marks test only greps `boot.js` for the substring `requestAnimationFrame`, and
 // code-reviewer's mutation at F-377 showed exactly what that misses: hoist the
 // `invoke` to script start, leave a no-op `requestAnimationFrame(() => {})` behind
-// to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below now sends
-// `PaintEvidence` — the two callbacks' own timestamps, plus a browser-instrumented
-// navigation-timing anchor neither callback could fake — so `crates/serat-app`'s
-// guard (task #105) has something to check the call against rather than trusting
-// that it happened. See `PaintEvidence` in `src/ipc/client.ts` for the field-by-field
-// reasoning.
+// to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below sends
+// `PaintEvidence`, and F-388 is why it is two kinds of evidence rather than one: a
+// frame gate alone (raf1_ms/raf2_ms) is still forgeable by a mutation that honestly
+// waits for two real frames and just schedules them too early, before this app has
+// mounted anything visible — so `first_contentful_paint_ms`, the browser's own
+// record of when it painted actual content, is the second half of the conjunction,
+// checked against the frame timestamps rather than replacing them. See
+// `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
 import type { useVaultStore } from "@/stores/vault";
@@ -34,10 +36,22 @@ import type { useVaultStore } from "@/stores/vault";
 type VaultStore = ReturnType<typeof useVaultStore>;
 
 /**
+ * `PerformancePaintTiming`'s `first-contentful-paint` entry, if the webview recorded
+ * one — see `PaintEvidence.first_contentful_paint_ms` for why this, and not
+ * `nav_dom_content_loaded_ms` below, is the evidence F-388's conjunction needs.
+ */
+function firstContentfulPaintMs(): number | null {
+  const entry = performance
+    .getEntriesByType("paint")
+    .find((candidate) => candidate.name === "first-contentful-paint");
+  return entry ? entry.startTime : null;
+}
+
+/**
  * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded a
  * navigation entry — see `PaintEvidence.nav_dom_content_loaded_ms`. Its own function
  * only so `schedulePaintMark` reads as "gather evidence, then call", rather than
- * burying the one fallible read among timestamps that cannot fail.
+ * burying the fallible reads among timestamps that cannot fail.
  */
 function navDomContentLoadedMs(): number | null {
   const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
@@ -61,6 +75,7 @@ export function schedulePaintMark(store: VaultStore): Promise<number | null> {
         markFirstPaint({
           raf1_ms: raf1,
           raf2_ms: raf2,
+          first_contentful_paint_ms: firstContentfulPaintMs(),
           nav_dom_content_loaded_ms: navDomContentLoadedMs(),
         }).then(
           (ms) => {
