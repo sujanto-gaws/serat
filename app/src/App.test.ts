@@ -17,11 +17,29 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => new Promise(() => {})),
 }));
 
+// `@/startup` is mocked separately from the `@tauri-apps/api` mock above so the
+// second test below can tell "schedulePaintMark ran" apart from "CodeMirror's own
+// internal requestAnimationFrame usage ran" — a global rAF spy cannot make that
+// distinction (verified: it stayed green under the ordering bug this test exists to
+// catch, because CodeMirror 6 calls requestAnimationFrame on its own during
+// construction, independent of anything App.vue does).
+const schedulePaintMark = vi.fn((..._args: unknown[]) => new Promise<number | null>(() => {}));
+const hydrateBuffer = vi.fn((..._args: unknown[]) => new Promise<void>(() => {}));
+
+vi.mock("@/startup", () => ({
+  schedulePaintMark: (...args: unknown[]) => schedulePaintMark(...args),
+  hydrateBuffer: (...args: unknown[]) => hydrateBuffer(...args),
+}));
+
 const { default: App } = await import("./App.vue");
 
 beforeEach(() => {
   window.__SERAT_BOOT__ = { vault: "/vault", open: "a.md", exit_after_ready: false };
+  // CodeMirror 6 uses requestAnimationFrame internally; this only has to exist and
+  // not throw, since the assertions below no longer depend on it being called.
   vi.stubGlobal("requestAnimationFrame", () => 0);
+  schedulePaintMark.mockClear();
+  hydrateBuffer.mockClear();
 });
 
 afterEach(() => {
@@ -35,5 +53,20 @@ describe("App", () => {
     const content = wrapper.find(".cm-content");
     expect(content.exists()).toBe(true);
     expect(content.attributes("contenteditable")).toBe("true");
+  });
+
+  it("schedules the paint mark synchronously, ahead of the index-status subscription", () => {
+    // code-reviewer's SHOULD-FIX on #98: onMounted used to `await onIndexStatus(...)`
+    // — an IPC round trip — before calling schedulePaintMark, so the double rAF that
+    // call schedules could miss the frame that actually painted first, inflating
+    // S_shell (ADR-0014's binding Serat term) with time that has nothing to do with
+    // painting. `listen` is mocked to a promise that never resolves, so under the
+    // old ordering `schedulePaintMark` would never run in this test at all —
+    // execution would be stuck behind that `await` forever. That
+    // `schedulePaintMark` is called here, synchronously during `mount` and before
+    // `onIndexStatus`'s underlying `listen` call could possibly have settled, is
+    // only possible because it now runs first.
+    mount(App, { global: { plugins: [createPinia()] } });
+    expect(schedulePaintMark).toHaveBeenCalledTimes(1);
   });
 });
