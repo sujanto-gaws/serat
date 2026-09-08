@@ -36,18 +36,18 @@ function stubDoubleRaf() {
 
 /** The shape `markFirstPaint` is called with — matches `PaintEvidence`, kept local so this file does not import a type only to satisfy a cast. */
 interface PaintEvidenceForTest {
-  raf1_ms: number;
-  raf2_ms: number;
-  first_contentful_paint_ms: number | null;
-  nav_dom_content_loaded_ms: number | null;
+  firstContentfulPaintMs: number | null;
+  raf1Ms: number;
+  raf2Ms: number;
+  navDomContentLoadedMs: number | null;
 }
 
 /**
  * `schedulePaintMark` reads two different `performance.getEntriesByType` calls —
- * `"paint"` for `first_contentful_paint_ms` and `"navigation"` for
- * `nav_dom_content_loaded_ms` — so a single blanket mock would make one test's
- * fixture leak into the other's assertion. This stubs both by type, defaulting to
- * an empty list for whichever the caller does not supply.
+ * `"paint"` for `firstContentfulPaintMs` and `"navigation"` for
+ * `navDomContentLoadedMs` — so a single blanket mock would make one test's fixture
+ * leak into the other's assertion. This stubs both by type, defaulting to an empty
+ * list for whichever the caller does not supply.
  */
 function stubPerformanceEntries(byType: Partial<Record<string, PerformanceEntry[]>>) {
   vi.spyOn(performance, "getEntriesByType").mockImplementation(
@@ -85,29 +85,43 @@ describe("schedulePaintMark", () => {
   });
 
   it("sends the two callbacks' own timestamps as evidence, not a recomputed pair", async () => {
-    // task #108 / F-377: the point of PaintEvidence is that raf1_ms and raf2_ms are
+    // task #108 / F-377: the point of PaintEvidence is that raf1Ms and raf2Ms are
     // the browser's own callback arguments. If schedulePaintMark ever starts calling
     // performance.now() a second time instead of using the callback argument, this
     // still passes as long as the two values it sends came from the two distinct
-    // scheduled callbacks in order — which is the property that matters for the
-    // guard (task #105) to check a gap against.
+    // scheduled callbacks in order.
     markFirstPaint.mockResolvedValue(1.0);
     const store = useVaultStore();
     await schedulePaintMark(store);
 
     expect(markFirstPaint).toHaveBeenCalledTimes(1);
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
-    expect(evidence.raf1_ms).toBe(10);
-    expect(evidence.raf2_ms).toBe(20);
-    expect(evidence.raf2_ms).toBeGreaterThan(evidence.raf1_ms);
+    expect(evidence.raf1Ms).toBe(10);
+    expect(evidence.raf2Ms).toBe(20);
+    expect(evidence.raf2Ms).toBeGreaterThan(evidence.raf1Ms);
   });
 
-  it("reports the first-contentful-paint entry — F-388's conjunction, not the frame gate", async () => {
+  it("sends camelCase keys, matching Tauri's default rename of command parameters", async () => {
+    // Confirmed against task #105's actual Rust signature (first_contentful_paint_ms),
+    // which Tauri only matches when the JS side sends firstContentfulPaintMs — the
+    // snake_case form this file shipped for one revision would have silently failed
+    // to reach the parameter at all. See PaintEvidence's own doc comment.
+    markFirstPaint.mockResolvedValue(1.0);
+    const store = useVaultStore();
+    await schedulePaintMark(store);
+
+    const evidence = markFirstPaint.mock.calls[0][0] as Record<string, unknown>;
+    expect(Object.keys(evidence).sort()).toEqual(
+      ["firstContentfulPaintMs", "navDomContentLoadedMs", "raf1Ms", "raf2Ms"].sort(),
+    );
+  });
+
+  it("reports the first-contentful-paint entry, not the frame gate", async () => {
     // F-388: a frame gate alone is forgeable by a mutation that honestly waits for
     // two real, early frames before this app has mounted anything visible.
-    // first_contentful_paint_ms is the evidence that closes that gap, and it is not
-    // the same signal as nav_dom_content_loaded_ms (which fires on HTML parse,
-    // before any script runs, and cannot see whether real content ever painted).
+    // firstContentfulPaintMs is the evidence that closes that gap, and it is not the
+    // same signal as navDomContentLoadedMs (which fires on HTML parse, before any
+    // script runs, and cannot see whether real content ever painted).
     stubPerformanceEntries({
       paint: [{ name: "first-contentful-paint", startTime: 17 } as PerformancePaintTiming],
     });
@@ -117,7 +131,7 @@ describe("schedulePaintMark", () => {
     await schedulePaintMark(store);
 
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
-    expect(evidence.first_contentful_paint_ms).toBe(17);
+    expect(evidence.firstContentfulPaintMs).toBe(17);
   });
 
   it("reports null for first-contentful-paint rather than throwing when the entry is absent", async () => {
@@ -128,7 +142,7 @@ describe("schedulePaintMark", () => {
     await schedulePaintMark(store);
 
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
-    expect(evidence.first_contentful_paint_ms).toBeNull();
+    expect(evidence.firstContentfulPaintMs).toBeNull();
   });
 
   it("reports the navigation-timing anchor when the webview recorded one", async () => {
@@ -141,7 +155,7 @@ describe("schedulePaintMark", () => {
     await schedulePaintMark(store);
 
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
-    expect(evidence.nav_dom_content_loaded_ms).toBe(42);
+    expect(evidence.navDomContentLoadedMs).toBe(42);
   });
 
   it("reports null rather than throwing when there is no navigation entry", async () => {
@@ -152,7 +166,7 @@ describe("schedulePaintMark", () => {
     await schedulePaintMark(store);
 
     const evidence = markFirstPaint.mock.calls[0][0] as PaintEvidenceForTest;
-    expect(evidence.nav_dom_content_loaded_ms).toBeNull();
+    expect(evidence.navDomContentLoadedMs).toBeNull();
   });
 
   it("resolves with null and records the failure rather than throwing", async () => {

@@ -22,13 +22,21 @@
 // code-reviewer's mutation at F-377 showed exactly what that misses: hoist the
 // `invoke` to script start, leave a no-op `requestAnimationFrame(() => {})` behind
 // to satisfy the grep, and 86 tests still pass. `schedulePaintMark` below sends
-// `PaintEvidence`, and F-388 is why it is two kinds of evidence rather than one: a
-// frame gate alone (raf1_ms/raf2_ms) is still forgeable by a mutation that honestly
-// waits for two real frames and just schedules them too early, before this app has
-// mounted anything visible — so `first_contentful_paint_ms`, the browser's own
-// record of when it painted actual content, is the second half of the conjunction,
-// checked against the frame timestamps rather than replacing them. See
-// `PaintEvidence` in `src/ipc/client.ts` for the field-by-field reasoning.
+// `PaintEvidence` alongside the call.
+//
+// **Open question, not yet resolved between this file and task #105.** F-388's
+// ratified resolution was "conjunction, not replacement": a frame gate alone
+// (raf1Ms/raf2Ms) is forgeable by a mutation that honestly waits for two real frames
+// scheduled too early, before this app has mounted anything visible, so the paint
+// entry was meant to be checked *against* the frame timestamps, not instead of them.
+// `task/105-paint-mark-evidence-guard` (unmerged at the time of writing) drops the
+// frame gate entirely and accepts `firstContentfulPaintMs` alone, gated only on
+// `is_finite() && > 0.0` plus a source-shape check counting `boot.js`'s call sites —
+// the latter being exactly the family of guard the lead's ratification said to drop.
+// Raised with architect/tauri-app-dev-2 rather than resolved here. raf1Ms/raf2Ms are
+// still sent regardless of how that lands: harmless if unused, immediately available
+// if the guard grows a frame-gap check back in. See `PaintEvidence` in
+// `src/ipc/client.ts` for the field-by-field reasoning.
 
 import { markFirstPaint, markVaultUsable, readFile } from "@/ipc/client";
 import type { useVaultStore } from "@/stores/vault";
@@ -37,10 +45,10 @@ type VaultStore = ReturnType<typeof useVaultStore>;
 
 /**
  * `PerformancePaintTiming`'s `first-contentful-paint` entry, if the webview recorded
- * one — see `PaintEvidence.first_contentful_paint_ms` for why this, and not
- * `nav_dom_content_loaded_ms` below, is the evidence F-388's conjunction needs.
+ * one — see `PaintEvidence.firstContentfulPaintMs` for why this, and not
+ * `navDomContentLoadedMs` below, is paint evidence.
  */
-function firstContentfulPaintMs(): number | null {
+function readFirstContentfulPaintMs(): number | null {
   const entry = performance
     .getEntriesByType("paint")
     .find((candidate) => candidate.name === "first-contentful-paint");
@@ -49,11 +57,11 @@ function firstContentfulPaintMs(): number | null {
 
 /**
  * `PerformanceNavigationTiming.domContentLoadedEventEnd`, if the webview recorded a
- * navigation entry — see `PaintEvidence.nav_dom_content_loaded_ms`. Its own function
+ * navigation entry — see `PaintEvidence.navDomContentLoadedMs`. Its own function
  * only so `schedulePaintMark` reads as "gather evidence, then call", rather than
  * burying the fallible reads among timestamps that cannot fail.
  */
-function navDomContentLoadedMs(): number | null {
+function readNavDomContentLoadedMs(): number | null {
   const [entry] = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
   return entry ? entry.domContentLoadedEventEnd : null;
 }
@@ -73,10 +81,10 @@ export function schedulePaintMark(store: VaultStore): Promise<number | null> {
     requestAnimationFrame((raf1) => {
       requestAnimationFrame((raf2) => {
         markFirstPaint({
-          raf1_ms: raf1,
-          raf2_ms: raf2,
-          first_contentful_paint_ms: firstContentfulPaintMs(),
-          nav_dom_content_loaded_ms: navDomContentLoadedMs(),
+          firstContentfulPaintMs: readFirstContentfulPaintMs(),
+          raf1Ms: raf1,
+          raf2Ms: raf2,
+          navDomContentLoadedMs: readNavDomContentLoadedMs(),
         }).then(
           (ms) => {
             store.setMark(`painted ${ms.toFixed(1)} ms`);
