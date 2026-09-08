@@ -453,8 +453,7 @@ impl IndexActor {
                 if let Some(index_handle) = opener.into_handle() {
                     *slot_for_thread
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(index_handle);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index_handle);
                 }
             })?;
         Ok((
@@ -715,10 +714,7 @@ mod tests {
             "an empty vault should index to zero notes, not stay Unavailable"
         );
         assert!(
-            handle_slot
-                .lock()
-                .expect("not poisoned")
-                .is_some(),
+            handle_slot.lock().expect("not poisoned").is_some(),
             "task #89: a successful open must hand its IndexHandle on through \
              into_handle, not drop it"
         );
