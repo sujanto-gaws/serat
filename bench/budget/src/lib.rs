@@ -1374,7 +1374,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io
         // instant anything opens the vault for real -- so it never enters the digest
         // this compares against, and this recompute must not treat its mere presence
         // as a difference either. F-401: this bit the shared 20k vault twice in one
-        // session, once through cold_start_once (fixed by CleanIndexOnDrop) and once
+        // session, once through cold_start_once (fixed by ColdStartVaultGuard) and once
         // through some other real invocation of the app against it directly, which no
         // per-caller cleanup can fully guard against -- excluding it here does, for
         // every caller, present and future, without relying on anyone remembering to
@@ -2011,26 +2011,29 @@ where
 ///
 /// Returns whether it held, having printed the verdict either way.
 pub fn run_scale_check(iterations: usize) -> bool {
-    // F-401: cold_start_once spawns the real app against these vaults, and the
-    // app's own .serat/ is left behind unless something removes it. Fetched here
-    // rather than inside scale_verdict's `vaults` closure so both guards can be
-    // held for the whole interleaved run and dropped together after the last
-    // spawn against either vault -- not per spawn, which would defeat the
-    // warm-index case this check exists to measure (subject::CleanIndexOnDrop's
-    // doc comment has the full reasoning).
-    let verdict = (|| -> Result<String, String> {
-        let small = ensure_vault("20k")?;
-        let large = ensure_vault("50k")?;
-        let _clean_small = subject::CleanIndexOnDrop(&small.path);
-        let _clean_large = subject::CleanIndexOnDrop(&large.path);
+    // F-401: this check calls `cold_start_once` directly, spawn by spawn,
+    // interleaved across both vaults (the doc comment on `cold_start_once`
+    // explains why) -- so no single call is "the batch" the way it is inside
+    // `cold_start`. The batch is the whole check, both vaults, every pair, and
+    // the guards below are taken before the first spawn and held across all of
+    // them, dropping only once `scale_verdict` has returned. Vaults are
+    // resolved before `scale_verdict` runs specifically so the guards can be
+    // taken on their paths first; `ensure_vault` errors surface through the
+    // same `?` a bare fetch would have used.
+    let vaults = (|| -> Result<(VaultUnderTest, VaultUnderTest), String> {
+        Ok((ensure_vault("20k")?, ensure_vault("50k")?))
+    })();
+    let verdict = vaults.and_then(|(small, large)| {
+        let _small_guard = subject::ColdStartVaultGuard::watch(&small.path);
+        let _large_guard = subject::ColdStartVaultGuard::watch(&large.path);
         scale_verdict(
             iterations,
-            || Ok((small.clone(), large.clone())),
+            || Ok((small, large)),
             |vault, run| {
                 subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
             },
         )
-    })();
+    });
     match verdict {
         Ok(line) => {
             println!("{line}");
