@@ -1,12 +1,19 @@
 # ADR-0014: Cold start is budgeted as two terms, one of which is not ours
 
-**Status:** proposed · **Date:** 2026-09-08 · **Serves:** NFR-PRF-01, C-06, C-07, NFR-PRF-08
+**Status:** accepted · **Date:** 2026-09-08 · **Serves:** NFR-PRF-01, C-06, C-07, NFR-PRF-08
 
-**Read this before citing it: the three consultations in §Objections were still outstanding
-when this was written, and if it merged in that state they were outstanding at merge.** The
-shape below is settled; two of the answers can still move §Decision 4's allocation and the
-placement of one boundary. A reader who skims to §Decision should know that much without
-reaching the bottom.
+**Accepted on task #100's figures.** All three consultations in §Objections are answered, and
+the one input this ADR reserved the right to be wrong about — `S_front`'s spread, which
+§Decision 4's allocation depends on — is now measured. **§Decision 5's rule has been applied
+and produced a non-empty interval, so the split yields a binding budget rather than the
+escalation its empty-interval clause provides for.** The numbers and their bounds are in
+§Decision 7, added on acceptance.
+
+**What is still true of every figure here: the basis travels with it, and two of the basis
+clauses are new.** #100's figures were taken with the paint mark **unguarded** (F-397: task
+#113 is not on main) and with the harness **not consuming** the paint evidence at all (F-403).
+Neither invalidates the numbers; both are conditions a later reading has to match to be
+comparable.
 
 ## Context
 
@@ -206,6 +213,44 @@ Clauses 1 and 2 push the number the same way. **A re-baseline attested on this b
 bounded claim and must be written as one.** This bound is why NFR-PRF-01 was deliberately
 *not* re-baselined earlier (F-96); the owner has ruled to proceed, so the bound is recorded
 rather than resolved.
+
+### 7. What #100 measured, and the budget the rule produces
+
+Two independent batches of n=20, same binary, same 20k vault, same sitting,
+`concurrent_build_processes: 0` throughout (task #100).
+
+| Term | Batch 1 median / p95 | Batch 2 median / p95 |
+|---|---|---|
+| `S_main` = `S_pre` + `S_setup` | 3.4 / 4.6 ms | 3.4 / 4.0 ms |
+| `S_front` = `S_shell` + `S_settle` | 176.4 / 213.9 ms | 197.6 / 230.4 ms |
+| **`S` (the binding Serat term)** | — | **201.1 / 233.8 ms** |
+| `P` (platform, unbudgeted) | — | 1117 / 1687 ms |
+
+**§Decision 4's allocation survives and is confirmed rather than assumed.** `S_main` reads
+3.4 ms median in *both* batches with p95 between 4.0 and 4.6 — quiet enough to budget tightly,
+which is what §Decision 4 claimed of it from the old phase table whose basis turned out to be
+unreconstructable. `S_front` moves 176→198 ms median and 214→230 ms p95 across batches: about
+13% and 8%. That is the spread the allocation needed and it is small enough that the two
+sub-terms want separate budgets, as §Decision 4 said.
+
+**§Decision 5's rule, applied.** `s95` = **233.8 ms**. The floor is `s95 × 1.3` = **303.9 ms**;
+the ceiling is **400 ms**. The interval **[304, 400] is non-empty**, with 96 ms of room.
+**So the empty-interval clause does not fire and the split produces a binding budget** — which
+was never guaranteed when the clause was written, and is the result that makes this a split
+rather than a slackening in fact rather than in intention.
+
+**Recommended to product-analyst for #104: 350 ms**, sitting above the floor with margin for a
+tail three batches cannot bound (F-327) and well below the ceiling, so it remains a tightening
+of the 400 ms that used to govern a strictly larger quantity. The number is theirs; the
+interval is not.
+
+**The strongest empirical result is not any of the above.** #100 reports the aggregate scalars
+at roughly **97% within-batch spread and 19% cross-batch**, at zero build contention — while
+`S` moves about 8% on p95 across batches. **The term this ADR made binding is measurable and
+the term it declined to budget is not.** That is the case for the split arriving from the
+instrument rather than from the argument, and it is a better defence of §Decision 3 than
+§Decision 3 gave itself. It also means the aggregate scalars cannot serve as a gate in their
+current form whatever budget is set on them, which is #101's problem and not this ADR's.
 
 ## Consequences
 
