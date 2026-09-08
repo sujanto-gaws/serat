@@ -100,11 +100,19 @@ mod tests {
              going red"
         );
         assert!(
-            !csp.contains("connect-src"),
-            "tauri.conf.json's CSP now sets connect-src explicitly (was {csp:?}) — a \
-             connect-src directive stops falling back to default-src and takes over \
-             T-02's enforcement on its own, so confirm the new value is 'self' or \
-             narrower before trusting it"
+            directives.contains(&"connect-src ipc: http://ipc.localhost"),
+            "tauri.conf.json's CSP no longer pins connect-src to the canonical narrow \
+             value (was {csp:?}) — task #117 / F-423(c): with no connect-src directive \
+             the value fell back to default-src 'self', which blocks the event|listen \
+             IPC call @tauri-apps/api/event's listen() makes, so onIndexStatus()'s push \
+             subscription was silently dead in a real WebView2 window. `ipc: \
+             http://ipc.localhost` is Tauri's own documented minimal directive for its \
+             IPC channel (tauri-utils-2.9.3/src/config.rs:2741) — the narrowest value \
+             that restores the call without opening connect-src to anything else. \
+             T-02's enforcement moves from default-src's fallback to this directive \
+             once it is set explicitly, so a wider value here would take over that \
+             enforcement silently; confirmed with vue-frontend-dev that nothing in \
+             app/src makes any other network-shaped call (F-423(c), #117)."
         );
     }
 
