@@ -593,6 +593,15 @@ pub fn app_binary() -> Result<PathBuf, String> {
 /// for a reason the guard cannot see -- its own doc comment named that exact
 /// hazard one paragraph before doing it anyway. Kept this version because it
 /// is strictly safer and ships with tests exercising both branches.
+///
+/// **Scope: guards one batch's own side effect, not arbitrary concurrent writers.**
+/// `created_by_this_batch` is computed once, from a single existence check at
+/// [`ColdStartVaultGuard::watch`] time, and is never re-evaluated. It cannot distinguish "this
+/// batch's own `serat.exe` created `.serat/` after `watch()`" from "an unrelated concurrent
+/// process created it after `watch()`" -- both look identical and both are removed at drop. That
+/// is by design for the single-process batches this crate runs (F-401's own hazard is one
+/// process, not several racing), and it is not a promise this guard makes about arbitrary
+/// concurrent callers.
 pub(crate) struct ColdStartVaultGuard {
     serat_dir: PathBuf,
     created_by_this_batch: bool,
@@ -966,26 +975,25 @@ mod tests {
         std::fs::remove_dir_all(&vault).ok();
     }
 
-    #[test]
-    fn a_guard_taken_before_a_pre_existing_dot_serat_is_created_still_protects_it() {
-        // Ordering matters: watch() must record whether .serat/ existed at
-        // the moment it was taken, not at drop time. If a second concurrent
-        // caller created .serat/ between watch() and drop() for an unrelated
-        // reason, this guard's own answer must still be "I did not create
-        // this" from what it observed when it started watching.
-        let vault = scratch_vault_dir("ordering");
-        let serat_dir = vault.join(".serat");
-        assert!(!serat_dir.exists());
-
-        let guard = ColdStartVaultGuard::watch(&vault);
-        // Nothing created .serat/ yet -- this guard did create it in spirit,
-        // so dropping should remove it. Assert the flag the guard itself
-        // computed rather than re-deriving it, so the test is pinned to
-        // watch()'s observation rather than to drop()'s filesystem state.
-        assert!(guard.created_by_this_batch);
-        drop(guard);
-        std::fs::remove_dir_all(&vault).ok();
-    }
+    // `a_guard_taken_before_a_pre_existing_dot_serat_is_created_still_protects_it` stood here and
+    // is removed rather than fixed in place -- code-reviewer's SHOULD-FIX (F-107's shape). Its
+    // comment claimed the guard "must still answer 'I did not create this'" for a `.serat/` a
+    // *second, concurrent* caller creates between `watch()` and `drop()`. The body never set up
+    // that scenario: it called `watch()` on an empty vault, asserted `created_by_this_batch`
+    // (true), and dropped -- which is `a_guard_removes_dot_serat_it_created_on_drop` with the
+    // internal field asserted directly instead of the filesystem effect. No mutation kills it
+    // that the removes-own-on-drop and cleans-up-on-early-return tests do not already kill.
+    //
+    // Chose "fix the comment" over "fix the code" and then chose deletion over a corrected
+    // comment, because the property the comment described is not one this guard can provide.
+    // `created_by_this_batch` is computed once, at `watch()` time, from a single existence check,
+    // and is never re-evaluated -- so the guard has no way to tell "this batch's own `serat.exe`
+    // created `.serat/` after watch()" apart from "an unrelated concurrent process created it
+    // after watch()". Both look identical and both are removed at drop. That is the guard's
+    // documented contract (see `ColdStartVaultGuard`'s own doc comment: it guards a single
+    // batch's own side effect, not arbitrary concurrent writers), so a test claiming it
+    // "protects" the concurrent case would be asserting a property that does not hold, which is
+    // worse than asserting nothing.
 
     // ------------------------------------------------------ T-07 / task #30
 
