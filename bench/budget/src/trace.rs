@@ -120,19 +120,48 @@ pub struct StartupTrace {
     /// `PerformanceObserver` and reports beside the two `requestAnimationFrame`
     /// marks (task #108, task #114). **Not required and not validated by
     /// [`StartupTrace::validate`]** -- F-397: nothing yet asserts that
-    /// `mark_first_paint`'s call site passes this rather than a placeholder,
-    /// and F-403: `raf1_ms`/`raf2_ms` reach no Rust parameter on main, so this
-    /// harness cannot check the conjunction ADR-0014 calls for. Carried here
-    /// so a caller can report the value the app claims, explicitly labelled as
-    /// unguarded, rather than the harness silently discarding evidence it
+    /// `mark_first_paint`'s call site passes this rather than a placeholder.
+    /// `raf1_ms`/`raf2_ms` now do reach a Rust parameter (`commands::mark_first_paint`
+    /// -> `startup::validate_paint_evidence`, closing F-403's original gap) and are
+    /// checked there against each other and against this value, but neither crosses
+    /// back into the trace this harness reads -- see [`StartupTrace::raf2_ms`].
+    /// Carried here so a caller can report the value the app claims, explicitly
+    /// labelled as unguarded, rather than the harness silently discarding evidence it
     /// receives.
     pub paint_evidence_ms: Option<f64>,
+    /// The second `requestAnimationFrame` callback's own timestamp, on the same
+    /// browser navigation-origin clock as [`StartupTrace::paint_evidence_ms`] --
+    /// F-411. **Not required, not validated, and not compared against any
+    /// `t0_to_*` field** (those are on the harness's `t0` clock; this and
+    /// `paint_evidence_ms` are not). Its only use here is
+    /// [`StartupTrace::frame_to_paint_gap_ms`], a diagnostic with no assertion on
+    /// it: architect's ruling on F-411 was that a real rejection needs a
+    /// separating threshold this project does not yet have the samples to set
+    /// (honest gap ~51-65 ms, attack bound ~184 ms, against F-405's ~19%
+    /// unexplained batch spread), so building one now would be an eleventh
+    /// guard-that-cannot-fire rather than a working check. This field exists to
+    /// grow the distribution a future reading could set a real threshold from.
+    /// `None` on any trace taken before the field existed, or if the app never
+    /// sent it.
+    pub raf2_ms: Option<f64>,
 }
 
 impl StartupTrace {
     /// `window_visible - window_created`.
     pub fn paint_gap_ms(&self) -> f64 {
         self.window_visible_ms - self.window_created_ms
+    }
+
+    /// `paint_evidence_ms - raf2_ms` -- F-411's diagnostic, reported and never
+    /// asserted. Both operands are on the browser's own navigation-origin clock
+    /// (see their doc comments), so the difference is meaningful without any
+    /// cross-clock reconciliation to `t0`, unlike every `t0_to_*` field on this
+    /// struct. `None` when either input is absent, which is the normal case on
+    /// any trace taken before `raf2_ms` was wired through (or against a build
+    /// that does not send it).
+    #[must_use]
+    pub fn frame_to_paint_gap_ms(&self) -> Option<f64> {
+        Some(self.paint_evidence_ms? - self.raf2_ms?)
     }
 
     /// The window-painted mark as a `Duration`.
@@ -172,6 +201,7 @@ impl StartupTrace {
             vault: string(line, "vault").unwrap_or_default(),
             last_open: string(line, "last_open").unwrap_or_default(),
             paint_evidence_ms: number(line, "paint_evidence_ms"),
+            raf2_ms: number(line, "raf2_ms"),
         };
         trace.validate()?;
         Ok(trace)
@@ -399,6 +429,58 @@ mod tests {
         assert_eq!(t.vault, "bench/vaults/vault-20k");
         assert!((t.paint_gap_ms() - 215.6).abs() < 0.001);
         assert_eq!(t.window_visible(), Duration::from_secs_f64(0.3124));
+    }
+
+    // ---------------------------------------------------------------- F-411
+
+    #[test]
+    fn raf2_ms_and_the_frame_to_paint_gap_are_absent_when_the_app_never_sent_them() {
+        // good() carries neither field, which is every trace taken before this task
+        // and every build that predates the app-side wiring test-engineer asked
+        // tauri-app-dev for. Absence must not be an error -- both are diagnostic.
+        let t = StartupTrace::parse(&good()).expect("valid trace");
+        assert_eq!(t.paint_evidence_ms, None);
+        assert_eq!(t.raf2_ms, None);
+        assert_eq!(t.frame_to_paint_gap_ms(), None);
+    }
+
+    #[test]
+    fn the_frame_to_paint_gap_is_reported_once_both_operands_are_present() {
+        let line = good().replace(
+            "\"schema_version\": 1}",
+            "\"paint_evidence_ms\": 184.0, \"raf2_ms\": 120.6, \"schema_version\": 1}",
+        );
+        let t = StartupTrace::parse(&line).expect("valid trace");
+        assert_eq!(t.paint_evidence_ms, Some(184.0));
+        assert_eq!(t.raf2_ms, Some(120.6));
+        assert!((t.frame_to_paint_gap_ms().expect("both present") - 63.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_frame_to_paint_gap_is_absent_when_only_one_operand_is_present() {
+        // paint_evidence_ms alone (task #100's actual traces, taken before raf2_ms
+        // existed) must not synthesise a gap from a missing second operand.
+        let line = good().replace(
+            "\"schema_version\": 1}",
+            "\"paint_evidence_ms\": 184.0, \"schema_version\": 1}",
+        );
+        let t = StartupTrace::parse(&line).expect("valid trace");
+        assert_eq!(t.paint_evidence_ms, Some(184.0));
+        assert_eq!(t.raf2_ms, None);
+        assert_eq!(t.frame_to_paint_gap_ms(), None);
+    }
+
+    #[test]
+    fn raf2_ms_is_not_required_and_does_not_gate_validation() {
+        // F-411 is explicit: no assertion. A trace with every required mark but no
+        // raf2_ms must still validate -- the whole point is that this is a column,
+        // not a seventh rejection alongside the existing six.
+        let line = good().replace(
+            "\"schema_version\": 1}",
+            "\"paint_evidence_ms\": 184.0, \"schema_version\": 1}",
+        );
+        StartupTrace::parse(&line)
+            .expect("raf2_ms absence must not reject an otherwise-valid trace");
     }
 
     // ---------------------------------------------------------------- #106 / F-381

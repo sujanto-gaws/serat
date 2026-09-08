@@ -78,6 +78,7 @@ fn main() -> ExitCode {
     let mut vault_usable = vec![];
     let mut paint_evidence: Vec<f64> = vec![];
     let mut paint_evidence_missing = 0usize;
+    let mut frame_to_paint_gap: Vec<f64> = vec![];
     let mut raw_lines = Vec::with_capacity(traces.len());
 
     for (run, t) in traces.iter().enumerate() {
@@ -99,13 +100,16 @@ fn main() -> ExitCode {
             Some(v) => paint_evidence.push(v),
             None => paint_evidence_missing += 1,
         }
+        if let Some(gap) = t.frame_to_paint_gap_ms() {
+            frame_to_paint_gap.push(gap);
+        }
         raw_lines.push(format!(
             "{{\"run\":{run},\"p_load_ms\":{:.1},\"s_pre_ms\":{:.1},\"p_builder_ms\":{:.1},\
              \"s_setup_ms\":{:.1},\"p_webview_ms\":{:.1},\"s_shell_ms\":{:.1},\
              \"s_settle_ms\":{:.1},\"s_main_ms\":{:.1},\"s_front_ms\":{:.1},\
              \"serat_term_ms\":{:.1},\"platform_term_ms\":{:.1},\
              \"window_visible_ms\":{:.1},\"vault_usable_ms\":{:.1},\
-             \"paint_evidence_ms\":{}}}",
+             \"paint_evidence_ms\":{},\"raf2_ms\":{},\"frame_to_paint_gap_ms\":{}}}",
             terms.p_load_ms,
             terms.s_pre_ms,
             terms.p_builder_ms,
@@ -120,6 +124,12 @@ fn main() -> ExitCode {
             t.window_visible_ms,
             t.vault_usable_ms,
             t.paint_evidence_ms
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "null".to_string()),
+            t.raf2_ms
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "null".to_string()),
+            t.frame_to_paint_gap_ms()
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "null".to_string()),
         ));
@@ -148,9 +158,8 @@ fn main() -> ExitCode {
     report_line("visible", &window_visible);
     report_line("usable", &vault_usable);
     println!(
-        "paint_evidence_ms (F-397: unguarded: mark_first_paint's call site is not tested against \
-         it. F-403: raf1_ms/raf2_ms reach no Rust parameter, so the conjunction is not enforced \
-         here either):"
+        "paint_evidence_ms (F-397: unguarded here -- mark_first_paint's call site is not tested \
+         against it by this harness):"
     );
     if paint_evidence.is_empty() {
         println!("  none of {} runs carried a value", traces.len());
@@ -161,6 +170,24 @@ fn main() -> ExitCode {
             paint_evidence.len(),
             traces.len(),
             paint_evidence_missing
+        );
+    }
+    println!(
+        "frame_to_paint_gap_ms = paint_evidence_ms - raf2_ms (F-411: reported, not asserted -- \
+         no threshold exists that separates an honest run from the attack F-388 describes \
+         without more samples than this run alone can provide):"
+    );
+    if frame_to_paint_gap.is_empty() {
+        println!(
+            "  none of {} runs carried both raf2_ms and paint_evidence_ms",
+            traces.len()
+        );
+    } else {
+        report_line("gap", &frame_to_paint_gap);
+        println!(
+            "  present on {}/{} runs",
+            frame_to_paint_gap.len(),
+            traces.len()
         );
     }
 
