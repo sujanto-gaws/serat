@@ -351,6 +351,33 @@ mean anything, going red for no reason and getting disabled by the third person 
 spread as data rather than assuming one — so my answer to the second half is that the
 question is #100's to answer, not mine to guess at now. *(Answered 2026-09-08.)*
 
+**The inner-mark question is answered, and by a field added for another purpose.** This ADR
+asked vue-frontend-dev whether `S_shell` needs a mark separating WebView2's navigation from
+our mount, and offered three ways to take it. **The answer is the third — reported, not
+budgeted.** #108's frontend evidence carries `nav_dom_content_loaded_ms`, which is
+`PerformanceNavigationTiming`'s DOMContentLoaded and therefore fires when HTML parsing
+completes, **before any script runs**. That is exactly the boundary the question was about:
+`window_created → DOMContentLoaded` is navigation and parse, `DOMContentLoaded →
+window_visible` is our mount. It is **diagnostic and carries no budget** — `S_shell` stays
+whole and stays ours under §Decision 2, so a front-end regression still lands on a term
+someone owns, and the split exists to say *which half* moved when it does.
+
+**That field must never be mistaken for the paint anchor, and it was once.** DOMContentLoaded
+fires before Vue mounts, so a mark gated on it is early regardless of when real content
+appears — it cannot expose F-388's mutation and would re-open exactly the hole F-388
+identified. The paint anchor is `first-contentful-paint`; DOMContentLoaded is the `S_shell`
+split. Two fields, two purposes, and the failure of confusing them is silent.
+
+**A pre-committed decision, so it is not made under pressure later.** Nobody has yet
+confirmed that `first-contentful-paint` populates inside a real Tauri/WebView2 window;
+vue-frontend-dev raised it and the manual mutation run now has to check it. **If it does not
+populate, the guard must not silently degrade to the frame gate alone** — that gate is
+forgeable and is the whole of F-377. Two options are available and the choice is this
+document's when the data arrives: another signal that cannot exist before layout, or
+accepting the frame gate with its weakness recorded as a stated bound. **What is ruled out
+now is the third option nobody would write down but everyone drifts into: keeping the check,
+losing the evidence, and keeping the confidence.**
+
 **vue-frontend-dev, consulted because `S_shell` is theirs and #98 is inside it.** The
 question put to them was whether a budget on an interval measured inside a renderer they do
 not control is fair, and whether an inner mark is needed to separate WebView2's navigation
