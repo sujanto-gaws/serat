@@ -326,7 +326,13 @@ P0 cannot distinguish the two futures that follow, and both are P1's:
   structurally unmeetable is a constraint being tested rather than a budget being missed.
 
 **Neither is being decided now, and neither may be quietly dropped.** What settles it is
-measuring the same seven-term partition on the other two webviews. That is one row in
+measuring the same seven-term partition on the other two webviews. **#112 is a precondition of
+that plan and was not visible when it was written:** #108 types the paint field
+`number | null` while #105 takes a bare `f64`, so a genuine null produces **no trace at all**.
+On any webview without Paint Timing, cold start therefore becomes **unmeasurable rather than
+merely unguarded** — and "run the partition on WKWebView and WebKitGTK" assumes a trace can be
+taken there. It does not block P0, since F-393 measured the entry landing on WebView2, but the
+P1 plan above is contingent on #112 and should be read that way. That is one row in
 §Open design questions and it should stay there until someone has run it.
 
 ## Objections recorded
@@ -446,6 +452,18 @@ one asked for — §3.4's property still holds, because the first paint now **is
 shell — and the hazard described above never materialised. **It also means the mechanism's
 safety now rests on a markup decision rather than on the mechanism**, which is what the
 paragraph on F-393 below is about.
+
+**F-396 checked that against #98's actual tree and made the survival reason stronger than the
+one given here.** `app/index.html` and the built output both carry an empty `<div id="app">`,
+and `shell.css` paints only a background colour — which the Paint Timing spec excludes from
+*contentful* paint by definition. **So on this tree FCP does attest that our shell rendered**,
+and the hazard argued above is not merely unrealised, it is absent. What survives is a
+different and better objection: **#105's guard lives in `crates/serat-app` and its soundness
+depends on a property of `app/index.html` that nothing asserts** — that the document stays
+contentless until Vue fills it. That is a cross-crate implicit dependency with no check
+across the boundary, and it is a stronger reason to keep the conjunction than the one this
+ADR originally gave, because it survives someone adding a splash screen where "FCP fires on
+the skeleton" only described a tree that no longer exists.
 
 The resolution is **conjunction rather than replacement**: keep the gate that ties the mark
 to our shell having rendered, and add the paint entry as the evidence that cannot be
