@@ -169,6 +169,38 @@ pub const PRF01_VAULT_USABLE: Budget = Budget {
     interval: "process spawn to the vault-usable mark, as task D2 defines it",
 };
 
+/// NFR-PRF-01, re-baselined (task #104, ADR-0014 §Decision 3): the binding
+/// quantity from the split forward is the Serat term, not either of the two
+/// legacy marks above. [`measure_serat_term`] keeps `PRF01_WINDOW_VISIBLE` and
+/// `PRF01_VAULT_USABLE`'s intervals alive as reported, unasserted series on
+/// this same measurement — F-407 found the aggregate moves ~19%
+/// batch-to-batch against ~8% for the Serat term, so it cannot decide a pass
+/// at any budget and gating it manufactures a red job that eventually gets
+/// disabled, taking the honest reporting with it.
+///
+/// **Task #107 is additive only.** `prf01-cold-start` still asserts the two
+/// legacy marks above; demoting them to reported-only is task #118, tracked
+/// separately because F-443 found it is a real gap between what the PRD says
+/// is gated and what CI currently gates, and because whether §3.4's
+/// scale-check moves to this job or stays with the legacy one is architect's
+/// call, not bench/'s.
+pub const PRF01_SERAT_TERM: Budget = Budget {
+    id: "prf01-serat-term",
+    requirement: "NFR-PRF-01",
+    statement: "Of the interval from process start to an interactive window and a fully usable \
+                vault, the portion Serat's own code is responsible for -- main-thread setup \
+                plus the front end's mount, first composited frame and settle -- shall not \
+                exceed 350ms at p95",
+    statistic: Statistic::P95,
+    iterations: 20,
+    product_limit_ms: 350.0,
+    ci_limit_ms: None,
+    vault: "20k",
+    interval: "S_pre + S_setup + S_shell + S_settle (ADR-0014 Decision 1's seven-mark \
+               partition, Decision 3's binding sum) -- the platform term and the two legacy \
+               marks are reported beside it, never asserted (F-407)",
+};
+
 /// NFR-PRF-03.
 pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
     id: "prf03-save-to-index",
@@ -229,9 +261,19 @@ pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), Stri
 /// Every P0 budget, so a CI configuration review (NFR-PRF-08's acceptance
 /// criterion is `Inspect`) can check the list against the PRD rather than
 /// against somebody's memory.
+///
+/// **Five entries, not four, and that count is provisional (task #118, F-443).**
+/// The PRD's re-baseline (task #104) says only `PRF01_SERAT_TERM` is a CI gate
+/// for NFR-PRF-01; `PRF01_WINDOW_VISIBLE` and `PRF01_VAULT_USABLE` are still
+/// listed here because `prf01-cold-start` still asserts them and this list is
+/// a review of what CI actually gates, not of what the PRD says should be
+/// gated -- the two are supposed to disagree right now, and #118 is what
+/// closes the gap by removing the two legacy entries once their job stops
+/// asserting them.
 pub const P0_BUDGETS: &[&Budget] = &[
     &PRF01_WINDOW_VISIBLE,
     &PRF01_VAULT_USABLE,
+    &PRF01_SERAT_TERM,
     &PRF03_SAVE_TO_INDEX,
     &PRF04_FULL_REBUILD,
 ];
@@ -2058,6 +2100,80 @@ pub fn measure_cold_start(
     Ok((Measurement::new(visible), Measurement::new(usable)))
 }
 
+/// NFR-PRF-01's binding measurement since the #104 re-baseline (task #107):
+/// the Serat term alone is asserted; the platform term and both legacy marks
+/// are reported beside it and never asserted (F-407 — the aggregate moves
+/// ~19% batch-to-batch against ~8% for the Serat term, so it cannot decide a
+/// pass at any budget).
+///
+/// Reuses [`subject::cold_start_traces`] — the same guarded batch, the same
+/// `--exit-after-ready` spawn, the same six-rejection validation in
+/// [`trace`] that [`measure_cold_start`] and `prf01-cold-start-terms`
+/// (task #100's diagnostic) already read — so this is a second reduction of
+/// the same data, not a second measurement method.
+///
+/// # Errors
+/// As [`measure_cold_start`].
+pub fn measure_serat_term(
+    vault: &VaultUnderTest,
+    iterations: usize,
+) -> Result<Measurement, String> {
+    measure_serat_term_with(vault, iterations, subject::cold_start_traces)
+}
+
+/// As [`measure_serat_term`], against an injected batch of traces.
+///
+/// Split out for the same reason [`measure_save_to_index_with`] is: the
+/// reduction from seven marks to four reported series is the logic worth
+/// testing, and exercising it through the real seam needs a compiled
+/// `serat.exe` and a real vault on disk.
+///
+/// # Errors
+/// As [`measure_serat_term`].
+pub fn measure_serat_term_with<F>(
+    vault: &VaultUnderTest,
+    iterations: usize,
+    cold_start_traces: F,
+) -> Result<Measurement, String>
+where
+    F: FnOnce(&Path, usize) -> Result<Vec<trace::StartupTrace>, String>,
+{
+    let traces = cold_start_traces(&vault.path, iterations)?;
+
+    let mut serat_term = Samples::new();
+    let mut platform_term = Samples::new();
+    let mut window_visible = Samples::new();
+    let mut vault_usable = Samples::new();
+    for t in &traces {
+        let terms = t.terms();
+        serat_term.push(Duration::from_secs_f64(terms.serat_term_ms() / 1000.0));
+        platform_term.push(Duration::from_secs_f64(terms.platform_term_ms() / 1000.0));
+        window_visible.push(t.window_visible());
+        vault_usable.push(t.vault_usable());
+    }
+
+    Ok(Measurement::new(serat_term)
+        .reporting(
+            "platform-term",
+            "P_load + P_builder + P_webview -- unbudgeted; no change confined to this \
+             repository moves it (ADR-0014 Decision 3).",
+            platform_term,
+        )
+        .reporting(
+            "window-visible (legacy total)",
+            "The pre-split aggregate PRF01_WINDOW_VISIBLE names. Reported, not gated here \
+             (F-407: moves ~19% batch-to-batch against ~8% for the Serat term, so it cannot \
+             decide a pass at any budget). Still asserted by prf01-cold-start until task #118.",
+            window_visible,
+        )
+        .reporting(
+            "vault-usable (legacy total)",
+            "The pre-split aggregate PRF01_VAULT_USABLE names. Reported, not gated here -- \
+             same reason as window-visible, and the same #118 caveat.",
+            vault_usable,
+        ))
+}
+
 /// Print an outcome and write its result file.
 pub fn report(outcome: &Outcome) {
     print!("{}", outcome.to_report());
@@ -2151,11 +2267,19 @@ mod tests {
         // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
         // confirms each budget has an asserting job". This is that review, as a
         // test, so the list cannot drift from the PRD unnoticed.
-        assert_eq!(P0_BUDGETS.len(), 4);
+        // 5, not 4 (task #107, F-443): PRF01_WINDOW_VISIBLE and
+        // PRF01_VAULT_USABLE are provisionally both still here, alongside the
+        // new PRF01_SERAT_TERM, until task #118 removes the two legacy
+        // entries once their job stops asserting them.
+        assert_eq!(P0_BUDGETS.len(), 5);
         assert_eq!(PRF01_WINDOW_VISIBLE.product_limit_ms, 400.0);
         assert_eq!(PRF01_WINDOW_VISIBLE.iterations, 20);
         assert_eq!(PRF01_VAULT_USABLE.product_limit_ms, 1_000.0);
         assert_eq!(PRF01_VAULT_USABLE.iterations, 20);
+        // ADR-0014's derived interval is [s95*1.3, 400ms] = [304, 400]; 350 sits
+        // inside it with room on both sides (task #104's own arithmetic).
+        assert_eq!(PRF01_SERAT_TERM.product_limit_ms, 350.0);
+        assert_eq!(PRF01_SERAT_TERM.iterations, 20);
         assert_eq!(PRF03_SAVE_TO_INDEX.product_limit_ms, 50.0);
         assert_eq!(PRF03_SAVE_TO_INDEX.iterations, 1_000);
         assert_eq!(PRF04_FULL_REBUILD.product_limit_ms, 30_000.0);
@@ -2919,6 +3043,104 @@ mod tests {
     fn a_failed_save_measurement_propagates_rather_than_being_absorbed() {
         let err = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Err("boom".into()))
             .expect_err("a failed save path is not a measurement");
+        assert_eq!(err, "boom");
+    }
+
+    // --------------------------------------------------------------- #107
+
+    /// A directly-constructed trace, bypassing `StartupTrace::parse` and its
+    /// six rejections -- this only exercises `measure_serat_term_with`'s own
+    /// reduction, not parsing, so the marks only need to be internally
+    /// consistent for `Terms::from_marks`, not a JSON line.
+    fn fake_trace(
+        main: f64,
+        state_ready: f64,
+        runtime_ready: f64,
+        setup_done: f64,
+        window_created: f64,
+        window_visible: f64,
+        vault_usable: f64,
+    ) -> trace::StartupTrace {
+        trace::StartupTrace {
+            main_ms: main,
+            state_ready_ms: state_ready,
+            runtime_ready_ms: runtime_ready,
+            setup_done_ms: setup_done,
+            window_created_ms: window_created,
+            window_visible_ms: window_visible,
+            vault_usable_ms: vault_usable,
+            t0_source: "harness".to_string(),
+            profile: "release".to_string(),
+            vault: "20k".to_string(),
+            last_open: String::new(),
+            paint_evidence_ms: None,
+            raf2_ms: None,
+        }
+    }
+
+    #[test]
+    fn measure_serat_term_asserts_the_serat_term_and_reports_three_other_series() {
+        // main=10, state_ready=15 (S_pre=5), runtime_ready=20 (P_builder=5),
+        // setup_done=30 (S_setup=10), window_created=40 (P_webview=10),
+        // window_visible=50 (S_shell=10), vault_usable=70 (S_settle=20).
+        // Serat term = 5+10+10+20 = 45; platform term = 10+5+10 = 25; sum = 70.
+        let a = fake_trace(10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 70.0);
+        // A second trace, scaled up, so the reduction is seen to run per-trace
+        // rather than reusing the first one's numbers.
+        let b = fake_trace(20.0, 30.0, 40.0, 60.0, 80.0, 100.0, 140.0);
+
+        let m = measure_serat_term_with(&a_vault(), 2, |_, _| Ok(vec![a.clone(), b.clone()]))
+            .expect("two consistent traces are accepted");
+
+        assert_eq!(
+            m.samples.values(),
+            &[45.0, 90.0],
+            "the asserted series is the Serat term"
+        );
+        assert_eq!(m.reported.len(), 3);
+        let labels: Vec<&str> = m.reported.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"platform-term"), "{labels:?}");
+        assert!(
+            labels.contains(&"window-visible (legacy total)"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"vault-usable (legacy total)"),
+            "{labels:?}"
+        );
+        assert_eq!(
+            m.reported
+                .iter()
+                .find(|r| r.label == "platform-term")
+                .expect("present")
+                .samples
+                .values(),
+            &[25.0, 50.0]
+        );
+        assert_eq!(
+            m.reported
+                .iter()
+                .find(|r| r.label == "window-visible (legacy total)")
+                .expect("present")
+                .samples
+                .values(),
+            &[50.0, 100.0]
+        );
+        assert_eq!(
+            m.reported
+                .iter()
+                .find(|r| r.label == "vault-usable (legacy total)")
+                .expect("present")
+                .samples
+                .values(),
+            &[70.0, 140.0]
+        );
+    }
+
+    #[test]
+    fn a_failed_serat_term_measurement_propagates_rather_than_being_absorbed() {
+        let err = measure_serat_term_with(&a_vault(), 1, |_, _| Err("boom".into()))
+            .expect_err("a failed cold-start batch is not a measurement");
         assert_eq!(err, "boom");
     }
 

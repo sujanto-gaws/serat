@@ -85,6 +85,11 @@ jobs:
 
   prf01-cold-start:
     name: "NFR-PRF-01 · window < 400 ms, usable < 1 s, p95 over 20 runs"
+    # Legacy, and provisionally still gating (task #118, F-443): the PRD's
+    # re-baseline says these two marks are reported, not gated, but demoting
+    # them here is a separate task from #107, which only adds prf01-serat-term
+    # below. Until #118 lands, NFR-PRF-01 is double-gated by design, not by
+    # oversight.
     needs: vault
     runs-on: windows-latest
     steps:
@@ -96,6 +101,22 @@ jobs:
         if: always()
         with:
           name: prf01-cold-start
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  prf01-serat-term:
+    name: "NFR-PRF-01 · Serat term < 350 ms p95 (task #104's binding gate)"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p budget --bin prf01-serat-term -- --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf01-serat-term
           path: bench/out/budgets/
           if-no-files-found: ignore
 
