@@ -37,6 +37,12 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
+> ## ⛔ MEASUREMENT WINDOW: **OPEN** — task #100 (`prf01-cold-start`), test-engineer
+>
+> **No `cargo` build/test/clippy, no `npm` build/test, no doclint, no mutation runs, by anyone except the measuring teammate.** Editing, committing, reading and writing documents are all fine. If you have a build running, kill it and tell the lead.
+>
+> **Check this line before you compile anything.** The lead declares windows and has now failed three times in one window to tell every teammate it binds — tauri-app-dev-2, vue-frontend-dev and code-reviewer each ran builds inside this one in good faith, because nobody had told them. **A freeze announced only to the people the lead remembered is not a freeze**, and the fix is that it lives here, where you are already looking, rather than in a message you may never receive. The lead updates this line when a window opens and closes.
+
 ## Resume task list (from #90)
 
 Two rulings by the owner, taken 2026-09-08, set this wave's shape.
