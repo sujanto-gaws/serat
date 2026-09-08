@@ -75,23 +75,40 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
 /// `first-contentful-paint` `PerformancePaintTiming` entry — the Paint Timing API does
 /// not report one until content has actually been painted, which is what makes this
 /// argument evidence rather than a timestamp we simply trust (F-377; see
-/// [`crate::startup`] and `webview/boot.js`). Returns the mark in milliseconds since
+/// [`crate::startup`] and `app/src/startup.ts`). Returns the mark in milliseconds since
 /// t0, on this process's own clock, so the shell can show its own number.
 ///
 /// **This is the only way `t0_to_window_visible_ms` is ever set.** Nothing in Rust
 /// stamps it, and this command refuses to stamp it from anything but genuine evidence.
 ///
+/// Task #112 (F-396) adds two things to what task #105 built. `first_contentful_paint_ms`
+/// is now `Option` because a webview with no Paint Timing support genuinely has nothing
+/// to send — that case must be a *typed, recorded* rejection a reader can tell apart
+/// from "the guard was never reached", not a raw IPC deserialisation failure against a
+/// mandatory `f64` that produces no trace and no explanation at all. And
+/// `raf1_ms`/`raf2_ms` — the two `requestAnimationFrame` callbacks' own timestamps,
+/// already sent by `app/src/startup.ts` and previously ignored here — are now checked
+/// against the paint entry: F-396(b) found that `first-contentful-paint` alone is sound
+/// only as long as `app/index.html` stays contentless, a property nothing in this crate
+/// asserts and that lives in a different file from this guard. See
+/// [`startup::validate_paint_evidence`] for what the check actually verifies.
+///
 /// # Errors
 ///
-/// [`startup::PaintEvidenceRejected`] if the argument is not a positive, finite value —
-/// a call with nothing real to send is refused rather than defaulted, including on a
-/// platform where the Paint Timing API does not exist at all.
+/// [`startup::PaintEvidenceRejected`] if the paint entry is absent, if the two frame
+/// timestamps are not two distinct frames, or if the second frame precedes the paint
+/// entry by more than clock-quantisation noise can explain — a call with nothing real
+/// to send, or nothing consistent to send, is refused rather than defaulted, including
+/// on a platform where the Paint Timing API does not exist at all.
 #[tauri::command]
 pub fn mark_first_paint(
     state: State<'_, Arc<AppState>>,
-    first_contentful_paint_ms: f64,
+    first_contentful_paint_ms: Option<f64>,
+    raf1_ms: f64,
+    raf2_ms: f64,
 ) -> Result<f64, startup::PaintEvidenceRejected> {
-    state.startup.mark_first_paint(first_contentful_paint_ms)?;
+    let evidence = startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)?;
+    state.startup.mark_first_paint(evidence)?;
     Ok(state.startup.elapsed_ms())
 }
 
