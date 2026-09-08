@@ -66,6 +66,7 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 | 105 | `[P0/impl] Give the two startup marks a guard that can fail` | NFR-PRF-01, NFR-PRF-08 · F-377 · ADR-0014 | tauri-app-dev, architect on the mechanism | `crates/serat-app` **only** | — | **pending — blocks #98 review, #100, and the split being worth anything** |
 | 106 | `[P0/test] Parse all seven marks, assert the sum identity, reject an early paint mark` | NFR-PRF-01, NFR-PRF-08, C-06 · ADR-0014 · F-377, F-381 | test-engineer | `bench/budget/src/trace.rs`, `bench/budget/src/bin/prf01-cold-start.rs` — **the only task touching trace.rs** | — | **pending — blocks #100, #101 and #104** |
 | 107 | `[P0/test] Add the Serat-term budget job at the number #104 sets` | NFR-PRF-01, NFR-PRF-08, C-06 · ADR-0014 | test-engineer | `bench/budget/` | 104, 106 | pending |
+| 108 | `[P0/impl] Emit the post-composite paint evidence from the Vue mount` | NFR-PRF-01, NFR-PRF-08 · F-377, F-386 · ADR-0006, ADR-0014 | vue-frontend-dev | `app/src/startup.ts` | 98 | pending — paired with #105 |
 
 ### Lead rulings, 2026-09-08 (this file is the authority; act on it without further ack)
 
