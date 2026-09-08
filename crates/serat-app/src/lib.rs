@@ -182,7 +182,9 @@ fn run_save_benchmark(
             .read_file(ipc::ReadFileArgs {
                 path: (*path).to_owned(),
             })
-            .map_err(|err| format!("--bench-save-list: reading {path} before saving it: {err:?}"))?;
+            .map_err(|err| {
+                format!("--bench-save-list: reading {path} before saving it: {err:?}")
+            })?;
 
         let started = std::time::Instant::now();
         let written = state.write_file(ipc::WriteFileArgs {
@@ -728,8 +730,7 @@ mod tests {
     /// real save path that test proved reaches the index without the watcher. Not
     /// reused directly: that helper is private to `state.rs`'s own test module.
     fn open_fixture_for_save_benchmark(name: &str) -> (std::path::PathBuf, AppState) {
-        let dir =
-            std::env::temp_dir().join(format!("serat-app-lib-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("serat-app-lib-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(dir.join("10-projects/a.md"), "# A\n").expect("fixture");
@@ -770,11 +771,7 @@ mod tests {
         // A blank line and surrounding whitespace, deliberately: the parser must
         // skip the former and trim the latter rather than trying to save `""` or
         // `" 10-projects/a.md"` (which read_file would refuse as NotFound).
-        std::fs::write(
-            &list_path,
-            "10-projects/a.md\n\n  10-projects/b.md  \n",
-        )
-        .expect("list");
+        std::fs::write(&list_path, "10-projects/a.md\n\n  10-projects/b.md  \n").expect("list");
 
         let result = run_save_benchmark(&state, &list_path).expect("benchmark");
         assert_eq!(result.attempted, 2, "blank lines must not be attempts");
@@ -817,8 +814,11 @@ mod tests {
         let (dir, state) = open_fixture_for_save_benchmark("save-bench-bad-path");
 
         let list_path = dir.join("save-list.txt");
-        std::fs::write(&list_path, "10-projects/a.md\n10-projects/does-not-exist.md\n")
-            .expect("list");
+        std::fs::write(
+            &list_path,
+            "10-projects/a.md\n10-projects/does-not-exist.md\n",
+        )
+        .expect("list");
 
         let err = run_save_benchmark(&state, &list_path)
             .expect_err("a note that does not exist must abort the run");
