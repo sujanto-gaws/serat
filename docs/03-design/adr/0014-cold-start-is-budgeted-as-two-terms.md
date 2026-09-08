@@ -471,12 +471,25 @@ is that the precondition is asserted **nowhere**. A check on `app/index.html` pl
 is correct placement, not a split. Four properties have to hold and they do not have one
 enforcer between them:
 
-| Property | Enforced by |
-|---|---|
-| Two genuinely distinct frames occurred | `raf2_ms > raf1_ms`, in `crates/serat-app` |
-| The paint value is the browser's entry, not a substitute clock read | `first_contentful_paint_ms <= raf2_ms`, same place, **subject to the condition below** |
-| The frames were scheduled *after our mount* | **Nothing, from these timestamps.** Frontend review; it is not recoverable in Rust |
-| `app/index.html` stays contentless, so the paint entry means *our* paint | A **static** check over that file |
+| Property | Enforced today | To be enforced by #112 |
+|---|---|---|
+| Two genuinely distinct frames occurred | **nothing** | `raf2_ms > raf1_ms`, in `crates/serat-app` |
+| The paint value is the browser's entry, not a substitute clock read | **nothing** | `first_contentful_paint_ms <= raf2_ms`, same place, **subject to the condition below** |
+| The frames were scheduled *after our mount* | **Nothing, and nothing can.** Not recoverable from these timestamps in Rust or anywhere else; frontend review only | — |
+| `app/index.html` stays contentless, so the paint entry means *our* paint | **nothing** | A **static** check over that file |
+
+**The "today" column is not padding, and it is the reason this table has two columns instead
+of one.** Checked against the tree rather than assumed: `raf1`/`raf2` appear in **no Rust file**
+on main or on either #112 branch, and `mark_first_paint` takes `first_contentful_paint_ms: f64`
+alone. The frontend has sent `raf1Ms`/`raf2Ms` since #108 and **Tauri silently drops both**,
+because the command has no parameter to receive them.
+
+**So both halves of the conjunction appear to exist and the conjunction is in force nowhere.**
+The frontend gathers the frame evidence; the Rust side has a guard; nothing joins them. That is
+the most dangerous state this mechanism could be in, because every individual file reads as
+though the work is done — and F-388's entire history is people reasoning correctly from a
+plausible reading of one file. A single-column table headed *"Enforced by"* would have said
+exactly that, in the document that makes the rule against it. Found by code-reviewer at #109.
 
 **The third row is the boundary worth stating rather than papering over.** Whether the frames
 were scheduled after Vue mounted is not recoverable from three numbers, so `serat-app` cannot
