@@ -267,9 +267,20 @@ cost rather than a presentational one.
   (`crates/serat-app/src/startup.rs:189`), and §3.4 measures `painted → usable` at
   4.7–7.5 ms, so `painted` is **not** the term that settles the maximum. Moving it earlier
   by Δ therefore leaves `t_usable` untouched: `S_shell` shrinks by Δ, `S_settle` grows by
-  exactly Δ, and every sum is invariant. **An identity over contiguous intervals constrains
-  data integrity — a missing mark, a clock step — and says nothing about whether a mark
-  fired at the right event.** Moving an interior boundary redistributes time between two
+  exactly Δ, and every sum is invariant. **An identity over contiguous intervals says nothing about
+  whether a mark fired at the right event.**
+
+  **And it constrains less than the first version of this bullet claimed — test-engineer's
+  correction at #106, and it is worth taking in full.** This said the identity "constrains
+  data integrity — a missing mark, a clock step". It does not. Given that all seven marks
+  are required and that monotonicity is checked separately, the identity is a **telescoping
+  sum of consecutive differences, which equals the last minus the first for any seven
+  numbers at all, ordered or not.** It therefore **cannot fail on real data**. What it
+  guards is the harness's own field-to-term mapping — an edit that feeds the wrong field
+  into a term, or adds an eighth term without updating the sum — and it was proven by
+  deliberately breaking that mapping rather than by any honest run failing it. So
+  §Decision 1 is right that the partition tiles, and wrong if it is read as saying the
+  identity is what checks that on live data. Nothing else in the decision changes. Moving an interior boundary redistributes time between two
   adjacent terms and is exactly what the identity cannot see. **So task #105 does not get
   simpler**, and the post-composite evidence it is built around is doing work nothing else
   does.
