@@ -102,11 +102,31 @@ that number is wrong, condition 2 passes things it should not.
 
 ## Objections recorded
 
-**test-engineer, consulted on whether conditions 1, 2 and 5 are checkable with the harness
-as it stands** — sent at the time of writing; their answer belongs here and this section
-will carry it verbatim rather than in summary. The conditions were drafted from F-375's
-measurements, which are theirs, so a reading that they cannot be routinely satisfied is a
-reason to amend the rule rather than to waive it.
+**test-engineer answered, split by condition because they are not equally checkable.**
+*Condition 2 (residual stated against a stated noise floor): yes, on every run, with no
+work needed.* `Outcome::spread_pct()` and `Outcome::determinate()` (→ `INDETERMINATE` in
+`to_report()`) are computed and printed unconditionally, not opted into — every result this
+harness has ever produced already carries the evidence condition 2 asks for; #13's citation
+of "37.9% spread" and "two earlier branch-only re-runs were INDETERMINATE" was reading fields
+that exist on every `Outcome`, not a special measurement taken for the occasion. *Condition 5
+(recorded with machine state and iteration count): yes, and stronger since #83.* `Outcome`
+already carries `Environment` and profile on every report; #83 added `cpu_load_percent` and
+`concurrent_build_processes` to that same `summary()` line, so a same-session A/B taken today
+states not just that the machine agreed with itself but whether anything else was building on
+it — the exact gap #13's own citation could not close (§What the merge then owes: "#83's
+finding undermines the *instrument* rather than the verdict"). *Condition 1 (same-session
+A/B): not checkable by the harness at all, and it should not be read as a gap in the harness — it
+is a property of how two jobs were run, not of what either one measured.* `Outcome` carries no
+timestamp; nothing links two separate `to_report()` calls into one A/B except a human or agent
+running both within one sitting and saying so in the prose that cites them, the way #13's
+commit message did. A tool cannot attest its own proximity to another tool's earlier run — the
+same reason F-332's calibration yardstick was tried and rejected for measuring the *machine's*
+drift is why nothing here could measure the *run's* adjacency either. **So the rule needs no
+amendment on checkability**: two of its three harness-facing conditions are already satisfied
+by fields every run produces, unconditionally, and the third was never a harness question. What
+condition 1 actually needs — recorded because #96 will need it too — is the discipline
+CLAUDE.md's measurement-window convention already supplies: one machine, one sitting, nobody
+else building.
 
 **The lead ruled the shape** — narrow rather than general, conjunctive rather than a
 balancing test, and written rather than left to precedent — on the ground that constraints

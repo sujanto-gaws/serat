@@ -326,9 +326,33 @@ fn write_trace(trace: &startup::Trace, path: Option<&std::path::Path>) -> std::i
 /// P0's is the placeholder in `crates/serat-app/webview/`, not vue-frontend-dev's
 /// application: task S2 replaces it. A cold-start number taken now is the shell's, and
 /// S2 will move it.
+///
+/// Reads `tauri.conf.json`'s `build.frontendDist` rather than repeating `"webview"` as
+/// a second literal (F-378): that field and this function used to name the same
+/// directory independently, so a build could repoint one, keep serving the bundle the
+/// other still points at, and every guard that only reads this function — including
+/// [`tests::the_placeholder_bundle_exists_and_carries_the_two_marks`] — would keep
+/// passing against a file the application no longer serves. There is now exactly one
+/// place `"webview"` is written down.
+///
+/// # Panics
+///
+/// If `tauri.conf.json` fails to parse or does not set `build.frontendDist` to a
+/// string. Both are checked into the repository and read by `tauri-build` at compile
+/// time too, so either failure means the crate cannot build correctly regardless of
+/// this function, and panicking here is louder than a wrong path silently substituted.
 #[must_use]
 pub fn webview_bundle() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webview")
+    /// The config `tauri-build` also reads at compile time (`build.rs`) — one file,
+    /// read twice for two different purposes, rather than one fact written twice.
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(CONF).expect("tauri.conf.json must be valid JSON");
+    let frontend_dist = parsed["build"]["frontendDist"]
+        .as_str()
+        .expect("tauri.conf.json must set build.frontendDist to a string path");
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(frontend_dist)
 }
 
 #[cfg(test)]
@@ -357,6 +381,20 @@ mod tests {
         // page, and the paint mark would never arrive. Assert the bundle is there and
         // that it still calls both marks — deleting either from the page is exactly how
         // a green cold-start job would start measuring nothing.
+        //
+        // F-395: this crate no longer owns verifying *how* the paint mark is taken.
+        // `crates/serat-app/webview/` becomes task #98's Vite build output, and #108
+        // puts the mechanism guard in `app/src/startup.test.ts`, against the source
+        // that actually produces the bundle rather than a copy this crate could only
+        // watch go stale the next `npm run build`. An earlier version of this test
+        // asserted the mechanism itself (F-377/F-392's fix) directly against
+        // `boot.js`; that assertion belongs beside the source now, not beside a
+        // generated artefact, so it moved rather than being duplicated. What stays
+        // here is the same shallow check this test has always done: the bundle
+        // exists and still names both marks. `Startup::mark_first_paint`'s rejection
+        // of non-finite/non-positive evidence (`startup::tests::f_377_mutation_a_shape_*`,
+        // `f_377_mutation_b_shape_*`) is the load-bearing, Rust-side half of F-377's
+        // fix and lives in this crate regardless of which front end calls it.
         let index = webview_bundle().join("index.html");
         assert!(index.is_file(), "{} is missing", index.display());
         let boot = webview_bundle().join("boot.js");
@@ -368,10 +406,6 @@ mod tests {
         assert!(
             script.contains("mark_vault_usable"),
             "boot.js stopped marking usability"
-        );
-        assert!(
-            script.contains("requestAnimationFrame"),
-            "the paint mark must be taken from a frame callback, not from script start"
         );
     }
 
@@ -392,7 +426,9 @@ mod tests {
     fn a_trace_with_no_path_does_not_fail() {
         let startup = Startup::begin_with(None);
         startup.mark_window_created();
-        startup.mark_first_paint();
+        startup
+            .mark_first_paint(42.0)
+            .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();

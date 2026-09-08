@@ -198,7 +198,11 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
         "index_status was refused by the ACL layer: {index:?}"
     );
 
-    let first_paint = invoke(&webview, "mark_first_paint", json!({}));
+    let first_paint = invoke(
+        &webview,
+        "mark_first_paint",
+        json!({ "firstContentfulPaintMs": 123.4 }),
+    );
     assert!(
         !matches!(&first_paint, Err(e) if is_acl_rejection(e)),
         "mark_first_paint was refused by the ACL layer: {first_paint:?}"

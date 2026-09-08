@@ -24,6 +24,12 @@
 //! could not be reopened after one succeeded. It is still never a fabricated `Ready`
 //! — a shell that claimed an index it does not have would make the cold-start number
 //! meaningless and would be exactly the kind of test that cannot fail.
+//!
+//! Task #89 closes the gap #65 deliberately left: the [`serat_index::IndexHandle`]
+//! `open_or_rebuild` returns is now kept, handed back through [`IndexOpen::into_handle`]
+//! into an [`IndexHandleSlot`], and `AppState::write_file` submits every save through
+//! it. Before this, the app opened an index it never updated — correct exactly until
+//! the first save (architecture §3.1.1, §3.2).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -239,7 +245,33 @@ pub trait IndexOpen: Send + 'static {
     /// contract is that it publishes; it returns nothing, because nothing on the main
     /// thread is waiting for it.
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState));
+
+    /// The incremental writer this opener produced, if `open` got far enough to build
+    /// one. Called once, by [`IndexActor::spawn`]'s thread, immediately after `open`
+    /// returns.
+    ///
+    /// Defaults to `None` so every existing test double keeps compiling unchanged —
+    /// most of them have no real [`serat_index::IndexHandle`] to offer and do not need
+    /// one, because nothing in this file's own tests submits an incremental write.
+    /// [`SeratIndexOpen`] is the one implementation that overrides it.
+    fn into_handle(self) -> Option<serat_index::IndexHandle>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
+
+/// Where [`AppState::write_file`](crate::state::AppState::write_file) finds the
+/// [`serat_index::IndexHandle`] once the actor thread has produced one.
+///
+/// `Arc<Mutex<Option<..>>>` rather than a channel the caller waits on: `open_vault`
+/// must return before the open check — possibly a full rebuild — has finished
+/// (§3.4), so there is a real window in which a save can land before a handle exists.
+/// A save in that window is not an error; it degrades to the watcher's slower path
+/// (FR-VLT-04) instead of NFR-PRF-03's, because nothing recorded an echo for it —
+/// design goal 5, applied to a race rather than to a missing capability.
+pub type IndexHandleSlot = std::sync::Arc<Mutex<Option<serat_index::IndexHandle>>>;
 
 /// The real open check, wired to the vault and the production parser.
 ///
@@ -253,14 +285,17 @@ pub trait IndexOpen: Send + 'static {
 /// rebuild has no other way to read or parse a note and duplicating either here would
 /// be exactly the divergence §2.1 rules out.
 ///
-/// The [`serat_index::IndexHandle`] `open_or_rebuild` returns is not kept past this
-/// call: nothing on this branch submits incremental writes to it (that is task I5's
-/// app-side wiring, tracked separately, not this task's scope), so holding it open
-/// would cost a writer thread for no writer. What the handle is used for here is
+/// The [`serat_index::IndexHandle`] `open_or_rebuild` returns is used here for
 /// [`serat_index::IndexHandle::note_count`] — read once, to answer the one question
-/// [`IndexState::Ready`] carries that `open_or_rebuild`'s status stream does not.
+/// [`IndexState::Ready`] carries that `open_or_rebuild`'s status stream does not — and
+/// then **kept**, in `handle` below, so [`IndexOpen::into_handle`] can hand it to the
+/// actor thread that owns this opener. Task #65 dropped it here deliberately, because
+/// nothing on that branch submitted incremental writes to it; task #89 is the writer,
+/// and holding the handle open is what makes submitting to it possible at all.
 #[derive(Debug, Default)]
-pub struct SeratIndexOpen;
+pub struct SeratIndexOpen {
+    handle: Option<serat_index::IndexHandle>,
+}
 
 impl IndexOpen for SeratIndexOpen {
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
@@ -301,7 +336,12 @@ impl IndexOpen for SeratIndexOpen {
 
         match result {
             Ok((handle, _report)) => match handle.note_count() {
-                Ok(note_count) => publish(IndexState::Ready { note_count }),
+                Ok(note_count) => {
+                    publish(IndexState::Ready { note_count });
+                    // Kept, not dropped (task #89): this is the handle `write_file`
+                    // will submit saves through, once `into_handle` hands it on.
+                    self.handle = Some(handle);
+                }
                 Err(err) => publish(IndexState::Unavailable {
                     message: format!(
                         "the index opened but its note count could not be read: {err}"
@@ -318,6 +358,10 @@ impl IndexOpen for SeratIndexOpen {
                 path: index_dir.display().to_string(),
             }),
         }
+    }
+
+    fn into_handle(self) -> Option<serat_index::IndexHandle> {
+        self.handle
     }
 }
 
@@ -382,6 +426,12 @@ impl IndexActor {
     /// what the thread does next — which is the first row of §3.4's table, expressed as
     /// code rather than as a comment.
     ///
+    /// Also returns an [`IndexHandleSlot`], empty until `opener` finishes and
+    /// [`IndexOpen::into_handle`] fills it (task #89). The caller polls it rather than
+    /// waiting on it, for the same reason the caller does not wait on this thread at
+    /// all: a save that lands before the slot is filled degrades to the watcher path
+    /// instead of blocking.
+    ///
     /// # Errors
     ///
     /// Only if the operating system refuses to create a thread, in which case the
@@ -391,17 +441,28 @@ impl IndexActor {
         mut opener: O,
         vault_root: PathBuf,
         index_dir: PathBuf,
-    ) -> std::io::Result<Self> {
+    ) -> std::io::Result<(Self, IndexHandleSlot)> {
+        let slot: IndexHandleSlot = Arc::new(Mutex::new(None));
+        let slot_for_thread = Arc::clone(&slot);
         let handle = std::thread::Builder::new()
             .name("serat-index".to_owned())
             .spawn(move || {
                 opener.open(&vault_root, &index_dir, &|state| {
                     publisher.publish(state);
                 });
+                if let Some(index_handle) = opener.into_handle() {
+                    *slot_for_thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(index_handle);
+                }
             })?;
-        Ok(Self {
-            handle: Some(handle),
-        })
+        Ok((
+            Self {
+                handle: Some(handle),
+            },
+            slot,
+        ))
     }
 
     /// Wait for the actor to finish. Tests only; the application never joins it on a
@@ -587,7 +648,7 @@ mod tests {
 
         let (publisher, recorder) = publisher(Duration::ZERO);
         let started = Instant::now();
-        let mut actor = IndexActor::spawn(
+        let (mut actor, _handle) = IndexActor::spawn(
             Arc::clone(&publisher),
             SlowRebuild,
             PathBuf::from("."),
@@ -639,9 +700,9 @@ mod tests {
         // count came from a database `open_or_rebuild` actually built.
         let root = throwaway_vault("ready");
         let (publisher, _) = publisher(Duration::ZERO);
-        let mut actor = IndexActor::spawn(
+        let (mut actor, handle_slot) = IndexActor::spawn(
             Arc::clone(&publisher),
-            SeratIndexOpen,
+            SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
         )
@@ -652,6 +713,14 @@ mod tests {
             publisher.status().state,
             IndexState::Ready { note_count: 0 },
             "an empty vault should index to zero notes, not stay Unavailable"
+        );
+        assert!(
+            handle_slot
+                .lock()
+                .expect("not poisoned")
+                .is_some(),
+            "task #89: a successful open must hand its IndexHandle on through \
+             into_handle, not drop it"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -670,9 +739,9 @@ mod tests {
         let sink = Arc::clone(&seen);
         publisher.on_publish(move |state| sink.lock().expect("not poisoned").push(state.clone()));
 
-        let mut actor = IndexActor::spawn(
+        let (mut actor, _handle) = IndexActor::spawn(
             Arc::clone(&publisher),
-            SeratIndexOpen,
+            SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
         )
