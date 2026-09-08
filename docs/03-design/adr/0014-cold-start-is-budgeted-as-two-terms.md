@@ -320,14 +320,25 @@ measuring the same seven-term partition on the other two webviews. That is one r
 
 ## Objections recorded
 
-**test-engineer, consulted on whether the split is assertable with the harness as it
-stands, and on `S_front`'s noise floor.** Their answer belongs here verbatim rather than
-in summary, because the conditions in §Decision 5 are written against measurements that are
-theirs. The question put to them was specifically whether a budget on `S_front` is
-measurable at a useful tolerance, since a budget whose noise exceeds its own margin is not
-a gate (F-327) — and if it is not, §Decision 4's allocation is the part that gives way.
-*(Consulted 2026-09-08; awaiting their answer, which lands here before this ADR moves to
-accepted.)*
+**test-engineer answered, in two halves, because the question has two different kinds of
+answer.** *Assertable with the harness as it stands: yes, as of task #106 (`bench/budget/
+src/trace.rs`).* All seven marks are now required rather than three of them `Option` (F-381's
+harness half), and a `Terms` type computes the seven-interval partition and exposes
+`platform_term_ms()`/`serat_term_ms()`/`s_main_ms()`/`s_front_ms()` — nothing before #106
+could produce any of the four sub-terms this ADR's §Decision 4 needs. The sum identity is
+also asserted, with one caveat stated rather than left implicit: given the other checks it is
+a tautology of how the terms are defined (a telescoping sum, true for any seven numbers) and
+cannot fail on real data — what it guards is this module's own field-to-term mapping, proven
+by deliberately breaking that mapping and watching it catch it, not by an honest run ever
+failing it. *`S_front`'s noise floor: I cannot answer this, and saying so is the honest
+answer.* No `S_front` figure exists anywhere in this repository yet — §3.4's phase table
+predates #98, and #100 is the task that mounts Vue 3 and CodeMirror 6 and takes the first
+real reading. A tolerance asserted against a number nobody has measured would be exactly
+what F-327 and §3.4's own scale-check lesson warn against: a job sized to pass rather than to
+mean anything, going red for no reason and getting disabled by the third person it wakes.
+§Decision 5's floor (`s95 × 1.3`) already builds the right instrument for this — it takes the
+spread as data rather than assuming one — so my answer to the second half is that the
+question is #100's to answer, not mine to guess at now. *(Answered 2026-09-08.)*
 
 **vue-frontend-dev, consulted because `S_shell` is theirs and #98 is inside it.** The
 question put to them was whether a budget on an interval measured inside a renderer they do
