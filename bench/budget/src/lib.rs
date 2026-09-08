@@ -1374,7 +1374,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io
         // instant anything opens the vault for real -- so it never enters the digest
         // this compares against, and this recompute must not treat its mere presence
         // as a difference either. F-401: this bit the shared 20k vault twice in one
-        // session, once through cold_start_once (fixed by CleanIndexOnDrop) and once
+        // session, once through cold_start_once (fixed by ColdStartVaultGuard) and once
         // through some other real invocation of the app against it directly, which no
         // per-caller cleanup can fully guard against -- excluding it here does, for
         // every caller, present and future, without relying on anyone remembering to

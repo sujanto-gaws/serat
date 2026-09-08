@@ -647,6 +647,28 @@ pub fn cold_start(vault: &Path, iterations: usize) -> Result<(Samples, Samples),
     Ok((visible, usable))
 }
 
+/// Same batch as [`cold_start`], but keeps every validated trace rather than
+/// reducing straight to the two asserted marks.
+///
+/// [`cold_start`] exists to feed the gate budgets, which only need
+/// `window_visible`/`vault_usable`; task #100 also needs ADR-0014's full
+/// seven-term partition (`Terms`) at median and p95, which those two scalars
+/// cannot reconstruct. Rather than widen `cold_start`'s return type for every
+/// caller, this is a second entry point over the same guarded batch and the
+/// same per-run validation, so a caller that wants the breakdown does not
+/// have to re-derive the guard discipline itself.
+///
+/// # Errors
+/// As [`cold_start`].
+pub fn cold_start_traces(vault: &Path, iterations: usize) -> Result<Vec<StartupTrace>, String> {
+    let _guard = ColdStartVaultGuard::watch(vault);
+    let mut traces = Vec::with_capacity(iterations);
+    for run in 0..iterations {
+        traces.push(cold_start_once(vault, run)?);
+    }
+    Ok(traces)
+}
+
 /// One cold start, validated.
 ///
 /// Separate from [`cold_start`] so the proportionality check can **interleave**

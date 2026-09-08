@@ -116,6 +116,17 @@ pub struct StartupTrace {
     /// did restore a note still reports it here, and because a non-empty value
     /// on a harness run would itself be worth noticing.
     pub last_open: String,
+    /// `first-contentful-paint`, as `app/src/startup.ts` reads it via
+    /// `PerformanceObserver` and reports beside the two `requestAnimationFrame`
+    /// marks (task #108, task #114). **Not required and not validated by
+    /// [`StartupTrace::validate`]** -- F-397: nothing yet asserts that
+    /// `mark_first_paint`'s call site passes this rather than a placeholder,
+    /// and F-403: `raf1_ms`/`raf2_ms` reach no Rust parameter on main, so this
+    /// harness cannot check the conjunction ADR-0014 calls for. Carried here
+    /// so a caller can report the value the app claims, explicitly labelled as
+    /// unguarded, rather than the harness silently discarding evidence it
+    /// receives.
+    pub paint_evidence_ms: Option<f64>,
 }
 
 impl StartupTrace {
@@ -160,6 +171,7 @@ impl StartupTrace {
             profile: text("profile")?,
             vault: string(line, "vault").unwrap_or_default(),
             last_open: string(line, "last_open").unwrap_or_default(),
+            paint_evidence_ms: number(line, "paint_evidence_ms"),
         };
         trace.validate()?;
         Ok(trace)
