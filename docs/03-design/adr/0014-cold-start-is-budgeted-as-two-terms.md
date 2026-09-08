@@ -465,6 +465,40 @@ across the boundary, and it is a stronger reason to keep the conjunction than th
 ADR originally gave, because it survives someone adding a splash screen where "FCP fires on
 the skeleton" only described a tree that no longer exists.
 
+**Ruling for #112, and it corrects the phrase "a guard split across crates" that this ADR
+used a paragraph ago.** The defect is not that an assertion would live in another crate — it
+is that the precondition is asserted **nowhere**. A check on `app/index.html` placed in `app/`
+is correct placement, not a split. Four properties have to hold and they do not have one
+enforcer between them:
+
+| Property | Enforced by |
+|---|---|
+| Two genuinely distinct frames occurred | `raf2_ms > raf1_ms`, in `crates/serat-app` |
+| The paint value is the browser's entry, not a substitute clock read | `first_contentful_paint_ms <= raf2_ms`, same place, **subject to the condition below** |
+| The frames were scheduled *after our mount* | **Nothing, from these timestamps.** Frontend review; it is not recoverable in Rust |
+| `app/index.html` stays contentless, so the paint entry means *our* paint | A **static** check over that file |
+
+**The third row is the boundary worth stating rather than papering over.** Whether the frames
+were scheduled after Vue mounted is not recoverable from three numbers, so `serat-app` cannot
+enforce it however the arithmetic is arranged. What it can enforce is the **internal
+consistency of the evidence**, which rows 1 and 2 do. Claiming more than that for a runtime
+guard is how a check comes to be trusted for something it never did.
+
+**The fourth row gets a static check and deliberately not a runtime one.** A bound on
+`raf2_ms − first_contentful_paint_ms` would technically detect a skeleton — a large gap means
+the paint preceded the frames — but it is a magnitude argument, and this section has already
+ruled that magnitude is weaker than evidence which cannot be fabricated. Worse, the threshold
+would be indistinguishable from a slow mount. The property is static, so it is checked
+statically.
+
+**And row 2 lands only after its margin is measured.** `first_contentful_paint_ms <= raf2_ms`
+catches the realistic mutation the others miss — reading the clock instead of the entry, which
+lands after `raf2` — but its false-positive risk depends on when the frames are scheduled
+relative to DOM insertion, and nobody has measured that margin. **It becomes a rejection if an
+honest run shows the ordering holding with room, and a reported diagnostic if it does not.**
+A guard that can fire on an honest run is worse than no guard, because it gets disabled
+(F-107).
+
 The resolution is **conjunction rather than replacement**: keep the gate that ties the mark
 to our shell having rendered, and add the paint entry as the evidence that cannot be
 fabricated. Each covers the other's blind spot — a frame gate alone is forgeable, which is
