@@ -91,6 +91,20 @@ impl IndexHandle {
     }
 
     /// A writer handle, for callers that want to submit without waiting.
+    ///
+    /// F-40's guard — that `submit_blocking` cannot be reached because it is off
+    /// `IndexWriter` — protects a caller holding `&dyn IndexWriter`, which is what
+    /// [`apply`] takes. It does **not** protect a caller holding the concrete
+    /// `WriterHandle` this method returns: `submit_blocking` is a public inherent
+    /// method on `WriterHandle` itself (code-reviewer, reviewing #90's adoption of
+    /// the clone-then-drop-the-lock pattern this method exists for). Nothing here
+    /// needs to change today — the trait boundary is exactly as strong as claimed
+    /// for a caller that passes the handle straight to `apply`, and every current
+    /// caller does — but a save path that instead reaches for `submit_blocking` on
+    /// the handle it got from here would be F-19 on a third path, and the type
+    /// system would not stop it. The type is public for a reason: it is also how
+    /// `rebuild()` reaches `submit_blocking` on purpose. What stops the save path
+    /// from doing the same is this comment, not the compiler.
     #[must_use]
     pub fn writer(&self) -> WriterHandle {
         self.actor.handle()
