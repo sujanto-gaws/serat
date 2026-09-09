@@ -4,7 +4,7 @@ artifact: T2 — the four P0 gate benchmarks, reported together (task #101)
 phase: 05-testing
 owner: test-engineer
 serves: NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-08, US-35
-cites: ADR-0001, ADR-0011, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-382, F-392, F-402, F-417, F-418, F-442, F-450, F-458, F-466, F-479
+cites: ADR-0001, ADR-0011, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-382, F-392, F-402, F-417, F-418, F-442, F-450, F-458, F-466, F-479, F-464, F-470, F-481, F-482, F-504
 ---
 
 # T2 — the four P0 gate benchmarks, reported together
@@ -207,19 +207,33 @@ blind spot in how a fix for one guard is checked, not nine independent lapses.
 
 **A green unit suite is not evidence a mechanism works.** Twenty-seven tests stayed green through two separate rounds
 of the paint-mark guard being broken against the real application (F-377's original mutation, then F-392's), and in
-both cases only a manual run against the real WebView2 window caught what the suite could not. This project's own
-recorded discipline — mutate a guard before trusting it — held here exactly where it mattered and is the reason
-either defect is a closed finding rather than a live one; it is restated here because T2 is the document meant to
-carry it forward rather than let it live only in the two findings that produced it.
+both cases only a manual run against the real WebView2 window caught what the suite could not. That observation is
+unchanged and is the durable lesson; it is restated here because T2 is the document meant to carry it forward rather
+than let it live only in the findings that produced it.
 
-**One of the two inputs to that paragraph is under an open, pre-registered challenge, and this report is where a
-reader would otherwise never learn it.** F-479 records code-reviewer's prediction — written *before* #121 can run, so
-it cannot be fitted to a result afterwards — that F-392's stated conclusion, *"the load-bearing mechanism caught both
-mutations independently of the structural test"*, may be false. The lesson above does not depend on which way that
-resolves: a green suite through two real breaks is the observation, and it stands either way. What would change is
-the credit assigned to *which* mechanism caught them, and that is #121's to settle. Recorded here rather than left
-in the register, because this report cites F-392 in its own header and a citation whose basis is contested reads as
-settled to everyone who does not also read the findings register.
+**This paragraph used to end "either defect is a closed finding rather than a live one", and F-504 falsified that
+clause.** It is corrected rather than deleted, because the line is narrow in *both* directions and a reader who takes
+away either "it was fine" or "the guard is broken" would have the wrong one.
+
+| Claim | Status after #121's run against a real WebView2 window (F-504) |
+|---|---|
+| **Positive control, run first** | Stubbed `boot.js` → `cargo build --release` → **exit 2, no trace.** The pipeline demonstrably reaches the binary, so everything below is evidence rather than a stale-binary artefact (F-470). **Recorded as method, not as a result:** a mutation run without this control cannot tell a surviving mutation from a mutation that never arrived. |
+| **Honest baseline** | exit 0, `paint_evidence_ms` 212.0, `raf2_ms` 163.2, raf2 preceding FCP by ~49 ms — inside F-406's measured 51–65 ms band. |
+| **Mutation A** (single rAF, `raf2 == raf1`) | **Discharged.** RED, exit 2, no trace — **against the real guard**, which is what F-392 asked for and what F-464 found had never actually been done. |
+| **Mutation B, canonical** (`fcp: 0`) | Rejected by `first_contentful_paint_ms <= 0.0`; the honest call then succeeds and the trace carries real numbers. **This is why the gap always looked covered.** |
+| **Mutation B, sharp** (`fcp: 1, raf1: 0, raf2: 1`) | **SURVIVED — reproduced, not predicted.** exit 0, and the trace records `paint_evidence_ms: 1.0`, `raf2_ms: 1.0`: fabricated evidence accepted, written verbatim into the audit field, and the honest call silently no-opped by first-wins. F-479's pre-registered prediction is confirmed, so **F-481 and F-482 are empirical rather than predicted.** |
+
+**What the surviving mutation does and does not establish, stated in both directions because the temptation runs both
+ways.** It establishes that fabricated paint evidence is **accepted and audited** — the number in the report is the
+number the fake supplied. It does **not** establish that any figure in this report was flattered: in that placement
+`t0_to_window_visible_ms` came out **2687 ms against the honest 2458 ms — worse, not better**, because module
+evaluation happens after window creation. **And nothing bounds it in our favour either**: the mark is stamped when
+the call *arrives*, so a fake arriving earlier would move the number the other way. The honest summary is that the
+mark is **unbounded in both directions**, not that it is safe.
+
+Closing it is **task #125**, named rather than described so that F-471's mechanism can watch it: a fix summarised in
+prose here would be a promise this document cannot keep, and the task number is the thing that can be checked as
+open or closed without reading this paragraph at all.
 ## Verdict
 
 **Not a clean GO, and the shape of the shortfall has changed: three of four budgets are now measured, and none of the
