@@ -47,6 +47,10 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 >
 > **The zero `handle_missing` is NOT recorded as measuring F-382's window** — on this tree it cannot separate the pre-warm working from #119 closing the window from both; F-462's 35.4 µs stays that measurement. What it does establish is that **every attempted save reached the index writer**, so the p95 is over the whole workload rather than over whichever fraction survived.
 >
+> ## Standing convention: **silence means "blocked or clear, nothing owed"**
+>
+> **Do not send periodic status pings.** Message on a **state change** — a finding, a verdict, a branch ready, a blocker, or a question. Three roles have now asked about this independently and code-reviewer gave the reason first: **a stream of messages from a role reads as activity by that role**, whatever the words say, and it pushes real messages down the queue. **The lead has already made that exact misreading once today (F-484)** — heartbeats echoing a task row that said `RUNNING` were taken as a live process for several rounds, in both directions. **If your idle hook asks you to report, treat this line as satisfying it.**
+>
 > ## Queue — everyone build freely
 >
 > - **code-reviewer:** #94's eight against `c60dfdd` → #118's four (E4 re-aimed at `run_job`) → **#121's two, where mutation B settles F-481 and F-482 in one run.** F-490: your F-475/F-476 clearances stand; the re-run is confirmation, not a precondition.
