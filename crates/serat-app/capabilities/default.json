@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The P0 shell. build.rs declares an app ACL manifest (ADR-0012) naming all six commands in generate_handler!, so this file's grant is now enforcement, not documentation: it names the five commands crates/serat-app/webview/boot.js actually invokes -- read_file, write_file, index_status, mark_first_paint, mark_vault_usable. open_vault is deliberately withheld; nothing in the webview calls it (F-342), it is invoked only from Rust inside setup, and granting it here would reopen surface removing it was meant to close. Widening this set is a threat-model decision, not a convenience -- see docs/03-design/adr/0012-declare-the-tauri-app-acl-manifest.md.",
+  "description": "The P0 shell. build.rs declares an app ACL manifest (ADR-0012) naming all six commands in generate_handler!, so this file's grant is now enforcement, not documentation: it names the five commands the front end actually invokes -- authored in app/src/ipc/client.ts and shipped as the Vite output crates/serat-app/webview/boot.js, which since task #98 is generated rather than hand-written (F-467) -- read_file, write_file, index_status, mark_first_paint, mark_vault_usable. open_vault is deliberately withheld; nothing in the webview calls it (F-342), it is invoked only from Rust inside setup, and granting it here would reopen surface removing it was meant to close. Widening this set is a threat-model decision, not a convenience -- see docs/03-design/adr/0012-declare-the-tauri-app-acl-manifest.md.",
   "windows": ["main"],
   "permissions": [
     "core:default",

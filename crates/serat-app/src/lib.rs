@@ -573,18 +573,52 @@ mod tests {
         // of non-finite/non-positive evidence (`startup::tests::f_377_mutation_a_shape_*`,
         // `f_377_mutation_b_shape_*`) is the load-bearing, Rust-side half of F-377's
         // fix and lives in this crate regardless of which front end calls it.
+        //
+        // Counted rather than merely present (#125, F-481, F-504). F-392 shipped a
+        // call-site *count*; the comment above once said it "moved rather than being
+        // duplicated" and named no destination, because there was none -- it was
+        // dropped. F-504 then reproduced what the absence costs, against a real
+        // WebView2 window rather than in prediction: a second `mark_first_paint` call
+        // carrying fabricated but plausible evidence survived, exit 0, with
+        // `paint_evidence_ms: 1.0` written verbatim into the audit field while the
+        // honest call was silently no-opped by `mark_first_paint`'s first-wins rule.
+        // "Is the good call there" and "is only the good call there" are different
+        // questions, and a positive-only assertion cannot see what was added beside
+        // it (F-392's own words, restored here as an assertion).
+        //
+        // Two things this does NOT do, stated because the defect is wider than the
+        // vector this closes and a comment that implied otherwise would be the more
+        // expensive error:
+        //
+        //   * It does not let the guard tell fabricated evidence from real. One call
+        //     carrying plausible-positive values is still accepted on its own say-so
+        //     (F-482, F-504), and where the resulting number lands is a property of
+        //     where the call site sits, not of this check. That is ADR-0014's table
+        //     to settle, not this test's.
+        //   * It does not catch a second call routed through the bundle's existing
+        //     `markFirstPaint` wrapper instead of a fresh literal -- that leaves the
+        //     command name at one occurrence. The complementary source-side check
+        //     belongs beside `app/src/` and is vue-frontend-dev's.
+        //
+        // What it does catch is the shape F-392 named and the shape F-504 used:
+        // another literal invocation of the command in the shipped bundle, including
+        // one hand-edited into it -- which F-478 records as the place a weakening
+        // would hide, since nobody reads a minified bundle in a diff.
         let index = webview_bundle().join("index.html");
         assert!(index.is_file(), "{} is missing", index.display());
         let boot = webview_bundle().join("boot.js");
         let script = std::fs::read_to_string(&boot).expect("boot.js");
-        assert!(
-            script.contains("mark_first_paint"),
-            "boot.js stopped marking the paint"
-        );
-        assert!(
-            script.contains("mark_vault_usable"),
-            "boot.js stopped marking usability"
-        );
+        for command in ["mark_first_paint", "mark_vault_usable"] {
+            let occurrences = script.matches(command).count();
+            assert_eq!(
+                occurrences, 1,
+                "boot.js names {command} {occurrences} times; exactly one is the \
+                 guarantee. Zero means the page stopped taking the mark and a \
+                 green cold-start job would measure nothing; more than one \
+                 means a second call site can take the mark first and no-op \
+                 the honest one (F-392, F-481, F-504)"
+            );
+        }
     }
 
     #[test]
