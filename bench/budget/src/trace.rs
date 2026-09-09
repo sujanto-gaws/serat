@@ -405,6 +405,87 @@ fn string(text: &str, key: &str) -> Option<String> {
     Some(rest[open..close].to_string())
 }
 
+/// As [`number`], for a flat JSON array of numbers: `"key":[1.0,2.5,3.0]` or
+/// `"key":[]`. Assumes no nested arrays or objects inside it, which holds for
+/// every array `serde_json::to_string` produces from a `Vec<f64>` — the only
+/// shape [`BenchmarkExitReport`]'s (`crates/serat-app/src/lib.rs`) `_ms`
+/// fields ever are.
+fn number_array(text: &str, key: &str) -> Option<Vec<f64>> {
+    let needle = format!("\"{key}\":[");
+    let start = text.find(&needle)? + needle.len();
+    let end = text[start..].find(']')? + start;
+    let body = text[start..end].trim();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    body.split(',').map(|tok| tok.trim().parse().ok()).collect()
+}
+
+/// One `--bench-save-list` run, as `serat-app` reported it (task #111's
+/// `BenchmarkExitReport`, task #94's reader). Parsed from the same exit-report
+/// line [`StartupTrace`] reads the seven marks from — `BenchmarkExitReport`
+/// (`crates/serat-app/src/lib.rs`) flattens the startup trace and adds these
+/// fields beside it — but kept as a
+/// separate type rather than folded into `StartupTrace`, deliberately: a
+/// `--bench-save-list` run's startup marks are real and worth validating on
+/// their own terms, but the six startup rejections have nothing to say about
+/// whether the save path degraded, and coupling the two would fail an
+/// NFR-PRF-03 run for an NFR-PRF-01 reason, or the reverse.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SaveBenchmarkTrace {
+    /// How many paths `--bench-save-list` named — the denominator task #94's
+    /// completeness check is against, not just a symptom count.
+    pub attempted: usize,
+    /// Elapsed ms of every save whose outcome was `submitted`. **The series
+    /// NFR-PRF-03's p95 is asserted against.**
+    pub submitted_ms: Vec<f64>,
+    /// Attempted saves that found no index handle. F-382's own legitimate
+    /// race is a narrow window at `open_vault`; a hard zero is expected over
+    /// a run this long — `bench/budget`'s [`crate::check_save_completeness`]
+    /// is what enforces that, not this parser.
+    pub handle_missing: u64,
+    /// Attempted saves the writer refused — ADR-0011's sanctioned
+    /// backpressure. May legitimately be non-zero.
+    pub writer_refused: u64,
+    /// Elapsed ms of every refused save, reported beside `submitted_ms` and
+    /// excluded from it (F-19, F-382).
+    pub writer_refused_ms: Vec<f64>,
+}
+
+impl SaveBenchmarkTrace {
+    /// Parse one exit-report line's save-benchmark fields.
+    ///
+    /// Does not require or validate `StartupTrace`'s seven marks — see this
+    /// type's own doc comment for why the two are kept apart.
+    ///
+    /// # Errors
+    /// Any of the five fields is missing or is not the shape it claims —
+    /// naming the field, the same discipline [`StartupTrace::parse`] follows.
+    pub fn parse(line: &str) -> Result<SaveBenchmarkTrace, String> {
+        let count = |key: &str| -> Result<usize, String> {
+            number(line, key)
+                .map(|n| n as usize)
+                .ok_or_else(|| format!("the save benchmark report has no {key}: {line}"))
+        };
+        let counter = |key: &str| -> Result<u64, String> {
+            number(line, key)
+                .map(|n| n as u64)
+                .ok_or_else(|| format!("the save benchmark report has no {key}: {line}"))
+        };
+        let array = |key: &str| -> Result<Vec<f64>, String> {
+            number_array(line, key)
+                .ok_or_else(|| format!("the save benchmark report has no {key}: {line}"))
+        };
+        Ok(SaveBenchmarkTrace {
+            attempted: count("save_attempted")?,
+            submitted_ms: array("save_submitted_ms")?,
+            handle_missing: counter("save_handle_missing")?,
+            writer_refused: counter("save_writer_refused")?,
+            writer_refused_ms: array("save_writer_refused_ms")?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,5 +755,91 @@ mod tests {
         let line = good().replace("\"profile\": \"release\", ", "");
         let err = StartupTrace::parse(&line).expect_err("a missing field must not pass");
         assert!(err.contains("profile"), "{err}");
+    }
+
+    // ---------------------------------------------------------------- #94
+
+    fn save_report(
+        attempted: usize,
+        submitted_ms: &str,
+        handle_missing: u64,
+        writer_refused: u64,
+        writer_refused_ms: &str,
+    ) -> String {
+        // The real shape serde_json::to_string produces (`BenchmarkExitReport`,
+        // crates/serat-app/src/lib.rs): no spaces, exercised here rather than the
+        // spaced style `good()` uses above, so this test also stands as evidence
+        // the reader tolerates compact JSON and not only the hand-spaced fixture
+        // style `StartupTrace`'s own tests use.
+        format!(
+            "{{\"save_attempted\":{attempted},\"save_submitted_ms\":[{submitted_ms}],\
+             \"save_handle_missing\":{handle_missing},\"save_writer_refused\":{writer_refused},\
+             \"save_writer_refused_ms\":[{writer_refused_ms}]}}"
+        )
+    }
+
+    #[test]
+    fn an_honest_save_report_parses() {
+        let line = save_report(3, "12.5,8.3,15.0", 0, 0, "");
+        let trace = SaveBenchmarkTrace::parse(&line).expect("valid save report");
+        assert_eq!(trace.attempted, 3);
+        assert_eq!(trace.submitted_ms, vec![12.5, 8.3, 15.0]);
+        assert_eq!(trace.handle_missing, 0);
+        assert_eq!(trace.writer_refused, 0);
+        assert!(trace.writer_refused_ms.is_empty());
+    }
+
+    #[test]
+    fn a_report_with_a_refusal_parses_both_series_apart() {
+        let line = save_report(4, "12.5,8.3,15.0", 0, 1, "0.4");
+        let trace = SaveBenchmarkTrace::parse(&line).expect("valid save report");
+        assert_eq!(trace.attempted, 4);
+        assert_eq!(trace.submitted_ms, vec![12.5, 8.3, 15.0]);
+        assert_eq!(trace.writer_refused, 1);
+        assert_eq!(trace.writer_refused_ms, vec![0.4]);
+    }
+
+    #[test]
+    fn an_untouched_run_reports_true_zeros_not_absence() {
+        // BenchmarkExitReport's own doc: a run over an untouched vault reports
+        // every field 0, not the absence of a measurement -- matched here.
+        let line = save_report(0, "", 0, 0, "");
+        let trace = SaveBenchmarkTrace::parse(&line).expect("an all-zero report is valid");
+        assert_eq!(trace.attempted, 0);
+        assert!(trace.submitted_ms.is_empty());
+        assert_eq!(trace.handle_missing, 0);
+    }
+
+    #[test]
+    fn each_missing_field_names_itself() {
+        for key in [
+            "save_attempted",
+            "save_submitted_ms",
+            "save_handle_missing",
+            "save_writer_refused",
+            "save_writer_refused_ms",
+        ] {
+            let line = save_report(1, "1.0", 0, 0, "").replace(&format!("\"{key}\":"), "\"x\":");
+            let err = SaveBenchmarkTrace::parse(&line)
+                .expect_err(&format!("a report missing {key} must not pass"));
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn number_array_parses_the_shapes_serde_json_actually_produces() {
+        assert_eq!(number_array("{\"xs\":[]}", "xs"), Some(Vec::new()));
+        assert_eq!(number_array("{\"xs\":[1.0]}", "xs"), Some(vec![1.0]));
+        assert_eq!(
+            number_array("{\"xs\":[1.0,2.5,3.0]}", "xs"),
+            Some(vec![1.0, 2.5, 3.0])
+        );
+        // Trailing content after the array must not confuse the closing bracket
+        // search -- a real report has fields on both sides of every array.
+        assert_eq!(
+            number_array("{\"a\":1,\"xs\":[4.0,5.0],\"b\":2}", "xs"),
+            Some(vec![4.0, 5.0])
+        );
+        assert_eq!(number_array("{}", "xs"), None);
     }
 }

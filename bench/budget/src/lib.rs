@@ -211,8 +211,9 @@ pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
     product_limit_ms: 50.0,
     ci_limit_ms: None,
     vault: "20k",
-    interval: "apply() submitted through flush() returning -- Serat's own save path, \
-               no watcher, no debounce (F-227, F-268; see check_save_path)",
+    interval: "AppState::write_file's call into the index, timed from the outside -- Serat's \
+               own save path, no watcher, no debounce (architecture §3.1.1; \
+               see check_save_completeness)",
 };
 
 /// NFR-PRF-04.
@@ -484,6 +485,33 @@ pub struct ReportedSeries {
     pub samples: Samples,
 }
 
+/// What became of every save a `--bench-save-list` run attempted.
+///
+/// Task **#94**, finding **F-450**, and the lead's binding condition on
+/// `subject::prewarm_index`: *the run must report `handle_missing`, and any
+/// residual must be reported, never absorbed.* Pre-warming the index is a
+/// change that makes a failing measurement pass, so the census it makes
+/// passable is stated on the face of the result rather than left to be
+/// inferred from the absence of an error.
+///
+/// `handle_missing` is a hard zero — [`check_save_completeness`] refuses the
+/// run before an [`Outcome`] exists if it is not — so every census that
+/// reaches a report carries a zero there. **That zero is the point.** It is
+/// #119's answer arriving from the other direction, and printing it is what
+/// distinguishes "the pre-warm closed the window" from "nobody looked".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveCensus {
+    /// Saves the run was asked to make.
+    pub attempted: usize,
+    /// Saves that reached the index writer, and so are in the asserted series.
+    pub submitted: usize,
+    /// Saves ADR-0011 backpressure refused. Non-zero is a real NFR-PRF-03
+    /// finding and already sets [`Outcome::degraded`].
+    pub writer_refused: u64,
+    /// Saves that found no index handle — F-382's window.
+    pub handle_missing: u64,
+}
+
 /// A finished measurement.
 #[derive(Clone, Debug)]
 pub struct Outcome {
@@ -507,6 +535,24 @@ pub struct Outcome {
     /// answer architecture.md's open design question 1, and that question is
     /// what §1.2 says the parse pool exists to settle.
     pub phases: Option<subject::RebuildPhases>,
+    /// Why this measurement, though real, must not be reported as a pass no
+    /// matter what `samples` says (task #94, F-382/F-421).
+    ///
+    /// Distinct from a measurement error (an `Err` from the `measure`
+    /// closure, which produces no `Outcome` at all — "failing the run") and
+    /// from an ordinary breach (`value_ms() > limit_ms()`, which needs no
+    /// help from this field to fail). This is for a run that is real and
+    /// honestly measured, and still must not pass: NFR-PRF-03's own p95 over
+    /// `save_submitted_ms` alone cannot see that some fraction of the 1,000
+    /// attempted saves never reached the index (ADR-0011 backpressure,
+    /// reported here rather than folded silently into a fast-looking
+    /// series). "Fail the number, not the run."
+    pub degraded: Option<String>,
+    /// The save path's own census, for the budget that has one (NFR-PRF-03).
+    ///
+    /// `None` for every other budget: nothing else in P0 attempts a countable
+    /// unit of work that can fail without failing the run.
+    pub save_census: Option<SaveCensus>,
 }
 
 impl Outcome {
@@ -521,8 +567,12 @@ impl Outcome {
     }
 
     /// Whether the budget held.
+    ///
+    /// `degraded` gates this before the timing comparison runs: a run that
+    /// did not reach the index for every attempted save is not a pass no
+    /// matter how fast the saves that did land were.
     pub fn passed(&self) -> bool {
-        self.value_ms() <= self.limit_ms()
+        self.degraded.is_none() && self.value_ms() <= self.limit_ms()
     }
 
     /// Whether this number may be recorded as the gate figure.
@@ -647,6 +697,21 @@ impl Outcome {
                 self.limit_ms(),
             );
         }
+        if let Some(reason) = &self.degraded {
+            let _ = writeln!(s, "  DEGRADED    {reason}");
+        }
+        if let Some(c) = self.save_census {
+            // Printed whether or not anything went wrong, and `handle_missing`
+            // is printed even at zero: the pre-warm this census exists to
+            // police (task #94, F-450) is a setup change that makes a failing
+            // measurement pass, and a residual that is never shown is a
+            // residual that was absorbed.
+            let _ = writeln!(
+                s,
+                "  save path   {} attempted · {} submitted · {} writer-refused · {} handle-missing",
+                c.attempted, c.submitted, c.writer_refused, c.handle_missing
+            );
+        }
         let _ = writeln!(
             s,
             "  vault       {} ({} notes, generator v{})",
@@ -723,6 +788,16 @@ impl Outcome {
         let _ = writeln!(s, "  \"value_ms\": {:.3},", self.value_ms());
         let _ = writeln!(s, "  \"limit_ms\": {:.3},", self.limit_ms());
         let _ = writeln!(s, "  \"passed\": {},", self.passed());
+        let _ = writeln!(
+            s,
+            "  \"degraded\": {},",
+            match &self.degraded {
+                // Debug-formatting a String gives JSON-legal quoting (escapes
+                // any embedded quote or backslash) without a dependency.
+                Some(reason) => format!("{reason:?}"),
+                None => "null".to_string(),
+            }
+        );
         let _ = writeln!(s, "  \"samples_n\": {},", self.samples.len());
         let _ = writeln!(s, "  \"min_ms\": {:.3},", self.samples.min());
         let _ = writeln!(s, "  \"mean_ms\": {:.3},", self.samples.mean());
@@ -759,6 +834,14 @@ impl Outcome {
             let _ = writeln!(s, "    \"parse\": {:.3},", ms(p.parse));
             let _ = writeln!(s, "    \"producer_wait\": {:.3},", ms(p.producer_wait));
             let _ = writeln!(s, "    \"write_fts\": {:.3}", ms(p.write_fts));
+            let _ = writeln!(s, "  }},");
+        }
+        if let Some(c) = self.save_census {
+            let _ = writeln!(s, "  \"save_path_census\": {{");
+            let _ = writeln!(s, "    \"attempted\": {},", c.attempted);
+            let _ = writeln!(s, "    \"submitted\": {},", c.submitted);
+            let _ = writeln!(s, "    \"writer_refused\": {},", c.writer_refused);
+            let _ = writeln!(s, "    \"handle_missing\": {}", c.handle_missing);
             let _ = writeln!(s, "  }},");
         }
         if !self.reported.is_empty() {
@@ -803,6 +886,12 @@ pub struct Measurement {
     pub phases: Option<subject::RebuildPhases>,
     /// Series reported beside it.
     pub reported: Vec<ReportedSeries>,
+    /// Carried straight through to [`Outcome::degraded`] by [`outcome_from`] —
+    /// see that field's doc for what it means and why it is not the same
+    /// thing as this function returning `Err`.
+    pub degraded: Option<String>,
+    /// Carried straight through to [`Outcome::save_census`] by [`outcome_from`].
+    pub save_census: Option<SaveCensus>,
 }
 
 impl Measurement {
@@ -812,6 +901,8 @@ impl Measurement {
             samples,
             phases: None,
             reported: Vec::new(),
+            degraded: None,
+            save_census: None,
         }
     }
 
@@ -826,10 +917,25 @@ impl Measurement {
         self
     }
 
+    /// Mark this measurement as real but not a pass, for a reason `samples`
+    /// alone cannot express (task #94; see [`Outcome::degraded`]).
+    #[must_use]
+    pub fn degraded(mut self, reason: impl Into<String>) -> Measurement {
+        self.degraded = Some(reason.into());
+        self
+    }
+
     /// Attach the phase breakdown.
     #[must_use]
     pub fn with_phases(mut self, phases: subject::RebuildPhases) -> Measurement {
         self.phases = Some(phases);
+        self
+    }
+
+    /// Attach the save-path census (task #94, F-450).
+    #[must_use]
+    pub fn counting(mut self, census: SaveCensus) -> Measurement {
+        self.save_census = Some(census);
         self
     }
 }
@@ -1332,32 +1438,76 @@ pub fn check_note_count(reported: usize, expected: usize) -> Result<(), String> 
     ))
 }
 
-/// Whether a save's timing came from Serat's own save path rather than the
-/// watcher.
+/// Whether a `--bench-save-list` run's own counters add up — checked against
+/// the harness's own count of what it attempted rather than trusted from the
+/// app's arithmetic, the same "recompute, don't trust" rule [`tree_digest`]
+/// and [`subject::stat1_note_rows`] already follow.
 ///
-/// P0 findings **F-227, F-229, F-268**. A save routed through the watcher
-/// carries FR-VLT-04's 500 ms budget and the 150 ms coalescing window;
-/// NFR-PRF-03's 50 ms can only mean the direct path `apply()` then `flush()`
-/// takes, since architecture §3.1.1/§3.2 mean no external change can reach
-/// the index inside the coalescing window at all. A number measured on the
-/// wrong path is not distinguishable from a real one by looking at it — that
-/// is what makes this check load-bearing rather than decorative, and it is
-/// exactly the shape F-268 found already inside the instrument meant to
-/// prevent it.
+/// P0 findings **F-382, F-390, F-421**, task **#94**. The two ways an
+/// attempted save can fail to reach the index want different treatment,
+/// which is why this is one check rather than "the degraded count is zero":
+///
+/// * `handle_missing` is a **hard zero**, checked here. F-382's legitimate
+///   empty-handle race is a narrow window at `open_vault` — a save landing
+///   before the handle exists — and seeing it recur across a run this long
+///   means something else is wrong. Non-zero here refuses the whole run: no
+///   number is produced, because none of what it attempted can be trusted to
+///   mean what the series claims.
+/// * `writer_refused` is **not** checked here. ADR-0011's sanctioned
+///   backpressure may legitimately fire, and ruling on a non-zero value is
+///   [`measure_save_to_index_with`]'s job, not this one's — ADR-0011
+///   backpressure is a real, reportable NFR-PRF-03 finding, not evidence
+///   this harness malfunctioned, and refusing the run over it here would be
+///   exactly the "fail the run instead of the number" mistake this function
+///   exists to avoid.
+///
+/// What this function alone checks is the **denominator**: that `submitted`
+/// plus `writer_refused` accounts for everything `--bench-save-list`
+/// attempted. That is deliberately a different check from "the two named
+/// degraded counters are zero" — it also catches a fourth, unnamed way a
+/// save could vanish that neither counter was built to count, which neither
+/// `handle_missing == 0` nor `writer_refused == 0` alone would notice.
 ///
 /// # Errors
-/// When `path` is not exactly `"save"`.
-pub fn check_save_path(path: &str) -> Result<(), String> {
-    if path == "save" {
-        return Ok(());
+/// `handle_missing` is non-zero, or the counted outcomes do not sum to what
+/// was attempted.
+pub fn check_save_completeness(trace: &trace::SaveBenchmarkTrace) -> Result<(), String> {
+    if trace.handle_missing != 0 {
+        return Err(format!(
+            "{} of {} attempted saves found no index handle. F-382's legitimate race is a \
+             narrow window at open; seeing it recur across a run this long means an instrument \
+             problem, not a number to report.",
+            trace.handle_missing, trace.attempted
+        ));
     }
-    Err(format!(
-        "a save timing came from the {path:?} path, not \"save\". NFR-PRF-03 governs Serat's \
-         own save path (apply() then flush()), not a save observed through the watcher, which \
-         carries FR-VLT-04's 500 ms budget and the 150 ms coalescing window instead (F-227, \
-         F-229, F-268). Reporting this number against NFR-PRF-03 would be wrong by \
-         construction, not by a measurement error."
-    ))
+    let accounted = trace.submitted_ms.len() as u64 + trace.writer_refused;
+    if accounted != trace.attempted as u64 {
+        return Err(format!(
+            "{} attempted saves but only {accounted} are accounted for -- {} submitted, {} \
+             refused. Something vanished in a way neither named counter caught.",
+            trace.attempted,
+            trace.submitted_ms.len(),
+            trace.writer_refused
+        ));
+    }
+    // F-445's first SHOULD-FIX: a run this counters agree on is still one with
+    // no p95 to report if nothing was ever submitted -- every attempt landed in
+    // writer_refused. Left unhandled, that reaches Samples::percentile with an
+    // empty series and panics on its own "no samples" assertion (outcome_from's
+    // guard catches an empty Measurement generically, but the specific reason
+    // -- every save refused -- is exactly the message a reader most needs and
+    // the one a generic panic or a generic "no samples" Err both discard). A
+    // named refusal here is the last point before that reason is lost.
+    if trace.submitted_ms.is_empty() && trace.attempted > 0 {
+        return Err(format!(
+            "all {} attempted saves were refused by the writer (ADR-0011 backpressure) -- there \
+             is no p95 to compute over zero submitted saves. This is a finding about the queue \
+             being saturated well beyond a single save's workload, not a shorter series to \
+             quietly accept.",
+            trace.attempted
+        ));
+    }
+    Ok(())
 }
 
 /// Recompute the vault's tree digest from what is on disk, exactly as the
@@ -1542,7 +1692,25 @@ pub fn decide_with_vault<F>(
 where
     F: FnOnce(&VaultUnderTest, usize) -> Result<Measurement, String>,
 {
-    let measurement = measure(&vault, parsed.iterations)?;
+    let mut measurement = measure(&vault, parsed.iterations)?;
+    // F-445's second SHOULD-FIX: `decide`'s own eprintln! says this result must
+    // not be recorded as a gate number, and stops there -- the `Outcome` (and
+    // its `to_json()`, which is what a trend tool or a pasted report actually
+    // reads back) carried no trace of it. `degraded` is the carrier task #94
+    // built for exactly this shape ("real measurement, must not read as a
+    // pass"), so an indicative run rides the same field a backpressure finding
+    // does, rather than a warning that only ever reached stderr.
+    if parsed.indicative {
+        let note = format!(
+            "running {} iterations, not the {} the acceptance criterion names; this result is \
+             indicative only and must not be recorded as a gate number",
+            parsed.iterations, budget.iterations
+        );
+        measurement.degraded = Some(match measurement.degraded.take() {
+            Some(existing) => format!("{note}; also: {existing}"),
+            None => note,
+        });
+    }
     outcome_from(budget, parsed.profile, vault, measurement)
 }
 
@@ -1567,6 +1735,8 @@ pub fn outcome_from(
         samples: measurement.samples,
         reported: measurement.reported,
         phases: measurement.phases,
+        degraded: measurement.degraded,
+        save_census: measurement.save_census,
     };
     outcome.check_phases()?;
     Ok(outcome)
@@ -1793,30 +1963,27 @@ where
     Ok(Measurement::new(samples).with_phases(phases))
 }
 
-/// NFR-PRF-03's measurement: the save-path interval, asserted, beside the two
-/// watcher-path intervals kept for FR-VLT-04 (F-227, F-268).
+/// NFR-PRF-03's measurement: 1,000 distinct saves through the real
+/// application (task #94, following #111).
 ///
 /// # Errors
-/// Any failure of the save path, or [`check_save_path`] rejecting a save
-/// measured on the watcher path rather than Serat's own.
+/// The application could not be driven, [`check_save_completeness`] refused
+/// the run (`handle_missing` non-zero, or the counted outcomes did not sum to
+/// what was attempted), or the measurement produced no samples.
 pub fn measure_save_to_index(
     vault: &VaultUnderTest,
     iterations: usize,
 ) -> Result<Measurement, String> {
-    measure_save_to_index_with(vault, iterations, |v, i, it| {
-        subject::save_to_index(v, i, it)
-    })
+    measure_save_to_index_with(vault, iterations, subject::save_to_index_via_app)
 }
 
-/// As [`measure_save_to_index`], against an injected save path.
+/// As [`measure_save_to_index`], against an injected save run.
 ///
-/// Split out so `check_save_path` refusing a watcher-path measurement can be
-/// tested without the real seam existing yet (task I3, the last blocker
-/// standing between `subject::save_to_index` and a real number now that I5
-/// has landed) — the same reasoning as `measure_full_rebuild_with`, and
-/// forced by the same lesson: F-268 was a
-/// harness bug nothing exercised, because nothing could inject a `"watcher"`
-/// tag to prove the guard fires on it.
+/// Split out for the same reason [`measure_full_rebuild_with`] is: the loop
+/// worth testing here — the completeness check, and the writer-refused
+/// bookkeeping that turns a non-zero count into a [`Measurement::degraded`]
+/// reason rather than a silent pass — cannot be exercised through the real
+/// seam without a compiled `serat.exe` and a real vault on disk.
 ///
 /// # Errors
 /// As [`measure_save_to_index`].
@@ -1826,31 +1993,55 @@ pub fn measure_save_to_index_with<F>(
     save_to_index: F,
 ) -> Result<Measurement, String>
 where
-    F: FnOnce(&Path, &Path, usize) -> Result<subject::SaveSamples, String>,
+    F: FnOnce(&Path, usize) -> Result<trace::SaveBenchmarkTrace, String>,
 {
-    // Outside the vault: the same fix as `measure_full_rebuild_with`, for the
-    // same reason (F-372, task #78). No `{i}` suffix needed -- there is one
-    // scratch directory for the whole call, not one per iteration -- but the
-    // pid still guards against two concurrent `prf03` runs colliding.
-    let index_dir = std::env::temp_dir().join(format!("serat-bench-save-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&index_dir);
-    let samples = save_to_index(&vault.path, &index_dir, iterations)?;
-    let _ = std::fs::remove_dir_all(&index_dir);
-    check_save_path(samples.path)?;
-    Ok(Measurement::new(samples.save)
-        .reporting(
-            "watcher-write-to-visible",
-            "File written to row visible, via the watcher -- includes the 150 ms coalescing \
-             window of architecture §3.1 step 1. FR-VLT-04's interval, not this budget's \
-             (F-227).",
-            samples.end_to_end,
-        )
-        .reporting(
-            "watcher-dequeue-to-visible",
-            "Watcher event dequeued to row visible. Still a watcher-path interval despite the \
-             name -- not this budget's either (F-268).",
-            samples.pipeline,
-        ))
+    let trace = save_to_index(&vault.path, iterations)?;
+    check_save_completeness(&trace)?;
+
+    let mut samples = Samples::new();
+    for ms in &trace.submitted_ms {
+        samples.push(Duration::from_secs_f64(ms / 1000.0));
+    }
+    // The census goes on before any branch below can return: the lead's
+    // condition on `prewarm_index` is that `handle_missing` is reported on
+    // every run, not only on the runs that went wrong (task #94, F-450).
+    // `check_save_completeness` above has already refused a non-zero
+    // `handle_missing`, so what this carries is the zero that says the
+    // pre-warm closed the window -- #119's answer from the other direction.
+    let mut measurement = Measurement::new(samples).counting(SaveCensus {
+        attempted: trace.attempted,
+        submitted: trace.submitted_ms.len(),
+        writer_refused: trace.writer_refused,
+        handle_missing: trace.handle_missing,
+    });
+
+    if trace.writer_refused > 0 {
+        let mut refused = Samples::new();
+        for ms in &trace.writer_refused_ms {
+            refused.push(Duration::from_secs_f64(ms / 1000.0));
+        }
+        measurement = measurement
+            .reporting(
+                "writer-refused",
+                "ADR-0011's sanctioned backpressure -- excluded from the asserted p95 because a \
+                 refused save's near-instant timing would deflate the series rather than \
+                 represent it (F-19, F-382).",
+                refused,
+            )
+            .degraded(format!(
+                "{} of {} attempted saves were refused by the writer (ADR-0011 backpressure). \
+                 NFR-PRF-03's own stated workload of {} saves is enough to make the writer \
+                 refuse on this vault -- a finding about the queue, not about this harness \
+                 (F-421) -- and it fails this run's number regardless of what the {} landed \
+                 saves' own p95 says.",
+                trace.writer_refused,
+                trace.attempted,
+                trace.attempted,
+                trace.submitted_ms.len()
+            ));
+    }
+
+    Ok(measurement)
 }
 
 /// The window-painted mark at two vault sizes, measured in interleaved pairs.
@@ -2242,6 +2433,8 @@ mod tests {
             samples: samples(&[30_000.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         assert!(
             at_limit.passed(),
@@ -2256,17 +2449,111 @@ mod tests {
             samples: samples(&[30_001.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         assert!(!over.passed());
         assert!(over.to_report().starts_with("FAIL"));
         assert!(over.to_json().contains("\"passed\": false"));
     }
 
+    // --------------------------------------------------------------- #94
+
     #[test]
-    fn every_p0_budget_matches_the_number_in_the_prd() {
-        // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
-        // confirms each budget has an asserting job". This is that review, as a
-        // test, so the list cannot drift from the PRD unnoticed.
+    fn a_degraded_outcome_fails_regardless_of_the_timing() {
+        // "fail the number, not the run" (task #94): a real, honestly measured
+        // Outcome whose own p95 clears the budget by a wide margin must still
+        // report FAIL when `degraded` is set -- that is the whole point of the
+        // field existing rather than folding this into `samples`.
+        let outcome = Outcome {
+            budget: PRF03_SAVE_TO_INDEX,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[1.0, 2.0, 3.0]),
+            reported: Vec::new(),
+            phases: None,
+            degraded: Some("3 of 1000 attempted saves were refused by the writer".to_string()),
+            save_census: None,
+        };
+        assert!(
+            outcome.value_ms() <= outcome.limit_ms(),
+            "the timing alone would pass -- that is what makes this a meaningful test"
+        );
+        assert!(!outcome.passed(), "degraded must override a passing timing");
+        assert!(
+            outcome.to_report().starts_with("FAIL"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(
+            outcome.to_report().contains("DEGRADED"),
+            "the reason must be visible in the pasted report: {}",
+            outcome.to_report()
+        );
+        assert!(
+            outcome
+                .to_report()
+                .contains("3 of 1000 attempted saves were refused"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(
+            outcome
+                .to_json()
+                .contains("\"degraded\": \"3 of 1000 attempted saves were refused by the writer\""),
+            "{}",
+            outcome.to_json()
+        );
+        assert!(
+            outcome.to_json().contains("\"passed\": false"),
+            "{}",
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn an_undegraded_outcome_reports_a_null_reason() {
+        let outcome = Outcome {
+            budget: PRF03_SAVE_TO_INDEX,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[1.0]),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+        assert!(
+            !outcome.to_report().contains("DEGRADED"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(
+            outcome.to_json().contains("\"degraded\": null"),
+            "{}",
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn every_p0_budget_constant_is_pinned_against_drift_within_this_file() {
+        // **F-447: this test does not read the PRD, and its old name said it
+        // did.** Nothing under `bench/budget/src/` opens
+        // `docs/02-requirements/prd.md`. What it pins is the budget constants
+        // against silent drift *within this crate* -- real value, and why the
+        // 350 -> 3500 mutation went red -- but one edit touching both the
+        // constant and the literal below passes it, which is F-443's failure
+        // mode exactly ("the re-baseline landed in the PRD, not the code").
+        // Renamed to what it does rather than left promising what it does not;
+        // `bench/doclint`'s `check-prd-join` is the mechanism that would
+        // genuinely close the gap, and extending it is the other legitimate
+        // fix.
+        //
+        // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration
+        // review confirms each budget has an asserting job". This is that
+        // review, as a test, for the half of it that lives in this file.
         // 5, not 4 (task #107, F-443): PRF01_WINDOW_VISIBLE and
         // PRF01_VAULT_USABLE are provisionally both still here, alongside the
         // new PRF01_SERAT_TERM, until task #118 removes the two legacy
@@ -2362,6 +2649,8 @@ mod tests {
             samples: samples(&[10_000.0, 40_000.0, 20_000.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         assert_eq!(outcome.value_ms(), 20_000.0, "the middle run decides");
         assert!(outcome.passed());
@@ -2385,6 +2674,8 @@ mod tests {
             samples: samples(&[10_000.0, 40_000.0, 20_000.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         assert!(
             outcome.to_report().contains("median of 3 wall-clock runs"),
@@ -2634,6 +2925,71 @@ mod tests {
         assert!(err.contains("task I4"), "{err}");
     }
 
+    // --------------------------------------------------------------- F-445
+
+    #[test]
+    fn an_indicative_run_carries_the_warning_into_degraded_not_only_stderr() {
+        // F-445's second SHOULD-FIX. Before this fix `decide`'s eprintln! was
+        // the only record of "must not be recorded as a gate number" -- it
+        // never reached the Outcome, so a fast in-budget reading from a short
+        // local run could still print PASS and a JSON result with no trace of
+        // the warning that made it meaningless.
+        let parsed = JobArgs {
+            profile: Profile::Reference,
+            iterations: 1,
+            indicative: true,
+            help: false,
+        };
+        let outcome = decide_with_vault(&PRF04_FULL_REBUILD, parsed, a_vault(), |_, _| {
+            let mut s = Samples::new();
+            s.push(Duration::from_millis(100));
+            Ok(Measurement::new(s))
+        })
+        .expect("an indicative run with real samples is still a real Outcome");
+
+        assert!(
+            outcome.value_ms() <= outcome.limit_ms(),
+            "the timing alone would pass -- that is what makes this test meaningful"
+        );
+        let reason = outcome
+            .degraded
+            .as_ref()
+            .expect("indicative must set degraded, not only print to stderr");
+        assert!(reason.contains("indicative"), "{reason}");
+        assert!(
+            !outcome.passed(),
+            "an indicative reading must never report PASS"
+        );
+        assert!(
+            outcome.to_json().contains("\"degraded\":"),
+            "{}",
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn an_indicative_run_combines_with_an_existing_degraded_reason_rather_than_overwriting_it() {
+        let parsed = JobArgs {
+            profile: Profile::Reference,
+            iterations: 1,
+            indicative: true,
+            help: false,
+        };
+        let outcome = decide_with_vault(&PRF04_FULL_REBUILD, parsed, a_vault(), |_, _| {
+            let mut s = Samples::new();
+            s.push(Duration::from_millis(100));
+            Ok(Measurement::new(s).degraded("a pre-existing finding"))
+        })
+        .expect("a degraded measurement is still a real Outcome");
+
+        let reason = outcome.degraded.expect("degraded must still be set");
+        assert!(reason.contains("indicative"), "{reason}");
+        assert!(
+            reason.contains("a pre-existing finding"),
+            "neither reason may silently replace the other: {reason}"
+        );
+    }
+
     #[test]
     fn the_vault_generation_lock_excludes_a_second_holder_and_releases_on_drop() {
         // Task #70's other half: ensure_vault's check-then-generate window is
@@ -2863,6 +3219,8 @@ mod tests {
             samples: samples(values),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
 
         // Every sample under the limit: the run agreed with itself.
@@ -2973,75 +3331,213 @@ mod tests {
 
     // ---------------------------------------------------------------- F-30
 
-    // ---------------------------------------------------- F-227/F-229/F-268
+    // ------------------------------------------- F-382, F-390, F-421, #94
 
-    #[test]
-    fn check_save_path_accepts_only_save() {
-        check_save_path("save").expect("the direct save path is accepted");
-
-        let err = check_save_path("watcher").expect_err("a watcher-path save must be refused");
-        assert!(err.contains("watcher"), "{err}");
-        assert!(err.contains("NFR-PRF-03"), "{err}");
-        assert!(err.contains("F-227"), "{err}");
-        assert!(err.contains("F-229"), "{err}");
-        assert!(err.contains("F-268"), "{err}");
-
-        // SaveSamples::default() gives path: "" -- the guard must fail closed
-        // on the default, not open.
-        assert!(check_save_path("").is_err());
-    }
-
-    fn save_samples(path: &'static str) -> subject::SaveSamples {
-        let mut save = Samples::new();
-        save.push(Duration::from_millis(12));
-        let mut end_to_end = Samples::new();
-        end_to_end.push(Duration::from_millis(400));
-        let mut pipeline = Samples::new();
-        pipeline.push(Duration::from_millis(180));
-        subject::SaveSamples {
-            path,
-            save,
-            end_to_end,
-            pipeline,
+    fn save_trace(
+        attempted: usize,
+        submitted_ms: &[f64],
+        handle_missing: u64,
+        writer_refused: u64,
+        writer_refused_ms: &[f64],
+    ) -> trace::SaveBenchmarkTrace {
+        trace::SaveBenchmarkTrace {
+            attempted,
+            submitted_ms: submitted_ms.to_vec(),
+            handle_missing,
+            writer_refused,
+            writer_refused_ms: writer_refused_ms.to_vec(),
         }
     }
 
     #[test]
-    fn measure_save_to_index_asserts_the_save_interval_and_reports_the_watcher_ones() {
-        // F-268: this is the regression test for the defect the finding is
-        // about. Before the fix this measurement asserted `pipeline` -- a
-        // watcher-path interval -- and this test would have passed on the
-        // wrong series, silently, the same way the real bug did.
-        let m = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Ok(save_samples("save")))
-            .expect("a save-path measurement is accepted");
-        assert_eq!(m.samples.values(), &[12.0]);
-        assert_eq!(m.reported.len(), 2);
-        let labels: Vec<&str> = m.reported.iter().map(|r| r.label.as_str()).collect();
-        assert!(labels.contains(&"watcher-write-to-visible"), "{labels:?}");
-        assert!(labels.contains(&"watcher-dequeue-to-visible"), "{labels:?}");
-        // Neither watcher-path series may be silently dropped, or FR-VLT-04
-        // loses the only measurement of the interval it actually governs.
+    fn check_save_completeness_accepts_a_fully_submitted_run() {
+        check_save_completeness(&save_trace(3, &[12.0, 8.0, 15.0], 0, 0, &[]))
+            .expect("every attempted save landed; nothing to refuse");
+    }
+
+    #[test]
+    fn check_save_completeness_is_a_hard_zero_on_handle_missing() {
+        let err = check_save_completeness(&save_trace(3, &[12.0, 8.0], 1, 0, &[]))
+            .expect_err("a non-zero handle_missing must refuse the run");
+        assert!(err.contains("1 of 3"), "{err}");
+        assert!(err.contains("F-382"), "{err}");
+    }
+
+    #[test]
+    fn check_save_completeness_accepts_a_non_zero_writer_refused() {
+        // The other half of the split this check exists to make: writer_refused
+        // is ADR-0011's sanctioned backpressure, not this function's business --
+        // ruling on it belongs to measure_save_to_index_with, tested below.
+        check_save_completeness(&save_trace(3, &[12.0, 8.0], 0, 1, &[0.4]))
+            .expect("writer_refused alone must not refuse the run");
+    }
+
+    #[test]
+    fn check_save_completeness_catches_a_fourth_unnamed_way_to_vanish() {
+        // 3 attempted, only 2 accounted for by submitted+refused -- neither
+        // named counter caught it, which is exactly the "denominator, not a
+        // symptom" case this function exists for.
+        let err = check_save_completeness(&save_trace(3, &[12.0], 0, 0, &[]))
+            .expect_err("an unaccounted-for save must refuse the run");
+        assert!(err.contains("3 attempted"), "{err}");
+        assert!(err.contains("1 submitted, 0 refused"), "{err}");
+    }
+
+    #[test]
+    fn check_save_completeness_refuses_an_all_refused_run_by_name_not_by_a_generic_panic() {
+        // F-445's first SHOULD-FIX. Conservation alone passes here -- 0
+        // submitted + 3 refused == 3 attempted -- and without this branch that
+        // Ok would have reached Samples::percentile with an empty asserted
+        // series, whose own "no samples" assertion panics rather than naming
+        // the actual reason (every save was refused by the writer). The
+        // specific message is the one worth reading; a panic or a generic
+        // empty-measurement Err both discard it.
+        let err = check_save_completeness(&save_trace(3, &[], 0, 3, &[0.1, 0.2, 0.3]))
+            .expect_err("an all-refused run has no p95 to compute and must say so by name");
+        assert!(err.contains("all 3 attempted saves were refused"), "{err}");
+        assert!(err.contains("ADR-0011"), "{err}");
+    }
+
+    #[test]
+    fn measure_save_to_index_propagates_the_specific_all_refused_reason() {
+        let err = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[], 0, 3, &[0.1, 0.2, 0.3]))
+        })
+        .expect_err("an all-refused run must not silently produce an empty-samples measurement");
+        assert!(err.contains("all 3 attempted saves were refused"), "{err}");
+    }
+
+    #[test]
+    fn measure_save_to_index_asserts_only_the_submitted_series() {
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0, 15.0], 0, 0, &[]))
+        })
+        .expect("a fully submitted run is accepted");
+        assert_eq!(m.samples.values(), &[12.0, 8.0, 15.0]);
+        assert!(
+            m.reported.is_empty(),
+            "nothing to report when nothing degraded"
+        );
+        assert!(m.degraded.is_none());
+    }
+
+    #[test]
+    fn a_clean_save_run_still_states_its_handle_missing_count() {
+        // The lead's binding condition on task #94's prewarm_index (F-450):
+        // the run must REPORT handle_missing, not merely refuse when it is
+        // non-zero. Pre-warming the index is a setup change that turns a
+        // failing measurement into a passing one, and this project's four
+        // worst defects were all instruments that flattered the figure. A
+        // zero that is printed is evidence the window closed; a zero that is
+        // only implied by the absence of an error is indistinguishable from
+        // nobody having looked.
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0, 15.0], 0, 0, &[]))
+        })
+        .expect("a fully submitted run is accepted");
+        let census = m
+            .save_census
+            .expect("every save measurement carries its census, clean or not");
         assert_eq!(
-            m.reported
-                .iter()
-                .find(|r| r.label == "watcher-write-to-visible")
-                .expect("present")
-                .samples
-                .values(),
-            &[400.0]
+            census,
+            SaveCensus {
+                attempted: 3,
+                submitted: 3,
+                writer_refused: 0,
+                handle_missing: 0,
+            }
+        );
+
+        let outcome = outcome_from(&PRF03_SAVE_TO_INDEX, Profile::Reference, a_vault(), m)
+            .expect("a clean run produces an outcome");
+        let report = outcome.to_report();
+        assert!(
+            report.contains("0 handle-missing"),
+            "the zero must appear on the face of the report: {report}"
+        );
+        assert!(report.contains("3 attempted"), "{report}");
+        let json = outcome.to_json();
+        assert!(json.contains("\"handle_missing\": 0"), "{json}");
+        assert!(json.contains("\"save_path_census\""), "{json}");
+    }
+
+    #[test]
+    fn a_degraded_save_run_carries_the_refusal_count_into_the_census_too() {
+        // The census is the denominator's full statement, so a run that
+        // degrades on backpressure must still say how the attempts split.
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0], 0, 1, &[0.4]))
+        })
+        .expect("writer_refused alone must not fail the run");
+        assert_eq!(
+            m.save_census
+                .expect("census travels with a degraded run too"),
+            SaveCensus {
+                attempted: 3,
+                submitted: 2,
+                writer_refused: 1,
+                handle_missing: 0,
+            }
         );
     }
 
     #[test]
-    fn a_save_measured_on_the_watcher_path_is_refused_not_silently_asserted() {
-        let err = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Ok(save_samples("watcher")))
-            .expect_err("a watcher-path measurement must not become an NFR-PRF-03 number");
-        assert!(err.contains("watcher"), "{err}");
+    fn a_budget_with_no_countable_unit_of_work_carries_no_census() {
+        // The other half: nothing but NFR-PRF-03 has a census, and an empty
+        // one must not print as a row of zeroes that reads like a measured
+        // result. A rebuild does not attempt saves.
+        let outcome = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[19_000.0])),
+        )
+        .expect("a rebuild measurement is an outcome");
+        assert!(outcome.save_census.is_none());
+        assert!(
+            !outcome.to_report().contains("save path"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(!outcome.to_json().contains("save_path_census"));
+    }
+
+    #[test]
+    fn measure_save_to_index_refuses_a_run_with_a_missing_handle() {
+        let err = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0], 1, 0, &[]))
+        })
+        .expect_err("handle_missing is a hard zero");
+        assert!(err.contains("F-382"), "{err}");
+    }
+
+    #[test]
+    fn measure_save_to_index_reports_and_degrades_a_run_with_a_refusal() {
+        // "fail the number rather than the run" (F-421): the run is not an
+        // Err -- a real Measurement comes back, with writer-refused reported
+        // beside the submitted series -- but it must be marked degraded, so
+        // an otherwise-fast p95 cannot pass as though 1,000 saves reached the
+        // index when fewer did.
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0], 0, 1, &[0.4]))
+        })
+        .expect("writer_refused alone must not fail the run");
+        assert_eq!(
+            m.samples.values(),
+            &[12.0, 8.0],
+            "only submitted saves feed the p95"
+        );
+        assert_eq!(m.reported.len(), 1);
+        assert_eq!(m.reported[0].label, "writer-refused");
+        assert_eq!(m.reported[0].samples.values(), &[0.4]);
+        let reason = m.degraded.expect("a refusal must set degraded");
+        assert!(reason.contains("1 of 3"), "{reason}");
+        assert!(reason.contains("F-421"), "{reason}");
     }
 
     #[test]
     fn a_failed_save_measurement_propagates_rather_than_being_absorbed() {
-        let err = measure_save_to_index_with(&a_vault(), 1, |_, _, _| Err("boom".into()))
+        let err = measure_save_to_index_with(&a_vault(), 1, |_, _| Err("boom".into()))
             .expect_err("a failed save path is not a measurement");
         assert_eq!(err, "boom");
     }
@@ -3481,6 +3977,8 @@ mod tests {
             samples: samples(&[19_000.0, 21_000.0, 20_000.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         let path = write_result_to(&dir, &outcome).expect("write");
         let written = std::fs::read_to_string(&path).expect("read back");
@@ -3517,6 +4015,8 @@ mod tests {
             samples: samples(&[20_000.0]),
             reported: Vec::new(),
             phases: None,
+            degraded: None,
+            save_census: None,
         };
         assert!(outcome.passed(), "20 s is inside 30 s");
         assert!(

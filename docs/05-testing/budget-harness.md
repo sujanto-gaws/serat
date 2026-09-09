@@ -269,13 +269,13 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-021 | NFR-PRF-03, NFR-PRF-08 | `bench/budget/src/bin/prf03-save-to-index.rs` | harness landed, red pending I5 |
 | TC-022 | NFR-PRF-01, NFR-PRF-08 | `bench/budget/src/bin/prf01-cold-start.rs` | harness landed, red pending D2 + S1 |
 | TC-023 | NFR-PRF-08, US-35 | `.github/workflows/budgets.yml` | landed |
-| TC-026 | NFR-PRF-08 — the budget table matches the PRD | `bench/budget/src/lib.rs::every_p0_budget_matches_the_number_in_the_prd` | pass |
+| TC-026 | NFR-PRF-08 — the budget constants are pinned against drift **within this crate**; nothing here reads the PRD (F-447) | `bench/budget/src/lib.rs::every_p0_budget_constant_is_pinned_against_drift_within_this_file` | pass |
 | TC-027 | NFR-PRF-01/03 — p95 is nearest-rank at n = 20 | `…::nearest_rank_p95_over_twenty_runs_allows_exactly_one_slow_run` | pass |
 | TC-028 | NFR-PRF-08 — a breach fails, the boundary passes | `…::a_breach_is_a_failure_and_the_boundary_passes` | pass |
 | TC-029 | NFR-PRF-08 — a missing subject fails loudly and names the task | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
 | TC-040 | NFR-PRF-04 — a scanner-disabled Windows run is not gate eligible | `bench/budget/src/env.rs::a_scanner_disabled_windows_run_is_not_gate_eligible` | pass |
 | TC-041 | NFR-PRF-01/03/04 — the measurement environment is detected and recorded | `bench/budget/src/env.rs::detection_reports_something_about_this_machine` | pass |
-| TC-042 | F-03 — every budget declares the interval it times | `bench/budget/src/lib.rs::every_p0_budget_matches_the_number_in_the_prd` | pass |
+| TC-042 | F-03 — every budget declares the interval it times | `bench/budget/src/lib.rs::every_p0_budget_constant_is_pinned_against_drift_within_this_file` | pass |
 | TC-043 | F-10 — the rebuild seam asks for the phases and they sum coherently | `bench/budget/src/subject.rs::the_seam_fails_loudly_and_says_what_is_missing` | pass |
 | TC-044 | NFR-PRF-01 — a trace that undercounts pre-`main` time is refused | `bench/budget/src/trace.rs::a_trace_that_undercounts_pre_main_is_refused` | pass |
 | TC-045 | NFR-PRF-01 — a debug build cannot produce a budget number | `…::a_debug_build_cannot_produce_a_budget_number` | pass |
