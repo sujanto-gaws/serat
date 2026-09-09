@@ -37,21 +37,25 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## 🟢 BUILDS: **ALLOWED** — no measurement is running. **The freeze is SHUT and the lead holds it.**
+> ## 🔴 BUILDS: **FROZEN** — #95 is taking NFR-PRF-03, the last unmeasured gate number
 >
-> **Three of the four gate numbers are settled. NFR-PRF-03 is the last one and it is two sentences away.** #119 merges → #94 rebases onto it → code-reviewer mutates *that* tree → the lead declares the freeze → #95 takes the number. **#94's approval at `d30aa34` is against a tree #95 will not run on**, because #119 changes the binary; F-429 applied to ourselves.
+> **Declared by the lead. No teammate runs a cargo build, a cargo test, or anything that writes to a `target/` until this banner turns green.** F-327 records 35% session-to-session movement on unchanged code and F-367's confirmed second cause is two cargo processes sharing one `target/`. **This is a scheduling constraint, not advice.** If you are idle, stay idle; if you are mid-build, finish and stop.
 >
-> **What is holding the freeze, and it is not code:** code-reviewer owes two sentences — **(1)** is **F-435** closed (990 refused + 10 submitted satisfies conservation and yields a p95 over ten fastest samples; its status still reads *must close before #95 runs*), and by which mechanism; **(2)** can a failed or skipped pre-warm reach a reported figure (the survivor at `subject.rs:610`)? *If yes it blocks; if `handle_missing` catches it downstream by construction it is a SHOULD-FIX and the freeze opens.* **An implicit clearance and a stale status are the same defect** — a claim nobody re-derived. That is F-465, found today, in this file.
+> **The tree #95 measures is `c60dfdd`** — `main` with **#119 merged** (`690b70c`) and **#94 merged**. Both approved by mutation, and code-reviewer verified the merge trees rather than the branch tips: `git diff 8460e32 690b70c` over all code files is empty, and #94's merge touches no file both sides changed. **This exact tree has now been reviewed, which is what F-429 asks and what three attempts at #95 did not have.**
 >
-> ## Queue
+> **test-engineer: take #95.** 1,000 saves, `--profile reference`, canonical 20k vault, pre-warmed. Report `handle_missing` at zero or non-zero — **a residual is F-382's window measured a second way and it goes to #119's record, never absorbed.**
 >
-> - **code-reviewer:** F-435 + the survivor → **#119 at `8460e32`** (mutate that `Rebuilding`/`Unavailable` still fire the settled mark — a *close it cheaply* fix breaks that quietly or not at all) → **#121**. #102 is **DONE, no BLOCKING**.
-> - **test-engineer:** #118's code half. **Hold #95 for the freeze.** #94 is approved at `d30aa34`.
-> - **rust-core-dev:** #120 implementation. **#94 merges before you rebase** — you are editing `subject.rs` from a base without its pre-warm. The **objection** and the **`asset_path`/`sidecar_path`** answer are still owed.
-> - **tauri-app-dev:** #121's *run mechanics only* — the mutations and the verdict are code-reviewer's. Plus `capabilities/default.json`'s stale `boot.js` description.
-> - **architect:** clear, nothing owed.
+> **The clearance on F-435 and the pre-warm survivor is *derived by the lead*, not attested by the reviewer**, and the register says so. Three asks did not produce the two sentences, so: #95 runs 1,000 saves, and a short series cannot post a gate number either way — `indicative` travels on `Outcome` (F-448) and `degraded` gates `passed()` (mutation-verified). A failed pre-warm drives `handle_missing` non-zero and the run is refused outright. **If either derivation is wrong, the freeze shuts and the number is void.**
 >
-> **Today's register runs F-450 → F-469.** The one to read first is **F-469**, which subsumes five of them: *after fixing a defect, ask what one-line query would have found it, run that query, and fix everything it returns — and enumerate against content, never against metadata about content.* Ancestry, task-list status, a stub's *"objections: none"* and a commit message's own promises have each been recorded stale today. **Six findings are against work already marked done, and four are against the lead.**
+> ## Queue after the freeze lifts
+>
+> - **code-reviewer:** #118 at `bc565ee`; then #121's mutations and verdict — **read F-470 first**, a `boot.js` mutation with no rebuild gives exit 0 and a complete trace.
+> - **rust-core-dev:** #120 — **rebase onto `c60dfdd` now that #94 has merged**; plus F-474 (T1's three unguarded series) and the two answers still owed.
+> - **tauri-app-dev:** F-470's scope assessment, F-473, `capabilities/default.json`.
+> - **test-engineer:** #101's update — **F-466 says every stated reason for the NFR-PRF-03 blank is now false**, and the blank is about to be filled.
+> - **architect:** F-470's basis clause for §3.4 and ADR-0014 — every claim about the front end cites `app/src/*` while the binary embeds `webview/`.
+>
+> **Today's register runs F-450 → F-474.** Read **F-469** first; it subsumes six of them and now has three clauses. **Seven findings are against work already marked done, and five are against the lead.**
 
 ## Resume task list (from #90)
 
@@ -68,8 +72,8 @@ Two rulings by the owner, taken 2026-09-08, set this wave's shape.
 | 91 | `[P0/test] Recover or discard the uncommitted bench/budget env work` | NFR-PRF-08 | test-engineer | `bench/budget` | — | **done** — discarded as superseded; on `task/91-93-97-test-recovery` |
 | 92 | `[P0/impl] Resolve the uncommitted serat-app/state.rs one-liner` | T-06, FR-BIN-19 | rust-core-dev | `crates/serat-app` | — | **CLOSED** — discarded; F-383 recorded |
 | 93 | `[P0/test] Close the cross-process race on the shared 20k vault` | NFR-PRF-08 · F-369/F-370 | test-engineer | `bench/`, CI | — | **done** — closed on task #70's evidence; CI verification blocked by F-384 |
-| 94 | `[P0/test] Make prf03-save-to-index measure the real save path at p95, and fail when it degraded` | NFR-PRF-03, NFR-PRF-08, US-35 · F-382 | test-engineer | `bench/budget/src/bin/prf03-save-to-index.rs` | 90 | **built, uncommitted work to recover** — `task/94-prf03-real-save-path` @ `3da25bc`, plus an unlanded `prewarm_index` in the worktree. Then code-reviewer mutates. |
-| 95 | `[P0/test] Take and record NFR-PRF-03 on #83's attested method` | NFR-PRF-03, US-35 · F-NEXT/index-handle-slot-filled-after-status-publishes | test-engineer | `docs/05-testing/reports/` | 94, 93 | **UNBLOCKED, fourth attempt** — the 1000/1000 was a cold-vault premise error in the harness, not a `serat-app` defect (F-450). Behind #94's recovery and code-reviewer's mutation; lead declares the freeze. |
+| 94 | `[P0/test] Make prf03-save-to-index measure the real save path at p95, and fail when it degraded` | NFR-PRF-03, NFR-PRF-08, US-35 · F-382 | test-engineer | `bench/budget/src/bin/prf03-save-to-index.rs` | 90 | **MERGED** `c60dfdd` — approved at `d30aa34`, zero BLOCKING, 8 mutations / 6 red / 1 survivor (F-475). |
+| 95 | `[P0/test] Take and record NFR-PRF-03 on #83's attested method` | NFR-PRF-03, US-35 · F-NEXT/index-handle-slot-filled-after-status-publishes | test-engineer | `docs/05-testing/reports/` | 94, 93 | **RUNNING — fourth attempt, freeze declared, tree `c60dfdd`** — the 1000/1000 was a cold-vault premise error in the harness, not a `serat-app` defect (F-450). Behind #94's recovery and code-reviewer's mutation; lead declares the freeze. |
 | 96 | `[P0/test] Rule whether NFR-PRF-04 has a gate-quality measurement` | NFR-PRF-04, C-06 · ADR-0013 · F-327 | test-engineer | `docs/05-testing/nfr-prf-04-gate-quality.md` | 91, 93 | **done** — gate-quality PASS, 27,693.5 ms / 30,000 ms limit, `concurrent_build_processes: 0`, 3.2% spread |
 | 97 | `[P0/test] T1 rebuild-equivalence: delete .serat/, assert identical results` | FR-VLT-02, NFR-REL-02, US-01, US-07 · ADR-0002 · F-136 (real-disk half only) | rust-core-dev | `crates/serat-index/tests` — branch `task/97-rebuild-equivalence` | — | **MERGED** — landed as a rebase-twin, so `origin/task/97-rebuild-equivalence` @ `c01698d` reports ahead=1 forever (F-460). Verified by content: `crates/serat-index/tests/rebuild_equivalence.rs` is on main. |
 | 98 | `[P0/impl] Mount Vue 3 + CodeMirror 6, keeping both startup marks` | NFR-PRF-01 · ADR-0006, ADR-0007 | vue-frontend-dev | `app/`, `crates/serat-app/webview/` | — | **MERGED** — `b2f6969` is on main (rebase-twin; the ref reports ahead=0). Corrected per F-469: the lead fixed #97 and #105 and left the rest of the class, which cost code-reviewer a second offer to review four merged branches. |
