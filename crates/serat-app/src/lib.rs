@@ -618,10 +618,13 @@ mod tests {
                  means a second call site can take the mark first and no-op \
                  the honest one (F-392, F-481, F-504). If you added the \
                  second site deliberately -- a retry path, say -- raising \
-                 this count is not the fix: both marks are first-wins, so a \
-                 second site can only ever fire when the first did not, and \
-                 which one is allowed to win is ADR-0014's table rather \
-                 than a number to bump here"
+                 this count is not the fix, and it is not a tie to break \
+                 either: with two sites, first-wins makes window_visible \
+                 name whichever site executed earlier, which is code \
+                 ordering rather than painting. A second site changes what \
+                 S_shell measures. ADR-0014's table decides which \
+                 interval the term names, and that decision has to precede \
+                 the site"
             );
         }
     }
