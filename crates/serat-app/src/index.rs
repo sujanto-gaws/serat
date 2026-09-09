@@ -931,6 +931,62 @@ mod tests {
     }
 
     #[test]
+    fn only_the_states_that_end_the_open_check_are_deferred() {
+        // code-reviewer's SHOULD-FIX on #119, by mutation: splitting `Unavailable`
+        // out of `is_terminal` -- so it publishes from inside `open()` instead of
+        // being deferred -- left all 108 tests green. The behavioural tests could not
+        // see it, because on the `Unavailable` path `into_handle()` returns `None`,
+        // so there is no handle for the publish to race and *both* orderings are
+        // correct today. What was unpinned was the **classification**, and pinning it
+        // directly is cheaper than proving its consequences.
+        //
+        // Each row is a decision, and two of them are load-bearing:
+        //
+        //   `Rebuilding` false -- deferring it would make the shell wait for `Ready`
+        //       and hang for the length of a rebuild on exactly the vault where the
+        //       window most needs to be up (§3.4's first precondition, and the reason
+        //       written above `Startup::mark_index_settled`).
+        //
+        //   `Unavailable` true -- the deferral is uniform across terminal states *by
+        //       design*, not conditional on a handle having appeared. `is_terminal`'s
+        //       own doc says so ("its `IndexHandle`, **if it produced one**, exists"),
+        //       and until this test nothing held it to that. A later reader who
+        //       simplified the arm to just `Ready` would get a green suite, and any
+        //       future opener that published `Unavailable` while still yielding a
+        //       handle -- a degraded-but-open index is the obvious candidate --
+        //       would silently reopen F-382's window on that path with nothing
+        //       objecting.
+        for (state, expected) in [
+            (IndexState::Ready { note_count: 0 }, true),
+            (
+                IndexState::Unavailable {
+                    message: "the rebuild failed".to_owned(),
+                    path: "/vault/.serat".to_owned(),
+                },
+                true,
+            ),
+            (IndexState::Opening, false),
+            (
+                IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 0,
+                    walk_complete: false,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(
+                is_terminal(&state),
+                expected,
+                "{state:?} is classified wrongly: the deferral must cover every \
+                 state after which the open check is over, and no state \
+                 before it"
+            );
+        }
+    }
+
+    #[test]
     fn an_open_that_produced_no_handle_still_publishes_its_terminal_state() {
         // The other half of #119's deferral, and the reason it is a deferral rather
         // than a condition on the handle existing. `Unavailable` is terminal with
