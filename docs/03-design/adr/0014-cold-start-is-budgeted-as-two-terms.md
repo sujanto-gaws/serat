@@ -31,15 +31,22 @@ more than twice, with no code from this repository in it. §3.4's own diagnosis:
 > the 619 ms is not a finding about the crate graph, the actor, or the schema. It is a
 > finding that the requirement was written without a webview-startup term in it.
 
-**Three different figures for the webview term appear within a few lines here — 619 ms,
-753.7–865.4 ms, and the ~966 ms platform term in §Consequences — and they are three
-different measurements, not a drift.** F-86's 619 ms is the median of that phase on the run
-that first measured the miss; 753.7–865.4 ms is the same phase on the later run with marks
-placed for the purpose, at two notes and at twenty thousand; ~966 ms is the whole *platform
-term* at twenty thousand, so it sums three phases rather than naming one. Stated because
-§Decision 6 of this ADR requires the basis to travel with the figure, and this paragraph is
-the one place in it that quoted numbers without one. F-94 and F-106 both landed on exactly
-this shape of error.
+**Three different figures for the webview term appeared within a few lines here — 619 ms,
+753.7–865.4 ms, and a ~966 ms platform term — and they were three different measurements,
+not a drift.** F-86's 619 ms is the median of that phase on the run that first measured the
+miss; 753.7–865.4 ms is the same phase on the later run with marks placed for the purpose, at
+two notes and at twenty thousand; ~966 ms was the whole *platform term* at twenty thousand, so
+it summed three phases rather than naming one. Stated because §Decision 6 of this ADR requires
+the basis to travel with the figure, and this paragraph is the one place in it that quoted
+numbers without one. F-94 and F-106 both landed on exactly this shape of error.
+
+**Every figure in this section is from that phase table, whose basis turned out to be
+unreconstructable (§Objections), so this section is the diagnosis and not the evidence.** The
+~966 ms is no longer quoted as a value anywhere else in this ADR: §Decision 2 and §Consequences
+now carry #100's attested platform term and name the ~966 only as the figure they withdrew.
+And the figures that remain here remain because withdrawing them would erase the reasoning
+that produced the split. They are quoted for shape: an 865 ms term beside a 5 ms term is
+not a claim any statistic decides.
 
 The owner ruled on 2026-09-08 that NFR-PRF-01 is re-baselined **with** the webview term
 rather than by opening C-07 (Tauri v2 + Vue 3 are fixed), and that **the re-baseline is a
@@ -136,7 +143,9 @@ deliberate:
   `tauri::Builder`'s construction is platform code whose cost is partly a function of a
   Serat decision — the size of `generate_handler!` and the plugin set. It is the one term
   where a Serat regression could hide in the platform column. It is booked to the platform
-  because ~29 ms of builder against a ~966 ms platform term is not where anything hides,
+  because a builder term of ~13 ms against a platform term of ~1117 ms is not where anything
+  hides (#100's attested medians; the ~29 ms and ~966 ms this clause used to quote came from
+  the phase table whose basis is unreconstructable, §Objections),
   and because a budget on an interval we cannot profile from inside is a budget nobody can
   act on. **It is watched rather than budgeted**, and if it ever moves materially with
   command count that is the signal to re-book it.
@@ -355,8 +364,10 @@ cost rather than a presentational one.
 ### What P0 hands P1, stated plainly so the decision is visible rather than lost
 
 **On WebView2, the 400 ms first-paint budget is unreachable regardless of what Serat
-does.** The platform term at 20,000 notes is ~966 ms with zero Serat code in it — 2.4×
-the whole budget. No allocation of the Serat term changes that.
+does.** The platform term at 20,000 notes is **1116.7 ms median and 1687.1 ms p95** with zero
+Serat code in it — 2.8× the whole budget at the median and 4.2× at p95 (#100, attested,
+post-#98; the ~966 ms this paragraph used to quote came from the phase table whose basis is
+unreconstructable, §Objections). No allocation of the Serat term changes that.
 
 P0 cannot distinguish the two futures that follow, and both are P1's:
 
@@ -586,9 +597,38 @@ is the first case where that mattered rather than being a precaution.
 **What this must not become is a precedent for quoting them anyway.** These figures travelled
 into three documents before anyone asked what they were. That they can no longer be attested,
 and that nobody noticed until the question was put twice, is a stronger argument for
-§Decision 6 than the rule's original justification was. They measured the table this ADR partitions, and §Decision 2's caveat
-about `generate_handler!` is a question only they have watched move. *(Consulted
-2026-09-08; awaiting their answer.)*
+§Decision 6 than the rule's original justification was.
+
+**Why they were the ones asked, and what is left of it.** tauri-app-dev was consulted on two
+things: they measured the table this ADR partitions, and §Decision 2's caveat about
+`generate_handler!` is a question only they have watched move. The first is answered above and
+the answer is that it cannot be reconstructed. The second is now partly answered by something
+other than a consultation — #100 measures `P_builder` at **13.3 ms median / 16.9 ms p95**, and
+it stays watched rather than budgeted. *(Consulted 2026-09-08; answered on the basis question
+2026-09-08, and this paragraph corrected 2026-09-09, where it had gone on reading "awaiting
+their answer" beneath the answer itself.)*
+
+**Architect's closure of the basis question, and it is a bound rather than a blank
+(2026-09-09).** The conclusion above stands — the basis cannot be reconstructed from what was
+recorded — and part of it can be recovered from arithmetic the table itself carries, which is
+worth more to a later reader than the bare word *unreconstructable*. The two rows this ADR
+calls `S_pre` and `S_setup` sum exactly to the `S_main` figure §3.4 records separately (4.7 +
+0.5 = 5.2 at two notes; 5.0 + 0.5 ≈ 5.6 at twenty thousand), and that figure is stated beside a
+**p95** of 9.4 and 9.6 — so those cells are a central statistic and p95 is what they are not.
+The 20,000-note column's three platform rows compose to 965.9 ms, which is the **~966 ms this
+ADR used to quote**: that figure had the table's basis and never a better one. **The honest
+form of the basis is: a central statistic, median or mean unknown, over twenty spawns per
+figure, release build, scanner off, machine state unrecorded, composition across runs not
+excluded.**
+
+**And one consequence that had not been drawn: the table may not be read across, either.** Its
+two columns are a *blocked* two-vault comparison, which §3.4 later discredits for exactly this
+comparison because the within-arm spread is about five times the effect. So neither the 753.7 →
+865.4 ms growth nor the 4.7 → 5.0 ms flatness is evidence about vault size. The flat reading is
+the load-bearing one — it is where "nothing on the critical path is proportional to the size of
+the vault" gets its only direct measurement — and it is now carried as a bound rather than as a
+demonstration until §3.4's proportionality check runs on the Serat term (task #118's ruling),
+which puts it inside a paired interleaved design for the first time.
 
 **The owner ruled the frame** — re-baseline with the webview term rather than open C-07,
 and as a split rather than a slackening — on 2026-09-08. The grounds are quoted in
@@ -596,21 +636,41 @@ and as a split rather than a slackening — on 2026-09-08. The grounds are quote
 
 ## Tested against
 
-**None yet, and the case that would test it is task #100.** The partition is derived from
-§3.4's phase table, which is the same body of measurement it is meant to organise — a rule
-derived from one case and checked against that case has not been checked, which is exactly
-what ADR-0013's own Tested against field had to admit about itself.
+**Task #100, and it has now run — this field said "none yet" for a day after its own case
+landed.** The partition was derived from §3.4's phase table, which is the same body of
+measurement it is meant to organise — a rule derived from one case and checked against that
+case has not been checked, which is exactly what ADR-0013's own Tested against field had to
+admit about itself. #100 is the independent case, and it is independent in the way that
+matters: a different build (post-#98), a different sitting, and a harness that computes the
+terms rather than a reader who composes them.
 
-Three specific things #100 will either confirm or break, and whoever runs it should record
-which:
+Three specific things #100 would confirm or break, with what it returned:
 
-1. **Does Σ(terms) equal `t0_to_vault_usable_ms` on every run?** If it does not, a mark is
-   missing or a boundary is wrong, and §Decision 1's central property does not hold.
+1. **Does Σ(terms) equal `t0_to_vault_usable_ms` on every run?** **Yes, and the answer is
+   worth less than the question assumed.** #106 asserts the identity, and test-engineer's
+   objection above is the reason it proves less than it reads: with all seven marks required
+   and monotonicity checked separately it is a telescoping sum, true of any seven numbers, so
+   what it guards is the harness's field-to-term mapping — proven by breaking that mapping
+   deliberately, not by an honest run ever failing it.
 2. **Is `S_front` still ~138 ms with Vue 3 and CodeMirror 6 mounted, or does it move by an
-   order?** The split's value rests on the Serat term being small enough to budget usefully
-   and large enough to be worth budgeting. #98 is the first change that tests both.
-3. **Does `s95` × 1.3 fit under 400 ms?** §Decision 5's empty-interval clause has never
-   fired and is the clause most likely to be argued with when it does.
+   order?** **It moved, and not by an order: 197.6 ms median / 230.4 ms p95**, against
+   `S_main`'s 3.4 / 4.0. So §Decision 4's allocation survives its own test, and it turns out to
+   have been the load-bearing decision — `S_front` is 98% of the Serat term, so a single sum
+   would have hidden the entire front end behind four milliseconds of quiet Rust.
+3. **Does `s95` × 1.3 fit under 400 ms?** **Yes: 233.8 × 1.3 = 303.9, leaving [304, 400] and
+   96 ms of room.** The empty-interval clause still has never fired, so it remains the clause
+   most likely to be argued with when it does.
+
+**A fourth thing #100 returned that this list did not ask for, and it is the strongest result
+in the document** (§Decision 7, F-407): the aggregate scalars move ~19% between attested
+batches while `S` moves ~8% on p95. The term this ADR made binding is measurable and the term
+it declined to budget is not, which defends §Decision 3 better than §Decision 3 did.
+
+**What is still untested here is the ratio, not the level.** §3.4's proportionality check has
+never been run against the Serat term — task #118's ruling moves its subject there — so
+"nothing on the critical path is proportional to vault size" remains supported only by a
+blocked two-vault comparison in the phase table, which §Objections above now records as
+inadmissible for that reading.
 
 The second case that would test this — and the more valuable one — is **the first
 platform that is not Windows**, because the attribution rule claims to be
