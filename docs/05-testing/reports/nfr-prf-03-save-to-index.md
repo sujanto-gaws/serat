@@ -9,8 +9,8 @@ cites: ADR-0001, ADR-0011, F-327, F-382, F-435, F-448, F-450, F-458, F-462, F-48
 
 # Save → index, measured (task #95)
 
-**Status:** measured · **PASS on the budget, `gate_eligible: false` on the machine** · **Run by:** test-engineer,
-2026-09-09
+**Status:** measured · **PASS on the budget, `gate_eligible: false` on the machine** · **instrument
+mutation-attested after the fact by #122, passed** · **Run by:** test-engineer, 2026-09-09
 **Tree:** `c60dfdd` — `main` with #119 merged (`690b70c`) and #94 merged. `target/release/serat.exe` and
 `target/release/prf03-save-to-index.exe`, release profile, both built from that tree in one cargo process.
 **Vault:** canonical 20k fixture, digest `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e`,
@@ -86,10 +86,21 @@ be filed under F-382 without a fresh diagnosis. None appeared, so nothing goes t
    than an honest red.
 4. **One platform.** Windows, 16 cores, Energy Star power plan, `concurrent_build_processes: 0` under the declared
    freeze.
-5. **The composed tree was not mutation-attested at measurement time.** code-reviewer verified `690b70c` byte-identical
-   to the approved `8460e32` and verified #94 would merge cleanly, but had not mutated `c60dfdd` itself; F-429 is
-   satisfied on the merges and *inferred* on the composition. That attestation comes after the freeze lifts, and if it
-   fails, this number is void.
+5. **The composed tree was not mutation-attested at measurement time — DISCHARGED by task #122, and kept rather than
+   deleted.** At the time this figure was taken, code-reviewer had verified `690b70c` byte-identical to the approved
+   `8460e32` and verified #94 would merge cleanly, but had not mutated `c60dfdd` itself; F-429 was satisfied on the
+   merges and *inferred* on the composition, and the bound said that if the attestation failed, this number was void.
+   **It passed** — #122, against `c60dfdd` rather than the branch tips: control 95/0, ten of eleven red, identical to
+   `d30aa34`, D1/D2 red. **4.306 ms is not void.**
+
+   The bound stays on this list because **it remains true of the figure**: this number was taken before its instrument
+   was attested, and a later pass does not reorder those two events. Deleting it would drop a true bound and leave a
+   reader unable to tell that the sequence was ever a risk.
+
+   **The eleventh mutation survived and that is a known, already-recorded SHOULD-FIX, not a new hole.** It is the
+   pre-warm survivor, and its status is conditional in a way worth repeating where the number lives: it is a
+   SHOULD-FIX **only while `handle_missing` stays a hard zero.** Soften that check and it becomes blocking the same
+   day, because the conservation rule is what makes the survivor harmless.
 
 ## Verdict
 
