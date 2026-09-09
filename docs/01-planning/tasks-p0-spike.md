@@ -37,18 +37,21 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 
 > **The table above is historical.** Its rows record the spike's original wave and its statuses were last true many hundreds of commits ago; the work since has been tracked by number (`#13`, `#52`, `#83`, `#89`). It is kept because the D/B/I/S/T/R/Q identifiers are cited throughout the findings register below. **The live task list is the resume table.**
 
-> ## 🟢 BUILDS: **ALLOWED** — no measurement is running
+> ## 🟢 BUILDS: **ALLOWED** — no measurement is running. **The freeze is SHUT and the lead holds it.**
 >
-> **#119's premise is wrong and I am withdrawing it as written. The 1000/1000 is not the slot-ordering race; it is the harness saving into a cold vault's first rebuild.** Uncommitted work in `.worktrees/test` (`bench/budget/src/subject.rs`, a `prewarm_index` helper) diagnosed the real cause on the same run that produced F-449, and it never reached a commit. `Startup::mark_index_settled` settles on *the actor's first published state that is not `Opening`*, and its own doc says why that is right: *"the requirement is that the state is **known**, not that it is good, and a shell that waited for `Ready` would hang for the length of a rebuild on exactly the vault where the window most needs to be up."* Against the canonical 20k vault with no `.serat/`, `--exit-after-ready` therefore returns while a full 20,000-note rebuild is still running, and every save for the length of that rebuild finds an empty slot. **1000/1000 is what design-correct behaviour looks like when the benchmark's premise is wrong** — not a defect rate.
+> **Three of the four gate numbers are settled. NFR-PRF-03 is the last one and it is two sentences away.** #119 merges → #94 rebases onto it → code-reviewer mutates *that* tree → the lead declares the freeze → #95 takes the number. **#94's approval at `d30aa34` is against a tree #95 will not run on**, because #119 changes the binary; F-429 applied to ourselves.
 >
-> **#95 is unblocked and does not wait on `serat-app`.** The ruling below says what it must carry.
+> **What is holding the freeze, and it is not code:** code-reviewer owes two sentences — **(1)** is **F-435** closed (990 refused + 10 submitted satisfies conservation and yields a p95 over ten fastest samples; its status still reads *must close before #95 runs*), and by which mechanism; **(2)** can a failed or skipped pre-warm reach a reported figure (the survivor at `subject.rs:610`)? *If yes it blocks; if `handle_missing` catches it downstream by construction it is a SHOULD-FIX and the freeze opens.* **An implicit clearance and a stale status are the same defect** — a claim nobody re-derived. That is F-465, found today, in this file.
 >
 > ## Queue
 >
-> - **test-engineer:** #94 — recover the uncommitted `prewarm_index`, land it, then #95 behind code-reviewer. **Do not take the gate number until the lead declares the freeze.**
-> - **code-reviewer:** mutate #94's instrument at `task/94-prf03-real-save-path` @ `3da25bc` (**not** `e6e4f78`, which does not exist, and not `48835ce`, which is one commit behind the tip); then verify the #107 merge commit `7cd0ac6`, since your approval was against `bcd32be`.
-> - **tauri-app-dev:** #119, re-scoped by the ruling below — bound the real window, do not fix what is not broken.
-> - **architect:** #118's open question — whether §3.4's scale check moves to the Serat-term job or stays.
+> - **code-reviewer:** F-435 + the survivor → **#119 at `8460e32`** (mutate that `Rebuilding`/`Unavailable` still fire the settled mark — a *close it cheaply* fix breaks that quietly or not at all) → **#121**. #102 is **DONE, no BLOCKING**.
+> - **test-engineer:** #118's code half. **Hold #95 for the freeze.** #94 is approved at `d30aa34`.
+> - **rust-core-dev:** #120 implementation. **#94 merges before you rebase** — you are editing `subject.rs` from a base without its pre-warm. The **objection** and the **`asset_path`/`sidecar_path`** answer are still owed.
+> - **tauri-app-dev:** #121's *run mechanics only* — the mutations and the verdict are code-reviewer's. Plus `capabilities/default.json`'s stale `boot.js` description.
+> - **architect:** clear, nothing owed.
+>
+> **Today's register runs F-450 → F-469.** The one to read first is **F-469**, which subsumes five of them: *after fixing a defect, ask what one-line query would have found it, run that query, and fix everything it returns — and enumerate against content, never against metadata about content.* Ancestry, task-list status, a stub's *"objections: none"* and a commit message's own promises have each been recorded stale today. **Six findings are against work already marked done, and four are against the lead.**
 
 ## Resume task list (from #90)
 
