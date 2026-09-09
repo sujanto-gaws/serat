@@ -1453,6 +1453,18 @@ pub fn check_note_count(reported: usize, expected: usize) -> Result<(), String> 
 ///   means something else is wrong. Non-zero here refuses the whole run: no
 ///   number is produced, because none of what it attempted can be trusted to
 ///   mean what the series claims.
+///
+///   **Read this before softening it (F-499, F-475).** Task #122's attestation
+///   of the tree behind NFR-PRF-03's 4.306 ms left **one mutation surviving**,
+///   and it was accepted as a SHOULD-FIX rather than a blocker **only because
+///   this check is a hard zero.** The strictness here is what makes that
+///   survivor harmless: a run that would expose it cannot produce a number at
+///   all. Relax this to a threshold, a warning, or a `degraded` reason and
+///   **the survivor becomes blocking the same day**, and the standing gate
+///   number loses the argument that admitted it. The conditional is written
+///   here rather than only in the register and the report because the person
+///   who would soften a check is reading the check, not the finding — the
+///   register is a record, not a tripwire.
 /// * `writer_refused` is **not** checked here. ADR-0011's sanctioned
 ///   backpressure may legitimately fire, and ruling on a non-zero value is
 ///   [`measure_save_to_index_with`]'s job, not this one's — ADR-0011
@@ -3357,6 +3369,18 @@ mod tests {
 
     #[test]
     fn check_save_completeness_is_a_hard_zero_on_handle_missing() {
+        // **This test is the tripwire, and that is deliberate (F-499).** The
+        // hard zero cannot be softened without editing this assertion, so
+        // whoever softens it arrives here -- which is the one place a warning
+        // is certain to be read. What they need to know before they do:
+        //
+        // #122's attestation of the tree behind NFR-PRF-03's 4.306 ms left one
+        // mutation surviving, and it was accepted as a SHOULD-FIX rather than
+        // a blocker ONLY because this check is a hard zero (F-475). Loosen it
+        // and that survivor becomes blocking the same day, and the standing
+        // gate number loses the argument that admitted it. The trade is not
+        // "this check is strict" against "this check is convenient"; it is
+        // this check's strictness against a gate number's validity.
         let err = check_save_completeness(&save_trace(3, &[12.0, 8.0], 1, 0, &[]))
             .expect_err("a non-zero handle_missing must refuse the run");
         assert!(err.contains("1 of 3"), "{err}");
