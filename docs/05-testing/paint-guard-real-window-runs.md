@@ -201,6 +201,54 @@ the only line you see.
 
 ---
 
+## Teardown — mandatory, not tidying
+
+Every mutation in this procedure is *break the thing, observe, restore*, and a
+procedure that ends at "observe" manufactures abandoned probes by construction. This
+project has one on record already (F-383: a `if !path.is_markdown()` turned into
+`if false`, found in a worktree, which the standing dirty-worktree rule now exists to
+catch).
+
+`crates/serat-app/webview/boot.js` is the worst possible place to leave one, and the
+reason is not carelessness — it is that the file defeats review. It is **minified,
+committed build output**. A weakening left in it would appear in a diff as one line
+against 347 KB of unreadable text, would read exactly like a legitimate rebuild, and
+would ship a binary that mounts nothing on the very artefact #100 measured and #107's
+budget gates on. **Nobody reads a minified bundle in a diff.** This is the finding
+recorded as `F-NEXT/committed-build-output-is-where-a-weakening-hides`; the teardown
+below is its remedy.
+
+Run all four, in order, before you commit anything:
+
+```
+git checkout -- crates/serat-app/webview/     # restore the bundle
+cargo build --release -p serat-app            # do not leave a stubbed binary behind
+git status --porcelain                        # MUST be empty — whole worktree
+git diff --name-only origin/main...HEAD -- crates/serat-app/webview/   # MUST be empty
+```
+
+Why each is written the way it is:
+
+- **`git status --porcelain` over the whole worktree, not the paths you think you
+  touched.** The failure mode is not knowing which files you modified — if you knew,
+  you would have restored them.
+- **`git diff` against `origin/main...HEAD`, not the working tree.** This is the check
+  that catches a stub which survived into a *commit* rather than merely into a working
+  tree. The first check cannot see that; this one can, and it is the one that matters,
+  because a clean working tree over a bad commit is exactly what "reverted it" feels
+  like from the inside.
+- **Rebuild after restoring.** Otherwise `target/release/serat.exe` still contains the
+  mutation, and the next run — possibly someone else's — measures it.
+- **Never `git add -A` or `git commit -a` during a mutation run.** Path-scoped adds
+  only (F-394). A wholesale stage is how an unrelated in-flight edit joins a commit
+  whose message describes something else.
+
+**If you legitimately rebuilt the front end**, `npm run build` rewrites all three files
+in `crates/serat-app/webview/` because `emptyOutDir: true`. "Clean" still means
+*restored to HEAD*: `git checkout -- crates/serat-app/webview/` and rebuild the binary.
+Do not commit a regenerated bundle as part of a mutation run — a bundle rebuild is its
+own change and belongs in its own commit, reviewed as one.
+
 ## What I expect to be hard
 
 The one section that is judgement rather than mechanics, offered because I have run
