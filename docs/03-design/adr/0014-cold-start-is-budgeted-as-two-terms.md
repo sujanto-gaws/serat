@@ -574,8 +574,13 @@ the skeleton" only described a tree that no longer exists.
 **Ruling for #112, and it corrects the phrase "a guard split across crates" that this ADR
 used a paragraph ago.** The defect is not that an assertion would live in another crate — it
 is that the precondition is asserted **nowhere**. A check on `app/index.html` placed in `app/`
-is correct placement, not a split. Four properties have to hold and they do not have one
-enforcer between them:
+is correct placement, not a split. **Four properties had to hold and none of them had an enforcer** — the state at #109, and the
+reason this table exists. There are **five** rows below because #112 made the absent-paint-entry
+case a rejection in its own right, and two of the five are now enforced; the *Enforced as of*
+column is the current state and this sentence is the starting one. **The count moved with the
+table in the commit that added the row, which is the discipline F-496 names and which the first
+version of this rewrite did not follow** — it fixed the column header one screen down and left
+this sentence saying four:
 
 | Property | Enforced as of `8a5c525` | By what |
 |---|---|---|
