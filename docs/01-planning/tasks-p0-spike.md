@@ -43,6 +43,8 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 >
 > **The fourth attempt, and the first to produce a number.** #119 closed F-382's ordering window and #94's pre-warm removed F-450's cold-rebuild premise — the two causes of 1000/1000, from opposite ends, one in the product and one in the harness.
 >
+> **It is a measured number with a named gap, not yet a gate number — and the report says so itself (caveat 5).** The composed tree `c60dfdd` was **not mutation-attested at measurement time**: code-reviewer verified `690b70c` byte-identical to the approved `8460e32` and verified #94 would merge cleanly, **but had not mutated `c60dfdd` itself.** F-429 is satisfied on the merges and inferred on the composition. **code-reviewer's eight mutations against `c60dfdd` close it** (plus D1/D2 as F-490's confirmation); until they run, the standing ruling holds.
+>
 > **The zero `handle_missing` is NOT recorded as measuring F-382's window** — on this tree it cannot separate the pre-warm working from #119 closing the window from both; F-462's 35.4 µs stays that measurement. What it does establish is that **every attempted save reached the index writer**, so the p95 is over the whole workload rather than over whichever fraction survived.
 >
 > ## Queue — everyone build freely
