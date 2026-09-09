@@ -284,7 +284,10 @@ pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), Stri
 /// acceptance criterion is `Inspect`) can check the list against the PRD
 /// rather than against somebody's memory.
 ///
-/// **Three entries since task #118, and the count is no longer provisional.**
+/// **Every entry below gates; the two pre-split aggregates do not and are in
+/// [`PRF01_REPORTED`].** Stated as "every entry" rather than as a number
+/// (F-496): a count over a list that grows is maintained by whoever changes
+/// the list, who is exactly the person not reading the paragraph above it.
 /// The PRD's re-baseline (task #104) gates only `PRF01_SERAT_TERM` for
 /// NFR-PRF-01; `PRF01_WINDOW_VISIBLE` and `PRF01_VAULT_USABLE` are measured
 /// and reported by the same job and gate nothing (F-443 was the gap between

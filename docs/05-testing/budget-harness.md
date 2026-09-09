@@ -44,7 +44,7 @@ The product budget belongs to the reference machine (`reference-machine.md`). A 
 - `product_limit_ms` — the number in the PRD, asserted under `--profile reference`.
 - `ci_limit_ms` — a regression ceiling, asserted under `--profile ci`. Its job is to catch a change that made things worse, not to certify the product.
 
-`ci_limit_ms` is `None` for all four budgets, because there has been no CI run to set it from and a placeholder invented at a desk is worse than an honest red. Until it is set, the CI job asserts the product limit. **The ceilings are set from the first green CI run and recorded here with the run they came from** — not by lowering a bar to make a build pass.
+`ci_limit_ms` is `None` for every budget in the table above, because there has been no CI run to set it from and a placeholder invented at a desk is worse than an honest red. Until it is set, the CI job asserts the product limit. **The ceilings are set from the first green CI run and recorded here with the run they came from** — not by lowering a bar to make a build pass.
 
 ### Every budget names the interval it times
 
