@@ -116,6 +116,48 @@ fn a_vault_reached_by_a_second_spelling_of_the_same_path_is_not_rebuilt() {
 }
 
 #[test]
+fn a_rebuild_records_the_canonical_root_whatever_spelling_built_it() {
+    // The *record* side of the fix, on its own, and it exists because a mutation
+    // survived without it: putting `to_string_lossy()` back into `rebuild` left every
+    // test green, because the demotion covered for it — the next open canonicalised,
+    // found a mismatch, probed, and adopted. Correct behaviour reached through the
+    // repair path instead of by construction, and F-458's whole lesson is that those
+    // two are not the same thing. Concretely, it costs an adopt-and-write-back on the
+    // very first open of every vault, which is a repair that should never be needed.
+    //
+    // F-458's own shape: the harness *built* through a non-canonical spelling and the
+    // application *opened* through `Vault::open(..).root()`.
+    let tree = vault_on_disk("record-side");
+    let index_dir = tree.join(".serat");
+
+    let crooked = tree.join("10-projects").join("..");
+    assert_ne!(
+        crooked.to_string_lossy(),
+        canonical_root(&tree),
+        "the fixture must build through a spelling that is not already canonical"
+    );
+
+    let (rebuilt, _) = open_at(&crooked, &tree, &index_dir);
+    assert!(rebuilt, "the first open of an empty index must build it");
+    assert_eq!(
+        recorded_root(&index_dir),
+        Some(canonical_root(&tree)),
+        "the rebuild stamped the argument's spelling rather than the resolved directory"
+    );
+
+    // And the consequence that makes it matter: the canonical open is an ordinary one,
+    // with nothing to adopt and nothing to write back.
+    let (_, seen) = open_at(&tree, &tree, &index_dir);
+    assert_eq!(
+        seen,
+        vec![IndexStatus::Opening, IndexStatus::Ready],
+        "opening the vault it was built from went through the repair path: {seen:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tree);
+}
+
+#[test]
 fn a_vault_that_really_moved_keeps_its_index_and_records_the_new_root() {
     // `notes.path` is vault-relative (`schema/001_init.sql:134`), so a vault that
     // moved carries an index in which every row is still exactly right. Task #120

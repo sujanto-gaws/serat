@@ -453,6 +453,13 @@ pub struct OpenCheckTiming {
     /// Whether the index was usable as-is. `false` means a rebuild ran, so
     /// `elapsed` includes it and is not the open-check number by itself.
     pub was_ready: bool,
+    /// Whether the open adopted a changed `index_meta.vault_root` (task #120).
+    ///
+    /// Usable either way -- an adopt is *not* a rebuild and does not clear
+    /// `was_ready` -- but it means `elapsed` also carries the identity probe
+    /// and the write-back, which is a different number from the bare stamp and
+    /// must not be reported as one.
+    pub adopted: bool,
 }
 
 /// Time one `open_or_rebuild` call against the index at `index_dir`, for the
@@ -474,13 +481,15 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
         .map_err(|e| format!("opening {}: {e}", vault_path.display()))?;
     let parser = serat_parse::CommonMarkParser;
     let was_ready = std::cell::Cell::new(true);
-    let on_status = |status: serat_index::IndexStatus| {
-        if !matches!(
-            status,
-            serat_index::IndexStatus::Opening | serat_index::IndexStatus::Ready
-        ) {
-            was_ready.set(false);
-        }
+    let adopted = std::cell::Cell::new(false);
+    let on_status = |status: serat_index::IndexStatus| match status {
+        serat_index::IndexStatus::Opening | serat_index::IndexStatus::Ready => {}
+        // Task #120: an index recorded under another root is adopted, not rebuilt,
+        // so this must not read as "the index was not usable" -- that would report
+        // an adopt under the same flag as a 28 s rebuild, which is the conflation
+        // F-459 is about.
+        serat_index::IndexStatus::RootAdopted { .. } => adopted.set(true),
+        _ => was_ready.set(false),
     };
 
     let started = Instant::now();
@@ -495,6 +504,7 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
     Ok(OpenCheckTiming {
         elapsed,
         was_ready: was_ready.get(),
+        adopted: adopted.get(),
     })
 }
 
@@ -1394,14 +1404,46 @@ mod tests {
             "a second open_or_rebuild against an index this one just built and closed \
              cleanly must find it Ready, not trigger a second rebuild"
         );
+        assert!(
+            !ready.adopted,
+            "a second open of the vault it was built from must have nothing to adopt; \
+             if it does, the record side is stamping a spelling rather than the \
+             resolved directory (task #120, F-458)"
+        );
         let ready_ms = ready.elapsed.as_secs_f64() * 1000.0;
+
+        let index_path = serat_index::index_path(&scratch);
+
+        // Task #120's new read path on the open critical path, measured because it
+        // is one: an index whose recorded root differs is no longer rebuilt, it is
+        // probed against the tree (32 `notes.path` rows stat-ed) and adopted. That
+        // is the branch that replaced a 28.6 s rebuild, so what it costs instead
+        // belongs on the record beside the stamp it follows. Run on the real 20k
+        // index, in place, so the probe pays real filesystem calls.
+        {
+            let conn = rusqlite::Connection::open(&index_path).expect("open the ready index");
+            conn.execute(
+                "UPDATE index_meta SET vault_root = 'C:/nowhere/not-the-real-vault'",
+                [],
+            )
+            .expect("re-stamp the root");
+        }
+        let adopt = measure_open_check(&vault.path, &scratch).expect("open with a changed root");
+        let adopt_ms = adopt.elapsed.as_secs_f64() * 1000.0;
+        assert!(
+            adopt.was_ready,
+            "a changed vault_root must not trigger a rebuild any more (task #120)"
+        );
+        assert!(
+            adopt.adopted,
+            "a changed vault_root must be adopted and reported, not silently ignored"
+        );
 
         // The four rebuild-triggering states, measured at the check alone
         // (schema::inspect_for), not through a full open_or_rebuild -- that
         // would pay for an actual rebuild and measure NFR-PRF-04 by accident.
         // What #68 asks whether these "fail early", and inspect_for is where
         // that failure happens.
-        let index_path = serat_index::index_path(&scratch);
 
         let absent_started = Instant::now();
         let absent = serat_index::schema::inspect_for(&scratch.join("no-such-index.db"), None);
@@ -1486,6 +1528,7 @@ mod tests {
              \x20 SchemaChanged (inspect_for only):  {schema_ms:.3} ms\n\
              \x20 Interrupted (inspect_for only):    {interrupted_ms:.3} ms\n\
              \x20 RootChanged (inspect_for only, not a rebuild trigger since #120): {moved_ms:.3} ms\n\
+             \x20 RootAdopted (open_or_rebuild: stamp + identity probe + write-back, task #120): {adopt_ms:.2} ms\n\
              (for comparison, architecture.md §3.4: integrity_check 1310ms, quick_check 1150ms, rejected)"
         );
 
