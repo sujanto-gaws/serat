@@ -534,10 +534,26 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     }
     let source = serat_vault::Vault::open(vault)
         .map_err(|e| format!("opening {} to pre-warm the index: {e}", vault.display()))?;
+    // **The root must be `source.root()`, not `vault`** -- F-451, and the whole
+    // pre-warm is worthless without it. `open_or_rebuild` records the vault's
+    // identity as `vault_root.to_string_lossy()` and rebuilds from scratch on
+    // `RebuildReason::VaultMoved` when a later open presents a different
+    // string. `serat-app` reaches its root through `Vault::open(..).root()`,
+    // which canonicalises and strips the verbatim prefix; this harness reaches
+    // the same directory through `repo_root().join("bench/vaults/vault-20k")`,
+    // which is textually different (mixed separators from `CARGO_MANIFEST_DIR`)
+    // for the same bytes on disk. Pre-warming under the harness's spelling
+    // therefore left an index the application declared moved and rebuilt --
+    // measured: `Rebuilding { reason: VaultMoved }` on every spawn, and
+    // `handle_missing` unchanged at 25 of 25. Deriving the root the same way
+    // `serat-app` does makes the two spellings identical by construction
+    // rather than by coincidence.
+    let root = source.root().to_path_buf();
+    let index_dir = root.join(".serat");
     let parser = serat_parse::CommonMarkParser;
     let on_status = |_status: serat_index::IndexStatus| {};
     let (handle, _report) =
-        serat_index::open_or_rebuild(vault, &index_dir, &source, &parser, &on_status)
+        serat_index::open_or_rebuild(&root, &index_dir, &source, &parser, &on_status)
             .map_err(|e| format!("pre-warming the index at {}: {e}", index_dir.display()))?;
     handle.close().map_err(|e| {
         format!(
@@ -1132,6 +1148,51 @@ mod tests {
             write_note(&dir, &format!("notes/other-{i}.md"));
         }
         dir
+    }
+
+    #[test]
+    fn a_prewarmed_index_survives_the_root_spelling_serat_app_will_open_it_with() {
+        // F-456. The pre-warm exists to hand `serat-app` a `Ready` index; an
+        // index the application declares `VaultMoved` and rebuilds from
+        // scratch is worth exactly nothing, and nothing else in this crate
+        // would notice, because `open_or_rebuild` succeeds either way. The
+        // identity `open_or_rebuild` records is `vault_root.to_string_lossy()`
+        // -- a string, not a resolved directory -- so two spellings of the
+        // same directory are two different vaults to it. `serat-app` reaches
+        // its root through `Vault::open(..).root()`; this harness reaches the
+        // same bytes through `repo_root().join("bench/vaults/vault-20k")`.
+        // Measured before the fix: `Rebuilding { reason: VaultMoved }` on
+        // every spawn and `handle_missing` unmoved at 25 of 25.
+        let vault = hub_shaped_vault("prewarm-root-spelling", 4, 8);
+        // Textually different, byte-identical directory -- the same class of
+        // difference as the mixed separators the real path carries, without
+        // depending on how any particular platform spells a temp directory.
+        let second_spelling = vault.join(".");
+        assert_ne!(
+            second_spelling.display().to_string(),
+            vault.display().to_string(),
+            "precondition: the two spellings must actually differ"
+        );
+        prewarm_index(&second_spelling).expect("pre-warming through the second spelling");
+
+        let source = serat_vault::Vault::open(&vault).expect("reopening the vault");
+        let root = source.root().to_path_buf();
+        let parser = serat_parse::CommonMarkParser;
+        let (handle, report) = serat_index::open_or_rebuild(
+            &root,
+            &root.join(".serat"),
+            &source,
+            &parser,
+            &|_status: serat_index::IndexStatus| {},
+        )
+        .expect("reopening the pre-warmed index");
+        handle.close().expect("closing the reopened index");
+        let _ = std::fs::remove_dir_all(&vault);
+
+        assert!(
+            report.is_none(),
+            "the pre-warmed index was rebuilt rather than opened: {report:?}. A pre-warm the              application throws away is a pre-warm that measured nothing."
+        );
     }
 
     #[test]
