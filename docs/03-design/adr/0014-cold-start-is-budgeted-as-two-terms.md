@@ -575,12 +575,21 @@ the skeleton" only described a tree that no longer exists.
 used a paragraph ago.** The defect is not that an assertion would live in another crate — it
 is that the precondition is asserted **nowhere**. A check on `app/index.html` placed in `app/`
 is correct placement, not a split. **Four properties had to hold and none of them had an enforcer** — the state at #109, and the
-reason this table exists. There are **five** rows below because #112 made the absent-paint-entry
-case a rejection in its own right, and two of the five are now enforced; the *Enforced as of*
-column is the current state and this sentence is the starting one. **The count moved with the
-table in the commit that added the row, which is the discipline F-496 names and which the first
-version of this rewrite did not follow** — it fixed the column header one screen down and left
-this sentence saying four:
+reason this table exists. That is a claim about a past tree, so it can only become history and
+never false. **The table has since gained a row** — #112 made the absent-paint-entry case a
+rejection in its own right — **and what is enforced now is the *Enforced as of* column's to
+say, not this sentence's.**
+
+**This sentence carried a count of the rows below it through two corrections, and product-analyst
+argued it out rather than reporting it.** The first version left it reading *"four properties"*
+over five rows (F-496). The second moved the number and added a second one — *five rows, two of
+them enforced* — which is two live counts of a growing table where there had been one. **Their
+argument for dropping both is that the guard a count buys depends on what it guards.** In the
+PRD, a count over a bounds list is a real guard: a figure quoted elsewhere with three of its
+four bounds looks complete, and the number is what makes that visibly wrong. **Here the reader
+is looking straight at the table**, so the rows already say everything the count says, and all
+the count can do is disagree with them. So it is gone, and the sentence keeps only the claim
+that cannot decay:
 
 | Property | Enforced as of `8a5c525` | By what |
 |---|---|---|
