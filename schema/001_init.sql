@@ -151,6 +151,13 @@ CREATE TABLE notes (
     folder_tier  TEXT CHECK (folder_tier IS NULL OR
                              folder_tier IN ('inbox','project','system','note','ref')),
     kind         TEXT    NOT NULL CHECK (kind IN ('note','asset')),
+    -- Both are vault-relative, canonical and / separated, exactly as `path` above.
+    -- Stated rather than left to inference (task #120): `asset_path` is bound to the same
+    -- parameter as `path` by `upsert_asset` and is byte-identical to it on every row that
+    -- has one, while `sidecar_path` has no writer yet -- so its premise holds VACUOUSLY,
+    -- which is the state in which the first writer breaks it without anyone noticing. An
+    -- absolute path in either column would silently break the open check's identity probe,
+    -- which joins these names onto the vault root.
     asset_path   TEXT,                     -- kind='asset': the binary this row stands for
     sidecar_path TEXT,                     -- kind='asset': the .md carrying its frontmatter
     mtime        INTEGER NOT NULL,         -- filesystem mtime at last index
