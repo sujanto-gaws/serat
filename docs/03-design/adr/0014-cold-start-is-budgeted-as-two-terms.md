@@ -165,8 +165,17 @@ deliberate:
 
 `S_main = S_pre + S_setup` (Rust, main thread) and `S_front = S_shell + S_settle` (our
 front end in their renderer) have different owners and different noise floors. `S_main` is
-the one term §3.4 can measure cleanly — 5.2 / 5.6 ms median, 9.4 / 9.6 p95, across a vault
-ten thousand times larger. `S_front` sits at ~121–138 ms pre-#98 and is where the editor
+the one term §3.4 can measure cleanly — 5.2 / 5.6 ms against a p95 of 9.4 / 9.6, across a
+vault ten thousand times larger. **This clause said *median* until F-452, and could not**:
+the basis of those cells is unrecoverable beyond *a central statistic, median or mean
+unknown* (§Objections), and naming one is the error §Decision 6 exists to prevent — found
+in this ADR's own text, one clause after the rule. The attested replacement is #100's
+`S_main` at **3.4 ms median / 4.0 ms p95**, which is a median because someone recorded that
+it was. **And the across-a-vault reading is a bound rather than a demonstration** (F-452:
+the table's columns are a blocked comparison), which costs this decision nothing — the
+allocation rests on the two sub-terms having different owners and different noise floors,
+not on either being flat in vault size. `S_front` sits at ~121–138 ms pre-#98, composed
+from the same table and superseded by #100's 197.6 / 230.4 ms, and is where the editor
 lands.
 
 **One binding number in the PRD (the Serat term); its allocation between `S_main` and
