@@ -82,9 +82,11 @@ describe("the IPC client stays inside ADR-0012's grant", () => {
     expect(
       unused,
       `the capability grants ${unused.join(", ")} and nothing in app/src/ipc/client.ts ` +
-        `invokes it. The capability's own justification is that the set is what the webview ` +
-        `actually invokes; an unused grant makes that description false and leaves surface ` +
-        `open for no live reason (ADR-0012, F-467).`,
+        `invokes it. Add the wrapper or drop the grant — an unused grant is a widening ` +
+        `that has already happened with nobody having decided it, and it makes the ` +
+        `capability's own description ("the five commands the front end actually invokes") ` +
+        `false. If the front end really does reach this command another way, that route is ` +
+        `outside the declared IPC surface and is the thing to fix (ADR-0012, F-467).`,
     ).toEqual([]);
   });
 
