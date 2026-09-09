@@ -43,6 +43,8 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 >
 > **Full index 27,693.5 ms / 30,000 · save→index 4.306 ms / 50 · cold start ~1577 ms / 1000.** The third is missed because **1117–1687 ms of it is inside `WebviewWindowBuilder::build`** while Serat's own main-thread work is **3.4 ms median** and the binding Serat term is **201/234 ms against 350**.
 >
+> **`cargo test --workspace --no-fail-fast` on `main` at `24e54a2`: exit 0.** Run by the lead after the gate verdict, because a phase gate deserves a verified-green tree rather than an assumed one. **The pass/fail count is not recorded here and is not being guessed** — the invocation piped through `tail` and truncated the per-binary lines before capture, so exit 0 is what there is evidence for. The last attributed count is **529 passed / 0 failed** (test-engineer, #124, `bd0cd09`).
+>
 > ## 🟢 BUILDS: ALLOWED. Two items are the OWNER's and nothing the team does moves them.
 >
 > - **#123** — the scanner-on charter re-run needs **real-time protection enabled on the owner's machine**. test-engineer correctly **declined to change a security setting for a benchmark**. Until then `gate_eligible: false` stands and is recorded honestly in three places.
