@@ -499,8 +499,8 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
 }
 
 /// Build a real, `Ready` index at `vault_root.join(".serat")` before the real
-/// application is ever spawned against it -- **F-NEXT/save-benchmark-races-
-/// cold-rebuild**, found live during the first real #95 run.
+/// application is ever spawned against it -- **F-450**, found live during the
+/// first real #95 run and issued its number after the fact.
 ///
 /// NFR-PRF-03 governs a save made in an *already-open* vault -- "a note saved
 /// through Serat's own write path", not a race against the vault's own first
@@ -534,7 +534,7 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     }
     let source = serat_vault::Vault::open(vault)
         .map_err(|e| format!("opening {} to pre-warm the index: {e}", vault.display()))?;
-    // **The root must be `source.root()`, not `vault`** -- F-451, and the whole
+    // **The root must be `source.root()`, not `vault`** -- F-458, and the whole
     // pre-warm is worthless without it. `open_or_rebuild` records the vault's
     // identity as `vault_root.to_string_lossy()` and rebuilds from scratch on
     // `RebuildReason::VaultMoved` when a later open presents a different
@@ -1152,9 +1152,10 @@ mod tests {
 
     #[test]
     fn a_prewarmed_index_survives_the_root_spelling_serat_app_will_open_it_with() {
-        // F-456. The pre-warm exists to hand `serat-app` a `Ready` index; an
+        // F-458, whose product half is F-459 and task #120. The pre-warm
+        // exists to hand `serat-app` a `Ready` index; an
         // index the application declares `VaultMoved` and rebuilds from
-        // scratch is worth exactly nothing, and nothing else in this crate
+        // scratch is worth nothing, and nothing else in this crate
         // would notice, because `open_or_rebuild` succeeds either way. The
         // identity `open_or_rebuild` records is `vault_root.to_string_lossy()`
         // -- a string, not a resolved directory -- so two spellings of the
