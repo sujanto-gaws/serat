@@ -28,6 +28,14 @@ import { describe, expect, it } from "vitest";
  * a list in a second place is a thing that goes stale silently. If the ACL and this
  * front end are meant to diverge, that is an ADR-0012 decision and this test is where
  * it gets recorded.
+ *
+ * Reading both files off disk is deliberate, and worth a clause because a reader
+ * arriving from F-470 will pause at it. F-470's hazard is a check that reads a *file*
+ * while the behaviour it judges lives in a compiled copy — there, the file is the
+ * stale thing. Here the source *is* the subject: the claim is about what this front
+ * end is written to invoke, so reading anything downstream of the bundler would be
+ * reading the wrong artefact. F-470's own discriminator — does the observer read the
+ * file that was mutated, or a compiled copy of it? — comes out on the safe side.
  */
 describe("the IPC client stays inside ADR-0012's grant", () => {
   const here = dirname(fileURLToPath(import.meta.url));
