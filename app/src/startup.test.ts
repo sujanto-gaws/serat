@@ -1,3 +1,7 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -288,4 +292,177 @@ describe("hydrateBuffer", () => {
     // Still reported usable: an unreadable note is not a blocked shell (§9.1).
     expect(markVaultUsable).toHaveBeenCalledWith(null);
   });
+});
+
+/**
+ * The call-site count (#125, closing the front-end half of F-481/F-482/F-504) — the
+ * source-side twin of the count `crates/serat-app/src/lib.rs` takes over the shipped
+ * bundle.
+ *
+ * F-392 closed on an assertion that the paint mark is invoked *exactly once*. F-481
+ * found that assertion is not in the repository and was dropped rather than moved,
+ * and F-504 then reproduced what its absence costs against a real WebView2 window: a
+ * second `mark_first_paint` call carrying fabricated but plausible evidence
+ * (`firstContentfulPaintMs: 1, raf1Ms: 0, raf2Ms: 1`) is **accepted, recorded
+ * verbatim in the audit field, and the honest call is silently no-opped** by the
+ * Rust side's first-wins rule. The mark is stamped when the call *arrives*, so the
+ * number that results is **unbounded in both directions** — F-504's own placement
+ * came out worse than honest (`t0_to_window_visible_ms` 2687 against 2458) because
+ * module evaluation happens after window creation, and a site hoisted earlier would
+ * come out better. What this check buys is that a second site cannot be added
+ * without something going red. It does **not** make the guard able to tell
+ * fabricated evidence from real: one call carrying plausible-positive values is
+ * still accepted on its own say-so (F-482), and that is ADR-0014's to settle.
+ *
+ * Why this is a twin and not a duplicate. tauri-app-dev's count matches the command
+ * *name string* in `crates/serat-app/webview/boot.js`, the artefact that actually
+ * ships — so it catches a literal hand-edited into the committed bundle, which
+ * vitest never reads (F-493: the bundle is where a weakening survives review by
+ * default). It cannot catch a second call written as `markFirstPaint({...})` against
+ * the wrapper already in `app/src/ipc/client.ts`, because that route leaves the
+ * command name at one occurrence and passes. This check reads source, so it catches
+ * the wrapper route at authoring time — and F-470's two-build hazard does not reach
+ * it, since no rebuild stands between the edit and the observation.
+ *
+ * That division was measured rather than reasoned, because it is the whole argument
+ * for a second check. `markFirstPaint({ firstContentfulPaintMs: 1, raf1Ms: 0,
+ * raf2Ms: 1, ... })` was added to `main.ts` — F-504's sharp form through the existing
+ * wrapper — and `npm run build` run: the shipped `boot.js` **still names
+ * `mark_first_paint` exactly once**, so the bundle-side count passes, while the
+ * fabricated object is in it verbatim. Reverted, and the rebuild reproduced the
+ * committed bundle byte-identically.
+ *
+ * What it cannot see, said here rather than left to be found: a call inside a
+ * `*.test.ts` file (excluded below, and none of it ships); a call reached through a
+ * dynamic property access such as `client["markFirstPaint"]()`; and anything in the
+ * bundle that is not in `app/src/`, which is the other half's job.
+ */
+describe("the startup marks have exactly one call site each", () => {
+  // Derived from the module path rather than with `new URL(".", import.meta.url)`:
+  // under the jsdom environment `URL` is jsdom's, and it resolves the relative part
+  // against the *document* base (`http://localhost:3000`) instead of the module.
+  const sourceRoot = dirname(fileURLToPath(import.meta.url));
+
+  /** Every shipping source file under `app/src/`. Tests are excluded — see the note above. */
+  function shippingSources(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .flatMap((entry) => {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) return shippingSources(full);
+        if (entry.name.endsWith(".test.ts")) return [];
+        return /\.(ts|vue)$/.test(entry.name) ? [full] : [];
+      });
+  }
+
+  /**
+   * Counted **without** stripping comments first. A comment that writes the name
+   * with parentheses will trip this, which is a false alarm with a one-word fix
+   * (drop the parentheses); a stripper is the other trade, and it would let a call
+   * hide behind anything it mistook for a comment. A guard for a forgeable mark
+   * should fail loudly rather than quietly.
+   */
+  function occurrences(text: string, pattern: RegExp): number {
+    return text.match(pattern)?.length ?? 0;
+  }
+
+  const files = shippingSources(sourceRoot).map((path) => ({
+    path,
+    relative: relative(sourceRoot, path).replaceAll("\\", "/"),
+    text: readFileSync(path, "utf8"),
+  }));
+
+  it("scans a plausible number of files, so an empty scan cannot pass vacuously", () => {
+    // Without this, a bad `shippingSources` (wrong root, wrong extension test) makes
+    // every assertion below true over an empty set — the shape of guard this project
+    // has recorded fifteen of.
+    expect(files.length).toBeGreaterThan(3);
+    expect(files.map((file) => file.relative)).toContain("startup.ts");
+    expect(files.map((file) => file.relative)).toContain("ipc/client.ts");
+  });
+
+  /** Every call of `wrapper` in `app/src/`, by file. The wrapper's own definition in
+   * `ipc/client.ts` is a declaration, not a call, and is subtracted. */
+  function callSites(wrapper: string): { relative: string; count: number }[] {
+    const call = new RegExp(String.raw`\b${wrapper}\s*\(`, "g");
+    const declaration = new RegExp(String.raw`\bfunction\s+${wrapper}\s*\(`, "g");
+    return files
+      .map((file) => ({
+        relative: file.relative,
+        count: occurrences(file.text, call) - occurrences(file.text, declaration),
+      }))
+      .filter((file) => file.count > 0);
+  }
+
+  function describeSites(sites: { relative: string; count: number }[]): string {
+    return sites.map((site) => `${site.relative}×${site.count}`).join(", ") || "nowhere";
+  }
+
+  it("markFirstPaint is called from exactly one site", () => {
+    const sites = callSites("markFirstPaint");
+    const total = sites.reduce((sum, site) => sum + site.count, 0);
+
+    expect(
+      total,
+      `markFirstPaint is called ${total} times across app/src (${describeSites(sites)}); ` +
+        `exactly one is the guarantee. Zero means the page stopped taking the mark, and a ` +
+        `green cold-start job would then be measuring nothing. More than one means a second ` +
+        `call can claim mark_first_paint first and silently no-op the honest one (first-wins), ` +
+        `with the resulting number unbounded in both directions — F-392, F-481, F-504.`,
+    ).toBe(1);
+    expect(sites[0]?.relative).toBe("startup.ts");
+  });
+
+  /**
+   * `markVaultUsable` gets confinement rather than a count, and the difference is a
+   * fact about the code rather than a softer standard: `hydrateBuffer` marks usable
+   * from each of its two mutually exclusive branches (a restored note, or nothing to
+   * restore), so *two* is the correct number and pinning one would be asserting
+   * something false. The count that does hold for it is the one in
+   * `crates/serat-app/src/lib.rs` — the shipped bundle names the command once,
+   * because both branches reach it through the single wrapper. Confinement is what
+   * this side can add: the mark is taken by the startup path and by nothing else, so
+   * a component or store that decides to report the vault usable goes red here.
+   */
+  it("markVaultUsable is called only from the startup path", () => {
+    const sites = callSites("markVaultUsable");
+
+    expect(
+      sites.map((site) => site.relative),
+      `markVaultUsable is called from ${describeSites(sites)}; only startup.ts may take ` +
+        `the mark. Its two sites there are hydrateBuffer's two mutually exclusive branches ` +
+        `— see this block's note for why this is confinement and not a count.`,
+    ).toEqual(["startup.ts"]);
+    expect(sites[0]?.count).toBeGreaterThan(0);
+  });
+
+  it.each(["markFirstPaint", "markVaultUsable"])(
+    "%s is never imported under another name, which is the one static route past the count",
+    (wrapper) => {
+      // `import { markFirstPaint as mfp }` then `mfp(...)` would leave the count
+      // above at one and the command-name count in boot.js at one as well.
+      const aliased = files.filter((file) =>
+        new RegExp(String.raw`\b${wrapper}\s+as\s+`).test(file.text),
+      );
+      expect(aliased.map((file) => file.relative)).toEqual([]);
+    },
+  );
+
+  it.each(["mark_first_paint", "mark_vault_usable"])(
+    "%s is invoked by name from exactly one place, the ipc/client.ts wrapper",
+    (command) => {
+      // The other route to a second call site: a fresh `invoke("mark_first_paint")`
+      // beside the wrapper rather than through it. boot.js's count catches this one
+      // too; catching it here names the offending source file instead of reporting a
+      // number over a minified bundle.
+      const invocations = files
+        .map((file) => ({
+          relative: file.relative,
+          count: occurrences(file.text, new RegExp(String.raw`invoke\(\s*"${command}"`, "g")),
+        }))
+        .filter((file) => file.count > 0);
+
+      expect(invocations).toEqual([{ relative: "ipc/client.ts", count: 1 }]);
+    },
+  );
 });
