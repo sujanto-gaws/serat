@@ -50,9 +50,9 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 > ## Queue — everyone build freely
 >
 > - **code-reviewer:** #94's eight against `c60dfdd` → #118's four (E4 re-aimed at `run_job`) → **#121's two, where mutation B settles F-481 and F-482 in one run.** F-490: your F-475/F-476 clearances stand; the re-run is confirmation, not a precondition.
-> - **rust-core-dev:** **F-474** (T1's three unguarded series) and the full re-verify of #120 — its third commit has never been through cargo, and the first two ran under F-486's contention.
+> - **rust-core-dev:** **CLEAR.** F-474 closed (`1913fa6`, all six series guarded, four mutations red at their own lines) and #120 re-verified in the green window — 488 passed, clippy and fmt clean, covering the commit that had never been through cargo. **`task/120-vault-identity-impl` @ `1913fa6` awaits code-reviewer, queued after #121.** The 6.95/23.59 ms open-check pair stays contended by their own choice: re-measuring now would produce another contended reading *and be* the contention for others. No gate depends on it.
 > - **tauri-app-dev:** **F-473**, `capabilities/default.json`'s stale `boot.js` string, and F-477's register line.
-> - **test-engineer:** #118's rebase over #94 in `lib.rs`, #110's live half, and **F-485's `enforce` fix** — one function both runners call, truth table over gated/ungated × passed/breached/indeterminate.
+> - **test-engineer:** **F-485's `enforce` fix** on `bc565ee` — one function both runners call, truth table over gated/ungated × passed/breached/indeterminate, plus the assertion that `run_job`'s callers are exactly the gated set. Then #118's rebase over #94 in `lib.rs` and #110's live half. **The scanner-on charter re-run of NFR-PRF-03 is approved and waits on code-reviewer's attestation** — if the eight mutations fail, the current number is void and a scanner-on figure taken first is two wasted runs.
 > - **architect:** clear.
 >
 > **Where the four numbers stand.** NFR-PRF-04 **PASS** gate-quality (27,693.5 / 30,000 ms). NFR-PRF-03 **measured, 11.6× headroom, not gate-eligible on the environment**. NFR-PRF-01 **FAIL/INDETERMINATE** aggregate, binding Serat term clears alone. NFR-PRF-08 **unsatisfiable on infrastructure** (F-384). **Three of four measured, and none of the three open items is a code problem.**
