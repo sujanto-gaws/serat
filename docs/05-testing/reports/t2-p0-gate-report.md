@@ -115,6 +115,8 @@ report's `S_shell`/`S`/`S_front` figures should be read as provisional until it 
 | Vault | canonical 20k, digest `35fcb867…bd393e`, verified by the job before measuring and intact after |
 | Verdict | **PASS on the budget** — 11.6x of headroom, so F-327's 35% session-to-session movement cannot reach the verdict here the way it reached NFR-PRF-04's |
 | **Binding caveat** | **`gate_eligible: false`** — real-time scanning is disabled on this machine (RISK-012), which the harness itself refuses to call the charter number. A scanner-on re-run is what makes this the gate figure; the headroom makes that likely to hold and *likely* is not *measured*. |
+| Instrument | **Mutation-attested after the fact and passed** — task #122 against the composed tree `c60dfdd` rather than the branch tips: control 95/0, ten of eleven red, identical to `d30aa34`. The number was taken before that attestation existed and a later pass does not reorder those events, so the report keeps the bound as *discharged* rather than deleting it. The surviving eleventh is the known pre-warm SHOULD-FIX, and it is a SHOULD-FIX **only while `handle_missing` stays a hard zero**. |
+| Charter re-run | Task **#123**, blocked on the repository owner's own machine setting. Enabling real-time protection is a security decision on their machine, **not a benchmark convenience**, and it is theirs to make. |
 
 **The zero is not a measurement of F-382's window, and is not recorded as one.** On this tree a zero cannot
 distinguish *the pre-warm worked* from *#119 closed the ordering window* from *both* — #119's own 35.4 µs / 191 µs
