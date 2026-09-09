@@ -231,6 +231,21 @@ fn kind_of(state: &IndexState) -> u8 {
     }
 }
 
+/// Whether this state is the open check's *last word* — the one after which the actor
+/// has nothing further to publish and its [`serat_index::IndexHandle`], if it produced
+/// one, exists.
+///
+/// Distinct from [`kind_of`], which answers a different question (is this a transition
+/// the throttle must let through). `Opening` is not terminal because the check has not
+/// run; `Rebuilding` is not terminal because it is progress, and holding it back is the
+/// one thing [`IndexActor::spawn`] must never do.
+fn is_terminal(state: &IndexState) -> bool {
+    match state {
+        IndexState::Ready { .. } | IndexState::Unavailable { .. } => true,
+        IndexState::Opening | IndexState::Rebuilding { .. } => false,
+    }
+}
+
 /// Opening an index, as the actor thread performs it.
 ///
 /// A trait rather than a function so the actor — the thread, the publishing, the
@@ -432,6 +447,39 @@ impl IndexActor {
     /// all: a save that lands before the slot is filled degrades to the watcher path
     /// instead of blocking.
     ///
+    /// # The terminal state is published after the slot is filled (#119, F-382)
+    ///
+    /// [`IndexOpen::open`] publishes `Ready` or `Unavailable` from *inside* itself, and
+    /// [`IndexOpen::into_handle`] cannot run until `open` has returned. So the state
+    /// that tells [`Startup::mark_index_settled`] the open check is over was, until
+    /// this task, observable while the slot was still empty — F-382 named that window
+    /// and called it narrow without measuring it. This thread therefore holds the last
+    /// terminal state back and publishes it *after* `into_handle` has filled the slot,
+    /// which turns the race into an ordering: a caller that has seen `Ready` finds a
+    /// handle, because the slot write happens-before the publish on this one thread and
+    /// both cross a mutex.
+    ///
+    /// **Intermediate states are not held back, and that constraint outranks the race
+    /// it closes.** `Rebuilding` is forwarded the instant the opener publishes it, so
+    /// `mark_index_settled` still fires *before* a rebuild starts and the shell still
+    /// comes up on the vault that needs one most — §3.4's first precondition, and the
+    /// reason written above that mark's own signature. Deferring everything until the
+    /// slot was filled would make the shell wait for `Ready`, which is strictly worse
+    /// than the window it would close.
+    ///
+    /// This does not close, and cannot close, the window a save hits *during* a
+    /// rebuild. The slot is legitimately empty for the length of one, `Rebuilding`
+    /// settles the mark by design, and a save landing there degrades to the watcher
+    /// path — that is F-450, and it is not a defect. What is closed is the ordering
+    /// between the open check's *last word* and the handle it produced.
+    ///
+    /// One consequence, stated rather than guarded: an opener that publishes a terminal
+    /// state and then panics now leaves the published state at `Opening` instead of at
+    /// that terminal state. A panicking opener already loses its handle and its thread
+    /// with no recovery path, so this changes what an already-unhandled failure looks
+    /// like, not whether it is handled. Neither implementation in this crate can reach
+    /// it: [`SeratIndexOpen::open`] returns on every error rather than unwinding.
+    ///
     /// # Errors
     ///
     /// Only if the operating system refuses to create a thread, in which case the
@@ -447,13 +495,28 @@ impl IndexActor {
         let handle = std::thread::Builder::new()
             .name("serat-index".to_owned())
             .spawn(move || {
+                // The opener's last word, withheld until the slot below is filled. A
+                // `RefCell` and not a `Mutex`: `publish` is a `&dyn Fn` with no `Send`
+                // bound, so it cannot leave this thread, and only `open` can call it.
+                let terminal: std::cell::RefCell<Option<IndexState>> =
+                    std::cell::RefCell::new(None);
                 opener.open(&vault_root, &index_dir, &|state| {
-                    publisher.publish(state);
+                    if is_terminal(&state) {
+                        // Last one wins. Nothing in this crate publishes two, but
+                        // keeping the latest is the only answer that cannot publish a
+                        // state the opener has already superseded.
+                        *terminal.borrow_mut() = Some(state);
+                    } else {
+                        publisher.publish(state);
+                    }
                 });
                 if let Some(index_handle) = opener.into_handle() {
                     *slot_for_thread
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index_handle);
+                }
+                if let Some(state) = terminal.borrow_mut().take() {
+                    publisher.publish(state);
                 }
             })?;
         Ok((
@@ -758,6 +821,168 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_slot_is_filled_before_the_terminal_state_and_rebuilding_still_flows_before_it() {
+        // #119, closing the window F-382 named and F-449 measured the wrong thing
+        // with. Two rows in one sequence, because the fix has two halves that pull
+        // against each other:
+        //
+        //   Ready       must not be observable while the slot is empty  -> `true`
+        //   Rebuilding  must still be observable while it is            -> `false`
+        //
+        // A "fix" that deferred *every* state until the slot was filled satisfies the
+        // first and breaks the second: that is the shell waiting for `Ready`, which
+        // §3.4's first precondition forbids and which `mark_index_settled`'s own doc
+        // explains is worse than the race it would close. So the `false` on the
+        // `Rebuilding` row is exactly as load-bearing as the `true` on the `Ready`
+        // one, and neither assertion is worth having without the other.
+        //
+        // Deterministic rather than raced: the opener blocks on a barrier until the
+        // test has handed the observer the slot, so every publish below happens with
+        // the slot already reachable and the observation is never "not yet shared".
+        struct Scripted {
+            start: Arc<std::sync::Barrier>,
+            handle: Option<serat_index::IndexHandle>,
+        }
+        impl IndexOpen for Scripted {
+            fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
+                self.start.wait();
+                publish(IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 0,
+                    walk_complete: false,
+                });
+                publish(IndexState::Ready { note_count: 0 });
+            }
+
+            fn into_handle(self) -> Option<serat_index::IndexHandle> {
+                self.handle
+            }
+        }
+
+        // A real `IndexHandle`, built by the production opener against a real
+        // database, rather than a stand-in: what is under test is when the slot is
+        // filled, and a slot filled with something the application would never put
+        // there proves less than it appears to.
+        let root = throwaway_vault("slot-ordering");
+        let mut real = SeratIndexOpen::default();
+        real.open(&root, &index_dir_for(&root), &|_| {});
+        let handle = real
+            .into_handle()
+            .expect("the production opener produced a handle over a real index");
+
+        let (publisher, _) = publisher(Duration::ZERO);
+        let slot_cell: Arc<std::sync::OnceLock<IndexHandleSlot>> =
+            Arc::new(std::sync::OnceLock::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cell = Arc::clone(&slot_cell);
+        let sink = Arc::clone(&seen);
+        publisher.on_publish(move |state| {
+            // `on_publish` and not the sink: the throttle must not be able to decide
+            // what this test sees (`the_observer_sees_states_the_throttle_swallows`).
+            let filled = cell
+                .get()
+                .expect("the actor is released only after the slot has been shared")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            sink.lock()
+                .expect("not poisoned")
+                .push((state.clone(), filled));
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (mut actor, slot) = IndexActor::spawn(
+            Arc::clone(&publisher),
+            Scripted {
+                start: Arc::clone(&start),
+                handle: Some(handle),
+            },
+            root.clone(),
+            index_dir_for(&root),
+        )
+        .expect("spawn");
+        slot_cell.set(Arc::clone(&slot)).expect("shared once");
+        start.wait();
+        actor.join();
+
+        assert_eq!(
+            seen.lock().expect("not poisoned").clone(),
+            vec![
+                (
+                    IndexState::Rebuilding {
+                        reason: RebuildReason::NoIndex,
+                        done: 0,
+                        total: 0,
+                        walk_complete: false,
+                    },
+                    false,
+                ),
+                (IndexState::Ready { note_count: 0 }, true),
+            ],
+            "the state that settles the open check must not be observable before the \
+             handle it produced is reachable (#119/F-382), and the states that \
+             precede it must still be published while the slot is empty (§3.4)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_open_that_produced_no_handle_still_publishes_its_terminal_state() {
+        // The other half of #119's deferral, and the reason it is a deferral rather
+        // than a condition on the handle existing. `Unavailable` is terminal with
+        // nothing to wait for, and `into_handle` returning `None` must not swallow it:
+        // if it did, the shell would sit on `Opening` forever on exactly the vault
+        // whose index failed, and `mark_index_settled` -- which fires on `Unavailable`
+        // as readily as on `Ready` -- would never fire at all, so `t_usable` would
+        // never be reached and the vault would never be declared usable.
+        struct FailsWithNoHandle;
+        impl IndexOpen for FailsWithNoHandle {
+            fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
+                publish(IndexState::Unavailable {
+                    message: "the rebuild failed".to_owned(),
+                    path: "/vault/.serat".to_owned(),
+                });
+                // into_handle() is not overridden: the trait default returns None.
+            }
+        }
+
+        let (publisher, recorder) = publisher(Duration::ZERO);
+        let (mut actor, slot) = IndexActor::spawn(
+            Arc::clone(&publisher),
+            FailsWithNoHandle,
+            PathBuf::from("."),
+            PathBuf::from("./.serat"),
+        )
+        .expect("spawn");
+        actor.join();
+
+        let expected = IndexState::Unavailable {
+            message: "the rebuild failed".to_owned(),
+            path: "/vault/.serat".to_owned(),
+        };
+        assert_eq!(
+            publisher.status().state,
+            expected,
+            "a terminal state held back for the slot must still be published when \
+             the slot is never filled"
+        );
+        assert_eq!(
+            recorder
+                .taken()
+                .iter()
+                .map(|s| &s.state)
+                .collect::<Vec<_>>(),
+            vec![&expected],
+            "and emitted exactly once, not swallowed and not duplicated"
+        );
+        assert!(
+            slot.lock().expect("not poisoned").is_none(),
+            "there was no handle to fill it with"
+        );
     }
 
     #[test]

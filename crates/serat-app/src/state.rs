@@ -1536,6 +1536,72 @@ mod tests {
     }
 
     #[test]
+    fn the_vault_becomes_usable_while_the_rebuild_is_still_running() {
+        // §3.4's first `t_usable` precondition, pinned through the real
+        // `open_vault_with` wiring rather than by calling `mark_index_settled` by
+        // hand: the mark fires when the index state is *known*, not when it is good.
+        //
+        // Recorded as its own test by #119, because #119 makes the actor hold its
+        // *terminal* state back until the handle slot is filled and the whole safety
+        // of that change rests on `Rebuilding` being exempt. The index-side tests
+        // prove `Rebuilding` is still published; only this one proves that publishing
+        // it still makes the vault usable -- the observer installed in
+        // `open_vault_with` is the link between the two, and nothing else asserted it.
+        // Widen the deferral to every state and this opener, which never reaches
+        // `Ready` while the assertion runs, leaves the shell waiting forever.
+        struct RebuildsUntilReleased(Arc<std::sync::Barrier>);
+        impl IndexOpen for RebuildsUntilReleased {
+            fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
+                publish(IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 20_000,
+                    walk_complete: false,
+                });
+                // Still rebuilding, and still holding no handle, for as long as the
+                // assertion below takes -- which is the situation §3.4 describes.
+                self.0.wait();
+            }
+        }
+
+        let dir = fixture("usable-mid-rebuild");
+        let startup = Arc::new(Startup::begin());
+        let state =
+            AppState::with_settings(Arc::clone(&startup), Boot::default(), Settings::default());
+
+        // The three `t_usable` terms this test is not about. Set first, so that when
+        // the assertion runs the only outstanding term is the index one.
+        startup.mark_window_created();
+        startup
+            .mark_first_paint(42.0, 20.0)
+            .expect("valid paint evidence");
+        startup.mark_watcher(WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+
+        let release = Arc::new(std::sync::Barrier::new(2));
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                RebuildsUntilReleased(Arc::clone(&release)),
+            )
+            .expect("open");
+
+        assert!(
+            startup.wait_for_usable(Duration::from_secs(5)),
+            "a vault whose index is still rebuilding is usable: the shell must come \
+             up on exactly the vault that needs a rebuild most (§3.4, and \
+             `Startup::mark_index_settled`'s own doc). A save landing here \
+             finds an empty slot and degrades to the watcher path, which is \
+             design goal 5 and not a defect (F-450)"
+        );
+
+        release.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_save_with_no_index_handle_is_counted_not_silent() {
         // F-382: `write_file` returns `Ok` identically whether the save reached the
         // writer or the slot was empty, and the empty-slot case covers two of F-382's
