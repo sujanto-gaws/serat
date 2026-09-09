@@ -21,6 +21,10 @@ name = "doclint"
 path = "src/lib.rs"
 
 [[bin]]
+name = "check-count-over-list"
+path = "src/bin/check-count-over-list.rs"
+
+[[bin]]
 name = "check-design-paths"
 path = "src/bin/check-design-paths.rs"
 

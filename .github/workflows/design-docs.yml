@@ -59,3 +59,15 @@ jobs:
       - name: Print the report either way
         if: always()
         run: cargo run -p doclint --bin check-table-structure
+
+  count-over-list:
+    name: "F-496 · a count written above a list matches the list"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p doclint
+      - name: Print the report either way
+        if: always()
+        run: cargo run -p doclint --bin check-count-over-list
