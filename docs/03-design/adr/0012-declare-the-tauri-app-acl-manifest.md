@@ -31,7 +31,7 @@ commands that field does nothing.** It is already written down as the intent. De
 the manifest is closer to connecting a wire than to adding a mechanism.
 
 **One of the six is reachable from the webview and called by nothing there.**
-`crates/serat-app/webview/boot.js` is the whole of the P0 front end and it invokes
+*(Written when `boot.js` was hand-authored source. Since task #98 it is Vite output built from `app/`, and the claim was re-verified against the shipped artifact at task #102 — see the note below the decision.)* `crates/serat-app/webview/boot.js` is the whole of the P0 front end and it invokes
 `read_file`, `write_file`, `index_status`, `mark_first_paint` and `mark_vault_usable` —
 **five.** `open_vault` is invoked only from Rust, by `state.open_vault(...)` inside
 `setup` (`crates/serat-app/src/lib.rs`), which does not cross the IPC boundary at all.
@@ -103,6 +103,10 @@ better message, not reverting the ACL. And `app/src/` currently holds only gener
 `ts-rs` types — the Vue front end is not wired yet, so **the five-command set describes
 the P0 boot shell and will need revisiting when the real front end lands.** That
 revisiting is the mechanism working, not a defect in it.
+
+**The revisit came due at task #98 and the answer is: still five.** `app/` now holds Vue 3 and CodeMirror 6, and `crates/serat-app/webview/` is its build output rather than hand-authored source. code-reviewer verified the grant against the **shipped artifact** at task #102: the bundle invokes exactly the five granted commands. Event delivery, which #117 wired for `index-status`, needs no addition here — it is covered by `core:default`, observed working in a real window rather than asserted by this ADR.
+
+**What that verification does and does not establish (F-467).** `app/src/ipc/client.ts` exports an `openVault` wrapper for the one command deliberately withheld. Nothing calls it and the bundler drops it, which is why the artifact is clean — **so the property holds by tree-shaking rather than by anything anyone asserted.** The *security* property is asserted: a test drives the ACL and confirms `open_vault` is refused while the five are not. The *authoring-time* property is not — a developer who writes `await openVault(...)` gets a runtime ACL denial where a compile error was available. Deleting the wrapper is the fix and it is vue-frontend-dev's file; **the reason it belongs in this ADR is that this document's own evidence sentence would otherwise keep citing a file that has changed what it is.** A static check that `app/src/ipc/` exports no wrapper for an ungranted command is what would make it hold by assertion; it is not built, and saying so is the point.
 
 **Why now rather than later**, which is the whole argument: roughly three lines of
 `build.rs` plus a permission list before a second window exists, against a security
