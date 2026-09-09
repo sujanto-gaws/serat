@@ -114,8 +114,15 @@ term is the interval between two marks the application already emits
 
 Being a partition is the whole of its integrity. Time cannot be moved out of the Serat
 term without moving it into a named platform term at a named mark, and the identity
-`Σ(terms) = t0_to_vault_usable_ms` is checkable on every single run — **checkable in
-principle today and in fact only after task #106**, and the tense matters. F-381 caught this
+`Σ(terms) = t0_to_vault_usable_ms` is checkable on every single run — **and since task #106
+landed it is checked: `bench/budget/src/trace.rs` requires all seven marks rather than
+making four of them `Option`, and asserts the identity.** The paragraph below is kept in the
+tense it was written in because it records why the property was unassertable and what that
+cost; **what it must not be read as is the current state.** §Objections carries what the
+assertion is actually worth, and it is less than this paragraph hoped: given the other
+checks the identity is a telescoping sum, true of any seven numbers, so what it guards is
+the harness's own field-to-term mapping rather than the application's marks. One-line
+re-check: `grep -n 'fn sum_ms' bench/budget/src/trace.rs`. F-381 caught this
 paragraph asserting the property in the present tense when the harness could not evaluate
 it: the application stamps all seven marks and `bench/budget/src/trace.rs` parses four, so
 three of the seven terms are computable and **the Serat term, which is the binding one, is
