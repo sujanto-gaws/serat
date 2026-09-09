@@ -498,6 +498,55 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
     })
 }
 
+/// Build a real, `Ready` index at `vault_root.join(".serat")` before the real
+/// application is ever spawned against it -- **F-NEXT/save-benchmark-races-
+/// cold-rebuild**, found live during the first real #95 run.
+///
+/// NFR-PRF-03 governs a save made in an *already-open* vault -- "a note saved
+/// through Serat's own write path", not a race against the vault's own first
+/// index build. But `--exit-after-ready`'s "usable" mark does not wait for
+/// that build to finish: `Startup::mark_index_settled`'s own doc names its
+/// trigger as "the actor's first published state that is not `Opening`",
+/// which a vault needing a full rebuild reaches almost immediately, long
+/// before `AppState`'s `IndexHandleSlot` actually holds a handle. Against a
+/// vault with no pre-existing `.serat/`, every one of a benchmark's saves can
+/// therefore land inside that window and find the slot empty -- not F-382's
+/// documented narrow race, but a near-certain miss for as long as a 20,000-
+/// note rebuild takes. Measured directly: a first real run against the
+/// canonical (cold) 20k vault reported `handle_missing: 1000` of 1000.
+///
+/// This calls the exact same `serat_index::open_or_rebuild` `serat-app`'s own
+/// `index.rs` calls (same four arguments, same status callback shape), so the
+/// `.serat/` this leaves behind is indistinguishable from one a real user's
+/// first open would produce -- the next real app spawn finds it `Ready` and
+/// installs a handle at task #68's few-millisecond open-check cost rather
+/// than triggering a second rebuild. A no-op if `.serat/` already exists
+/// (warm from an earlier run in the same guarded batch): NFR-PRF-03's own
+/// premise is a warm, already-open vault, and re-warming one that already is
+/// would just be a second, wasted rebuild.
+///
+/// # Errors
+/// The vault cannot be opened, or the rebuild-or-open itself fails.
+fn prewarm_index(vault: &Path) -> Result<(), String> {
+    let index_dir = vault.join(".serat");
+    if index_dir.exists() {
+        return Ok(());
+    }
+    let source = serat_vault::Vault::open(vault)
+        .map_err(|e| format!("opening {} to pre-warm the index: {e}", vault.display()))?;
+    let parser = serat_parse::CommonMarkParser;
+    let on_status = |_status: serat_index::IndexStatus| {};
+    let (handle, _report) =
+        serat_index::open_or_rebuild(vault, &index_dir, &source, &parser, &on_status)
+            .map_err(|e| format!("pre-warming the index at {}: {e}", index_dir.display()))?;
+    handle.close().map_err(|e| {
+        format!(
+            "closing the pre-warmed index at {}: {e}",
+            index_dir.display()
+        )
+    })
+}
+
 /// Save `iterations` distinct notes through the real application, driving the
 /// compiled binary via `--bench-save-list` (task #94, following #111).
 ///
@@ -515,23 +564,35 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
 /// reason: this is the only seam that measures `serat-app`, which `bench/
 /// budget` may not link under architecture §2.1's dependency rule.
 ///
-/// Selects the sample with [`select_save_sample`], writes it to a scratch
-/// list file, spawns the binary the same way [`cold_start_once`] does — `t0`
-/// stamped by the harness immediately before `spawn()`, handed in through
-/// `SERAT_STARTUP_T0_UNIX_NANOS` — and parses
+/// Calls [`prewarm_index`] first — NFR-PRF-03 governs an already-open vault,
+/// not a race against its first rebuild (see that function's own doc for the
+/// defect this closes, found live on the first real run of this instrument).
+/// Then selects the sample with [`select_save_sample`], writes it to a
+/// scratch list file, spawns the binary the same way [`cold_start_once`] does
+/// — `t0` stamped by the harness immediately before `spawn()`, handed in
+/// through `SERAT_STARTUP_T0_UNIX_NANOS` — and parses
 /// [`crate::trace::SaveBenchmarkTrace`] out of the one line the run writes to
 /// `SERAT_STARTUP_TRACE`.
 ///
 /// # Errors
 /// The application binary is absent (task S1's message), the vault cannot
-/// supply `iterations` distinct notes, the run exits non-zero (the process's
-/// own contract: abort rather than report a shorter series than was asked
-/// for), or the exit report cannot be parsed.
+/// supply `iterations` distinct notes, pre-warming the index fails, the run
+/// exits non-zero (the process's own contract: abort rather than report a
+/// shorter series than was asked for), or the exit report cannot be parsed.
 pub fn save_to_index_via_app(
     vault: &Path,
     iterations: usize,
 ) -> Result<crate::trace::SaveBenchmarkTrace, String> {
     let binary = app_binary()?;
+
+    // F-401: the same hazard `cold_start`'s guard exists for, and for the same
+    // reason -- both this function's own spawn and `prewarm_index` below
+    // create `.serat/` inside `vault` as an ordinary side effect of indexing.
+    // One guard for the whole run, taken before either touches the vault and
+    // dropped after this function returns on every exit path including `?`.
+    let _guard = ColdStartVaultGuard::watch(vault);
+    prewarm_index(vault)?;
+
     let paths = select_save_sample(vault, iterations)?;
 
     let list_path =
@@ -544,13 +605,6 @@ pub fn save_to_index_via_app(
         std::process::id()
     ));
     let _ = std::fs::remove_file(&trace_path);
-
-    // F-401: the same hazard `cold_start`'s guard exists for, and for the same
-    // reason -- this spawns the real app against `vault`, which creates
-    // `.serat/` inside it as an ordinary side effect of indexing. One guard for
-    // the whole run, taken before the spawn and dropped after this function
-    // returns on every exit path including `?`.
-    let _guard = ColdStartVaultGuard::watch(vault);
 
     let t0 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
