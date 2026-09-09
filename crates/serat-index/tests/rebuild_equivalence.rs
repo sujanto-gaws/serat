@@ -257,8 +257,24 @@ fn a_vault_recovered_after_deleting_serat_answers_every_query_the_same_way() {
     // snapshots proves nothing (the shape of failure this whole file exists to
     // rule out one level up). This is the check that the comparison above was
     // actually exercised.
+    //
+    // **All six series, not three (F-474).** The comment above was already right
+    // and the code covered half of it: hollowing each series in turn so both
+    // snapshots return empty left `tasks`, `fields` and `blocks` GREEN while
+    // `notes` went red. Latent rather than live, since `seed()` populates all six
+    // today -- but the reason it has to close is a limit of equivalence testing in
+    // general. **A defect that affects both builds identically is invisible to
+    // it.** If the parser stopped emitting tasks, both snapshots would be empty,
+    // every `assert_eq!` above would still pass, and T1 would report equivalence
+    // over a table nothing was populating -- while T1 is the evidence C-02 and
+    // NFR-REL-02 rest on. These assertions are what make it the stronger claim, so
+    // every series the comparison covers is held to non-emptiness and none is left
+    // to be vacuously equal.
     assert!(!before.notes.is_empty(), "the fixture indexed nothing");
+    assert!(!before.blocks.is_empty(), "the fixture produced no blocks");
+    assert!(!before.fields.is_empty(), "the fixture produced no fields");
     assert!(!before.links.is_empty(), "the fixture produced no links");
+    assert!(!before.tasks.is_empty(), "the fixture produced no tasks");
     assert!(
         !before.fts_hits.is_empty(),
         "the fixture produced no FTS hits"
