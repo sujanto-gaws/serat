@@ -101,13 +101,29 @@ and `style-mod` (CodeMirror's runtime styling) creates an inline `<style>` eleme
 confirmed, `S_shell` did not pay for work a styled editor would actually do. Task #116 verifies before fixing; this
 report's `S_shell`/`S`/`S_front` figures should be read as provisional until it closes.
 
-## NFR-PRF-03 — save → index < 50 ms p95 — **still blank; every reason this section used to give was false**
+## NFR-PRF-03 — save → index < 50 ms p95 — **PASS at 4.306 ms, `gate_eligible: false`**
 
-Not estimated, per the lead's instruction. **The number is being taken now** — task #95, fourth attempt, under the
-declared freeze, against tree `c60dfdd`. This section is rewritten ahead of it because F-466 found the conclusion
-right and the whole apparatus supporting it wrong, *"the most dangerous form, because the section reads as
-maintained."* Four claims were stale, and all four are corrected below with the anchor-plus-re-check convention
-F-442 asks for: a claim that cannot be re-checked in one line decays exactly like the ones being replaced here.
+**Measured.** Task #95, fourth attempt, 2026-09-09, under the declared freeze against tree `c60dfdd` (`main` +
+#119 `690b70c` + #94). Full report: `docs/05-testing/reports/nfr-prf-03-save-to-index.md`.
+
+| Field | Value |
+|---|---|
+| p95 | **4.306 ms** over 1,000 saves · limit 50.0 ms (reference profile) · `degraded: null` |
+| Replication | a second 1,000-save run immediately after gave **4.4 ms**; both are reported so that designating the first cannot be read as choosing the better |
+| Distribution | min 1.481 · mean 3.002 · max 8.218 ms |
+| Save-path census | **1000 attempted · 1000 submitted · 0 writer-refused · 0 handle-missing** — every attempted save reached the index writer, so the p95 is over the whole workload rather than over whichever fraction survived |
+| Vault | canonical 20k, digest `35fcb867…bd393e`, verified by the job before measuring and intact after |
+| Verdict | **PASS on the budget** — 11.6x of headroom, so F-327's 35% session-to-session movement cannot reach the verdict here the way it reached NFR-PRF-04's |
+| **Binding caveat** | **`gate_eligible: false`** — real-time scanning is disabled on this machine (RISK-012), which the harness itself refuses to call the charter number. A scanner-on re-run is what makes this the gate figure; the headroom makes that likely to hold and *likely* is not *measured*. |
+
+**The zero is not a measurement of F-382's window, and is not recorded as one.** On this tree a zero cannot
+distinguish *the pre-warm worked* from *#119 closed the ordering window* from *both* — #119's own 35.4 µs / 191 µs
+(F-462) stays the measurement of record. A residual would have been the more interesting result and would have gone
+to #119's record; none appeared.
+
+**This section previously carried five stale claims under a correct conclusion (F-466)** — *"the most dangerous form,
+because the section reads as maintained."* They are corrected below with the anchor-plus-re-check convention F-442
+asks for, and kept rather than deleted, because what the section used to say is why the number took four attempts.
 
 | What this section used to say | What is true, and the one-line re-check |
 |---|---|
@@ -128,9 +144,11 @@ F-442 asks for: a claim that cannot be re-checked in one line decays exactly lik
 | Degradation | ADR-0011 backpressure does not fail the run, it fails the **number**: a non-zero `writer_refused` sets `Measurement::degraded`, and a degraded outcome cannot report PASS however fast the saves that landed were. |
 | What still bounds the figure | Reference machine only; warm vault by construction (above); `gate_eligible: false` whenever the real-time scanner is off (RISK-012). |
 
-| Field | Value |
-|---|---|
-| Verdict | **Blank, and for one reason only: the run has not finished.** Every blocker this section previously named is closed. When #95 lands, this row takes its p95, its census line and its `gate_eligible` flag — and if a residual `handle_missing` survives the pre-warm, that residual is F-382's window measured at last and belongs in #119's record rather than in a footnote here. |
+**Why it took four attempts, since that is the part worth carrying forward.** No instrument reached `serat-app`
+(closed by #94); `save_path_outcomes` was unreachable by a budget job (closed by #111); and the harness was saving
+into a cold vault's first rebuild (F-450) — closed by the pre-warm, **which was itself inert until F-458**, because
+it passed a differently-spelled vault root and `open_or_rebuild` declared the index `VaultMoved` and rebuilt. Three
+of the four failures were the instrument, not the code, and the third looked exactly like a product defect.
 
 ## NFR-PRF-08 — every budget has an asserting job; a breach fails CI — **cannot currently be satisfied at all**
 
@@ -202,22 +220,33 @@ in the register, because this report cites F-392 in its own header and a citatio
 settled to everyone who does not also read the findings register.
 ## Verdict
 
-**Not a clean GO.** Two of four budgets are final and one of those two (NFR-PRF-01) fails its current asserted
-scalars, though the seven-term breakdown shows the failure is a platform-term problem this project does not control
-rather than a Serat-code problem, and ADR-0014's split — now `accepted` — gives product-analyst a budget on the term
-that is ours to control and comfortably clears it. The other two budgets are not measured: NFR-PRF-03 is blocked on
-work outside this task (#111) and an instrument defect found and recorded but not yet fixed (F-402); NFR-PRF-08, a
-Must, cannot currently be satisfied at all for a reason outside any team member's code (F-384, needs the repository
-owner). **This document does not decide whether P0 proceeds — that is #102's (code-reviewer's final sweep) and the
-owner's call — it states what is known, what is blocked, and why, so that decision is made against evidence rather
-than a placeholder.**
+**Not a clean GO, and the shape of the shortfall has changed: three of four budgets are now measured, and none of the
+three that remain open is a code problem.**
+
+- **NFR-PRF-04** — PASS, gate-quality (#96).
+- **NFR-PRF-03** — **PASS at 4.306 ms against 50 ms**, 1,000 saves, every attempt accounted for (#95). `gate_eligible:
+  false` on the scanner, so it is a comparable figure and not yet the charter one.
+- **NFR-PRF-01** — fails its current asserted scalars, and the seven-term breakdown shows the failure is a platform
+  term this project does not control rather than Serat code; ADR-0014's split, now `accepted`, budgets the term that
+  is ours and comfortably clears it.
+- **NFR-PRF-08** — a **Must** that cannot currently be satisfied at all, for a reason outside every team member's
+  code (F-384, needs the repository owner).
+
+**Two of the three open items are the same item wearing different clothes: the machine.** NFR-PRF-03's
+`gate_eligible: false` and NFR-PRF-01's platform term are both "the number this project controls is fine and the
+environment it is measured in is not the one the charter judges", and both are answered by re-measuring rather than
+by changing code. NFR-PRF-08 is answered by nobody on this team.
+
+**This document does not decide whether P0 proceeds** — that is #102's (code-reviewer's final sweep) and the owner's
+call — **it states what is known, what is blocked, and why**, so that decision is made against evidence rather than a
+placeholder.
 
 ## Traceability
 
 | ID | How this report serves it |
 |---|---|
 | NFR-PRF-01 | Final reading, seven-term breakdown, F-397/F-403/F-405 caveats, ADR-0014 acceptance. |
-| NFR-PRF-03 | States precisely what blocks it (#111, F-402) rather than estimating. |
+| NFR-PRF-03 | Measured: 4.306 ms p95 over 1,000 saves (#95), with the census, the `gate_eligible: false` caveat, and an explicit refusal to read the zero `handle_missing` as F-382's window. Full report in `reports/nfr-prf-03-save-to-index.md`. |
 | NFR-PRF-04 | Carries #96's gate-quality PASS forward without re-deriving it. |
 | NFR-PRF-08 | States the Must is unsatisfiable on infrastructure grounds (F-384), distinct from unmeasured. |
 | US-35 | "Stays fast as the vault grows" — all four numbers this project can currently produce, in one place. |
