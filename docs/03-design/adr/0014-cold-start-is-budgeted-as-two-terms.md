@@ -577,25 +577,35 @@ is that the precondition is asserted **nowhere**. A check on `app/index.html` pl
 is correct placement, not a split. Four properties have to hold and they do not have one
 enforcer between them:
 
-| Property | Enforced today | To be enforced by #112 |
+| Property | Enforced as of `8a5c525` | By what |
 |---|---|---|
-| Two genuinely distinct frames occurred | **nothing** | `raf2_ms > raf1_ms`, in `crates/serat-app` |
-| The paint value is the browser's entry, not a substitute clock read | **nothing** | `first_contentful_paint_ms <= raf2_ms`, same place, **subject to the condition below** |
-| The frames were scheduled *after our mount* | **Nothing, and nothing can.** Not recoverable from these timestamps in Rust or anywhere else; frontend review only | — |
-| `app/index.html` stays contentless, so the paint entry means *our* paint | **nothing** | A **static** check over that file |
+| Two genuinely distinct frames occurred | **Yes, as a rejection** | `validate_paint_evidence` requires both finite and `raf2_ms > raf1_ms`, returning `PaintEvidenceRejected::frame_gate_failed` (#113, #115) |
+| The paint entry is present at all | **Yes, as a typed rejection** | `Option<f64>` plus `PaintEvidenceRejected::missing_entry` — raised by our code rather than failing at Tauri's IPC layer before it runs (#112) |
+| The paint value is the browser's entry, not a substitute clock read | **No — demoted to a diagnostic** | `frame_precedes_paint_diagnostic` prints and returns `Ok`. It is not a rejection because at a 200 ms tolerance it could not fire: the attack's own gap is bounded above by FCP, measured at 184 ms (F-406, F-393) |
+| The frames were scheduled *after our mount* | **No, and nothing can.** | Not recoverable from these timestamps in Rust or anywhere else; frontend review only |
+| `app/index.html` stays contentless, so the paint entry means *our* paint | **No** | Still nothing. `crates/serat-app/src/commands.rs:92` and `startup.rs:66` both say so in their own words: *"a property nothing in this crate"* enforces |
 
-**The "today" column is not padding, and it is the reason this table has two columns instead
-of one.** Checked against the tree rather than assumed: `raf1`/`raf2` appear in **no Rust file**
-on main or on either #112 branch, and `mark_first_paint` takes `first_contentful_paint_ms: f64`
-alone. The frontend has sent `raf1Ms`/`raf2Ms` since #108 and **Tauri silently drops both**,
-because the command has no parameter to receive them.
-
-**So both halves of the conjunction appear to exist and the conjunction is in force nowhere.**
-The frontend gathers the frame evidence; the Rust side has a guard; nothing joins them. That is
-the most dangerous state this mechanism could be in, because every individual file reads as
-though the work is done — and F-388's entire history is people reasoning correctly from a
+**The state this table recorded when it was written, kept because it is what the two-column
+shape was for.** At #109 the conjunction was in force **nowhere**: `raf1`/`raf2` appeared in no
+Rust file, `mark_first_paint` took `first_contentful_paint_ms: f64` alone, and the frontend had
+been sending `raf1Ms`/`raf2Ms` since #108 with **Tauri silently dropping both**, because the
+command had no parameter to receive them. **Both halves appeared to exist and nothing joined
+them** — the most dangerous state a mechanism can be in, because every individual file reads as
+though the work is done, and F-388's entire history is people reasoning correctly from a
 plausible reading of one file. A single-column table headed *"Enforced by"* would have said
 exactly that, in the document that makes the rule against it. Found by code-reviewer at #109.
+
+**What changed, and it is not what the old column promised.** #112, #113, #114 and #115 landed
+and the first two rows are now enforced as rejections. **The third was not enforced — it was
+demoted**, on this ADR's own pre-committed condition, because F-393 measured FCP at 184 ms and
+F-406 showed a 200 ms tolerance therefore cannot fire. **So "to be enforced by #112" resolved
+to "yes, yes, no, and the reason for the no is a measurement"**, and a reader who took the
+column as a plan would have concluded the opposite of the truth about the row that matters
+most. Raised by product-analyst against PRD v1.3, checked against the tree rather than against
+this register, and it is F-471's class in the document that hosts §Decision 6: **a column
+headed with a task number is a promise with a date on it.** One-line re-check, which stays
+true either way because it names the call rather than its verdict: `grep -n
+'frame_precedes_paint_diagnostic' crates/serat-app/src/startup.rs`.
 
 **The third row is the boundary worth stating rather than papering over.** Whether the frames
 were scheduled after Vue mounted is not recoverable from three numbers, so `serat-app` cannot
