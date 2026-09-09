@@ -871,9 +871,25 @@ impl std::error::Error for PaintEvidenceRejected {}
 /// stays contentless, a property nothing in this crate asserts and that lives in a
 /// different file from this guard — a splash screen or loading skeleton, an entirely
 /// ordinary future addition, would silently degrade an FCP-only guard to F-377's
-/// mutation B with nothing going red. Checking the frame timestamps against the paint
-/// entry makes this guard's soundness independent of what `index.html` happens to
-/// contain today.
+/// mutation B with nothing going red.
+///
+/// **That independence was real when #112 wrote this and is not real now (F-482).**
+/// The sentence that stood here claimed checking the frame timestamps *against the
+/// paint entry* made this guard's soundness independent of `index.html`'s contents.
+/// Read the body: the only rejection is `!raf1.is_finite() || !raf2.is_finite() ||
+/// raf2 <= raf1` — the two frame timestamps compared **to each other**, never to the
+/// paint entry. The sole check that ever compared them to the paint entry was
+/// `frame_precedes_paint`, and **F-406 demoted it to a non-rejecting diagnostic**, so
+/// the sentence became false the moment that landed. This guard is FCP-only again,
+/// F-396(b)'s dependency on `app/index.html` staying contentless is live again, and
+/// nothing asserts that property.
+///
+/// Stated here rather than fixed here because the fix is a decision, not an edit:
+/// re-arming a rejection is ADR-0014's table to change (F-406's demotion was itself
+/// sound and correctly pinned — see F-444), and a doc that quietly promised the
+/// property was the more expensive half. What #125 closes is the *textual* route
+/// (`lib.rs`'s call-site count, F-481); this runtime route stays open and is named as
+/// open.
 ///
 /// All three inputs are on the *webview's own* `performance.now()` clock, never this
 /// process's `elapsed_ms` — they only ever need to be compared to each other, which is
