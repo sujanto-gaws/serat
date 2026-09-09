@@ -2538,10 +2538,22 @@ mod tests {
     }
 
     #[test]
-    fn every_p0_budget_matches_the_number_in_the_prd() {
-        // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
-        // confirms each budget has an asserting job". This is that review, as a
-        // test, so the list cannot drift from the PRD unnoticed.
+    fn every_p0_budget_constant_is_pinned_against_drift_within_this_file() {
+        // **F-447: this test does not read the PRD, and its old name said it
+        // did.** Nothing under `bench/budget/src/` opens
+        // `docs/02-requirements/prd.md`. What it pins is the budget constants
+        // against silent drift *within this crate* -- real value, and why the
+        // 350 -> 3500 mutation went red -- but one edit touching both the
+        // constant and the literal below passes it, which is F-443's failure
+        // mode exactly ("the re-baseline landed in the PRD, not the code").
+        // Renamed to what it does rather than left promising what it does not;
+        // `bench/doclint`'s `check-prd-join` is the mechanism that would
+        // genuinely close the gap, and extending it is the other legitimate
+        // fix.
+        //
+        // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration
+        // review confirms each budget has an asserting job". This is that
+        // review, as a test, for the half of it that lives in this file.
         // 5, not 4 (task #107, F-443): PRF01_WINDOW_VISIBLE and
         // PRF01_VAULT_USABLE are provisionally both still here, alongside the
         // new PRF01_SERAT_TERM, until task #118 removes the two legacy
