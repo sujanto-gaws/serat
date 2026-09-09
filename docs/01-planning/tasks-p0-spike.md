@@ -70,6 +70,24 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 >
 > **Today's register runs F-450 → F-490.** Read **F-469** first. **Eight are against the lead.**
 
+## The P0 gate clause, and what the verdict must answer
+
+**The charter's row, verbatim:** *"Full index < 30 s, save→index < 50 ms, cold start < 1 s. **If missed badly, architecture changes before anything is built on it.**"*
+
+**Groundwork, not a verdict** — the verdict waits on #124, #125 and #120, and writing it early is the premature-closure defect this register is full of. But the mapping should be visible before the conclusion, so the conclusion can be checked against it rather than taken.
+
+| Charter clause | Evidence | Reading |
+|---|---|---|
+| Full index < 30 s | **27,693.5 ms**, gate-quality, 3.2% spread, `concurrent_build_processes: 0` (#96) | **Met** |
+| save→index < 50 ms | **4.306 ms p95**, n=1000, census 1000/1000/0/0, attested on the composed tree (#95, #122) | **Met**, with the environment bound: `gate_eligible: false`, scanner off (RISK-012, #123, owner's call) |
+| cold start < 1 s | `vault_usable` p95 **1577.2 ms**, `window_visible` p95 **1575.6 ms** (#100) | **Missed** |
+
+**So the whole verdict turns on the charter's own conditional — *missed badly* means *architecture changes*, and that is the question, not whether a number is over.** The evidence says the miss is **not architectural**: Serat's own main-thread work is **3.4 ms median / 4.0 p95**, the binding Serat term is **201.1 / 233.8 ms** against the 350 ms budget #104 set, and **1117–1687 ms sits inside `WebviewWindowBuilder::build`** — a platform term, bounded to one webview (F-96), on a platform C-07 fixes. **A requirement written without a webview-startup term in it is a requirement that mismeasured, not an architecture that failed.**
+
+**What could still overturn that**, and it is why the verdict waits: **#125** — mutation B is reproduced, so NFR-PRF-01's paint evidence *can be fabricated and audited*, and the mark is **unbounded in both directions**. The Serat term's own credibility rests on marks that guard is meant to protect. **#124** — C-06's enforcement line is unpinned, so *every* budget's bindingness is currently unasserted. Neither changes a measured number; both change how much weight the numbers carry.
+
+**And NFR-PRF-08 is a Must that cannot be satisfied at all** while CI produces no jobs (F-384, the owner's). That is stated, not omitted.
+
 ## Resume task list (from #90)
 
 Two rulings by the owner, taken 2026-09-08, set this wave's shape.
