@@ -69,8 +69,9 @@ way and says so where it appears.
 1. **Slacken NFR-PRF-01 to the measured number** — 400 ms becomes 1100 ms, 1 s becomes
    1.2 s. Rejected. It converts a requirement into a description of the current build,
    which is the failure mode C-06 exists to prevent: the budget stops being able to fail,
-   so it stops being able to catch a regression. It also books ~140 ms of Serat's own work
-   into a number dominated by a platform term, so a doubling of the front end's startup
+   so it stops being able to catch a regression. It also books Serat's own work — ~140 ms
+   when this option was weighed, composed from the phase table and since attested at
+   **201.1 ms median / 233.8 ms p95** (#100) — into a number dominated by a platform term, so a doubling of the front end's startup
    cost would be inside the new budget on arrival.
 
 2. **Open C-07 and re-decide the shell.** Rejected by the owner, and the reasons are on
@@ -273,8 +274,10 @@ current form whatever budget is set on them, which is #101's problem and not thi
 ## Consequences
 
 **Positive.** Serat's contribution to cold start acquires a budget that can actually fail:
-~140 ms of measurable work, currently invisible inside a number dominated by a platform
-term, becomes the thing someone is held to. The partition is checkable per run rather than
+**201.1 ms median / 233.8 ms p95** of measurable work (#100, attested; the ~140 ms written
+here before #100 was composed from the phase table and carried that table's basis),
+invisible inside a number dominated by a platform term, becomes the thing someone is held
+to. The partition is checkable per run rather than
 argued. The front end gets a budget before the editor lands in it rather than after. And
 the platform cost stops being an excuse that has to be re-explained in every conversation,
 because it has a name and a column.
@@ -288,7 +291,11 @@ cost rather than a presentational one.
 **Risks.**
 
 - **The split can be used to stop looking.** A term with no budget attracts no attention,
-  and `P_webview` is 78% of the wait. The mitigation is §Open design questions, not this
+  and `P_webview` is the largest single term in the wait by a wide margin — **725.3 ms
+  median / 1199.1 ms p95**, against a whole Serat term of 201.1 / 233.8 (#100, attested).
+  The *78% of the wait* this clause used to quote was a ratio composed from the phase
+  table's cells and inherited its basis; the attested figures make the point without one.
+  The mitigation is §Open design questions, not this
   ADR, and mitigations that live in a table are the kind this project has watched go stale.
 - **"Not ours to budget" is one claim; "irreducible" is another, and only the first is
   established.** §3.4 says the platform term is *"a platform cost that no decision in this
@@ -327,8 +334,10 @@ cost rather than a presentational one.
   rather than hoped: does the partition catch F-377's surviving mutation — `mark_first_paint`
   hoisted to script start — on its own? **No, and the reason is structural.**
   `Startup::vault_usable()` is `painted.max(rendered).max(index).max(watcher)`
-  (`crates/serat-app/src/startup.rs:189`), and §3.4 measures `painted → usable` at
-  4.7–7.5 ms, so `painted` is **not** the term that settles the maximum. Moving it earlier
+  (`crates/serat-app/src/startup.rs:189`), and `painted → usable` is the smallest term
+  there is — **1.1 ms median / 1.7 ms p95** (#100, attested; the 4.7–7.5 ms this clause
+  used to quote was the phase table's last row read *across* its two columns, which F-452
+  rules inadmissible) — so `painted` is **not** the term that settles the maximum. Moving it earlier
   by Δ therefore leaves `t_usable` untouched: `S_shell` shrinks by Δ, `S_settle` grows by
   exactly Δ, and every sum is invariant. **An identity over contiguous intervals says nothing about
   whether a mark fired at the right event.**
@@ -349,9 +358,12 @@ cost rather than a presentational one.
   does.
 
   **What the partition does buy is a diagnostic, and it is a sharp one.** Under the
-  mutation `S_settle` grows from a measured 4.7–7.5 ms to roughly Δ, bounded by F-86's
-  ~100 ms from window build to first painted frame — a 13–21× anomaly in the smallest and
-  most stable term in the table, in a quantity today's four-mark harness cannot compute at
+  mutation `S_settle` grows from an attested 1.1 / 1.7 ms (#100) to roughly Δ, bounded by
+  the window-build-to-paint interval — F-86 put that at ~100 ms pre-#98 and #100 attests
+  `S_shell` at 196.1 / 229.2 ms after it. **The multiplier is left unstated rather than
+  recomputed**: the 13–21× first written here divided one unattested figure by another,
+  and what the diagnostic needs is only that the anomaly is orders of magnitude in the
+  smallest and most stable term in the table, in a quantity today's four-mark harness cannot compute at
   all. **It is not a rejection and must not be turned into one by bounding `S_settle`:**
   that term grows legitimately in P1 with a real file tree, and on Linux with one inotify
   watch per directory. A large `S_settle` means the paint fired well before the other three
