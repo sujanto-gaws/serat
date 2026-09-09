@@ -1828,9 +1828,10 @@ where
     match decide(budget, args, measure) {
         Ok(outcome) => {
             report(&outcome);
-            // Indeterminate is not success. A run whose samples straddled the
-            // limit saw the budget breached and would go green on the median.
-            if outcome.passed() && outcome.determinate() {
+            // One rule, one place (F-485). This used to be a second copy of
+            // the decision that did not consult `gates()` at all, so a
+            // budget's report and its enforcement could disagree.
+            if enforce(&outcome) {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::FAILURE
@@ -1841,6 +1842,91 @@ where
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// **The one place a measured outcome becomes a build result.**
+///
+/// F-485, following F-480. Before this, the rule lived twice — `run_job` had
+/// its own `if outcome.passed() && outcome.determinate()` and `run_paired_job`
+/// had a second copy behind an `if outcome.gates()` — and the two could
+/// disagree without anything going red. **They did disagree**: `gates()` was
+/// consulted in the verdict word, the report body and the JSON key, and *not*
+/// in `run_job`'s decision, which is the path every gated budget actually
+/// takes. That was fail-closed and therefore safe (setting `gated: false` on a
+/// real gate could not disarm it), and it still meant a budget could **print
+/// "not a gate" and fail CI anyway** — a figure whose report contradicts its
+/// enforcement.
+///
+/// So the rule is written once, here, and both runners call it. The three
+/// inputs are exactly the three things that decide it and there is no fourth:
+///
+/// * **`gated`** — from [`Budget::gated`], which is what the PRD says. An
+///   ungated figure is measured, validated, printed and written to its JSON,
+///   and cannot fail a build.
+/// * **`passed`** — the timing comparison, with `degraded` already folded in
+///   (F-435: *fail the number, not the run*).
+/// * **`determinate`** — a run whose samples straddled the limit observed both
+///   outcomes and settled nothing; reporting either as the verdict is a coin
+///   toss dressed as a measurement.
+///
+/// A measurement that could not be *taken* never reaches this function: that
+/// is an `Err` at the call site and fails on its own. "Reported" means the
+/// number is not asserted, not that its absence is acceptable.
+#[must_use]
+pub fn enforce(outcome: &Outcome) -> bool {
+    if !outcome.gates() {
+        return true;
+    }
+    outcome.passed() && outcome.determinate()
+}
+
+/// Every budget id that a job enforcing through [`enforce`] can breach a build
+/// with — read off the binaries rather than restated (F-485).
+///
+/// The gap F-485 names is not that enforcement is wrong today; it is that
+/// **nothing pinned the wiring**. `PRF01_REPORTED`'s entries are ungated, and
+/// a sixth budget added to that list but wired to a `run_job`-calling binary
+/// would print *"not a gate"* in its own report and still fail CI on a breach.
+/// The partition test pins flag against list; this pins **list against the
+/// binaries that actually run**, which is the half that was missing.
+///
+/// # Errors
+/// The `bin/` directory cannot be read.
+pub fn budgets_enforced_by_a_binary() -> Result<Vec<String>, String> {
+    let dir = repo_root().join("bench/budget/src/bin");
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    let mut ids = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        // `run_paired_job` contains `run_job` as a substring, so the paired
+        // form has to be excluded explicitly rather than matched loosely --
+        // exactly the kind of near-miss F-30 recorded when a grep decided a
+        // check's coverage.
+        let calls_run_job = text.contains("run_job(") && !text.contains("run_paired_job(");
+        if !calls_run_job {
+            continue;
+        }
+        for budget in P0_BUDGETS.iter().chain(PRF01_REPORTED) {
+            // `prf03-save-to-index` -> `PRF03_SAVE_TO_INDEX`, which is how
+            // every one of these constants is named. Derived rather than
+            // listed, so a new budget cannot be missed by a table nobody
+            // updated.
+            let konst = budget.id.to_uppercase().replace('-', "_");
+            if text.contains(&konst) {
+                ids.push(budget.id.to_string());
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// Run two budgets that share one measurement, as NFR-PRF-01 does.
@@ -1889,14 +1975,9 @@ where
         match outcome_from(budget, parsed.profile, vault.clone(), measurement) {
             Ok(outcome) => {
                 report(&outcome);
-                // Task #118: an ungated figure is measured, validated, written
-                // to its JSON and printed -- and cannot fail the build. A
-                // measurement that could not be *taken* still fails below,
-                // because "reported" means the number is not asserted, not
-                // that its absence is acceptable.
-                if outcome.gates() {
-                    ok &= outcome.passed() && outcome.determinate();
-                }
+                // The same `enforce` `run_job` calls -- not a second copy of
+                // the rule that happens to agree with it (F-485).
+                ok &= enforce(&outcome);
             }
             Err(e) => {
                 eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
@@ -2862,6 +2943,114 @@ mod tests {
                 b.id
             );
         }
+    }
+
+    #[test]
+    fn enforce_is_the_whole_truth_table_and_the_only_place_the_rule_lives() {
+        // F-485, following F-480. The rule used to be written twice and the
+        // two copies disagreed -- `run_job`'s decision never consulted
+        // `gates()` at all. This is the exhaustive table for the one copy that
+        // is left: three inputs, eight rows, no fourth input.
+        //
+        // Both mutations that motivated it die here: `if false` in place of
+        // the gated branch (rows 1-4 go wrong) and dropping the `gates()`
+        // check so an ungated breach fails a build (rows 5-8 go wrong).
+        let outcome = |budget: Budget, values: &[f64]| Outcome {
+            budget,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(values),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+        // PRF04's limit is 30,000 ms; PRF01_WINDOW_VISIBLE's is 400 ms.
+        let gated_pass = outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]);
+        let gated_breach = outcome(PRF04_FULL_REBUILD, &[40_000.0, 41_000.0]);
+        let gated_straddle = outcome(PRF04_FULL_REBUILD, &[10_000.0, 40_000.0]);
+        let mut gated_degraded = outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]);
+        gated_degraded.degraded = Some("backpressure".to_string());
+
+        let reported_pass = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 200.0]);
+        let reported_breach = outcome(PRF01_WINDOW_VISIBLE, &[1_575.6, 1_580.0]);
+        let reported_straddle = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 1_580.0]);
+        let mut reported_degraded = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 200.0]);
+        reported_degraded.degraded = Some("backpressure".to_string());
+
+        // Gated: only a determinate, undegraded pass may go green.
+        assert!(enforce(&gated_pass), "a gated budget that held must pass");
+        assert!(
+            !enforce(&gated_breach),
+            "a gated breach must fail the build"
+        );
+        assert!(
+            !enforce(&gated_straddle),
+            "a run that observed both a pass and a fail settled nothing and must not go green"
+        );
+        assert!(
+            !enforce(&gated_degraded),
+            "F-435: degraded fails the number, and the number is what the build asserts"
+        );
+
+        // Ungated: measured, printed, and unable to fail a build -- whatever
+        // the arithmetic says. This is the half #118 exists for.
+        assert!(enforce(&reported_pass));
+        assert!(
+            enforce(&reported_breach),
+            "a reported figure over its reference limit must not fail a build"
+        );
+        assert!(enforce(&reported_straddle));
+        assert!(enforce(&reported_degraded));
+
+        // And the report agrees with the enforcement in both directions --
+        // F-485's actual complaint was a figure whose words and whose exit
+        // code could say different things.
+        assert!(reported_breach.to_report().starts_with("REPORTED"));
+        assert!(gated_breach.to_report().starts_with("FAIL"));
+    }
+
+    #[test]
+    fn every_budget_a_run_job_binary_drives_is_a_gated_one() {
+        // **F-485's real gap.** The partition test below pins the `gated` flag
+        // against list membership. Nothing pinned that the binaries calling
+        // `run_job` -- the path that can fail a build -- drive exactly the
+        // gated set. A sixth budget added to PRF01_REPORTED with
+        // `gated: false` and wired to a run_job binary would print "not a
+        // gate" in its own report and still fail CI on a breach: report and
+        // enforcement in contradiction, with every existing test green.
+        //
+        // Read off the binaries rather than restated, so it cannot drift.
+        let enforced = budgets_enforced_by_a_binary().expect("bin/ is readable");
+        assert!(
+            !enforced.is_empty(),
+            "no binary was found to call run_job -- this check would pass vacuously, which is \
+             F-27's lesson about a review that reviews nothing"
+        );
+        for id in &enforced {
+            let budget = P0_BUDGETS
+                .iter()
+                .chain(PRF01_REPORTED)
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| {
+                    panic!("{id} is driven by a binary but is not a declared budget")
+                });
+            assert!(
+                budget.gated,
+                "{id} is driven by a run_job binary, so a breach of it fails the build -- but it \
+                 is flagged ungated and its own report will say \"not a gate\". Report and \
+                 enforcement must not be able to disagree (F-485)."
+            );
+        }
+        let mut gated: Vec<String> = P0_BUDGETS.iter().map(|b| b.id.to_string()).collect();
+        gated.sort_unstable();
+        assert_eq!(
+            enforced, gated,
+            "the budgets a run_job binary drives and the budgets flagged gated must be the same \
+             set, in both directions: a gated budget with no such binary is a budget CI cannot \
+             breach on, which is NFR-PRF-08's own acceptance criterion unmet"
+        );
     }
 
     #[test]
