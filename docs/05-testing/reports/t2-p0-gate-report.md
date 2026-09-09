@@ -4,7 +4,7 @@ artifact: T2 — the four P0 gate benchmarks, reported together (task #101)
 phase: 05-testing
 owner: test-engineer
 serves: NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-08, US-35
-cites: ADR-0001, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-392, F-402, F-417, F-418
+cites: ADR-0001, ADR-0011, ADR-0013, ADR-0014, F-384, F-397, F-403, F-405, F-14, F-33, F-34, F-382, F-392, F-402, F-417, F-418, F-442, F-450, F-458, F-466, F-479
 ---
 
 # T2 — the four P0 gate benchmarks, reported together
@@ -101,16 +101,54 @@ and `style-mod` (CodeMirror's runtime styling) creates an inline `<style>` eleme
 confirmed, `S_shell` did not pay for work a styled editor would actually do. Task #116 verifies before fixing; this
 report's `S_shell`/`S`/`S_front` figures should be read as provisional until it closes.
 
-## NFR-PRF-03 — save → index < 50 ms p95 — **unmeasured, blank by design**
+## NFR-PRF-03 — save → index < 50 ms p95 — **PASS at 4.306 ms, `gate_eligible: false`**
 
-Not estimated, per the lead's instruction. What would fill this row:
+**Measured.** Task #95, fourth attempt, 2026-09-09, under the declared freeze against tree `c60dfdd` (`main` +
+#119 `690b70c` + #94). Full report: `docs/05-testing/reports/nfr-prf-03-save-to-index.md`.
 
-| Field | What is needed |
+| Field | Value |
 |---|---|
-| Instrument | `bench/budget/src/bin/prf03-save-to-index.rs` exists and is wired to `IndexHandle::apply()`/`flush()` (TC-021), but `bench/budget/src/subject.rs:517`'s `save_to_index` calls those directly against `serat-index` — it never enters `serat-app`, so it never exercises `AppState::write_file`, `write_atomic`, the re-read/hash, echo suppression or the handle slot. The lead's third ruling set left this open: does NFR-PRF-03 mean "the save interval measured however it can be reached" or "Serat's own write path, end to end"? Unresolved as of this writing. |
-| Blocker | **#111** (`tauri-app-dev-2`, pending) — makes `save_path_outcomes` reachable by a budget job. #94 (test-engineer, this task's own #101 sibling) cannot assert the real save path without it: *"#94 has nothing to assert against without it"* is the resume table's own words. #94 → #95 (take and record the number) → this row. |
-| A second, independent reason nothing here can pass yet | **F-402** — the ninth guard-that-cannot-fail on record (see below). `run_save_benchmark`'s outcome bucketing does not distinguish a refused save from a submitted one in the series NFR-PRF-03's p95 is asserted against; replacing the bucketing with an unconditional push gives **94 passed, 0 failed — identical to control.** A number taken through the current instrument, even once #111 unblocks it, would not yet be trustworthy until F-402 is fixed. |
-| Verdict | **Cannot be reported.** Blocked on #111 (implementation) and F-402 (instrument correctness), both open and both outside this task's scope to close. |
+| p95 | **4.306 ms** over 1,000 saves · limit 50.0 ms (reference profile) · `degraded: null` |
+| Replication | a second 1,000-save run immediately after gave **4.4 ms**; both are reported so that designating the first cannot be read as choosing the better |
+| Distribution | min 1.481 · mean 3.002 · max 8.218 ms |
+| Save-path census | **1000 attempted · 1000 submitted · 0 writer-refused · 0 handle-missing** — every attempted save reached the index writer, so the p95 is over the whole workload rather than over whichever fraction survived |
+| Vault | canonical 20k, digest `35fcb867…bd393e`, verified by the job before measuring and intact after |
+| Verdict | **PASS on the budget** — 11.6x of headroom, so F-327's 35% session-to-session movement cannot reach the verdict here the way it reached NFR-PRF-04's |
+| **Binding caveat** | **`gate_eligible: false`** — real-time scanning is disabled on this machine (RISK-012), which the harness itself refuses to call the charter number. A scanner-on re-run is what makes this the gate figure; the headroom makes that likely to hold and *likely* is not *measured*. |
+
+**The zero is not a measurement of F-382's window, and is not recorded as one.** On this tree a zero cannot
+distinguish *the pre-warm worked* from *#119 closed the ordering window* from *both* — #119's own 35.4 µs / 191 µs
+(F-462) stays the measurement of record. A residual would have been the more interesting result and would have gone
+to #119's record; none appeared.
+
+**This section previously carried five stale claims under a correct conclusion (F-466)** — *"the most dangerous form,
+because the section reads as maintained."* They are corrected below with the anchor-plus-re-check convention F-442
+asks for, and kept rather than deleted, because what the section used to say is why the number took four attempts.
+
+| What this section used to say | What is true, and the one-line re-check |
+|---|---|
+| `save_to_index` *"calls `IndexHandle::apply()`/`flush()` directly against `serat-index` — it never enters `serat-app`"* | **False since #94 merged.** `subject::save_to_index_via_app` spawns the real compiled binary with `--bench-save-list`, so every sample is a real `AppState::write_file`: `write_atomic`, the re-read/hash, echo suppression and the handle slot all included. Re-check: `grep -n "bench-save-list" bench/budget/src/subject.rs` |
+| Anchored at `bench/budget/src/subject.rs:517` | **The line number has moved and will move again.** Anchored by symbol from here on. Re-check: `grep -n "fn save_to_index_via_app" bench/budget/src/subject.rs` |
+| Blocked on **#111**, *"pending"* | **#111 is MERGED.** `save_path_outcomes` is reachable by a budget job; F-402 and F-412 both closed with their mutations re-run red by code-reviewer. Re-check: the resume table's #111 row |
+| Blocked on **F-402**, *"open"* — the ninth guard-that-cannot-fail | **Closed.** The outcome bucketing now distinguishes a refused save from a submitted one, and the p95 is computed over submitted saves alone. Re-check: `grep -n "writer_refused_ms" bench/budget/src/lib.rs` |
+| The lead's third ruling set *"left this open: does NFR-PRF-03 mean the save interval measured however it can be reached, or Serat's own write path, end to end? Unresolved as of this writing."* | **Settled: Serat's own write path.** The requirement's words are *a note saved through Serat's own write path* in an open vault. That ruling is also what makes the pre-warm below legitimate rather than a slackening. |
+
+**What the instrument now is, so the number arrives with its method attached rather than after it.**
+
+| Property | State |
+|---|---|
+| Interval | `AppState::write_file`'s call into the index, timed from outside the process — Serat's own save path, no watcher, no debounce (architecture §3.1.1). |
+| Setup | The vault is **pre-warmed** to a `Ready` index before the binary is spawned (`subject::prewarm_index`). NFR-PRF-03 governs a save in an *already-open* vault; racing a vault's first index build is a different question, and F-450 records that racing it was what produced the earlier 1000/1000. The pre-warm derives its root the same way `serat-app` does, because F-458 found that a differently-spelled path makes `open_or_rebuild` declare the index `VaultMoved` and rebuild — leaving the pre-warm **inert while looking like it worked**. |
+| Conservation | `check_save_completeness` treats `handle_missing` as a **hard zero** and refuses the whole run if it is not, and separately requires `submitted + writer_refused` to account for every attempt — which also catches a fourth, unnamed way a save could vanish that neither counter was built to count. |
+| Census, printed every run | `attempted · submitted · writer-refused · handle-missing`, **including when `handle_missing` is zero.** The zero is the point: a residual that only shows up as silence is indistinguishable from nobody having looked. |
+| Degradation | ADR-0011 backpressure does not fail the run, it fails the **number**: a non-zero `writer_refused` sets `Measurement::degraded`, and a degraded outcome cannot report PASS however fast the saves that landed were. |
+| What still bounds the figure | Reference machine only; warm vault by construction (above); `gate_eligible: false` whenever the real-time scanner is off (RISK-012). |
+
+**Why it took four attempts, since that is the part worth carrying forward.** No instrument reached `serat-app`
+(closed by #94); `save_path_outcomes` was unreachable by a budget job (closed by #111); and the harness was saving
+into a cold vault's first rebuild (F-450) — closed by the pre-warm, **which was itself inert until F-458**, because
+it passed a differently-spelled vault root and `open_or_rebuild` declared the index `VaultMoved` and rebuilt. Three
+of the four failures were the instrument, not the code, and the third looked exactly like a product defect.
 
 ## NFR-PRF-08 — every budget has an asserting job; a breach fails CI — **cannot currently be satisfied at all**
 
@@ -172,24 +210,43 @@ recorded discipline — mutate a guard before trusting it — held here exactly 
 either defect is a closed finding rather than a live one; it is restated here because T2 is the document meant to
 carry it forward rather than let it live only in the two findings that produced it.
 
+**One of the two inputs to that paragraph is under an open, pre-registered challenge, and this report is where a
+reader would otherwise never learn it.** F-479 records code-reviewer's prediction — written *before* #121 can run, so
+it cannot be fitted to a result afterwards — that F-392's stated conclusion, *"the load-bearing mechanism caught both
+mutations independently of the structural test"*, may be false. The lesson above does not depend on which way that
+resolves: a green suite through two real breaks is the observation, and it stands either way. What would change is
+the credit assigned to *which* mechanism caught them, and that is #121's to settle. Recorded here rather than left
+in the register, because this report cites F-392 in its own header and a citation whose basis is contested reads as
+settled to everyone who does not also read the findings register.
 ## Verdict
 
-**Not a clean GO.** Two of four budgets are final and one of those two (NFR-PRF-01) fails its current asserted
-scalars, though the seven-term breakdown shows the failure is a platform-term problem this project does not control
-rather than a Serat-code problem, and ADR-0014's split — now `accepted` — gives product-analyst a budget on the term
-that is ours to control and comfortably clears it. The other two budgets are not measured: NFR-PRF-03 is blocked on
-work outside this task (#111) and an instrument defect found and recorded but not yet fixed (F-402); NFR-PRF-08, a
-Must, cannot currently be satisfied at all for a reason outside any team member's code (F-384, needs the repository
-owner). **This document does not decide whether P0 proceeds — that is #102's (code-reviewer's final sweep) and the
-owner's call — it states what is known, what is blocked, and why, so that decision is made against evidence rather
-than a placeholder.**
+**Not a clean GO, and the shape of the shortfall has changed: three of four budgets are now measured, and none of the
+three that remain open is a code problem.**
+
+- **NFR-PRF-04** — PASS, gate-quality (#96).
+- **NFR-PRF-03** — **PASS at 4.306 ms against 50 ms**, 1,000 saves, every attempt accounted for (#95). `gate_eligible:
+  false` on the scanner, so it is a comparable figure and not yet the charter one.
+- **NFR-PRF-01** — fails its current asserted scalars, and the seven-term breakdown shows the failure is a platform
+  term this project does not control rather than Serat code; ADR-0014's split, now `accepted`, budgets the term that
+  is ours and comfortably clears it.
+- **NFR-PRF-08** — a **Must** that cannot currently be satisfied at all, for a reason outside every team member's
+  code (F-384, needs the repository owner).
+
+**Two of the three open items are the same item wearing different clothes: the machine.** NFR-PRF-03's
+`gate_eligible: false` and NFR-PRF-01's platform term are both "the number this project controls is fine and the
+environment it is measured in is not the one the charter judges", and both are answered by re-measuring rather than
+by changing code. NFR-PRF-08 is answered by nobody on this team.
+
+**This document does not decide whether P0 proceeds** — that is #102's (code-reviewer's final sweep) and the owner's
+call — **it states what is known, what is blocked, and why**, so that decision is made against evidence rather than a
+placeholder.
 
 ## Traceability
 
 | ID | How this report serves it |
 |---|---|
 | NFR-PRF-01 | Final reading, seven-term breakdown, F-397/F-403/F-405 caveats, ADR-0014 acceptance. |
-| NFR-PRF-03 | States precisely what blocks it (#111, F-402) rather than estimating. |
+| NFR-PRF-03 | Measured: 4.306 ms p95 over 1,000 saves (#95), with the census, the `gate_eligible: false` caveat, and an explicit refusal to read the zero `handle_missing` as F-382's window. Full report in `reports/nfr-prf-03-save-to-index.md`. |
 | NFR-PRF-04 | Carries #96's gate-quality PASS forward without re-deriving it. |
 | NFR-PRF-08 | States the Must is unsatisfiable on infrastructure grounds (F-384), distinct from unmeasured. |
 | US-35 | "Stays fast as the vault grows" — all four numbers this project can currently produce, in one place. |
