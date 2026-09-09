@@ -241,9 +241,16 @@ fn an_interrupted_rebuild_is_finished_on_the_next_open() {
 }
 
 #[test]
-fn an_index_built_from_another_vault_is_rebuilt() {
-    // §3.4 step 5. Not corruption — the database is perfectly sound — but every path in
-    // it describes files that are not there, which is as useless as if it were.
+fn an_index_describing_a_tree_that_is_not_there_is_rebuilt() {
+    // §3.4 step 5, as task #120 leaves it. The trigger is no longer that the recorded
+    // root differs — that alone is `IndexState::RootChanged`, a value, and this vault
+    // did not move so much as get its `.serat/` copied — but that not one path in the
+    // index names a file under the root being opened.
+    //
+    // The root here is a directory that does not exist, so the probe finds nothing and
+    // the verdict is unambiguous. The half this cannot reach is the *other* answer, a
+    // root that changed and an index that still describes it, which needs a real tree
+    // on real disk: `vault_identity.rs` (F-136's gap on this path).
     let dir = tempfile::tempdir().expect("temp");
     seed(dir.path());
 
@@ -262,7 +269,7 @@ fn an_index_built_from_another_vault_is_rebuilt() {
 
     assert!(report.is_some(), "an index from another vault was reused");
     assert!(recorder.seen().contains(&IndexStatus::Rebuilding {
-        reason: RebuildReason::VaultMoved
+        reason: RebuildReason::ForeignVault
     }));
 }
 

@@ -214,7 +214,11 @@ pub fn rebuild_with_queue_depth(
     writer.analyze()?;
     let write_fts = end_bulk_load + analyze_started.elapsed();
 
-    writer.mark_ready(&vault_root.to_string_lossy())?;
+    // The resolved directory, not the bytes of the argument: `schema/001_init.sql`
+    // documents this column as "canonical vault path this index was built from" and the
+    // code recorded whatever spelling the caller held, so the same vault reached twice
+    // by two names was two vaults and the second paid for a rebuild (F-458, F-459).
+    writer.mark_ready(&crate::identity::canonical_root(vault_root))?;
     actor.shutdown()?;
 
     let mut report = count(&path, skipped)?;

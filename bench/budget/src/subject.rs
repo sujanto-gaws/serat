@@ -453,6 +453,13 @@ pub struct OpenCheckTiming {
     /// Whether the index was usable as-is. `false` means a rebuild ran, so
     /// `elapsed` includes it and is not the open-check number by itself.
     pub was_ready: bool,
+    /// Whether the open adopted a changed `index_meta.vault_root` (task #120).
+    ///
+    /// Usable either way -- an adopt is *not* a rebuild and does not clear
+    /// `was_ready` -- but it means `elapsed` also carries the identity probe
+    /// and the write-back, which is a different number from the bare stamp and
+    /// must not be reported as one.
+    pub adopted: bool,
 }
 
 /// Time one `open_or_rebuild` call against the index at `index_dir`, for the
@@ -474,13 +481,15 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
         .map_err(|e| format!("opening {}: {e}", vault_path.display()))?;
     let parser = serat_parse::CommonMarkParser;
     let was_ready = std::cell::Cell::new(true);
-    let on_status = |status: serat_index::IndexStatus| {
-        if !matches!(
-            status,
-            serat_index::IndexStatus::Opening | serat_index::IndexStatus::Ready
-        ) {
-            was_ready.set(false);
-        }
+    let adopted = std::cell::Cell::new(false);
+    let on_status = |status: serat_index::IndexStatus| match status {
+        serat_index::IndexStatus::Opening | serat_index::IndexStatus::Ready => {}
+        // Task #120: an index recorded under another root is adopted, not rebuilt,
+        // so this must not read as "the index was not usable" -- that would report
+        // an adopt under the same flag as a 28 s rebuild, which is the conflation
+        // F-459 is about.
+        serat_index::IndexStatus::RootAdopted { .. } => adopted.set(true),
+        _ => was_ready.set(false),
     };
 
     let started = Instant::now();
@@ -495,6 +504,7 @@ pub fn measure_open_check(vault_path: &Path, index_dir: &Path) -> Result<OpenChe
     Ok(OpenCheckTiming {
         elapsed,
         was_ready: was_ready.get(),
+        adopted: adopted.get(),
     })
 }
 
@@ -534,10 +544,12 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     }
     let source = serat_vault::Vault::open(vault)
         .map_err(|e| format!("opening {} to pre-warm the index: {e}", vault.display()))?;
-    // **The root must be `source.root()`, not `vault`** -- F-458, and the whole
-    // pre-warm is worthless without it. `open_or_rebuild` records the vault's
-    // identity as `vault_root.to_string_lossy()` and rebuilds from scratch on
-    // `RebuildReason::VaultMoved` when a later open presents a different
+    // **The root is `source.root()`, not `vault`** -- F-458. Kept, and the
+    // reason it is kept has changed, so the tense below has to as well.
+    //
+    // *What it was.* `open_or_rebuild` recorded the vault's identity as
+    // `vault_root.to_string_lossy()` and rebuilt from scratch on
+    // `RebuildReason::VaultMoved` when a later open presented a different
     // string. `serat-app` reaches its root through `Vault::open(..).root()`,
     // which canonicalises and strips the verbatim prefix; this harness reaches
     // the same directory through `repo_root().join("bench/vaults/vault-20k")`,
@@ -545,9 +557,17 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     // for the same bytes on disk. Pre-warming under the harness's spelling
     // therefore left an index the application declared moved and rebuilt --
     // measured: `Rebuilding { reason: VaultMoved }` on every spawn, and
-    // `handle_missing` unchanged at 25 of 25. Deriving the root the same way
-    // `serat-app` does makes the two spellings identical by construction
-    // rather than by coincidence.
+    // `handle_missing` unchanged at 25 of 25.
+    //
+    // *What it is since task #120.* The product half is fixed: the identity is
+    // `identity::canonical_root`, on record and on comparison, so neither
+    // spelling can produce a rebuild any more. This line is therefore no longer
+    // load-bearing for correctness -- it is load-bearing for the *measurement*.
+    // Pre-warming under a second spelling would leave an index the next open
+    // has to adopt, and an adopt costs the identity probe and a write-back
+    // (23.59 ms against 6.95 ms for the bare stamp) on the very open this
+    // harness is timing. Identical by construction rather than by coincidence
+    // was the point either way.
     let root = source.root().to_path_buf();
     let index_dir = root.join(".serat");
     let parser = serat_parse::CommonMarkParser;
@@ -1153,17 +1173,27 @@ mod tests {
     #[test]
     fn a_prewarmed_index_survives_the_root_spelling_serat_app_will_open_it_with() {
         // F-458, whose product half is F-459 and task #120. The pre-warm
-        // exists to hand `serat-app` a `Ready` index; an
-        // index the application declares `VaultMoved` and rebuilds from
-        // scratch is worth nothing, and nothing else in this crate
-        // would notice, because `open_or_rebuild` succeeds either way. The
-        // identity `open_or_rebuild` records is `vault_root.to_string_lossy()`
-        // -- a string, not a resolved directory -- so two spellings of the
-        // same directory are two different vaults to it. `serat-app` reaches
-        // its root through `Vault::open(..).root()`; this harness reaches the
-        // same bytes through `repo_root().join("bench/vaults/vault-20k")`.
-        // Measured before the fix: `Rebuilding { reason: VaultMoved }` on
-        // every spawn and `handle_missing` unmoved at 25 of 25.
+        // exists to hand `serat-app` a `Ready` index; an index the application
+        // declares moved and rebuilds from scratch is worth nothing, and
+        // nothing else in this crate would notice, because `open_or_rebuild`
+        // succeeds either way. The identity it recorded *was*
+        // `vault_root.to_string_lossy()` -- a string, not a resolved directory
+        // -- so two spellings of the same directory were two vaults to it.
+        // `serat-app` reaches its root through `Vault::open(..).root()`; this
+        // harness reaches the same bytes through
+        // `repo_root().join("bench/vaults/vault-20k")`. Measured before the
+        // fix: `Rebuilding { reason: VaultMoved }` on every spawn and
+        // `handle_missing` unmoved at 25 of 25.
+        //
+        // **Task #120 fixed the product half, and this test is kept rather
+        // than retired** -- it is now the regression test for the fix instead
+        // of the demonstration of the bug, and it is the only one that runs
+        // through `serat_vault::Vault` and the real `CommonMarkParser` rather
+        // than through `serat-index`'s own stubs. What it asserts is unchanged
+        // and is stricter than it looks: `report.is_none()` fails on a rebuild,
+        // and under #120 a *foreign* index still rebuilds, so this would still
+        // go red if canonicalisation regressed far enough to make the probe
+        // find nothing.
         let vault = hub_shaped_vault("prewarm-root-spelling", 4, 8);
         // Textually different, byte-identical directory -- the same class of
         // difference as the mixed separators the real path carries, without
@@ -1394,14 +1424,46 @@ mod tests {
             "a second open_or_rebuild against an index this one just built and closed \
              cleanly must find it Ready, not trigger a second rebuild"
         );
+        assert!(
+            !ready.adopted,
+            "a second open of the vault it was built from must have nothing to adopt; \
+             if it does, the record side is stamping a spelling rather than the \
+             resolved directory (task #120, F-458)"
+        );
         let ready_ms = ready.elapsed.as_secs_f64() * 1000.0;
+
+        let index_path = serat_index::index_path(&scratch);
+
+        // Task #120's new read path on the open critical path, measured because it
+        // is one: an index whose recorded root differs is no longer rebuilt, it is
+        // probed against the tree (32 `notes.path` rows stat-ed) and adopted. That
+        // is the branch that replaced a 28.6 s rebuild, so what it costs instead
+        // belongs on the record beside the stamp it follows. Run on the real 20k
+        // index, in place, so the probe pays real filesystem calls.
+        {
+            let conn = rusqlite::Connection::open(&index_path).expect("open the ready index");
+            conn.execute(
+                "UPDATE index_meta SET vault_root = 'C:/nowhere/not-the-real-vault'",
+                [],
+            )
+            .expect("re-stamp the root");
+        }
+        let adopt = measure_open_check(&vault.path, &scratch).expect("open with a changed root");
+        let adopt_ms = adopt.elapsed.as_secs_f64() * 1000.0;
+        assert!(
+            adopt.was_ready,
+            "a changed vault_root must not trigger a rebuild any more (task #120)"
+        );
+        assert!(
+            adopt.adopted,
+            "a changed vault_root must be adopted and reported, not silently ignored"
+        );
 
         // The four rebuild-triggering states, measured at the check alone
         // (schema::inspect_for), not through a full open_or_rebuild -- that
         // would pay for an actual rebuild and measure NFR-PRF-04 by accident.
         // What #68 asks whether these "fail early", and inspect_for is where
         // that failure happens.
-        let index_path = serat_index::index_path(&scratch);
 
         let absent_started = Instant::now();
         let absent = serat_index::schema::inspect_for(&scratch.join("no-such-index.db"), None);
@@ -1414,7 +1476,12 @@ mod tests {
         // Three copies of the real Ready database, each mutated to trigger one
         // specific UnusableReason, so the check alone -- not a rebuild -- is
         // what gets timed.
-        let root = vault.path.to_string_lossy().into_owned();
+        //
+        // `canonical_root`, not `to_string_lossy` (task #120, F-458): the index
+        // records the resolved directory, so an expectation built from the raw
+        // path would report RootChanged on every one of these and measure the
+        // wrong branch.
+        let root = serat_index::canonical_root(&vault.path);
         let mutate = |name: &str, sql: &str| -> std::path::PathBuf {
             let copy = scratch.join(name);
             std::fs::copy(&index_path, &copy).expect("copy the ready index");
@@ -1453,6 +1520,10 @@ mod tests {
             "state='building' must report RebuildInterrupted: {interrupted_result:?}"
         );
 
+        // Not a rebuild trigger since task #120, so no longer one of the four
+        // "fails early" states -- but still a branch of the stamp, and the one
+        // that grew a filesystem probe, so it is still measured here. What it
+        // reports changed with it: RootChanged, a value, not Unusable.
         let moved = mutate(
             "moved.db",
             "UPDATE index_meta SET vault_root = 'C:/nowhere/not-the-real-vault'",
@@ -1463,11 +1534,10 @@ mod tests {
         assert!(
             matches!(
                 moved_result,
-                Ok(serat_index::IndexState::Unusable {
-                    reason: serat_index::UnusableReason::VaultMoved
-                })
+                Ok(serat_index::IndexState::RootChanged { .. })
             ),
-            "a vault_root that does not match must report VaultMoved: {moved_result:?}"
+            "a vault_root that does not match must report RootChanged, not a fault \
+             (task #120): {moved_result:?}"
         );
 
         eprintln!(
@@ -1477,7 +1547,8 @@ mod tests {
              \x20 Absent (inspect_for only):        {absent_ms:.3} ms\n\
              \x20 SchemaChanged (inspect_for only):  {schema_ms:.3} ms\n\
              \x20 Interrupted (inspect_for only):    {interrupted_ms:.3} ms\n\
-             \x20 VaultMoved (inspect_for only):     {moved_ms:.3} ms\n\
+             \x20 RootChanged (inspect_for only, not a rebuild trigger since #120): {moved_ms:.3} ms\n\
+             \x20 RootAdopted (open_or_rebuild: stamp + identity probe + write-back, task #120): {adopt_ms:.2} ms\n\
              (for comparison, architecture.md §3.4: integrity_check 1310ms, quick_check 1150ms, rejected)"
         );
 
@@ -1493,7 +1564,7 @@ mod tests {
             ("Absent", absent_ms),
             ("SchemaChanged", schema_ms),
             ("Interrupted", interrupted_ms),
-            ("VaultMoved", moved_ms),
+            ("RootChanged", moved_ms),
         ] {
             assert!(
                 ms < 300.0,
