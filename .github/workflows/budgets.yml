@@ -84,12 +84,23 @@ jobs:
           if-no-files-found: ignore
 
   prf01-cold-start:
-    name: "NFR-PRF-01 · window < 400 ms, usable < 1 s, p95 over 20 runs"
-    # Legacy, and provisionally still gating (task #118, F-443): the PRD's
-    # re-baseline says these two marks are reported, not gated, but demoting
-    # them here is a separate task from #107, which only adds prf01-serat-term
-    # below. Until #118 lands, NFR-PRF-01 is double-gated by design, not by
-    # oversight.
+    name: "NFR-PRF-01 · scale independence on the Serat term; the two aggregates reported"
+    # Task #118 landed: the PRD is the source of truth for what is gated, and
+    # PRD v1.2 gates only the Serat term for NFR-PRF-01 (prf01-serat-term,
+    # below). window_visible and vault_usable are measured, validated, printed
+    # and uploaded by this job and gate nothing -- F-407 measured the aggregate
+    # moving ~19% batch-to-batch against ~8% for the Serat term, so it cannot
+    # decide a pass at any threshold, and F-443 is the gap between that fact
+    # and what CI used to assert.
+    #
+    # This job is still required, and not as a formality: architecture §3.4's
+    # scale-independence check is its remaining assertion, and it fails the
+    # build. §3.4's #118 ruling moved that check's subject from
+    # window_visible_ms to the Serat term and kept the job here, because
+    # prf01-serat-term is a second reduction of one batch of traces while this
+    # is a second measurement -- two vaults, interleaved, with the 50,000-note
+    # fixture in it (F-446). Removing this job would silently delete the only
+    # assertion that vault size does not move the critical path.
     needs: vault
     runs-on: windows-latest
     steps:

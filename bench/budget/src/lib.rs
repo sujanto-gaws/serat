@@ -131,6 +131,22 @@ pub struct Budget {
     /// cost from the event being dequeued. A number reported without saying
     /// which one it is is not a measurement, it is a rumour.
     pub interval: &'static str,
+    /// Whether a breach of this budget fails the build (NFR-PRF-08, C-06), or
+    /// whether the figure is measured and printed and gates nothing.
+    ///
+    /// **Task #118, F-443, F-407.** The PRD is the source of truth for what is
+    /// gated, and PRD v1.2 gates only the Serat term for NFR-PRF-01; the two
+    /// pre-split aggregates are reported. That disagreement used to live in
+    /// the difference between a doc and a job, which is exactly how F-443 was
+    /// found. It is a field now, so the two cannot drift again without a line
+    /// of code changing, and [`P0_BUDGETS`] is checked against it.
+    ///
+    /// A `false` here is **not** a weakened budget. The limit stays on the
+    /// struct and stays in the report, because the pre-split figures are still
+    /// the ones a reader compares a cold start against; what is removed is the
+    /// assertion, and only because F-407 measured the aggregate moving ~19%
+    /// batch-to-batch, which cannot decide a pass at any threshold.
+    pub gated: bool,
 }
 
 impl Budget {
@@ -154,6 +170,7 @@ pub const PRF01_WINDOW_VISIBLE: Budget = Budget {
     ci_limit_ms: None,
     vault: "20k",
     interval: "process spawn to the first painted frame",
+    gated: false,
 };
 
 /// NFR-PRF-01, the second mark.
@@ -167,6 +184,7 @@ pub const PRF01_VAULT_USABLE: Budget = Budget {
     ci_limit_ms: None,
     vault: "20k",
     interval: "process spawn to the vault-usable mark, as task D2 defines it",
+    gated: false,
 };
 
 /// NFR-PRF-01, re-baselined (task #104, ADR-0014 §Decision 3): the binding
@@ -199,6 +217,7 @@ pub const PRF01_SERAT_TERM: Budget = Budget {
     interval: "S_pre + S_setup + S_shell + S_settle (ADR-0014 Decision 1's seven-mark \
                partition, Decision 3's binding sum) -- the platform term and the two legacy \
                marks are reported beside it, never asserted (F-407)",
+    gated: true,
 };
 
 /// NFR-PRF-03.
@@ -214,6 +233,7 @@ pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
     interval: "AppState::write_file's call into the index, timed from the outside -- Serat's \
                own save path, no watcher, no debounce (architecture §3.1.1; \
                see check_save_completeness)",
+    gated: true,
 };
 
 /// NFR-PRF-04.
@@ -227,6 +247,7 @@ pub const PRF04_FULL_REBUILD: Budget = Budget {
     ci_limit_ms: None,
     vault: "20k",
     interval: "entry to rebuild() until it returns, writer drained and ANALYZE run",
+    gated: true,
 };
 
 /// The share by which the window-painted mark may grow between the 20k and the
@@ -259,25 +280,32 @@ pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), Stri
     ))
 }
 
-/// Every P0 budget, so a CI configuration review (NFR-PRF-08's acceptance
-/// criterion is `Inspect`) can check the list against the PRD rather than
-/// against somebody's memory.
+/// Every P0 budget CI gates, so a configuration review (NFR-PRF-08's
+/// acceptance criterion is `Inspect`) can check the list against the PRD
+/// rather than against somebody's memory.
 ///
-/// **Five entries, not four, and that count is provisional (task #118, F-443).**
-/// The PRD's re-baseline (task #104) says only `PRF01_SERAT_TERM` is a CI gate
-/// for NFR-PRF-01; `PRF01_WINDOW_VISIBLE` and `PRF01_VAULT_USABLE` are still
-/// listed here because `prf01-cold-start` still asserts them and this list is
-/// a review of what CI actually gates, not of what the PRD says should be
-/// gated -- the two are supposed to disagree right now, and #118 is what
-/// closes the gap by removing the two legacy entries once their job stops
-/// asserting them.
-pub const P0_BUDGETS: &[&Budget] = &[
-    &PRF01_WINDOW_VISIBLE,
-    &PRF01_VAULT_USABLE,
-    &PRF01_SERAT_TERM,
-    &PRF03_SAVE_TO_INDEX,
-    &PRF04_FULL_REBUILD,
-];
+/// **Every entry below gates; the two pre-split aggregates do not and are in
+/// [`PRF01_REPORTED`].** Stated as "every entry" rather than as a number
+/// (F-496): a count over a list that grows is maintained by whoever changes
+/// the list, who is exactly the person not reading the paragraph above it.
+/// The PRD's re-baseline (task #104) gates only `PRF01_SERAT_TERM` for
+/// NFR-PRF-01; `PRF01_WINDOW_VISIBLE` and `PRF01_VAULT_USABLE` are measured
+/// and reported by the same job and gate nothing (F-443 was the gap between
+/// those two facts; F-407 is why the aggregates cannot decide a pass). They
+/// are in [`PRF01_REPORTED`], not gone -- **#118 removed the assertion, not
+/// the figure.**
+///
+/// The split is checked mechanically rather than kept by hand: see
+/// `the_gated_list_and_the_reported_list_partition_every_budget_by_its_own_flag`.
+pub const P0_BUDGETS: &[&Budget] = &[&PRF01_SERAT_TERM, &PRF03_SAVE_TO_INDEX, &PRF04_FULL_REBUILD];
+
+/// Every P0 figure that is measured and printed and gates nothing (task #118).
+///
+/// This list exists so "reported" is a place rather than an absence. A figure
+/// that is merely dropped from [`P0_BUDGETS`] stops being enumerable, stops
+/// being testable, and is one refactor away from silently ceasing to be
+/// measured -- which is the failure #118 exists to avoid, not to cause.
+pub const PRF01_REPORTED: &[&Budget] = &[&PRF01_WINDOW_VISIBLE, &PRF01_VAULT_USABLE];
 
 /// A benchmark vault the harness knows how to produce and how to recognise.
 #[derive(Clone, Copy, Debug)]
@@ -566,11 +594,25 @@ impl Outcome {
         self.budget.limit_ms(self.profile)
     }
 
+    /// Whether a breach of this figure fails the build (task #118).
+    ///
+    /// Carried from [`Budget::gated`] rather than decided here, so the one
+    /// place that answers "is this a gate" is the budget the PRD describes.
+    pub fn gates(&self) -> bool {
+        self.budget.gated
+    }
+
     /// Whether the budget held.
     ///
     /// `degraded` gates this before the timing comparison runs: a run that
     /// did not reach the index for every attempted save is not a pass no
     /// matter how fast the saves that did land were.
+    ///
+    /// **Still computed for an ungated figure**, and deliberately: the
+    /// arithmetic is meaningful whether or not anything is asserted on it, and
+    /// a reader comparing a cold start against the pre-split 400 ms wants that
+    /// comparison. What [`Outcome::gates`] decides is whether the comparison
+    /// may fail a build, not whether it may be made.
     pub fn passed(&self) -> bool {
         self.degraded.is_none() && self.value_ms() <= self.limit_ms()
     }
@@ -658,10 +700,15 @@ impl Outcome {
     /// Human-readable report. Printed by the job, pasted into a gate report.
     pub fn to_report(&self) -> String {
         let mut s = String::new();
-        let verdict = match (self.determinate(), self.passed()) {
-            (false, _) => "INDETERMINATE",
-            (true, true) => "PASS",
-            (true, false) => "FAIL",
+        // An ungated figure never prints PASS or FAIL. Task #118: those two
+        // words are a verdict, and a verdict on a series nothing asserts is
+        // F-443's untruth in the opposite direction -- a reader who sees FAIL
+        // beside a green build learns to ignore the word.
+        let verdict = match (self.gates(), self.determinate(), self.passed()) {
+            (false, _, _) => "REPORTED",
+            (true, false, _) => "INDETERMINATE",
+            (true, true, true) => "PASS",
+            (true, true, false) => "FAIL",
         };
         let _ = writeln!(
             s,
@@ -678,6 +725,14 @@ impl Outcome {
             self.limit_ms(),
             self.profile.label()
         );
+        if !self.gates() {
+            let _ = writeln!(
+                s,
+                "  not a gate  PRD v1.2 reports this figure and does not gate it (task #118,                  F-443). The {:.1} ms limit above is the pre-split reference figure, printed                  because it is what a reader compares a cold start against -- it decides                  nothing here, and {} is the NFR-PRF-01 budget that does (F-407: this series                  moves ~19% batch-to-batch against ~8% for the Serat term, so it cannot decide                  a pass at any threshold).",
+                self.limit_ms(),
+                PRF01_SERAT_TERM.id
+            );
+        }
         let _ = writeln!(
             s,
             "  samples     n={}  min {:.1}  mean {:.1}  max {:.1} ms  spread {:.1}%",
@@ -798,6 +853,10 @@ impl Outcome {
                 None => "null".to_string(),
             }
         );
+        // Task #118: `passed` alone cannot say whether anything depended on
+        // it. A trend reader joining these files needs to know which rows were
+        // gates when they were written, because that changes.
+        let _ = writeln!(s, "  \"gated\": {},", self.gates());
         let _ = writeln!(s, "  \"samples_n\": {},", self.samples.len());
         let _ = writeln!(s, "  \"min_ms\": {:.3},", self.samples.min());
         let _ = writeln!(s, "  \"mean_ms\": {:.3},", self.samples.mean());
@@ -1784,9 +1843,10 @@ where
     match decide(budget, args, measure) {
         Ok(outcome) => {
             report(&outcome);
-            // Indeterminate is not success. A run whose samples straddled the
-            // limit saw the budget breached and would go green on the median.
-            if outcome.passed() && outcome.determinate() {
+            // One rule, one place (F-485). This used to be a second copy of
+            // the decision that did not consult `gates()` at all, so a
+            // budget's report and its enforcement could disagree.
+            if enforce(&outcome) {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::FAILURE
@@ -1797,6 +1857,91 @@ where
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// **The one place a measured outcome becomes a build result.**
+///
+/// F-485, following F-480. Before this, the rule lived twice — `run_job` had
+/// its own `if outcome.passed() && outcome.determinate()` and `run_paired_job`
+/// had a second copy behind an `if outcome.gates()` — and the two could
+/// disagree without anything going red. **They did disagree**: `gates()` was
+/// consulted in the verdict word, the report body and the JSON key, and *not*
+/// in `run_job`'s decision, which is the path every gated budget actually
+/// takes. That was fail-closed and therefore safe (setting `gated: false` on a
+/// real gate could not disarm it), and it still meant a budget could **print
+/// "not a gate" and fail CI anyway** — a figure whose report contradicts its
+/// enforcement.
+///
+/// So the rule is written once, here, and both runners call it. The three
+/// inputs are exactly the three things that decide it and there is no fourth:
+///
+/// * **`gated`** — from [`Budget::gated`], which is what the PRD says. An
+///   ungated figure is measured, validated, printed and written to its JSON,
+///   and cannot fail a build.
+/// * **`passed`** — the timing comparison, with `degraded` already folded in
+///   (F-435: *fail the number, not the run*).
+/// * **`determinate`** — a run whose samples straddled the limit observed both
+///   outcomes and settled nothing; reporting either as the verdict is a coin
+///   toss dressed as a measurement.
+///
+/// A measurement that could not be *taken* never reaches this function: that
+/// is an `Err` at the call site and fails on its own. "Reported" means the
+/// number is not asserted, not that its absence is acceptable.
+#[must_use]
+pub fn enforce(outcome: &Outcome) -> bool {
+    if !outcome.gates() {
+        return true;
+    }
+    outcome.passed() && outcome.determinate()
+}
+
+/// Every budget id that a job enforcing through [`enforce`] can breach a build
+/// with — read off the binaries rather than restated (F-485).
+///
+/// The gap F-485 names is not that enforcement is wrong today; it is that
+/// **nothing pinned the wiring**. `PRF01_REPORTED`'s entries are ungated, and
+/// a sixth budget added to that list but wired to a `run_job`-calling binary
+/// would print *"not a gate"* in its own report and still fail CI on a breach.
+/// The partition test pins flag against list; this pins **list against the
+/// binaries that actually run**, which is the half that was missing.
+///
+/// # Errors
+/// The `bin/` directory cannot be read.
+pub fn budgets_enforced_by_a_binary() -> Result<Vec<String>, String> {
+    let dir = repo_root().join("bench/budget/src/bin");
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    let mut ids = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        // `run_paired_job` contains `run_job` as a substring, so the paired
+        // form has to be excluded explicitly rather than matched loosely --
+        // exactly the kind of near-miss F-30 recorded when a grep decided a
+        // check's coverage.
+        let calls_run_job = text.contains("run_job(") && !text.contains("run_paired_job(");
+        if !calls_run_job {
+            continue;
+        }
+        for budget in P0_BUDGETS.iter().chain(PRF01_REPORTED) {
+            // `prf03-save-to-index` -> `PRF03_SAVE_TO_INDEX`, which is how
+            // every one of these constants is named. Derived rather than
+            // listed, so a new budget cannot be missed by a table nobody
+            // updated.
+            let konst = budget.id.to_uppercase().replace('-', "_");
+            if text.contains(&konst) {
+                ids.push(budget.id.to_string());
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// Run two budgets that share one measurement, as NFR-PRF-01 does.
@@ -1845,7 +1990,9 @@ where
         match outcome_from(budget, parsed.profile, vault.clone(), measurement) {
             Ok(outcome) => {
                 report(&outcome);
-                ok &= outcome.passed() && outcome.determinate();
+                // The same `enforce` `run_job` calls -- not a second copy of
+                // the rule that happens to agree with it (F-485).
+                ok &= enforce(&outcome);
             }
             Err(e) => {
                 eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
@@ -2056,8 +2203,132 @@ where
     Ok(measurement)
 }
 
-/// The window-painted mark at two vault sizes, measured in interleaved pairs.
-#[derive(Clone, Debug)]
+/// One spawn's contribution to the scale check (task #118).
+///
+/// Three series come off the same trace, and which one the check *asserts*
+/// moved in #118: architecture §3.4's ruling puts the assertion on the Serat
+/// term and keeps the two pre-split aggregates measured and printed. Carrying
+/// all three from one spawn is what makes that possible without spawning
+/// twice -- the aggregates are a second reduction of the same batch, never a
+/// second measurement (F-446's rule, applied here).
+#[derive(Clone, Copy, Debug)]
+pub struct ScaleSample {
+    /// ADR-0014 §Decision 3's binding sum, `S_pre + S_setup + S_shell +
+    /// S_settle`. **The asserted series since task #118.**
+    pub serat_term_ms: f64,
+    /// The pre-split window-painted aggregate. Reported, never asserted.
+    pub window_visible_ms: f64,
+    /// The pre-split vault-usable aggregate. Reported, never asserted.
+    pub vault_usable_ms: f64,
+}
+
+impl ScaleSample {
+    /// A sample whose three series are the same number.
+    ///
+    /// For tests about the pairing, the drift cancellation or the judgement --
+    /// none of which are about *which* series is the subject. A test that is
+    /// about the subject sets the three fields apart, and one of those is
+    /// below.
+    #[must_use]
+    pub fn flat(ms: f64) -> ScaleSample {
+        ScaleSample {
+            serat_term_ms: ms,
+            window_visible_ms: ms,
+            vault_usable_ms: ms,
+        }
+    }
+}
+
+/// A 20k-vs-50k ratio that is measured and printed and never asserted
+/// (task #118).
+///
+/// §3.4's ruling keeps the aggregates in the output because contention is one
+/// channel of vault-size dependence that lands in `P_webview`, which `S`
+/// excludes by construction -- so dropping them would lose a signal, while
+/// asserting them is what F-407 says cannot decide a pass.
+#[derive(Clone, Copy, Debug)]
+pub struct ScaleRatio {
+    /// What it is, e.g. `window painted`.
+    pub label: &'static str,
+    /// p95 at the 20k vault.
+    pub small_p95_ms: f64,
+    /// p95 at the 50k vault.
+    pub large_p95_ms: f64,
+}
+
+impl ScaleRatio {
+    /// Growth from the small arm to the large one, as a percentage.
+    ///
+    /// Zero rather than infinity when the small arm is zero: this figure is
+    /// printed, never compared, so a degenerate input must not panic or emit
+    /// `inf` into a report someone pastes into a gate document.
+    #[must_use]
+    pub fn growth_pct(&self) -> f64 {
+        if self.small_p95_ms <= 0.0 {
+            return 0.0;
+        }
+        (self.large_p95_ms / self.small_p95_ms - 1.0) * 100.0
+    }
+}
+
+/// What index state both arms of a scale check started from (task #118).
+///
+/// §3.4's ruling makes this a precondition rather than a detail: `S_settle` is
+/// inside the compared quantity, so a `.serat/` present on one arm and absent
+/// on the other measures fixture preparation rather than code. The existing
+/// [`subject::ColdStartVaultGuard`] equalises *cleanup* and says nothing about
+/// the starting state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexStartState {
+    /// Neither vault had a `.serat/`. The first spawn on each arm starts a
+    /// rebuild that outlives the process it was spawned in (F-450), so the
+    /// arms are comparable to each other and no figure here is a warm one.
+    ColdBoth,
+    /// Both vaults had a `.serat/` before the first spawn.
+    WarmBoth,
+}
+
+impl IndexStartState {
+    /// How it prints in the verdict line.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            IndexStartState::ColdBoth => {
+                "both arms started COLD (no .serat/): every arm pays a rebuild that outlives \
+                 its spawn (F-450), so this compares two cold starts and not two warm ones"
+            }
+            IndexStartState::WarmBoth => "both arms started warm (.serat/ present)",
+        }
+    }
+}
+
+/// Check that both arms enter the batch in the same index state, and say which.
+///
+/// §3.4's task #118 ruling, as a refusal rather than a caveat: an unequal
+/// start does not weaken the comparison, it replaces it with a measurement of
+/// which fixture happened to be warm.
+///
+/// # Errors
+/// The two arms disagree.
+pub fn equal_index_start(small: &Path, large: &Path) -> Result<IndexStartState, String> {
+    let small_warm = small.join(".serat").exists();
+    let large_warm = large.join(".serat").exists();
+    match (small_warm, large_warm) {
+        (true, true) => Ok(IndexStartState::WarmBoth),
+        (false, false) => Ok(IndexStartState::ColdBoth),
+        _ => Err(format!(
+            "the 20k arm started {} and the 50k arm started {}. S_settle is inside the \
+             compared quantity, so unequal starting index state measures which fixture was \
+             warm rather than whether the critical path grew with the vault (architecture \
+             §3.4, task #118). Delete both .serat/ directories, or pre-build both, and re-run.",
+            if small_warm { "warm" } else { "cold" },
+            if large_warm { "warm" } else { "cold" },
+        )),
+    }
+}
+
+/// The asserted mark at two vault sizes, measured in interleaved pairs.
+#[derive(Clone, Copy, Debug)]
 pub struct ScaleCheck {
     /// Median at the 20k vault.
     pub small_ms: f64,
@@ -2082,6 +2353,23 @@ pub struct ScaleCheck {
     pub larger_slower: usize,
     /// Two-sided sign-test p for that count against a fair coin.
     pub sign_test_p: f64,
+    /// What index state both arms entered with (task #118's precondition).
+    pub index_start: IndexStartState,
+    /// The 20k arm's own spread, `(max - min) / min`, as a percentage.
+    ///
+    /// §3.4's ruling requires this beside the verdict rather than in a later
+    /// investigation: the 20% tolerance was sized against the *effect* and
+    /// never against the noise of the series it is asserted on, and the
+    /// subject has just changed. If the spread is not comfortably inside the
+    /// tolerance, that is the finding, and it is escalated rather than
+    /// repaired by widening (ADR-0014 §Decision 5's floor rule).
+    pub small_spread_pct: f64,
+    /// The 50k arm's own spread, by the same definition.
+    pub large_spread_pct: f64,
+    /// The pre-split window-painted ratio. Printed, never asserted.
+    pub window_visible: ScaleRatio,
+    /// The pre-split vault-usable ratio. Printed, never asserted.
+    pub vault_usable: ScaleRatio,
 }
 
 /// Two-sided sign test: the probability of a split at least this lopsided if
@@ -2134,13 +2422,14 @@ pub fn sign_test_p(pairs: usize, successes: usize) -> f64 {
 /// # Errors
 /// Any failure to take a measurement.
 pub fn measure_scale_independence<F>(
-    small: &VaultUnderTest,
-    large: &VaultUnderTest,
+    small_vault: &VaultUnderTest,
+    large_vault: &VaultUnderTest,
     pairs: usize,
+    index_start: IndexStartState,
     mut measure_one: F,
 ) -> Result<ScaleCheck, String>
 where
-    F: FnMut(&VaultUnderTest, usize) -> Result<f64, String>,
+    F: FnMut(&VaultUnderTest, usize) -> Result<ScaleSample, String>,
 {
     // The vaults are arguments rather than fetched here, so a test can drive
     // this without generating 98 MiB and hashing it. `ensure_vault` has its own
@@ -2148,41 +2437,74 @@ where
     if pairs == 0 {
         return Err("a scale check needs at least one pair".to_string());
     }
-    let mut small_ms = Vec::with_capacity(pairs);
-    let mut large_ms = Vec::with_capacity(pairs);
+    let mut small = Vec::with_capacity(pairs);
+    let mut large = Vec::with_capacity(pairs);
     let mut diffs = Vec::with_capacity(pairs);
 
     for i in 0..pairs {
         // Alternate which arm goes first, so any within-pair ordering effect —
         // a warm page cache, a thermal ramp — falls on both arms equally.
         let (a, b) = if i % 2 == 0 {
-            (small, large)
+            (small_vault, large_vault)
         } else {
-            (large, small)
+            (large_vault, small_vault)
         };
         let first = measure_one(a, i)?;
         let second = measure_one(b, i)?;
-        let (s_ms, l_ms) = if i % 2 == 0 {
+        let (s, l) = if i % 2 == 0 {
             (first, second)
         } else {
             (second, first)
         };
-        small_ms.push(s_ms);
-        large_ms.push(l_ms);
-        diffs.push(l_ms - s_ms);
+        // Task #118: the paired difference is taken on the **asserted** series
+        // only. The aggregates are reduced to a ratio of p95s below and never
+        // enter the sign test, because a signal nothing asserts must not be
+        // able to move a verdict by the back door.
+        diffs.push(l.serat_term_ms - s.serat_term_ms);
+        small.push(s);
+        large.push(l);
     }
+
+    let pick =
+        |xs: &[ScaleSample], f: fn(&ScaleSample) -> f64| -> Vec<f64> { xs.iter().map(f).collect() };
+    let small_serat = pick(&small, |x| x.serat_term_ms);
+    let large_serat = pick(&large, |x| x.serat_term_ms);
 
     let larger_slower = diffs.iter().filter(|d| **d > 0.0).count();
     Ok(ScaleCheck {
-        small_ms: median_of(&small_ms),
-        large_ms: median_of(&large_ms),
-        small_p95_ms: percentile_of(&small_ms, 0.95),
-        large_p95_ms: percentile_of(&large_ms, 0.95),
+        small_ms: median_of(&small_serat),
+        large_ms: median_of(&large_serat),
+        small_p95_ms: percentile_of(&small_serat, 0.95),
+        large_p95_ms: percentile_of(&large_serat, 0.95),
         pairs,
         median_diff_ms: median_of(&diffs),
         larger_slower,
         sign_test_p: sign_test_p(pairs, larger_slower),
+        index_start,
+        small_spread_pct: spread_pct_of(&small_serat),
+        large_spread_pct: spread_pct_of(&large_serat),
+        window_visible: ScaleRatio {
+            label: "window painted",
+            small_p95_ms: percentile_of(&pick(&small, |x| x.window_visible_ms), 0.95),
+            large_p95_ms: percentile_of(&pick(&large, |x| x.window_visible_ms), 0.95),
+        },
+        vault_usable: ScaleRatio {
+            label: "vault usable",
+            small_p95_ms: percentile_of(&pick(&small, |x| x.vault_usable_ms), 0.95),
+            large_p95_ms: percentile_of(&pick(&large, |x| x.vault_usable_ms), 0.95),
+        },
     })
+}
+
+/// `(max - min) / min` as a percentage, the same definition
+/// [`Outcome::spread_pct`] uses, so the two cannot drift apart.
+fn spread_pct_of(xs: &[f64]) -> f64 {
+    let min = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !min.is_finite() || min <= 0.0 {
+        return 0.0;
+    }
+    (max - min) / min * 100.0
 }
 
 /// Nearest-rank percentile of a slice of milliseconds, matching
@@ -2212,12 +2534,20 @@ pub fn judge_scale(check: &ScaleCheck) -> Result<String, String> {
     // something the budget does not care about.
     assert_scale_independent(check.small_p95_ms, check.large_p95_ms)?;
     Ok(format!(
-        "PASS  NFR-PRF-01 · scale independence\n  window painted p95 {:.1} ms at 20k, {:.1} ms \
-         at 50k over {} interleaved pairs (median {:.1} / {:.1})\n  paired median difference \
-         {:+.1} ms, larger vault slower in {}/{} pairs, sign test p = {:.3} — vault size does \
-         not inflate the mark beyond the {:.0}% tolerance (§3.4). This bounds the effect; it \
-         does not claim there is none.\n  caveat: every iteration reads a page-cached vault, so \
-         no figure here is a cold-VAULT figure",
+        "PASS  NFR-PRF-01 · scale independence\n  subject     the Serat term (ADR-0014 \
+         §Decision 3's S_pre+S_setup+S_shell+S_settle) — task #118 moved the assertion here \
+         from window_visible_ms; §3.4 has the five grounds\n  Serat term p95 {:.1} ms at 20k, \
+         {:.1} ms at 50k over {} interleaved pairs (median {:.1} / {:.1})\n  paired median \
+         difference {:+.1} ms, larger vault slower in {}/{} pairs, sign test p = {:.3} — vault \
+         size does not inflate the mark beyond the {:.0}% tolerance (§3.4). This bounds the \
+         effect; it does not claim there is none.\n  spread      the asserted series moved \
+         {:.1}% within the 20k arm and {:.1}% within the 50k arm against a {:.0}% tolerance. \
+         §3.4 requires this beside the verdict because the tolerance was sized against the \
+         effect and never against this series' noise; a spread not comfortably inside it is a \
+         finding to escalate, not a tolerance to widen.\n  reported    {} p95 {:.1} → {:.1} ms \
+         ({:+.1}%) · {} p95 {:.1} → {:.1} ms ({:+.1}%) — measured, printed, asserted on \
+         nothing (F-407, task #118)\n  index state {}\n  caveat: every iteration reads a \
+         page-cached vault, so no figure here is a cold-VAULT figure",
         check.small_p95_ms,
         check.large_p95_ms,
         check.pairs,
@@ -2227,7 +2557,19 @@ pub fn judge_scale(check: &ScaleCheck) -> Result<String, String> {
         check.larger_slower,
         check.pairs,
         check.sign_test_p,
-        SCALE_TOLERANCE * 100.0
+        SCALE_TOLERANCE * 100.0,
+        check.small_spread_pct,
+        check.large_spread_pct,
+        SCALE_TOLERANCE * 100.0,
+        check.window_visible.label,
+        check.window_visible.small_p95_ms,
+        check.window_visible.large_p95_ms,
+        check.window_visible.growth_pct(),
+        check.vault_usable.label,
+        check.vault_usable.small_p95_ms,
+        check.vault_usable.large_p95_ms,
+        check.vault_usable.growth_pct(),
+        check.index_start.describe(),
     ))
 }
 
@@ -2242,13 +2584,18 @@ pub fn judge_scale(check: &ScaleCheck) -> Result<String, String> {
 /// # Errors
 /// A vault that cannot be prepared, a measurement that fails, or a critical
 /// path that grew with the vault.
-pub fn scale_verdict<V, F>(iterations: usize, vaults: V, measure: F) -> Result<String, String>
+pub fn scale_verdict<V, F>(
+    iterations: usize,
+    index_start: IndexStartState,
+    vaults: V,
+    measure: F,
+) -> Result<String, String>
 where
     V: FnOnce() -> Result<(VaultUnderTest, VaultUnderTest), String>,
-    F: FnMut(&VaultUnderTest, usize) -> Result<f64, String>,
+    F: FnMut(&VaultUnderTest, usize) -> Result<ScaleSample, String>,
 {
     let (small, large) = vaults()?;
-    let check = measure_scale_independence(&small, &large, iterations, measure)?;
+    let check = measure_scale_independence(&small, &large, iterations, index_start, measure)?;
     judge_scale(&check)
 }
 
@@ -2269,13 +2616,31 @@ pub fn run_scale_check(iterations: usize) -> bool {
         Ok((ensure_vault("20k")?, ensure_vault("50k")?))
     })();
     let verdict = vaults.and_then(|(small, large)| {
+        // Task #118's precondition, read before the guards and before the
+        // first spawn: `S_settle` is inside the asserted quantity, so the two
+        // arms must enter in the same index state and the run must say which
+        // (§3.4). Checked here rather than inside `measure_scale_independence`
+        // because it is a fact about the fixtures on disk, and that function
+        // deliberately takes vaults it never touches.
+        let index_start = equal_index_start(&small.path, &large.path)?;
         let _small_guard = subject::ColdStartVaultGuard::watch(&small.path);
         let _large_guard = subject::ColdStartVaultGuard::watch(&large.path);
         scale_verdict(
             iterations,
+            index_start,
             || Ok((small, large)),
             |vault, run| {
-                subject::cold_start_once(&vault.path, run).map(|trace| trace.window_visible_ms)
+                // Task #118: three series off one spawn. The Serat term is
+                // asserted; the two aggregates are reported beside it. Same
+                // trace, same validation, no second measurement (F-446).
+                subject::cold_start_once(&vault.path, run).map(|trace| {
+                    let terms = trace.terms();
+                    ScaleSample {
+                        serat_term_ms: terms.serat_term_ms(),
+                        window_visible_ms: trace.window_visible_ms,
+                        vault_usable_ms: trace.vault_usable_ms,
+                    }
+                })
             },
         )
     });
@@ -2566,11 +2931,13 @@ mod tests {
         // NFR-PRF-08's acceptance criterion is Inspect: "CI configuration
         // review confirms each budget has an asserting job". This is that
         // review, as a test, for the half of it that lives in this file.
-        // 5, not 4 (task #107, F-443): PRF01_WINDOW_VISIBLE and
-        // PRF01_VAULT_USABLE are provisionally both still here, alongside the
-        // new PRF01_SERAT_TERM, until task #118 removes the two legacy
-        // entries once their job stops asserting them.
-        assert_eq!(P0_BUDGETS.len(), 5);
+        // **Three gated entries since task #118**, not five: PRD v1.2 gates
+        // only the Serat term for NFR-PRF-01, so the two pre-split aggregates
+        // moved to `PRF01_REPORTED`. Their limits are still asserted here,
+        // because a reported figure whose reference number could drift
+        // unnoticed is worth no more than an ungated one.
+        assert_eq!(P0_BUDGETS.len(), 3);
+        assert_eq!(PRF01_REPORTED.len(), 2);
         assert_eq!(PRF01_WINDOW_VISIBLE.product_limit_ms, 400.0);
         assert_eq!(PRF01_WINDOW_VISIBLE.iterations, 20);
         assert_eq!(PRF01_VAULT_USABLE.product_limit_ms, 1_000.0);
@@ -2582,7 +2949,7 @@ mod tests {
         assert_eq!(PRF03_SAVE_TO_INDEX.product_limit_ms, 50.0);
         assert_eq!(PRF03_SAVE_TO_INDEX.iterations, 1_000);
         assert_eq!(PRF04_FULL_REBUILD.product_limit_ms, 30_000.0);
-        for b in P0_BUDGETS {
+        for b in P0_BUDGETS.iter().chain(PRF01_REPORTED) {
             assert!(b.requirement.starts_with("NFR-PRF-"));
             assert_eq!(b.vault, "20k", "{} measures the wrong vault", b.id);
             assert!(
@@ -2591,6 +2958,154 @@ mod tests {
                 b.id
             );
         }
+    }
+
+    #[test]
+    fn enforce_is_the_whole_truth_table_and_the_only_place_the_rule_lives() {
+        // F-485, following F-480. The rule used to be written twice and the
+        // two copies disagreed -- `run_job`'s decision never consulted
+        // `gates()` at all. This is the exhaustive table for the one copy that
+        // is left: three inputs, eight rows, no fourth input.
+        //
+        // Both mutations that motivated it die here: `if false` in place of
+        // the gated branch (rows 1-4 go wrong) and dropping the `gates()`
+        // check so an ungated breach fails a build (rows 5-8 go wrong).
+        let outcome = |budget: Budget, values: &[f64]| Outcome {
+            budget,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(values),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+        // PRF04's limit is 30,000 ms; PRF01_WINDOW_VISIBLE's is 400 ms.
+        let gated_pass = outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]);
+        let gated_breach = outcome(PRF04_FULL_REBUILD, &[40_000.0, 41_000.0]);
+        let gated_straddle = outcome(PRF04_FULL_REBUILD, &[10_000.0, 40_000.0]);
+        let mut gated_degraded = outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]);
+        gated_degraded.degraded = Some("backpressure".to_string());
+
+        let reported_pass = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 200.0]);
+        let reported_breach = outcome(PRF01_WINDOW_VISIBLE, &[1_575.6, 1_580.0]);
+        let reported_straddle = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 1_580.0]);
+        let mut reported_degraded = outcome(PRF01_WINDOW_VISIBLE, &[100.0, 200.0]);
+        reported_degraded.degraded = Some("backpressure".to_string());
+
+        // Gated: only a determinate, undegraded pass may go green.
+        assert!(enforce(&gated_pass), "a gated budget that held must pass");
+        assert!(
+            !enforce(&gated_breach),
+            "a gated breach must fail the build"
+        );
+        assert!(
+            !enforce(&gated_straddle),
+            "a run that observed both a pass and a fail settled nothing and must not go green"
+        );
+        assert!(
+            !enforce(&gated_degraded),
+            "F-435: degraded fails the number, and the number is what the build asserts"
+        );
+
+        // Ungated: measured, printed, and unable to fail a build -- whatever
+        // the arithmetic says. This is the half #118 exists for.
+        assert!(enforce(&reported_pass));
+        assert!(
+            enforce(&reported_breach),
+            "a reported figure over its reference limit must not fail a build"
+        );
+        assert!(enforce(&reported_straddle));
+        assert!(enforce(&reported_degraded));
+
+        // And the report agrees with the enforcement in both directions --
+        // F-485's actual complaint was a figure whose words and whose exit
+        // code could say different things.
+        assert!(reported_breach.to_report().starts_with("REPORTED"));
+        assert!(gated_breach.to_report().starts_with("FAIL"));
+    }
+
+    #[test]
+    fn every_budget_a_run_job_binary_drives_is_a_gated_one() {
+        // **F-485's real gap.** The partition test below pins the `gated` flag
+        // against list membership. Nothing pinned that the binaries calling
+        // `run_job` -- the path that can fail a build -- drive exactly the
+        // gated set. A sixth budget added to PRF01_REPORTED with
+        // `gated: false` and wired to a run_job binary would print "not a
+        // gate" in its own report and still fail CI on a breach: report and
+        // enforcement in contradiction, with every existing test green.
+        //
+        // Read off the binaries rather than restated, so it cannot drift.
+        let enforced = budgets_enforced_by_a_binary().expect("bin/ is readable");
+        assert!(
+            !enforced.is_empty(),
+            "no binary was found to call run_job -- this check would pass vacuously, which is \
+             F-27's lesson about a review that reviews nothing"
+        );
+        for id in &enforced {
+            let budget = P0_BUDGETS
+                .iter()
+                .chain(PRF01_REPORTED)
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| {
+                    panic!("{id} is driven by a binary but is not a declared budget")
+                });
+            assert!(
+                budget.gated,
+                "{id} is driven by a run_job binary, so a breach of it fails the build -- but it \
+                 is flagged ungated and its own report will say \"not a gate\". Report and \
+                 enforcement must not be able to disagree (F-485)."
+            );
+        }
+        let mut gated: Vec<String> = P0_BUDGETS.iter().map(|b| b.id.to_string()).collect();
+        gated.sort_unstable();
+        assert_eq!(
+            enforced, gated,
+            "the budgets a run_job binary drives and the budgets flagged gated must be the same \
+             set, in both directions: a gated budget with no such binary is a budget CI cannot \
+             breach on, which is NFR-PRF-08's own acceptance criterion unmet"
+        );
+    }
+
+    #[test]
+    fn the_gated_list_and_the_reported_list_partition_every_budget_by_its_own_flag() {
+        // Task #118's invariant, and the reason `gated` is a field rather than
+        // a convention. F-443 was found because "what the PRD gates" and "what
+        // CI gates" were two facts kept in two documents by hand, and they
+        // disagreed for a wave without anyone noticing. Keeping the same
+        // disagreement possible between a `bool` and a list would be that
+        // defect one layer down, so the two are checked against each other:
+        // every entry in P0_BUDGETS gates, every entry in PRF01_REPORTED does
+        // not, no id is in both, and every budget this file declares is in
+        // exactly one of them -- so a sixth budget added to neither list fails
+        // here rather than being silently unmeasured.
+        for b in P0_BUDGETS {
+            assert!(b.gated, "{} is in P0_BUDGETS but does not gate", b.id);
+        }
+        for b in PRF01_REPORTED {
+            assert!(!b.gated, "{} is in PRF01_REPORTED but gates", b.id);
+        }
+        let mut ids: Vec<&str> = P0_BUDGETS
+            .iter()
+            .chain(PRF01_REPORTED)
+            .map(|b| b.id)
+            .collect();
+        let declared = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(declared, ids.len(), "a budget is in both lists: {ids:?}");
+        assert_eq!(
+            ids,
+            vec![
+                "prf01-serat-term",
+                "prf01-vault-usable",
+                "prf01-window-visible",
+                "prf03-save-to-index",
+                "prf04-full-rebuild",
+            ],
+            "every budget this file declares must be in exactly one list"
+        );
     }
 
     #[test]
@@ -3770,10 +4285,20 @@ mod tests {
 
         // The arms must alternate, and which one goes first must alternate too.
         let mut order: Vec<usize> = Vec::new();
-        let check = measure_scale_independence(&small, &large, 4, |vault, _| {
-            order.push(vault.notes);
-            Ok(if vault.notes == 20_000 { 300.0 } else { 310.0 })
-        })
+        let check = measure_scale_independence(
+            &small,
+            &large,
+            4,
+            IndexStartState::WarmBoth,
+            |vault: &VaultUnderTest, _| {
+                order.push(vault.notes);
+                Ok(ScaleSample::flat(if vault.notes == 20_000 {
+                    300.0
+                } else {
+                    310.0
+                }))
+            },
+        )
         .expect("four pairs measured");
         assert_eq!(
             order,
@@ -3803,6 +4328,9 @@ mod tests {
         let line = judge_scale(&check).expect("3% growth is within tolerance");
         assert!(line.contains("PASS"), "{line}");
         assert!(line.contains("interleaved pairs"), "{line}");
+        // Task #118: the verdict must name the series it is asserting on, or
+        // the change of subject is invisible to everyone reading the output.
+        assert!(line.contains("Serat term p95"), "{line}");
         assert!(
             line.contains("does not claim there is none"),
             "the claim is a bound on the effect, not its absence: {line}"
@@ -3811,12 +4339,20 @@ mod tests {
         // The paired difference is what survives machine drift: both arms move
         // together, and the difference does not.
         let mut i = 0;
-        let drifting = measure_scale_independence(&small, &large, 6, |vault, _| {
-            i += 1;
-            // A ramp of 100 ms per spawn, on top of a flat 5 ms real effect.
-            let drift = f64::from(i) * 100.0;
-            Ok(drift + if vault.notes == 20_000 { 300.0 } else { 305.0 })
-        })
+        let drifting = measure_scale_independence(
+            &small,
+            &large,
+            6,
+            IndexStartState::WarmBoth,
+            |vault: &VaultUnderTest, _| {
+                i += 1;
+                // A ramp of 100 ms per spawn, on top of a flat 5 ms real effect.
+                let drift = f64::from(i) * 100.0;
+                Ok(ScaleSample::flat(
+                    drift + if vault.notes == 20_000 { 300.0 } else { 305.0 },
+                ))
+            },
+        )
         .expect("six pairs");
         assert!(
             drifting.median_diff_ms.abs() < 106.0,
@@ -3830,14 +4366,20 @@ mod tests {
         // 1.20 while the median barely moved -- and a judgement on the median
         // or the mean would call it noise.
         let mut n = 0;
-        let tail_only = measure_scale_independence(&small, &large, 20, |vault, _| {
-            if vault.notes == 20_000 {
-                return Ok(300.0);
-            }
-            n += 1;
-            // Four slow spawns in twenty: the median is untouched, the p95 is not.
-            Ok(if n > 16 { 900.0 } else { 300.0 })
-        })
+        let tail_only = measure_scale_independence(
+            &small,
+            &large,
+            20,
+            IndexStartState::WarmBoth,
+            |vault: &VaultUnderTest, _| {
+                if vault.notes == 20_000 {
+                    return Ok(ScaleSample::flat(300.0));
+                }
+                n += 1;
+                // Four slow spawns in twenty: the median is untouched, the p95 is not.
+                Ok(ScaleSample::flat(if n > 16 { 900.0 } else { 300.0 }))
+            },
+        )
         .expect("twenty pairs");
         assert_eq!(tail_only.large_ms, 300.0, "the median is flat");
         assert_eq!(tail_only.small_p95_ms, 300.0);
@@ -3856,17 +4398,36 @@ mod tests {
             median_diff_ms: 450.0,
             larger_slower: 30,
             sign_test_p: 0.0,
+            index_start: IndexStartState::WarmBoth,
+            small_spread_pct: 0.0,
+            large_spread_pct: 0.0,
+            window_visible: ScaleRatio {
+                label: "window painted",
+                small_p95_ms: 300.0,
+                large_p95_ms: 750.0,
+            },
+            vault_usable: ScaleRatio {
+                label: "vault usable",
+                small_p95_ms: 300.0,
+                large_p95_ms: 750.0,
+            },
         };
         let err = judge_scale(&grew).expect_err("2.5x must fail the job");
         assert!(err.contains("proportional to vault size"), "{err}");
 
         // Zero pairs is a failure, not an empty pass.
-        let err = measure_scale_independence(&small, &large, 0, |_, _| Ok(300.0))
+        let err =
+            measure_scale_independence(&small, &large, 0, IndexStartState::WarmBoth, |_, _| {
+                Ok(ScaleSample::flat(300.0))
+            })
             .expect_err("no pairs is not a passing scale check");
         assert!(err.contains("at least one pair"), "{err}");
 
         // And a failure to measure propagates rather than being absorbed.
-        let err = measure_scale_independence(&small, &large, 4, |_, _| Err("no app".into()))
+        let err =
+            measure_scale_independence(&small, &large, 4, IndexStartState::WarmBoth, |_, _| {
+                Err("no app".into())
+            })
             .expect_err("a failed measurement is not a passing scale check");
         assert_eq!(err, "no app");
 
@@ -3880,20 +4441,233 @@ mod tests {
             fifty.notes = 50_000;
             Ok((a_vault(), fifty))
         };
-        let line = scale_verdict(4, vaults, |_, _| Ok(300.0)).expect("a flat critical path passes");
+        let line = scale_verdict(4, IndexStartState::WarmBoth, vaults, |_, _| {
+            Ok(ScaleSample::flat(300.0))
+        })
+        .expect("a flat critical path passes");
         assert!(line.starts_with("PASS"), "{line}");
         assert!(line.contains("300.0 ms at 20k"), "{line}");
 
-        let err = scale_verdict(4, vaults, |vault, _| {
-            Ok(if vault.notes == 20_000 { 300.0 } else { 750.0 })
-        })
+        let err = scale_verdict(
+            4,
+            IndexStartState::WarmBoth,
+            vaults,
+            |vault: &VaultUnderTest, _| {
+                Ok(ScaleSample::flat(if vault.notes == 20_000 {
+                    300.0
+                } else {
+                    750.0
+                }))
+            },
+        )
         .expect_err("2.5x growth must not produce a PASS line");
         assert!(err.contains("proportional to vault size"), "{err}");
 
         // A vault that cannot be prepared is a failure, not a pass.
-        let err = scale_verdict(4, || Err("no 50k vault".to_string()), |_, _| Ok(300.0))
-            .expect_err("no vault, no verdict");
+        let err = scale_verdict(
+            4,
+            IndexStartState::WarmBoth,
+            || Err("no 50k vault".to_string()),
+            |_, _| Ok(ScaleSample::flat(300.0)),
+        )
+        .expect_err("no vault, no verdict");
         assert_eq!(err, "no 50k vault");
+    }
+
+    #[test]
+    fn the_scale_check_asserts_the_serat_term_and_only_reports_the_aggregates() {
+        // Task #118, architecture §3.4's ruling. This is the test the change
+        // exists for, and it is written so that it fails if the subject is put
+        // back: the aggregates carry a 2.5x step that would fail the tolerance
+        // outright, while the asserted Serat term is flat. A check still
+        // judging window_visible_ms cannot pass this.
+        let small = a_vault();
+        let mut large = a_vault();
+        large.notes = 50_000;
+
+        let check = measure_scale_independence(
+            &small,
+            &large,
+            4,
+            IndexStartState::WarmBoth,
+            |vault: &VaultUnderTest, _| {
+                let big = vault.notes == 50_000;
+                Ok(ScaleSample {
+                    // Flat: nothing of ours grew with the vault.
+                    serat_term_ms: 200.0,
+                    // 2.5x: the platform term did, which is not ours to gate.
+                    window_visible_ms: if big { 3_750.0 } else { 1_500.0 },
+                    vault_usable_ms: if big { 4_000.0 } else { 1_600.0 },
+                })
+            },
+        )
+        .expect("four pairs measured");
+
+        assert_eq!(
+            (check.small_p95_ms, check.large_p95_ms),
+            (200.0, 200.0),
+            "the asserted series must be the Serat term, not either aggregate"
+        );
+        assert_eq!(check.median_diff_ms, 0.0);
+        assert_eq!(
+            check.larger_slower, 0,
+            "the sign test must see the asserted series only -- an aggregate that grew must \
+             not be able to move the verdict by the back door"
+        );
+
+        let line = judge_scale(&check)
+            .expect("a flat Serat term passes however the platform term behaved");
+        assert!(line.starts_with("PASS"), "{line}");
+        assert!(line.contains("Serat term p95 200.0 ms at 20k"), "{line}");
+        // And the aggregates are still in the output, with their growth, doing
+        // nothing to the verdict. "Remove only the assertion" is only true if
+        // the figure survives.
+        assert!(
+            line.contains("window painted p95 1500.0 → 3750.0 ms (+150.0%)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("vault usable p95 1600.0 → 4000.0 ms (+150.0%)"),
+            "{line}"
+        );
+        assert!(line.contains("asserted on"), "{line}");
+    }
+
+    #[test]
+    fn the_scale_check_reports_its_own_spread_and_the_index_state_both_arms_started_from() {
+        // Two of §3.4's requirements on the moved check, and both are about
+        // what the verdict must SAY rather than what it computes: the
+        // tolerance was never sized against this series' noise, and S_settle
+        // is inside the compared quantity so the starting index state decides
+        // what was compared.
+        let small = a_vault();
+        let mut large = a_vault();
+        large.notes = 50_000;
+
+        let mut n = 0;
+        let check = measure_scale_independence(
+            &small,
+            &large,
+            4,
+            IndexStartState::ColdBoth,
+            |_vault: &VaultUnderTest, _| {
+                n += 1;
+                // 200, 210, 220, 230 … within each arm: a 15% spread against a
+                // 20% tolerance, which is exactly the uncomfortable case the
+                // ruling wants visible rather than buried.
+                Ok(ScaleSample::flat(200.0 + f64::from(n % 4) * 10.0))
+            },
+        )
+        .expect("four pairs measured");
+
+        assert!(
+            check.small_spread_pct > 0.0 && check.large_spread_pct > 0.0,
+            "a series that moved must report a non-zero spread: {check:?}"
+        );
+        let line = judge_scale(&check).expect("within tolerance");
+        assert!(line.contains("spread"), "{line}");
+        assert!(
+            line.contains("finding to escalate, not a tolerance to widen"),
+            "the spread must arrive with what to do about it: {line}"
+        );
+        assert!(
+            line.contains("both arms started COLD"),
+            "the run must record which index state it compared: {line}"
+        );
+    }
+
+    #[test]
+    fn a_scale_check_whose_arms_start_in_different_index_states_is_refused() {
+        // §3.4's precondition for the moved subject. ColdStartVaultGuard
+        // equalises cleanup and says nothing about the starting state, so this
+        // is a separate check and it refuses rather than caveats: an unequal
+        // start does not weaken the comparison, it replaces it with a
+        // measurement of which fixture happened to be warm.
+        let dir = std::env::temp_dir().join(format!(
+            "serat-budget-test-index-start-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let small = dir.join("small");
+        let large = dir.join("large");
+        std::fs::create_dir_all(&small).expect("small arm");
+        std::fs::create_dir_all(&large).expect("large arm");
+
+        assert_eq!(
+            equal_index_start(&small, &large).expect("neither arm has an index"),
+            IndexStartState::ColdBoth
+        );
+
+        std::fs::create_dir_all(small.join(".serat")).expect("warm the small arm only");
+        let err = equal_index_start(&small, &large)
+            .expect_err("one warm arm and one cold arm is not a comparison");
+        assert!(err.contains("20k arm started warm"), "{err}");
+        assert!(err.contains("50k arm started cold"), "{err}");
+        assert!(err.contains("S_settle"), "{err}");
+
+        std::fs::create_dir_all(large.join(".serat")).expect("warm the large arm too");
+        assert_eq!(
+            equal_index_start(&small, &large).expect("both arms warm"),
+            IndexStartState::WarmBoth
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reported_figure_prints_no_verdict_and_cannot_fail_a_build() {
+        // Task #118's whole point, at the one seam where "demoted" could
+        // silently mean "still gating": an ungated Outcome over a breached
+        // limit. It must still be a real, complete report -- value, limit,
+        // samples, JSON -- and it must not print PASS or FAIL, because a
+        // verdict on a series nothing asserts teaches a reader to ignore the
+        // word.
+        let breached = Outcome {
+            budget: PRF01_WINDOW_VISIBLE,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[1_575.6, 1_580.0, 1_590.0]),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+        assert!(!breached.gates(), "PRD v1.2 does not gate this figure");
+        assert!(
+            !breached.passed(),
+            "the arithmetic is still done: 1575.6 ms is over 400 ms"
+        );
+        let report = breached.to_report();
+        assert!(
+            report.starts_with("REPORTED"),
+            "an ungated figure must not print a verdict: {report}"
+        );
+        assert!(!report.contains("FAIL"), "{report}");
+        assert!(report.contains("not a gate"), "{report}");
+        assert!(
+            report.contains(PRF01_SERAT_TERM.id),
+            "the report must name the budget that does gate NFR-PRF-01: {report}"
+        );
+        // The figure itself is still there. Demoted, not deleted.
+        assert!(report.contains("1575.6"), "{report}");
+        assert!(breached.to_json().contains("\"gated\": false"));
+        assert!(breached.to_json().contains("\"passed\": false"));
+
+        // And a gated budget is unaffected: it still says FAIL.
+        let gated = Outcome {
+            budget: PRF04_FULL_REBUILD,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(&[40_000.0]),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+        assert!(gated.gates());
+        assert!(gated.to_report().starts_with("FAIL"));
+        assert!(gated.to_json().contains("\"gated\": true"));
     }
 
     #[test]
@@ -4069,16 +4843,41 @@ mod tests {
         let text = std::fs::read_to_string(&workflow)
             .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
 
+        // Task #118: the two pre-split aggregates are no longer in
+        // P0_BUDGETS, so this no longer maps them onto prf01-cold-start. They
+        // are still measured -- by that same job, which is now a reporting job
+        // with the scale check as its only assertion -- and the test that they
+        // stay measured is the one below, not this one. NFR-PRF-08 is about
+        // budgets having asserting jobs, and they are no longer budgets.
         assert!(!P0_BUDGETS.is_empty());
         for budget in P0_BUDGETS {
-            // NFR-PRF-01 is one requirement with two marks measured by one job.
-            let job = match budget.id {
-                "prf01-window-visible" | "prf01-vault-usable" => "prf01-cold-start",
-                other => other,
-            };
             assert!(
-                text.contains(&format!("\n  {job}:")),
+                text.contains(&format!("\n  {}:", budget.id)),
                 "budget {} has no asserting job in budgets.yml (NFR-PRF-08)",
+                budget.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_demoted_aggregates_are_still_measured_by_a_job_that_ci_runs() {
+        // The other half of #118, and the half that is easy to lose: "remove
+        // only the assertion" is true only while something still takes the
+        // measurement. A figure dropped from P0_BUDGETS with no job left
+        // running it is not demoted, it is deleted -- and it would look
+        // identical to every other test in this file.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        assert!(
+            text.contains("\n  prf01-cold-start:"),
+            "the job that measures the demoted aggregates is not in budgets.yml"
+        );
+        assert!(!PRF01_REPORTED.is_empty());
+        for budget in PRF01_REPORTED {
+            assert!(
+                !budget.gated,
+                "{} is listed as reported but still gates",
                 budget.id
             );
         }
