@@ -616,7 +616,12 @@ mod tests {
                  guarantee. Zero means the page stopped taking the mark and a \
                  green cold-start job would measure nothing; more than one \
                  means a second call site can take the mark first and no-op \
-                 the honest one (F-392, F-481, F-504)"
+                 the honest one (F-392, F-481, F-504). If you added the \
+                 second site deliberately -- a retry path, say -- raising \
+                 this count is not the fix: both marks are first-wins, so a \
+                 second site can only ever fire when the first did not, and \
+                 which one is allowed to win is ADR-0014's table rather \
+                 than a number to bump here"
             );
         }
     }
