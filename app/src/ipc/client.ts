@@ -14,9 +14,7 @@ import type { FileContents } from "./generated/FileContents";
 import type { FileWritten } from "./generated/FileWritten";
 import type { IndexStatus } from "./generated/IndexStatus";
 import type { IpcError } from "./generated/IpcError";
-import type { OpenVaultArgs } from "./generated/OpenVaultArgs";
 import type { ReadFileArgs } from "./generated/ReadFileArgs";
-import type { VaultOpened } from "./generated/VaultOpened";
 import type { WriteFileArgs } from "./generated/WriteFileArgs";
 
 export type { IpcError };
@@ -24,9 +22,22 @@ export type { IpcError };
 /** `contracts/ipc.rs::INDEX_STATUS_EVENT`. See that file for why it is not "/". */
 export const INDEX_STATUS_EVENT = "index://status";
 
-export function openVault(args: OpenVaultArgs): Promise<VaultOpened> {
-  return invoke("open_vault", { args });
-}
+// There is deliberately no `openVault` wrapper, and its absence is the point rather
+// than an omission. `open_vault` exists as a command, but
+// `crates/serat-app/capabilities/default.json` withholds it from the webview
+// (ADR-0012): the vault is opened from Rust inside `setup`, and granting it here
+// would reopen the surface that removing it was meant to close. A wrapper stood here
+// until task #125 with nothing calling it — so the "webview never invokes
+// `open_vault`" property that the capability's own justification rests on held by
+// Rollup's tree-shaking rather than by anything anyone asserted, and the first caller
+// would have got a runtime ACL denial where "there is no such function" was available
+// (F-467). Deleted rather than annotated: a deprecation note still compiles, and this
+// file's job is to make the boundary visible at authoring time.
+//
+// The generated `OpenVaultArgs`/`VaultOpened` types stay under ./generated — ts-rs
+// emits every type in the contract, and a type existing is not a grant. What keeps
+// the two sides equal is `client.test.ts`, which compares the command names invoked
+// below against the capability file's own grant.
 
 export function readFile(args: ReadFileArgs): Promise<FileContents> {
   return invoke("read_file", { args });
