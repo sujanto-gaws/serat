@@ -33,36 +33,26 @@
 //!
 //! `--skip-scale` reports the two figures only, for a quick local check. That
 //! leaves the run with nothing asserted in it at all, which is what
-//! `--skip-scale` now means and why it is not what CI runs.
+//!
+//! **This file holds no logic, and that is task #124's whole point (F-501).**
+//! F-81 recorded `run_scale_check` being droppable with nothing going red, and
+//! the remedy moved the measurement and the judgement into the library -- but
+//! the *composition* stayed here, in a `main` no test could call, and deleting
+//! the scale-check call from it still left the suite green. So the composition
+//! is `budget::cold_start_job` now, driven in tests through
+//! `cold_start_job_with`. **A `main` that does anything is a `main` nobody can
+//! test.**
+//!
+//! ```text
+//! cargo run --release -p budget --bin prf01-cold-start -- --profile reference
+//! ```
+//!
+//! `--skip-scale` reports the two figures only, for a quick local check. That
+//! leaves the run with nothing asserted in it at all, which is what
+//! `--skip-scale` means and why it is not what CI runs.
 
 use std::process::ExitCode;
 
-use budget::{PRF01_VAULT_USABLE, PRF01_WINDOW_VISIBLE, measure_cold_start, run_paired_job};
-
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let skip_scale = args.iter().any(|a| a == "--skip-scale");
-
-    // Both figures go through run_paired_job, so they keep the argument
-    // parsing, the empty-samples check and the vault verification that this
-    // binary used to reimplement and lose (F-27). Since #118 it fails only
-    // when a measurement could not be *taken*: `Budget::gated` is false for
-    // both of these, so a breach is reported and does not fail the build.
-    let reported = run_paired_job(
-        &PRF01_WINDOW_VISIBLE,
-        &PRF01_VAULT_USABLE,
-        &args,
-        measure_cold_start,
-    );
-    if reported != ExitCode::SUCCESS || skip_scale {
-        return reported;
-    }
-    // Architecture §3.4: nothing on the critical path is proportional to vault
-    // size. The measurement and the judgement both live in the library, because
-    // F-81 was this exact call being droppable with nothing going red.
-    if budget::run_scale_check(PRF01_WINDOW_VISIBLE.iterations) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    budget::cold_start_job(&std::env::args().skip(1).collect::<Vec<String>>())
 }

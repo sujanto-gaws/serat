@@ -1840,7 +1840,34 @@ where
             return std::process::ExitCode::FAILURE;
         }
     }
-    match decide(budget, args, measure) {
+    // The verdict step is `job_exit`'s, not this function's (task #124,
+    // F-500). What used to be here was the single conditional that decides
+    // SUCCESS vs FAILURE for every gated budget, and changing it to `if true`
+    // -- so no budget could ever fail CI -- left the whole suite green. It was
+    // correct; nothing would have noticed it breaking. There is no decision
+    // left in this function to mutate.
+    job_exit(budget, decide(budget, args, measure))
+}
+
+/// Turn a finished (or failed) measurement into this process's exit code.
+///
+/// **Task #124, finding F-500 — this exists to be callable from a test.**
+/// The conditional inside it is the whole of C-06's enforcement for every
+/// gated budget: it decides `ExitCode::FAILURE` for NFR-PRF-01's Serat term,
+/// NFR-PRF-03 and NFR-PRF-04 alike. While it lived inline in [`run_job`],
+/// mutating it to `if true` left the suite entirely green — **F-27's own
+/// finding, on the same function, still open years of findings later.**
+///
+/// Split out rather than tested through `run_job` because `run_job` acquires
+/// the 20,000-note fixture before it reaches the decision, and a test that
+/// must generate 20,000 notes to check a boolean is a test nobody runs.
+///
+/// An `Err` here is a measurement that could not be *taken*, which fails on
+/// its own account and never reaches [`enforce`]: "reported" means a number is
+/// not asserted, not that its absence is acceptable.
+#[must_use]
+pub fn job_exit(budget: &Budget, result: Result<Outcome, String>) -> std::process::ExitCode {
+    match result {
         Ok(outcome) => {
             report(&outcome);
             // One rule, one place (F-485). This used to be a second copy of
@@ -1856,6 +1883,61 @@ where
             eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// `prf01-cold-start`'s whole composition: report the two demoted aggregates,
+/// then assert §3.4's scale independence.
+///
+/// **Task #124, finding F-501 — F-81 reopened one level further out.** F-81
+/// was `run_scale_check` being droppable with nothing going red; the remedy
+/// moved the measurement and the judgement into this library, and
+/// [`scale_verdict`]'s own doc records the lesson — *"the pieces were tested
+/// and the composition was not."* **The next level up was still unpinned:**
+/// deleting the `run_scale_check` call from the binary's `main` left every
+/// test green, and the comment beside that call claimed the opposite. So the
+/// composition moves here too, and the binary keeps nothing a test cannot
+/// reach.
+///
+/// See [`cold_start_job_with`] for the seam the tests drive.
+#[must_use]
+pub fn cold_start_job(args: &[String]) -> std::process::ExitCode {
+    cold_start_job_with(
+        args,
+        |a| {
+            run_paired_job(
+                &PRF01_WINDOW_VISIBLE,
+                &PRF01_VAULT_USABLE,
+                a,
+                measure_cold_start,
+            )
+        },
+        run_scale_check,
+    )
+}
+
+/// [`cold_start_job`] with both halves injected, so a test can assert the
+/// composition without a 20,000-note fixture or a compiled `serat.exe`.
+///
+/// The order is the contract and is asserted by the tests: the reported pair
+/// runs first; the scale check runs **only** if that step could be taken at
+/// all and `--skip-scale` was not passed; and a failed scale check fails the
+/// job even though the two figures it ran beside gate nothing (task #118).
+#[must_use]
+pub fn cold_start_job_with<R, S>(args: &[String], reported: R, scale: S) -> std::process::ExitCode
+where
+    R: FnOnce(&[String]) -> std::process::ExitCode,
+    S: FnOnce(usize) -> bool,
+{
+    let skip_scale = args.iter().any(|a| a == "--skip-scale");
+    let reported = reported(args);
+    if reported != std::process::ExitCode::SUCCESS || skip_scale {
+        return reported;
+    }
+    if scale(PRF01_WINDOW_VISIBLE.iterations) {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -1893,6 +1975,63 @@ pub fn enforce(outcome: &Outcome) -> bool {
         return true;
     }
     outcome.passed() && outcome.determinate()
+}
+
+/// The body of every budget binary's `main`, with comments and whitespace
+/// stripped — the last link in the chain a unit test can otherwise not reach.
+///
+/// **Task #124. This is where the regress stops, and it stops by argument
+/// rather than by execution.** F-501 is F-69 one step further out: pin a
+/// predicate and the line calling it is unpinned; pin that line and the
+/// function calling it is unpinned; move the composition into the library and
+/// **`main` calling the composition is still unpinned** — measured, not
+/// assumed: replacing `prf01-cold-start`'s `main` body with
+/// `ExitCode::SUCCESS` leaves the whole suite green.
+///
+/// No unit test can call a `main`. So the property asserted instead is that
+/// **there is nothing in a `main` worth testing**: each one is a single
+/// delegation to a library entry point. That is weaker than executing it and
+/// it is honest about being weaker — what it buys is that the unpinned
+/// remainder is one line long and visible in a diff, rather than a
+/// composition that can quietly lose a step.
+///
+/// # Errors
+/// The `bin/` directory or one of its files cannot be read.
+pub fn budget_binary_main_bodies() -> Result<Vec<(String, String)>, String> {
+    let dir = repo_root().join("bench/budget/src/bin");
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let Some(at) = text.find("fn main(") else {
+            continue;
+        };
+        let Some(open) = text[at..].find('{') else {
+            continue;
+        };
+        let body: String = text[at + open + 1..]
+            .lines()
+            .map(str::trim)
+            .take_while(|l| *l != "}")
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push((name, body));
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Every budget id that a job enforcing through [`enforce`] can breach a build
@@ -2958,6 +3097,216 @@ mod tests {
                 b.id
             );
         }
+    }
+
+    #[test]
+    fn no_budget_binary_holds_logic_a_test_cannot_reach() {
+        // **Task #124, and the honest end of F-501's regress.** Pinning
+        // `enforce` left its caller unpinned; pinning the caller left the
+        // composition unpinned; moving the composition into the library left
+        // `main` calling it unpinned -- verified, not assumed: gutting
+        // `prf01-cold-start`'s `main` to `ExitCode::SUCCESS` leaves the suite
+        // green. No unit test can call a `main`, so the property asserted here
+        // is that **there is nothing in one worth testing**.
+        //
+        // Weaker than executing it, and deliberately so. What it buys is that
+        // whatever stays unpinned is one line long and shows up in a diff.
+        let all = budget_binary_main_bodies().expect("bin/ is readable");
+        assert!(
+            all.len() >= 5,
+            "found {} binaries; a check that found none would pass vacuously, which is F-30's              own lesson about a grep deciding coverage: {all:?}",
+            all.len()
+        );
+
+        // **Which binaries this governs, derived rather than listed.** The
+        // property is about paths that decide a BUILD RESULT, so the subjects
+        // are the binaries calling a job entry point -- `run_job`,
+        // `run_paired_job` or `cold_start_job`. `environment` and
+        // `prf01-cold-start-terms` are diagnostics: they print, they assert no
+        // budget, and there is no verdict in them to lose. A hand-kept
+        // exemption list would be the second list that drifts from the first,
+        // which is the failure doclint's own doc warns about, so the
+        // discriminator is read off the source.
+        let bodies: Vec<&(String, String)> = all
+            .iter()
+            .filter(|(_, body)| {
+                body.contains("run_job(")
+                    || body.contains("run_paired_job(")
+                    || body.contains("cold_start_job(")
+            })
+            .collect();
+        assert!(
+            bodies.len() >= 4,
+            "only {} binaries run a budget job; all four gate jobs must be here or this check              governs less than it looks: {bodies:?}",
+            bodies.len()
+        );
+        for (name, body) in &bodies {
+            // One statement, and it hands off to the library. `let` bindings
+            // for argv are the only plumbing allowed; anything else is a
+            // decision living where no test can drive it.
+            let statements = body.matches(';').count();
+            assert!(
+                statements <= 1,
+                "{name}'s main has {statements} statements. A main that does anything is a main \
+                 nobody can test (F-501): move the composition into the library and leave one \
+                 delegation here. Body: {body}"
+            );
+            assert!(
+                body.contains("budget::") || body.contains("run_job") || body.contains("job("),
+                "{name}'s main does not delegate to a library entry point, so whatever it does \
+                 is untestable by construction. Body: {body}"
+            );
+        }
+
+        // The specific one F-501 names, by name, because the general property
+        // above would still hold if this binary delegated somewhere else.
+        let cold_start = bodies
+            .iter()
+            .find(|(n, _)| n == "prf01-cold-start.rs")
+            .expect("prf01-cold-start.rs exists");
+        assert!(
+            cold_start.1.contains("cold_start_job"),
+            "prf01-cold-start's main must call the composition that runs the scale check -- \
+             F-81 was this call being droppable with nothing going red, and F-501 is that same \
+             call one level further out. Body: {}",
+            cold_start.1
+        );
+    }
+
+    #[test]
+    fn a_breached_gated_budget_exits_failure_through_the_real_verdict_step() {
+        // **Task #124, F-500.** `enforce` had a truth table and the line that
+        // CALLS it did not: changing `run_job`'s verdict to `if true` -- so no
+        // budget could ever fail CI -- left the whole suite green on both
+        // trees. Testing the predicate is not testing the decision. This
+        // drives the decision itself and asserts the process exit code, which
+        // is the thing CI reads.
+        let outcome = |budget: Budget, values: &[f64]| Outcome {
+            budget,
+            profile: Profile::Reference,
+            vault: a_vault(),
+            environment: Environment::default(),
+            samples: samples(values),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        };
+
+        assert_eq!(
+            job_exit(
+                &PRF04_FULL_REBUILD,
+                Ok(outcome(PRF04_FULL_REBUILD, &[40_000.0, 41_000.0]))
+            ),
+            std::process::ExitCode::FAILURE,
+            "a gated budget over its limit must exit non-zero -- this is the whole of C-06's \
+             enforcement and F-500 is what happens when nothing asserts it"
+        );
+        assert_eq!(
+            job_exit(
+                &PRF04_FULL_REBUILD,
+                Ok(outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]))
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            job_exit(
+                &PRF04_FULL_REBUILD,
+                Ok(outcome(PRF04_FULL_REBUILD, &[10_000.0, 40_000.0]))
+            ),
+            std::process::ExitCode::FAILURE,
+            "a straddling run settled nothing and must not go green"
+        );
+        // The demoted figures keep their side of #118: reported, never fatal.
+        assert_eq!(
+            job_exit(
+                &PRF01_WINDOW_VISIBLE,
+                Ok(outcome(PRF01_WINDOW_VISIBLE, &[1_575.6, 1_580.0]))
+            ),
+            std::process::ExitCode::SUCCESS,
+            "an ungated figure over its reference limit must not fail a build"
+        );
+        // And a measurement that could not be TAKEN fails on its own account,
+        // never reaching `enforce`.
+        assert_eq!(
+            job_exit(
+                &PRF04_FULL_REBUILD,
+                Err("no application to start".to_string())
+            ),
+            std::process::ExitCode::FAILURE,
+            "reported means a number is not asserted, not that its absence is acceptable"
+        );
+    }
+
+    #[test]
+    fn the_cold_start_job_runs_the_scale_check_and_fails_when_it_fails() {
+        // **Task #124, F-501: F-81 reopened one level further out.** Deleting
+        // `run_scale_check` from the binary's `main` left every test green,
+        // while the comment beside that call claimed the composition was
+        // pinned. The composition is in the library now and this drives it.
+        use std::cell::Cell;
+        use std::process::ExitCode;
+
+        // 1. The scale check is CALLED, and its failure fails the job -- even
+        //    though the two figures reported beside it gate nothing (#118).
+        let called = Cell::new(false);
+        let code = cold_start_job_with(
+            &[],
+            |_| ExitCode::SUCCESS,
+            |iterations| {
+                called.set(true);
+                assert_eq!(
+                    iterations, PRF01_WINDOW_VISIBLE.iterations,
+                    "the scale check must run the same number of pairs the budget names"
+                );
+                false
+            },
+        );
+        assert!(
+            called.get(),
+            "the scale check was never called -- F-81, again"
+        );
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "a critical path that grew with the vault must fail the job"
+        );
+
+        // 2. And its success is the job's success.
+        let ok = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| true);
+        assert_eq!(ok, ExitCode::SUCCESS);
+
+        // 3. `--skip-scale` skips it, which is what makes that flag honest --
+        //    and means a --skip-scale run asserts nothing at all.
+        let skipped = Cell::new(false);
+        let code = cold_start_job_with(
+            &["--skip-scale".to_string()],
+            |_| ExitCode::SUCCESS,
+            |_| {
+                skipped.set(true);
+                false
+            },
+        );
+        assert!(!skipped.get(), "--skip-scale must not run the scale check");
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // 4. A reporting step that could not be taken short-circuits: there is
+        //    no point measuring scale independence against a vault that would
+        //    not open, and the scale check must not paper over it.
+        let reached = Cell::new(false);
+        let code = cold_start_job_with(
+            &[],
+            |_| ExitCode::FAILURE,
+            |_| {
+                reached.set(true);
+                true
+            },
+        );
+        assert!(
+            !reached.get(),
+            "the scale check must not run after the measurement step failed"
+        );
+        assert_eq!(code, ExitCode::FAILURE);
     }
 
     #[test]
