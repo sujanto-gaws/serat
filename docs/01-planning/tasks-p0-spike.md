@@ -73,6 +73,27 @@ Each teammate works in a git worktree under `.worktrees/<role>` and branches per
 >
 > **Today's register runs F-450 → F-490.** Read **F-469** first. **Eight are against the lead.**
 
+## P0 GATE VERDICT — the lead's ruling, 2026-09-09
+
+**P0 passes. The architecture does not change.** The charter's condition is *"if missed badly, architecture changes before anything is built on it"*, and one number is missed while nothing in the miss is architectural.
+
+| Charter clause | Result | Basis |
+|---|---|---|
+| Full index < 30 s | **PASS** | 27,693.5 ms, gate-quality, 3.2% spread, `concurrent_build_processes: 0` (#96) |
+| save→index < 50 ms | **PASS**, one bound outstanding | 4.306 ms p95, n=1000, census 1000/1000/0/0, instrument mutation-attested on the composed tree (#95, #122). `gate_eligible: false` — scanner off, **the owner's call** (#123, RISK-012) |
+| cold start < 1 s | **MISSED, not badly** | `vault_usable` p95 1577.2 ms, `window_visible` p95 1575.6 ms (#100) |
+
+**Why the miss is not architectural, and this is the whole ruling.** Serat's own main-thread work is **3.4 ms median / 4.0 p95** (ADR-0014:278, #100). The binding Serat term is **201.1 / 233.8 ms** against the **350 ms** budget #104 set from measurement. **1117–1687 ms sits inside `WebviewWindowBuilder::build`** — a platform term, on a platform C-07 fixes, bounded to one webview by F-96. **A requirement written without a webview-startup term in it mismeasured; it is not an architecture that failed.** Nothing in the P0 design is implicated by a number produced almost entirely by a dependency's window creation.
+
+**What the gate does not clear, stated because a pass that hides them is worth nothing.**
+
+- **NFR-PRF-08 is a Must that cannot be satisfied at all.** CI produces no jobs (F-384, the owner's). Every buildable half is written and dormant. **ADR-0007's conformance gap (F-509) can only close when CI runs**, so F-384 now blocks two things.
+- **NFR-PRF-01's paint evidence has a *reproduced* defect.** #121 ran mutation B against a real WebView2 window: fabricated evidence is **accepted, audited, and the honest call silently no-opped**. F-505 rules **no guard at `mark_first_paint` can discriminate**, because everything there is caller-supplied or caller-determined (F-507). **The mark is unbounded in both directions** — it is *not* that the figures were flattered, and *not* that they are safe. #128 is the only workable remedy and is unbuilt.
+- **The 6.95 / 23.59 ms open-check pair is a contended reading** from inside F-486's window, deliberately not re-taken.
+- **F-14, F-33, F-34** are carried, not adopted — open from before this wave and outside P0.
+
+**On the one number that decides the phase, the honest form is this: P0 did what P0 was for.** The charter says *"numbers are targets, not measurements; P0 exists to replace them with real ones."* Three targets are now measurements. The fourth is a measurement of the wrong quantity, and the re-baseline (#104, PRD v1.2) splits it into the term we own and the term we do not — **which is the architecture surviving contact with a number, rather than being rescued from one.**
+
 ## The P0 gate clause, and what the verdict must answer
 
 **The charter's row, verbatim:** *"Full index < 30 s, save→index < 50 ms, cold start < 1 s. **If missed badly, architecture changes before anything is built on it.**"*
