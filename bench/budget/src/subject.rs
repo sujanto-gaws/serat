@@ -544,10 +544,12 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     }
     let source = serat_vault::Vault::open(vault)
         .map_err(|e| format!("opening {} to pre-warm the index: {e}", vault.display()))?;
-    // **The root must be `source.root()`, not `vault`** -- F-458, and the whole
-    // pre-warm is worthless without it. `open_or_rebuild` records the vault's
-    // identity as `vault_root.to_string_lossy()` and rebuilds from scratch on
-    // `RebuildReason::VaultMoved` when a later open presents a different
+    // **The root is `source.root()`, not `vault`** -- F-458. Kept, and the
+    // reason it is kept has changed, so the tense below has to as well.
+    //
+    // *What it was.* `open_or_rebuild` recorded the vault's identity as
+    // `vault_root.to_string_lossy()` and rebuilt from scratch on
+    // `RebuildReason::VaultMoved` when a later open presented a different
     // string. `serat-app` reaches its root through `Vault::open(..).root()`,
     // which canonicalises and strips the verbatim prefix; this harness reaches
     // the same directory through `repo_root().join("bench/vaults/vault-20k")`,
@@ -555,9 +557,17 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
     // for the same bytes on disk. Pre-warming under the harness's spelling
     // therefore left an index the application declared moved and rebuilt --
     // measured: `Rebuilding { reason: VaultMoved }` on every spawn, and
-    // `handle_missing` unchanged at 25 of 25. Deriving the root the same way
-    // `serat-app` does makes the two spellings identical by construction
-    // rather than by coincidence.
+    // `handle_missing` unchanged at 25 of 25.
+    //
+    // *What it is since task #120.* The product half is fixed: the identity is
+    // `identity::canonical_root`, on record and on comparison, so neither
+    // spelling can produce a rebuild any more. This line is therefore no longer
+    // load-bearing for correctness -- it is load-bearing for the *measurement*.
+    // Pre-warming under a second spelling would leave an index the next open
+    // has to adopt, and an adopt costs the identity probe and a write-back
+    // (23.59 ms against 6.95 ms for the bare stamp) on the very open this
+    // harness is timing. Identical by construction rather than by coincidence
+    // was the point either way.
     let root = source.root().to_path_buf();
     let index_dir = root.join(".serat");
     let parser = serat_parse::CommonMarkParser;
@@ -1163,17 +1173,27 @@ mod tests {
     #[test]
     fn a_prewarmed_index_survives_the_root_spelling_serat_app_will_open_it_with() {
         // F-458, whose product half is F-459 and task #120. The pre-warm
-        // exists to hand `serat-app` a `Ready` index; an
-        // index the application declares `VaultMoved` and rebuilds from
-        // scratch is worth nothing, and nothing else in this crate
-        // would notice, because `open_or_rebuild` succeeds either way. The
-        // identity `open_or_rebuild` records is `vault_root.to_string_lossy()`
-        // -- a string, not a resolved directory -- so two spellings of the
-        // same directory are two different vaults to it. `serat-app` reaches
-        // its root through `Vault::open(..).root()`; this harness reaches the
-        // same bytes through `repo_root().join("bench/vaults/vault-20k")`.
-        // Measured before the fix: `Rebuilding { reason: VaultMoved }` on
-        // every spawn and `handle_missing` unmoved at 25 of 25.
+        // exists to hand `serat-app` a `Ready` index; an index the application
+        // declares moved and rebuilds from scratch is worth nothing, and
+        // nothing else in this crate would notice, because `open_or_rebuild`
+        // succeeds either way. The identity it recorded *was*
+        // `vault_root.to_string_lossy()` -- a string, not a resolved directory
+        // -- so two spellings of the same directory were two vaults to it.
+        // `serat-app` reaches its root through `Vault::open(..).root()`; this
+        // harness reaches the same bytes through
+        // `repo_root().join("bench/vaults/vault-20k")`. Measured before the
+        // fix: `Rebuilding { reason: VaultMoved }` on every spawn and
+        // `handle_missing` unmoved at 25 of 25.
+        //
+        // **Task #120 fixed the product half, and this test is kept rather
+        // than retired** -- it is now the regression test for the fix instead
+        // of the demonstration of the bug, and it is the only one that runs
+        // through `serat_vault::Vault` and the real `CommonMarkParser` rather
+        // than through `serat-index`'s own stubs. What it asserts is unchanged
+        // and is stricter than it looks: `report.is_none()` fails on a rebuild,
+        // and under #120 a *foreign* index still rebuilds, so this would still
+        // go red if canonicalisation regressed far enough to make the probe
+        // find nothing.
         let vault = hub_shaped_vault("prewarm-root-spelling", 4, 8);
         // Textually different, byte-identical directory -- the same class of
         // difference as the mixed separators the real path carries, without
