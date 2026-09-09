@@ -36,12 +36,25 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 pub const INDEX_VERSION: i64 = 5;
 
 /// What an existing database turned out to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexState {
     /// Schema matches and the last rebuild completed. Usable as-is.
     Ready,
     /// Nothing there. Build it.
     Absent,
+    /// Every check passed, and `index_meta.vault_root` is not the root being opened.
+    ///
+    /// A value, not a fault (§3.4 step 5, task #120). `notes.path` is vault-relative,
+    /// so an index recorded under another root may still describe this tree exactly —
+    /// and until F-459 this was classified `Unusable` and bought a full rebuild on the
+    /// strength of two strings differing. Deciding what it means needs the vault, which
+    /// this function does not have; the caller does.
+    RootChanged {
+        /// What the index says it was built from, for the report. `None` if the column
+        /// is null, which is what an index built before this column was written looks
+        /// like.
+        recorded: Option<String>,
+    },
     /// Present but unusable: wrong version, failed integrity check, or a rebuild that
     /// never finished. Every one of these has the same answer (ADR-0002), which is why
     /// they are one variant with a reason rather than three.
@@ -73,11 +86,6 @@ pub enum UnusableReason {
     Corrupt,
     /// `state` is still 'building': a rebuild was interrupted.
     RebuildInterrupted,
-    /// The index was built from a different vault.
-    ///
-    /// §3.4 step 5. Not corruption — the database is perfectly sound — but every path
-    /// in it describes files that are not there, so it is as useless as if it were.
-    VaultMoved,
     /// `note_count` disagrees with `count(*)` on notes.
     ///
     /// The DDL makes this an invariant maintained inside each transaction, so a
@@ -180,10 +188,16 @@ pub fn inspect(path: &Path) -> Result<IndexState, IndexError> {
     inspect_for(path, None)
 }
 
-/// As [`inspect`], and also check the index was built from `vault_root`.
+/// As [`inspect`], and also compare the recorded identity against `vault_root`.
 ///
-/// §3.4 step 5. Passing `None` skips that step, which is what a caller with no vault in
-/// hand — a test, or a tool inspecting a database — actually wants.
+/// §3.4 step 5. `vault_root` is the *canonical* root ([`crate::canonical_root`]), not
+/// whatever spelling a caller holds — recording one and comparing the other is F-459.
+/// Passing `None` skips the comparison, which is what a caller with no vault in hand —
+/// a test, or a tool inspecting a database — actually wants.
+///
+/// A difference is reported as [`IndexState::RootChanged`] and **is not**
+/// [`IndexState::Unusable`]: since task #120 nothing rebuilds on this alone. See
+/// [`crate::identity`] for what does.
 ///
 /// # Errors
 ///
@@ -216,20 +230,25 @@ pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, 
         Err(_) => return unusable(UnusableReason::Corrupt),
     }
 
-    // §3.4 step 5, before the count check because it is cheaper and more likely: an
-    // index built from another vault is sound and entirely wrong.
-    if let Some(expected) = vault_root {
-        let recorded: Result<Option<String>, _> = conn.query_row(
-            "SELECT vault_root FROM index_meta WHERE id = 1",
-            [],
-            |row| row.get(0),
-        );
-        match recorded {
-            Ok(Some(found)) if found == expected => {}
-            Ok(_) => return unusable(UnusableReason::VaultMoved),
-            Err(_) => return unusable(UnusableReason::Corrupt),
+    // §3.4 step 5. Read here and decided last: since task #120 a root that differs is
+    // not a fault, so it may not short-circuit the count check below — that one IS a
+    // fault, and letting a spelling difference hide a torn transaction would trade one
+    // silent failure for a worse one.
+    let root_change = match vault_root {
+        None => None,
+        Some(expected) => {
+            let recorded: Result<Option<String>, _> = conn.query_row(
+                "SELECT vault_root FROM index_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            );
+            match recorded {
+                Ok(Some(found)) if found == expected => None,
+                Ok(recorded) => Some(recorded),
+                Err(_) => return unusable(UnusableReason::Corrupt),
+            }
         }
-    }
+    };
 
     // The invariant the DDL asks serat-index to maintain: note_count is updated in
     // the same transaction as any change to the number of notes. A mismatch is a torn
@@ -241,7 +260,10 @@ pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, 
         |row| Ok((row.get(0)?, row.get(1)?)),
     );
     match counts {
-        Ok((actual, recorded)) if actual == recorded => Ok(IndexState::Ready),
+        Ok((actual, recorded)) if actual == recorded => match root_change {
+            None => Ok(IndexState::Ready),
+            Some(recorded) => Ok(IndexState::RootChanged { recorded }),
+        },
         Ok(_) => unusable(UnusableReason::CountMismatch),
         Err(_) => unusable(UnusableReason::Corrupt),
     }

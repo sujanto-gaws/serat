@@ -12,12 +12,14 @@
 //! in I6.
 
 mod apply;
+pub mod identity;
 pub mod incremental;
 pub mod open;
 pub mod rebuild;
 pub mod schema;
 pub mod writer;
 
+pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};

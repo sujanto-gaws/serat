@@ -390,6 +390,14 @@ impl IndexOpen for SeratIndexOpen {
 fn map_open_status(status: serat_index::IndexStatus, index_dir: &Path) -> Option<IndexState> {
     match status {
         serat_index::IndexStatus::Opening => Some(IndexState::Opening),
+        // Task #120. Not a contract state and deliberately not one: the index is
+        // usable, nothing is rebuilding, and inventing an `IndexState` for it would put
+        // a transient on the wire that every consumer would have to learn to ignore.
+        // It reaches a user through boot info, which is where the ruling put it, and
+        // that is `serat-app`'s to wire when boot info exists -- named here rather than
+        // dropped silently, because a status the shell swallows and a status nobody
+        // publishes look identical from outside (F-459's own complaint).
+        serat_index::IndexStatus::RootAdopted { .. } => None,
         serat_index::IndexStatus::Rebuilding { reason } => Some(IndexState::Rebuilding {
             reason: map_rebuild_reason(reason),
             // `open_or_rebuild` does not report walk/index progress yet — there is
@@ -423,7 +431,14 @@ fn map_rebuild_reason(reason: serat_index::RebuildReason) -> RebuildReason {
         serat_index::RebuildReason::Corrupt => RebuildReason::Corrupt,
         serat_index::RebuildReason::SchemaChanged => RebuildReason::IndexVersion,
         serat_index::RebuildReason::Interrupted => RebuildReason::Interrupted,
-        serat_index::RebuildReason::VaultMoved => RebuildReason::VaultMoved,
+        // The contract's variant keeps its name for now: renaming it moves a
+        // `ts-rs`-generated type and a frontend string, which is architect's and
+        // vue-frontend-dev's to take. `serat_index`'s side is renamed on task #120
+        // because the old name asserted a rationale that is false of the case it was
+        // named after -- `notes.path` is vault-relative, so a vault that moved keeps a
+        // correct index. This arm is where the two disagree, and it is the only place
+        // they can.
+        serat_index::RebuildReason::ForeignVault => RebuildReason::VaultMoved,
     }
 }
 

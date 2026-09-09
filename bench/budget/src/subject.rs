@@ -1414,7 +1414,12 @@ mod tests {
         // Three copies of the real Ready database, each mutated to trigger one
         // specific UnusableReason, so the check alone -- not a rebuild -- is
         // what gets timed.
-        let root = vault.path.to_string_lossy().into_owned();
+        //
+        // `canonical_root`, not `to_string_lossy` (task #120, F-458): the index
+        // records the resolved directory, so an expectation built from the raw
+        // path would report RootChanged on every one of these and measure the
+        // wrong branch.
+        let root = serat_index::canonical_root(&vault.path);
         let mutate = |name: &str, sql: &str| -> std::path::PathBuf {
             let copy = scratch.join(name);
             std::fs::copy(&index_path, &copy).expect("copy the ready index");
@@ -1453,6 +1458,10 @@ mod tests {
             "state='building' must report RebuildInterrupted: {interrupted_result:?}"
         );
 
+        // Not a rebuild trigger since task #120, so no longer one of the four
+        // "fails early" states -- but still a branch of the stamp, and the one
+        // that grew a filesystem probe, so it is still measured here. What it
+        // reports changed with it: RootChanged, a value, not Unusable.
         let moved = mutate(
             "moved.db",
             "UPDATE index_meta SET vault_root = 'C:/nowhere/not-the-real-vault'",
@@ -1463,11 +1472,10 @@ mod tests {
         assert!(
             matches!(
                 moved_result,
-                Ok(serat_index::IndexState::Unusable {
-                    reason: serat_index::UnusableReason::VaultMoved
-                })
+                Ok(serat_index::IndexState::RootChanged { .. })
             ),
-            "a vault_root that does not match must report VaultMoved: {moved_result:?}"
+            "a vault_root that does not match must report RootChanged, not a fault \
+             (task #120): {moved_result:?}"
         );
 
         eprintln!(
@@ -1477,7 +1485,7 @@ mod tests {
              \x20 Absent (inspect_for only):        {absent_ms:.3} ms\n\
              \x20 SchemaChanged (inspect_for only):  {schema_ms:.3} ms\n\
              \x20 Interrupted (inspect_for only):    {interrupted_ms:.3} ms\n\
-             \x20 VaultMoved (inspect_for only):     {moved_ms:.3} ms\n\
+             \x20 RootChanged (inspect_for only, not a rebuild trigger since #120): {moved_ms:.3} ms\n\
              (for comparison, architecture.md §3.4: integrity_check 1310ms, quick_check 1150ms, rejected)"
         );
 
@@ -1493,7 +1501,7 @@ mod tests {
             ("Absent", absent_ms),
             ("SchemaChanged", schema_ms),
             ("Interrupted", interrupted_ms),
-            ("VaultMoved", moved_ms),
+            ("RootChanged", moved_ms),
         ] {
             assert!(
                 ms < 300.0,
