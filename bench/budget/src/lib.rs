@@ -485,6 +485,33 @@ pub struct ReportedSeries {
     pub samples: Samples,
 }
 
+/// What became of every save a `--bench-save-list` run attempted.
+///
+/// Task **#94**, finding **F-450**, and the lead's binding condition on
+/// `subject::prewarm_index`: *the run must report `handle_missing`, and any
+/// residual must be reported, never absorbed.* Pre-warming the index is a
+/// change that makes a failing measurement pass, so the census it makes
+/// passable is stated on the face of the result rather than left to be
+/// inferred from the absence of an error.
+///
+/// `handle_missing` is a hard zero — [`check_save_completeness`] refuses the
+/// run before an [`Outcome`] exists if it is not — so every census that
+/// reaches a report carries a zero there. **That zero is the point.** It is
+/// #119's answer arriving from the other direction, and printing it is what
+/// distinguishes "the pre-warm closed the window" from "nobody looked".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveCensus {
+    /// Saves the run was asked to make.
+    pub attempted: usize,
+    /// Saves that reached the index writer, and so are in the asserted series.
+    pub submitted: usize,
+    /// Saves ADR-0011 backpressure refused. Non-zero is a real NFR-PRF-03
+    /// finding and already sets [`Outcome::degraded`].
+    pub writer_refused: u64,
+    /// Saves that found no index handle — F-382's window.
+    pub handle_missing: u64,
+}
+
 /// A finished measurement.
 #[derive(Clone, Debug)]
 pub struct Outcome {
@@ -521,6 +548,11 @@ pub struct Outcome {
     /// reported here rather than folded silently into a fast-looking
     /// series). "Fail the number, not the run."
     pub degraded: Option<String>,
+    /// The save path's own census, for the budget that has one (NFR-PRF-03).
+    ///
+    /// `None` for every other budget: nothing else in P0 attempts a countable
+    /// unit of work that can fail without failing the run.
+    pub save_census: Option<SaveCensus>,
 }
 
 impl Outcome {
@@ -668,6 +700,18 @@ impl Outcome {
         if let Some(reason) = &self.degraded {
             let _ = writeln!(s, "  DEGRADED    {reason}");
         }
+        if let Some(c) = self.save_census {
+            // Printed whether or not anything went wrong, and `handle_missing`
+            // is printed even at zero: the pre-warm this census exists to
+            // police (task #94, F-450) is a setup change that makes a failing
+            // measurement pass, and a residual that is never shown is a
+            // residual that was absorbed.
+            let _ = writeln!(
+                s,
+                "  save path   {} attempted · {} submitted · {} writer-refused · {} handle-missing",
+                c.attempted, c.submitted, c.writer_refused, c.handle_missing
+            );
+        }
         let _ = writeln!(
             s,
             "  vault       {} ({} notes, generator v{})",
@@ -792,6 +836,14 @@ impl Outcome {
             let _ = writeln!(s, "    \"write_fts\": {:.3}", ms(p.write_fts));
             let _ = writeln!(s, "  }},");
         }
+        if let Some(c) = self.save_census {
+            let _ = writeln!(s, "  \"save_path_census\": {{");
+            let _ = writeln!(s, "    \"attempted\": {},", c.attempted);
+            let _ = writeln!(s, "    \"submitted\": {},", c.submitted);
+            let _ = writeln!(s, "    \"writer_refused\": {},", c.writer_refused);
+            let _ = writeln!(s, "    \"handle_missing\": {}", c.handle_missing);
+            let _ = writeln!(s, "  }},");
+        }
         if !self.reported.is_empty() {
             let _ = writeln!(s, "  \"reported_not_asserted\": {{");
             let last = self.reported.len() - 1;
@@ -838,6 +890,8 @@ pub struct Measurement {
     /// see that field's doc for what it means and why it is not the same
     /// thing as this function returning `Err`.
     pub degraded: Option<String>,
+    /// Carried straight through to [`Outcome::save_census`] by [`outcome_from`].
+    pub save_census: Option<SaveCensus>,
 }
 
 impl Measurement {
@@ -848,6 +902,7 @@ impl Measurement {
             phases: None,
             reported: Vec::new(),
             degraded: None,
+            save_census: None,
         }
     }
 
@@ -874,6 +929,13 @@ impl Measurement {
     #[must_use]
     pub fn with_phases(mut self, phases: subject::RebuildPhases) -> Measurement {
         self.phases = Some(phases);
+        self
+    }
+
+    /// Attach the save-path census (task #94, F-450).
+    #[must_use]
+    pub fn counting(mut self, census: SaveCensus) -> Measurement {
+        self.save_census = Some(census);
         self
     }
 }
@@ -1674,6 +1736,7 @@ pub fn outcome_from(
         reported: measurement.reported,
         phases: measurement.phases,
         degraded: measurement.degraded,
+        save_census: measurement.save_census,
     };
     outcome.check_phases()?;
     Ok(outcome)
@@ -1939,7 +2002,18 @@ where
     for ms in &trace.submitted_ms {
         samples.push(Duration::from_secs_f64(ms / 1000.0));
     }
-    let mut measurement = Measurement::new(samples);
+    // The census goes on before any branch below can return: the lead's
+    // condition on `prewarm_index` is that `handle_missing` is reported on
+    // every run, not only on the runs that went wrong (task #94, F-450).
+    // `check_save_completeness` above has already refused a non-zero
+    // `handle_missing`, so what this carries is the zero that says the
+    // pre-warm closed the window -- #119's answer from the other direction.
+    let mut measurement = Measurement::new(samples).counting(SaveCensus {
+        attempted: trace.attempted,
+        submitted: trace.submitted_ms.len(),
+        writer_refused: trace.writer_refused,
+        handle_missing: trace.handle_missing,
+    });
 
     if trace.writer_refused > 0 {
         let mut refused = Samples::new();
@@ -2360,6 +2434,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert!(
             at_limit.passed(),
@@ -2375,6 +2450,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert!(!over.passed());
         assert!(over.to_report().starts_with("FAIL"));
@@ -2398,6 +2474,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: Some("3 of 1000 attempted saves were refused by the writer".to_string()),
+            save_census: None,
         };
         assert!(
             outcome.value_ms() <= outcome.limit_ms(),
@@ -2446,6 +2523,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert!(
             !outcome.to_report().contains("DEGRADED"),
@@ -2560,6 +2638,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert_eq!(outcome.value_ms(), 20_000.0, "the middle run decides");
         assert!(outcome.passed());
@@ -2584,6 +2663,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert!(
             outcome.to_report().contains("median of 3 wall-clock runs"),
@@ -3128,6 +3208,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
 
         // Every sample under the limit: the run agreed with itself.
@@ -3326,6 +3407,87 @@ mod tests {
             "nothing to report when nothing degraded"
         );
         assert!(m.degraded.is_none());
+    }
+
+    #[test]
+    fn a_clean_save_run_still_states_its_handle_missing_count() {
+        // The lead's binding condition on task #94's prewarm_index (F-450):
+        // the run must REPORT handle_missing, not merely refuse when it is
+        // non-zero. Pre-warming the index is a setup change that turns a
+        // failing measurement into a passing one, and this project's four
+        // worst defects were all instruments that flattered the figure. A
+        // zero that is printed is evidence the window closed; a zero that is
+        // only implied by the absence of an error is indistinguishable from
+        // nobody having looked.
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0, 15.0], 0, 0, &[]))
+        })
+        .expect("a fully submitted run is accepted");
+        let census = m
+            .save_census
+            .expect("every save measurement carries its census, clean or not");
+        assert_eq!(
+            census,
+            SaveCensus {
+                attempted: 3,
+                submitted: 3,
+                writer_refused: 0,
+                handle_missing: 0,
+            }
+        );
+
+        let outcome = outcome_from(&PRF03_SAVE_TO_INDEX, Profile::Reference, a_vault(), m)
+            .expect("a clean run produces an outcome");
+        let report = outcome.to_report();
+        assert!(
+            report.contains("0 handle-missing"),
+            "the zero must appear on the face of the report: {report}"
+        );
+        assert!(report.contains("3 attempted"), "{report}");
+        let json = outcome.to_json();
+        assert!(json.contains("\"handle_missing\": 0"), "{json}");
+        assert!(json.contains("\"save_path_census\""), "{json}");
+    }
+
+    #[test]
+    fn a_degraded_save_run_carries_the_refusal_count_into_the_census_too() {
+        // The census is the denominator's full statement, so a run that
+        // degrades on backpressure must still say how the attempts split.
+        let m = measure_save_to_index_with(&a_vault(), 3, |_, _| {
+            Ok(save_trace(3, &[12.0, 8.0], 0, 1, &[0.4]))
+        })
+        .expect("writer_refused alone must not fail the run");
+        assert_eq!(
+            m.save_census
+                .expect("census travels with a degraded run too"),
+            SaveCensus {
+                attempted: 3,
+                submitted: 2,
+                writer_refused: 1,
+                handle_missing: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_budget_with_no_countable_unit_of_work_carries_no_census() {
+        // The other half: nothing but NFR-PRF-03 has a census, and an empty
+        // one must not print as a row of zeroes that reads like a measured
+        // result. A rebuild does not attempt saves.
+        let outcome = outcome_from(
+            &PRF04_FULL_REBUILD,
+            Profile::Reference,
+            a_vault(),
+            Measurement::new(samples(&[19_000.0])),
+        )
+        .expect("a rebuild measurement is an outcome");
+        assert!(outcome.save_census.is_none());
+        assert!(
+            !outcome.to_report().contains("save path"),
+            "{}",
+            outcome.to_report()
+        );
+        assert!(!outcome.to_json().contains("save_path_census"));
     }
 
     #[test]
@@ -3804,6 +3966,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         let path = write_result_to(&dir, &outcome).expect("write");
         let written = std::fs::read_to_string(&path).expect("read back");
@@ -3841,6 +4004,7 @@ mod tests {
             reported: Vec::new(),
             phases: None,
             degraded: None,
+            save_census: None,
         };
         assert!(outcome.passed(), "20 s is inside 30 s");
         assert!(
