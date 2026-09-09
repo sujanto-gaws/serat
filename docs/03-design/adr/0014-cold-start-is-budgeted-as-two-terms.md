@@ -214,8 +214,8 @@ Serat term's p95 from task #100.
 ### 6. Every figure carries its basis, and every bound is stated as a bound
 
 §3.4: *"the basis belongs with the figure wherever it is quoted, because the figure without
-it is what went wrong the first time."* For this split the basis is five clauses, and all
-five are conditions **under which the number is better than a user's**:
+it is what went wrong the first time."* For this split the basis is **six** clauses, and all
+six are conditions **under which the number is better than a user's**:
 
 1. **Warm vault.** Every cold-start figure this project has produced is a warm-vault
    figure (F-154): repeated spawns leave the vault in the page cache, a freshly generated
