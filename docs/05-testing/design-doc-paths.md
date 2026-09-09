@@ -8,9 +8,11 @@ serves: F-239, F-238, F-303, F-346, F-348, C-03, FR-STR-08, FR-STR-09, FR-STR-10
 
 # Design-document consistency checks
 
-Three checks, one crate (`bench/doclint`): F-239 (below) is about a document
+One crate (`bench/doclint`), and every check in it is here: F-239 (below) is
+about a document
 citing evidence that is not there; F-303 is about two documents making a claim
-that depends on each other and nothing checking the join; F-346/F-348 (at the
+that depends on each other and nothing checking the join; F-496 (task #126) is
+about a count written above a list that stops matching it; F-346/F-348 (at the
 end of this file) is about a table that stops rendering as a table while every
 word in it is still true. All three are mechanical for the same reason —
 none of these failures is visible from inside one document read alone, or
@@ -168,6 +170,8 @@ cargo test -p doclint
 
 ## CI
 
-`.github/workflows/design-docs.yml` runs `cargo test -p doclint` (covering all
-three checks, since they are one crate) on every pull request and push to
-`main`, and prints each binary's report so a failure names which check failed.
+`.github/workflows/design-docs.yml` runs `cargo test -p doclint` (covering
+every check in the crate, since they are one crate) on every pull request and
+push to `main`, and prints each binary's report so a failure names which check
+failed. **Counted as "every check" rather than as a number, per F-496** — this
+sentence said "three checks", and the crate has grown twice since.
