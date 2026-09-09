@@ -234,6 +234,28 @@ five are conditions **under which the number is better than a user's**:
    with each other.
 5. **Which build.** Figures quoted from §3.4's phase table predate task #98's front end.
    #100's figures are the post-#98 ones, and the two must never be mixed in one table.
+6. **Which *front-end* build, which is a separate clause and was missing until F-470.**
+   Every claim this ADR and §3.4 make about front-end behaviour cites `app/src/*`, and the
+   binary does not read `app/src/*`. `tauri.conf.json` sets `frontendDist: "webview"` with
+   **no `beforeBuildCommand`**, so `crates/serat-app/webview/` is compiled *into*
+   `serat.exe` and `cargo build` never invokes vite. **A statement about the front end is
+   therefore a statement about the last vite build, not about the source it cites**, and
+   the two can disagree with nothing to say so. F-470 measured the gap rather than
+   inferring it: a stub that never calls `mark_first_paint`, launched without a rebuild,
+   produced **exit 0, a complete trace and `paint_evidence_ms` 352.0** — a trace
+   indistinguishable from an honest one. After `cargo build --release`, the same stub gave
+   **exit 2 and no trace**. So a front-end change needs `npm ci`, `npm run build` and
+   `cargo build --release`, **in that order**, and a run whose pipeline was never shown to
+   reach the binary is not evidence about the binary.
+
+   **What this clause does *not* say, because guessing either way would be worse than the
+   bound.** The real-window runs already on record — #116's CSP work (F-417), F-392's
+   `boot.js` mutations — are **not** re-characterised as invalid here. Nobody recorded
+   whether they were taken with the two-build discipline, and inventing either answer is
+   the failure this ADR's §Decision 6 exists to prevent. What is recorded is that their
+   basis is **unstated on this axis**, which is the honest status and is the same shape as
+   the phase table's unreconstructable basis (F-452). The remedy is F-470's positive
+   control — apply the stub, rebuild, confirm exit 2, restore — and it costs one rebuild.
 
 Clauses 1 and 2 push the number the same way. **A re-baseline attested on this basis is a
 bounded claim and must be written as one.** This bound is why NFR-PRF-01 was deliberately
