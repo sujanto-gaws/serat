@@ -1,16 +1,20 @@
 <!--
-  Task #98 (P0/impl): Vue 3 + CodeMirror 6, replacing the placeholder shell
-  (crates/serat-app/webview/, task S1). P0 scope only — a plain text box, one
-  buffer, no live preview (ADR-0006), no wikilink UI, no lens switcher, no file
-  tree (`list_notes` is P1). See app/README.md.
+  Task #98 (P0) mounted a plain text box; task #21 (P1: FR-EDT-01/02/03/10,
+  NFR-PRF-02, ADR-0006, ADR-0016) puts the hybrid live-preview editor behind
+  it. No file tree/lens switcher/wikilink UI yet — those are their own
+  tasks (#1-#4, #22) — this file's job is still just "one buffer", but that
+  buffer now saves through `save_patch` patch sets (ADR-0016 §2) instead of
+  whole-document `write_file`, debounced/blurred/closed internally by
+  `CodeMirrorEditor.vue` rather than driven from here.
 -->
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
+import type { SaveOutcome } from "@/editor/buffer";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
-import { indexStatus, isIpcError, onIndexStatus, writeFile } from "@/ipc/client";
+import { indexStatus, isIpcError, onIndexStatus } from "@/ipc/client";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 
@@ -19,6 +23,22 @@ const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 
 onMounted(async () => {
+  // NFR-PRF-02's harness seam (`bench/editor-latency/tests/subject.ts`,
+  // `openNoteForLatencyTest`, task #11/#21): that harness drives the
+  // production vite build with the IPC client stubbed (architecture.md
+  // §9.3's own words), so it has no `note_opened`/`read_file` round trip to
+  // hang a deterministic note-open off. This global, present the instant
+  // the editor exists (synchronous, before any `await` in this function —
+  // same property as the editor's own synchronous mount), lets the harness
+  // load its fixture note directly through `loadNote` and reach the running
+  // `EditorView` the same way a real note open would leave it: with a base
+  // buffer, saves wired to the (stubbed) IPC adapter, and the reveal rule
+  // live. `bench-hash` is a syntactically valid but obviously-fake hash —
+  // nothing the harness types triggers a save, so it is never checked.
+  window.__seratBenchOpenNote = (text: string) => {
+    editorRef.value?.loadNote(text, "__bench__.md", "bench-hash-not-a-real-blake3");
+  };
+
   // The paint mark, first and synchronous — code-reviewer's SHOULD-FIX on #98's
   // review. This used to run after `await onIndexStatus(...)` below, which is an IPC
   // round trip: the double requestAnimationFrame this schedules could miss the frame
@@ -41,7 +61,15 @@ onMounted(async () => {
   indexStatus().then((status) => store.setIndexState(status.state));
 
   if (editorRef.value) {
+    // `hydrateBuffer` loads the text (`readFile`, for the vault-usable mark)
+    // via the editor's back-compat `setText`; it knows nothing about
+    // ADR-0016's base/hash bookkeeping. Once it resolves, `store.openNote`/
+    // `store.baseHash` hold what was read, and `loadNote` seeds the P1
+    // buffer from exactly that — no second read.
     await hydrateBuffer(store, editorRef.value, paintMark);
+    if (store.openNote && store.baseHash) {
+      editorRef.value.loadNote(editorRef.value.getText(), store.openNote, store.baseHash);
+    }
   }
 });
 
@@ -50,29 +78,27 @@ onUnmounted(() => {
 });
 
 /**
- * Ctrl/Cmd-S writes the buffer back, optimistically locked on the hash it was read
- * at. A stale hash resolves in place: no modal on the write path (§9.1). This is
- * P0's whole-file write (`write_file`); the byte-range write-back of ADR-0008
- * arrives with views in P2 and is a different command.
+ * ADR-0016 §2: the editor saves patch sets through `save_patch`, debounced
+ * 1s idle / on blur / on unmount, and on the save command — all internal to
+ * `CodeMirrorEditor.vue`. This only reflects the outcome in the status
+ * strip (§9.1: no modal on the write path; a refusal resolves in place).
  */
-async function onSave(): Promise<void> {
-  if (!store.openNote || !editorRef.value) {
-    return;
-  }
-  try {
-    const written = await writeFile({
-      path: store.openNote,
-      text: editorRef.value.getText(),
-      base_hash: store.baseHash,
-    });
-    store.setBaseHash(written.hash);
-    store.setMark(`saved ${written.bytes} bytes`);
-  } catch (err) {
-    if (isIpcError(err) && err.kind === "stale_hash") {
-      store.setMark("changed on disk since it was read — reopen to merge");
-    } else {
-      store.setMark(`not saved: ${JSON.stringify(err)}`);
-    }
+function onSaveOutcome(outcome: SaveOutcome): void {
+  switch (outcome.kind) {
+    case "saved":
+      store.setBaseHash(outcome.written.hash);
+      store.setMark(`saved ${outcome.written.bytes} bytes`);
+      break;
+    case "stale":
+      if (isIpcError(outcome.error) && outcome.error.kind === "stale_hash") {
+        store.setMark("changed on disk since it was read — reopen to merge");
+      } else {
+        store.setMark(`not saved: ${JSON.stringify(outcome.error)}`);
+      }
+      break;
+    case "noop":
+    case "coalesced":
+      break;
   }
 }
 </script>
@@ -86,8 +112,8 @@ async function onSave(): Promise<void> {
   <main class="workspace">
     <CodeMirrorEditor
       ref="editorRef"
-      placeholder="P0 shell — a plain text box. Live preview is P1 (ADR-0006)."
-      @save="onSave"
+      placeholder="No note open — the file tree (task #1-#4) arrives separately."
+      @save-outcome="onSaveOutcome"
     />
   </main>
 
