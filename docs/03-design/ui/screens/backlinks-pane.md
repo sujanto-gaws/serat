@@ -1,7 +1,7 @@
 # Screen: Backlinks pane — block-precise excerpts
 
 Serves: FR-NAV-04 · US-03
-Design basis: architecture.md §4.5 (R2 backlinks, P1-04 branch)
+Design basis: architecture.md §4.5 (R2 backlinks)
 
 ## Layout
 
@@ -32,7 +32,7 @@ One entry per **distinct (source note, source block)** — exactly the R2 read's
 
 Each entry:
 - **Source note title** (`ui-medium`, `small`), acts as a link — click or `↵` opens that note, scrolled to the linking block.
-- **Excerpt**: the block's text, up to 300 characters, in `body-serif` at `small`-adjacent size (the pane is narrower than the editor, so excerpts run at 13–14px serif rather than the editor's 17px, still serif because it is quoted prose from a note, not UI chrome).
+- **Excerpt**: the block's text, up to 300 characters, in `body-serif` at `small`-adjacent size (the pane is narrower than the editor, so excerpts run at 13–14px serif rather than the editor's 17px, still serif because it is quoted prose from a note, not UI chrome). R2 carries no match markers (there's no search query here to highlight against, just the linking block's plain text), so the excerpt is rendered as one plain-text node through normal text interpolation (`{{ excerpt }}`) — never `innerHTML`/`v-html`. Where the search panel's snippet *does* carry match markers (control characters around query hits), it uses the same never-`innerHTML` discipline, described in `search-panel.md`'s "Rendering the snippet is a split, not a parse" — the two surfaces differ in whether there's anything to highlight, not in whether raw note text is ever treated as markup.
 - **Frontmatter-origin links** (e.g. `owner: [[Person]]`) show the field key in `mono`, `micro`, `text-tertiary` instead of a prose excerpt, labelled exactly as the read returns it: *frontmatter*.
 - No relevance score, no "3 links from this note" collapsing — every entry is its own block-precise row, because collapsing by source note is exactly what FR-NAV-04 explicitly does *not* want (the acceptance criterion is block count, not note count).
 
@@ -64,6 +64,8 @@ Entries are grouped by source note (a light `text-tertiary` note-title header on
 | Open focused entry | `↵` |
 | Open focused entry in new tab | `⌘` `↵` |
 | Refresh (rarely needed; the pane already updates on index change) | Not bound — there is no manual refresh action, because a stale-and-refreshable backlinks pane would be a second source of truth to reason about; it always reflects the current index. |
+
+This table is a subset of the single authoritative binding set in `components.md` §7.
 
 ## Responsive rules
 

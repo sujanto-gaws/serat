@@ -1,7 +1,7 @@
 # Screen: Quick switcher
 
 Serves: FR-NAV-01, NFR-PRF-06 · US-04
-Design basis: architecture.md §9.2 (P1-03 branch)
+Design basis: architecture.md §9.2
 
 ## Layout
 
@@ -49,6 +49,8 @@ With `#` present in the query (`Roadmap#risk`), results switch to heading mode f
 | Open selected in current tab | `↵` |
 | Open selected in new tab | `⌘` `↵` |
 | Dismiss, return focus to origin | `Esc` |
+
+This table is a subset of the single authoritative binding set in `components.md` §7.
 
 ## States
 

@@ -1,7 +1,7 @@
 # Screen: Binary viewers — PDF (page navigation) and image (zoom)
 
 Serves: FR-BIN-11, FR-BIN-12 · US-19
-Design basis: ADR-0017 (`serat-asset://` scheme, range requests, per-response CSP), architecture.md §7.4 (P1-06 branch)
+Design basis: ADR-0017 (`serat-asset://` scheme, range requests, per-response CSP), architecture.md §7.4
 
 Both viewers open in the same pane an editor tab would occupy — a PDF or image is a tab like any note, not a separate window — and both read bytes exclusively through the `serat-asset://` scheme (ADR-0017), never through `read_file`. If the asset has a sidecar (ADR-0005/§7.4), its metadata shows in a collapsible header above the viewer surface rather than a separate pane, keeping "one entry, one thing" consistent with the tree's fold (`file-tree.md`).
 
@@ -21,6 +21,7 @@ Both viewers open in the same pane an editor tab would occupy — a PDF or image
 - Rendered via pdf.js (bundled, no network, `isEvalSupported: false` per ADR-0017), loading pages incrementally through single-range requests against `serat-asset://` — the toolbar's page field is responsive even before the whole document has downloaded, because only the requested page's bytes are fetched.
 - Text selection is native pdf.js text-layer selection; copy works normally; no custom selection UI is designed here beyond what pdf.js already provides, since FR-BIN-11's acceptance criterion is page navigation, and text selection is stated as a capability, not a bespoke interaction to design.
 - A hit that arrives from the search panel with a page locator (P2, PDF-content search — out of scope here per the task boundary) would land through the same page-jump mechanism; this spec notes the seam exists without designing that P2 flow.
+- **Links in the PDF itself** (annotation link objects to external `http(s)://` URLs, which pdf.js exposes) follow the same rule as an editor link: hovering shows the URL in a tooltip, and only an explicit click opens it, in the system default browser, never inside the app window or as a navigation of the viewer tab. Nothing in the PDF's annotation layer is prefetched or resolved ahead of a click (NFR-SEC-01). Internal PDF links (a table of contents entry, a cross-reference to another page) navigate within the same viewer tab, since that's page navigation, not leaving the app.
 
 ### States
 | State | Presentation |
@@ -28,7 +29,7 @@ Both viewers open in the same pane an editor tab would occupy — a PDF or image
 | Loading first page | A single skeleton page outline (`bg-surface-sunken` rectangle at the page's aspect ratio once known from the PDF header, else a fixed placeholder) — no spinner-in-a-circle, consistent with the rest of the system's restraint around loading chrome. |
 | Page loaded | As drawn above. |
 | Jump to out-of-range page number | Field reverts to the current page with a brief `accent-error` outline flash (120ms) rather than a dialog — a wrong page number is corrected in place, not treated as an error worth interrupting for. |
-| File replaced on disk mid-view (ADR-0017's `ETag`/`If-Range` restart) | The viewer silently restarts the load for the affected range; if the visible page's bytes were affected, a small `text-tertiary` note appears at the top of the page: "This file changed on disk — showing the latest version," non-blocking, auto-dismissing after 4s. |
+| File replaced on disk mid-view (ADR-0017's `ETag`/`If-Range` restart) | The viewer silently restarts the load for the affected range; if the visible page's bytes were affected, a small `text-secondary` note appears at the top of the page (required information — the user needs to know a page they might already be reading has changed underneath them — so it gets the higher-contrast token, not `text-tertiary`): "This file changed on disk — showing the latest version," non-blocking, auto-dismissing after 4s. |
 | Extraction/search unavailable for this PDF (P2 concern, not P1) | Not shown in P1 — no "not searchable yet" badge is specified here since content extraction is out of scope for this task; noted so it isn't accidentally designed twice when P2 picks it up. |
 | Range requests unsupported by the platform webview (ADR-0017's named WebKitGTK/WKWebView risk) | The viewer has no visibly different UI for this — the fallback (IPC bytes for PDFs, per the ADR's contingency) is a transport detail behind the same `serat-asset://`-shaped interface; the only user-visible difference would be a slower initial load on affected platforms, which this spec does not attempt to hide or announce, since it is not yet known whether the fallback is needed (see Design questions below). |
 
@@ -40,7 +41,7 @@ Both viewers open in the same pane an editor tab would occupy — a PDF or image
 | Confirm typed page | `↵` |
 | Zoom in / out | `⌘` `+` / `⌘` `-` |
 | Fit width / fit page | `⌘` `0` toggles between the two fit modes |
-| Find in this PDF (text-layer only, P1) | `⌘` `F` opens a small in-pane find bar (native-style, not the vault search panel) that highlights matches in the currently-loaded page's text layer — scoped to loaded pages only in P1, since full-document PDF text search is P2's FR-BIN-05/06 |
+| Find in this PDF (text-layer only, P1) | `⌘` `F` — **this is pdf.js's own built-in find bar**, with its own default binding, not a control Serat designs or registers in the command registry. It highlights matches in the currently-loaded page's text layer — scoped to loaded pages only in P1, since full-document PDF text search is P2's FR-BIN-05/06. Because it's scoped to the PDF viewer's own focus context, it doesn't collide with any Serat-registered `⌘F` elsewhere (see the master table, `components.md` §7). |
 
 ## Image viewer (FR-BIN-12)
 
@@ -54,6 +55,7 @@ Both viewers open in the same pane an editor tab would occupy — a PDF or image
 ```
 
 - Toolbar: zoom percentage (mono, editable — type a number, `Enter` applies), fit/actual-size buttons, and a zoom slider for continuous adjustment (unlike the PDF's discrete fit modes, a slider is appropriate here because zoom on an image genuinely is continuous).
+- **Rendering, for every format including SVG**: a plain `<img src="serat-asset://…">`, and nothing else. This holds regardless of format — an SVG opened in this viewer is still an `<img>`, never loaded as a document, never as `<object>`/`<iframe>`/inline markup — which is exactly the containment ADR-0017 §6 already specifies for the scheme's own per-response CSP (`sandbox`), stated here again because it's this screen's job to not undermine it by choosing a different embedding element.
 - Pan by drag when zoomed beyond fit; scroll-wheel + modifier (`⌘`+scroll, or pinch on trackpad) zooms toward the cursor position, not the image centre — a small but real usability point ("scales without leaving the app" is the letter of FR-BIN-12; zooming toward the cursor is what makes that pleasant rather than merely present).
 - Transparent images show the checkerboard backdrop (components.md §4) — the only textured background in the system, because it's information.
 
@@ -72,6 +74,8 @@ Both viewers open in the same pane an editor tab would occupy — a PDF or image
 | Zoom in / out | `⌘` `+` / `⌘` `-` |
 | Fit / actual size | `⌘` `0` toggles |
 | Reset pan to centre | `⌘` `⇧` `0` |
+
+Both keyboard maps above are subsets of the single authoritative binding set in `components.md` §7.
 
 ## Responsive rules
 

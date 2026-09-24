@@ -1,7 +1,7 @@
 # Screen: Command palette — every action, its binding, rebindable
 
 Serves: FR-NAV-06, NFR-USE-01
-Design basis: architecture.md §9.3 "The command registry" (P1-05 branch)
+Design basis: architecture.md §9.3 "The command registry"
 
 ## Layout
 
@@ -55,6 +55,8 @@ Rebinding does not happen inside the palette itself (the palette is for *running
 | Confirm captured shortcut | `↵` (auto-confirms on any valid non-modifier-only chord after a short settle, so the user doesn't have to remember to press Enter after pressing the shortcut itself — pressing the intended chord *is* the input) |
 | Cancel rebinding | `Esc` |
 | Dismiss palette | `Esc` |
+
+This table is a subset of the single authoritative binding set in `components.md` §7.
 
 ## Responsive rules
 
