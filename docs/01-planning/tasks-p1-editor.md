@@ -20,7 +20,7 @@ owner: lead
 
 | # | Subject | Owner | Depends on | Status |
 |---|---|---|---|---|
-| 1 | `[P1/req] Split FR-NAV-02 and confirm FR-BIN-02 is a P1 field lookup` | product-analyst | — | in progress |
+| 1 | `[P1/req] Split FR-NAV-02 and confirm FR-BIN-02 is a P1 field lookup` | product-analyst | — | **merged** — PRD v1.5, FR-NAV-08 new (P2) |
 | 2 | `[P1/design] Make the FR-VLT-01 file tree meet 2 s at 20k notes` (ADR-0015) | architect | — | in progress |
 | 3 | `[P1/design] Design the quick switcher and its NFR-PRF-06 budget` | architect | — | pending |
 | 4 | `[P1/design] Specify the P1 read paths: note search, block backlinks, frontmatter lookup` | architect | 1 | pending |
