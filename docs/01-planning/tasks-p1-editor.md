@@ -21,13 +21,13 @@ owner: lead
 | # | Subject | Owner | Depends on | Status |
 |---|---|---|---|---|
 | 1 | `[P1/req] Split FR-NAV-02 and confirm FR-BIN-02 is a P1 field lookup` | product-analyst | — | **merged** — PRD v1.5, FR-NAV-08 new (P2) |
-| 2 | `[P1/design] Make the FR-VLT-01 file tree meet 2 s at 20k notes` (ADR-0015) | architect | — | in progress |
-| 3 | `[P1/design] Design the quick switcher and its NFR-PRF-06 budget` | architect | — | pending |
-| 4 | `[P1/design] Specify the P1 read paths: note search, block backlinks, frontmatter lookup` | architect | 1 | pending |
-| 5 | `[P1/design] Specify editor integration: reconciliation, links/embeds, command registry, split preview` | architect | — | pending |
-| 6 | `[P1/design] Specify assets, sidecars and the viewers' file-serving path` | architect | 1 | pending |
+| 2 | `[P1/design] Make the FR-VLT-01 file tree meet 2 s at 20k notes` (ADR-0015) | architect | — | **merged** e624c20 |
+| 3 | `[P1/design] Design the quick switcher and its NFR-PRF-06 budget` | architect | — | **merged** 487abc3 |
+| 4 | `[P1/design] Specify the P1 read paths: note search, block backlinks, frontmatter lookup` | architect | 1 | **merged** b2d2f1c |
+| 5 | `[P1/design] Specify editor integration: reconciliation, links/embeds, command registry, split preview` | architect | — | **merged** d0d5300 |
+| 6 | `[P1/design] Specify assets, sidecars and the viewers' file-serving path` | architect | 1 | **merged** (this commit) |
 | 7 | `[P1/design] Cut the P1 subset of contracts/ipc.rs` | architect | 2–6 | pending |
-| 8 | `[P1/design] Write P1 screen specs and tokens` | frontend-designer | 3, 5 | pending |
+| 8 | `[P1/design] Write P1 screen specs and tokens` | frontend-designer | 3, 5 | **merged** 8fe20a3 |
 | 9 | `[P1/test] Budget jobs for FR-VLT-01 tree ≤2 s and FR-VLT-04 ≤500 ms` | test-engineer | 2 | pending |
 | 10 | `[P1/test] Budget jobs for the quick switcher (FR-NAV-01, NFR-PRF-06)` | test-engineer | 3 | pending |
 | 11 | `[P1/test] NFR-PRF-02 editor keystroke-latency harness` | test-engineer | 5 | pending |
@@ -48,5 +48,12 @@ owner: lead
 | 26 | `[P1/impl] PDF and image viewers` | vue-frontend-dev | 8, 19 | pending |
 | 27 | `[P1/test] Test cases for every P1 ID + hostile suite` | test-engineer | 12–17, 22–26 | pending |
 | 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol in progress |
+| 30 | `[P1/design] Account for FR-NAV-08 in architecture.md so doclint passes` | architect | 1 | **merged** db1d967 |
+| 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | pending |
+| 32 | `[P1/req] Amend FR-VLT-01 and NFR-PRF-02 to the owner-approved definitions` (PRD v1.6) | product-analyst | 2, 5 | in review |
+| 33 | `[P1/impl] Implement ADR-0016 patch-set application and edit-script in serat-vault` | rust-core-dev | 5 | pending |
+| 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | in progress |
 
-Every branch is reviewed by code-reviewer before merge.
+Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
+
+**Owner rulings recorded during P1 (2026-09-24):** gate reaches for any post-P1 capability are logged and counted, not gate-failing; FR-VLT-01 is re-defined as the complete tree timed from window paint (ADR-0015); NFR-PRF-02 is re-defined as ≥95% of keystrokes painted in the first frame (architecture §9.3), because the old "p95 < 16 ms" is unmeetable at 60 Hz (a bare contenteditable measures 17.1 ms).

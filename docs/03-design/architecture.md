@@ -7,7 +7,7 @@ derived_from: Serat Design Description 1.0 (design baseline, August 2026) — or
 
 # Architecture Overview — Serat
 
-**Owner:** Sujanto (architect role) · **Version:** 1.0 (design baseline) · **Status:** Baselined, pre-P0 · **Upstream:** `docs/02-requirements/prd.md` (138 requirements at PRD v1.5; 135 at the design baseline) · **Decisions:** 15 ADRs in `adr/` (0001–0010 baseline; 0011–0015 from P0–P1)
+**Owner:** Sujanto (architect role) · **Version:** 1.0 (design baseline) · **Status:** Baselined, pre-P0 · **Upstream:** `docs/02-requirements/prd.md` (138 requirements at PRD v1.5; 135 at the design baseline) · **Decisions:** 17 ADRs in `adr/` (0001–0010 baseline; 0011–0017 from P0–P1)
 
 How the requirements are actually built: the crate graph, the indexing pipeline, the query compiler, the write-back patcher, the extraction sandbox and the ten decisions that would be expensive to reverse. The original document has six figures; they did not survive conversion to Markdown and are referenced below by figure number — open the HTML original to see them.
 
@@ -210,6 +210,53 @@ That last step is also what makes the sequence crash-safe, and the property is w
 
 The three `ix_fields_key_*` partial indexes were expected to need help from the query compiler — a redundant `val_date IS NOT NULL` emitted beside every predicate — on the assumption that SQLite's partial-index prover is too limited to infer it. It is not: `=`, `<`, `BETWEEN`, `IN` and a `LIKE` prefix on the typed column all select the partial index unaided. The lowering emits no redundant term. The one shape that cannot use them is a bare `key = ?` with no predicate on the value, which is why a merely *projected* field must be reached through the pivot join on `ix_fields_note_key`, never by selecting on `key` alone.
 
+#### 4.5 P1 read paths — fixed statements, no query language
+
+P1 needs four reads and has no SQ (C-03, ADR-0010: SQ is P2). Each read is a **fixed-shape prepared statement** in a `read` module of serat-index. The statements run on the read-only pool (§2.2), never on the writer (ADR-0001). The user supplies values and never shape: a statement's text is chosen from a closed set in code, and every user string is a bound parameter. Before the index is `Ready`, every read returns the index state instead of rows (`contracts/ipc.rs` rule 1).
+
+**Latency expectations are what task #15's benches report against.** No NFR budgets search or backlinks, so these are **expectations, not gates**. A breach is a finding for architect and product-analyst, not a red build. Each is measured at 20k, with 50k reported beside it.
+
+| Read | Serves | Statement shape | Uses | Expectation (p95, 20k) |
+|---|---|---|---|---|
+| **R1 search** | FR-NAV-02 (P1 half), US-05 | `blocks_fts MATCH ?` ⋈ `blocks` ⋈ `notes` `WHERE notes.kind = 'note'` `ORDER BY rank LIMIT ? OFFSET ?`, returning path, title, block id, kind, `heading_path`, `byte_start`/`byte_end`, `notes.hash`, `snippet(…)` and the rank | `blocks_fts` | ≤ 100 ms for the top 50, across a query set that includes the vault's most common terms. #15 reports **the single most common term separately**, as the worst case, rather than letting it disappear into the p95 |
+| **R2 backlinks** | FR-NAV-04, US-03 | `links` ⋈ `notes` (source) ⟕ `blocks` (source block) `WHERE links.dst_note = (SELECT id FROM notes WHERE path = ?) AND links.kind IN ('wiki','embed','md')`, **one row per distinct (source note, source block)**, ordered by source path then block `ord` | `ix_links_dst` | ≤ 20 ms on the vault's highest in-degree note (679) |
+| **R3 property lookup** | FR-STR-03, FR-BIN-02, US-09, US-18 | `key = 'type'` → `notes.type = ?`; any other key → `fields.key = ? AND fields.val_text = ? AND fields.source = 'frontmatter'`; both ⟕ `notes AS asset ON asset.sidecar_path = notes.path` | `ix_notes_type`, `ix_fields_key_text`, `ix_notes_sidecar` (below) | ≤ 20 ms for 500 rows |
+| **R1 + R3** | FR-NAV-02 with one property filter | R1 plus `AND notes.id IN (` R3's note-id subquery `)` | as both | ≤ 100 ms |
+
+**Search syntax, and the closed set it maps to.** The search box accepts free text, `"quoted phrases"` and at most **one** `[key:value]` term — Obsidian's own property-search syntax, so nothing new is learned. Free text only selects R1; a `[key:value]` term only selects R3; both select R1 + R3. A second property term is refused with a message and never silently dropped: statements stay a fixed set of three. Free text becomes an FTS5 query in Rust. Each bare word becomes a quoted FTS5 string (`"word"`, with `"` doubled), phrases stay phrases, and terms are ANDed. User text can therefore never be FTS5 syntax, and a stray `AND`, `*` or `NEAR(` cannot fail or reshape the query. There is no prefix matching in P1: `blocks_fts` has no `prefix=` option, and adding one costs NFR-PRF-04 rebuild time (the DDL's own comment). Search runs on Enter and after 250 ms of idle typing. It is not search-as-you-type; the switcher (§9.2) is.
+
+**Degenerate input never reaches FTS5 as an error.** **An unbalanced `"` is refused, not repaired.** The search panel does not submit while a quote is open ("Close the quote to search a phrase", `docs/03-design/ui/screens/search-panel.md`). If one reaches Rust anyway, `search` returns `SearchOutcome::UnbalancedQuote` without running a statement. There is one behaviour, and it is the screen spec's. A query that tokenises to nothing — only punctuation, only quotes, or empty after removing the `[key:value]` term — returns no rows and a message ("nothing to search for"), without running a statement. If FTS5 still rejects a query, that is a defect: it is shown as the same message and logged, never raised as an error.
+
+**Results never carry HTML.** The snippet is delimited with the control characters U+0002 and U+0003. The front end splits on them and builds **text nodes only**, with `<mark>` elements it creates itself between them. No string from a note is ever inserted as markup (T-09). U+0002 and U+0003 can occur in a note's own text, and there they mis-place a highlight. That is harmless precisely because only text nodes are built, and it is accepted rather than paid for with a second pass over every snippet.
+
+**Location.** A hit carries its block's byte range and the `notes.hash` it was indexed from. Opening a hit maps `byte_start` to `{line, col}` with ADR-0016's function, over the bytes just read, when the hash matches. When it does not match (the file changed since indexing), the block's `ord` is used and the location is marked approximate. It is never a wrong line presented as exact.
+
+**Backlinks detail (FR-NAV-04).** The acceptance case — three paragraphs across two notes gives three entries — is exactly "one row per distinct (source note, source block)": two links in one paragraph are one entry. A link with no source block, from frontmatter such as `owner: [[Person]]`, is one entry labelled *frontmatter*. The excerpt is the block's `text`, cut to 300 characters by Rust. **Unresolved links never appear in any backlinks pane**, because an unresolved link names no note. **Ambiguous names follow §9.3's resolver.** A `[[Meeting]]` with two `Meeting.md` files resolves to the shorter path, and only that note lists it, which is Obsidian's behaviour. Because it is a resolution rule, it must stay current in both directions:
+
+- **A note appears** at path *P*. There are two steps:
+  - **(A1)** `resolve_inbound(P)` (`crates/serat-index/src/apply.rs`) re-resolves the unresolved links whose `dst_path` is one of *P*'s four candidate spellings (path, path without `.md`, file name, file name without `.md`), through `ix_links_unresolved`.
+  - **(A2)** The file-name-resolved links that point at *another* note with the same `file_name` may now prefer *P* as the shorter path. Find those notes through `ix_notes_file_name` and their inbound links through `ix_links_dst`, and re-run the resolver on the ones with no `/` in `dst_path`.
+- **A note disappears** from path *P*. `ON DELETE SET NULL` unresolves its inbound links. They now have `dst_note IS NULL` and a `dst_path` that is one of *P*'s candidates, so A2 **cannot see them** — it walks `dst_note`. **(B1)** Run `resolve_inbound` with the removed path's candidate spellings. That lookup goes through `ix_links_unresolved` and re-points each orphan at a remaining same-named note, or leaves it unresolved. Without B1, the index after a delete differs from the index a rebuild would produce, which is exactly what C-02's *disposable* promise forbids.
+- **A note is renamed** from *P* to *Q* (`rename` in `apply.rs`, which today updates `path` and nothing else). Four steps:
+  1. Set `file_name` as well as `path`.
+  2. **Unresolve the renamed note's inbound links** (`dst_note := NULL WHERE dst_note = id`), because a link written as `[[old/P]]` must stop pointing at *Q*.
+  3. Run B1 for *P*.
+  4. Run A1 and A2 for *Q*.
+  Links whose written target still names the note resolve back to it in step 4, and links written for the old name go to another same-named note or stay unresolved. Every step goes through `ix_links_unresolved`, `ix_links_dst` or `ix_notes_file_name`.
+- **Test:** for each of the three events, compare the index with a fresh rebuild of the same tree.
+- No new index on `links` is added, because every index on `links` costs the rebuild once per link (F-373).
+- This is the per-save half of §3.1's third-caller rule. **Neither step runs during a bulk load**, where the rebuild's single final `resolve_links` pass supersedes both (F-371).
+
+**Property lookup detail (FR-STR-03, FR-BIN-02).** List values are one `fields` row per item, so `[tags:x]` matches an item. **Values compare case-insensitively (ASCII fold, `COLLATE NOCASE`), as Obsidian's property search does — except `type`.** Keys compare exactly. **`[type:x]` compares exactly** and uses `ix_notes_type`. A `NOCASE` comparison would make that partial index unusable, and indexing it `NOCASE` would stop it serving P2's binary `type = ?` lowering (§4.4). A type is also the name of a type note, which the P2 schema registry matches exactly. So `[type:Contract]` does not find `type: contract`, and the search panel should say so in its hint, which is frontend-designer's to add. The key prefix of `ix_fields_key_text` still selects the rows, and the value comparison becomes a filter over one key's rows; #15's benchmark checks that against the 20 ms expectation, using the vault's largest key (`tags`). Non-ASCII case is not folded in P1, which is the same limit as link resolution. Inline fields (`key:: value`) are FR-STR-04's and P2's, so R3 filters `source = 'frontmatter'`. **A sidecar hit is returned as its asset.** When the matching note is some asset's sidecar (ADR-0005: `x.pdf.md` for `x.pdf`), the row returned is the asset's path, kind and MIME, with the sidecar path beside it. That is FR-BIN-02's "the PDF is returned as a typed row". It needs `notes.sidecar_path` populated (task #17, per §7) and one partial index, `ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL`. That index holds at most one entry per asset (200 in the benchmark vault), so its rebuild cost is negligible. It lands with task #17's writer, not before — an index nobody reads is a cost with no counterweight.
+
+**Block references need no new index.** `[[note#^id]]` looks for `blocks.block_ref = ?` within one note, and `UNIQUE(note_id, ord)` already indexes `note_id` as a prefix, so the lookup is a scan over one note's dozen blocks. The DDL header's planned `ix_blocks_ref` is withdrawn on that ground. **Case-insensitive link resolution (§9.3) is one change in five places, all in one commit (task #15).** A partial change is F-371 again: any comparison left in one collation while its index is in the other turns the per-link join into a scan.
+
+1. `ix_notes_file_name` becomes `COLLATE NOCASE`.
+2. A new `ix_notes_path_nocase ON notes(path COLLATE NOCASE)` serves the `n.path = links.dst_path` comparisons. `notes.path`'s `UNIQUE` index is binary, and a NOCASE comparison cannot use it. The new index covers 20,000 rows, not 217,000 links.
+3. `ix_links_unresolved(dst_path)` becomes `COLLATE NOCASE`. It is dropped and recreated around the bulk load, so the rebuild pays nothing for the change.
+4. Every comparison in `resolve_links` and `resolve_inbound` — `n.path`, `n.file_name` and `dst_path IN (…)` — becomes `COLLATE NOCASE`.
+5. The rebuild benchmark runs in the same PR.
+
 ## Key flows
 
 ### Indexing
@@ -393,6 +440,15 @@ The case that decides the design
 
 You are editing line 400. Claude Code rewrites the frontmatter at line 3. With a document replacement you lose your place and your undo history; with an edit script you do not notice. Every reconciliation decision follows from wanting the second outcome.
 
+##### What P1 specifies (ADR-0016)
+
+The paragraphs above assumed a buffer with no unsaved changes. ADR-0016 covers the case they skip, and it also fixes the save direction, because both directions have to use the same coordinates:
+
+- **Coordinates.** `{line, col}` in the base document. Lines split on `\r\n`, `\n` and a lone `\r`, exactly as CodeMirror splits them. `col` is in UTF-16 code units. One pure function in serat-vault maps a position to a byte offset.
+- **The edit script** is computed in Rust by serat-vault: a line diff with character refinement, under a 50 ms deadline. serat-app emits it for any open note whose disk hash differs from the buffer's base hash, so an echo of Serat's own save is a no-op without any echo logic.
+- **Applying it.** A clean buffer takes it as a transaction with `addToHistory(false)`: the cursor and undo are mapped through it, and undo never reverts someone else's edit. A dirty buffer whose changes are disjoint from the external ones takes the mapped edits and stays dirty. Overlapping changes are a **conflict**: nothing is applied, and a non-modal notice offers *Keep mine* / *Take theirs* (undoable) / *Compare*. Nothing is lost silently.
+- **Saves are patch sets against the base hash, never whole documents.** CodeMirror joins lines with `\n`, so a whole-document save would rewrite every line ending of a CRLF or mixed-ending note — the re-serialisation C-04 forbids. `write_file` now only creates notes.
+
 #### 3.4 Cold start, and how a broken index is noticed
 
 Two requirements meet on this path and pull in opposite directions. NFR-PRF-01 wants an interactive window in 400ms and a usable vault in one second at 20,000 notes. NFR-REL-02 wants a corrupt index detected and rebuilt with no user action beyond restarting. Every thorough way of detecting corruption costs more than the entire window budget, so the two are reconciled by deciding what is checked *when*, rather than by checking less.
@@ -434,7 +490,7 @@ A budget that is not defined as two observable events is a number that flatters 
 |-------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `t0`        | Process spawn, taken by the harness from outside the process.                                                                                                | Not `Instant::now()` in `main`. The loader, the DLLs and the webview runtime are real cost the user waits through, and a t0 inside `main` hides exactly the part we do not control. The app also records its own `main` entry, so the pre-`main` gap is visible rather than absorbed. |
 | `t_visible` | The first frame the webview actually paints, signalled by the front end from the first `requestAnimationFrame` after the shell mounts.                        | Not window creation. Window creation is much cheaper and would pass 400ms while shipping a blank rectangle. This is test-engineer's trap and they are right about it.                                                                                                              |
-| `t_usable`  | The **latest** of: the open check having finished, so the index state is known; the file tree's **first listing (the root)** having been applied and painted by the front end — the mark `tree_first_screen`, from P1, per ADR-0015 §5 (proposed); P0, with no tree, used `buffer_rendered`, which leaves `t_usable` and stays in the trace as a reported mark; the watcher having settled; and the window having painted. | Not "the index is open". A vault that is usable but unwatched silently misses every edit made in that window, which is a correctness bug dressed as a faster number.                                                                                                              |
+| `t_usable`  | The **latest** of: the open check having finished, so the index state is known; the file tree's **first listing (the root)** having been applied and painted by the front end — the mark `tree_first_screen`, from P1, per ADR-0015 §5; P0, with no tree, used `buffer_rendered`, which leaves `t_usable` and stays in the trace as a reported mark; the watcher having settled; and the window having painted. | Not "the index is open". A vault that is usable but unwatched silently misses every edit made in that window, which is a correctness bug dressed as a faster number.                                                                                                              |
 
 The watcher clause is load-bearing and is why it is in the definition rather than in a note. It also fixes an ordering: the watcher is registered before the walk, so nothing that changes during startup is lost. "Settled" rather than "registered", because a watcher that failed to start is a supported outcome — a vault with no watcher is stale, not broken (goal 5) — and the trace records which it was, since a usable figure taken without a watcher is not comparable to one taken with.
 
@@ -749,7 +805,7 @@ Recorded because an absent ADR should read as a judgement rather than an oversig
 
 > The costs above were measured on a development machine, not on the reference machine, and through a Python harness rather than the real pipeline. They are three orders of magnitude apart, so the decision is safe; the numbers that go into the baseline are T2's, on the benchmark vault.
 
-#### 3.5 The file tree (FR-VLT-01, ADR-0015 — proposed until the PRD carries its acceptance wording)
+#### 3.5 The file tree (FR-VLT-01, ADR-0015)
 
 P0 measured FR-VLT-01 at 4180 ms median / 8099 ms p95 at 20k (F-193). That figure ran from process spawn, so it carried ADR-0014's platform term (1117 / 1687 ms), and it predates F-12's lexical strip; what was left was the shape — a walk that returns a sorted `Vec` makes the first row visible only when the last one is found. ADR-0015 removes the shape and moves the clock. The mechanism in one paragraph:
 
@@ -842,6 +898,25 @@ The index is disposable by principle. Re-OCRing four hundred scanned PDFs is not
 
 When no extractor claims a file, the asset still indexes with its sidecar and stays typed, linkable and queryable — only full-text search over its contents is unavailable. ExtractionState::Unavailable is a normal value in the IPC contract, not an error, and the UI shows it as a fact about the file rather than as a failure.
 
+#### 7.4 P1: assets without extraction (FR-BIN-01/02/03, FR-VLT-08, FR-BIN-11/12)
+
+P1 indexes, pairs, lists and displays binaries. It does not extract them (P2), so every mechanism below works on metadata and on bytes served untouched.
+
+- **Asset rows (FR-BIN-01).** An asset is a `notes` row with `kind = 'asset'`, as today (`upsert_asset`). A new table `assets(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE, mime TEXT NOT NULL, bytes INTEGER NOT NULL)` carries MIME and size. It is the P1 slice of the table the DDL header already names; the extraction columns arrive with P2's schema change, which under ADR-0002 costs a rebuild and nothing else. **MIME comes from the file extension**, through one table in `serat-core` (unknown extensions become `application/octet-stream`). Sniffing content was rejected: it would read every binary on every rebuild, a per-file I/O cost on NFR-PRF-04's path, for a distinction P1 displays and does not act on. Size comes from the walk's stat, which is already in `SourceEntry`. Both the rebuild and the incremental path write the row in the same `upsert_asset` call, so no second path exists. The DDL lands with task #17 as one change that bumps `user_version`.
+- **Sidecar association (FR-BIN-02, ADR-0005).** The pairing is derived from names alone: `x.pdf.md` is `x.pdf`'s sidecar when both exist in one directory. The names are compared **byte for byte**, deliberately: `X.PDF` and `x.pdf.md` are not a pair (ADR-0017 records why). It is recorded as `notes.sidecar_path` on the asset row, and nothing is copied from the sidecar to the asset. The sidecar stays an ordinary note, carrying its own `type` and fields, and R3 (§4.5) reaches the asset through the join. **In a rebuild** one `UPDATE` pairs every asset after the load, beside `resolve_links`. It touches only the ~200 asset rows through `notes.path`'s unique index, so NFR-PRF-04 pays nothing measurable. **Incrementally**, upserting a note whose path is `<asset path>.md` sets that asset's `sidecar_path`; upserting an asset checks for its sidecar; deleting either clears the pairing. Each is one lookup through the same unique index.
+- **Paired presentation (FR-BIN-03).** The fold happens in Rust, in the pure listing function ADR-0015 puts in `serat-core`. When a directory holds `x.pdf` and `x.pdf.md`, its listing carries one entry, `x.pdf` with kind `asset` and `sidecar: true`, and no entry for `x.pdf.md`. Creating or deleting the sidecar sends one `TreeUpsert` for the asset entry, and deleting the asset sends a `TreeUpsert` that turns `x.pdf.md` back into an ordinary note entry. Because the index and the walk share the function, they cannot disagree about a fold. The sidecar remains a note everywhere else: in the switcher, search and backlinks. Opening a folded entry opens the viewer with the sidecar available as its metadata note.
+- **Attachments are listed and linkable (FR-VLT-08).** Listings include assets. Inserting a link to one — a command on the tree entry, or dragging it into the editor — writes the shortest resolving form of §9.3: `![[name.png]]` for an image or PDF, `[[name.ext]]` for anything else.
+- **Viewer bytes (FR-BIN-11, FR-BIN-12): ADR-0017 (proposed).** Bytes come through one read-only custom scheme, `serat-asset`. The handler:
+  - accepts GET and HEAD only, on host `localhost`, and decodes the path exactly once;
+  - builds the path under task #34's rules (no `:`, no device names, no trailing dot or space), and **must not ship before #34 lands**;
+  - serves viewable types only (PDF and images);
+  - resolves every request through `Vault::resolve` and checks `starts_with(root)`, then re-verifies the opened handle's real path and requires `is_file()` (T-10);
+  - sends CORS for the exact app origin only;
+  - serves PDFs in spans capped at 1,000 KiB, with pdf.js given its length from `assets.bytes`, set to `disableStream`/`disableAutoFetch`, and sending `If-Range`;
+  - serves images whole up to 64 MiB, because `<img>` sends no `Range`; a larger image gets 404 and "couldn't be displayed";
+  - sends `nosniff` and a sandboxing per-response CSP.
+  The app CSP gains that one first-party origin in `img-src` and `connect-src`, and nothing else. pdf.js, with its worker, cMaps and fonts, is bundled and runs without `eval` and with `enableScripting: false`, so the viewers make no network request (NFR-SEC-01). Content from the scheme is a remote origin to Tauri and can invoke no IPC command. **If a webview will not deliver a custom-scheme 206**, that platform falls back to a span-serving `read_asset_range` command with the same checks, so PDFs still load per page (ADR-0017 §Fallback).
+
 ### AI retrieval and MCP
 
 Three separable pieces: retrieval, which is always local; generation, which is provider-agnostic; and exposure, which is the MCP server. Only the middle one ever touches the network.
@@ -922,7 +997,7 @@ At most 50 results, by partial selection rather than a full sort. Each result ca
 - **Why it is not in `index.db`:** it is not derived from the vault and cannot be re-derived, so putting it in the index would make a rebuild destroy it. The rebuild removes only `index.db`, `-wal` and `-shm` (`crates/serat-index/src/rebuild.rs`), so a sibling file survives it — which makes *"degrades to lexical after a rebuild"* unnecessary rather than merely acceptable. It is lost only when the user deletes `.serat/`.
 - A rename done in Serat moves the key. A rename done outside Serat loses that note's history, which is acceptable for a ranking signal.
 
-**Freshness.** The corpus is an immutable snapshot swapped atomically by generation. It is built when the index publishes `Ready`, and rebuilt on a background thread 500 ms after the last `index.changed`, so queries never wait for a refresh and results are at most about a second stale. **Before `Ready`** — first open, or a rebuild — the snapshot is built from the paths the vault thread has already enumerated for the file tree: paths and file names only. That holds whichever tree-delivery design lands. ADR-0015 (proposed) is the one expected, and under it the source is its directory listings. So the switcher works from the first listing, and gains titles, aliases and headings when the index arrives (goal 5).
+**Freshness.** The corpus is an immutable snapshot swapped atomically by generation. It is built when the index publishes `Ready`, and rebuilt on a background thread 500 ms after the last `index.changed`, so queries never wait for a refresh and results are at most about a second stale. **Before `Ready`** — first open, or a rebuild — the snapshot is built from the paths the vault thread has already enumerated for the file tree: paths and file names only. That holds whichever tree-delivery design lands. Under ADR-0015 that source is its directory listings. So the switcher works from the first listing, and gains titles, aliases and headings when the index arrives (goal 5).
 
 **Stale responses.** Each query carries a sequence number. The Rust side answers the newest query and discards any older one still waiting; the front end drops any response whose sequence is not its latest. A slow keystroke therefore never paints over a faster one.
 
@@ -941,6 +1016,81 @@ At most 50 results, by partial selection rather than a full sort. Each result ca
 **A run is rejected, not recorded, unless:** `.serat/history.json` is in a declared state — absent, or a fixed fixture committed with the query file — and the run line names which, because frecency changes the order and a history left over from a developer session is per-machine state (F-169's shape); every query constructed from a known note returns that note in its top 10 — a switcher that returns nothing is fast, which is F-19's shape — every no-match query returns zero results, and the number of measured keystrokes equals the number of queries.
 
 **No ADR.** Every choice here sits behind one command and one module. The one on-disk artifact, `.serat/history.json`, is disposable by construction: changing its format costs users their ranking once and nothing else.
+
+#### 9.3 The editor (FR-EDT-01/02/03/10, FR-NAV-06, NFR-PRF-02)
+
+Designed in P1 (task #5). Saving and reconciliation are ADR-0016 and §3.3. Everything else is below. **The editor has no IPC on the keystroke path.** Saves are debounced and asynchronous, link resolution is batched per viewport, and the preview render is scheduled off the keystroke. This is design goal 2 stated as a rule a reviewer can check.
+
+##### Decorations (FR-EDT-01, FR-EDT-02, ADR-0006)
+
+- **Parse.** Lezer markdown through `@codemirror/lang-markdown` with the GFM extensions (tables, task lists, strikethrough, autolinks). Custom inline extensions for what Lezer lacks: footnotes, `[[wikilink]]`, `![[embed]]`, `^block-id`, `key:: value`, and `==highlight==`. The parse is incremental, and it is time-sliced by CodeMirror, so a long note never parses on one keystroke.
+- **Inline decorations** come from a `ViewPlugin` over `view.visibleRanges` only, so their cost follows the viewport rather than the note. The previous `DecorationSet` is mapped through each change, and only the changed lines plus newly visible ranges are recomputed.
+- **Block widgets** — tables, embeds, callouts — come from a `StateField`, because CM6 permits block decorations only from state. Each widget implements `eq` so that an unchanged table is never rebuilt in the DOM.
+- **Reveal rule (FR-EDT-02).** Syntax markers are `Decoration.replace`d except on lines that intersect any selection range. A selection change recomputes only the lines it enters and leaves, which is how "within one frame" is kept.
+- **Obsidian syntax that Serat does not render** (for example Dataview blocks and plugin fences) is left as source text. It is never rewritten (C-01, NFR-CMP-01).
+
+##### Links and embeds (FR-EDT-03, NFR-CMP-01)
+
+**Resolution has one implementation, in serat-index, used by the writer and by the editor.** A link resolves by:
+
+1. the vault path exactly, with or without `.md`;
+2. then, only if the target has no `/`, the file name anywhere in the vault. Ties go to the shortest path, then byte order. This is the rule `resolve_links` already implements (`crates/serat-index/src/writer.rs`).
+
+**Matching is case-insensitive, as Obsidian's is.** The current SQL compares with `=`, so `[[my note]]` does not resolve to `My Note.md` today. The change is `COLLATE NOCASE` on both the comparison and `ix_notes_file_name`, and the two **must land in one commit with the rebuild benchmark**: either change without the other turns the per-link join into a scan, which is F-371 again. NOCASE folds ASCII only. Non-ASCII case differences stay unresolved in P1, and that is recorded rather than approximated. **Task #12's compatibility corpus is the check of both rules against Obsidian.** Where Obsidian disagrees, Obsidian wins, and the rule changes in this one place.
+
+**Subpaths.** `#Heading` matches a heading of the target case-insensitively; `#A#B` matches `B` under `A`; `#^id` matches `blocks.block_ref`; `[[#Heading]]` targets the current note. `|text` is display text only. An unresolved link renders as unresolved and is never "fixed" in the file.
+
+**The editor resolves through one batched command per viewport change.** Results are cached for the session and invalidated by `index.changed`. Before the index is `Ready`, links resolve by file name against the ADR-0015 tree listings (goal 5).
+
+**Autocompletion.** `[[` followed by two characters queries the §9.2 switcher in link mode: same corpus, same ranking. Choosing an entry inserts the shortest link that resolves back to it — the file stem if its name is unique, otherwise the vault path without `.md`. Then `#` completes that note's headings and `^` its block ids. FR-EDT-03's "inserts a resolving link" is tested by re-resolving every inserted link.
+
+**Embeds.** `![[note]]`, `![[note#Heading]]` and `![[note#^id]]` render the target's Markdown read-only, as a block widget, through the preview renderer below. Nesting is capped at depth 2 and cycles render as a link. `![[image.png|300]]` renders the image through the asset path of task #6. PDFs and other binaries render as a link chip that opens the viewer (FR-BIN-11). The widget yields to raw source when the selection enters its line, as any other syntax does.
+
+##### The preview renderer, and what it may not do (T-09)
+
+Split preview and embeds share one renderer: `markdown-it` with GFM, footnote and wikilink plugins, plus the resolver above. That makes three Markdown parsers — comrak for the index, Lezer for the editor, markdown-it for preview. They are kept rather than unified because each one is the standard tool for its job. Their divergence is checked by task #12's corpus rather than assumed away.
+
+**Rendered HTML passes a strict allowlist sanitiser before it reaches the DOM.** It keeps no `<script>`, no event-handler attributes, no `style` attributes, no `iframe`, `object` or `embed`, and no `javascript:` or `data:` URL of any kind. An inline `data:image/*` renders as a labelled placeholder, like a remote image. That keeps the app CSP free of a `data:` source: its only P1 addition is ADR-0017's `serat-asset` origin. **It loads no remote resource**: a remote image renders as a labelled placeholder with its URL, and is never fetched (NFR-SEC-01). The CSP in `tauri.conf.json` (`default-src 'self'`) already refuses both, so the sanitiser is the first barrier and the CSP the second. A note is untrusted input: git, sync tools and agents all write into the vault.
+
+**Navigation is guarded separately, because the CSP does not cover it.** A rendered `<a href="https://…">` that the webview follows would navigate the app window to a remote origin. The window would then be showing remote content, which breaks NFR-SEC-01, and `connect-src` does not stop a top-level navigation. So:
+
+- **serat-app installs an `on_navigation` handler on every webview.** It refuses every URL that is not the app's own origin: `tauri://localhost` and `http://tauri.localhost`, plus the dev server in debug builds only.
+- **The front end intercepts clicks on rendered external links** (`http`, `https`, `mailto`). A click hands the URL to the system browser through the opener plugin, and only on that explicit click. **The opener capability is scoped to exactly those three schemes (ADR-0012)**: `file:`, custom schemes and anything else are refused by the capability itself, not only by the front end. Hovering shows the URL, and nothing ever opens one automatically.
+- Internal wikilinks never navigate the webview. They are routed by the editor.
+- `window.open` and new-window requests are refused the same way.
+
+The guard is part of T-09, and #12's hostile corpus includes an external link, a `javascript:` link and a meta-refresh, each of which must leave the window on the app origin.
+
+##### Split preview (FR-EDT-10)
+
+With `editor.live_preview = false`, the editor is source mode (syntax highlighting only) beside a read-only rendered pane. The pane re-renders 150 ms after the last change. The render is scheduled in idle time and chunked, so a 5,000-line note never renders in one frame. Scroll sync maps source lines to the rendered blocks' `data-line` attributes. Editing capability is identical in both modes, because it is the same editor.
+
+##### The command registry (FR-NAV-06, NFR-USE-01)
+
+One front-end module owns every user-invocable action: `register({ id, name, defaultBinding?, when?, run })`. The palette lists the registry with each command's effective binding. **The CodeMirror keymap is built from the registry**, including the default editing and history commands, which are re-registered under Serat ids. `keymap.of` appears in exactly one place, and a test asserts that. User rebindings live in the settings TOML (FR-PLT-05) under `[keybindings]`, keyed by id. A unit test asserts that ids are unique, that every command has a name, that no two commands share a binding in the same `when` context, and that every entry in the NFR-USE-01 primary-action list is registered. That test is the "Inspect" the requirement names, made repeatable.
+
+##### NFR-PRF-02: what is measured — frames, not milliseconds
+
+**"Keystroke to paint ≤ 16 ms at p95", read literally, cannot be met at 60 Hz by any editor.** A keystroke lands at a random point in a 16.7 ms frame, so the wait for the next vsync alone averages 8 ms and reaches about 16 ms at p95. code-reviewer measured it on a **bare `contenteditable`**: timestamp to the next main-thread paint was 17.1 ms p95, and 16.2 ms of that was the vsync wait. An earlier draft of this subsection used the Event Timing API's `duration`, which contains the same wait and would have failed a bare `contenteditable` too. It is withdrawn. **16 ms is one frame at 60 Hz, so the requirement is read as a frame budget.**
+
+**Binding: at least 95% of keystrokes are painted in the first frame after the keystroke, in every scenario, in a 5,000-line note.** In other words, the p95 of `frames_to_paint` is 1, and the worst scenario gates. The figure is independent of refresh rate and of how fast the machine is at anything but our own work. That is what a user perceives: typing either keeps up with the display or it drops frames.
+
+- **Frames.** A continuous `requestAnimationFrame` loop records each frame's `rAF` timestamp `ts_i` and when its callback ran. Before the run, the harness measures the refresh interval `R` as the median of 120 consecutive deltas, and records it.
+- **The keystroke's frame.** For a keystroke with event `timeStamp` `t`, let `p` be the end of its processing: the `keydown`/`input` handlers plus CodeMirror's synchronous view update, stamped at the end of the dispatch. **The change is in frame `k`, the first frame whose `rAF` callback runs after `p`**, and `ts_k` is that frame's timestamp. It is not the first frame whose *start* is after `p`. Rendering follows the `rAF` callbacks, so input processed between a frame's timestamp and its callback is painted in that same frame. The start-based rule mis-scored about 5–8% of keystrokes as late (code-reviewer's measurement), and it is withdrawn.
+- **`frames_to_paint`** is the number of frame timestamps in `(t, ts_k]`, **clamped to at least 1**. `ts_k` can precede `t` when the keystroke arrived after that frame's timestamp but before its callback, and that is still an on-time paint. It is **1** when the change is painted in the first frame that could hold it. **If frame `k` itself runs long** (`ts_{k+1} − ts_k > 1.5 R`), the paint missed its vsync and `frames_to_paint` gains one.
+- **Keystrokes are driven through the browser's input pipeline** with Playwright's `keyboard.press` (CDP `Input.dispatchKeyEvent`), never by synthesised DOM events. The cadence is fixed at 100 ms between keystrokes and is recorded.
+
+**Diagnostic (b), reported and not gated:** the editor's own work per keystroke, in milliseconds. That is handler time (`p − processingStart`) plus frame `k`'s rendering: from its `rAF` callback to a post-paint timestamp taken by a `MessageChannel` message posted inside frame `k`'s `rAF` callback. It excludes the vsync wait by construction, and it is the number to look at when the frame metric fails.
+
+**Control arm, required on every run.** A bare `contenteditable` goes through the same harness, scenarios and cadence. It must show **≥ 99%** of keystrokes on time, or the run is rejected: a harness or machine that cannot show a trivial editor keeping up cannot judge ours.
+
+**Acceptance wording offered to product-analyst (task #32):** *"Given a 5,000-line note in the editor, when each benchmark scenario is typed through the browser's input pipeline, then at least 95% of keystrokes are painted in the first display frame after the keystroke, in every scenario, and a bare-contenteditable control arm on the same run is at 99% or better; the editor's own per-keystroke work is reported beside it."* The requirement's statement would read *"A keystroke's change shall be painted in the first display frame after it (16 ms is one frame at 60 Hz) for at least 95% of keystrokes in a 5,000-line note."*
+
+The harness runs Playwright/Chromium against the production vite build, with the IPC client stubbed. The keystroke path makes no IPC call. Asynchronous replies still land on frames, though: the debounced save, the batched link resolution and a switcher-mode completion. So the stub answers each with **latencies recorded from the real binary** (a table of per-command p50/p95 captured once per build), rather than instantly. A reply that lands mid-typing is then inside the measurement, as it would be for a user.
+
+- **Note.** A generated 5,000-line note: paragraphs dense with wikilinks, 50 GFM tables, task lists, footnotes, fenced code, headings every ~40 lines, a CRLF variant and a BOM variant. It lives with the harness, because the benchmark vault's notes average about 2 KiB.
+- **Scenarios**, each at least 500 keystrokes with the viewport at the cursor: typing at the start, the middle and the end; typing inside a table cell; typing in a link-dense paragraph; Enter mid-note; Backspace across a bold delimiter (reveal/hide); and continuous typing in split-preview mode, so that a preview render landing on a frame is inside the measurement.
+- **Basis.** Chromium on the harness machine. It is the same engine as WebView2, not the same process, and WKWebView and WebKitGTK are not measured (F-96's basis clause). Every figure carries that basis.
 
 ## Cross-cutting concerns (packaging, security, verification)
 
@@ -991,12 +1141,12 @@ The remaining Must-priority requirements have designs that are the obvious ones,
 
 | Requirements                               | Design                                                                                                                                                                                                       |
 |--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| FR-EDT-01, FR-EDT-03, FR-EDT-05, FR-EDT-08 | CodeMirror 6 with custom Lezer nodes for wikilinks, embeds, block refs and inline fields; per ADR-06 and §3.3 for the reconciliation half. Undo integration is the transaction path already described in §6. |
-| FR-NAV-06, FR-VIW-01                       | Command palette over the same registry the keybinding table uses; TanStack Table over the streamed rows and anchors defined in contracts/ipc.rs.                                                             |
+| FR-EDT-01, FR-EDT-03, FR-EDT-05, FR-EDT-08 | CodeMirror 6 with custom Lezer nodes for wikilinks, embeds, block refs and inline fields; per ADR-06, §9.3 for the P1 specification (decorations, resolution, embeds, completion) and §3.3 / ADR-0016 for reconciliation and saves. Undo integration is the transaction path already described in §6. |
+| FR-NAV-06, FR-VIW-01                       | Command palette over the same registry the keybinding table uses (§9.3, *The command registry*); TanStack Table over the streamed rows and anchors defined in contracts/ipc.rs.                                                             |
 | FR-STR-01, FR-STR-02                       | The schema registry described in §2.1 as a trait in serat-core, loaded from type notes and invalidated by the same index.changed events views use.                                                           |
 | FR-LNS-01, FR-LNS-05, FR-LNS-07            | Lenses, tasks and dashboards are all ordinary notes parsed by ordinary rules; a lens is an SQ predicate, a task is a block, a dashboard is a note with query blocks. No new mechanism.                       |
-| FR-BIN-11, FR-BIN-12                       | Bundled PDF and image viewers in the webview, opened at the locator a search hit carries.                                                                                                                    |
-| FR-VLT-03, FR-VLT-08                       | Temp-file-and-rename in serat-vault, described in §6.1 step 5; assets are listed by the same walk that finds notes.                                                                                          |
+| FR-BIN-11, FR-BIN-12                       | Bundled PDF (pdf.js, no network, no `eval`) and image viewers in the webview, fed by the read-only `serat-asset` scheme of §7.4 and ADR-0017, opened at the locator a search hit carries. |
+| FR-VLT-03, FR-VLT-08                       | Temp-file-and-rename in serat-vault, described in §6.1 step 5 (editor saves: ADR-0016); assets are listed by the same walk that finds notes, and linked by the shortest resolving form (§7.4). |
 | FR-AIX-06, FR-AIX-11, FR-AIX-12            | One provider trait with two implementations; retrieval never depends on which. Absence of a provider disables generation and nothing else, and no model ships in the installer.                              |
 | NFR-CMP-01, NFR-CMP-02                     | `.obsidian/`, `.trash/` and `.serat/` are in serat-vault's ignore list — descended into by nothing, read by nothing, written by nothing — so an Obsidian vault opens unmodified and its configuration survives a session. And everything Serat does write is Markdown, YAML or documented plain text, which falls out of the first design goal. |
 
@@ -1019,6 +1169,8 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0013 — When a merge may proceed with a performance budget red (serves C-06, NFR-PRF-04, NFR-MNT-01)
 - ADR-0014 — Cold start is budgeted as two terms, one of which is not ours (serves NFR-PRF-01, C-06, C-07, NFR-PRF-08)
 - ADR-0015 — The file tree arrives as complete directory listings, on a clock that starts at the painted window (serves FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04)
+- ADR-0016 — Editor saves are patches against a base, and external changes arrive in the same coordinates (serves FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04)
+- ADR-0017 — Vault bytes reach the webview through one read-only custom scheme (serves FR-BIN-11, FR-BIN-12, NFR-SEC-06, NFR-SEC-01)
 
 ## Traceability
 
@@ -1035,6 +1187,8 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | NFR-PRF-03's measurable interval, and the branch a serat-index-scoped harness cannot see | §3.1.1 *What NFR-PRF-03's benchmark may enter*, F-382, F-19 | NFR-PRF-03, NFR-PRF-08, C-06 |
 | Echo suppression                        | §3.2                       | FR-VLT-06                                                                     |
 | Diff-based reconciliation               | §3.3                       | FR-VLT-05                                                                     |
+| Editor saves as patch sets; reconciliation with unsaved edits; the conflict path | §3.3, ADR-0016 | FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04 |
+| Editor: decorations, link resolution and embeds, preview sanitiser, split preview, command registry, NFR-PRF-02 measurement | §9.3, threat-model.md T-09 | FR-EDT-01, FR-EDT-02, FR-EDT-03, FR-EDT-10, FR-NAV-06, NFR-PRF-02, NFR-USE-01, NFR-CMP-01, NFR-SEC-01 |
 | Cold-start path and phase budgets       | §3.4                       | NFR-PRF-01, FR-VLT-01                                                         |
 | Cold-start term split: the seven-term partition, the attribution rule, and which terms bind | §3.4 *The split*, ADR-0014, `crates/serat-app/src/startup.rs` | NFR-PRF-01, NFR-PRF-08, C-06, C-07 |
 | Scale independence: which series carries the 20,000-vs-50,000 assertion, and which is reported beside it | §3.4 *Ruling (task #118)*, ADR-0014 §Decision 3, `bench/budget/src/lib.rs` | NFR-PRF-01, NFR-PRF-08, C-06 |
@@ -1043,6 +1197,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
 | Vault identity: what `index_meta.vault_root` compares, and what a mismatch may cost | §3.4 *Ruling (task #120)*, `schema/001_init.sql` (index_meta.vault_root), ADR-02 | FR-VLT-02, NFR-REL-02, NFR-PRF-04, C-02 |
 | Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, FR-NAV-08, NFR-PRF-05 |
+| P1 read paths: search, backlinks, property lookup (fixed statements, one search syntax, sidecar-as-asset, re-resolution on note create/delete) | §4.5 | FR-NAV-02, FR-NAV-04, FR-STR-03, FR-BIN-02, C-03 |
 | Rebuild-not-migrate                     | §4.3, ADR-02               | FR-VLT-02, NFR-REL-02                                                         |
 | SQ grammar and type rules               | §5, grammar/sq.ebnf *(planned)* | FR-STR-06, FR-STR-07, FR-STR-09                                          |
 | Lowering algorithm                      | §5.2, grammar/lowering.md *(planned)* | FR-STR-08, FR-STR-12, NFR-PRF-05                                    |
@@ -1051,6 +1206,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, FR-NAV-08, NFR-SEC-03, NFR-REL-03         |
 | Extraction cache                        | §7.2                       | FR-BIN-08                                                                     |
 | Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
+| P1 assets: `assets` table (MIME by extension, size), sidecar pairing by name, paired tree entry, attachment links, viewer bytes via `serat-asset` | §7.4, ADR-0005, ADR-0017, threat-model.md T-10 | FR-BIN-01, FR-BIN-02, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-VLT-08, NFR-SEC-01, NFR-SEC-06 |
 | Path containment: one rule, two enforcement points | §*A symlink is not a vault file*, threat-model.md T-07 | NFR-SEC-06 |
 | IPC command allowlisting: the handler list, the app manifest and the capability must agree | threat-model.md T-08 and §Trust boundaries, ADR-0012 | NFR-SEC-06 |
 | Budget enforcement, and the five conditions under which a red one may be merged past | ADR-0013, §Open design questions | C-06, NFR-PRF-04 |
