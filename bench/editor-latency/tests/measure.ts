@@ -6,51 +6,126 @@
 //
 // Serves NFR-PRF-02: "Keystroke to paint shall not exceed 16ms at p95 in a
 // 5,000-line note." The interval timed, per test-plan.md's rule that every
-// budget names the interval it asserts: from the input event being
-// dispatched to the first frame painted after the resulting DOM/canvas
-// mutation is committed — not from the event handler returning, which is
-// not the same moment and would understate the number the user experiences.
-import type { Locator } from "@playwright/test";
+// budget names the interval it asserts: from the *trusted* keydown event's
+// own `timeStamp` (t0) to the first macrotask the event loop runs after
+// that frame's rendering — style, layout, paint — step completes (t1), per
+// the HTML spec's "update the rendering" steps. A macrotask (here, a
+// `MessageChannel` message) posted from *inside* the `requestAnimationFrame`
+// callback that follows the keystroke fires only once rendering for that
+// frame has finished, so it observes "painted" without waiting for a whole
+// extra frame the way a second `requestAnimationFrame` callback would (that
+// fires on the *next* frame, after rendering, and was this file's original
+// bug: it added close to one full frame — ~16.7ms at 60Hz — to every
+// sample, which is the size of the entire NFR-PRF-02 budget, so the budget
+// was red by construction regardless of editor performance).
+//
+// **Known limit, stated rather than hidden:** this technique is accurate to
+// the browser's own frame cadence — if the renderer coalesces or skips a
+// frame under load, or composites/presents to the screen on a separate
+// thread some interval after the main-thread rendering step this measures,
+// that gap is not observed. It is not a substitute for CDP frame-presentation
+// tracing, which is the third option available if this figure and a real
+// user's experience diverge enough to matter; kept as plain page-script
+// timing for now because it needs no CDP session and stays comparable to
+// `performance.now()` elsewhere in this harness.
+import type { Locator, Page } from "@playwright/test";
 
 export interface LatencySample {
-  /** ms, input dispatch to next painted frame */
+  /** ms, trusted keydown `timeStamp` to the post-render macrotask */
   ms: number;
 }
 
+const INSTALLED_FLAG = "__seratLatencyCaptureInstalled";
+const ENTRIES_KEY = "__seratLatencyEntries";
+
+type PageEntries = { ms: number }[];
+
 /**
- * Types one character into `target` and measures the time from dispatching
- * that keystroke to the next frame the browser actually painted.
+ * Installs, once per page, a capture-phase `keydown` listener that times
+ * every *trusted* keystroke from its own `event.timeStamp` to the next
+ * post-render macrotask (see file header) and appends `{ ms }` to a
+ * page-global array this module polls. Idempotent — safe to call before
+ * every sample; does nothing on the second and later calls.
+ */
+export async function installLatencyCapture(page: Page): Promise<void> {
+  await page.evaluate(
+    ({ installedFlag, entriesKey }) => {
+      const w = window as unknown as Record<string, unknown>;
+      if (w[installedFlag]) return;
+      w[installedFlag] = true;
+      w[entriesKey] = [] as PageEntries;
+      document.addEventListener(
+        "keydown",
+        (event) => {
+          if (!event.isTrusted) return; // only real, OS-level input counts
+          const t0 = event.timeStamp;
+          requestAnimationFrame(() => {
+            const channel = new MessageChannel();
+            channel.port2.onmessage = () => {
+              const t1 = performance.now();
+              (w[entriesKey] as PageEntries).push({ ms: t1 - t0 });
+            };
+            channel.port1.postMessage(null);
+          });
+        },
+        { capture: true },
+      );
+    },
+    { installedFlag: INSTALLED_FLAG, entriesKey: ENTRIES_KEY },
+  );
+}
+
+/**
+ * Types one **trusted** character into `target` via `page.keyboard.press`,
+ * which drives the browser's real input pipeline through CDP — unlike
+ * `document.dispatchEvent(new KeyboardEvent(...))`, which is
+ * `isTrusted: false` and which CodeMirror's own input handling ignores
+ * entirely. (An earlier version of this file used the synthetic form: it
+ * timed real frames, but never actually typed a character, so it was
+ * silently measuring idle frames.)
  *
- * Technique: a double `requestAnimationFrame` after the keystroke is the
- * standard way to observe "the browser has painted" from page-script land
- * (the first rAF fires before paint, the second fires after) without
- * needing a CDP frame-timing session. `performance.now()` is read inside
- * the page so the clock is the browser's own, not round-tripped through
- * Playwright's IPC — round-tripping would add exactly the kind of harness
- * overhead NFR-PRF-01's cold-start work found (F-403-shaped mistake:
- * measuring the harness instead of the subject).
+ * After the keystroke, asserts the editor's visible text actually grew by
+ * one character. A keystroke that did not reach the editor — swallowed,
+ * untrusted, or routed somewhere else — fails the sample loudly instead of
+ * quietly contributing a fast, meaningless number to the p95.
  */
 export async function measureKeystrokeToPaint(
   target: Locator,
   char: string,
 ): Promise<LatencySample> {
-  await target.focus();
   const page = target.page();
+  await installLatencyCapture(page);
+  await target.focus();
 
-  const ms = await page.evaluate(async (typedChar) => {
-    const t0 = performance.now();
-    // Real keyboard event, not a synthetic value assignment — a budget
-    // that measured a programmatic mutation instead of an input event
-    // would not be measuring what NFR-PRF-02 describes.
-    document.dispatchEvent(
-      new KeyboardEvent("keydown", { key: typedChar, bubbles: true }),
+  const textBefore = (await target.textContent()) ?? "";
+  const before = await page.evaluate(
+    (key) => ((window as unknown as Record<string, unknown>)[key] as PageEntries).length,
+    ENTRIES_KEY,
+  );
+
+  await page.keyboard.press(char);
+
+  const handle = await page.waitForFunction(
+    ({ key, expected }) => {
+      const entries = (window as unknown as Record<string, unknown>)[key] as
+        | PageEntries
+        | undefined;
+      return entries && entries.length > expected ? entries[entries.length - 1] : null;
+    },
+    { key: ENTRIES_KEY, expected: before },
+  );
+  const sample = (await handle.jsonValue()) as LatencySample;
+
+  const textAfter = (await target.textContent()) ?? "";
+  if (textAfter.length !== textBefore.length + 1) {
+    throw new Error(
+      `keystroke ${JSON.stringify(char)} did not reach the editor: text length was ` +
+        `${textBefore.length}, expected ${textBefore.length + 1} after typing, got ` +
+        `${textAfter.length}. The harness would otherwise have timed an idle frame.`,
     );
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    return performance.now() - t0;
-  }, char);
+  }
 
-  return { ms };
+  return sample;
 }
 
 /** Nearest-rank p95, matching `bench/budget`'s statistic (TC-027) so a

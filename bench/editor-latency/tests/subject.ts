@@ -22,12 +22,15 @@
 // Until then, `openNoteForLatencyTest` throws with the task numbers that
 // unblock it, the same way `bench/budget`'s subjects failed loudly before
 // I3–I6 landed, rather than silently measuring nothing.
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 
 /** Serves NFR-PRF-02. Opens a 5,000-line note and returns a locator for the
  * editable surface the harness will type into. Not implemented — see the
- * module doc comment above. */
-export async function openNoteForLatencyTest(_page: Page): Promise<never> {
+ * module doc comment above. Typed as `Promise<Locator>`, its real return
+ * type once wired, rather than `Promise<never>`: a function that always
+ * throws today is still typed as what it will return, the same way
+ * `bench/budget`'s not-yet-wired subjects keep their real signatures. */
+export async function openNoteForLatencyTest(_page: Page): Promise<Locator> {
   throw new Error(
     "editor-latency subject not wired: no app entry point and no " +
       "5,000-line fixture note exist yet. Blocked on P1 task #5 " +

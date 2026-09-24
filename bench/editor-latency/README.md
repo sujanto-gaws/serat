@@ -25,7 +25,7 @@ Chromium is not downloaded by Playwright's own installer here — `playwright.co
 1. Architect task #5 says how the app under test is reached (dev-server stand-in for the Tauri webview, or CDP attach to a real window) and how a note is opened deterministically.
 2. vue-frontend-dev task #21 lands the hybrid live-preview editor `tests/subject.ts` needs a locator for.
 3. A 5,000-line fixture note, generated deterministically (NFR-MNT-02) rather than hand-authored, ideally beside `bench/vaultgen`'s existing generator rather than duplicating it.
-4. Once 1–3 land, `subject.ts`'s `openNoteForLatencyTest` gets a real body, the spec goes from throwing to asserting, and this harness is wired into `.github/workflows/budgets.yml` beside the Rust jobs — following NFR-PRF-08 and RISK-013's rule that a CI job is only claimed once it can actually run, not once it is written.
+4. Once 1–3 land, `subject.ts`'s `openNoteForLatencyTest` gets a real body, the spec goes from throwing to asserting, and this harness is wired into `.github/workflows/budgets.yml` beside the Rust jobs — following NFR-PRF-08 and RISK-013's rule that a CI job is only claimed once it can actually run, not once it is written. **That CI job must run `npx playwright test tests/nfr-prf-02.spec.ts` specifically, not a bare `npm test`/`npx playwright test`** — `tests/measure.unit.spec.ts` passing is necessary but not sufficient for the NFR-PRF-02 gate, and a job that only ran the whole suite (or, worse, only the unit spec) could report green on this budget without the actual budget assertion ever having run.
 
 ## Serves
 
