@@ -210,6 +210,53 @@ That last step is also what makes the sequence crash-safe, and the property is w
 
 The three `ix_fields_key_*` partial indexes were expected to need help from the query compiler — a redundant `val_date IS NOT NULL` emitted beside every predicate — on the assumption that SQLite's partial-index prover is too limited to infer it. It is not: `=`, `<`, `BETWEEN`, `IN` and a `LIKE` prefix on the typed column all select the partial index unaided. The lowering emits no redundant term. The one shape that cannot use them is a bare `key = ?` with no predicate on the value, which is why a merely *projected* field must be reached through the pivot join on `ix_fields_note_key`, never by selecting on `key` alone.
 
+#### 4.5 P1 read paths — fixed statements, no query language
+
+P1 needs four reads and has no SQ (C-03, ADR-0010: SQ is P2). Each read is a **fixed-shape prepared statement** in a `read` module of serat-index. The statements run on the read-only pool (§2.2), never on the writer (ADR-0001). The user supplies values and never shape: a statement's text is chosen from a closed set in code, and every user string is a bound parameter. Before the index is `Ready`, every read returns the index state instead of rows (`contracts/ipc.rs` rule 1).
+
+**Latency expectations are what task #15's benches report against.** No NFR budgets search or backlinks, so these are **expectations, not gates**. A breach is a finding for architect and product-analyst, not a red build. Each is measured at 20k, with 50k reported beside it.
+
+| Read | Serves | Statement shape | Uses | Expectation (p95, 20k) |
+|---|---|---|---|---|
+| **R1 search** | FR-NAV-02 (P1 half), US-05 | `blocks_fts MATCH ?` ⋈ `blocks` ⋈ `notes` `WHERE notes.kind = 'note'` `ORDER BY rank LIMIT ? OFFSET ?`, returning path, title, block id, kind, `heading_path`, `byte_start`/`byte_end`, `notes.hash`, `snippet(…)` and the rank | `blocks_fts` | ≤ 100 ms for the top 50, across a query set that includes the vault's most common terms. #15 reports **the single most common term separately**, as the worst case, rather than letting it disappear into the p95 |
+| **R2 backlinks** | FR-NAV-04, US-03 | `links` ⋈ `notes` (source) ⟕ `blocks` (source block) `WHERE links.dst_note = (SELECT id FROM notes WHERE path = ?) AND links.kind IN ('wiki','embed','md')`, **one row per distinct (source note, source block)**, ordered by source path then block `ord` | `ix_links_dst` | ≤ 20 ms on the vault's highest in-degree note (679) |
+| **R3 property lookup** | FR-STR-03, FR-BIN-02, US-09, US-18 | `key = 'type'` → `notes.type = ?`; any other key → `fields.key = ? AND fields.val_text = ? AND fields.source = 'frontmatter'`; both ⟕ `notes AS asset ON asset.sidecar_path = notes.path` | `ix_notes_type`, `ix_fields_key_text`, `ix_notes_sidecar` (below) | ≤ 20 ms for 500 rows |
+| **R1 + R3** | FR-NAV-02 with one property filter | R1 plus `AND notes.id IN (` R3's note-id subquery `)` | as both | ≤ 100 ms |
+
+**Search syntax, and the closed set it maps to.** The search box accepts free text, `"quoted phrases"` and at most **one** `[key:value]` term — Obsidian's own property-search syntax, so nothing new is learned. Free text only selects R1; a `[key:value]` term only selects R3; both select R1 + R3. A second property term is refused with a message and never silently dropped: statements stay a fixed set of three. Free text becomes an FTS5 query in Rust. Each bare word becomes a quoted FTS5 string (`"word"`, with `"` doubled), phrases stay phrases, and terms are ANDed. User text can therefore never be FTS5 syntax, and a stray `AND`, `*` or `NEAR(` cannot fail or reshape the query. There is no prefix matching in P1: `blocks_fts` has no `prefix=` option, and adding one costs NFR-PRF-04 rebuild time (the DDL's own comment). Search runs on Enter and after 250 ms of idle typing. It is not search-as-you-type; the switcher (§9.2) is.
+
+**Degenerate input never reaches FTS5 as an error.** An unbalanced `"` closes at the end of the input. A query that tokenises to nothing — only punctuation, only quotes, or empty after removing the `[key:value]` term — returns no rows and a message ("nothing to search for"), without running a statement. If FTS5 still rejects a query, that is a defect: it is shown as the same message and logged, never raised as an error.
+
+**Results never carry HTML.** The snippet is delimited with the control characters U+0002 and U+0003. The front end splits on them and builds **text nodes only**, with `<mark>` elements it creates itself between them. No string from a note is ever inserted as markup (T-09). U+0002 and U+0003 can occur in a note's own text, and there they mis-place a highlight. That is harmless precisely because only text nodes are built, and it is accepted rather than paid for with a second pass over every snippet.
+
+**Location.** A hit carries its block's byte range and the `notes.hash` it was indexed from. Opening a hit maps `byte_start` to `{line, col}` with ADR-0016's function, over the bytes just read, when the hash matches. When it does not match (the file changed since indexing), the block's `ord` is used and the location is marked approximate. It is never a wrong line presented as exact.
+
+**Backlinks detail (FR-NAV-04).** The acceptance case — three paragraphs across two notes gives three entries — is exactly "one row per distinct (source note, source block)": two links in one paragraph are one entry. A link with no source block, from frontmatter such as `owner: [[Person]]`, is one entry labelled *frontmatter*. The excerpt is the block's `text`, cut to 300 characters by Rust. **Unresolved links never appear in any backlinks pane**, because an unresolved link names no note. **Ambiguous names follow §9.3's resolver.** A `[[Meeting]]` with two `Meeting.md` files resolves to the shorter path, and only that note lists it, which is Obsidian's behaviour. Because it is a resolution rule, it must stay current in both directions:
+
+- **A note appears** at path *P*. There are two steps:
+  - **(A1)** `resolve_inbound(P)` (`crates/serat-index/src/apply.rs`) re-resolves the unresolved links whose `dst_path` is one of *P*'s four candidate spellings (path, path without `.md`, file name, file name without `.md`), through `ix_links_unresolved`.
+  - **(A2)** The file-name-resolved links that point at *another* note with the same `file_name` may now prefer *P* as the shorter path. Find those notes through `ix_notes_file_name` and their inbound links through `ix_links_dst`, and re-run the resolver on the ones with no `/` in `dst_path`.
+- **A note disappears** from path *P*. `ON DELETE SET NULL` unresolves its inbound links. They now have `dst_note IS NULL` and a `dst_path` that is one of *P*'s candidates, so A2 **cannot see them** — it walks `dst_note`. **(B1)** Run `resolve_inbound` with the removed path's candidate spellings. That lookup goes through `ix_links_unresolved` and re-points each orphan at a remaining same-named note, or leaves it unresolved. Without B1, the index after a delete differs from the index a rebuild would produce, which is exactly what C-02's *disposable* promise forbids.
+- **A note is renamed** from *P* to *Q* (`rename` in `apply.rs`, which today updates `path` and nothing else). Four steps:
+  1. Set `file_name` as well as `path`.
+  2. **Unresolve the renamed note's inbound links** (`dst_note := NULL WHERE dst_note = id`), because a link written as `[[old/P]]` must stop pointing at *Q*.
+  3. Run B1 for *P*.
+  4. Run A1 and A2 for *Q*.
+  Links whose written target still names the note resolve back to it in step 4, and links written for the old name go to another same-named note or stay unresolved. Every step goes through `ix_links_unresolved`, `ix_links_dst` or `ix_notes_file_name`.
+- **Test:** for each of the three events, compare the index with a fresh rebuild of the same tree.
+- No new index on `links` is added, because every index on `links` costs the rebuild once per link (F-373).
+- This is the per-save half of §3.1's third-caller rule. **Neither step runs during a bulk load**, where the rebuild's single final `resolve_links` pass supersedes both (F-371).
+
+**Property lookup detail (FR-STR-03, FR-BIN-02).** List values are one `fields` row per item, so `[tags:x]` matches an item. **Values compare case-insensitively (ASCII fold, `COLLATE NOCASE`), as Obsidian's property search does.** Keys compare exactly. The key prefix of `ix_fields_key_text` still selects the rows, and the value comparison becomes a filter over one key's rows; #15's benchmark checks that against the 20 ms expectation, using the vault's largest key (`tags`). Non-ASCII case is not folded in P1, which is the same limit as link resolution. Inline fields (`key:: value`) are FR-STR-04's and P2's, so R3 filters `source = 'frontmatter'`. **A sidecar hit is returned as its asset.** When the matching note is some asset's sidecar (ADR-0005: `x.pdf.md` for `x.pdf`), the row returned is the asset's path, kind and MIME, with the sidecar path beside it. That is FR-BIN-02's "the PDF is returned as a typed row". It needs `notes.sidecar_path` populated (task #17, per §7) and one partial index, `ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL`. That index holds at most one entry per asset (200 in the benchmark vault), so its rebuild cost is negligible. It lands with task #17's writer, not before — an index nobody reads is a cost with no counterweight.
+
+**Block references need no new index.** `[[note#^id]]` looks for `blocks.block_ref = ?` within one note, and `UNIQUE(note_id, ord)` already indexes `note_id` as a prefix, so the lookup is a scan over one note's dozen blocks. The DDL header's planned `ix_blocks_ref` is withdrawn on that ground. **Case-insensitive link resolution (§9.3) is one change in five places, all in one commit (task #15).** A partial change is F-371 again: any comparison left in one collation while its index is in the other turns the per-link join into a scan.
+
+1. `ix_notes_file_name` becomes `COLLATE NOCASE`.
+2. A new `ix_notes_path_nocase ON notes(path COLLATE NOCASE)` serves the `n.path = links.dst_path` comparisons. `notes.path`'s `UNIQUE` index is binary, and a NOCASE comparison cannot use it. The new index covers 20,000 rows, not 217,000 links.
+3. `ix_links_unresolved(dst_path)` becomes `COLLATE NOCASE`. It is dropped and recreated around the bulk load, so the rebuild pays nothing for the change.
+4. Every comparison in `resolve_links` and `resolve_inbound` — `n.path`, `n.file_name` and `dst_path IN (…)` — becomes `COLLATE NOCASE`.
+5. The rebuild benchmark runs in the same PR.
+
 ## Key flows
 
 ### Indexing
@@ -1130,6 +1177,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
 | Vault identity: what `index_meta.vault_root` compares, and what a mismatch may cost | §3.4 *Ruling (task #120)*, `schema/001_init.sql` (index_meta.vault_root), ADR-02 | FR-VLT-02, NFR-REL-02, NFR-PRF-04, C-02 |
 | Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, FR-NAV-08, NFR-PRF-05 |
+| P1 read paths: search, backlinks, property lookup (fixed statements, one search syntax, sidecar-as-asset, re-resolution on note create/delete) | §4.5 | FR-NAV-02, FR-NAV-04, FR-STR-03, FR-BIN-02, C-03 |
 | Rebuild-not-migrate                     | §4.3, ADR-02               | FR-VLT-02, NFR-REL-02                                                         |
 | SQ grammar and type rules               | §5, grammar/sq.ebnf *(planned)* | FR-STR-06, FR-STR-07, FR-STR-09                                          |
 | Lowering algorithm                      | §5.2, grammar/lowering.md *(planned)* | FR-STR-08, FR-STR-12, NFR-PRF-05                                    |
