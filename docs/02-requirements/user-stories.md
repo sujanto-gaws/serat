@@ -54,14 +54,15 @@ As a daily user, I want to jump to any note in two keystrokes, so that navigatio
 
 - Given 20,000 notes, when I type three characters, then ranked results render in under 50ms.
 
-### US-05 — Search everything  (serves FR-NAV-02, FR-NAV-03)
+### US-05 — Search everything  (serves FR-NAV-02, FR-NAV-03, FR-NAV-08)
 **Phase:** P1 → P2 · **Size:** M
 
 As a researcher, I want one search box that covers the whole vault, so that I never wonder whether something was missed.
 
 **Acceptance criteria**
 
-- Given a phrase in a note and in a PDF, when I search it, then both are returned with snippets.
+- Given a phrase present in a note, when I search it (P1, FR-NAV-02), then it is returned with a snippet and a block-precise location.
+- Given a phrase present only in a PDF, when I search it from the same search box (P2, FR-NAV-08), then the PDF is returned with a snippet and a locator naming its page.
 
 ### US-06 — Survive external edits  (serves FR-VLT-04, FR-VLT-05)
 **Phase:** P1 · **Size:** L
@@ -203,7 +204,7 @@ As a vault owner, I want to tag and type a PDF, so that my contracts are data ra
 
 **Acceptance criteria**
 
-- Given contract.pdf with a sidecar declaring type: contract, when I query contracts, then the PDF is returned as a typed row.
+- Given contract.pdf with a sidecar declaring type: contract, when I look contracts up by type, then the PDF is returned as a typed row.
 - Given a file with a sidecar, when I browse the folder, then I see one entry, not two.
 
 ### US-19 — Read documents without leaving  (serves FR-BIN-11, FR-BIN-12, FR-BIN-13)

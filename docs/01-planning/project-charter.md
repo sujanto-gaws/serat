@@ -52,7 +52,7 @@ Every later trade-off falls out of these. When a feature fights one of them, the
 | Goal | Metric | Target |
 |---|---|---|
 | Performance at scale (50k notes, one laptop) | Cold start (20k notes, warm index) | < 1 s; window visible < 400 ms |
-| | Keystroke → paint | < 16 ms; editing never blocks on the indexer |
+| | Keystroke → paint | Painted in the first frame after the keystroke for ≥95% of keystrokes (NFR-PRF-02 as re-defined, owner 2026-09-24); editing never blocks on the indexer |
 | | Save → index (single-note incremental) | < 50 ms |
 | | Full rebuild, 20k notes | < 30 s |
 | | Resident memory | < 400 MB with embedding model; < 200 MB without |
@@ -93,7 +93,7 @@ Solo, part-time; each phase ends on a gate, not a date. ~30 weeks to v1.
 | Milestone | Duration | Deliverable | Gate |
 |---|---|---|---|
 | P0 — Spike: prove the numbers | 2 weeks | Tauri v2 shell, CodeMirror 6 mounted, read/write one file, `notify` watcher, `comrak` parse, 20k-note benchmark vault indexed into SQLite. No product features. | Full index < 30 s, save→index < 50 ms, cold start < 1 s. If missed badly, architecture changes before anything is built on it. |
-| P1 — An editor you could live in | 8–10 weeks | Hybrid live-preview editing, wikilinks/embeds, backlinks, quick switcher, command palette, full-text search, Obsidian vault compatibility, external-edit reconciliation, one flat table view, sidecar/asset model, PDF + image viewers. | Owner opens their own vault in Serat for a week without needing Obsidian. |
+| P1 — An editor you could live in | 8–10 weeks | Hybrid live-preview editing, wikilinks/embeds, backlinks, quick switcher, command palette, full-text search over notes, Obsidian vault compatibility, external-edit reconciliation, sidecar/asset model, PDF + image viewers. *(Owner ruling 2026-09-24: the flat table view stays in P2 with FR-VIW-01; search inside PDFs moves to P2 with extraction — FR-NAV-02 split.)* | Owner opens their own vault in Serat for a week without needing Obsidian. |
 | P2 — Structure: types, SQ, writable tables | 6–8 weeks | Schema registry, inline field indexing, SQ parser/typechecker/codegen, embedded query blocks, table view with cell write-back and undo, extraction pipeline (PDF, Office, CSV), sheets as data. | Every Dataview query expressible in SQ; cell edit survives hostile test; phrase inside a PDF findable from the note search box. |
 | P3 — Lenses, lifecycle, tasks | 4–5 weeks | Lens definitions and switcher, dashboard notes, promote-across-tiers with link repair, task model, board/calendar views, rollups. | PM, analyst and engineer dashboards live in Serat; promotion leaves zero broken links. |
 | P4 — AI: retrieval, agent panel, MCP | 6–8 weeks | Local embedding pipeline over notes and extracted blocks, hybrid retrieval, agent panel with diff review, capture agent, synthesis with citations, MCP server (ship early in the phase), OCR/captioning behind on-demand downloads. | A Claude Code subagent answers a vault question via MCP that grep cannot; no AI write has landed unreviewed. |

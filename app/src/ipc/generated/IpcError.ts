@@ -58,7 +58,15 @@ path: string,
 /**
  * The hash the file has now, lowercase hex.
  */
-current_hash: string, } | { "kind": "io", 
+current_hash: string, } | { "kind": "invalid_patch", 
+/**
+ * Vault-relative path.
+ */
+path: string, 
+/**
+ * What was wrong, for the log.
+ */
+message: string, } | { "kind": "io", 
 /**
  * Vault-relative path, or the best available description of the target.
  */
