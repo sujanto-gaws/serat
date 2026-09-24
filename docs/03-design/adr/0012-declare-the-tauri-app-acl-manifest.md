@@ -1,5 +1,6 @@
 # ADR-0012: Declare the Tauri app ACL manifest, and grant only the commands the webview calls
 **Status:** accepted · **Date:** 2026-09-06 (accepted after the run named below) · **Serves:** NFR-SEC-06, T-08, design goal 5 (corrected by task #50; see the correction below)
+**P1 grants recorded against this ADR (2026-09-24, architecture §9.3, ADR-0017, `contracts/ipc.rs`):** the P1 commands are granted to `main`; `open_vault` stays withheld, and `choose_vault` takes no path. The opener plugin's capability is scoped to the URL schemes `http`, `https` and `mailto` only. The `serat-asset` URI scheme is outside this ACL by construction, and ADR-0017 records its two compensating controls.
 
 ## Context
 
