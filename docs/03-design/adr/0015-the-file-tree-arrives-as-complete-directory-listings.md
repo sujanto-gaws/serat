@@ -1,6 +1,6 @@
 # ADR-0015: The file tree arrives as complete directory listings, on a clock that starts at the painted window
 
-**Status:** accepted · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
+**Status:** proposed — becomes accepted when the PRD amendment to FR-VLT-01's acceptance criterion lands (product-analyst, citing this ADR), because §3 decides the PRD's open question on *complete* versus *first screen* and moves the clock start · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
 **Honours:** ADR-0001 (the tree read is a read, never a writer request), ADR-0002 (the index is disposable, so the tree must stand without it), ADR-0011 (catch-up from the tree walk enters on the bulk side), ADR-0014 (the platform term is not ours)
 
 ## Context
@@ -33,9 +33,17 @@ And on the clock:
 
 ### 1. The unit is a complete directory listing
 
-The tree crosses from Rust to the front end as a sequence of `DirListing { dir, entries }` messages. Each is **the complete, final-order contents of one directory** — never a partial one — and replaces any earlier listing for the same `dir`. Entries carry name, kind (`note` | `asset` | `dir`), size and mtime. Order is decided in Rust, once, per directory: directories first, then files; case-insensitive by name under Unicode simple case folding; ties broken by byte order. The front end never sorts.
+The tree crosses from Rust to the front end as a sequence of `DirListing { dir, entries }` messages. Each is **the complete, final-order contents of one directory** — never a partial one — and replaces any earlier listing for the same `dir`. **An entry is a name and a kind (`note` | `asset` | `dir`), and nothing else.** Size and mtime are deliberately absent: the tree displays neither, and an entry that carried them would change on every save. Order is decided in Rust, once, per directory: directories first, then files; case-insensitive by name under Unicode simple case folding; ties broken by byte order. The front end never sorts.
 
-**There is one message type, and it serves initial population, catch-up and live updates.** A directory changed on disk is re-listed and its listing re-sent; the front end replaces it. No delta format exists, so no delta can be applied in the wrong order.
+**Three message types, and the cost of each is bounded by what changed.**
+
+| Message | Sent for | Cost to the webview |
+|---|---|---|
+| `DirListing { dir, entries }` | Initial population; a catch-up listing that **differs** from what was sent (Rust keeps what it sent, so identical listings are never re-sent); a directory rename; the rescan that recovers from a watcher overflow (ADR-0011) | Proportional to that directory, and never triggered by a save |
+| `TreeUpsert { dir, entry, after }` | A file or directory created, or the new name of a rename | One entry. `after` names the sibling it follows (`None` = first), so the front end inserts without comparing names and cannot disagree with Rust's collation |
+| `TreeRemove { dir, name }` | A file or directory deleted, or the old name of a rename | One entry |
+
+**A content change to an existing file sends nothing at all.** Saving a note in a 5,000-entry flat folder therefore costs the tree zero messages, which is what design goal 2 and NFR-PRF-02 need from it. An earlier draft of this ADR re-sent the whole parent listing on every watcher event, and that was a keystroke-adjacent cost proportional to folder size (lead's review of task #2).
 
 Listings travel on an **ordered, lossless per-session stream** (a Tauri `ipc::Channel` bound to the open-vault session), never on the throttled `index://` event bus: §3.4 already rules that throttled events are for invalidation, never for establishing that something has occurred, and a tree listing is data. The stream ends its initial population with `TreeComplete { entries, source }`, where `entries` is the count of file entries delivered and `source` is `index` or `walk`.
 
@@ -45,7 +53,7 @@ Listings travel on an **ordered, lossless per-session stream** (a Tauri `ipc::Ch
 - **No-index path (`Opening` that resolves to rebuild, `Rebuilding`, `Unavailable`).** A **breadth-first streaming tree walk** in `serat-vault`: each `read_dir` produces one listing, root first. It shares `walk`'s ignore rules, its symlink refusal (T-07) and its lexical prefix strip (F-12). `Vault::walk` — sorted `Vec`, used by the rebuild for rowid determinism — is unchanged. On the no-index path this is a second enumeration beside the rebuild's; that duplication is accepted and **is inside the measured number**, because the budget is taken with the rebuild running (§4).
 - **Which one populates.** The index tree is sent only if no walk listing has been sent yet; otherwise the walk populates alone. `TreeComplete.source` records which.
 - **The walk always runs, after the first paint, and is authoritative.** On the warm path its listings arrive after `TreeComplete{source: index}` and replace any that differ. Every path the walk finds that the index lacks, or the index holds that the walk did not find, is submitted to the index as catch-up on the **bulk, blocking side of ADR-0011** — the reconciliation-on-open that §3.4 records as missing (*"the open path still has no catch-up mechanism"*) gets its consumer here.
-- **Live updates.** A watcher event on a path re-lists its parent directory after the 150 ms coalescing window and sends the listing. FR-VLT-04's 500 ms applies.
+- **Live updates.** After the 150 ms coalescing window, a watcher event that creates or deletes a path sends one `TreeUpsert` or `TreeRemove`, and a modification sends nothing. The front end applies an upsert or remove as one keyed insertion into the virtualised list, never as a rebuild of the directory. FR-VLT-04's 500 ms applies.
 
 Batching for the channel: the root listing alone; thereafter listings coalesced into one message per ≤ 256 KiB or ≤ 16 ms of walking, whichever comes first. The numbers are tuning, not contract.
 
@@ -57,7 +65,7 @@ Two front-end marks, stamped the way `window_visible` is: after the Vue commit t
 
 | Mark | Fires when | Status |
 |---|---|---|
-| `tree_first_screen` | The root listing has been applied **and painted**, and the rows in the viewport accept click and keyboard focus (NFR-USE-01). | Reported at 20k and 50k. |
+| `tree_first_screen` | The root listing has been applied **and painted**, with the viewport's rows interactive. The observable event: the tree component's post-flush watcher (`flush: 'post'`) has run for the commit that rendered those rows. Vue binds a row's click and keydown handlers when it creates the element, so a row in the DOM after that flush is clickable and focusable (NFR-USE-01). The mark is then taken on the second `requestAnimationFrame`. | Reported at 20k and 50k; also NFR-PRF-01's tree precondition (§5). |
 | `tree_complete` | The `TreeComplete` message has been applied **and painted**: every listing of the initial population is in the front-end model. | **Binding.** |
 
 **FR-VLT-01 is met when `tree_complete − T_open` ≤ 2000 ms at p95 at 20,000 notes, on each of two arms separately, never averaged** (§3.4 already forbids averaging a warm and a cold measurement):
@@ -69,7 +77,7 @@ The stricter reading — *complete* — is the one gated, because this design sa
 
 **Validity conditions a run must meet, or it is rejected rather than recorded:**
 
-1. `TreeComplete.entries` and the front-end model's file-entry count at `tree_complete` both equal the **vaultgen manifest's** count of indexable files (notes plus assets under the default ignore rules) — taken from the manifest, never from the walk, because a walk that drops entries agrees with itself (F-19's shape).
+1. `TreeComplete.entries` and the front-end model's file-entry count at `tree_complete` both equal the **vaultgen manifest's `notes + assets`**. That is 20,000 + 200 = 20,200 on the 20k vault, the count the P0 walk returns (ADR-0011's worked shape; T-07's 20,200 files). The manifest counts exactly what the default ignore rules admit: `notes` excludes `.trash/`, the `.obsidian/` and `.trash/` files are counted separately as `ignored_files`, and the `.vaultgen` stamp is in `files` only (`bench/vaultgen/src/lib.rs`, `Manifest`). The count is taken from the manifest and never from the walk, because a walk that drops entries agrees with itself (F-19's shape).
 2. `source` matches the arm.
 3. `tree_first_screen ≤ tree_complete`, and both are after `T_open`.
 4. The run records `cpu_load_percent`, `concurrent_build_processes` and `gate_eligible` like every other budget run.
@@ -82,32 +90,39 @@ The tree renders through a **virtualised list**: DOM rows proportional to the vi
 
 A directory whose listing has not arrived renders as a folder row in a pending state and becomes expandable when its listing lands. No request/priority mechanism exists in P1 (see *Trigger to revisit*).
 
-### 5. NFR-PRF-01's `t_usable` tree clause changes subject
+### 5. NFR-PRF-01's `t_usable` tree clause changes subject (amends ADR-0014)
 
-§3.4 defines `t_usable` as the latest of four marks, one being *"the file tree having been delivered to the front end"*, which P0 satisfied with `mark_buffer_rendered` because P0 had no tree. **From P1 that clause is satisfied by the first listing — the root — delivered to the front end**, on either source. Waiting for the whole tree would make `S_settle` proportional to vault size, which §3.4's load-bearing property forbids, and on the no-index path would put a rebuild-contended walk inside the Serat term's 350 ms. Root-listing size is a property of the vault's top level, not of its note count.
+§3.4 defines `t_usable` as the latest of four marks. One of them is *"the file tree having been delivered to the front end"*, which P0 satisfied with `mark_buffer_rendered` because P0 had no tree. From P1:
+
+- **"Delivered" is the concrete front-end mark `tree_first_screen` (§3)**, not the Rust send. It is the root listing applied and painted, on either source. The front-end apply is chosen over the Rust send because §3.4's own rule is that usable means *the front end has it*, and a send can succeed into a webview that has not rendered it.
+- **`buffer_rendered` leaves `t_usable`.** It was only ever the stand-in for a tree P0 did not have, and §3.4's ruling (*a note being open is not one of the four*) already says a restored buffer does not gate usability. It stays in the trace as a reported, unbudgeted mark.
+- **Why the root and not the whole tree.** Waiting for the whole tree would make `S_settle` proportional to vault size, which §3.4's load-bearing property forbids. On the no-index path it would also put a rebuild-contended walk inside the Serat term's 350 ms. How big the root listing is depends on the vault's top level, not its note count. On the warm arm NFR-PRF-01 measures, it comes from one index read about 10 ms after the index is `Ready`.
+- **This changes what NFR-PRF-01's binding term measures, so the benchmarks change with it (working agreement 4).** `prf01-serat-term` and `prf01-cold-start` must require `tree_first_screen` in the trace in place of `buffer_rendered` as the tree precondition of `vault_usable`, and the harness's check of which mark settles `t_usable` must be updated to match. The seven-mark partition and its terms are unchanged; only `S_settle`'s end-mark precondition moves. The Serat term is then re-measured on the first build that renders a tree (after tasks #13, #18 and #24), and the figure is compared against the 350 ms budget with its basis clauses — this is a test-engineer task (lead creates it). Until that re-measurement, NFR-PRF-01's attested 233.8 ms p95 is a figure for the *buffer-rendered* precondition and must be labelled that way.
 
 ## Consequences
 
-**Positive.** The time to a usable first screen stops depending on vault size on both paths. Initial population, catch-up and live updates share one message and one replace rule. The open path gains the catch-up reconciliation §3.4 recorded as absent, so a warm index that is stale in some rows is corrected in the session rather than trusted for its life. The FR-VLT-01 figure no longer carries the WebView2 term, so it measures something this repository can move.
+**Positive.** The time to a usable first screen stops depending on vault size on both paths. Initial population and catch-up share one message and one replace rule. Live updates cost one entry each, and a save costs the tree nothing. The open path gains the catch-up reconciliation §3.4 recorded as absent, so a warm index that is stale in some rows is corrected in the session rather than trusted for its life. The FR-VLT-01 figure no longer carries the WebView2 term, so it measures something this repository can move.
 
-**Negative.** Completion is still linear in vault size. The expectation, not a measurement, is that the strip plus the moved clock put the no-index arm at 20k well inside 2 s; at 50k it may not, and FR-VLT-01 says nothing about 50k, so that is reported rather than gated. The no-index path enumerates the vault twice (tree walk and rebuild walk). Empty directories are missing from a warm tree until the walk arrives.
+**Negative.** Completion is still linear in vault size. The live-update path adds two message types beside the listing, and a front end that applies an upsert at the wrong `after` position would be wrong silently, so task #24 needs a test that replays a random create/delete sequence and compares the result against a fresh listing. The expectation, not a measurement, is that the strip plus the moved clock put the no-index arm at 20k well inside 2 s; at 50k it may not, and FR-VLT-01 says nothing about 50k, so that is reported rather than gated. The no-index path enumerates the vault twice (tree walk and rebuild walk). Empty directories are missing from a warm tree until the walk arrives.
 
 **Risks.**
-- The no-index arm's contention with the rebuild is unmeasured. If it breaches, the first remedy is to delay the rebuild's read-and-hash phase behind `tree_complete`, not to couple the rebuild to the tree walk.
+- The no-index arm's contention with the rebuild is unmeasured. **If `tree_complete` breaches, the remedy is to hold the rebuild's read-and-hash phase until `tree_complete`**, not to couple the rebuild to the tree walk. That deferral is not free: it adds the tree's completion time to the rebuild's wall clock, and NFR-PRF-04 sits at 27.7 s against 30 s (task #96). A deferral longer than about 2 s spends the whole margin, so it can only be adopted with an NFR-PRF-04 re-measurement beside it.
 - `T_open = window_visible` relies on ADR-0014's paint mark being honest; every guard that mark carries (and every one it lacks, ADR-0014's table) is inherited here.
 - A front-end mark is again the thing timed, and F-470 applies: a front-end change is only exercised after `npm run build` and `cargo build --release`.
 
-**Trigger to revisit.** If `tree_complete` at 20k on the no-index arm is within 20% of 2000 ms, or users in the P1 gate week wait on an unexpanded folder, add a `tree_prioritise(dir)` request that moves a pending directory to the front of the walk — option 3's idea inside option 5, not a replacement for it.
+**Triggers to revisit, and they are two different problems.** A `tree_complete` breach, or a result within 20% of 2000 ms at 20k on the no-index arm, is answered by the rebuild deferral above; `tree_prioritise` would not help it, because completion needs every directory listed. **Users in the P1 gate week waiting on an unexpanded folder** is a navigability problem, and it is answered by a `tree_prioritise(dir)` request that moves a pending directory to the front of the walk. That is option 3's idea inside option 5, not a replacement for it.
 
 ## Objections recorded
 
 **rust-core-dev** (owns `serat-vault`, `serat-index`) and **test-engineer** (owns the bench, task #9) were consulted on the draft on 2026-09-24 with two specific questions each; the proposal and questions are in their inboxes. **No reply had arrived when this was committed, so their objections are absent, not waived** — and the places I expect them are named rather than left for them to find:
 
 - *rust-core-dev*: whether the rebuild should consume the tree walk's output instead of enumerating separately. I think not — it would couple rebuild determinism (sorted rowids, FR-VLT-02) to a UI-ordered stream — but the duplicate enumeration is their cost to carry.
-- *test-engineer*: whether the manifest count can be the guard's denominator for the no-index arm when the ignore rules are the product's (the manifest must count what the product's default ignore rules admit, or the guard fails for a correct run).
+- *test-engineer*: whether the manifest count can be the guard's denominator when the ignore rules are the product's. **Answered from the code since, without waiting for them:** the manifest's `notes + assets` is exactly what the default ignore rules admit (§3, validity condition 1). Their objection, if they have one, is still wanted on the rest.
 
 Replies will be recorded here, and if one changes the mechanism the ADR is amended before task #13 starts.
 
+**lead** (review of task #2, 2026-09-24) raised the objection that changed the mechanism: re-sending a whole parent listing on every watcher event put a folder-sized IPC payload, and a folder-sized replace on the webview's main thread, behind every save. Upheld. Live updates became single-entry messages without size or mtime (§1). The same review moved the rebuild deferral ahead of `tree_prioritise` as the remedy for a completion breach, made `tree_first_screen` an observable event, pinned "delivered" to that front-end mark, and returned this ADR to *proposed* until the PRD carries its acceptance wording.
+
 ## Tested against
 
-The F-193 numbers, decomposed: they include the platform term (1117 / 1687 ms, ADR-0014) and a pre-strip walk (3.1 s in situ, F-12), and those are the two terms this ADR removes from the gated quantity by clock and by landed code respectively. **Not yet tested against a post-strip in-situ measurement, which is the case that would falsify it** — the no-index arm at 20k with the rebuild running. Today's code has no tree to mark, so task #9's first run takes `walk_complete − window_visible` from the existing `--exit-after-walk` trace as the baseline — the post-strip in-situ walk F-204 said should be measured before anything was believed — and the budget job proper goes red until task #13 emits the two marks.
+The F-193 numbers, decomposed: they include the platform term (1117 / 1687 ms, ADR-0014) and a pre-strip walk (3.1 s in situ, F-12), and those are the two terms this ADR removes from the gated quantity by clock and by landed code respectively. **Not yet tested against a post-strip in-situ measurement, which is the case that would falsify it** — the no-index arm at 20k with the rebuild running. Today's code has no tree to mark, so task #9's first run takes `walk_complete − window_visible` from the existing `--exit-after-walk` trace as the baseline — the post-strip in-situ walk F-204 said should be measured before anything was believed — and the budget job proper goes red until the two marks exist (tasks #13, #18 and #24).
