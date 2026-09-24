@@ -827,6 +827,16 @@ The index is disposable by principle. Re-OCRing four hundred scanned PDFs is not
 
 When no extractor claims a file, the asset still indexes with its sidecar and stays typed, linkable and queryable — only full-text search over its contents is unavailable. ExtractionState::Unavailable is a normal value in the IPC contract, not an error, and the UI shows it as a fact about the file rather than as a failure.
 
+#### 7.4 P1: assets without extraction (FR-BIN-01/02/03, FR-VLT-08, FR-BIN-11/12)
+
+P1 indexes, pairs, lists and displays binaries. It does not extract them (P2), so every mechanism below works on metadata and on bytes served untouched.
+
+- **Asset rows (FR-BIN-01).** An asset is a `notes` row with `kind = 'asset'`, as today (`upsert_asset`). A new table `assets(note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE, mime TEXT NOT NULL, bytes INTEGER NOT NULL)` carries MIME and size. It is the P1 slice of the table the DDL header already names; the extraction columns arrive with P2's schema change, which under ADR-0002 costs a rebuild and nothing else. **MIME comes from the file extension**, through one table in `serat-core` (unknown extensions become `application/octet-stream`). Sniffing content was rejected: it would read every binary on every rebuild, a per-file I/O cost on NFR-PRF-04's path, for a distinction P1 displays and does not act on. Size comes from the walk's stat, which is already in `SourceEntry`. Both the rebuild and the incremental path write the row in the same `upsert_asset` call, so no second path exists. The DDL lands with task #17 as one change that bumps `user_version`.
+- **Sidecar association (FR-BIN-02, ADR-0005).** The pairing is derived from names alone: `x.pdf.md` is `x.pdf`'s sidecar when both exist in one directory. It is recorded as `notes.sidecar_path` on the asset row, and nothing is copied from the sidecar to the asset. The sidecar stays an ordinary note, carrying its own `type` and fields, and R3 (§4.5) reaches the asset through the join. **In a rebuild** one `UPDATE` pairs every asset after the load, beside `resolve_links`. It touches only the ~200 asset rows through `notes.path`'s unique index, so NFR-PRF-04 pays nothing measurable. **Incrementally**, upserting a note whose path is `<asset path>.md` sets that asset's `sidecar_path`; upserting an asset checks for its sidecar; deleting either clears the pairing. Each is one lookup through the same unique index.
+- **Paired presentation (FR-BIN-03).** The fold happens in Rust, in the pure listing function ADR-0015 puts in `serat-core`. When a directory holds `x.pdf` and `x.pdf.md`, its listing carries one entry, `x.pdf` with kind `asset` and `sidecar: true`, and no entry for `x.pdf.md`. Creating or deleting the sidecar sends one `TreeUpsert` for the asset entry, and deleting the asset sends a `TreeUpsert` that turns `x.pdf.md` back into an ordinary note entry. Because the index and the walk share the function, they cannot disagree about a fold. The sidecar remains a note everywhere else: in the switcher, search and backlinks. Opening a folded entry opens the viewer with the sidecar available as its metadata note.
+- **Attachments are listed and linkable (FR-VLT-08).** Listings include assets. Inserting a link to one — a command on the tree entry, or dragging it into the editor — writes the shortest resolving form of §9.3: `![[name.png]]` for an image or PDF, `[[name.ext]]` for anything else.
+- **Viewer bytes (FR-BIN-11, FR-BIN-12): ADR-0017.** Bytes come through one read-only custom scheme, `serat-asset`. Its handler allows GET and HEAD only, serves viewable types only (PDF and images), resolves every request through `Vault::resolve` (T-07), supports single-range requests for pdf.js, and sends `nosniff` plus a sandboxing per-response CSP. The app CSP gains that one first-party origin in `img-src` and `connect-src`, and nothing else. pdf.js, with its worker, cMaps and fonts, is bundled and runs without `eval`, so the viewers make no network request (NFR-SEC-01).
+
 ### AI retrieval and MCP
 
 Three separable pieces: retrieval, which is always local; generation, which is provider-agnostic; and exposure, which is the MCP server. Only the middle one ever touches the network.
@@ -934,8 +944,8 @@ The remaining Must-priority requirements have designs that are the obvious ones,
 | FR-NAV-06, FR-VIW-01                       | Command palette over the same registry the keybinding table uses; TanStack Table over the streamed rows and anchors defined in contracts/ipc.rs.                                                             |
 | FR-STR-01, FR-STR-02                       | The schema registry described in §2.1 as a trait in serat-core, loaded from type notes and invalidated by the same index.changed events views use.                                                           |
 | FR-LNS-01, FR-LNS-05, FR-LNS-07            | Lenses, tasks and dashboards are all ordinary notes parsed by ordinary rules; a lens is an SQ predicate, a task is a block, a dashboard is a note with query blocks. No new mechanism.                       |
-| FR-BIN-11, FR-BIN-12                       | Bundled PDF and image viewers in the webview, opened at the locator a search hit carries.                                                                                                                    |
-| FR-VLT-03, FR-VLT-08                       | Temp-file-and-rename in serat-vault, described in §6.1 step 5; assets are listed by the same walk that finds notes.                                                                                          |
+| FR-BIN-11, FR-BIN-12                       | Bundled PDF (pdf.js, no network, no `eval`) and image viewers in the webview, fed by the read-only `serat-asset` scheme of §7.4 and ADR-0017, opened at the locator a search hit carries. |
+| FR-VLT-03, FR-VLT-08                       | Temp-file-and-rename in serat-vault, described in §6.1 step 5 (editor saves: ADR-0016); assets are listed by the same walk that finds notes, and linked by the shortest resolving form (§7.4). |
 | FR-AIX-06, FR-AIX-11, FR-AIX-12            | One provider trait with two implementations; retrieval never depends on which. Absence of a provider disables generation and nothing else, and no model ships in the installer.                              |
 | NFR-CMP-01, NFR-CMP-02                     | `.obsidian/`, `.trash/` and `.serat/` are in serat-vault's ignore list — descended into by nothing, read by nothing, written by nothing — so an Obsidian vault opens unmodified and its configuration survives a session. And everything Serat does write is Markdown, YAML or documented plain text, which falls out of the first design goal. |
 
@@ -957,6 +967,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0012 — Declare the Tauri app ACL manifest, and grant only the commands the webview calls (serves NFR-SEC-06, T-08)
 - ADR-0013 — When a merge may proceed with a performance budget red (serves C-06, NFR-PRF-04, NFR-MNT-01)
 - ADR-0014 — Cold start is budgeted as two terms, one of which is not ours (serves NFR-PRF-01, C-06, C-07, NFR-PRF-08)
+- ADR-0017 — Vault bytes reach the webview through one read-only custom scheme (serves FR-BIN-11, FR-BIN-12, NFR-SEC-06, NFR-SEC-01)
 
 ## Traceability
 
@@ -988,6 +999,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, FR-NAV-08, NFR-SEC-03, NFR-REL-03         |
 | Extraction cache                        | §7.2                       | FR-BIN-08                                                                     |
 | Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
+| P1 assets: `assets` table (MIME by extension, size), sidecar pairing by name, paired tree entry, attachment links, viewer bytes via `serat-asset` | §7.4, ADR-0005, ADR-0017, threat-model.md T-10 | FR-BIN-01, FR-BIN-02, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-VLT-08, NFR-SEC-01, NFR-SEC-06 |
 | Path containment: one rule, two enforcement points | §*A symlink is not a vault file*, threat-model.md T-07 | NFR-SEC-06 |
 | IPC command allowlisting: the handler list, the app manifest and the capability must agree | threat-model.md T-08 and §Trust boundaries, ADR-0012 | NFR-SEC-06 |
 | Budget enforcement, and the five conditions under which a red one may be merged past | ADR-0013, §Open design questions | C-06, NFR-PRF-04 |
