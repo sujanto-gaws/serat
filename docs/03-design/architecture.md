@@ -11,7 +11,7 @@ derived_from: Serat Design Description 1.0 (design baseline, August 2026) — or
 
 How the requirements are actually built: the crate graph, the indexing pipeline, the query compiler, the write-back patcher, the extraction sandbox and the ten decisions that would be expensive to reverse. The original document has six figures; they did not survive conversion to Markdown and are referenced below by figure number — open the HTML original to see them.
 
-> The design description names companion repo-ready files — `schema/001_init.sql`, `grammar/sq.ebnf`, `grammar/lowering.md`, `grammar/conformance.md`, `contracts/ipc.rs`, `contracts/extractor.rs`, `contracts/mcp-tools.json` — and states that where this document and those files disagree, the files are correct. `schema/001_init.sql` exists as of P0 and is the correct copy of §4; §4 and §4.4 have been updated where writing and running it contradicted them. The rest arrive with the phase that needs them: `contracts/ipc.rs` in P0 as the four-command subset, the `grammar/` files in P2, `contracts/extractor.rs` in P2 and `contracts/mcp-tools.json` in P4.
+> The design description names companion repo-ready files — `schema/001_init.sql`, `grammar/sq.ebnf`, `grammar/lowering.md`, `grammar/conformance.md`, `contracts/ipc.rs`, `contracts/extractor.rs`, `contracts/mcp-tools.json` — and states that where this document and those files disagree, the files are correct. `schema/001_init.sql` exists as of P0 and is the correct copy of §4; §4 and §4.4 have been updated where writing and running it contradicted them. The rest arrive with the phase that needs them: `contracts/ipc.rs` in P0 as the four-command subset and extended in P1 with the tree channel, editor buffers, switcher, search, backlinks, assets, settings and the ignore offer (task #7), the `grammar/` files in P2, `contracts/extractor.rs` in P2 and `contracts/mcp-tools.json` in P4.
 
 ## Context diagram
 
@@ -1213,7 +1213,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Retrieval fusion                        | §8.2, Fig. 3               | FR-AIX-01, FR-AIX-03, FR-AIX-09, FR-AIX-10                                    |
 | Proposal lifecycle                      | §8.3, Fig. 6               | FR-AIX-05, FR-AIX-04, FR-MCP-03                                               |
 | MCP tool schemas                        | contracts/mcp-tools.json *(planned)* | FR-MCP-01, FR-MCP-02, FR-MCP-04, NFR-SEC-05                           |
-| IPC contract                            | contracts/ipc.rs           | FR-VLT-01, FR-VLT-09, FR-LNS-02, FR-LNS-04, NFR-USE-04                        |
+| IPC contract                            | contracts/ipc.rs (P0 + P1 subset, task #7) | FR-VLT-01, FR-VLT-04, FR-VLT-05, FR-VLT-09, FR-NAV-01, FR-NAV-02, FR-NAV-04, FR-BIN-01, FR-BIN-11, FR-LNS-02, FR-LNS-04, NFR-CMP-04, NFR-MNT-01, NFR-USE-04 |
 | Quick switcher: corpus, matching, ranking, frecency storage, the NFR-PRF-06 measurement | §9.2 | FR-NAV-01, NFR-PRF-06, NFR-USE-01, C-02 |
 | Screen designs and interaction rules    | §9, Figs. 4–6              | FR-EDT-02, FR-STR-10, FR-NAV-04, FR-LNS-02, FR-VIW-05, NFR-USE-01, NFR-USE-04 |
 | Benchmark vault generator               | §10.3, bench/              | NFR-MNT-02                                                                    |
