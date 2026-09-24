@@ -3,7 +3,7 @@ project: Serat
 artifact: P1 gate protocol
 phase: 05-testing
 owner: test-engineer
-serves: NFR-CMP-01, NFR-CMP-02, NFR-CMP-03, NFR-CMP-04, NFR-USE-01, NFR-MNT-01, FR-VLT-08, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-NAV-06, US-01, US-29, US-34, US-35, RISK-013
+serves: NFR-CMP-01, NFR-CMP-02, NFR-CMP-04, NFR-USE-01, NFR-MNT-01, FR-VLT-08, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-NAV-06, US-01, US-29, RISK-013
 ---
 
 # P1 Gate Protocol
@@ -18,17 +18,25 @@ This is not a benchmark. There is no synthetic vault, no CI runner, and — whil
 
 A bright line, decided now rather than argued case-by-case during the week, because the case-by-case version always resolves in favour of whichever answer is more comfortable that day.
 
-**Needing Obsidian** means any of:
-- Opening Obsidian to **read or edit vault content** because Serat could not show it, could not edit it, or the owner did not trust what Serat showed.
+**"The real vault" is not just the one file tree on the primary machine.** Any copy, clone or synced replica of it is the real vault for this purpose — a laptop-side clone, a synced copy on another machine, a phone. **Obsidian mobile counts.** Doing vault work in any other tool that isn't Obsidian either — VS Code, a plain text editor, a terminal `cat`/`sed` — because Serat couldn't do it also counts as needing Obsidian: the gate is about not needing help, not specifically about not needing *Obsidian's app icon*. The only exemption from all of this is the scheduled external-edit test in daily-checklist item 6, which exists precisely to inject an edit from outside Serat and is not itself a "need."
+
+**Needing Obsidian (or an equivalent workaround)** means any of:
+- Opening Obsidian — desktop or mobile — to **read or edit vault content**, on any copy of the vault, because Serat could not show it, could not edit it, or the owner did not trust what Serat showed.
 - Opening Obsidian to **perform an action** — install/configure a plugin's data, resolve a link, view a PDF/image, run a query — because Serat has no equivalent yet or the equivalent broke.
 - Opening Obsidian to **check whether Serat corrupted or lost something**, other than the scheduled NFR-CMP-01 checks below. Reaching for Obsidian as a safety net is itself evidence the gate is not met, independent of what the check finds.
+- Doing real vault work in **any other tool** (VS Code, a plain text editor, a shell) because Serat could not do it. Swapping Obsidian for a different workaround does not satisfy "without needing Obsidian" — it satisfies the letter and defeats the point.
 
 **Not needing Obsidian** (does not break the week):
-- The two scheduled NFR-CMP-01 checks (day 0 baseline, day 7 reopen) — those checks *are* the compatibility test, not a use of Obsidian as a tool.
+- The two scheduled NFR-CMP-01 checks (day 0 baseline, day 7 reopen) and item 6's scheduled external-edit test — those exist to exercise compatibility and reconciliation, not to use Obsidian (or another editor) as a tool for getting real work done.
 - Opening Obsidian on a **different** vault, or out of idle curiosity with zero vault interaction.
-- Consulting Obsidian's plugin documentation or settings screen without opening the vault in it.
+- Consulting Obsidian's online documentation without opening the vault in it. (Obsidian's settings screen is per-vault state, not documentation — opening it against the real vault is a vault interaction and is logged like any other.)
 
-Every reach for Obsidian against the real vault — justified or not — is logged the same way (see daily log below): what was being attempted, why Serat did not serve it, and whether it was a missing P1 feature, a P2+ feature correctly out of scope, or a defect. A week with zero log entries is not evidence of nothing happening; it is evidence the owner did not use the vault hard enough to find out, and the gate report says so if session logs are thin.
+Every reach for Obsidian (or an equivalent workaround tool) against the real vault — justified or not — is logged the same way (see daily log below): what was being attempted, why Serat did not serve it, and whether it was a missing P1 feature, a P2+ feature correctly out of scope, or a defect. A week with zero log entries is not evidence of nothing happening; it is evidence the owner did not use the vault hard enough to find out, and the gate report says so if session logs are thin.
+
+**GO/NO-GO rule.** This is not a judgement call made once at the end of the week:
+- **Any reach logged as "missing P1 feature" or "defect" is NO-GO**, full stop — not weighed against how many good days surrounded it.
+- **A gate-stopping breach restarts the 7-day count.** The week is 7 consecutive days with no NO-GO event in it, not "7 good days spread across a longer window." A NO-GO on day 5 means a new day 1 starts once the cause is fixed, not a resumption at day 6.
+- **Reaches logged as "P2+ feature correctly out of scope" — placeholder, owner decision pending:** whether a reach for out-of-P1-scope capability (Dataview-equivalent queries, the flat table view, PDF full-text search) fails the gate is being put to the owner directly, because the charter's gate sentence doesn't say and it changes what "living in it for a week" means. **`[OWNER DECISION PENDING — do not run the gate week until this is filled in]`.** Until answered, a reach of this kind is logged but does not by itself resolve GO/NO-GO one way or the other.
 
 ## Daily checklist
 
@@ -42,6 +50,8 @@ Each day of the week the vault is the owner's actual note-taking tool for real w
 6. **Let an external edit happen** at least twice across the week, not necessarily daily — edit a note with git (a pull, a stash pop, a checkout) or another editor while Serat is open, and confirm the change appears in Serat without losing cursor position, selection or undo history in any note that was open at the time (FR-VLT-04/05, out of this protocol's Demo/Inspect list but the same week is the only chance to see it for real).
 7. **Log the day** — a dated entry appended to `docs/05-testing/reports/p1-gate-log.md` (created on day 0), recording: session start/end, what was done against items 2–6, any reach for Obsidian (with the reason, per the definition above), any crash, hang, data-loss scare or visibly wrong render, and its severity. A day with nothing to log still gets a one-line entry saying so — an absent day is not the same claim as an uneventful one.
 
+**A day only counts toward the week if items 2–4 were actually done** (write, link + check backlinks, switch/search + palette). Items 5 and 6 are conditional on the day's real work having a binary file or an external edit to exercise, and their absence on a given day does not disqualify it — but a day with no real writing, no link exercised and no navigation is not a day of "living in it," whatever else got logged.
+
 A defect found during the week is filed the same way test-plan.md requires elsewhere in this project: **a failure becomes a task**, assigned to the owning crate/role, with reproduction steps and the exact vault state — not left as a line in the log for someone to rediscover.
 
 ## The NFR-CMP-01 procedure (Obsidian reopens with no configuration loss)
@@ -49,21 +59,28 @@ A defect found during the week is filed the same way test-plan.md requires elsew
 NFR-CMP-01's acceptance criterion is exact: *"Given a real Obsidian vault, when opened and used for a session, then Obsidian opens it afterwards with no configuration loss."* Architecture §10.3/line 940 gives the mechanism this checks: `.obsidian/`, `.trash/` and `.serat/` are in serat-vault's ignore list — descended into by nothing, read by nothing, written by nothing. This procedure checks that promise held, not just that it was made.
 
 **Day 0, before Serat ever opens the vault:**
-1. Close Obsidian cleanly.
-2. Snapshot `.obsidian/` — `tar` it (or equivalent) to a location **outside** the vault, and record its size and a recursive checksum (e.g. `find .obsidian -type f -exec sha256sum {} \; | sort`).
-3. From inside Obsidian before closing it, record by hand: enabled community plugins, hotkey overrides, workspace layout (panes open), and any plugin-specific state the owner cares about (e.g. Dataview query cache, daily-notes settings). This is the part a checksum can't tell you was lost, because it can't tell you it *mattered*.
-4. Note the vault's git status if it is a git repo (clean/dirty, current branch) — NFR-CMP-04 is checked separately below but starts from the same baseline.
+1. **From inside Obsidian, before closing it**, record by hand: enabled community plugins, hotkey overrides, workspace layout (panes open), and any plugin-specific state the owner cares about (e.g. Dataview query cache, daily-notes settings). This is the part a checksum can't tell you was lost, because it can't tell you it *mattered* — it has to be captured while Obsidian can still show it.
+2. Close Obsidian cleanly.
+3. Snapshot `.obsidian/` — `tar` it (or equivalent) to a location **outside** the vault, and record its size and a recursive checksum that includes symlinks as well as regular files (e.g. `find .obsidian \( -type f -o -type l \) -exec sha256sum {} \; | sort` — a plain `-type f` search silently skips any symlinked config Obsidian itself follows).
+4. Note the vault's git status if it is a git repo (clean/dirty, current branch) — NFR-CMP-04 is checked separately below but starts from the same baseline. **If it is a git repo, also run `git ls-files .obsidian` and record whether `.obsidian/` itself is tracked.** If it is tracked, either keep item 6's external-edit git operations (pulls, stash pops, checkouts) to paths outside `.obsidian/` for the rest of the week, or re-run the step-3 checksum after every such git operation and log the result — a tracked `.obsidian/` means an ordinary git command touches the same tree this check is trying to hold still, and that is not a Serat-caused change but has to be told apart from one.
+5. Record `.trash/`'s existence and contents (a file listing, or "absent" if Obsidian hasn't created it yet), and note the moment as a timestamp marker for the day-7 comparison.
 
 **Through the week:** Obsidian stays closed on this vault except for the two scheduled checks. Serat is the only thing with the vault open.
 
 **Day 7, after the week's use:**
 1. Close Serat cleanly.
-2. Re-run the checksum from step 2 above and diff it against the day-0 snapshot. **Expected: byte-identical, zero diff.** Any diff is not a soft finding — it is a breach of a Must requirement and stops the gate.
-3. Open the vault in Obsidian. Confirm: it opens without a "vault needs repair" or re-index prompt, the plugins from step 3 are still enabled with the same settings, hotkeys are unchanged, and the workspace layout restores (or fails to restore for a reason Obsidian itself would give with Obsidian alone — not a Serat-caused loss).
-4. Confirm `.trash/` was not created or written to by Serat (grep its mtimes against the week's date range).
+2. Re-run the checksum from day-0 step 3 and diff it against the day-0 snapshot. **Expected: byte-identical, zero diff** (subject to day-0 step 4's tracked-`.obsidian/` carve-out, if it applies). Any unexplained diff is not a soft finding — it is a breach of a Must requirement and stops the gate.
+3. Open the vault in Obsidian. Confirm: it opens without a "vault needs repair" or re-index prompt, the plugins/hotkeys/layout recorded in day-0 step 1 are still enabled with the same settings, and the workspace layout restores (or fails to restore for a reason Obsidian itself would give with Obsidian alone — not a Serat-caused loss).
+4. Confirm `.trash/` was not created or written to by Serat: compare against the day-0 listing, and run `find .trash -newer <day-0 marker>` (empty result expected) to catch anything the listing diff alone would miss.
 5. Record all of the above — pass/fail per item, not a single "no config loss" line — in the gate report's NFR-CMP-01 section.
 
-**NFR-CMP-04** (`.serat/` never enters version control silently) is checked at the same two points: day-0 `git status` on the vault (does `.gitignore` already exclude `.serat/`?), and confirm across the week that if it did not, Serat *offered* to add the entry and made no `.gitignore` edit without that confirmation being given. If the vault is not a git repository this ID is not exercised this week and the gate report says so rather than marking it witnessed.
+**NFR-CMP-04** (`.serat/` never enters version control silently) has its own procedure, run **before the vault is opened in Serat for the first time**:
+1. Hash `.gitignore` (`sha256sum .gitignore`, or record its absence) and run `git check-ignore .serat` to establish, factually, whether `.serat/` is already ignored.
+2. Open the vault in Serat. If prompted to add an ignore entry, **decline the offer.**
+3. Re-hash `.gitignore` and confirm it is unchanged, and run `git status` and confirm it is clean with respect to `.gitignore` (no untracked-but-should-be-ignored `.serat/` sitting there, no modified `.gitignore`).
+4. If the owner's real vault already has `.serat/` ignored (so declining the offer never gets exercised — there's nothing to offer), this ID cannot be checked against the real vault. Run the same four steps against a **throwaway clone of the vault with no `.serat/` directory and no existing ignore entry**, so the "offer, decline, confirm untouched" path is actually exercised once, and record that it ran against a clone rather than the real vault.
+
+If the vault is not a git repository at all, this ID is not exercised this week and the gate report says so rather than marking it witnessed.
 
 ## How each P1 Demo/Inspect ID is witnessed
 
@@ -91,7 +108,7 @@ Two things this table is deliberately honest about, matching the standard the re
 
 ## What the gate report will contain (task #28, second half — not this document)
 
-This document is the protocol; the report that applies it is written after the week and after task #27's test cases land, per the task list. The report will carry, per `test-plan.md`'s reporting rule: the daily log in full, the NFR-CMP-01/CMP-04 day-7 checklist with pass/fail per item, the Demo/Inspect table above filled in with actual evidence references, every Obsidian-reach logged during the week with its disposition (missing P1 feature / correctly out of scope / defect, with the defect's task number), and an explicit GO / NO-GO — not a qualified one, because a gate that can be met "mostly" is not a gate.
+This document is the protocol; the report that applies it is written after the week and after task #27's test cases land, per the task list. The report will carry, per `test-plan.md`'s reporting rule: the daily log in full, the NFR-CMP-01/CMP-04 day-7 checklist with pass/fail per item, the Demo/Inspect table above filled in with actual evidence references, every Obsidian-reach logged during the week with its disposition (missing P1 feature / correctly out of scope / defect, with the defect's task number), and an explicit GO / NO-GO applying the rule above exactly — not a qualified one, because a gate that can be met "mostly" is not a gate. If any day in the reported week was restarted by a gate-stopping breach, the report shows the full history of attempts, not just the final clean run.
 
 ## Traceability
 
@@ -99,11 +116,10 @@ This document is the protocol; the report that applies it is written after the w
 |---|---|
 | NFR-CMP-01 | Turns "no configuration loss" into a day-0/day-7 checksum-and-checklist procedure instead of an impression. |
 | NFR-CMP-02 | Gives Inspect a concrete artefact (every file Serat wrote that week) rather than a spot check. |
-| NFR-CMP-03 | Implicit in day-0 setup: `.serat/` is never required for the vault to be usable in Obsidian at day 7. |
-| NFR-CMP-04 | Checked at the same two points as NFR-CMP-01, on the same git-repo precondition. |
+| NFR-CMP-04 | Its own hash-and-decline procedure, with a throwaway-clone fallback when the real vault has nothing to offer. |
 | NFR-USE-01, FR-NAV-06 | Give Inspect a cross-reference (actions actually used vs. palette listing) instead of a read-through of the palette alone. |
 | NFR-MNT-01 | States plainly that this ID is not witnessed by vault use and names what does witness it, so it is not silently marked done by proximity. |
 | FR-VLT-08, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12 | Each Demo ID gets a specific, repeatable in-week action and the evidence it leaves behind. |
-| US-01 | The whole document is US-01's acceptance criteria ("wikilinks, embeds, block refs and inline fields all resolve"; "no setting or plugin state was lost") made checkable. |
-| US-29, US-34, US-35 | US-29 (plain-text guarantee) → NFR-CMP-02 row; US-34 (no telemetry) is Test-verified elsewhere and out of this protocol's scope; US-35 (stays fast as it grows) is Bench-verified elsewhere — named here only to record why they are *not* in the Demo/Inspect table. |
+| US-01 | The whole document is US-01's acceptance criteria made checkable, narrowed to what P1 scope actually delivers: wikilinks and embeds (FR-EDT-03) resolving, and "no setting or plugin state was lost." Block refs (`[[note^block]]`) are FR-EDT-04, which is **P2** scope, not P1 — this document does not claim to witness them. |
+| US-29 | Plain-text guarantee → NFR-CMP-02 row. |
 | RISK-013 | The report will state which of this protocol's checks were CI-asserted (none) with the same honesty RISK-013 requires of the budget jobs. |
