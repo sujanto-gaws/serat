@@ -393,6 +393,15 @@ The case that decides the design
 
 You are editing line 400. Claude Code rewrites the frontmatter at line 3. With a document replacement you lose your place and your undo history; with an edit script you do not notice. Every reconciliation decision follows from wanting the second outcome.
 
+##### What P1 specifies (ADR-0016)
+
+The paragraphs above assumed a buffer with no unsaved changes. ADR-0016 covers the case they skip, and it also fixes the save direction, because both directions have to use the same coordinates:
+
+- **Coordinates.** `{line, col}` in the base document. Lines split on `\r\n`, `\n` and a lone `\r`, exactly as CodeMirror splits them. `col` is in UTF-16 code units. One pure function in serat-vault maps a position to a byte offset.
+- **The edit script** is computed in Rust by serat-vault: a line diff with character refinement, under a 50 ms deadline. serat-app emits it for any open note whose disk hash differs from the buffer's base hash, so an echo of Serat's own save is a no-op without any echo logic.
+- **Applying it.** A clean buffer takes it as a transaction with `addToHistory(false)`: the cursor and undo are mapped through it, and undo never reverts someone else's edit. A dirty buffer whose changes are disjoint from the external ones takes the mapped edits and stays dirty. Overlapping changes are a **conflict**: nothing is applied, and a non-modal notice offers *Keep mine* / *Take theirs* (undoable) / *Compare*. Nothing is lost silently.
+- **Saves are patch sets against the base hash, never whole documents.** CodeMirror joins lines with `\n`, so a whole-document save would rewrite every line ending of a CRLF or mixed-ending note — the re-serialisation C-04 forbids. `write_file` now only creates notes.
+
 #### 3.4 Cold start, and how a broken index is noticed
 
 Two requirements meet on this path and pull in opposite directions. NFR-PRF-01 wants an interactive window in 400ms and a usable vault in one second at 20,000 notes. NFR-REL-02 wants a corrupt index detected and rebuilt with no user action beyond restarting. Every thorough way of detecting corruption costs more than the entire window budget, so the two are reconciled by deciding what is checked *when*, rather than by checking less.
@@ -881,6 +890,58 @@ Fig. 6 — Review queue. One queue for every origin, including external agents o
 | Extraction state is shown on the file, not in a global progress bar    | The user cares whether this PDF is searchable yet, not about queue depth.                |
 | No modal dialogs on the write path                                     | A refused write resolves in place; a modal would make a routine event feel like a fault. |
 
+#### 9.3 The editor (FR-EDT-01/02/03/10, FR-NAV-06, NFR-PRF-02)
+
+Designed in P1 (task #5). Saving and reconciliation are ADR-0016 and §3.3. Everything else is below. **The editor has no IPC on the keystroke path.** Saves are debounced and asynchronous, link resolution is batched per viewport, and the preview render is scheduled off the keystroke. This is design goal 2 stated as a rule a reviewer can check.
+
+##### Decorations (FR-EDT-01, FR-EDT-02, ADR-0006)
+
+- **Parse.** Lezer markdown through `@codemirror/lang-markdown` with the GFM extensions (tables, task lists, strikethrough, autolinks). Custom inline extensions for what Lezer lacks: footnotes, `[[wikilink]]`, `![[embed]]`, `^block-id`, `key:: value`, and `==highlight==`. The parse is incremental, and it is time-sliced by CodeMirror, so a long note never parses on one keystroke.
+- **Inline decorations** come from a `ViewPlugin` over `view.visibleRanges` only, so their cost follows the viewport rather than the note. The previous `DecorationSet` is mapped through each change, and only the changed lines plus newly visible ranges are recomputed.
+- **Block widgets** — tables, embeds, callouts — come from a `StateField`, because CM6 permits block decorations only from state. Each widget implements `eq` so that an unchanged table is never rebuilt in the DOM.
+- **Reveal rule (FR-EDT-02).** Syntax markers are `Decoration.replace`d except on lines that intersect any selection range. A selection change recomputes only the lines it enters and leaves, which is how "within one frame" is kept.
+- **Obsidian syntax that Serat does not render** (for example Dataview blocks and plugin fences) is left as source text. It is never rewritten (C-01, NFR-CMP-01).
+
+##### Links and embeds (FR-EDT-03, NFR-CMP-01)
+
+**Resolution has one implementation, in serat-index, used by the writer and by the editor.** A link resolves by:
+
+1. the vault path exactly, with or without `.md`;
+2. then, only if the target has no `/`, the file name anywhere in the vault. Ties go to the shortest path, then byte order. This is the rule `resolve_links` already implements (`crates/serat-index/src/writer.rs`).
+
+**Matching is case-insensitive, as Obsidian's is.** The current SQL compares with `=`, so `[[my note]]` does not resolve to `My Note.md` today. The change is `COLLATE NOCASE` on both the comparison and `ix_notes_file_name`, and the two **must land in one commit with the rebuild benchmark**: either change without the other turns the per-link join into a scan, which is F-371 again. NOCASE folds ASCII only. Non-ASCII case differences stay unresolved in P1, and that is recorded rather than approximated. **Task #12's compatibility corpus is the check of both rules against Obsidian.** Where Obsidian disagrees, Obsidian wins, and the rule changes in this one place.
+
+**Subpaths.** `#Heading` matches a heading of the target case-insensitively; `#A#B` matches `B` under `A`; `#^id` matches `blocks.block_ref`; `[[#Heading]]` targets the current note. `|text` is display text only. An unresolved link renders as unresolved and is never "fixed" in the file.
+
+**The editor resolves through one batched command per viewport change.** Results are cached for the session and invalidated by `index.changed`. Before the index is `Ready`, links resolve by file name against the ADR-0015 tree listings (goal 5).
+
+**Autocompletion.** `[[` followed by two characters queries the §9.2 switcher in link mode: same corpus, same ranking. Choosing an entry inserts the shortest link that resolves back to it — the file stem if its name is unique, otherwise the vault path without `.md`. Then `#` completes that note's headings and `^` its block ids. FR-EDT-03's "inserts a resolving link" is tested by re-resolving every inserted link.
+
+**Embeds.** `![[note]]`, `![[note#Heading]]` and `![[note#^id]]` render the target's Markdown read-only, as a block widget, through the preview renderer below. Nesting is capped at depth 2 and cycles render as a link. `![[image.png|300]]` renders the image through the asset path of task #6. PDFs and other binaries render as a link chip that opens the viewer (FR-BIN-11). The widget yields to raw source when the selection enters its line, as any other syntax does.
+
+##### The preview renderer, and what it may not do (T-09)
+
+Split preview and embeds share one renderer: `markdown-it` with GFM, footnote and wikilink plugins, plus the resolver above. That makes three Markdown parsers — comrak for the index, Lezer for the editor, markdown-it for preview. They are kept rather than unified because each one is the standard tool for its job. Their divergence is checked by task #12's corpus rather than assumed away.
+
+**Rendered HTML passes a strict allowlist sanitiser before it reaches the DOM.** It keeps no `<script>`, no event-handler attributes, no `style` attributes, no `iframe`, `object` or `embed`, and no `javascript:` or `data:` URLs except `data:image/*`. **It loads no remote resource**: a remote image renders as a labelled placeholder with its URL, and is never fetched (NFR-SEC-01). The CSP in `tauri.conf.json` (`default-src 'self'`) already refuses both, so the sanitiser is the first barrier and the CSP the second. A note is untrusted input: git, sync tools and agents all write into the vault.
+
+##### Split preview (FR-EDT-10)
+
+With `editor.live_preview = false`, the editor is source mode (syntax highlighting only) beside a read-only rendered pane. The pane re-renders 150 ms after the last change. The render is scheduled in idle time and chunked, so a 5,000-line note never renders in one frame. Scroll sync maps source lines to the rendered blocks' `data-line` attributes. Editing capability is identical in both modes, because it is the same editor.
+
+##### The command registry (FR-NAV-06, NFR-USE-01)
+
+One front-end module owns every user-invocable action: `register({ id, name, defaultBinding?, when?, run })`. The palette lists the registry with each command's effective binding. **The CodeMirror keymap is built from the registry**, including the default editing and history commands, which are re-registered under Serat ids. `keymap.of` appears in exactly one place, and a test asserts that. User rebindings live in the settings TOML (FR-PLT-05) under `[keybindings]`, keyed by id. A unit test asserts that ids are unique, that every command has a name, that no two commands share a binding in the same `when` context, and that every entry in the NFR-USE-01 primary-action list is registered. That test is the "Inspect" the requirement names, made repeatable.
+
+##### NFR-PRF-02: how keystroke-to-paint is measured
+
+**Binding: ≤ 16 ms p95, in a 5,000-line note, per scenario, gated on the worst scenario.** It is measured by task #11's Playwright/Chromium harness against the production vite build, with the IPC client stubbed — the keystroke path makes no IPC call, so a stub removes nothing that is measured.
+
+- **Interval.** The Event Timing API's `duration` for each `keydown`, from the event's `timeStamp` to the next paint after its handlers ran. Chromium reports it in 8 ms steps, which is coarse but decisive: 16 passes and 24 is a missed frame. `processingEnd − processingStart` is reported beside it, unrounded, as the script-cost diagnostic.
+- **Note.** A generated 5,000-line note: paragraphs dense with wikilinks, 50 GFM tables, task lists, footnotes, fenced code, headings every ~40 lines, a CRLF variant and a BOM variant. It lives with the harness, because the benchmark vault's notes average about 2 KiB.
+- **Scenarios**, each at least 500 keystrokes with the viewport at the cursor: typing at the start, the middle and the end; typing inside a table cell; typing in a link-dense paragraph; Enter mid-note; Backspace across a bold delimiter (reveal/hide); and continuous typing in split-preview mode, so that a preview render landing on a frame is inside the measurement.
+- **Basis.** Chromium on the harness machine. It is the same engine as WebView2, not the same process, and WKWebView and WebKitGTK are not measured (F-96's basis clause). Every figure carries that basis.
+
 ## Cross-cutting concerns (packaging, security, verification)
 
 Three areas that carry Must-priority requirements and no interesting mechanism, which is exactly why they are easy to leave undesigned until they become a crisis. This section exists because a coverage check against the requirements baseline found them missing.
@@ -930,8 +991,8 @@ The remaining Must-priority requirements have designs that are the obvious ones,
 
 | Requirements                               | Design                                                                                                                                                                                                       |
 |--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| FR-EDT-01, FR-EDT-03, FR-EDT-05, FR-EDT-08 | CodeMirror 6 with custom Lezer nodes for wikilinks, embeds, block refs and inline fields; per ADR-06 and §3.3 for the reconciliation half. Undo integration is the transaction path already described in §6. |
-| FR-NAV-06, FR-VIW-01                       | Command palette over the same registry the keybinding table uses; TanStack Table over the streamed rows and anchors defined in contracts/ipc.rs.                                                             |
+| FR-EDT-01, FR-EDT-03, FR-EDT-05, FR-EDT-08 | CodeMirror 6 with custom Lezer nodes for wikilinks, embeds, block refs and inline fields; per ADR-06, §9.3 for the P1 specification (decorations, resolution, embeds, completion) and §3.3 / ADR-0016 for reconciliation and saves. Undo integration is the transaction path already described in §6. |
+| FR-NAV-06, FR-VIW-01                       | Command palette over the same registry the keybinding table uses (§9.3, *The command registry*); TanStack Table over the streamed rows and anchors defined in contracts/ipc.rs.                                                             |
 | FR-STR-01, FR-STR-02                       | The schema registry described in §2.1 as a trait in serat-core, loaded from type notes and invalidated by the same index.changed events views use.                                                           |
 | FR-LNS-01, FR-LNS-05, FR-LNS-07            | Lenses, tasks and dashboards are all ordinary notes parsed by ordinary rules; a lens is an SQ predicate, a task is a block, a dashboard is a note with query blocks. No new mechanism.                       |
 | FR-BIN-11, FR-BIN-12                       | Bundled PDF and image viewers in the webview, opened at the locator a search hit carries.                                                                                                                    |
@@ -957,6 +1018,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0012 — Declare the Tauri app ACL manifest, and grant only the commands the webview calls (serves NFR-SEC-06, T-08)
 - ADR-0013 — When a merge may proceed with a performance budget red (serves C-06, NFR-PRF-04, NFR-MNT-01)
 - ADR-0014 — Cold start is budgeted as two terms, one of which is not ours (serves NFR-PRF-01, C-06, C-07, NFR-PRF-08)
+- ADR-0016 — Editor saves are patches against a base, and external changes arrive in the same coordinates (serves FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04)
 
 ## Traceability
 
@@ -973,6 +1035,8 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | NFR-PRF-03's measurable interval, and the branch a serat-index-scoped harness cannot see | §3.1.1 *What NFR-PRF-03's benchmark may enter*, F-382, F-19 | NFR-PRF-03, NFR-PRF-08, C-06 |
 | Echo suppression                        | §3.2                       | FR-VLT-06                                                                     |
 | Diff-based reconciliation               | §3.3                       | FR-VLT-05                                                                     |
+| Editor saves as patch sets; reconciliation with unsaved edits; the conflict path | §3.3, ADR-0016 | FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04 |
+| Editor: decorations, link resolution and embeds, preview sanitiser, split preview, command registry, NFR-PRF-02 measurement | §9.3, threat-model.md T-09 | FR-EDT-01, FR-EDT-02, FR-EDT-03, FR-EDT-10, FR-NAV-06, NFR-PRF-02, NFR-USE-01, NFR-CMP-01, NFR-SEC-01 |
 | Cold-start path and phase budgets       | §3.4                       | NFR-PRF-01, FR-VLT-01                                                         |
 | Cold-start term split: the seven-term partition, the attribution rule, and which terms bind | §3.4 *The split*, ADR-0014, `crates/serat-app/src/startup.rs` | NFR-PRF-01, NFR-PRF-08, C-06, C-07 |
 | Scale independence: which series carries the 20,000-vs-50,000 assertion, and which is reported beside it | §3.4 *Ruling (task #118)*, ADR-0014 §Decision 3, `bench/budget/src/lib.rs` | NFR-PRF-01, NFR-PRF-08, C-06 |
