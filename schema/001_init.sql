@@ -17,8 +17,19 @@
 -- phase that adds them:
 --   P1  assets(note_id, mime, bytes, page_count, extractor, extractor_ver,
 --       content_hash, extracted_at, needs_ocr)      — FR-BIN-01, FR-BIN-02
---       ix_links_dst_path (re-resolving links when a missing note appears),
---       ix_blocks_ref (block-reference resolution)
+--       ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL
+--         — R3's sidecar-to-asset join (architecture §4.5); lands with the
+--         writer that fills sidecar_path (task #17), not before
+--       ix_notes_file_name becomes COLLATE NOCASE — case-insensitive link
+--         resolution (§9.3); lands in ONE commit with the resolver's
+--         comparison, because either alone turns the per-link join into a
+--         scan (F-371)
+--   Withdrawn from this list by architecture §4.5 (task #4), reasons kept
+--   because a reason for an absence is the one a remover reads:
+--       ix_links_dst_path — shipped as the partial ix_links_unresolved; a full
+--         index on links(dst_path) would cost the rebuild once per link (F-373)
+--       ix_blocks_ref — UNIQUE(note_id, ord) already indexes note_id, so a
+--         block reference scans one note's dozen blocks
 --   P2  types(name, path, spec_json)                — FR-STR-01, FR-STR-02
 --   P4  chunks(id, note_id, block_lo, block_hi, text) and the sqlite-vec
 --       virtual table chunk_vec(chunk_id, embedding FLOAT[384])
