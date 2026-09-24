@@ -16,9 +16,12 @@
  *
  * `request_external_diff` is ADR-0016 §2's recovery path: the front end
  * dropped an `ExternalChange` whose `base_hash` did not match, or a save came
- * back `StaleHash`. `serat-app` diffs `base_hash`'s bytes — which it still
- * holds for an open note — against the disk as it is now. `None` means the
- * disk equals the base.
+ * back `StaleHash` (which **always** calls it). `serat-app` diffs
+ * `base_hash`'s bytes against the disk as it is now; `None` means the disk
+ * equals the base. When `serat-app` no longer holds the bytes for
+ * `base_hash`, the answer is `IpcError::StaleHash` with the current disk hash
+ * — never a guessed diff — and the front end takes the conflict path
+ * (ADR-0016 §2, §4).
  */
 export type NoteBufferArgs = { 
 /**

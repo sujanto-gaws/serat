@@ -64,7 +64,7 @@
 //! |---|---|---|
 //! | File tree | `open_tree` + `Channel<TreeMessage>` (streaming), `mark_tree` | ADR-0015, §3.5 |
 //! | Choosing a vault | `choose_vault` (native dialog, no path parameter) | T-08 |
-//! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, event `note://external-change` | ADR-0016, §3.3 |
+//! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change` | ADR-0016, §3.3 |
 //! | Invalidation | event `index://changed` (throttled, invalidation only) | §3.1 step 6 |
 //! | Switcher + link completion | `switcher_query` | §9.2 |
 //! | Search, property lookup | `search` | §4.5 R1/R3 |
@@ -750,9 +750,12 @@ pub enum TreeMark {
 ///
 /// `request_external_diff` is ADR-0016 §2's recovery path: the front end
 /// dropped an `ExternalChange` whose `base_hash` did not match, or a save came
-/// back `StaleHash`. `serat-app` diffs `base_hash`'s bytes — which it still
-/// holds for an open note — against the disk as it is now. `None` means the
-/// disk equals the base.
+/// back `StaleHash` (which **always** calls it). `serat-app` diffs
+/// `base_hash`'s bytes against the disk as it is now; `None` means the disk
+/// equals the base. When `serat-app` no longer holds the bytes for
+/// `base_hash`, the answer is `IpcError::StaleHash` with the current disk hash
+/// — never a guessed diff — and the front end takes the conflict path
+/// (ADR-0016 §2, §4).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct NoteBufferArgs {
@@ -784,6 +787,28 @@ pub struct SavePatchArgs {
     /// Ordered, non-overlapping patches in base coordinates. May be empty (a
     /// no-op that still checks the hash).
     pub patches: Vec<Patch>,
+}
+
+/// Arguments to `rebase_buffer`.
+///
+/// `rebase_buffer(args: RebaseBufferArgs) -> Result<Vec<Patch>, IpcError>`
+///
+/// ADR-0016 §4's *Keep mine*. Sent once, on that explicit action, with the
+/// whole buffer text. `serat-app` checks that `disk_hash` is the file's current
+/// hash (otherwise `StaleHash`), then serat-vault computes the edit script from
+/// the disk text to `buffer` — the same function as `ExternalChange` — and it
+/// returns those patches in **disk** coordinates. The front end then makes the
+/// disk text its base and those patches its pending changes, so the next
+/// `save_patch` turns the disk into exactly the buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RebaseBufferArgs {
+    /// Vault-relative path.
+    pub path: String,
+    /// The disk hash the user chose to keep their text over.
+    pub disk_hash: String,
+    /// The buffer's full text, as CodeMirror holds it.
+    pub buffer: String,
 }
 
 /// Event `note://external-change`, and the answer of `request_external_diff`.
@@ -980,6 +1005,9 @@ pub enum SearchOutcome {
     NothingToSearch,
     /// More than one `[key:value]` term.
     TooManyPropertyTerms,
+    /// An unbalanced `"`. The search panel does not submit one; this answers
+    /// one that arrives anyway, without running a statement (§4.5).
+    UnbalancedQuote,
 }
 
 /// One search or property-lookup hit.
