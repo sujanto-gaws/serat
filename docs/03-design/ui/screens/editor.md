@@ -37,13 +37,31 @@ Two editor modes, one document, one command registry (architecture.md §9.3: "ed
 | Clean, focused | As above. Status strip save state: `Saved`. |
 | Dirty (unsaved change) | Tab dot turns brass. Status strip: `Unsaved` in `text-secondary`, no colour alarm — this is the normal state of writing, not a warning. |
 | Saving (debounced, async, off the keystroke path per §9.3) | Status strip: `Saving…` for the ~200ms round trip; no spinner over the buffer, no blocking. |
-| Save refused (`StaleHash`) | **No retry, no "waiting" copy, and no save is ever in flight during this.** The front end doesn't poll after a refusal — it waits for the `ExternalChange` the watcher already emits for that same disk change, applies one of the three reconciliation outcomes (`external-change-notice.md`), adopts the new base, and only then re-sends the save. For a clean or dirty-disjoint buffer this resolves on its own and is invisible; the editor itself never shows a raw error toast for `StaleHash` — the notice, when there is one, *is* the UI for it. |
+| Save refused (`StaleHash`) | See the dedicated subsection below — this row is intentionally short because the sequencing has enough rules (ADR-0016 §2) to need its own explanation, not a one-line status-table cell. |
 | Link unresolved | Rust-coloured text with dotted underline (components.md §3); hovering shows a tooltip "No note named “X” — click to create" (Enter on it, when focused via keyboard nav of links, offers the same). |
 | Embed loading / embed depth-2 cycle | A cycle renders as a plain link, per architecture.md §9.3, with a small tooltip "embedded here would repeat itself." |
 | Sidecar note open | A sidecar (`x.pdf.md`) is an **ordinary, fully editable note** — nothing distinguishes its editor state from any other note's (US-18/FR-BIN-02 treat it as real frontmatter someone edits directly, and the file-tree's "Edit metadata note" escape hatch would be pointless if this view refused input). There is no "read-only" state modelled here for it. |
 | Genuinely non-writable content (e.g. a future read-only view, out of scope for these nine screens) | Where a view truly cannot accept edits, it **refuses input at the point of typing** — keystrokes simply don't insert, with a one-time tooltip explaining why on the first attempt — rather than accepting text into a buffer whose Save button is then disabled. Accepting typing that can never be saved is a worse lie than not accepting it. |
 
-## Mode 2 — Split preview (`editor.live_preview = false`, FR-EDT-10, US-08)
+### Save refused (`StaleHash`) — the sequencing, restated from ADR-0016 §2, and why it can't hang
+
+A `StaleHash` refusal is never followed by a blind retry or an indefinite "waiting" state. ADR-0016 §2 gives the front end exactly four rules for ordering a save against an `ExternalChange`, and the UI is built to make all four observable rather than silent:
+
+1. **An `ExternalChange` is applied only when its `base_hash` equals the buffer's current base hash.** One that doesn't match — because something else has since happened to the buffer or the file — is not applied.
+2. **While a save is in flight, an arriving `ExternalChange` is held, not applied.** When the save resolves, the held change is applied if its `base_hash` now matches the (possibly just-updated) base, and dropped otherwise. A save is therefore never overtaken by a reconciliation mid-flight.
+3. **Any other mismatch drops the change and calls `request_external_diff(path, base_hash)`** — the front end asks explicitly for a fresh diff against its current base rather than waiting for a watcher event that may not arrive in the shape it needs.
+4. **After a `StaleHash` refusal specifically, the front end requests the diff (rule 3) unless the explaining `ExternalChange` was already applied** (i.e. rule 1 already resolved it via the watcher's own event, which can arrive first). Either way, something is always actively pursued — there is no path where the front end is simply idle, waiting on nothing, after a refusal.
+
+**What this looks like on screen**, because "the front end requests a diff" is not itself a user-visible state:
+
+| Moment | Status strip / editor presentation |
+|---|---|
+| The instant a save is refused | Save state reads **`Unsaved`** — the same token as ordinary dirty-buffer text (`text-secondary`, no alarm colour). It never reads `Saving…` (the save has already resolved, as a refusal) and never `Saved` (nothing was written). This is deliberately the *least* alarming truthful state: a refused save is not yet known to be a conflict, only known to be not-yet-saved. |
+| The diff arrives and resolves to a clean-buffer or dirty-disjoint outcome | Same as an ordinary external change: **`Updated externally`** for 3s in the status strip, then back to the normal save state (`external-change-notice.md`'s outcome table). This is the common case and resolves within one round trip, typically well under a second. |
+| The diff arrives and resolves to an overlap | The full conflict notice appears (`external-change-notice.md`) — this *is* the visible resolution of the refusal; nothing about the refusal itself needed a separate error state, because the notice explains it. |
+| **`request_external_diff` returns nothing (disk already equals the current base) *and* the save still can't be assumed safe to blindly retry, or the request fails outright** (IPC error, note closed mid-flight, etc.) | A **persistent** status-strip line, `text-secondary`, replacing the ordinary save state until acknowledged: **"Not saved — file changed on disk"**, with a **Compare** action (opens the same read-only diff view `external-change-notice.md`'s Compare uses) so the user can see what's actually different before deciding what to do next. This is the one case that doesn't resolve itself in a round trip, and it is the state that keeps the flow from ever going quiet: if nothing else explains the refusal, this line says so instead of the UI simply sitting at `Unsaved` forever with no indication anything is wrong. |
+
+No state in this sequence is a spinner or a toast that disappears before it's read — the `Unsaved` state persists until something resolves it, and the fallback line persists until the user acts on it (Compare, or a subsequent successful save).
 
 - Source pane (left of the split, or full width in narrow layout): plain syntax-highlighted Markdown, `mono-source` throughout, no reveal/hide — nothing is ever hidden in this mode, which is the point of the fallback.
 - Preview pane (right): the same `markdown-it`-rendered, sanitised output as embeds use (architecture.md §9.3, "the preview renderer, and what it may not do"), `body-serif`, read-only, scroll-synced via `data-line`.

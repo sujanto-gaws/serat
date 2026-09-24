@@ -70,7 +70,7 @@ Shared chrome for `command-palette.md` and `quick-switcher.md`:
 
 **Keybinding chip**: `mono`, `micro`/`small`, `bg-surface-sunken`, `radius.chip`, 1px `border-hairline`, one glyph per physical key (`⌘` `⇧` `⌥` `⌃` `↵` `⎋` `⇥` on macOS; `Ctrl` `Shift` `Alt` `Enter` `Esc` `Tab` spelled out on Windows/Linux, since those platforms have no single-glyph convention) joined with no separator character (not `Cmd+K`, but two adjacent chips `⌘` `K` — a chip pair reads as "these two keys", a plus sign reads as arithmetic).
 
-**Non-modal notice** (conflict notice, gitignore offer): docked card, `elevation.overlay`, anchored to the pane it concerns (editor for conflicts, tree for the gitignore offer) rather than to window centre. Dismissible by `Esc`, but `Esc` on a notice with unresolved state (the conflict notice) parks it rather than discarding the choice — see `external-change-notice.md`.
+**Non-modal notice** (conflict notice, gitignore offer): docked card, `elevation.overlay`, anchored to the pane it concerns (editor for conflicts, tree for the gitignore offer) rather than to window centre. Dismissible by `Esc` **when the card itself has focus** — but `Esc` on a notice with unresolved state (the conflict notice) parks it rather than discarding the choice, and does not compete with `Esc` bindings already owned by the content the notice sits over (CodeMirror's own `Esc` handling keeps working while the editor has focus and the notice is simply showing) — see `external-change-notice.md` and §7's conflict-notice keybinding scope note.
 
 ---
 
@@ -178,14 +178,16 @@ Every P1 default binding, in one place, so it can be checked once for the regist
 | `⌘0` | Toggle fit / actual size |
 | `⌘⇧0` | Reset pan to centre |
 
-### Local to a pending external-change conflict (`when` that note's conflict notice is active)
+### Local to a pending external-change conflict
+
+`⌘⇧K`/`⌘⇧O`/`⌘⇧D` (below) are scoped `when` that note's conflict notice is active, same as any other contextual binding. **`Esc` is scoped more narrowly still — `when` the notice card itself holds focus, not merely "a conflict is pending for this note".** The editor buffer under the notice stays fully focusable and editable while a conflict is pending (per the notice's own Layout section), and CodeMirror binds `Esc` for its own purposes there (closing autocomplete, dropping a multi-cursor selection, exiting search-in-note, etc.) — those must keep working normally while the user is typing. So: `Esc` while the **editor/buffer** has focus runs CodeMirror's own `Esc` handler, untouched; `Esc` only minimises the conflict notice when focus is **on the notice itself** (its buttons, or the notice landed focus when it first appeared and hasn't been moved away — see `external-change-notice.md`'s "focus **not** stolen" note, which means in practice the user has to `Tab` to the notice, or click it, before `Esc` there means "minimise" rather than "whatever CodeMirror does"). The minimised tab indicator is a third, separate focus target with its own `↵`-to-reopen binding (`external-change-notice.md`), not reachable via a global `Esc`.
 
 | Binding | Command |
 |---|---|
 | `⌘⇧K` | Keep mine |
 | `⌘⇧O` | Take theirs (**not** `⌘⇧T`, reserved above for reopen-closed-tab) |
 | `⌘⇧D` | Open compare |
-| `Esc` | Minimise the notice (does not resolve the conflict) |
+| `Esc` (**only** when the notice card has focus) | Minimise the notice (does not resolve the conflict) |
 
 ### Local to the `.serat/` gitignore offer (`when` that card has focus)
 
