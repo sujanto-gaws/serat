@@ -20,10 +20,12 @@
 --       ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL
 --         — R3's sidecar-to-asset join (architecture §4.5); lands with the
 --         writer that fills sidecar_path (task #17), not before
---       ix_notes_file_name becomes COLLATE NOCASE — case-insensitive link
---         resolution (§9.3); lands in ONE commit with the resolver's
---         comparison, because either alone turns the per-link join into a
---         scan (F-371)
+--       case-insensitive link resolution (§9.3, §4.5), all in ONE commit with
+--         the resolver's comparisons and the rebuild bench, because any one
+--         alone turns the per-link join into a scan (F-371):
+--           ix_notes_file_name            -> COLLATE NOCASE
+--           ix_notes_path_nocase ON notes(path COLLATE NOCASE)   (new)
+--           ix_links_unresolved(dst_path) -> COLLATE NOCASE
 --   Withdrawn from this list by architecture §4.5 (task #4), reasons kept
 --   because a reason for an absence is the one a remover reads:
 --       ix_links_dst_path — shipped as the partial ix_links_unresolved; a full
