@@ -221,3 +221,114 @@ mod tests {
         }
     }
 }
+
+/// The shared table test ADR-0016 §"Risks" calls for: the same fixture strings and
+/// expected `{line, col}` <-> byte-offset mappings as the front end's
+/// `app/src/editor/patches.test.ts` (`textFromString` / `posAt` / `offsetAt`
+/// describe block, task #21, `b87755d`), so a drift between CodeMirror's line
+/// model and this module's is a failing test on both sides rather than a note
+/// where positions silently disagree.
+///
+/// `byte_offset_to_position` here is `posAt` there; `position_to_byte_offset` is
+/// `offsetAt`. The front end counts UTF-16 code units in JS string indices, which
+/// are already UTF-16 code units; this module counts them explicitly over UTF-8
+/// bytes, which is the entire reason the mapping is a function and not an
+/// assumption.
+#[cfg(test)]
+mod shared_table_tests {
+    use super::*;
+
+    #[test]
+    fn splits_on_lf() {
+        let doc = "one\ntwo\nthree";
+        assert_eq!(byte_offset_to_position(doc, 0), Position::new(0, 0));
+        assert_eq!(byte_offset_to_position(doc, 4), Position::new(1, 0));
+        assert_eq!(byte_offset_to_position(doc, 5), Position::new(1, 1));
+    }
+
+    #[test]
+    fn splits_on_crlf_and_the_terminator_is_never_part_of_either_line() {
+        let doc = "one\r\ntwo\r\nthree";
+        // Offset 3 is the position right after "one", the end of line 0.
+        assert_eq!(byte_offset_to_position(doc, 3), Position::new(0, 3));
+        // Line 1 ("two") starts at byte offset 5, after the two-byte \r\n.
+        let line_1_from = 5;
+        assert_eq!(
+            position_to_byte_offset(doc, Position::new(1, 0)),
+            Some(line_1_from)
+        );
+        assert_eq!(
+            byte_offset_to_position(doc, line_1_from),
+            Position::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn splits_on_a_lone_cr() {
+        let doc = "one\rtwo\rthree";
+        assert_eq!(byte_offset_to_position(doc, 4), Position::new(1, 0));
+    }
+
+    #[test]
+    fn keeps_a_bom_as_the_first_character_of_line_zeros_text() {
+        let doc = "\u{FEFF}title\nbody";
+        assert_eq!(byte_offset_to_position(doc, 3), Position::new(0, 1));
+        assert_eq!(
+            position_to_byte_offset(doc, Position::new(0, 1)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn counts_utf16_code_units_not_code_points_for_astral_characters() {
+        // U+1F600 (an emoji) is a surrogate pair: two UTF-16 code units, and
+        // four UTF-8 bytes.
+        let doc = "a\u{1F600}b";
+        assert_eq!(byte_offset_to_position(doc, 1), Position::new(0, 1)); // right after "a"
+        assert_eq!(byte_offset_to_position(doc, 5), Position::new(0, 3)); // after the pair, before "b"
+        assert_eq!(
+            position_to_byte_offset(doc, Position::new(0, 3)),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn offset_and_position_are_exact_inverses_across_a_whole_document_mixed_terminators_included()
+     {
+        // The fixture the amendment specifically asked for: CRLF, a lone CR and
+        // LF, all three, in one document — exactly the front end's
+        // "offsetAt is the exact inverse of posAt" fixture.
+        //
+        // Only *addressable* byte offsets round-trip, and the walk below visits
+        // exactly those: every offset inside a line's content, plus each line's
+        // own start, but never the second byte of a `\r\n` — offset 6 in this
+        // fixture, the `\n` half of "alpha\r\n"'s terminator. ADR-0016 §1 states
+        // that byte as unaddressable ("no position can fall inside a `\r\n`"),
+        // and CodeMirror's own line model agrees: `doc.line(2).from` is the
+        // *only* position between line 0 and line 1, not two. Walking every raw
+        // byte instead of every addressable one is precisely the bug this test
+        // first caught: `byte_offset_to_position(doc, 6)` computed *some*
+        // position, because it does not know it has landed inside a
+        // terminator, and that position did not map back to 6 — proving the
+        // fixture needs the same "walk content, skip terminators" shape the
+        // narrower `first\nsecond\r\nthird\rfourth` test above already uses,
+        // not a blind `for offset in 0..=len`.
+        let doc = "alpha\r\nbeta\rgamma\ndelta";
+        for line in 0..4u32 {
+            let (start, end) = line_content_range(doc, line).expect("line exists");
+            let mut offset = start;
+            loop {
+                let pos = byte_offset_to_position(doc, offset);
+                assert_eq!(
+                    position_to_byte_offset(doc, pos),
+                    Some(offset),
+                    "line {line} offset {offset} round-trips through {pos:?}"
+                );
+                if offset == end {
+                    break;
+                }
+                offset += doc[offset..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+}

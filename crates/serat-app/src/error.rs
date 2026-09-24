@@ -49,6 +49,27 @@ pub fn from_vault_error(error: VaultError) -> IpcError {
             path: String::new(),
             message,
         },
+        // ADR-0016 §2's editor-save path (task #33, serat-vault::Vault::write_patch).
+        // `IpcError::StaleHash` already exists for exactly this — the optimistic lock
+        // failing on a plain whole-document write and on a patch set are the same
+        // fact to the front end, "re-read and offer the choice" (§9.1) — so the
+        // patch path reuses it rather than growing a second variant for one race.
+        VaultError::StaleHash { path, found, .. } => IpcError::StaleHash {
+            path,
+            current_hash: found,
+        },
+        // No dedicated contract variant yet: `contracts/ipc.rs` has not caught up
+        // with ADR-0016's patch-set save path (the IPC contract is still the one
+        // piece of that design not yet merged, per the task that added this arm).
+        // A malformed patch is a client bug — ranges out of order, a position past
+        // a line's end — not an operating-system failure, but until the contract
+        // grows its own variant this is the closest existing one and, like the
+        // `Watcher` arm above, a plausible mapping is safer than leaving the match
+        // non-exhaustive. Revisit when tauri-app-dev lands the patch-set IPC types.
+        VaultError::MalformedPatch { path, reason } => IpcError::Io {
+            path,
+            message: reason,
+        },
     }
 }
 
@@ -135,6 +156,27 @@ mod tests {
                 },
                 IpcError::NotWritable {
                     path: "contract.pdf".into(),
+                },
+            ),
+            (
+                VaultError::StaleHash {
+                    path: "a.md".into(),
+                    expected: "aa".repeat(32),
+                    found: "bb".repeat(32),
+                },
+                IpcError::StaleHash {
+                    path: "a.md".into(),
+                    current_hash: "bb".repeat(32),
+                },
+            ),
+            (
+                VaultError::MalformedPatch {
+                    path: "a.md".into(),
+                    reason: "edits overlap".into(),
+                },
+                IpcError::Io {
+                    path: "a.md".into(),
+                    message: "edits overlap".into(),
                 },
             ),
         ];
