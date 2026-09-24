@@ -52,7 +52,7 @@ Every later trade-off falls out of these. When a feature fights one of them, the
 | Goal | Metric | Target |
 |---|---|---|
 | Performance at scale (50k notes, one laptop) | Cold start (20k notes, warm index) | < 1 s; window visible < 400 ms |
-| | Keystroke → paint | < 16 ms; editing never blocks on the indexer |
+| | Keystroke → paint | Painted in the first frame after the keystroke for ≥95% of keystrokes (NFR-PRF-02 as re-defined, owner 2026-09-24); editing never blocks on the indexer |
 | | Save → index (single-note incremental) | < 50 ms |
 | | Full rebuild, 20k notes | < 30 s |
 | | Resident memory | < 400 MB with embedding model; < 200 MB without |
