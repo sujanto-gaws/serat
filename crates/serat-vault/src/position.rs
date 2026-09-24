@@ -1,0 +1,223 @@
+//! `{line, col}` positions in a document, mapped to and from byte offsets.
+//!
+//! ADR-0016 §1: **one pure function**, used by both directions — the save path maps
+//! a patch's positions to byte offsets to apply it, and the reconciliation diff maps
+//! its byte offsets back to positions to describe it — so saves and reconciliation
+//! cannot disagree about where a position is.
+//!
+//! Lines split on `\r\n`, `\n` and a lone `\r`, exactly as CodeMirror 6 splits them.
+//! `col` counts **UTF-16 code units** within the line, CodeMirror's native unit. The
+//! line terminator itself is never part of a line, so no position can fall inside a
+//! `\r\n`, and a BOM is part of line 0's text, exactly as it is in CodeMirror's
+//! document, provided the caller built that document from a `String` that kept it.
+
+use serde::{Deserialize, Serialize};
+
+/// A position in a document: a 0-based line and a UTF-16 column within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Position {
+    /// 0-based line index.
+    pub line: u32,
+    /// UTF-16 code units into the line.
+    pub col: u32,
+}
+
+impl Position {
+    /// A position at `line`, `col`.
+    #[must_use]
+    pub const fn new(line: u32, col: u32) -> Self {
+        Self { line, col }
+    }
+}
+
+/// The byte offset at which each line of `text` begins, in CodeMirror's splitting
+/// rule: `\r\n`, `\n` and a lone `\r` all terminate a line, and the terminator
+/// belongs to neither the line before it nor the line after it.
+///
+/// Always has at least one entry (`0`, the start of line 0), even for an empty
+/// document. Byte-indexed scanning is safe here because `\r` and `\n` are both
+/// single-byte ASCII code points that can never appear as part of a multi-byte
+/// UTF-8 sequence — neither as a continuation byte (`0x80..=0xBF`) nor as a leading
+/// one (`0xC0..`) — so splitting on them never lands mid-character.
+#[must_use]
+pub fn line_starts(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut starts = vec![0usize];
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                starts.push(i);
+            }
+            b'\n' => {
+                i += 1;
+                starts.push(i);
+            }
+            _ => i += 1,
+        }
+    }
+    starts
+}
+
+/// The byte range of line `line`'s content, excluding its terminator.
+///
+/// `None` if `line` does not exist in `text`.
+fn line_content_range(text: &str, line: u32) -> Option<(usize, usize)> {
+    let starts = line_starts(text);
+    let start = *starts.get(line as usize)?;
+    // The content ends at the next line's start minus its terminator, or at the
+    // text's end for the last line (which has none).
+    let content_end = match starts.get(line as usize + 1) {
+        Some(&next_start) => {
+            let bytes = text.as_bytes();
+            // Walk back over the one or two terminator bytes that separate this
+            // line's content from the next line's start.
+            if next_start >= 2 && &bytes[next_start - 2..next_start] == b"\r\n" {
+                next_start - 2
+            } else {
+                next_start - 1
+            }
+        }
+        None => text.len(),
+    };
+    Some((start, content_end))
+}
+
+/// Map a `{line, col}` position to a byte offset into `text`.
+///
+/// `None` if `line` does not exist, or `col` lands past the end of that line's
+/// content (inside or beyond its terminator) — both client bugs, per ADR-0016 §2
+/// step 2, which the caller reports as [`serat_core::VaultError::MalformedPatch`]
+/// rather than clamping silently.
+#[must_use]
+pub fn position_to_byte_offset(text: &str, pos: Position) -> Option<usize> {
+    let (content_start, content_end) = line_content_range(text, pos.line)?;
+    let mut units = 0u32;
+    let mut offset = content_start;
+    if pos.col == 0 {
+        return Some(content_start);
+    }
+    for ch in text[content_start..content_end].chars() {
+        if units == pos.col {
+            return Some(offset);
+        }
+        units += ch.len_utf16() as u32;
+        offset += ch.len_utf8();
+        if units == pos.col {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+/// Map a byte offset in `text` back to a `{line, col}` position.
+///
+/// # Panics
+///
+/// Panics if `offset` is not on a UTF-8 character boundary of `text`, or exceeds
+/// its length. Every caller in this crate derives `offset` from `text` itself (a
+/// diff's own match boundaries), so an offset that violates this is our own bug,
+/// not an input to validate.
+#[must_use]
+pub fn byte_offset_to_position(text: &str, offset: usize) -> Position {
+    assert!(
+        offset <= text.len() && text.is_char_boundary(offset),
+        "byte_offset_to_position: {offset} is not a char boundary of a {}-byte string",
+        text.len()
+    );
+    let starts = line_starts(text);
+    // The line containing `offset` is the last line whose start is <= offset.
+    let line = starts.partition_point(|&start| start <= offset).saturating_sub(1);
+    let content_start = starts[line];
+    let units: u32 = text[content_start..offset]
+        .chars()
+        .map(|ch| ch.len_utf16() as u32)
+        .sum();
+    Position::new(line as u32, units)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_starts_splits_on_all_three_cm6_terminators() {
+        assert_eq!(line_starts("a\nb\r\nc\rd"), vec![0, 2, 5, 7]);
+        assert_eq!(line_starts(""), vec![0]);
+        assert_eq!(line_starts("no terminator"), vec![0]);
+        assert_eq!(line_starts("trailing\n"), vec![0, 9]);
+    }
+
+    #[test]
+    fn position_to_byte_offset_round_trips_through_ascii_lines() {
+        let text = "first\nsecond\r\nthird\rfourth";
+        for (pos, expected) in [
+            (Position::new(0, 0), 0),
+            (Position::new(0, 5), 5),  // end of "first", before the \n
+            (Position::new(1, 0), 6),  // start of "second"
+            (Position::new(1, 6), 12), // end of "second", before \r\n
+            (Position::new(2, 0), 14), // start of "third"
+            (Position::new(3, 0), 20), // start of "fourth"
+        ] {
+            assert_eq!(
+                position_to_byte_offset(text, pos),
+                Some(expected),
+                "{pos:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_inside_or_past_a_terminator_is_none() {
+        let text = "ab\ncd";
+        // Line 0's content is "ab", 2 UTF-16 units long: col 3 has nowhere to land.
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 3)), None);
+        // A line that does not exist.
+        assert_eq!(position_to_byte_offset(text, Position::new(5, 0)), None);
+    }
+
+    #[test]
+    fn col_counts_utf16_code_units_not_bytes_or_scalars() {
+        // "é" is one UTF-16 unit but two UTF-8 bytes; the emoji is a UTF-16
+        // surrogate pair (2 units) but one scalar value and four UTF-8 bytes.
+        let text = "é\u{1F600}x";
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 0)), Some(0));
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 1)), Some(2));
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 3)), Some(6));
+        assert_eq!(byte_offset_to_position(text, 0), Position::new(0, 0));
+        assert_eq!(byte_offset_to_position(text, 2), Position::new(0, 1));
+        assert_eq!(byte_offset_to_position(text, 6), Position::new(0, 3));
+    }
+
+    #[test]
+    fn a_bom_counts_as_one_utf16_unit_of_line_zero() {
+        // ADR-0016 §1: the BOM is part of line 0's text, as it is in CodeMirror's
+        // document, and every column after it is offset by one unit accordingly.
+        let text = "\u{FEFF}status:: active";
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 0)), Some(0));
+        // One UTF-16 unit (3 UTF-8 bytes) past the BOM is the start of "status".
+        assert_eq!(position_to_byte_offset(text, Position::new(0, 1)), Some(3));
+    }
+
+    #[test]
+    fn byte_offset_to_position_is_the_inverse_of_position_to_byte_offset() {
+        let text = "first\nsecond\r\nthird\rfourth line here";
+        for line in 0..4u32 {
+            let (start, end) = line_content_range(text, line).expect("line exists");
+            let mut offset = start;
+            while offset <= end {
+                let pos = byte_offset_to_position(text, offset);
+                assert_eq!(
+                    position_to_byte_offset(text, pos),
+                    Some(offset),
+                    "line {line} offset {offset} round-trips through {pos:?}"
+                );
+                if offset == end {
+                    break;
+                }
+                offset += text[offset..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+}
