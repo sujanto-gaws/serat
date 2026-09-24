@@ -1,0 +1,94 @@
+# Component inventory — P1
+
+Owner: frontend-designer. Tokens referenced below are from `tokens.json`. Every component that carries text states which type family it uses, because that choice is not incidental in this system (see tokens.json `meta.principles`).
+
+Cited requirement IDs are the ones a component exists to satisfy; screen specs in `screens/` carry the full FR/US list per screen.
+
+---
+
+## 1. App shell
+
+**Title bar** (`layout.titlebar-height`, `typography.ui`)
+- Left: window controls (platform-native). Centre: **lens switcher**, a segmented control naming the active lens (e.g. `Notes`, `Tasks` — P2+ lenses beyond Notes are out of scope here but the control's presence is not: it is the one thing architecture.md §9 places in the title bar because switching role is frequent and deliberate). Right: proposal count badge (P2, AI review queue) and vault name.
+- The lens switcher is a single keystroke (`Cmd/Ctrl+1..9` per registered lens) — see `command-palette.md`.
+
+**Three-pane layout**: file tree (`layout.tree-pane-width-*`) | editor | context pane (`layout.context-pane-width-*`). Panes are separated by a 1px hairline (`color.role.border-hairline`), never a shadow. Each pane is independently collapsible (`Cmd/Ctrl+B` tree, `Cmd/Ctrl+.` context pane). Below `layout.breakpoint-narrow` the context pane collapses to a flyover triggered by its own toolbar icon; below `layout.breakpoint-compact` the tree does the same and the editor becomes the only persistent pane (see each screen's Responsive section).
+
+**Status strip** (bottom of window, `typography.small`, mono for the hash/position fields): cursor `line:col` (mono), word count, index state (`Ready` / `Rebuilding…` / `Unavailable`, per ADR-0015's states — never a blocking spinner over content, per architecture.md §9.1 "extraction/index state is shown on the file, not a global bar"), save state.
+
+---
+
+## 2. Navigation
+
+**Tree row** (`layout.row-height-tree`, `typography.ui`)
+- States: default, hover (`bg-surface-sunken`), selected (`bg-selected`, left 2px indigo rail instead of a full highlight box — keeps the row's text legible and avoids the "everything is a rounded card" tell), open-in-editor (bold weight, not colour, so colour stays reserved for interaction), pending (row painted with a 1px dashed `border-hairline` folder icon and no chevron until its listing lands — ADR-0015 §4), dragging (opacity 0.6, drop-target line in `accent-interactive`).
+- Kind glyphs: folder (chevron + closed/open folder), note (the two-strip lontar mark reduction, 16px), asset (format-specific glyph: PDF, image, generic), **paired asset+sidecar** (asset glyph with a small brass dot at 4 o'clock — the one place a non-error, non-unsaved use of brass appears, meaning "this entry carries a metadata note folded into it").
+- Unsaved indicator: a brass dot to the left of the note name, replacing the kind glyph's position only while dirty (goal: one signal, not a glyph plus a dot).
+- Depth: 16px indentation per level, no vertical guide rules (rules read as a spreadsheet; indentation alone is legible at ≤ 6 levels, which covers the benchmark vault's shape).
+
+**Quick switcher** and **Command palette**: see their own screen specs. Both are the same overlay chrome — see §5 below.
+
+**Backlinks pane row**: see `backlinks-pane.md`.
+
+---
+
+## 3. Editor
+
+**Editor surface**: CodeMirror 6 host. Prose measure capped at `typography.measure.prose-max` (72ch), centred in the pane with generous side margins reclaimed as reading margin, not decoration — this is the single place in the shell where whitespace is the point.
+- Rendered (live-preview) text: `typography.body-serif`, in `color.role.text-primary`, `prose` family.
+- Revealed raw syntax (the line under the cursor/selection): `typography.mono-source`, in `color.role.text-secondary` for the marker characters (`**`, `#`, `[[`, `]]`) and `text-primary` for the content between them — so the eye can tell "structure" from "content" without colour-coding every token.
+- Headings render at `heading-sm` / `heading-md` / `heading-lg` in the `ui` family (Bricolage), deliberately breaking from the serif body: a heading is the app's structure imposed on the prose, not more prose.
+- Inline code / fenced code blocks: `mono-source`, on `bg-surface-sunken`, no border — a filled band reads as "this is data" without adding a rule.
+- Wikilinks (resolved): `color.role.text-link`, no underline at rest, underline on hover/focus. Unresolved: `color.role.unresolved-link` (rust) with a dotted underline — colour alone is not the only signal (colour-blindness; NFR-USE-02 is P5 but the habit starts now).
+- Block reference / inline field markers (`^id`, `key:: value`): `mono-source`, `text-tertiary`, always visible (never hidden by the reveal rule — they are structurally load-bearing, not typographic decoration).
+
+**Split-preview pane**: read-only render of the same document, `body-serif`, in a sibling pane separated by a hairline. See `editor.md`.
+
+**Conflict notice**: see `external-change-notice.md`. Uses the "overlay" elevation token but is docked, not centred — it never blocks the buffer underneath (architecture.md §9.1: no modal on the write path).
+
+---
+
+## 4. Binary viewers
+
+**PDF viewer chrome**: toolbar (`ui`, `small` icons) with page field (mono, editable, `Enter` jumps), page count, zoom, fit-width/fit-page toggle. Canvas area on `bg-surface-sunken`. See `binary-viewers.md`.
+
+**Image viewer chrome**: toolbar with zoom percentage (mono), fit/100%/zoom-to-selection. Checkerboard backdrop (`neutral.200`/`neutral.100` 8px check) behind transparent images — the one place a textured background is allowed, because it is information (this image has alpha), not decoration.
+
+---
+
+## 5. Overlays (palette, switcher, dialogs, tooltips)
+
+Shared chrome for `command-palette.md` and `quick-switcher.md`:
+- Card: `bg-overlay`, `radius.md`, `elevation.overlay`, 1px `border-hairline`. Centred horizontally, upper-third vertically (never true centre — true centre reads as a modal that owns the whole window; upper-third reads as a tool you summon and dismiss).
+- Input row: `typography.input`, `ui` family, no visible border once the card itself has the hairline — the input is the card, not a box inside it.
+- Result rows: `typography.ui`, icon + label + right-aligned metadata (mono, `small`/`micro`) + keybinding chip where relevant.
+- Matched characters: `color.role.accent-interactive`, `weight 600` — never a background highlight (a highlighted substring inside a highlighted row is the generic-AI tell; bolding the matched letters in the accent colour is legible and quieter).
+- Empty/no-match state: one line, `text-secondary`, states what to do next (see writing guidance — never "No results found." alone).
+- Keyboard: `↑↓` move, `Enter` accept, `Esc` dismiss, all overlays close on focus loss to a non-overlay element.
+
+**Keybinding chip**: `mono`, `micro`/`small`, `bg-surface-sunken`, `radius.chip`, 1px `border-hairline`, one glyph per physical key (`⌘` `⇧` `⌥` `⌃` `↵` `⎋` `⇥` on macOS; `Ctrl` `Shift` `Alt` `Enter` `Esc` `Tab` spelled out on Windows/Linux, since those platforms have no single-glyph convention) joined with no separator character (not `Cmd+K`, but two adjacent chips `⌘` `K` — a chip pair reads as "these two keys", a plus sign reads as arithmetic).
+
+**Non-modal notice** (conflict notice, gitignore offer): docked card, `elevation.overlay`, anchored to the pane it concerns (editor for conflicts, tree for the gitignore offer) rather than to window centre. Dismissible by `Esc`, but `Esc` on a notice with unresolved state (the conflict notice) parks it rather than discarding the choice — see `external-change-notice.md`.
+
+---
+
+## 6. Buttons, inputs, chips
+
+**Button**: `ui-medium`, `radius.sm`, 1px `border-hairline` by default (secondary), filled `accent-interactive` / `text-on-indigo` for primary, filled `accent-error` for destructive. No pill shape, no drop shadow. Hover darkens the fill/border by one ramp step (`indigo.700`, `rust.600`); no scale or lift transform (motion is reserved for state that actually changed, per the frontend-design skill's motion guidance).
+
+**Text input / search field**: `typography.input`, `bg-surface`, 1px `border-hairline`, `radius.sm`; focus replaces the hairline with `border.focus-ring` (2px indigo) rather than adding a glow — a ring, not a halo.
+
+**Filter chip** (the search panel's single `[key:value]` term): `mono`, `small`, `accent-secondary-bg` fill, `accent-secondary` text — brass, because a filter is an earned, secondary annotation on a query, not a primary action. A close (×) target ends the chip.
+
+**Status dot**: 6px circle. Brass = unsaved / attention (pending tree entry, sidecar fold). Rust = error/unresolved/refused. Never both meanings on the same token — see tokens.json's `unsaved-dot` vs `unresolved-link` vs `conflict-*` roles, which are named separately even though two of them render brass, so a future change to one cannot silently change the other.
+
+---
+
+## Accessibility baseline (applies to every component above)
+
+- Every interactive element reachable by `Tab`/`Shift+Tab` in visual order; overlays trap focus while open and return it to the invoking control on close.
+- Visible focus ring (`border.focus-ring`) on every focusable element — never `outline: none` without a replacement.
+- Colour is never the only carrier of a state: unresolved links get a dotted underline, conflicts get an icon and a label, errors get text, not just rust fill.
+- Hit targets ≥ 24×24px even where the visual glyph is 16px (tree row kind icons, chip close buttons).
+- `prefers-reduced-motion` collapses overlay open/close to opacity-only per `tokens.json` `motion.reduced-motion`.
+- All body/prose text meets 4.5:1 contrast against `bg-app`/`bg-surface`; `text-tertiary` is reserved for metadata never required for comprehension (word counts, timestamps).
