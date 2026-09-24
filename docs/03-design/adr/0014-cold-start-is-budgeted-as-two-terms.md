@@ -2,7 +2,7 @@
 
 **Status:** accepted · **Date:** 2026-09-08 · **Serves:** NFR-PRF-01, C-06, C-07, NFR-PRF-08
 
-**Amended by ADR-0015 §5 (2026-09-24, proposed).** The tree precondition of `t_usable` is now the front-end mark `tree_first_screen` (root listing applied and painted), replacing `buffer_rendered`, which P0 used because it had no tree. The seven-mark partition and every term boundary here are unchanged; `S_settle`'s end mark changes which precondition settles it. The 233.8 ms p95 in §Decision 7 was taken under the `buffer_rendered` precondition and is labelled so until the Serat term is re-measured on the first build that renders a tree.
+**Amended by ADR-0015 §5 (2026-09-24, accepted with PRD v1.6).** The tree precondition of `t_usable` is now the front-end mark `tree_first_screen` (root listing applied and painted), replacing `buffer_rendered`, which P0 used because it had no tree. The seven-mark partition and every term boundary here are unchanged; `S_settle`'s end mark changes which precondition settles it. The 233.8 ms p95 in §Decision 7 was taken under the `buffer_rendered` precondition and is labelled so until the Serat term is re-measured on the first build that renders a tree.
 
 **Accepted on task #100's figures.** All three consultations in §Objections are answered, and
 the one input this ADR reserved the right to be wrong about — `S_front`'s spread, which

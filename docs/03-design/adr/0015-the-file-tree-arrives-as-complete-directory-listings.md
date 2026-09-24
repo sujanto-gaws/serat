@@ -1,6 +1,6 @@
 # ADR-0015: The file tree arrives as complete directory listings, on a clock that starts at the painted window
 
-**Status:** proposed — becomes accepted when the PRD amendment to FR-VLT-01's acceptance criterion lands (product-analyst, citing this ADR), because §3 decides the PRD's open question on *complete* versus *first screen* and moves the clock start · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
+**Status:** accepted — on PRD v1.6 (task #32, merged at `857af57`), which carries FR-VLT-01's acceptance criterion as §3 defines it; proposed until then, because §3 decided the PRD's open question on *complete* versus *first screen* and moved the clock start · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
 **Honours:** ADR-0001 (the tree read is a read, never a writer request), ADR-0002 (the index is disposable, so the tree must stand without it), ADR-0011 (catch-up from the tree walk enters on the bulk side), ADR-0014 (the platform term is not ours)
 
 ## Context
@@ -39,7 +39,7 @@ The tree crosses from Rust to the front end as a sequence of `DirListing { dir, 
 
 | Message | Sent for | Cost to the webview |
 |---|---|---|
-| `DirListing { dir, entries }` | Initial population; a catch-up listing that **differs** from what was sent (Rust keeps what it sent, so identical listings are never re-sent); a directory rename; the rescan that recovers from a watcher overflow (ADR-0011) | Proportional to that directory, and never triggered by a save |
+| `DirListing { dir, entries }` | Initial population; a catch-up listing that **differs** from what was sent (Rust keeps what it sent, so identical listings are never re-sent); a directory rename; the rescan that recovers from a watcher overflow (ADR-0011) | Proportional to that directory, and never triggered by a save. **A directory rename drops the old subtree** (one `TreeRemove` for the old name, which removes every descendant from the model) **and re-lists every descendant directory under the new name**, root of the renamed subtree first, so its cost is proportional to the subtree. |
 | `TreeUpsert { dir, entry, after }` | A file or directory created, or the new name of a rename | One entry. `after` names the sibling it follows (`None` = first), so the front end inserts without comparing names and cannot disagree with Rust's collation |
 | `TreeRemove { dir, name }` | A file or directory deleted, or the old name of a rename | One entry |
 
@@ -49,7 +49,7 @@ Listings travel on an **ordered, lossless per-session stream** (a Tauri `ipc::Ch
 
 ### 2. Two sources, one shape
 
-- **Warm path (index `Ready`).** One prepared, fixed-shape read over `notes(path, kind)` on a read connection (ADR-0001: a read, not a request to the writer), grouped into listings by a pure function in `serat-core`. The root listing is sent first and alone, then the rest breadth-first. Directories that contain no indexed file are absent until the walk arrives — a missing empty folder for a moment, which is design goal 5 rather than a defect.
+- **Warm path (index `Ready`).** One prepared, fixed-shape read over `notes(path, kind)` on a read connection (ADR-0001: a read, not a request to the writer), grouped into listings by a pure function in `serat-core`. The root listing is sent first and alone, then the rest breadth-first. Directories that contain no indexed file — empty folders, or folders holding only ignored files — are absent until the walk arrives. **This is the requirement's scope, not a gap in it** (lead's ruling, taken to the PRD): FR-VLT-01's gated mark covers *every file the ignore rules admit and every folder that contains one*. Empty folders appear when the walk completes, and their arrival is reported, not gated.
 - **No-index path (`Opening` that resolves to rebuild, `Rebuilding`, `Unavailable`).** A **breadth-first streaming tree walk** in `serat-vault`: each `read_dir` produces one listing, root first. It shares `walk`'s ignore rules, its symlink refusal (T-07) and its lexical prefix strip (F-12). `Vault::walk` — sorted `Vec`, used by the rebuild for rowid determinism — is unchanged. On the no-index path this is a second enumeration beside the rebuild's; that duplication is accepted and **is inside the measured number**, because the budget is taken with the rebuild running (§4).
 - **Which one populates.** The index tree is sent only if no walk listing has been sent yet; otherwise the walk populates alone. `TreeComplete.source` records which.
 - **The walk always runs, after the first paint, and is authoritative.** On the warm path its listings arrive after `TreeComplete{source: index}` and replace any that differ. Every path the walk finds that the index lacks, or the index holds that the walk did not find, is submitted to the index as catch-up on the **bulk, blocking side of ADR-0011** — the reconciliation-on-open that §3.4 records as missing (*"the open path still has no catch-up mechanism"*) gets its consumer here.
@@ -75,6 +75,8 @@ Two front-end marks, stamped the way `window_visible` is: after the Vue commit t
 
 The stricter reading — *complete* — is the one gated, because this design satisfies both readings and a gate on the weaker one would pass a tree that shows its first screen and then takes ten seconds to fill. *Navigable* is carried by `tree_first_screen`, which is expected to be constant in vault size and is reported at both sizes so that expectation can fail visibly.
 
+**What `tree_complete` covers:** every file the ignore rules admit and every folder that contains one. An empty folder is not part of the gated mark: it appears when the walk completes, and that arrival is reported beside the verdict.
+
 **Validity conditions a run must meet, or it is rejected rather than recorded:**
 
 1. `TreeComplete.entries` and the front-end model's file-entry count at `tree_complete` both equal the **vaultgen manifest's `notes + assets`**. That is 20,000 + 200 = 20,200 on the 20k vault, the count the P0 walk returns (ADR-0011's worked shape; T-07's 20,200 files). The manifest counts exactly what the default ignore rules admit: `notes` excludes `.trash/`, the `.obsidian/` and `.trash/` files are counted separately as `ignored_files`, and the `.vaultgen` stamp is in `files` only (`bench/vaultgen/src/lib.rs`, `Manifest`). The count is taken from the manifest and never from the walk, because a walk that drops entries agrees with itself (F-19's shape).
@@ -82,7 +84,7 @@ The stricter reading — *complete* — is the one gated, because this design sa
 3. `tree_first_screen ≤ tree_complete`, and both are after `T_open`.
 4. The run records `cpu_load_percent`, `concurrent_build_processes` and `gate_eligible` like every other budget run.
 
-Reported beside the verdict, gating nothing: `t0 → tree_complete` (what a user waits through), `tree_first_screen − T_open` at 20k and 50k, and `tree_complete − T_open` at 50k.
+Reported beside the verdict, gating nothing: `t0 → tree_complete` (what a user waits through), `tree_first_screen − T_open` at 20k and 50k, `tree_complete − T_open` at 50k, and **empty folders: their count, and their time of arrival after `tree_complete`** (from `TreeMessage::WalkSettled`).
 
 ### 4. The front end's obligations
 
