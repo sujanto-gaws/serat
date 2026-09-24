@@ -28,10 +28,16 @@ impl VaultPath {
     ///
     /// # Errors
     ///
-    /// [`VaultError::InvalidPath`] if the path is empty, absolute, or contains a
-    /// `..` segment. [`VaultError::PathEscapesVault`] is reserved for the case where
-    /// a resolved absolute path lands outside the root, which only `serat-vault` can
-    /// determine.
+    /// [`VaultError::InvalidPath`] if the path is empty, absolute, contains a `..`
+    /// segment, contains a `:` in any segment (a Windows drive prefix or an NTFS
+    /// alternate data stream — NFR-SEC-06, T-07, T-10), names a reserved Windows
+    /// device (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or
+    /// without an extension), or has a segment with a trailing dot or space (both
+    /// are silently stripped by the Windows filesystem APIs, so `"note. "` and
+    /// `"note"` would otherwise name the same file on one platform and two
+    /// different files on another). [`VaultError::PathEscapesVault`] is reserved
+    /// for the case where a resolved absolute path lands outside the root, which
+    /// only `serat-vault` can determine.
     pub fn new(path: impl AsRef<str>) -> Result<Self, VaultError> {
         let raw = path.as_ref();
         let invalid = |reason: &str| VaultError::InvalidPath {
@@ -53,10 +59,43 @@ impl VaultPath {
         }
         // A Windows drive prefix or a UNC root reaching this constructor means an
         // absolute path was passed where a vault-relative one was required.
-        if unified.starts_with('/') || segments[0].ends_with(':') {
+        if unified.starts_with('/') {
             return Err(invalid(
                 "is absolute; pass a path relative to the vault root",
             ));
+        }
+        for segment in &segments {
+            // `:` anywhere in a segment, not just a trailing drive letter on the
+            // first one. `PathBuf::push` of a rootless, prefixed segment like
+            // `"C:Users"` *replaces* the accumulated path on Windows instead of
+            // appending to it — that is what let `"a/C:/Windows/x"` escape the
+            // vault root with no symlink involved (task #34) — and `:` mid-segment
+            // also names an NTFS alternate data stream (`note.md:hidden`), a second
+            // way to read or write bytes the vault never walked. Refusing `:`
+            // anywhere closes both with one rule (NFR-SEC-06, T-07, T-10).
+            if segment.contains(':') {
+                return Err(invalid(
+                    "contains a `:`, which is a drive prefix or an NTFS alternate \
+                     data stream on Windows",
+                ));
+            }
+            // Windows strips a trailing dot or space from a segment before it ever
+            // reaches the filesystem, so "note." and "note" name the same file
+            // there but two different rows here — and the OS-level stripping is
+            // itself a path first written on POSIX might not anticipate, which is
+            // a second door out of the vault-as-identity guarantee VaultPath
+            // exists to give (NFR-SEC-06).
+            if segment.ends_with('.') || segment.ends_with(' ') {
+                return Err(invalid(
+                    "has a segment with a trailing dot or space, which Windows \
+                     silently strips",
+                ));
+            }
+            if is_reserved_windows_name(segment) {
+                return Err(invalid(
+                    "names a reserved Windows device (CON, PRN, AUX, NUL, COM1-9, LPT1-9)",
+                ));
+            }
         }
         Ok(Self(segments.join("/")))
     }
@@ -108,6 +147,25 @@ impl VaultPath {
     pub fn is_markdown(&self) -> bool {
         matches!(self.extension().as_deref(), Some("md" | "markdown"))
     }
+}
+
+/// Whether a segment names a reserved Windows device, with or without an
+/// extension (`"NUL"` and `"NUL.txt"` both address the null device, never a
+/// file called that).
+///
+/// Case-folded: the reservation is case-insensitive on Windows, and a check
+/// that only matched `"NUL"` and missed `"nul"` or `"Nul.md"` would leave the
+/// door it exists to close open to any writer that happened to pick the
+/// wrong case.
+fn is_reserved_windows_name(segment: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = segment.split('.').next().unwrap_or(segment);
+    RESERVED
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
 }
 
 impl std::fmt::Display for VaultPath {
@@ -186,6 +244,53 @@ mod tests {
         assert_eq!(dotfile.extension(), None);
         assert_eq!(dotfile.stem(), ".gitignore");
         assert_eq!(dotfile.parent(), None);
+    }
+
+    #[test]
+    fn a_colon_anywhere_in_a_segment_is_refused() {
+        // Task #34 / NFR-SEC-06 / T-07 / T-10. `segments[0].ends_with(':')` alone
+        // let a non-leading drive prefix through: `Vault::resolve` pushes each
+        // segment onto a `PathBuf`, and on Windows `PathBuf::push` of a rootless,
+        // prefixed segment like "C:Users" *replaces* the whole accumulated path
+        // rather than appending to it — so "a/C:/Windows/x" escaped the vault root
+        // with no symlink involved. A trailing colon on a later segment is the
+        // same shape one directory down, and `:` mid-segment is a second escape
+        // route: an NTFS alternate data stream.
+        for bad in [
+            "a/C:/Windows/x",
+            "a/C:Users/x",
+            "notes/b:c.md",
+            "note.md:hidden",
+            "note.md:hidden:$DATA",
+        ] {
+            assert!(VaultPath::new(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_windows_device_names_are_refused_case_insensitively_and_with_an_extension() {
+        // NFR-SEC-06. Any of these as a segment addresses a device on Windows, not
+        // a file, regardless of case or a trailing extension.
+        for bad in [
+            "CON", "con", "Con.md", "PRN", "prn.txt", "AUX", "NUL", "nul.md", "COM1", "com3.md",
+            "LPT1", "lpt9.md", "notes/CON.md", "notes/con/note.md",
+        ] {
+            assert!(VaultPath::new(bad).is_err(), "accepted {bad:?}");
+        }
+        // And the near-misses must not be caught by an over-eager match.
+        for ok in ["CONtent.md", "console.md", "NULL.md", "COM10.md", "LPT10.md"] {
+            assert!(VaultPath::new(ok).is_ok(), "rejected {ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_in_a_segment_is_refused() {
+        // NFR-SEC-06. Windows silently strips a trailing dot or space before the
+        // segment ever reaches a filesystem call, so "note." and "note" would name
+        // the same file there but two different rows here.
+        for bad in ["note.md.", "note.md ", "dir./note.md", "dir /note.md"] {
+            assert!(VaultPath::new(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

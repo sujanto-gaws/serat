@@ -153,7 +153,8 @@ impl Vault {
     /// # Errors
     ///
     /// [`VaultError::PathEscapesVault`] if any path component between the root and the
-    /// target, inclusive, is a symlink.
+    /// target, inclusive, is a symlink, or if the accumulated path does not end up
+    /// inside the canonical root at all.
     pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, VaultError> {
         let mut current = self.root.clone();
         for component in path.as_str().split('/') {
@@ -166,6 +167,27 @@ impl Vault {
                     path: path.as_str().to_owned(),
                 });
             }
+        }
+        // Defence in depth (task #34, NFR-SEC-06, T-07, T-10): `VaultPath::new`
+        // already refuses the segment shapes that let a `PathBuf::push` escape the
+        // root — a `:` anywhere, in particular, which on Windows lets a rootless
+        // drive-prefixed segment like "C:Users" *replace* the accumulated path
+        // instead of extending it — but a guard that lives only at construction is
+        // one mechanism, and one mechanism that regresses (a future segment shape
+        // nobody thought of, a change to `VaultPath` that loosens a check) fails
+        // open with nothing here to catch it. This is the narrowest point every
+        // resolution passes through, so it is where a second, independent check
+        // belongs: whatever `current` ended up being, it must still be inside
+        // `self.root`. Factored out as `is_contained` so the containment rule
+        // itself is unit-testable independently of how `current` was built —
+        // which matters because the concrete escape this defends against
+        // (`PathBuf::push` replacing rather than extending) is Windows-specific
+        // behaviour that a Linux test run cannot reproduce end-to-end now that
+        // `VaultPath::new` refuses the segment shape that triggers it.
+        if !is_contained(&self.root, &current) {
+            return Err(VaultError::PathEscapesVault {
+                path: path.as_str().to_owned(),
+            });
         }
         Ok(current)
     }
@@ -391,6 +413,17 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 /// precisely the one an error needs to name.
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Whether `candidate` is `root` itself, or lies inside it.
+///
+/// [`Vault::resolve`]'s defence-in-depth check (task #34, NFR-SEC-06, T-07, T-10):
+/// `Path::starts_with` compares components, not raw text, so a sibling directory
+/// that merely shares `root`'s string prefix (`/vault-old` against `/vault`) is
+/// correctly not contained — that distinction is `std`'s, not reimplemented here,
+/// which is the point of using it rather than a string comparison.
+fn is_contained(root: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(root)
 }
 
 #[cfg(test)]
@@ -638,6 +671,50 @@ mod tests {
     }
 
     #[test]
+    fn a_colon_bearing_vault_path_is_refused_before_it_ever_reaches_resolve() {
+        // Task #34. The public door is closed at `VaultPath::new` (NFR-SEC-06,
+        // T-07, T-10): a segment with a `:` anywhere — not just a leading drive
+        // prefix — must never become a `VaultPath` at all, so it can never reach
+        // `resolve` to test `PathBuf::push`'s Windows replace-instead-of-extend
+        // behaviour in the first place.
+        for bad in ["a/C:/Windows/x", "a/C:Users/x", "note.md:hidden"] {
+            assert!(VaultPath::new(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_contained_refuses_a_candidate_outside_the_root() {
+        // The containment check `resolve()` applies after the symlink loop
+        // (task #34, NFR-SEC-06), tested directly rather than only through
+        // `resolve()`: the concrete way it can fire — `PathBuf::push` replacing
+        // the accumulated path — is Windows-only behaviour that `VaultPath::new`'s
+        // own guard (the test above) now prevents from ever reaching `resolve` on
+        // any platform, which is the point of defence in depth existing as a
+        // second, independently correct mechanism rather than something only
+        // reachable by first breaking the first one.
+        assert!(!is_contained(
+            Path::new("/vault"),
+            Path::new("/etc/passwd")
+        ));
+        assert!(!is_contained(
+            Path::new("/vault"),
+            Path::new("C:Users")
+        ));
+        // A sibling directory that merely shares the root's text prefix is not
+        // contained either — `Path::starts_with` is component-wise, and a naive
+        // string-prefix reimplementation of this check would get this wrong.
+        assert!(!is_contained(
+            Path::new("/vault"),
+            Path::new("/vault-old/secret.md")
+        ));
+        assert!(is_contained(
+            Path::new("/vault"),
+            Path::new("/vault/10-projects/note.md")
+        ));
+        assert!(is_contained(Path::new("/vault"), Path::new("/vault")));
+    }
+
+    #[test]
     fn an_absolute_path_inside_the_vault_relativises_to_one_spelling() {
         let (_dir, vault) = vault();
         let path = VaultPath::new("20-systems/indexing.md").expect("path");
@@ -860,6 +937,28 @@ mod permission_tests {
         let path = VaultPath::new("10-projects/new-subdir/note.md").expect("path");
         vault.write_atomic(&path, b"# New\n").expect("write");
         assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pathbuf_push_of_a_rootless_drive_prefixed_segment_replaces_the_path() {
+        // Task #34's actual mechanism, confirmed against the real platform rather
+        // than assumed: `PathBuf::push` of a segment like "C:Users" — a drive
+        // letter with no root, as opposed to "C:\Users" — discards whatever was
+        // accumulated so far instead of extending it. This is exactly what let
+        // "a/C:/Windows/x" escape the vault root with no symlink involved before
+        // `VaultPath::new` refused the `:` outright. The test documents the `std`
+        // behaviour the fix depends on continuing to hold; it does not call any
+        // Serat code, because `VaultPath::new`'s guard now makes the vulnerable
+        // call into `resolve()` unreachable through the public API.
+        let mut current = PathBuf::from(r"C:\vault\a");
+        current.push("C:Users");
+        assert_eq!(
+            current,
+            PathBuf::from("C:Users"),
+            "PathBuf::push no longer replaces on a rootless drive-prefixed push; \
+             re-examine whether the `:` guard in VaultPath::new is still load-bearing"
+        );
     }
 
     /// Creates an NTFS directory junction with `mklink /J`.
