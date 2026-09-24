@@ -1077,17 +1077,35 @@ One front-end module owns every user-invocable action: `register({ id, name, def
 
 - **Frames.** A continuous `requestAnimationFrame` loop records each frame's `rAF` timestamp `ts_i` and when its callback ran. Before the run, the harness measures the refresh interval `R` as the median of 120 consecutive deltas, and records it.
 - **The keystroke's frame.** For a keystroke with event `timeStamp` `t`, let `p` be the end of its processing: the `keydown`/`input` handlers plus CodeMirror's synchronous view update, stamped at the end of the dispatch. **The change is in frame `k`, the first frame whose `rAF` callback runs after `p`**, and `ts_k` is that frame's timestamp. It is not the first frame whose *start* is after `p`. Rendering follows the `rAF` callbacks, so input processed between a frame's timestamp and its callback is painted in that same frame. The start-based rule mis-scored about 5–8% of keystrokes as late (code-reviewer's measurement), and it is withdrawn.
-- **`frames_to_paint` counts elapsed vsync intervals by time, not recorded frames.** Let `ts_j` be the last recorded frame timestamp at or before `t`. Then `frames_to_paint = max(1, Σ round((ts_{i+1} − ts_i) / R))`, summed over consecutive recorded frames from `ts_j` through `ts_k`. A gap of about `R` counts one interval, and a gap of `2R` counts two, because the vsync between them was missed.
-- **Why by time.** **A blocked main thread records no `rAF` callbacks, so counting recorded frames makes missed vsyncs invisible.** The first version of this definition counted frame timestamps in `(t, ts_k]`, and an editor that blocked 20–25 ms on every keystroke scored 100% on time (#11 review). Summing `round(Δts / R)` sees the gap whether or not a callback ran inside it.
-- **The floor of 1.** `ts_k` can precede `t` when the keystroke arrived after that frame's timestamp but before its callback, and that is still an on-time paint. The floor also keeps the rounding rule symmetric: a short interval never counts as less than one frame, and a long one counts as every vsync it spans. The long-frame rule is the same rounding applied to frame `k`'s own interval, symmetrically: `max(0, round((ts_{k+1} − ts_k) / R) − 1)` is added, so a change frame that overruns its vsync by a whole interval counts as late, and the old `> 1.5 R` threshold is the rounding boundary rather than a separate rule.
+- **`frames_to_paint` is judged against a wall-clock deadline.** For a keystroke at `t`:
+  - **Anchor.** Let `ts_j` be the last recorded frame timestamp at or before `t`. The frame after it is the first one that could present the keystroke, and its vsync falls about `ts_j + R`.
+  - **Deadline.** `D = ts_j + 2R`: the end of the first frame after the keystroke.
+  - **`q_k`**: frame `k`'s post-paint timestamp, taken by a `MessageChannel` message posted inside frame `k`'s `rAF` callback. It was verified to land after the main-thread paint.
+  - **The count:** `frames_to_paint = 1 + max(0, ceil((q_k − D) / R))`.
+
+  The change is on time (1) when its frame finished painting by the deadline, and each whole frame past it adds one.
+- **Why a deadline on `q_k` rather than counting timestamps.** Two definitions before this one were wrong, each in a way a measurement showed.
+  - **Counting recorded frames** missed blocked vsyncs, because a blocked main thread records no `rAF` callbacks.
+  - **Summing `round(Δts / R)`** missed them too. code-reviewer recorded real `rAF` `{ts, run}` pairs in Chromium (60 keystrokes per arm, R = 16.70 ms). When the main thread blocks, Chromium does not skip vsyncs in the timestamps: the pending frame runs late with its *original* `ts`. So a 1.2R block scored 0/60 late and a 1.5R block 1/60. The delay sits in `run − ts`, which `ts` never shows.
+
+  A deadline on the post-paint wall-clock time holds whether the timestamps slide or skip. The render cost is inside `q_k`, so there is no separate long-frame term and nothing is counted twice.
+- **What the rule should produce.**
+  - A normal keystroke is on time.
+  - So is one processed between a frame's timestamp and its callback (`ts < p < run`), because it is painted in that frame and `q_k` meets `D`.
+  - A 1.2R block is late only when it starts late in a frame (phase above about 0.8R). One that starts early still meets the deadline and is genuinely on time under PRD v1.6's wording.
+  - A block of 2R or more is always late.
+- **No compositor margin yet.** `q_k` marks the end of the main-thread paint, not the compositor's presentation. A margin for the compositor deadline is deferred until a real WebView2 run shows whether it is needed.
 - **Keystrokes are driven through the browser's input pipeline** with Playwright's `keyboard.press` (CDP `Input.dispatchKeyEvent`), never by synthesised DOM events. The cadence is fixed at 100 ms between keystrokes and is recorded.
 
 **Diagnostic (b), reported and not gated:** the editor's own work per keystroke, in milliseconds. That is handler time (`p − processingStart`) plus frame `k`'s rendering: from its `rAF` callback to a post-paint timestamp taken by a `MessageChannel` message posted inside frame `k`'s `rAF` callback. It excludes the vsync wait by construction, and it is the number to look at when the frame metric fails.
 
-**Control arms, both required on every run.**
+**Control arms.**
 
 - **Positive.** A bare `contenteditable` goes through the same harness, scenarios and cadence. It must show **≥ 99%** of keystrokes on time, or the run is rejected: a harness or machine that cannot show a trivial editor keeping up cannot judge ours.
-- **Negative.** The same bare `contenteditable` gets a keystroke handler that busy-blocks the main thread for **1.2 R** (about 20 ms at 60 Hz). It must show **≥ 95% of keystrokes late**, or the run is rejected: a metric that cannot see a frame's worth of blocking cannot pass anyone. This arm is what caught the frame-counting definition, and it stays so the next definition is held to it.
+- **Negative, required.** The same bare `contenteditable` gets a keystroke handler that busy-blocks the main thread for **2.2 R** (about 37 ms at 60 Hz). Under the deadline rule that is late at every phase. It must show **≥ 95% of keystrokes late**, or the run is rejected: a metric that cannot see two frames of blocking cannot pass anyone. **1.2 R was the wrong bar**: a 1.2R block that starts early in a frame meets the deadline and is on time.
+- **Graded, reported and not gated.** A **1.5 R** busy-block should score about **50% late**, within a tolerance stated in the harness, because it misses the deadline only for the later half of phases. It shows that the rule tracks phase rather than merely detecting blocking.
+
+**What caught the earlier definitions was the busy-block probe measurement**: code-reviewer's recorded `{ts, run}` data under a known block, not a control arm. The negative and graded arms are there so the next definition is held to the same evidence.
 
 PRD v1.6's acceptance wording (*painted in the first frame after the keystroke*) is unchanged. This subsection only defines how that is counted.
 
