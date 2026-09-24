@@ -27,7 +27,14 @@ const CH_EQUALS = 61; // '='
  * start of a Markdown image. */
 const wikiLinkAndEmbed: InlineParser = {
   name: "SeratWikiLinkEmbed",
-  before: "Image",
+  // Ahead of every standard parser, not only "Image": the standard "Link"
+  // parser also triggers on a bare `[` and — task #40's investigation found
+  // this the hard way — happily claims the *inner* `[Note Name]` of a
+  // `[[Note Name]]` wikilink as an ordinary link before this parser ever
+  // gets a look, if this only ran "before Image". Running first means
+  // nothing else ever sees the leading `[`/`![[` of one of these
+  // constructs.
+  before: "Escape",
   parse(cx: InlineContext, next: number, pos: number): number {
     const isEmbed = next === CH_BANG;
     const bracketStart = isEmbed ? pos + 1 : pos;
