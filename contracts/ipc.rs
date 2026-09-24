@@ -80,6 +80,9 @@
 //!
 //! **Streaming**, stated per surface because the front end must treat them
 //! differently: the tree is an ordered, lossless per-session `Channel`;
+//! `Channel::send` never blocks, so the transport guarantees ordering and
+//! nothing else. What bounds the backlog is ADR-0015 §2's batching (at most
+//! 256 KiB or 16 ms of walking per message), not the channel;
 //! `note://external-change` is an event (unthrottled, unordered against command
 //! responses — ADR-0016's ordering rule is what makes that safe);
 //! `index://changed` and `index://status` are throttled and are for invalidation,
