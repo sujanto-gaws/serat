@@ -39,7 +39,7 @@ The tree crosses from Rust to the front end as a sequence of `DirListing { dir, 
 
 | Message | Sent for | Cost to the webview |
 |---|---|---|
-| `DirListing { dir, entries }` | Initial population; a catch-up listing that **differs** from what was sent (Rust keeps what it sent, so identical listings are never re-sent); a directory rename; the rescan that recovers from a watcher overflow (ADR-0011) | Proportional to that directory, and never triggered by a save |
+| `DirListing { dir, entries }` | Initial population; a catch-up listing that **differs** from what was sent (Rust keeps what it sent, so identical listings are never re-sent); a directory rename; the rescan that recovers from a watcher overflow (ADR-0011) | Proportional to that directory, and never triggered by a save. **A directory rename drops the old subtree** (one `TreeRemove` for the old name, which removes every descendant from the model) **and re-lists every descendant directory under the new name**, root of the renamed subtree first, so its cost is proportional to the subtree. |
 | `TreeUpsert { dir, entry, after }` | A file or directory created, or the new name of a rename | One entry. `after` names the sibling it follows (`None` = first), so the front end inserts without comparing names and cannot disagree with Rust's collation |
 | `TreeRemove { dir, name }` | A file or directory deleted, or the old name of a rename | One entry |
 
@@ -49,7 +49,7 @@ Listings travel on an **ordered, lossless per-session stream** (a Tauri `ipc::Ch
 
 ### 2. Two sources, one shape
 
-- **Warm path (index `Ready`).** One prepared, fixed-shape read over `notes(path, kind)` on a read connection (ADR-0001: a read, not a request to the writer), grouped into listings by a pure function in `serat-core`. The root listing is sent first and alone, then the rest breadth-first. Directories that contain no indexed file are absent until the walk arrives — a missing empty folder for a moment, which is design goal 5 rather than a defect.
+- **Warm path (index `Ready`).** One prepared, fixed-shape read over `notes(path, kind)` on a read connection (ADR-0001: a read, not a request to the writer), grouped into listings by a pure function in `serat-core`. The root listing is sent first and alone, then the rest breadth-first. Directories that contain no indexed file — empty folders, or folders holding only ignored files — are absent until the walk arrives. **This is the requirement's scope, not a gap in it** (lead's ruling, taken to the PRD): FR-VLT-01's gated mark covers *every file the ignore rules admit and every folder that contains one*. Empty folders appear when the walk completes, and their arrival is reported, not gated.
 - **No-index path (`Opening` that resolves to rebuild, `Rebuilding`, `Unavailable`).** A **breadth-first streaming tree walk** in `serat-vault`: each `read_dir` produces one listing, root first. It shares `walk`'s ignore rules, its symlink refusal (T-07) and its lexical prefix strip (F-12). `Vault::walk` — sorted `Vec`, used by the rebuild for rowid determinism — is unchanged. On the no-index path this is a second enumeration beside the rebuild's; that duplication is accepted and **is inside the measured number**, because the budget is taken with the rebuild running (§4).
 - **Which one populates.** The index tree is sent only if no walk listing has been sent yet; otherwise the walk populates alone. `TreeComplete.source` records which.
 - **The walk always runs, after the first paint, and is authoritative.** On the warm path its listings arrive after `TreeComplete{source: index}` and replace any that differ. Every path the walk finds that the index lacks, or the index holds that the walk did not find, is submitted to the index as catch-up on the **bulk, blocking side of ADR-0011** — the reconciliation-on-open that §3.4 records as missing (*"the open path still has no catch-up mechanism"*) gets its consumer here.
@@ -74,6 +74,8 @@ Two front-end marks, stamped the way `window_visible` is: after the Vue commit t
 - **no-index arm** — `.serat/` removed before each spawn, so the open check returns `NoIndex` and **the rebuild runs concurrently with the tree walk**, `source = walk`. That concurrency is the product's behaviour on first open, and measuring the walk without it is F-203's category error (an isolated benchmark for a cost that is about contention).
 
 The stricter reading — *complete* — is the one gated, because this design satisfies both readings and a gate on the weaker one would pass a tree that shows its first screen and then takes ten seconds to fill. *Navigable* is carried by `tree_first_screen`, which is expected to be constant in vault size and is reported at both sizes so that expectation can fail visibly.
+
+**What `tree_complete` covers:** every file the ignore rules admit and every folder that contains one. An empty folder is not part of the gated mark: it appears when the walk completes, and that arrival is reported beside the verdict.
 
 **Validity conditions a run must meet, or it is rejected rather than recorded:**
 
