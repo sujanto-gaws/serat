@@ -29,6 +29,7 @@ pub mod echo;
 pub mod hash;
 pub mod ignore;
 pub mod queue;
+pub mod refusal;
 pub mod walk;
 pub mod watch;
 
@@ -37,12 +38,15 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use serat_core::{ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, VaultError, VaultPath};
+use serat_core::{
+    ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, Platform, VaultError, VaultPath,
+};
 
 pub use echo::EchoSuppressor;
 pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
 pub use queue::{QueueStats, WorkQueue};
+pub use refusal::{Refusal, RefusalLog};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
@@ -57,6 +61,10 @@ pub struct Vault {
     /// all — see [`Vault::write_atomic`] and the [`EchoGuard`] impl below for where
     /// recording now happens and why (F-224, F-226).
     echo: Arc<EchoSuppressor>,
+    /// Paths the walk or the watcher could not turn into a `VaultPath`, reported
+    /// rather than dropped (task #34's amendment). Shared for the same reason
+    /// `echo` is: the walk and the watcher must both be able to add to it.
+    refusals: RefusalLog,
 }
 
 impl Vault {
@@ -94,6 +102,7 @@ impl Vault {
             root: strip_verbatim(&canonical),
             ignore,
             echo: Arc::new(EchoSuppressor::new()),
+            refusals: RefusalLog::new(),
         })
     }
 
@@ -119,6 +128,18 @@ impl Vault {
     #[must_use]
     pub fn echo(&self) -> &Arc<EchoSuppressor> {
         &self.echo
+    }
+
+    /// Paths the walk or the watcher refused to index, because their name is
+    /// illegal on the platform this binary runs on (task #34's amendment,
+    /// FR-VLT-01, design goal 5).
+    ///
+    /// Empty on an ordinary vault. When it is not, a caller has a status fact
+    /// worth surfacing — "N files could not be indexed" plus the list — rather
+    /// than a gap in the tree nothing explains.
+    #[must_use]
+    pub fn refusals(&self) -> &RefusalLog {
+        &self.refusals
     }
 
     /// The absolute path of a vault-relative one, refusing to resolve through a
@@ -156,21 +177,42 @@ impl Vault {
     /// target, inclusive, is a symlink, or if the accumulated path does not end up
     /// inside the canonical root at all.
     pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, VaultError> {
+        self.resolve_segments(path.as_str().split('/'), path.as_str())
+    }
+
+    /// The body of [`Vault::resolve`], parameterised over raw segments rather
+    /// than a [`VaultPath`].
+    ///
+    /// A seam for tests (task #34's amendment): `VaultPath::new` refuses every
+    /// segment shape that would trip the containment check below — a `:` on
+    /// Windows, a leading `/` — which is correct, but it also means no test that
+    /// goes through `resolve` can reach that check's own line, and a check no
+    /// test can reach is not proven to do anything. Calling this directly with a
+    /// segment a `VaultPath` could never hold (`"/etc"`, which `PathBuf::push`
+    /// treats as absolute and uses to *replace* the accumulated path — on every
+    /// platform, not only Windows) exercises the containment check on its own
+    /// terms, independent of whichever upstream guard currently keeps that shape
+    /// from arising in practice.
+    fn resolve_segments<'a>(
+        &self,
+        segments: impl Iterator<Item = &'a str>,
+        reported_path: &str,
+    ) -> Result<PathBuf, VaultError> {
         let mut current = self.root.clone();
-        for component in path.as_str().split('/') {
+        for component in segments {
             current.push(component);
             let is_symlink = fs::symlink_metadata(&current)
                 .map(|meta| meta.is_symlink())
                 .unwrap_or(false);
             if is_symlink {
                 return Err(VaultError::PathEscapesVault {
-                    path: path.as_str().to_owned(),
+                    path: reported_path.to_owned(),
                 });
             }
         }
         // Defence in depth (task #34, NFR-SEC-06, T-07, T-10): `VaultPath::new`
         // already refuses the segment shapes that let a `PathBuf::push` escape the
-        // root — a `:` anywhere, in particular, which on Windows lets a rootless
+        // root — a `:` anywhere on Windows, in particular, which lets a rootless
         // drive-prefixed segment like "C:Users" *replace* the accumulated path
         // instead of extending it — but a guard that lives only at construction is
         // one mechanism, and one mechanism that regresses (a future segment shape
@@ -179,14 +221,11 @@ impl Vault {
         // resolution passes through, so it is where a second, independent check
         // belongs: whatever `current` ended up being, it must still be inside
         // `self.root`. Factored out as `is_contained` so the containment rule
-        // itself is unit-testable independently of how `current` was built —
-        // which matters because the concrete escape this defends against
-        // (`PathBuf::push` replacing rather than extending) is Windows-specific
-        // behaviour that a Linux test run cannot reproduce end-to-end now that
-        // `VaultPath::new` refuses the segment shape that triggers it.
+        // itself is unit-testable independently of how `current` was built, and
+        // reachable end-to-end through `resolve_segments` above.
         if !is_contained(&self.root, &current) {
             return Err(VaultError::PathEscapesVault {
-                path: path.as_str().to_owned(),
+                path: reported_path.to_owned(),
             });
         }
         Ok(current)
@@ -222,7 +261,7 @@ impl Vault {
         let absolute = strip_verbatim(&absolute);
 
         let relative = absolute.strip_prefix(&self.root).map_err(|_| escaped())?;
-        VaultPath::new(display(relative))
+        vault_path_from_relative(Platform::current(), relative)
     }
 
     /// Every indexable file in the vault, in a deterministic order.
@@ -413,6 +452,40 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 /// precisely the one an error needs to name.
 fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Turn a path already relative to the vault root into a [`VaultPath`], refusing
+/// a real path component that would otherwise be silently misread.
+///
+/// `VaultPath::new` splits on both `/` and `\`, which is right for a path a user
+/// typed or pasted — a Windows spelling reaching a text field — but wrong for a
+/// path the filesystem itself just handed back: on a platform where `\` is an
+/// ordinary filename character, a real file named `"a\b.md"` would otherwise
+/// silently alias to the two-segment path `"a/b.md"` (task #34's amendment, nit
+/// (b)). This checks every real [`Component`] for a literal `\` before joining
+/// them — on Windows the check is skipped, because `\` there is the separator
+/// and cannot appear inside a single component's text at all.
+pub(crate) fn vault_path_from_relative(
+    platform: Platform,
+    relative: &Path,
+) -> Result<VaultPath, VaultError> {
+    let joined = display(relative);
+    if platform != Platform::Windows {
+        for component in relative.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if text.contains('\\') {
+                return Err(VaultError::InvalidPath {
+                    path: joined,
+                    reason: format!(
+                        "file name {text:?} contains a literal '\\', which this platform \
+                         allows in a name but which would otherwise be re-read as a path \
+                         separator"
+                    ),
+                });
+            }
+        }
+    }
+    VaultPath::new(joined)
 }
 
 /// Whether `candidate` is `root` itself, or lies inside it.
@@ -671,27 +744,37 @@ mod tests {
     }
 
     #[test]
-    fn a_colon_bearing_vault_path_is_refused_before_it_ever_reaches_resolve() {
-        // Task #34. The public door is closed at `VaultPath::new` (NFR-SEC-06,
-        // T-07, T-10): a segment with a `:` anywhere — not just a leading drive
-        // prefix — must never become a `VaultPath` at all, so it can never reach
-        // `resolve` to test `PathBuf::push`'s Windows replace-instead-of-extend
-        // behaviour in the first place.
+    fn a_colon_bearing_vault_path_is_refused_before_it_ever_reaches_resolve_on_windows() {
+        // Task #34, amended after code-reviewer-2's regression finding. The
+        // public door is closed at `VaultPath::new` on `Platform::Windows`
+        // (NFR-SEC-06, T-07, T-10): a segment with a `:` anywhere — not just a
+        // leading drive prefix — must never become a `VaultPath` there, so it
+        // can never reach `resolve` to test `PathBuf::push`'s Windows
+        // replace-instead-of-extend behaviour in the first place. On every other
+        // platform the same names are ordinary and must be accepted — a colon
+        // has no special meaning to `PathBuf::push` there — which is exactly
+        // what made the first version of this fix a regression: it refused
+        // these names everywhere, dropping real Linux and macOS files.
         for bad in ["a/C:/Windows/x", "a/C:Users/x", "note.md:hidden"] {
-            assert!(VaultPath::new(bad).is_err(), "accepted {bad:?}");
+            assert!(
+                serat_core::VaultPath::new_for_platform(bad, serat_core::Platform::Windows)
+                    .is_err(),
+                "accepted on Windows: {bad:?}"
+            );
+            assert!(
+                serat_core::VaultPath::new_for_platform(bad, serat_core::Platform::Other).is_ok(),
+                "refused on a platform where a colon is an ordinary character: {bad:?}"
+            );
         }
     }
 
     #[test]
     fn is_contained_refuses_a_candidate_outside_the_root() {
         // The containment check `resolve()` applies after the symlink loop
-        // (task #34, NFR-SEC-06), tested directly rather than only through
-        // `resolve()`: the concrete way it can fire — `PathBuf::push` replacing
-        // the accumulated path — is Windows-only behaviour that `VaultPath::new`'s
-        // own guard (the test above) now prevents from ever reaching `resolve` on
-        // any platform, which is the point of defence in depth existing as a
-        // second, independently correct mechanism rather than something only
-        // reachable by first breaking the first one.
+        // (task #34, NFR-SEC-06), tested directly as a pure function of two
+        // paths, independent of how the candidate was built. See
+        // `resolve_segments_containment_check_is_reachable_directly` below for
+        // the same check exercised end-to-end through `Vault::resolve_segments`.
         assert!(!is_contained(
             Path::new("/vault"),
             Path::new("/etc/passwd")
@@ -715,6 +798,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_segments_containment_check_is_reachable_directly() {
+        // Task #34's amendment. `VaultPath::new` refuses every segment shape
+        // that would trip `is_contained` inside `resolve` — a `:` on Windows, a
+        // leading `/` — which is correct, but it also means nothing that goes
+        // through the public `resolve(&VaultPath)` can reach that check's own
+        // line on any platform, and a check nothing can reach is not proven to
+        // do anything. `resolve_segments` is the seam: called directly with a
+        // raw segment a `VaultPath` could never hold, it proves the check fires
+        // for real, not only in the `is_contained` unit test above.
+        //
+        // "/etc" is the segment: `PathBuf::push` of a string that is itself
+        // absolute *replaces* the accumulated path rather than extending it —
+        // this is ordinary, documented `std` behaviour on every platform
+        // (`PathBuf::push`'s own docs give exactly this example), not the
+        // Windows-only drive-letter case `VaultPath::new`'s `:` rule defends
+        // against. So this test needs no `#[cfg]` at all.
+        let (_dir, vault) = vault();
+        let result = vault.resolve_segments(["a", "/etc"].into_iter(), "a//etc");
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn an_absolute_path_inside_the_vault_relativises_to_one_spelling() {
         let (_dir, vault) = vault();
         let path = VaultPath::new("20-systems/indexing.md").expect("path");
@@ -722,6 +830,27 @@ mod tests {
 
         let absolute = vault.resolve(&path).expect("resolve");
         assert_eq!(vault.relativise(&absolute).expect("relativise"), path);
+    }
+
+    #[test]
+    fn relativise_accepts_names_only_windows_would_refuse() {
+        // Task #34's regression, at `relativise` directly: `aux.md`, a colon in
+        // a filename and a directory named with a trailing dot are all
+        // ordinary, legal names on this platform, and `relativise` — the one
+        // door every path arriving from outside the process goes through
+        // (watcher events, IPC arguments, drag-and-drop) — must accept them
+        // rather than refuse a real file (FR-VLT-01, design goal 5).
+        let (dir, vault) = vault();
+        for legal in ["aux.md", "Meeting 10:30.md", "Misc./n.md"] {
+            let path = VaultPath::new(legal).expect("path");
+            vault.write_atomic(&path, b"body").expect("write");
+            let absolute = dir.path().join(legal);
+            assert_eq!(
+                vault.relativise(&absolute).expect("relativise"),
+                path,
+                "{legal} was refused"
+            );
+        }
     }
 
     #[test]
