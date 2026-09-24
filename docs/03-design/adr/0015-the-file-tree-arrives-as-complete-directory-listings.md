@@ -1,6 +1,6 @@
 # ADR-0015: The file tree arrives as complete directory listings, on a clock that starts at the painted window
 
-**Status:** proposed — becomes accepted when the PRD amendment to FR-VLT-01's acceptance criterion lands (product-analyst, citing this ADR), because §3 decides the PRD's open question on *complete* versus *first screen* and moves the clock start · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
+**Status:** accepted — on PRD v1.6 (task #32, merged at `857af57`), which carries FR-VLT-01's acceptance criterion as §3 defines it; proposed until then, because §3 decided the PRD's open question on *complete* versus *first screen* and moved the clock start · **Date:** 2026-09-24 · **Serves:** FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04, US-01
 **Honours:** ADR-0001 (the tree read is a read, never a writer request), ADR-0002 (the index is disposable, so the tree must stand without it), ADR-0011 (catch-up from the tree walk enters on the bulk side), ADR-0014 (the platform term is not ours)
 
 ## Context
@@ -84,7 +84,7 @@ The stricter reading — *complete* — is the one gated, because this design sa
 3. `tree_first_screen ≤ tree_complete`, and both are after `T_open`.
 4. The run records `cpu_load_percent`, `concurrent_build_processes` and `gate_eligible` like every other budget run.
 
-Reported beside the verdict, gating nothing: `t0 → tree_complete` (what a user waits through), `tree_first_screen − T_open` at 20k and 50k, and `tree_complete − T_open` at 50k.
+Reported beside the verdict, gating nothing: `t0 → tree_complete` (what a user waits through), `tree_first_screen − T_open` at 20k and 50k, `tree_complete − T_open` at 50k, and **empty folders: their count, and their time of arrival after `tree_complete`** (from `TreeMessage::WalkSettled`).
 
 ### 4. The front end's obligations
 
