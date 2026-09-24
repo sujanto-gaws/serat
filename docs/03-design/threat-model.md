@@ -16,6 +16,7 @@ The security requirements in the baseline are mostly negative — statements abo
 ## Assets
 - The user's vault: plain Markdown notes and binary assets on local disk — the only source of truth (C-01, C-02).
 - The rebuildable index in `.serat/` and the extraction cache `.serat/extract/`.
+- **Note-open history, `.serat/history.json`** (architecture §9.2, from P1). It records which notes the user opened and when, up to 10 timestamps for each of 2,000 paths. This is behavioural data, not content. It is not derived from the vault and survives a rebuild. **Exposure path:** it sits inside the vault folder, so it reaches git or a sync tool whenever `.serat/` is not ignored. NFR-CMP-04's offer to add the ignore entry is a *Should*, and the user may decline it. Mitigations: it is never written outside `.serat/`; deleting it costs only ranking quality (C-02); and the NFR-CMP-04 offer names this file as a reason to accept. It is not sent anywhere by Serat (NFR-SEC-01).
 - AI provider credentials.
 - The user's privacy: no telemetry, no network traffic the user did not configure.
 
