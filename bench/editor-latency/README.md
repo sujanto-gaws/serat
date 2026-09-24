@@ -10,16 +10,21 @@ The NFR-PRF-02 budget harness, per **architecture.md §9.3** ("NFR-PRF-02: what 
 
 Full mechanism (frame-start recording, the refresh interval `R`, `frames_to_paint`'s counting rule, the long-frame adjustment, the handler/render diagnostic) is in `tests/measure.ts`'s file header, mirroring §9.3 clause for clause; the acceptance wording offered to product-analyst as task #32 is quoted in `tests/nfr-prf-02.spec.ts`.
 
+**Fix 1 (code review, second pass, 2026-09-24): `f_k` is when a frame's callback *runs*, not its scheduled timestamp.** The first implementation picked `f_k` as the first frame whose `rAF` timestamp was `>= p`; review's probe found real cases where `p` landed after a frame's timestamp but before that frame's callback had actually executed, which the old rule wrongly counted as a missed frame. `selectFk` in `tests/measure.ts` now finds the first frame whose callback *ran* after `p`, tracked as `{ ts, run }` pairs. This is not a cosmetic fix: the control arm went from failing at 92.4% (misattributed to the environment) to passing at 99.4% once corrected — **the instrument was wrong, not the machine.**
+
+**Fix 2 (same pass): one implementation measures, not two.** The in-page frame walk used to reimplement the counting/long-frame logic by hand inside the browser context, as a second, hand-typed copy of the same logic the unit tests exercised. Review mutated the in-page copy alone and every unit test stayed green — the guard was tested, its caller was not. The pure functions (`selectFk`, `countFrameStartsInRange`, `isLongFrame`, `medianRefreshInterval`) are now injected into the page verbatim via `Function.prototype.toString()` (`installLatencyCapture`'s `pureFunctionSource`), so the page runs the exact function the unit tests call, not a lookalike.
+
 ## Status
 
-**Green today:** `tests/measure.unit.spec.ts` — 16 unit tests over §9.3's pure functions (`percentPaintedFirstFrame`, `p95FramesToPaint`, `countFrameStartsInRange`, `isLongFrame`, `medianRefreshInterval`), no browser page needed, nothing blocked on #21.
+**Green today:** `tests/measure.unit.spec.ts` — 25 unit tests over §9.3's pure functions, including the fix-1 boundary case (`ts < p < run` giving `frames_to_paint = 1`) and mutant-killing cases for `paintedFirstFrame`'s exact-1 check and `medianRefreshInterval`'s even-count averaging. No browser page needed, nothing blocked on #21.
 
-**Runs today against a real browser, and is informative even though it isn't gated on CI yet:**
+**Runs today against a real browser and passes, both controls:**
 
-- The **control arm** (`tests/control-arm.ts`) actually executes the full frame-walk instrumentation against a bare contenteditable and reports a real percentage. A reference run in this development environment (a headless, resource-constrained container, not a reference machine) measured **92.4% on time over 500 keystrokes** — below the 99% bar, and correctly rejected by the test rather than silently passed. This is recorded as an observation about *this* environment, not a claim about the technique: a headless container's compositor is not a real display's vsync, and the honest next step is to take this reading on an actual reference machine (`docs/05-testing/reference-machine.md`) before drawing any conclusion about the instrumentation itself.
+- The **positive control arm** (`tests/control-arm.ts`) — a bare contenteditable — measured **99.40% on time over 500 keystrokes** against the 99% bar in this development environment (a headless, resource-constrained container, not a reference machine). The 92.4% reading from before fix 1 is now understood as the instrument miscounting, not the environment being unrepresentative — that earlier README claim is withdrawn.
+- The **negative control arm** (`tests/negative-control-arm.ts`, new) — a contenteditable whose `input` handler deliberately busy-waits — measured **100% late over 100 keystrokes** against the required >=95%. Proves the harness can report a *bad* result for a genuinely bad subject, not just a good one for a good subject; a harness that always passes would clear the positive control too. **The busy-wait duration is 3x the measured refresh interval, not the ~1.5x first suggested** — measured empirically (1.5x: 0% late, 2x: 7% late, 3x: 100% late, repeatably), and the file header explains the structural reason 1.5x isn't enough: a block that happens *before* `p` is invisible to the base frame count for the same reason the harness's own recorder is blocked by it too.
 - The real **subject** test fails at `openNoteForLatencyTest`, not at a timeout — still blocked on #21 (vue-frontend-dev's implementation of the editor #5 designed).
 
-**Do not treat a red subject test as "the editor is over budget"** until the control arm passes on the machine the reading is taken on.
+**Do not treat a red subject test as "the editor is over budget"** until both control arms pass on the machine the reading is taken on.
 
 ## Run it
 
@@ -36,8 +41,9 @@ Chromium is not downloaded by Playwright's own installer here — `playwright.co
 1. vue-frontend-dev task #21 lands the hybrid live-preview editor `tests/subject.ts` needs a locator for, per architecture.md §9.3's decorations/reveal-rule design.
 2. A 5,000-line fixture note per §9.3's shape (dense wikilinks, 50 GFM tables, task lists, footnotes, fenced code, headings every ~40 lines, a CRLF and a BOM variant), generated deterministically (NFR-MNT-02) rather than hand-authored.
 3. The remaining §9.3 scenarios beyond the single representative one this harness currently drives: typing at the start/middle/end, inside a table cell, in a link-dense paragraph, Enter mid-note, Backspace across a bold delimiter, and continuous typing in split-preview mode. Each needs its own locator/setup from the real editor, so each is added as #21 exposes the surface for it.
-4. Once 1–3 land, `subject.ts`'s `openNoteForLatencyTest` gets a real body, the spec goes from throwing to asserting, and this harness is wired into `.github/workflows/budgets.yml` beside the Rust jobs — following NFR-PRF-08 and RISK-013's rule that a CI job is only claimed once it can actually run. **That CI job must run `npx playwright test tests/nfr-prf-02.spec.ts` specifically, not a bare `npm test`** — the unit spec passing alone is necessary but not sufficient, and the control arm must also be run and pass (per §9.3) before the subject result means anything.
-5. task #31 (NFR-PRF-01 benches requiring `tree_first_screen` in place of `buffer_rendered`, per ADR-0015 §5) is a separate P1 task-engineer task, owned once architect task #2 merges — not part of this harness.
+4. Once 1–3 land, `subject.ts`'s `openNoteForLatencyTest` gets a real body, the spec goes from throwing to asserting, and this harness is wired into `.github/workflows/budgets.yml` beside the Rust jobs — following NFR-PRF-08 and RISK-013's rule that a CI job is only claimed once it can actually run. **That CI job must run `npx playwright test tests/nfr-prf-02.spec.ts` specifically, not a bare `npm test`** — the unit spec passing alone is necessary but not sufficient, and **both control arms** must also run and pass (per §9.3 and code review's second pass) before the subject result means anything.
+
+Task #31 (NFR-PRF-01 benches requiring `tree_first_screen` in place of `buffer_rendered`, per ADR-0015 §5) landed separately, in `bench/budget/` (Rust) — not part of this (TypeScript) harness.
 
 ## Serves
 

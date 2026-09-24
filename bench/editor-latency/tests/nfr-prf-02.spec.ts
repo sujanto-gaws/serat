@@ -22,9 +22,12 @@ import { test, expect } from "@playwright/test";
 import { openNoteForLatencyTest } from "./subject";
 import { runScenario, percentPaintedFirstFrame, p95FramesToPaint } from "./measure";
 import { measureControlArm, CONTROL_ARM_MIN_ON_TIME } from "./control-arm";
+import { measureNegativeControlArm, NEGATIVE_CONTROL_MIN_LATE } from "./negative-control-arm";
 
 const SUBJECT_MIN_ON_TIME = 0.95;
 const SAMPLE_COUNT = 500; // §9.3: "each at least 500 keystrokes"
+const CONTROL_SAMPLE_COUNT = 500;
+const NEGATIVE_CONTROL_SAMPLE_COUNT = 100; // cheaper: this arm exists to prove the harness can fail, not to be precise
 
 test("control arm: a bare contenteditable is on time at least 99% of the time", async ({
   page,
@@ -33,9 +36,9 @@ test("control arm: a bare contenteditable is on time at least 99% of the time", 
   // control-arm.ts. Required on every run per §9.3: if this fails, the
   // subject result below (whenever it is unblocked) cannot be trusted —
   // the harness or machine itself cannot keep up with a trivial editor.
-  const { percentOnTime, samples } = await measureControlArm(page, SAMPLE_COUNT);
+  const { percentOnTime, samples } = await measureControlArm(page, CONTROL_SAMPLE_COUNT);
   console.log(
-    `control arm: ${(percentOnTime * 100).toFixed(2)}% on time over ${SAMPLE_COUNT} keystrokes ` +
+    `control arm: ${(percentOnTime * 100).toFixed(2)}% on time over ${CONTROL_SAMPLE_COUNT} keystrokes ` +
       `(must be >= ${(CONTROL_ARM_MIN_ON_TIME * 100).toFixed(0)}%); p95 frames_to_paint = ` +
       `${p95FramesToPaint(samples)}`,
   );
@@ -45,6 +48,32 @@ test("control arm: a bare contenteditable is on time at least 99% of the time", 
       `${(CONTROL_ARM_MIN_ON_TIME * 100).toFixed(0)}% — the NFR-PRF-02 subject result cannot be ` +
       `trusted until this passes (architecture.md §9.3)`,
   ).toBeGreaterThanOrEqual(CONTROL_ARM_MIN_ON_TIME);
+});
+
+test("negative control arm: a deliberately-blocking contenteditable is late at least 95% of the time", async ({
+  page,
+}) => {
+  // The complement of the positive control above (code review,
+  // 2026-09-24): proves the harness can report a bad result for a
+  // genuinely bad subject, not just a good one for a good subject — a
+  // harness that always reports "on time" regardless of the subject would
+  // pass the positive control too.
+  const { percentLate, refreshIntervalMs } = await measureNegativeControlArm(
+    page,
+    NEGATIVE_CONTROL_SAMPLE_COUNT,
+  );
+  console.log(
+    `negative control arm: ${(percentLate * 100).toFixed(2)}% late over ` +
+      `${NEGATIVE_CONTROL_SAMPLE_COUNT} keystrokes (must be >= ` +
+      `${(NEGATIVE_CONTROL_MIN_LATE * 100).toFixed(0)}%; busy-wait 3R = ` +
+      `${(refreshIntervalMs * 3).toFixed(1)}ms)`,
+  );
+  expect(
+    percentLate,
+    `negative control arm's late rate is ${(percentLate * 100).toFixed(2)}%, not >= ` +
+      `${(NEGATIVE_CONTROL_MIN_LATE * 100).toFixed(0)}% — the harness failed to detect a ` +
+      `deliberately blocking handler, which means it cannot be trusted to detect a real one`,
+  ).toBeGreaterThanOrEqual(NEGATIVE_CONTROL_MIN_LATE);
 });
 
 test("NFR-PRF-02: at least 95% of keystrokes painted in the first frame, 5,000-line note", async ({
