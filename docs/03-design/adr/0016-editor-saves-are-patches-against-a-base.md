@@ -1,11 +1,11 @@
 # ADR-0016: Editor saves are patches against a base, and external changes arrive in the same coordinates
 
-**Status:** accepted · **Date:** 2026-09-24 · **Serves:** FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04, US-06, US-07
+**Status:** proposed — accepted when review of task #5 is clean · **Date:** 2026-09-24 · **Serves:** FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04, US-06, US-07
 **Honours:** ADR-0006 (the document stays text), ADR-0008 (no serialiser in any write path — extended here from view writes to editor saves), ADR-0007 (the wire types are generated)
 
 ## Context
 
-P0's `write_file` takes the whole document. That was acceptable for a text box, and `contracts/ipc.rs` already refuses the one way it could corrupt a file — a lossy UTF-8 read followed by a save. **P1 puts CodeMirror 6 behind it, and CodeMirror has a second way.** With no `lineSeparator` configured, CM6 splits lines on `\r\n`, `\n` and `\r` and joins them with `\n`. Saving `doc.toString()` therefore rewrites every line ending of a CRLF note (399 of them in the 20k benchmark vault) and of any note with mixed endings, although the user changed one word. That is a re-serialisation, which C-04 forbids. It would pass every test that uses LF fixtures, and every Obsidian user on Windows would see it first as a whole-file git diff.
+P0's `write_file` takes the whole document. That was acceptable for a text box, and `contracts/ipc.rs` already refuses the one way it could corrupt a file — a lossy UTF-8 read followed by a save. **P1 puts CodeMirror 6 behind it, and CodeMirror has a second way.** With no `lineSeparator` configured, CM6 splits lines on `\r\n`, `\n` and `\r` and joins them with `\n`. Saving `doc.toString()` therefore rewrites every line ending of a CRLF note (the 20k benchmark vault's manifest counts `notes_crlf: 399` and `notes_bom: 79`) and of any note with mixed endings, although the user changed one word. That is a re-serialisation, which C-04 forbids. It would pass every test that uses LF fixtures, and every Obsidian user on Windows would see it first as a whole-file git diff.
 
 Setting `lineSeparator` to the file's dominant ending fixes pure-CRLF notes and still rewrites the minority endings of a mixed one. **The defect is not the separator. It is that a save sends a document instead of the edit.**
 
@@ -25,7 +25,7 @@ It is an ADR because the IPC contract, the front end's buffer model and serat-va
 
 ### 1. One coordinate system, both directions
 
-A position is `{ line, col }`: `line` is 0-based; `col` is in **UTF-16 code units** within that line, which is CodeMirror's native unit. Lines are split on `\r\n`, `\n` and a lone `\r`, exactly as CM6 splits them. The line terminator is not part of any line, so no position can fall inside a `\r\n`. A BOM is part of line 0's text, as it is in CM's document. A file that is not valid UTF-8 is never opened for editing (`IpcError::NotUtf8`, already in the contract), so every column maps to exactly one byte offset.
+A position is `{ line, col }`: `line` is 0-based; `col` is in **UTF-16 code units** within that line, which is CodeMirror's native unit. Lines are split on `\r\n`, `\n` and a lone `\r`, exactly as CM6 splits them. The line terminator is not part of any line, so no position can fall inside a `\r\n`. A BOM is part of line 0's text, as it is in CM's document. **That holds only if the front end builds the document from `read_file`'s `String`, which keeps U+FEFF, and never runs the bytes through a default `TextDecoder`, which strips it.** If the BOM were stripped, every column on line 0 would be off by one. The shared table test therefore includes a BOM case. A file that is not valid UTF-8 is never opened for editing (`IpcError::NotUtf8`, already in the contract), so every column maps to exactly one byte offset.
 
 The mapping from `{line, col}` to a byte offset in the base bytes is **one pure function in serat-vault**, beside `write_atomic`, and both directions use it.
 
@@ -36,7 +36,19 @@ The front end keeps, per open note, the **base** — the `Text` as last loaded o
 1. re-reads the file and refuses with `StaleHash` if its hash is not `base_hash` — the optimistic lock of §6.1;
 2. maps each range onto byte offsets and checks the ranges are ordered and disjoint;
 3. converts every `\n` in `insert` to the note's line ending, taken as its first terminator (`\n` when the file has none);
-4. splices, and writes by temp-file-and-rename (FR-VLT-03), returning the new hash.
+4. splices and writes the temporary file, then **re-hashes the target immediately before the rename** and refuses with `StaleHash` (removing the temporary file) if it moved;
+5. renames (FR-VLT-03) and returns the new hash.
+
+**The remaining window is stated as a bound rather than hidden.** An external write between step 4's re-hash and the rename is overwritten. The window is one hash of the current file plus one `rename` system call. For a note of the benchmark vault's 2 KiB mean that is well under a millisecond, and it is proportional to file size. Closing it entirely needs a lock no other editor honours. The loss is not silent, though: the other writer's bytes are gone from disk, but the watcher reports our rename, and nothing that writes into the vault from outside Serat is protected by any lock anyway. #23's hostile test writes externally between the step-1 check and the rename, and asserts the step-4 refusal.
+
+**Ordering between saves and external changes.** Tauri orders neither command responses against events nor events against responses. So the front end applies these rules, and nothing else:
+
+- An `ExternalChange` is applied **only when its `base_hash` equals the buffer's current base hash**.
+- **While a save is in flight, an arriving `ExternalChange` is held**, not applied. When the save resolves, the held change is applied if its `base_hash` now equals the base, and dropped otherwise.
+- **Any other mismatch drops the change and requests a fresh diff** against the current base (`request_external_diff(path, base_hash)`). serat-app answers with an `ExternalChange` computed from the disk bytes of that moment, or with nothing when disk equals the base.
+- **A save refused with `StaleHash` leaves the buffer dirty and is never retried blindly.** The front end waits for, or requests, the `ExternalChange` that explains the refusal, and the outcomes of §4 decide what happens next.
+
+#23 tests both arrival orders (response before event, and event before response) and the external write between check and rename.
 
 **Bytes outside the patched ranges are copied, never re-encoded — by construction rather than by care.** That is the invariant, and the property test in *Tested against* item 1 checks it. On success the base becomes the document as it was when the save was taken; changes typed while the save was in flight stay composed against that new base.
 
@@ -54,7 +66,7 @@ serat-app records the base bytes and hash of every note open in an editor. When 
 |---|---|
 | No unsaved changes | Apply `edits` as one transaction marked `Transaction.addToHistory.of(false)`. The selection and the undo history are mapped through it, so the cursor on line 40 stays put and undo reaches every earlier local state. Undo does not revert the external edit: undoing someone else's change in your buffer would write it away at the next save. The base becomes the disk version. |
 | Unsaved changes whose base ranges are **disjoint** from every external edit (ranges that touch count as overlapping) | Map the external changes through the local ones and apply them the same way. The base becomes the disk version, and the local ChangeSet is rebased over the external one. The buffer stays dirty, and the next save patches against the new hash. |
-| Unsaved changes that **overlap** | **Conflict.** Apply nothing and keep the buffer as the user left it. Show a non-modal notice (§9.1: no modal on the write path) with three actions. *Keep mine* adopts the disk hash as the base, so the next save overwrites deliberately. *Take theirs* replaces the buffer in one **history-recorded** transaction, so undo brings back what was typed. *Compare* opens a diff. Nothing is discarded silently in any branch. |
+| Unsaved changes that **overlap** | **Conflict.** Apply nothing and keep the buffer as the user left it. Show a non-modal notice (§9.1: no modal on the write path) with three actions. *Keep mine* **re-bases the buffer onto the disk version**: the base `Text` becomes the disk text, the base hash becomes the disk hash, and the local ChangeSet is **recomputed as the diff from the disk text to the buffer**. The next save then patches disk into exactly what the user sees. Adopting the disk hash while keeping a ChangeSet computed against the old base would splice old-base coordinates into new bytes and corrupt the file. That was the first draft's rule, and review caught it. #23's hostile test asserts that the disk bytes equal the buffer, byte for byte, after a *Keep mine* save. *Take theirs* replaces the buffer in one **history-recorded** transaction, so undo brings back what was typed. *Compare* opens a diff. Nothing is discarded silently in any branch. |
 
 A note deleted on disk while open keeps its buffer and shows a notice; the save command then recreates the file through `write_file` with `base_hash: None`.
 
@@ -69,6 +81,8 @@ A note deleted on disk while open keeps its buffer and shows a notice; the save 
 ## Objections recorded
 
 **vue-frontend-dev** (owns the editor) was consulted on 2026-09-24 with two questions: whether the composed ChangeSet is affordable on the keystroke path for a 5,000-line note, and whether `addToHistory(false)` with history mapping yields FR-VLT-05's behaviour. **No reply had arrived when this was committed, so the objection is absent, not waived.** The place I expect it: the cost of `compose` on every transaction. If NFR-PRF-02's harness shows it, the fallback keeps the per-transaction ChangeSets in an array and composes them only at save time — the same result, with the cost moved off the keystroke. The ADR does not depend on which of the two is used.
+
+**lead** (review of task #5, 2026-09-24) raised three blocking objections, all upheld. First, *Keep mine* as first drafted corrupted the file, because it adopted the new hash over a ChangeSet in old coordinates; it now re-bases (§4). Second, nothing ordered a save in flight against an `ExternalChange`; §2 now carries the ordering rule. Third, rendered links could navigate the app window to a remote origin; that is architecture §9.3 and T-09. The same review added the re-hash before rename, the BOM rule and the manifest citation.
 
 ## Tested against
 

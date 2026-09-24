@@ -1,5 +1,6 @@
 # ADR-0008: Byte-range patching, never round-tripping
 **Status:** accepted (design baseline 1.0) · **Date:** 2026-08 · **Serves:** FR-VIW-06, FR-VIW-08, NFR-MNT-03
+**Extended by ADR-0016 (proposed):** the same rule, with no serialiser in the write path, applies to editor saves. They are patch sets against a base hash, never whole documents.
 **Source:** Serat Design Description §11, decision ADR-08
 
 ## Context

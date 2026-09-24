@@ -984,7 +984,16 @@ Designed in P1 (task #5). Saving and reconciliation are ADR-0016 and §3.3. Ever
 
 Split preview and embeds share one renderer: `markdown-it` with GFM, footnote and wikilink plugins, plus the resolver above. That makes three Markdown parsers — comrak for the index, Lezer for the editor, markdown-it for preview. They are kept rather than unified because each one is the standard tool for its job. Their divergence is checked by task #12's corpus rather than assumed away.
 
-**Rendered HTML passes a strict allowlist sanitiser before it reaches the DOM.** It keeps no `<script>`, no event-handler attributes, no `style` attributes, no `iframe`, `object` or `embed`, and no `javascript:` or `data:` URLs except `data:image/*`. **It loads no remote resource**: a remote image renders as a labelled placeholder with its URL, and is never fetched (NFR-SEC-01). The CSP in `tauri.conf.json` (`default-src 'self'`) already refuses both, so the sanitiser is the first barrier and the CSP the second. A note is untrusted input: git, sync tools and agents all write into the vault.
+**Rendered HTML passes a strict allowlist sanitiser before it reaches the DOM.** It keeps no `<script>`, no event-handler attributes, no `style` attributes, no `iframe`, `object` or `embed`, and no `javascript:` or `data:` URL of any kind. An inline `data:image/*` renders as a labelled placeholder, like a remote image. That keeps the app CSP free of a `data:` source: its only P1 addition is ADR-0017's `serat-asset` origin. **It loads no remote resource**: a remote image renders as a labelled placeholder with its URL, and is never fetched (NFR-SEC-01). The CSP in `tauri.conf.json` (`default-src 'self'`) already refuses both, so the sanitiser is the first barrier and the CSP the second. A note is untrusted input: git, sync tools and agents all write into the vault.
+
+**Navigation is guarded separately, because the CSP does not cover it.** A rendered `<a href="https://…">` that the webview follows would navigate the app window to a remote origin. The window would then be showing remote content, which breaks NFR-SEC-01, and `connect-src` does not stop a top-level navigation. So:
+
+- **serat-app installs an `on_navigation` handler on every webview.** It refuses every URL that is not the app's own origin: `tauri://localhost` and `http://tauri.localhost`, plus the dev server in debug builds only.
+- **The front end intercepts clicks on rendered external links** (`http`, `https`, `mailto`). A click hands the URL to the system browser through the opener plugin, and only on that explicit click. Hovering shows the URL, and nothing ever opens one automatically.
+- Internal wikilinks never navigate the webview. They are routed by the editor.
+- `window.open` and new-window requests are refused the same way.
+
+The guard is part of T-09, and #12's hostile corpus includes an external link, a `javascript:` link and a meta-refresh, each of which must leave the window on the app origin.
 
 ##### Split preview (FR-EDT-10)
 
@@ -1011,7 +1020,7 @@ One front-end module owns every user-invocable action: `register({ id, name, def
 
 **Acceptance wording offered to product-analyst (task #32):** *"Given a 5,000-line note in the editor, when each benchmark scenario is typed through the browser's input pipeline, then at least 95% of keystrokes are painted in the first display frame after the keystroke, in every scenario, and a bare-contenteditable control arm on the same run is at 99% or better; the editor's own per-keystroke work is reported beside it."* The requirement's statement would read *"A keystroke's change shall be painted in the first display frame after it (16 ms is one frame at 60 Hz) for at least 95% of keystrokes in a 5,000-line note."*
 
-The harness runs Playwright/Chromium against the production vite build, with the IPC client stubbed. The keystroke path makes no IPC call, so the stub removes nothing that is measured.
+The harness runs Playwright/Chromium against the production vite build, with the IPC client stubbed. The keystroke path makes no IPC call. Asynchronous replies still land on frames, though: the debounced save, the batched link resolution and a switcher-mode completion. So the stub answers each with **latencies recorded from the real binary** (a table of per-command p50/p95 captured once per build), rather than instantly. A reply that lands mid-typing is then inside the measurement, as it would be for a user.
 
 - **Note.** A generated 5,000-line note: paragraphs dense with wikilinks, 50 GFM tables, task lists, footnotes, fenced code, headings every ~40 lines, a CRLF variant and a BOM variant. It lives with the harness, because the benchmark vault's notes average about 2 KiB.
 - **Scenarios**, each at least 500 keystrokes with the viewport at the cursor: typing at the start, the middle and the end; typing inside a table cell; typing in a link-dense paragraph; Enter mid-note; Backspace across a bold delimiter (reveal/hide); and continuous typing in split-preview mode, so that a preview render landing on a frame is inside the measurement.
