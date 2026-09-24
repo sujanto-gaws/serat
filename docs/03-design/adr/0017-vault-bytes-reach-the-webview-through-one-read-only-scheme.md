@@ -49,7 +49,17 @@ It is an ADR because it adds a third read path into the vault, beside `read_file
 
 **pdf.js is bundled and inert.** Its worker, cMaps and standard fonts are served from `'self'`. It runs with `isEvalSupported: false` and **`enableScripting: false`**, so a PDF's JavaScript never runs. A link inside a PDF opens only on an explicit click, and only through the system opener (the same rule as §9.3's external links). **SVG is shown only through `<img>`**: never inline in the DOM and never as a navigated document, and the per-response `sandbox` CSP backs that up.
 
-**Two controls compensate for the ACL not covering the scheme.** ADR-0012's command ACL gates `invoke`; a scheme handler is reached by URL loads and is not in it. **First:** the scheme is read-only and serves only viewable types from contained paths (steps 1–10). **Second:** Tauri classifies `serat-asset` content as a **remote origin** (`is_local_url` is false for it), so a document loaded from the scheme **can invoke no IPC command at all**. A malicious SVG or PDF that somehow ran would be a remote page with no bridge. The hostile tests of task #19 are the scheme's ACL.
+**What stops a `serat-asset` document from reaching IPC — corrected.** ADR-0012's command ACL gates `invoke`, and a scheme handler is reached by URL loads, so the ACL does not cover it. **There is no origin-classification control.** An earlier version of this paragraph said Tauri classifies `serat-asset` content as a remote origin (`is_local_url` false), so a document loaded from it could invoke no IPC command. **That is false.** tauri-app-dev checked the tauri-2.11.5 source:
+
+- `webview/mod.rs:1698-1739` counts every scheme registered through `register_asynchronous_uri_scheme_protocol` as local.
+- `Origin::Local` matches the local capability unconditionally (`tauri-utils` `acl/authority.rs:57-66`).
+
+So a `serat-asset` document that became the main webview's top-level document **could invoke every command granted to `main`**. The controls that actually hold are two, and both must stay in place:
+
+- **(a) Navigation.** serat-app's `on_navigation` refuses every URL that is not the app's own origin (architecture §9.3). That includes `serat-asset://…` and `http://serat-asset.localhost/…`, so a scheme URL can be loaded as a subresource (`<img>`, pdf.js `fetch`) but never as the top-level document.
+- **(b) No script runs in a scheme document.** Every response carries `Content-Security-Policy: default-src 'none'; …; sandbox` with **no `allow-scripts`** (step 10), so even a document that did load from the scheme executes nothing. That also covers an SVG with script, and anything a PDF carries.
+
+(c) The read-only, viewable-types-only, contained-paths handler (steps 1–10) limits what the scheme can *serve*. It does not limit what a loaded document could *invoke*, so it is not a third control against IPC. Task #19 must prove (a) and (b) can fail: drive a real top-level navigation to `serat-asset://…` and assert that no command is reachable (tauri-app-dev writes that test).
 
 **Sidecar pairing matches bytes exactly, deliberately.** `X.PDF` and `x.pdf.md` are not a pair: ADR-0005 defines the sidecar name as the binary's full file name with `.md` appended, and on a case-sensitive filesystem the two could name different files. Folding case here would let one sidecar claim two binaries. A user who wants the pairing renames one of the two, and nothing is guessed.
 
@@ -59,7 +69,7 @@ If WebKitGTK or WKWebView does not deliver a custom-scheme 206 with these header
 
 ## Consequences
 
-**Positive.** One containment rule, with #34's hardening, serves the read command, the watcher's paths and now the viewer bytes. Large PDFs load a page's spans at a time on every platform, and no request holds more than 1,000 KiB. The CSP gains one first-party scheme. The scheme's content cannot reach IPC.
+**Positive.** One containment rule, with #34's hardening, serves the read command, the watcher's paths and now the viewer bytes. Large PDFs load a page's spans at a time on every platform, and no request holds more than 1,000 KiB. The CSP gains one first-party scheme. Scheme content is kept from IPC by the navigation guard and by the script-free sandbox CSP. Tauri still classifies the scheme as local, so both controls are load-bearing.
 
 **Negative.** **An image is held whole in memory while it is served**, because `<img>` cannot request spans. That costs up to 64 MiB per image request in the handler, plus the webview's decoded copy. The limit is what bounds it. A photo library with larger files degrades to "couldn't be displayed" (goal 5), never to a truncated image. It is a hand-written HTTP-ish handler, with range parsing, CORS and ten ordered steps to get right, and three platform-specific handle checks. The table of viewable types is a second allowlist beside the index's MIME table, which is why both come from the same function.
 
@@ -95,6 +105,7 @@ Nothing yet. The cases that would break it are listed for task #19 and belong in
 - an `Origin` that is not the app's;
 - an SVG with script opened as a document;
 - a PDF with JavaScript;
+- **a real top-level navigation of the main webview to `serat-asset://…`** (and to `http://serat-asset.localhost/…` on Windows), asserting that it is refused. Then, with the guard disabled in the test build only, assert that the loaded document runs no script, so no command is reachable. That second arm is what proves control (b) holds on its own. tauri-app-dev writes this test;
 - range requests at the file boundaries and over the cap;
 - an image over the cap with no `Range`, which must arrive whole; an image over 64 MiB, which must get 404; and a file changed between two range requests, which must restart through `If-Range`;
 - a no-`Range` request for a file over the cap.

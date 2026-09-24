@@ -915,7 +915,7 @@ P1 indexes, pairs, lists and displays binaries. It does not extract them (P2), s
   - serves PDFs in spans capped at 1,000 KiB, with pdf.js given its length from `assets.bytes`, set to `disableStream`/`disableAutoFetch`, and sending `If-Range`;
   - serves images whole up to 64 MiB, because `<img>` sends no `Range`; a larger image gets 404 and "couldn't be displayed";
   - sends `nosniff` and a sandboxing per-response CSP.
-  The app CSP gains that one first-party origin in `img-src` and `connect-src`, and nothing else. pdf.js, with its worker, cMaps and fonts, is bundled and runs without `eval` and with `enableScripting: false`, so the viewers make no network request (NFR-SEC-01). Content from the scheme is a remote origin to Tauri and can invoke no IPC command. **If a webview will not deliver a custom-scheme 206**, that platform falls back to a span-serving `read_asset_range` command with the same checks, so PDFs still load per page (ADR-0017 §Fallback).
+  The app CSP gains that one first-party origin in `img-src` and `connect-src`, and nothing else. pdf.js, with its worker, cMaps and fonts, is bundled and runs without `eval` and with `enableScripting: false`, so the viewers make no network request (NFR-SEC-01). **Tauri classifies the scheme as local, not remote**, so the only things keeping a scheme document from IPC are §9.3's `on_navigation` guard (the scheme is never a top-level document) and the script-free `sandbox` CSP on every response. There is no origin-classification control (ADR-0017, corrected). **If a webview will not deliver a custom-scheme 206**, that platform falls back to a span-serving `read_asset_range` command with the same checks, so PDFs still load per page (ADR-0017 §Fallback).
 
 ### AI retrieval and MCP
 
@@ -1054,7 +1054,7 @@ Split preview and embeds share one renderer: `markdown-it` with GFM, footnote an
 
 **Navigation is guarded separately, because the CSP does not cover it.** A rendered `<a href="https://…">` that the webview follows would navigate the app window to a remote origin. The window would then be showing remote content, which breaks NFR-SEC-01, and `connect-src` does not stop a top-level navigation. So:
 
-- **serat-app installs an `on_navigation` handler on every webview.** It refuses every URL that is not the app's own origin: `tauri://localhost` and `http://tauri.localhost`, plus the dev server in debug builds only.
+- **serat-app installs an `on_navigation` handler on every webview.** It refuses every URL that is not the app's own origin — **including `serat-asset://…`, which Tauri treats as local and which must never become the top-level document (ADR-0017)**: `tauri://localhost` and `http://tauri.localhost`, plus the dev server in debug builds only.
 - **The front end intercepts clicks on rendered external links** (`http`, `https`, `mailto`). A click hands the URL to the system browser through the opener plugin, and only on that explicit click. **The opener capability is scoped to exactly those three schemes (ADR-0012)**: `file:`, custom schemes and anything else are refused by the capability itself, not only by the front end. Hovering shows the URL, and nothing ever opens one automatically.
 - Internal wikilinks never navigate the webview. They are routed by the editor.
 - `window.open` and new-window requests are refused the same way.
