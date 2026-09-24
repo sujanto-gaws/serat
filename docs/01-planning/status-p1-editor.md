@@ -80,10 +80,10 @@ None of the P1 budgets has been measured: no subject code exists yet. Carried fr
 - Teammates cannot message each other or update the task list; the lead relays everything. product-analyst has no shell, so the lead commits its edits (commit messages say so).
 - Run `cargo test -p doclint` on **every** docs change, the lead's own planning edits included (the lead broke the tip twice this way).
 - A measurement definition must be checked against recorded data **before** it goes into the design text.
-- The task branches above exist **only in this container** unless they are pushed. See the resume note below.
+- All 26 `task/p1-*` branches, merged and unmerged, **are pushed to origin** (owner approved, 2026-09-24). None is merged into `main` or PR #10 by that push.
 
 ## To resume
 
-1. Restore the task branches (from the pushed refs, if the owner approved pushing them).
+1. Fetch the task branches: `git fetch origin 'refs/heads/task/p1-*:refs/heads/task/p1-*'`.
 2. Re-spawn the roles from `.claude/agents/`, each with its own worktree, and hand each the row above.
 3. Order: #34 re-review → merge (security); #21 data-loss fix; #9/#10 re-review → merge; #11 empirical rule selection → #38 → #11 → #31 → #21 merge; then #33/#15/#17 → #18/#19 → #22–#26 → #27 → #28 report.
