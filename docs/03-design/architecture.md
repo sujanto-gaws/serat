@@ -1021,13 +1021,13 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | The paint mark evidence: what makes `S_shell` non-forgeable, and which of its five properties are enforced, unenforced or demoted | §3.4 *The split*, ADR-0014 *(the four-property table and #106 closure)*, `app/src/startup.ts`, `crates/serat-app/src/startup.rs`, `bench/budget/src/trace.rs` | NFR-PRF-01, NFR-PRF-08, C-06 |
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
 | Vault identity: what `index_meta.vault_root` compares, and what a mismatch may cost | §3.4 *Ruling (task #120)*, `schema/001_init.sql` (index_meta.vault_root), ADR-02 | FR-VLT-02, NFR-REL-02, NFR-PRF-04, C-02 |
-| Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, NFR-PRF-05 |
+| Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, FR-NAV-08, NFR-PRF-05 |
 | Rebuild-not-migrate                     | §4.3, ADR-02               | FR-VLT-02, NFR-REL-02                                                         |
 | SQ grammar and type rules               | §5, grammar/sq.ebnf *(planned)* | FR-STR-06, FR-STR-07, FR-STR-09                                          |
 | Lowering algorithm                      | §5.2, grammar/lowering.md *(planned)* | FR-STR-08, FR-STR-12, NFR-PRF-05                                    |
 | Conformance suite                       | grammar/conformance.md *(planned — the whole of this row)* | FR-STR-06, FR-STR-07, FR-STR-10, P2 gate                |
 | Write-back patcher                      | §6, ADR-08                 | FR-VIW-05, FR-VIW-06, FR-VIW-07, FR-VIW-08, NFR-MNT-03                        |
-| Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, NFR-SEC-03, NFR-REL-03                    |
+| Extractor trait and worker protocol     | §7, contracts/extractor.rs *(planned)* | FR-BIN-05..10, FR-BIN-16, FR-NAV-08, NFR-SEC-03, NFR-REL-03         |
 | Extraction cache                        | §7.2                       | FR-BIN-08                                                                     |
 | Assets are ordinary rows: sidecars, and no second query path | §7, §7.3, ADR-05 | FR-BIN-02, FR-BIN-04                                              |
 | Path containment: one rule, two enforcement points | §*A symlink is not a vault file*, threat-model.md T-07 | NFR-SEC-06 |
