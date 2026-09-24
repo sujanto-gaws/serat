@@ -881,6 +881,48 @@ Fig. 6 — Review queue. One queue for every origin, including external agents o
 | Extraction state is shown on the file, not in a global progress bar    | The user cares whether this PDF is searchable yet, not about queue depth.                |
 | No modal dialogs on the write path                                     | A refused write resolves in place; a modal would make a routine event feel like a fault. |
 
+#### 9.2 The quick switcher (FR-NAV-01, NFR-PRF-06)
+
+A different control from §9's lens switcher: it changes note, not role. Designed in P1 (task #3); it had no design element before (§Traceability, *Musts with no design element yet*, now cleared).
+
+**Where it runs: in Rust, one IPC command per keystroke.** The corpus and the matcher live in a `switcher` module of **serat-index**, beside the rows they are derived from; `serat-app` exposes one command. The webview alternative was rejected on goal 2 — matching tens of thousands of strings on the webview's main thread shares a thread with the editor — and on cost: shipping the corpus to JavaScript is megabytes per refresh. FTS5 with the trigram tokenizer was rejected because it is substring rather than subsequence matching and because it is one more index maintained on every row of a rebuild that sits at 27.7 s against 30 s (NFR-PRF-04, task #96).
+
+**Sources, and the one query that loads them.** Per note: `notes.title`, the vault-relative path without extension, and every alias — `fields` rows with `key IN ('aliases','alias')` and `source = 'frontmatter'`, one row per list item as serat-parse emits them (Obsidian accepts both keys). Headings are `blocks` with `kind = 'heading'`. **No schema change**: the corpus is loaded by fixed-shape reads on a read connection, the heading read is a scan of `blocks` that runs off every critical path, and adding an index for it would put a per-row cost on the rebuild for a read that happens once per refresh (§3.1's third-caller rule).
+
+**Two modes, decided by the query.** Without `#`, the candidates are titles, paths and aliases — about 45,000 strings at 20k notes. With `#`, the text before it filters notes as above and the text after it matches those notes' headings; an empty prefix matches every heading (about 70,000 on the benchmark vault). Keeping headings out of the default mode is what keeps them from flooding ordinary results, and matches Obsidian's `[[note#heading]]` idiom.
+
+**Matching and ranking — deterministic, so it is testable (goal 3).** Subsequence match, smart case (a query with no capitals is case-insensitive), no diacritic folding in P1. Each note appears once, under its best-matching candidate. Results are ordered by:
+
+1. **Match class:** exact match of a title, alias or file name › prefix of one of those › contiguous substring or all query characters at word starts › scattered subsequence.
+2. **Frecency**, descending — recency and frequency, as FR-NAV-01 requires.
+3. The scorer's score, descending (an fzf-v2-style scorer; `nucleo-matcher` is the candidate, subject to the licence check — tests assert this ordering, not a crate).
+4. Shorter candidate, then path in byte order.
+
+At most 50 results, by partial selection rather than a full sort. Each result carries its note path, the candidate that matched (`title` | `alias` | `path` | `heading`), the heading's text and byte offset when it is one, and the matched character ranges for highlighting. An empty query returns the 20 most frecent notes.
+
+**Recency and frequency live in `.serat/history.json` — ruled, closing the open question.** Keyed by vault-relative path; up to the last 10 open times per path, at most 2,000 paths; frecency = Σ 0.5^(age_days / 7) over the stored opens. A note counts as opened when the front end reports it opened in an editor pane — never when a file is read for an embed, a preview or a search snippet. The file is written atomically, debounced by 2 s, by serat-index (it owns `.serat/`; the `std::fs` source-scan allow-list of §2.1 gains this module by name).
+
+- **Why `.serat/` and not the vault:** writing a file the user did not ask for into their vault is what design goal 1 forbids.
+- **Why this is C-02-compliant:** nothing depends on the file. Missing, unreadable or of an unknown version, it is ignored and replaced, and ranking falls back to classes 1, 3 and 4 alone — *capability degrades* (goal 5).
+- **Why it is not in `index.db`:** it is not derived from the vault and cannot be re-derived, so putting it in the index would make a rebuild destroy it. The rebuild removes only `index.db`, `-wal` and `-shm` (`crates/serat-index/src/rebuild.rs`), so a sibling file survives it — which makes *"degrades to lexical after a rebuild"* unnecessary rather than merely acceptable. It is lost only when the user deletes `.serat/`.
+- A rename done in Serat moves the key. A rename done outside Serat loses that note's history, which is acceptable for a ranking signal.
+
+**Freshness.** The corpus is an immutable snapshot swapped atomically by generation. It is built when the index publishes `Ready`, and rebuilt on a background thread 500 ms after the last `index.changed`, so queries never wait for a refresh and results are at most about a second stale. **Before `Ready`** — first open, or a rebuild — the snapshot is built from the file tree's listings (ADR-0015): paths and file names only. So the switcher works from the first listing, and gains titles, aliases and headings when the index arrives (goal 5).
+
+**Stale responses.** Each query carries a sequence number. The Rust side answers the newest query and discards any older one still waiting; the front end drops any response whose sequence is not its latest. A slow keystroke therefore never paints over a faster one.
+
+##### NFR-PRF-06: what is measured, where
+
+**Binding: keystroke to painted results, ≤ 50 ms p95, at 20,000 notes, measured in the real binary.** The interval runs from the `input` event's `timeStamp` for the keystroke that completes the query's third character to the second `requestAnimationFrame` after the Vue commit that renders that query's results — the response whose sequence number is that keystroke's. It is driven by a `--bench-switcher-list <file>` flag on `serat-app`, the same shape as `--bench-save-list`: with the vault open and the index `Ready` (pre-warmed, F-450), the front end types each query from the file one character at a time through synthesised input events and records one line per keystroke. Keystrokes 1, 2 and 4 onwards are reported and not gated. This is the aggregate, measured directly and not composed from its parts, which is the rule §3.4 learned twice.
+
+**Allocation, a diagnostic that CI can run without the application: `Switcher::query` ≤ 20 ms p95 at 20k**, measured in `bench/budget` against serat-index directly over the same query file, with the corpus built from the 20k vault's index. The remaining 30 ms is IPC plus render. A breach of the allocation with the aggregate green is a finding, not a failure. Also reported and not gated: the time to build the corpus snapshot, and all figures at 50k.
+
+**Query set** (test-engineer, task #10): derived from vaultgen's manifest and titles. At least 200 queries: three-character prefixes of titles and aliases; three-character subsequences spread across a title; path-segment queries; queries that match nothing; and `#` heading-mode queries. The benchmark vault draws headings from a small fixed vocabulary, so heading-mode figures overstate the match count and must be labelled with that.
+
+**A run is rejected, not recorded, unless:** every query constructed from a known note returns that note in its top 10 — a switcher that returns nothing is fast, which is F-19's shape — every no-match query returns zero results, and the number of measured keystrokes equals the number of queries.
+
+**No ADR.** Every choice here sits behind one command and one module. The one on-disk artifact, `.serat/history.json`, is disposable by construction: changing its format costs users their ranking once and nothing else.
+
 ## Cross-cutting concerns (packaging, security, verification)
 
 Three areas that carry Must-priority requirements and no interesting mechanism, which is exactly why they are easy to leave undesigned until they become a crisis. This section exists because a coverage check against the requirements baseline found them missing.
@@ -996,23 +1038,24 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | Proposal lifecycle                      | §8.3, Fig. 6               | FR-AIX-05, FR-AIX-04, FR-MCP-03                                               |
 | MCP tool schemas                        | contracts/mcp-tools.json *(planned)* | FR-MCP-01, FR-MCP-02, FR-MCP-04, NFR-SEC-05                           |
 | IPC contract                            | contracts/ipc.rs           | FR-VLT-01, FR-VLT-09, FR-LNS-02, FR-LNS-04, NFR-USE-04                        |
+| Quick switcher: corpus, matching, ranking, frecency storage, the NFR-PRF-06 measurement | §9.2 | FR-NAV-01, NFR-PRF-06, NFR-USE-01, C-02 |
 | Screen designs and interaction rules    | §9, Figs. 4–6              | FR-EDT-02, FR-STR-10, FR-NAV-04, FR-LNS-02, FR-VIW-05, NFR-USE-01, NFR-USE-04 |
 | Benchmark vault generator               | §10.3, bench/              | NFR-MNT-02                                                                    |
 | Budget jobs in CI, one per NFR-PRF      | §10.3, bench/, CI workflow | NFR-PRF-08                                                                    |
 
 ### Musts with no design element yet
 
-Three, listed rather than mapped. Every one of them could be given a plausible row — §9 mentions a switcher, §3.4 mentions NFR-CMP-03 by name — and that is exactly the mistake to avoid, because **an entry naming the wrong section is worse than an absence: it retires the question instead of raising it.** This is the same failure as citing a file that does not exist, one level up.
+**None remain open** — the three rows below are kept struck through with where each was resolved (NFR-CMP-03 at PRD v1.1; FR-NAV-01 and NFR-PRF-06 in P1, §9.2). They were listed rather than mapped, and the reason stands for the next one: every one of them could be given a plausible row — §9 mentions a switcher, §3.4 mentions NFR-CMP-03 by name — and that is exactly the mistake to avoid, because **an entry naming the wrong section is worse than an absence: it retires the question instead of raising it.** This is the same failure as citing a file that does not exist, one level up.
 
 | Requirement | What is actually missing |
 |-------------|--------------------------|
-| **FR-NAV-01** quick switcher (Must, P1) | Nothing here designs it. §9's *lens switcher* is a different control — it changes role, not note — and the resemblance is why this went unnoticed. Most of the input exists: `notes.title`, `notes.path`, an `aliases` frontmatter field in `fields`, and headings as `blocks` with `kind = 'heading'`. **What has no home is the ranking.** FR-NAV-01 requires results ranked by *recency and frequency*, and nothing records either. That is a decision rather than a missing column, and C-02 is what makes it one: per-note open counts are state, and if they live only in `.serat/` then nothing may depend on them. The likely answer is that they live there and the ranking degrades to lexical after a rebuild, which is design goal 5 working as intended — but it has not been ruled, and the alternative is writing a file into the user's vault that they did not ask for. |
-| **NFR-PRF-06** switcher latency (Must, P1) | Follows FR-NAV-01 and cannot be designed before it. It also has no budget job, which is correct rather than overdue: `bench/budget`'s table is P0-scoped and says so. It becomes due the day the switcher is designed, and §10.3's rule is that a budget with no job is an aspiration. |
+| ~~**FR-NAV-01** quick switcher (Must, P1)~~ | **Designed in P1, §9.2 (task #3).** Recency and frequency are ruled there: `.serat/history.json`, which survives a rebuild and which nothing depends on. |
+| ~~**NFR-PRF-06** switcher latency (Must, P1)~~ | **Designed in P1, §9.2.** Keystroke to painted results in the real binary is the binding figure; `Switcher::query` has a 20 ms allocation. Budget job: task #10. |
 | ~~**NFR-CMP-03**, the *by default* half~~ | **Resolved, by splitting the requirement rather than by designing anything.** The row said one requirement had two halves satisfied by opposite postures: a fresh clone rebuilding without `.serat/` is designed and covered (§3.4 step 1, ADR-02), while nothing said who writes `.serat/` into a `.gitignore`, and §3.4 says *"whether the vault is a git repository is the user's business and not ours"*. At v1.1 the requirement became **NFR-CMP-03** (index independence, Must — covered) and **NFR-CMP-04** (offer to add the entry, never edit a `.gitignore` unasked, Should — P1 UI work, not a design gap). **The tension was in the requirement, not in the design**, which is why nothing here had to change to close it. |
 
 ## Open design questions
 
-Recorded rather than resolved, because resolving them now would mean guessing. Each names what would settle it. **Question 1 has left this table** — it was answered by TC-020 and the answer lives in §2.2, because an answered question belongs beside the design it settles rather than in a list of things nobody knows. **The save-path re-read question has now left it too**, answered by task #95's number and recorded in §3.1.1 on the same principle.
+Recorded rather than resolved, because resolving them now would mean guessing. Each names what would settle it. **Question 1 has left this table** — it was answered by TC-020 and the answer lives in §2.2, because an answered question belongs beside the design it settles rather than in a list of things nobody knows. **The save-path re-read question has now left it too**, answered by task #95's number and recorded in §3.1.1 on the same principle. **So has *where do the quick switcher's recency and frequency live*** — ruled in P1 in §9.2 (task #3): `.serat/history.json`, beside the index and not inside it, so a rebuild keeps it and deleting it only degrades the ranking.
 
 | Question                                                              | Settled by                                                                                                                     |
 |-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
@@ -1023,5 +1066,4 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
 | Does the 150ms watcher debounce hold for every sync tool?             | Observation during P1 against git, Syncthing and iCloud, which behave differently.                                             |
 | Should saved views live in .serat or in the vault as notes?           | Follows from whether a user wants views to sync with their vault. Leaning toward notes, for consistency with types and lenses. |
-| Where do the quick switcher's recency and frequency live?             | A P1 ruling, not a measurement. C-02 forbids depending on state that lives only in `.serat/`, and per-note open counts are state. Ranking that degrades to lexical after a rebuild satisfies C-02 and design goal 5; the alternative writes a file into the user's vault. See §Traceability, Musts with no design element yet. |
 | Does §3.2's redundant index contend with P2's write-back submits?     | A P2 measurement of writer-queue depth while patching under load. Reasoning settles the correctness half — a redundant index touches no vault byte — and settles nothing about backpressure (ADR-11). |
