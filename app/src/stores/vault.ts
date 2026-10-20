@@ -45,6 +45,8 @@ export const useVaultStore = defineStore("vault", {
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
     baseHash: null as string | null,
+    /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
+    refusedNames: null as number | null,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
@@ -54,6 +56,9 @@ export const useVaultStore = defineStore("vault", {
     },
     setIndexState(state: IndexState) {
       this.indexStatusText = describeIndexState(state);
+    },
+    setRefusedNames(count: number | null) {
+      this.refusedNames = count;
     },
     setOpenBuffer(note: string | null, baseHash: string | null) {
       this.openNote = note;

@@ -10,6 +10,13 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 
+import BacklinksPane from "@/panes/BacklinksPane.vue";
+import SearchPanel from "@/panes/SearchPanel.vue";
+import { locateBlock } from "@/panes/locate";
+import FileTree from "@/tree/FileTree.vue";
+import { readFile } from "@/ipc/client";
+import type { BlockLocation } from "@/ipc/generated/BlockLocation";
+
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import type { SaveOutcome } from "@/editor/buffer";
@@ -21,6 +28,48 @@ import { useVaultStore } from "@/stores/vault";
 const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
+const searchOpen = ref(false);
+const editorDirty = ref(false);
+
+/**
+ * Opens `path` in the editor, optionally at a located block (backlinks and
+ * search jump-to-block). The previous note's unsaved edits are flushed first by
+ * `loadNote`; if they cannot be saved the note is not replaced.
+ */
+async function openNote(path: string, block: BlockLocation | null = null): Promise<void> {
+  const editor = editorRef.value;
+  if (!editor) return;
+  try {
+    const file = await readFile({ path });
+    const loaded = await editor.loadNote(file.text, file.path, file.hash);
+    if (!loaded) {
+      store.setMark("not opened: the current note has changes that could not be saved yet");
+      return;
+    }
+    store.setOpenBuffer(file.path, file.hash);
+    if (block) {
+      // Exact while the file still has the hash the block was indexed at; by `ord`
+      // (and said so) when it has changed since (architecture.md §4.5).
+      const position = locateBlock(file.text, file.hash, block);
+      editor.revealOffset(position.offset);
+      if (position.approximate) store.setMark("approximate location \u2014 this note has changed since it was indexed");
+    }
+  } catch (error) {
+    store.setMark(`could not open ${path}: ${JSON.stringify(error)}`);
+  }
+}
+
+function onInsertLink(payload: { path: string; text: string }): void {
+  if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
+}
+
+/** ⌘⇧F: global, regardless of which pane has focus (search-panel.md). */
+function onGlobalKeydown(event: KeyboardEvent): void {
+  if ((event.metaKey || event.ctrlKey) && event.shiftKey && (event.key === "F" || event.key === "f")) {
+    event.preventDefault();
+    searchOpen.value = !searchOpen.value;
+  }
+}
 
 onMounted(async () => {
   // NFR-PRF-02's harness seam (`bench/editor-latency/tests/subject.ts`,
@@ -59,7 +108,15 @@ onMounted(async () => {
   // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
   // concurrently with the rAF pair above, not before it: nothing here can delay a
   // mark that was already scheduled on the line above.
-  unlistenIndexStatus = await onIndexStatus((status) => store.setIndexState(status.state));
+  window.addEventListener("keydown", onGlobalKeydown);
+
+  unlistenIndexStatus = await onIndexStatus((status) => {
+    store.setIndexState(status.state);
+    // The count of names the vault refused to list is one status fact (not a
+    // per-name error). It is read when the status carries it.
+    const refused = (status as { refused_names?: number }).refused_names;
+    if (typeof refused === "number") store.setRefusedNames(refused);
+  });
 
   store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
 
@@ -77,6 +134,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
   unlistenIndexStatus?.();
 });
 
@@ -133,16 +191,34 @@ function onSaveOutcome(outcome: SaveOutcome): void {
   </header>
 
   <main class="workspace">
-    <CodeMirrorEditor
-      ref="editorRef"
-      placeholder="No note open — the file tree (task #1-#4) arrives separately."
-      @save-outcome="onSaveOutcome"
-      @follow-link="onFollowLink"
-    />
+    <aside class="pane pane-tree" aria-label="File tree">
+      <FileTree
+        :open-path="store.openNote"
+        :open-dirty="editorDirty"
+        @open="(p) => openNote(p.path)"
+        @insert-link="onInsertLink"
+      />
+    </aside>
+    <div class="editor-column">
+      <CodeMirrorEditor
+        ref="editorRef"
+        placeholder="No note open."
+        @save-outcome="onSaveOutcome"
+        @follow-link="onFollowLink"
+        @dirty-changed="(d: boolean) => (editorDirty = d)"
+      />
+    </div>
+    <aside class="pane pane-context" aria-label="Context">
+      <SearchPanel v-if="searchOpen" @open="(p) => openNote(p.path, p.block)" @close="searchOpen = false" />
+      <BacklinksPane :path="store.openNote" @open="(p) => openNote(p.path, p.block)" />
+    </aside>
   </main>
 
   <footer class="statusbar">
     <span class="index">{{ store.indexStatusText }}</span>
+    <span v-if="store.refusedNames" class="refused" data-testid="refused-names"
+      >{{ store.refusedNames }} {{ store.refusedNames === 1 ? "name" : "names" }} not shown (invalid on this platform)</span
+    >
     <span class="marks">{{ store.marksText }}</span>
   </footer>
 </template>

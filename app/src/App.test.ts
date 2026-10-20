@@ -12,6 +12,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // `await` landing before the editor is created.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => new Promise(() => {})),
+  Channel: class {
+    onmessage: unknown = null;
+  },
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => new Promise(() => {})),

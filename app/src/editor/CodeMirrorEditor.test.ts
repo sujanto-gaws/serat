@@ -287,6 +287,39 @@ describe("CodeMirrorEditor links", () => {
   });
 });
 
+describe("CodeMirrorEditor pane hooks", () => {
+  // jsdom has no execCommand; CodeMirror calls it when focusing a selection.
+  beforeEach(() => {
+    (document as unknown as { execCommand: () => boolean }).execCommand = () => false;
+  });
+  it("insertAtCursor is an ordinary tracked edit; it refuses (false) when no note is open", async () => {
+    const savePatch = vi.fn().mockResolvedValue(written("h1"));
+    const { wrapper, api } = mountEditor(mockIpc(savePatch));
+    const exposed = wrapper.vm as unknown as { insertAtCursor(t: string): boolean };
+    expect(exposed.insertAtCursor("[[x]]")).toBe(false);
+
+    await api.loadNote("ab", "a.md", "h0");
+    expect(exposed.insertAtCursor("![[pic.png]]")).toBe(true);
+    expect(api.getText()).toBe("![[pic.png]]ab");
+    expect(api.isDirty).toBe(true);
+    api.undo();
+    expect(api.getText()).toBe("ab");
+    wrapper.unmount();
+  });
+
+  it("revealOffset moves the cursor, clamped to the document", async () => {
+    const { wrapper, view, api } = mountEditor(mockIpc());
+    await api.loadNote("hello", "a.md", "h0");
+    const exposed = wrapper.vm as unknown as { revealOffset(o: number): void };
+    exposed.revealOffset(3);
+    expect(view.state.selection.main.head).toBe(3);
+    exposed.revealOffset(999);
+    expect(view.state.selection.main.head).toBe(5);
+    expect(api.isDirty).toBe(false); // navigation is never an edit
+    wrapper.unmount();
+  });
+});
+
 describe("CodeMirrorEditor keymap", () => {
   it("the built state has exactly one keymap entry, so no extension adds a bypass keymap (§9.3)", () => {
     const { wrapper, view } = mountEditor(mockIpc());

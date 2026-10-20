@@ -596,6 +596,26 @@ function focus(): void {
   view?.focus();
 }
 
+/**
+ * Inserts `text` at the cursor (file-tree "insert link"). An ordinary edit:
+ * it enters the undo stack and the buffer like typing. False when no note is
+ * open (the editor is read-only), so the caller can say why it did nothing.
+ */
+function insertAtCursor(text: string): boolean {
+  if (!view || !buffer) return false;
+  view.dispatch({ ...view.state.replaceSelection(text), scrollIntoView: true, userEvent: "input" });
+  view.focus();
+  return true;
+}
+
+/** Puts the cursor at `offset` (a document offset) and scrolls it into view (jump-to-block). */
+function revealOffset(offset: number): void {
+  if (!view) return;
+  const at = Math.max(0, Math.min(offset, view.state.doc.length));
+  view.dispatch({ selection: { anchor: at }, effects: EditorView.scrollIntoView(at, { y: "center" }) });
+  view.focus();
+}
+
 async function triggerSave(): Promise<SaveOutcome | null> {
   return performSave(true);
 }
@@ -606,6 +626,8 @@ defineExpose({
   setText,
   getText,
   focus,
+  insertAtCursor,
+  revealOffset,
   loadNote,
   triggerSave,
   isDirty,
