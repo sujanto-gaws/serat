@@ -44,6 +44,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  void import("@tauri-apps/api/event").then(({ listen }) => vi.mocked(listen).mockImplementation(() => new Promise(() => {})));
 });
 
 describe("App", () => {
@@ -58,6 +59,26 @@ describe("App", () => {
     expect(content).not.toBeNull();
     // Not editable yet: typing before `loadNote` would have no base to patch against.
     expect(content?.getAttribute("contenteditable")).toBe("false");
+  });
+
+  it("accepts keystrokes from the moment hydrateBuffer installs the document, before the usable mark (NFR-PRF-01)", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    // Every `listen` call resolves in this test (a later task adds more subscribers).
+    vi.mocked(listen).mockImplementation(() => Promise.resolve(() => undefined));
+    let loaded: Promise<boolean> | null = null;
+    // hydrateBuffer installs the note right after reading it, then waits for
+    // the paint mark / usable mark (which never resolve here).
+    hydrateBuffer.mockImplementationOnce((_store: unknown, editor: unknown) => {
+      loaded = (editor as { loadNote(t: string, p: string, h: string): Promise<boolean> }).loadNote("# hi", "a.md", "h0");
+      return new Promise<void>(() => {});
+    });
+    const wrapper = mount(App, { global: { plugins: [createPinia()] } });
+    await vi.waitFor(() => expect(loaded).not.toBeNull());
+    await loaded;
+
+    const host = wrapper.find(".cm-editor-host").element as HTMLElement;
+    const content = host.shadowRoot?.querySelector(".cm-content");
+    expect(content?.getAttribute("contenteditable")).toBe("true");
   });
 
   it("schedules the paint mark synchronously, ahead of the index-status subscription", () => {
