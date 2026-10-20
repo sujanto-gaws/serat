@@ -6,9 +6,12 @@ Each directory is one case; `link-*.md` files hold exactly one `[[link]]` line.
 
 | Case | Note | Link spellings | Expected |
 |---|---|---|---|
-| greek | `ΟΔΟΣ.md` (ends in capital sigma) | `[[ΟΔΟΣ]]`, `[[οδος]]`, `[[οδοσ]]` | all three resolve; the fold maps final sigma to sigma |
+| greek | `ΟΔΟΣ.md` (ends in capital sigma) | `[[ΟΔΟΣ]]`, `[[οδος]]` | both resolve; the fold maps final sigma to sigma |
+| greek (medial) | same note | `[[οδοσ]]` (sigma, not final sigma) | Serat: resolves; Obsidian: to measure (§4.5 accepted cost) |
 | turkish | `İstanbul.md` (U+0130) | `[[İstanbul]]` resolves; `[[istanbul]]` and `[[ıstanbul]]` do NOT | matches Obsidian: JavaScript lowercases U+0130 to `i` + U+0307, never to plain `i`, so `[[istanbul]]` does not find `İstanbul.md` |
 | nfd | `Café` spelled NFD (`e` + U+0301) | `[[Café]]` in NFC and in NFD | built at test time, Linux only |
+| u-diaeresis-acute | committed `Ǘ.md` (U+01D7, NFC) | `[[ǘ]]` (U+01D8, NFC) | resolves: case fold only |
+| u-diaeresis-acute (NFD) | `U` + U+0308 + U+0301 `.md`, built at test time, Linux only | `[[u` + U+0308 + U+0301 `]]` resolves; `[[ǘ]]` (NFC) is the cross-spelling case, `#[ignore]`d like Café until Obsidian is measured | two stacked marks: case fold and normalisation interact |
 
 ## Why the NFD case is not committed
 

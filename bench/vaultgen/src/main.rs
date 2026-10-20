@@ -29,6 +29,8 @@ PRESETS
     --preset 50k    50,000 notes,   500 assets  -> bench/vaults/vault-50k
 
 OPTIONS
+    --root <DIR>       Repository root (also SERAT_REPO_ROOT). Default: the
+                       [workspace] above the working directory.
     --out <DIR>        Vault root. Overrides the preset's location.
     --notes <N>        Total .md files, including type notes and sidecars.
     --assets <N>       Binaries under assets/.
@@ -54,31 +56,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// Repository root, resolved at run time (task #45): `SERAT_REPO_ROOT`, else the
-/// nearest ancestor of the working directory whose `Cargo.toml` declares a
-/// `[workspace]`, else the compile-time location (a binary reused across
-/// worktrees via a shared `CARGO_TARGET_DIR` must not write into the tree that
-/// built it).
-fn repo_root() -> PathBuf {
-    if let Some(e) = std::env::var_os("SERAT_REPO_ROOT").filter(|e| !e.is_empty()) {
-        return PathBuf::from(e);
+/// Repository root, resolved at run time (tasks #45, #54) by the shared `reporoot`
+/// crate. `--root` with no value is an error, from here as well as from the
+/// argument loop.
+fn resolved_root() -> Result<reporoot::Resolved, String> {
+    reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// The root to write under. Refuses the compiled-in fallback: vaultgen writes a
+/// whole vault, and a binary reused from another worktree must not write it into
+/// the tree that built the binary. Pass `--root`, set `SERAT_REPO_ROOT`, run from
+/// inside the checkout, or give `--out`.
+fn repo_root() -> Result<PathBuf, String> {
+    let r = resolved_root()?;
+    if r.rule == reporoot::Rule::CompiledIn {
+        return Err(format!(
+            "refusing to write under the compiled-in checkout {}: no [workspace] Cargo.toml \
+             above the working directory. Pass --root <dir>, set SERAT_REPO_ROOT, or give --out",
+            r.path.display()
+        ));
     }
-    let from_cwd = std::env::current_dir().ok().and_then(|cwd| {
-        cwd.ancestors()
-            .find(|d| {
-                std::fs::read_to_string(d.join("Cargo.toml"))
-                    .is_ok_and(|t| t.lines().any(|l| l.trim() == "[workspace]"))
-            })
-            .map(PathBuf::from)
-    });
-    if let Some(r) = from_cwd {
-        return r;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // bench/
-        .and_then(|p| p.parent()) // repo root
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    Ok(r.path)
 }
 
 fn run() -> Result<ExitCode, String> {
@@ -87,6 +85,9 @@ fn run() -> Result<ExitCode, String> {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
+    // A bare `--root` is an error even when `--out` means the root is never joined,
+    // and the root in force is always said (stderr, so `--quiet`'s digest stays clean).
+    eprintln!("vaultgen: {}", resolved_root()?.report_line());
 
     let mut opts = Options::default();
     let mut out_set = false;
@@ -123,6 +124,11 @@ fn run() -> Result<ExitCode, String> {
                     .parse()
                     .map_err(|_| "--seed must be an unsigned 64-bit integer".to_string())?
             }
+            // Consumed by `repo_root()` (shared `reporoot` rule); checked here so a
+            // bare `--root` is an error rather than silently ignored.
+            "--root" => {
+                value("--root")?;
+            }
             "--manifest" => opts.manifest = Some(PathBuf::from(value("--manifest")?)),
             "--jobs" => {
                 opts.jobs = Some(
@@ -134,6 +140,7 @@ fn run() -> Result<ExitCode, String> {
             "--expect" => expect = Some(value("--expect")?.to_lowercase()),
             "--force" => opts.force = true,
             "--quiet" => opts.quiet = true,
+            other if other.starts_with("--root=") => {}
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
         i += 1;
@@ -161,12 +168,12 @@ fn run() -> Result<ExitCode, String> {
             opts.assets = assets;
         }
         if !out_set {
-            opts.out = repo_root().join(dir);
+            opts.out = repo_root()?.join(dir);
             out_set = true;
         }
     }
     if !out_set {
-        opts.out = repo_root().join("bench/vaults/vault-20k");
+        opts.out = repo_root()?.join("bench/vaults/vault-20k");
     }
 
     if opts.notes < 64 {

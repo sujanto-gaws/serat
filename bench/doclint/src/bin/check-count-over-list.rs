@@ -8,8 +8,14 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let (scanned, problems) = match doclint::count_over_list::check_repo_docs(&doclint::repo_root())
-    {
+    let root = match doclint::announce_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL  {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (scanned, problems) = match doclint::count_over_list::check_repo_docs(&root) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("FAIL  could not run the count-over-list check\n  {e}");
