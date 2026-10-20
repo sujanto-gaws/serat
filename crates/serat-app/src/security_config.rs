@@ -44,6 +44,7 @@ pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acl_manifest::permission_identifier;
     use serde_json::Value;
 
     /// `tauri.conf.json`, compiled in rather than read at test time.
@@ -137,25 +138,6 @@ mod tests {
              Markdown; this is the same rule enforced at the CSP layer rather than \
              only by the sanitiser."
         );
-    }
-
-    /// A permission entry is either a bare string identifier (`"core:default"`) or an
-    /// object that extends a permission's scope (`{"identifier": ..., "allow": [...]}`,
-    /// `tauri-utils-2.9.3`'s `PermissionEntry::ExtendedPermission`). Both shapes carry
-    /// an identifier; this reads it from either so an exact-set check does not have to
-    /// choose one shape over the other.
-    fn permission_identifier(entry: &Value) -> String {
-        entry.as_str().map(str::to_owned).unwrap_or_else(|| {
-            entry["identifier"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "permission entry {entry:?} is neither a string identifier nor an \
-                         object carrying one"
-                    )
-                })
-                .to_owned()
-        })
     }
 
     #[test]

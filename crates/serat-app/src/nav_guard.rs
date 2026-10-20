@@ -57,8 +57,27 @@
 
 use tauri::Url;
 
+/// Which custom-protocol spelling the webview serves the bundle under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Platform {
+    /// WebView2: `http://tauri.localhost/`.
+    Windows,
+    /// WebKitGTK / WKWebView: `tauri://localhost/`.
+    Other,
+}
+
+impl Platform {
+    pub(crate) const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Whether `url` is somewhere `on_navigation` must allow the top-level webview
-/// to go: the app's own bundle, on either platform spelling, or the
+/// to go: the app's own bundle in `platform`'s spelling only, or the
 /// configured dev server while `cfg!(debug_assertions)` is true. Everything
 /// else — an external site, a `javascript:` URI, a meta-refresh target, and
 /// deliberately including `serat-asset://…` / `http://serat-asset.localhost/…`
@@ -73,12 +92,26 @@ use tauri::Url;
 /// `debug_assertions` is a property of *this build*, not of the config file,
 /// and a release binary must never trust a dev server origin baked into a
 /// config that ships with it.
-pub(crate) fn is_app_navigation_target(url: &Url, dev_server_origin: Option<&Url>) -> bool {
-    let is_app_bundle = (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-        || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"));
+pub(crate) fn is_app_navigation_target(
+    url: &Url,
+    dev_server_origin: Option<&Url>,
+    platform: Platform,
+) -> bool {
+    // No port, no userinfo: wry registers the Windows filter as the prefix
+    // `http://tauri.localhost/*`, so `http://tauri.localhost:8080/` is not
+    // intercepted, reaches the network, resolves to loopback, and tauri's
+    // `is_local_url` (scheme + domain only) would call it a local origin.
+    let bare = url.port().is_none() && url.username().is_empty() && url.password().is_none();
+    let is_app_bundle = bare
+        && match platform {
+            Platform::Windows => {
+                url.scheme() == "http" && url.host_str() == Some("tauri.localhost")
+            }
+            Platform::Other => url.scheme() == "tauri" && url.host_str() == Some("localhost"),
+        };
 
-    let is_dev_server = cfg!(debug_assertions)
-        && dev_server_origin.is_some_and(|dev| dev.origin() == url.origin());
+    let is_dev_server =
+        cfg!(debug_assertions) && dev_server_origin.is_some_and(|dev| dev.origin() == url.origin());
 
     is_app_bundle || is_dev_server
 }
@@ -106,9 +139,7 @@ pub(crate) fn is_app_navigation_target(url: &Url, dev_server_origin: Option<&Url
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
-pub(crate) fn disable_default_context_menu<R: tauri::Runtime>(
-    window: &tauri::WebviewWindow<R>,
-) {
+pub(crate) fn disable_default_context_menu<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
     // `with_webview` runs its closure on the main thread; we are already on
     // it (called from `setup`, before the event loop starts), so this is a
     // direct call rather than a hop. The result is ignored deliberately: the
@@ -134,21 +165,66 @@ mod tests {
 
     #[test]
     fn the_app_bundle_is_allowed_on_both_platform_spellings() {
-        assert!(is_app_navigation_target(&u("tauri://localhost/index.html"), None));
-        assert!(is_app_navigation_target(&u("http://tauri.localhost/index.html"), None));
+        let w = Platform::Windows;
+        let o = Platform::Other;
+        assert!(is_app_navigation_target(
+            &u("tauri://localhost/index.html"),
+            None,
+            o
+        ));
+        assert!(is_app_navigation_target(
+            &u("http://tauri.localhost/index.html"),
+            None,
+            w
+        ));
+        // Each spelling is refused on the other platform.
+        assert!(!is_app_navigation_target(
+            &u("http://tauri.localhost/"),
+            None,
+            o
+        ));
+        assert!(!is_app_navigation_target(&u("tauri://localhost/"), None, w));
+    }
+
+    #[test]
+    fn port_and_userinfo_on_the_bundle_origin_are_refused() {
+        for (url, p) in [
+            ("http://tauri.localhost:8080/", Platform::Windows),
+            ("http://tauri.localhost:443/", Platform::Windows),
+            ("http://tauri.localhost:0/", Platform::Windows),
+            ("http://user@tauri.localhost/", Platform::Windows),
+            ("http://user:pw@tauri.localhost/", Platform::Windows),
+            ("http://:pw@tauri.localhost/", Platform::Windows),
+            ("tauri://localhost:1234/", Platform::Other),
+            ("tauri://user@localhost/", Platform::Other),
+        ] {
+            assert!(!is_app_navigation_target(&u(url), None, p), "{url}");
+        }
     }
 
     #[test]
     fn an_external_https_link_is_refused() {
         // §9.3's "an external link" hostile case.
-        assert!(!is_app_navigation_target(&u("https://evil.example/"), None));
-        assert!(!is_app_navigation_target(&u("http://evil.example/"), None));
+        assert!(!is_app_navigation_target(
+            &u("https://evil.example/"),
+            None,
+            Platform::current()
+        ));
+        assert!(!is_app_navigation_target(
+            &u("http://evil.example/"),
+            None,
+            Platform::current()
+        ));
     }
 
     #[test]
     fn a_javascript_uri_is_refused() {
         // §9.3's "a javascript: link" hostile case.
-        assert!(!is_app_navigation_target(&u("javascript:alert(1)"), None));
+        assert!(!is_app_navigation_target(
+            &u("javascript:alert(1)"),
+            None,
+            Platform::current()
+        ));
     }
 
     #[test]
@@ -158,7 +234,11 @@ mod tests {
         // the point -- on_navigation sees a target URL regardless of what
         // triggered the navigation attempt, and this asserts the target a
         // meta-refresh would carry is refused exactly like a clicked link.
-        assert!(!is_app_navigation_target(&u("https://evil.example/redirected"), None));
+        assert!(!is_app_navigation_target(
+            &u("https://evil.example/redirected"),
+            None,
+            Platform::current()
+        ));
     }
 
     #[test]
@@ -171,11 +251,13 @@ mod tests {
         // scheme handler and lands with #19.
         assert!(!is_app_navigation_target(
             &u("serat-asset://localhost/note.pdf"),
-            None
+            None,
+            Platform::current()
         ));
         assert!(!is_app_navigation_target(
             &u("http://serat-asset.localhost/note.pdf"),
-            None
+            None,
+            Platform::current()
         ));
     }
 
@@ -190,17 +272,29 @@ mod tests {
         // states the rule as a fact about the caller's responsibility
         // (passing None in release) rather than something this function can
         // prove about itself from one build.
-        assert!(is_app_navigation_target(&u("http://localhost:5173/app.js"), Some(&dev)));
+        assert!(is_app_navigation_target(
+            &u("http://localhost:5173/app.js"),
+            Some(&dev),
+            Platform::current()
+        ));
         // A different port is a different origin and must still be refused --
         // "the dev server" means exactly the one URL that was configured, not
         // "anything on localhost".
-        assert!(!is_app_navigation_target(&u("http://localhost:5174/"), Some(&dev)));
+        assert!(!is_app_navigation_target(
+            &u("http://localhost:5174/"),
+            Some(&dev),
+            Platform::current()
+        ));
     }
 
     #[test]
     fn no_dev_server_configured_means_no_dev_exception_exists() {
         // Every build today: tauri.conf.json sets no build.devUrl. Passing
         // None must not silently become "allow anything on localhost".
-        assert!(!is_app_navigation_target(&u("http://localhost:5173/"), None));
+        assert!(!is_app_navigation_target(
+            &u("http://localhost:5173/"),
+            None,
+            Platform::current()
+        ));
     }
 }
