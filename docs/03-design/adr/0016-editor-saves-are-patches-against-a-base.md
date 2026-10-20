@@ -65,7 +65,7 @@ The front end keeps, per open note, the **base** — the `Text` as last loaded o
 
 **Bytes outside the patched ranges are copied, never re-encoded — by construction rather than by care.** That is the invariant, and the property test in *Tested against* item 1 checks it. On success the base becomes the document as it was when the save was taken; changes typed while the save was in flight stay composed against that new base.
 
-`write_file` keeps exactly one job: **creating** a note (`base_hash: None`). The editor never calls it for an existing file. Saves are triggered by 1 s of idle, by blur, by closing the note and by the save command. None of them runs on the keystroke path (goal 2): the save is an asynchronous IPC call, and the keystroke never waits for it.
+`write_file` keeps exactly one job: **creating** a note (`base_hash: None`, FR-VLT-11). A new folder is not a note and does not go through it: it uses `create_folder` (`contracts/ipc.rs`), which writes no content. The editor never calls `write_file` for an existing file. Saves are triggered by 1 s of idle, by blur, by closing the note and by the save command. None of them runs on the keystroke path (goal 2): the save is an asynchronous IPC call, and the keystroke never waits for it.
 
 ### 3. External changes are edit scripts in base coordinates
 
