@@ -159,12 +159,14 @@ mod tests {
             .collect();
         permissions.sort();
         let mut expected: Vec<String> = vec![
+            "allow-backlinks",
             "allow-create-folder",
             "allow-index-status",
             "allow-mark-first-paint",
             "allow-mark-vault-usable",
             "allow-read-file",
             "allow-refused-names",
+            "allow-search",
             "allow-write-file",
             "core:default",
             "opener:allow-open-url",

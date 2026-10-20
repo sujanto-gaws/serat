@@ -33,8 +33,9 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexState, IndexStatus, IpcError,
-    OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexState,
+    IndexStatus, IpcError, NotePathArgs, OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs,
+    RefusedName, SearchArgs, SearchOutcome, VaultOpened, WriteFileArgs,
 };
 use crate::settings::Settings;
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -473,6 +474,49 @@ impl AppState {
                 refused_names: None,
             },
         }
+    }
+
+    /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than
+    /// waiting (rule 1). Limits are the core's: `Reader::search` clamps (#15 ruling).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open.
+    pub fn search(&self, args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError> {
+        let (root, state) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(state, &root, |reader| {
+            reader
+                .search(&args.query, args.offset, args.limit)
+                .map(crate::reads::map_outcome)
+        }))
+    }
+
+    /// `backlinks`. FR-NAV-04.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PathEscapesVault`] for a bad path; [`IpcError::VaultNotFound`] with
+    /// no vault open.
+    pub fn backlinks(&self, args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
+        let path = Self::vault_path(&args.path)?;
+        let (root, state) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(state, &root, |reader| {
+            reader
+                .backlinks(path.as_str())
+                .map(|links| links.into_iter().map(crate::reads::map_backlink).collect())
+        }))
+    }
+
+    /// The root and the last published index state, read without blocking.
+    fn read_context(&self) -> Result<(PathBuf, IndexState), IpcError> {
+        let guard = self.open_lock();
+        let open = guard.as_ref().ok_or_else(|| IpcError::VaultNotFound {
+            path: String::new(),
+        })?;
+        Ok((
+            open.vault.root().to_path_buf(),
+            open.publisher.status().state,
+        ))
     }
 
     /// `create_folder`. FR-VLT-11, NFR-SEC-06. See [`crate::folder`].
@@ -1805,5 +1849,137 @@ mod tests {
         vault.walk().expect("walk");
         assert!(state.refused_names().is_empty());
         assert_eq!(state.index_status().refused_names, Some(0));
+    }
+
+    // -- index reads (FR-NAV-02, FR-NAV-04) -----------------------------------------
+
+    fn wait_ready(state: &AppState) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if matches!(state.index_status().state, IndexState::Ready { .. }) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the index never became Ready: {:?}", state.index_status());
+    }
+
+    #[test]
+    fn reads_with_no_vault_open_are_refused_by_name() {
+        let bare = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        let search = bare.search(SearchArgs {
+            query: "x".into(),
+            offset: 0,
+            limit: 10,
+        });
+        assert!(matches!(search, Err(IpcError::VaultNotFound { .. })));
+        let links = bare.backlinks(NotePathArgs {
+            path: "a.md".into(),
+        });
+        assert!(matches!(links, Err(IpcError::VaultNotFound { .. })));
+    }
+
+    #[test]
+    fn search_and_backlinks_answer_from_a_ready_index_in_the_contracts_terms() {
+        let dir = fixture("reads");
+        std::fs::write(dir.join("alpha.md"), "# Alpha\n\nsee [[beta]]\n").expect("fixture");
+        std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
+        let state = state(&dir);
+        wait_ready(&state);
+
+        let found = state
+            .search(SearchArgs {
+                query: "zebra".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        let IndexRead::Ready {
+            value: SearchOutcome::Hits { items },
+        } = found
+        else {
+            panic!("expected hits, got {found:?}");
+        };
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].path, "beta.md");
+        assert!(items[0].block.is_some() && items[0].snippet.is_some());
+
+        let nothing = state
+            .search(SearchArgs {
+                query: "\"unbalanced".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(matches!(
+            nothing,
+            IndexRead::Ready {
+                value: SearchOutcome::UnbalancedQuote
+            }
+        ));
+
+        let links = state
+            .backlinks(NotePathArgs {
+                path: "beta.md".into(),
+            })
+            .expect("backlinks");
+        let IndexRead::Ready { value } = links else {
+            panic!("expected ready, got {links:?}");
+        };
+        assert_eq!(value.len(), 1, "{value:?}");
+        assert_eq!(value[0].source_path, "alpha.md");
+        assert!(value[0].excerpt.contains("[[beta]]"), "{value:?}");
+
+        let bad = state.backlinks(NotePathArgs {
+            path: "../x.md".into(),
+        });
+        assert!(matches!(bad, Err(IpcError::PathEscapesVault { .. })));
+    }
+
+    #[test]
+    fn a_read_before_the_index_is_ready_reports_the_state_instead_of_waiting() {
+        // Rule 1. A scripted opener that never finishes keeps the state at `Opening`.
+        struct Never;
+        impl IndexOpen for Never {
+            fn open(&mut self, _: &Path, _: &Path, _: &dyn Fn(IndexState)) {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+        let dir = fixture("reads-not-ready");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                Never,
+            )
+            .expect("open");
+        let started = Instant::now();
+        let answer = state
+            .search(SearchArgs {
+                query: "x".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(
+                answer,
+                IndexRead::NotReady {
+                    state: IndexState::Opening
+                }
+            ),
+            "{answer:?}"
+        );
     }
 }

@@ -36,6 +36,8 @@ fn main() {
             "mark_vault_usable",
             "refused_names",
             "create_folder",
+            "search",
+            "backlinks",
         ]),
     ))
     .expect(

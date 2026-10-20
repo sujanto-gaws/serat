@@ -49,6 +49,7 @@ pub mod error;
 pub mod folder;
 pub mod index;
 mod nav_guard;
+pub mod reads;
 mod security_config;
 pub mod settings;
 pub mod startup;
@@ -265,6 +266,8 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::mark_vault_usable,
             commands::refused_names,
             commands::create_folder,
+            commands::search,
+            commands::backlinks,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();

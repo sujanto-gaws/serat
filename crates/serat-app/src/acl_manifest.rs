@@ -205,6 +205,8 @@ mod tests {
             "mark_vault_usable",
             "refused_names",
             "create_folder",
+            "search",
+            "backlinks",
         ]
         .into_iter()
         .map(str::to_owned)

@@ -12,6 +12,8 @@
     "allow-mark-vault-usable",
     "allow-refused-names",
     "allow-create-folder",
+    "allow-search",
+    "allow-backlinks",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

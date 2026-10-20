@@ -15,8 +15,9 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::ipc::{
-    CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexStatus, IpcError,
-    OpenVaultArgs, ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexStatus,
+    IpcError, NotePathArgs, OpenVaultArgs, ReadFileArgs, RefusedName, SearchArgs, SearchOutcome,
+    VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -67,6 +68,34 @@ pub fn write_file(
 #[must_use]
 pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
+}
+
+/// `search(args) -> Result<IndexRead<SearchOutcome>, IpcError>`
+///
+/// Off the main thread; never waits for the index.
+///
+/// # Errors
+///
+/// As [`AppState::search`].
+#[tauri::command(async)]
+pub fn search(
+    state: State<'_, Arc<AppState>>,
+    args: SearchArgs,
+) -> Result<IndexRead<SearchOutcome>, IpcError> {
+    state.search(args)
+}
+
+/// `backlinks(args) -> Result<IndexRead<Vec<Backlink>>, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::backlinks`].
+#[tauri::command(async)]
+pub fn backlinks(
+    state: State<'_, Arc<AppState>>,
+    args: NotePathArgs,
+) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
+    state.backlinks(args)
 }
 
 /// `create_folder(args) -> Result<FolderCreated, IpcError>`
