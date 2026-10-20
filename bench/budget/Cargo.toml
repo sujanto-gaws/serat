@@ -47,12 +47,23 @@ path = "src/bin/prf04-full-rebuild.rs"
 name = "p1-read-paths"
 path = "src/bin/p1-read-paths.rs"
 
+# Task #53: attributes the hub-note save tail (architecture 3.1.1) and diagnoses the
+# search-connection gap (architecture 4.5). Reports, applies no remedy, gates nothing.
+[[bin]]
+name = "p1-save-tail"
+path = "src/bin/p1-save-tail.rs"
+
+[[bin]]
+name = "p1-search-gap"
+path = "src/bin/p1-search-gap.rs"
+
 [dependencies]
 vaultgen = { path = "../vaultgen" }
 # Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
 # number the code under test reports -- the same argument as recomputing the
 # vault digest. serat-index already links it, so this costs no build time.
-rusqlite = { workspace = true }
+# "trace": the save-tail and search-gap benches read statement profile events.
+rusqlite = { workspace = true, features = ["trace"] }
 serat-core = { path = "../../crates/serat-core" }
 serat-index = { path = "../../crates/serat-index" }
 serat-parse = { path = "../../crates/serat-parse" }

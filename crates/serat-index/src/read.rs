@@ -337,6 +337,15 @@ impl Reader {
         })
     }
 
+    /// Run `f` on this reader's own connection.
+    ///
+    /// For `bench/budget`'s diagnoses only (task #53: reading pragmas back, counting
+    /// statement runs). Not part of any caller's contract; the application never calls it.
+    #[doc(hidden)]
+    pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        f(&self.conn)
+    }
+
     /// Route this reader's free-text searches (R1, R1 + R3) to the vault's search
     /// connection. R2, R3 and R4 stay on this reader's own connection.
     #[must_use]
@@ -627,6 +636,15 @@ impl SearchConn {
             #[cfg(test)]
             handler_calls,
         }))
+    }
+
+    /// Run `f` on the search connection, under its lock.
+    ///
+    /// For `bench/budget`'s diagnoses only (task #53), like [`Self::set_progress_handler`].
+    #[doc(hidden)]
+    pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&conn)
     }
 
     /// Install (`true`) or remove (`false`) the progress handler on this same connection.
