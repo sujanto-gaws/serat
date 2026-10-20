@@ -18,7 +18,7 @@
 // span for now so the preview never blocks on it landing, and is the one
 // obvious place #22 plugs a resolver in (`WikiLinkResolver` below).
 
-import type { MarkdownIt, StateInline, Token } from "markdown-it";
+import type { MarkdownIt, StateBlock, StateInline, Token } from "markdown-it";
 
 import { sanitizeToFragment } from "@/editor/sanitize";
 
@@ -59,6 +59,8 @@ async function getMarkdownIt(): Promise<MarkdownIt> {
       md.use(wikiLinkPlugin);
       md.use(taskListPlugin);
       md.use(footnoteRefPlugin);
+      md.use(footnoteSectionPlugin);
+      md.use(calloutPlugin);
       return md;
     });
   }
@@ -184,6 +186,98 @@ function footnoteRefPlugin(md: MarkdownIt): void {
     const escaped = md.utils.escapeHtml(label);
     return `<sup><a href="#${markerPrefix(env)}fnref:${encodeURIComponent(label)}">${escaped}</a></sup>`;
   };
+}
+
+/** Obsidian callouts: a blockquote whose first line is `[!type] Title`. The
+ * blockquote is rewritten to a `<div>` carrying a nonce-prefixed `title`, which
+ * the sanitiser turns into `data-callout` after sanitising (an incoming
+ * `data-callout` is stripped like every other `data-*`, so a document cannot
+ * forge one). The title line becomes a `<strong>`. */
+function calloutPlugin(md: MarkdownIt): void {
+  md.core.ruler.push("serat_callout", (state: import("markdown-it").StateCore) => {
+    const { tokens } = state;
+    const nonce = (state.env as RenderEnv | undefined)?.nonce ?? "";
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].type !== "blockquote_open") continue;
+      const inline = tokens[i + 2];
+      if (tokens[i + 1]?.type !== "paragraph_open" || !inline || inline.type !== "inline" || !inline.children?.length) {
+        continue;
+      }
+      const first = inline.children[0];
+      const match = /^\[!([\w-]+)\][ \t]*/.exec(first.type === "text" ? first.content : "");
+      if (!match) continue;
+      const type = match[1].toLowerCase();
+      const title = first.content.slice(match[0].length) || type.charAt(0).toUpperCase() + type.slice(1);
+      first.content = title;
+      inline.children.unshift(new state.Token("strong_open", "strong", 1));
+      inline.children.splice(2, 0, new state.Token("strong_close", "strong", -1));
+      // Matching close: the next blockquote_close at the same nesting level.
+      let depth = 0;
+      for (let j = i; j < tokens.length; j++) {
+        if (tokens[j].type === "blockquote_open") depth += 1;
+        if (tokens[j].type === "blockquote_close") {
+          depth -= 1;
+          if (depth === 0) {
+            tokens[j].tag = "div";
+            break;
+          }
+        }
+      }
+      tokens[i].tag = "div";
+      tokens[i].attrSet("title", `serat-${nonce}:callout:${encodeURIComponent(type)}`);
+    }
+    return true;
+  });
+}
+
+type FootnoteDef = { label: string; content: string };
+
+/** `[^label]: text` definitions (single-line): collected out of the flow and
+ * rendered as a numbered section after the content, so the preview shows
+ * footnotes where Obsidian does instead of leaving them as stray paragraphs.
+ * The source is never rewritten (C-01). Chunked rendering renders each chunk
+ * separately, so a definition is listed in the chunk that contains it. */
+function footnoteSectionPlugin(md: MarkdownIt): void {
+  md.block.ruler.before(
+    "reference",
+    "serat_footnote_def",
+    (state: StateBlock, startLine: number, _endLine: number, silent: boolean) => {
+      if (state.sCount[startLine] - state.blkIndent >= 4) return false;
+      const pos = state.bMarks[startLine] + state.tShift[startLine];
+      const line = state.src.slice(pos, state.eMarks[startLine]);
+      const match = /^\[\^([^\]\s]+)\]:[ \t]*(.*)$/.exec(line);
+      if (!match) return false;
+      if (silent) return true;
+      const env = state.env as { footnotes?: FootnoteDef[] };
+      (env.footnotes ??= []).push({ label: match[1], content: match[2] });
+      state.line = startLine + 1;
+      return true;
+    },
+  );
+  md.core.ruler.push("serat_footnote_section", (state: import("markdown-it").StateCore) => {
+    const defs = (state.env as { footnotes?: FootnoteDef[] }).footnotes;
+    if (!defs || defs.length === 0) return true;
+    const push = (type: string, tag: string, nesting: 1 | 0 | -1): Token => {
+      const token = new state.Token(type, tag, nesting);
+      token.block = true;
+      state.tokens.push(token);
+      return token;
+    };
+    push("hr", "hr", 0);
+    push("ordered_list_open", "ol", 1);
+    for (const def of defs) {
+      push("list_item_open", "li", 1);
+      push("paragraph_open", "p", 1);
+      const inline = push("inline", "", 0);
+      inline.content = def.content;
+      inline.children = [];
+      state.md.inline.parse(def.content, state.md, state.env, inline.children);
+      push("paragraph_close", "p", -1);
+      push("list_item_close", "li", -1);
+    }
+    push("ordered_list_close", "ol", -1);
+    return true;
+  });
 }
 
 /**

@@ -30,6 +30,32 @@ describe("renderMarkdownToFragment", () => {
     expect(html).toContain('href="#fn-1"');
   });
 
+  it("renders a callout as a div with a trusted data-callout and a title", async () => {
+    const html = await renderToHtml("> [!warning] Careful\n> mind the gap\n");
+    expect(html).toContain('<div data-callout="warning">');
+    expect(html).toContain("<strong>Careful</strong>");
+    expect(html).toContain("mind the gap");
+    expect(html).not.toContain("blockquote");
+    expect(html).not.toContain("title=");
+  });
+
+  it("defaults the callout title to the capitalised type, and leaves plain quotes alone", async () => {
+    expect(await renderToHtml("> [!note]\n> x\n")).toContain("<strong>Note</strong>");
+    expect(await renderToHtml("> just a quote\n")).toContain("<blockquote>");
+  });
+
+  it("collects footnote definitions into a numbered section after the content", async () => {
+    const html = await renderToHtml("see this[^1]\n\n[^1]: the *note*\n");
+    expect(html).toContain("<hr>");
+    expect(html).toMatch(/<ol>[\s\S]*<li>[\s\S]*the <em>note<\/em>[\s\S]*<\/ol>/);
+    expect(html).not.toContain("[^1]:");
+  });
+
+  it("raw HTML in a note never becomes a div (so no forged callout)", async () => {
+    const html = await renderToHtml('<div data-callout="x">hi</div>\n');
+    expect(html).not.toContain("<div");
+  });
+
   it("renders an unresolved wikilink as a styled, non-navigating anchor", async () => {
     const html = await renderToHtml("see [[Some Note]] here\n");
     expect(html).toContain("data-wikilink=");

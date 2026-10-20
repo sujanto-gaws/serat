@@ -161,6 +161,15 @@ describe("sanitizeToHtml — hostile inputs", () => {
     expect(sanitizeToHtml(html)).not.toContain("data-wikilink");
   });
 
+  it("keeps a callout marker only for the matching nonce and never an incoming data-callout", () => {
+    const html =
+      '<div title="serat-n0nce:callout:warning">a</div><div title="serat-bad:callout:x">b</div><div data-callout="y">c</div>';
+    const out = sanitizeToHtml(html, document, { markerNonce: "n0nce" });
+    expect(out).toContain('data-callout="warning"');
+    expect(out.match(/data-callout/g)).toHaveLength(1);
+    expect(out).not.toContain("title=");
+  });
+
   it("drops script and style in a foreign namespace along with their text", () => {
     const out = sanitizeToHtml(
       "<p>a</p><svg><script>alert(1)</script><style>p{}</style></svg><math><style>x</style></math>",

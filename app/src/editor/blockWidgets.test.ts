@@ -1,0 +1,127 @@
+// Task #40: block widgets (tables, ![[image]] embeds, callouts) — FR-EDT-01/02,
+// NFR-PRF-02, architecture.md §9.3. Widgets only change what is displayed;
+// the document is never touched (C-04).
+
+import { ensureSyntaxTree } from "@codemirror/language";
+import { EditorState } from "@codemirror/state";
+import { describe, expect, it } from "vitest";
+
+import {
+  blockWidgetsField,
+  isImageTarget,
+  parseCalloutHeader,
+  seratAssetUrl,
+  stripBlockquoteMarkers,
+} from "@/editor/blockWidgets";
+import { seratMarkdown } from "@/editor/markdownLanguage";
+
+function makeState(doc: string, anchor = 0): EditorState {
+  const state = EditorState.create({
+    doc,
+    selection: { anchor },
+    extensions: [seratMarkdown(), blockWidgetsField],
+  });
+  ensureSyntaxTree(state, state.doc.length, 5000);
+  // `create` may have parsed only a prefix; rebuild the field against the full tree.
+  return state.update({ selection: { anchor } }).state;
+}
+
+function widgets(state: EditorState): Array<{ from: number; to: number; widget: unknown; block: boolean }> {
+  const out: Array<{ from: number; to: number; widget: unknown; block: boolean }> = [];
+  const iter = state.field(blockWidgetsField).iter();
+  while (iter.value) {
+    const spec = iter.value.spec as { widget?: unknown; block?: boolean };
+    out.push({ from: iter.from, to: iter.to, widget: spec.widget, block: !!spec.block });
+    iter.next();
+  }
+  return out;
+}
+
+const TABLE = "| a | b |\n| - | - |\n| 1 | 2 |";
+
+describe("pure helpers", () => {
+  it("recognises image targets by extension", () => {
+    expect(isImageTarget("pic.PNG")).toBe(true);
+    expect(isImageTarget("pic.png|200")).toBe(true);
+    expect(isImageTarget("note")).toBe(false);
+    expect(isImageTarget("doc.pdf")).toBe(false);
+  });
+  it("builds a percent-encoded serat-asset URL per segment", () => {
+    expect(seratAssetUrl("a b/c#d.png")).toBe("serat-asset://localhost/a%20b/c%23d.png");
+  });
+  it("parses callout headers and strips quote markers", () => {
+    expect(parseCalloutHeader("> [!warning] Careful")).toEqual({ type: "warning", title: "Careful" });
+    expect(parseCalloutHeader("> [!note]")).toEqual({ type: "note", title: "Note" });
+    expect(parseCalloutHeader("> plain quote")).toBeNull();
+    expect(stripBlockquoteMarkers("> a\n>b\n> > c")).toBe("a\nb\n> c");
+  });
+});
+
+describe("blockWidgetsField", () => {
+  it("replaces a table, a callout and an image embed with widgets when the cursor is elsewhere", () => {
+    const doc = `intro\n\n${TABLE}\n\n> [!note] Hi\n> body\n\nx ![[pic.png]] y\n\nend`;
+    const found = widgets(makeState(doc, 0));
+    expect(found).toHaveLength(3);
+    expect(found.filter((w) => w.block)).toHaveLength(2);
+    // The text itself is untouched (C-04).
+    expect(makeState(doc, 0).doc.toString()).toBe(doc);
+  });
+
+  it("does not widget a non-image embed or an ordinary blockquote", () => {
+    expect(widgets(makeState("![[note]]\n\n> just a quote", 0))).toHaveLength(0);
+  });
+
+  it("yields to raw source on a line the selection touches", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    expect(widgets(makeState(doc, doc.indexOf("| 1")))).toHaveLength(0);
+    expect(widgets(makeState(doc, 0))).toHaveLength(1);
+  });
+
+  it("an unchanged table keeps its widget object when typing elsewhere (no rebuild)", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const before = widgets(s0)[0].widget;
+    const s1 = s0.update({ changes: { from: 0, insert: "x" }, selection: { anchor: 1 } }).state;
+    const after = widgets(s1);
+    expect(after).toHaveLength(1);
+    expect(after[0].widget).toBe(before);
+  });
+
+  it("editing a table's cell rebuilds only that table", () => {
+    const doc = `${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}`;
+    const s0 = makeState(doc, doc.indexOf("mid"));
+    const [first0, second0] = widgets(s0);
+    // Move cursor into table 1 (reveals it), edit, move out.
+    const s1 = s0.update({ selection: { anchor: 2 } }).state;
+    expect(widgets(s1)).toHaveLength(1);
+    const s2 = s1.update({ changes: { from: 2, to: 3, insert: "Z" }, selection: { anchor: doc.indexOf("mid") } }).state;
+    const [first2, second2] = widgets(s2);
+    expect(first2.widget).not.toBe(first0.widget);
+    expect(second2.widget).toBe(second0.widget);
+  });
+
+  it("a 5,000-line note: a keystroke in a paragraph reuses every one of 50 table widgets", () => {
+    const parts: string[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      parts.push(TABLE.replace("1", String(i)));
+      for (let j = 0; j < 90; j += 1) parts.push(`paragraph ${i}.${j}`, "");
+    }
+    const doc = parts.join("\n");
+    const s0 = makeState(doc, 0);
+    const before = widgets(s0);
+    expect(before.length).toBeGreaterThanOrEqual(49);
+    const t0 = performance.now();
+    const s1 = s0.update({
+      changes: { from: doc.length - 1, insert: "x" },
+      selection: { anchor: doc.length },
+    }).state;
+    const elapsed = performance.now() - t0;
+    const after = widgets(s1);
+    expect(after.length).toBe(before.length);
+    // Every pre-existing widget (those not near the edit/selection) is the same object.
+    const reused = after.filter((w, i) => w.widget === before[i].widget).length;
+    expect(reused).toBeGreaterThanOrEqual(before.length - 2);
+    // Loose guard against an accidental whole-document walk (jsdom/CI noise tolerated).
+    expect(elapsed).toBeLessThan(100);
+  });
+});

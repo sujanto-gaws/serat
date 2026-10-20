@@ -89,6 +89,7 @@ const ALLOWED_ATTRS: Record<string, readonly string[]> = {
   TH: ["colspan", "rowspan", "align"],
   OL: ["start"],
   LI: ["value"],
+  DIV: ["title"], // callout request, nonce-gated like the embed one below
   SPAN: ["title"], // carries only the nonce-prefixed embed request, rewritten after sanitising
 };
 
@@ -267,6 +268,15 @@ function applyTrustedMarkers(root: ParentNode, nonce: string): void {
       a.setAttribute("href", `#fn-${payload}`);
       a.setAttribute("data-footnote-ref", payload);
     }
+  }
+  for (const div of Array.from(root.querySelectorAll("div[title]"))) {
+    const title = div.getAttribute("title") ?? "";
+    const callout = `${prefix}callout:`;
+    // Always drop the title: a div never legitimately keeps one.
+    div.removeAttribute("title");
+    if (!title.startsWith(callout)) continue;
+    const type = decodeURIComponent(title.slice(callout.length));
+    if (/^[\w-]+$/.test(type)) div.setAttribute("data-callout", type);
   }
   for (const span of Array.from(root.querySelectorAll("span[title]"))) {
     const title = span.getAttribute("title") ?? "";

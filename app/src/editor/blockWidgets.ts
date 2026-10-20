@@ -27,7 +27,7 @@
 // one table, one callout or one paragraph, never the whole note. A 5,000
 // line note with 50 tables (the NFR-PRF-02 fixture's own shape) therefore
 // costs this field roughly what one block costs, per keystroke, not what 50
-# tables cost.
+// tables cost.
 
 import { syntaxTree } from "@codemirror/language";
 import { EditorState, RangeSetBuilder, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
@@ -394,6 +394,15 @@ function computeDirtyRegions(tr: Transaction): Span[] {
       regions.push(region ?? { from: fromB, to: Math.max(toB, fromB + 1) });
     });
   }
+  // CodeMirror parses a long note in time-sliced chunks after the state is
+  // created; the tree grows via a later (non-doc) transaction. Newly parsed
+  // territory has never been examined, so it is the one region to build.
+  const treeBefore = syntaxTree(tr.startState).length;
+  const treeAfter = syntaxTree(tr.state).length;
+  if (treeAfter > treeBefore) {
+    const start = enclosingTopLevelBlock(tr.state, Math.min(treeBefore, tr.state.doc.length));
+    regions.push({ from: start ? Math.min(start.from, treeBefore) : treeBefore, to: treeAfter });
+  }
   if (!tr.startState.selection.eq(tr.state.selection)) {
     for (const range of tr.startState.selection.ranges) {
       const mapped = tr.changes.mapPos(range.head);
@@ -417,7 +426,11 @@ export const blockWidgetsField = StateField.define<DecorationSet>({
     return buildAll(state);
   },
   update(value, tr) {
-    if (!tr.docChanged && tr.startState.selection.eq(tr.state.selection)) {
+    if (
+      !tr.docChanged &&
+      tr.startState.selection.eq(tr.state.selection) &&
+      syntaxTree(tr.startState) === syntaxTree(tr.state)
+    ) {
       return value;
     }
     let mapped = value.map(tr.changes);
@@ -437,6 +450,26 @@ export const blockWidgetsField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
+/** Minimal widget styling (serat-identity.md tokens, with fallbacks). Injected
+ * by CodeMirror into the editor's shadow root, so it needs no CSP exception. */
+const widgetTheme = EditorView.baseTheme({
+  ".serat-table-widget": { borderCollapse: "collapse", margin: "0.4em 0" },
+  ".serat-table-widget th, .serat-table-widget td": {
+    border: "1px solid var(--serat-border-hairline, #ddd)",
+    padding: "2px 8px",
+    textAlign: "left",
+  },
+  ".serat-table-widget th": { fontWeight: "600" },
+  ".serat-embed-widget": { maxWidth: "100%", verticalAlign: "middle" },
+  ".serat-callout": {
+    borderLeft: "3px solid var(--serat-accent, #4a6fa5)",
+    background: "var(--serat-surface-raised, rgba(0,0,0,0.04))",
+    padding: "4px 10px",
+    margin: "0.4em 0",
+  },
+  ".serat-callout-title": { fontWeight: "600" },
+});
+
 export function blockWidgetsExtension(): Extension {
-  return blockWidgetsField;
+  return [blockWidgetsField, widgetTheme];
 }

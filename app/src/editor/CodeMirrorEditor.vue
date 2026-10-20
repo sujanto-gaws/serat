@@ -36,6 +36,7 @@ import { buildEditorExtensions, createEditorCommandRegistry } from "@/editor/cod
 import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
 import { seratMarkdown } from "@/editor/markdownLanguage";
 import Preview from "@/editor/Preview.vue";
+import { blockWidgetsExtension } from "@/editor/blockWidgets";
 import { revealMarkersPlugin } from "@/editor/reveal";
 import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
 
@@ -70,6 +71,9 @@ let buffer: EditorBuffer | null = null;
 let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 const revealCompartment = new Compartment();
+/** Live-preview-only extensions: the inline reveal rule and block widgets. Split
+ * mode (FR-EDT-10) drops both together. */
+const liveExtensions: Extension[] = [revealMarkersPlugin, blockWidgetsExtension()];
 const dirty = ref(false);
 const previewSource = ref("");
 /** True only while `loadNote`/`setText` replace the whole state — that must
@@ -128,7 +132,7 @@ function buildExtensions(livePreview: boolean): Extension[] {
     EditorState.readOnly.of(!buffer),
     EditorView.editable.of(!!buffer),
     seratMarkdown(),
-    revealCompartment.of(livePreview ? [revealMarkersPlugin] : []),
+    revealCompartment.of(livePreview ? liveExtensions : []),
     ...buildEditorExtensions(registry),
     EditorView.lineWrapping,
     EditorView.contentAttributes.of({ spellcheck: "false", "aria-label": "editor" }),
@@ -177,7 +181,7 @@ onBeforeUnmount(() => {
 watch(
   () => props.livePreview,
   (enabled) => {
-    view?.dispatch({ effects: revealCompartment.reconfigure(enabled ? [revealMarkersPlugin] : []) });
+    view?.dispatch({ effects: revealCompartment.reconfigure(enabled ? liveExtensions : []) });
   },
 );
 
