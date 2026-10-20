@@ -25,9 +25,14 @@
 //! Nothing here sits on the keystroke path, which is this pipeline's actual design
 //! constraint — not throughput (design goal 2).
 
+pub mod diff;
 pub mod echo;
 pub mod hash;
 pub mod ignore;
+pub mod patch;
+#[cfg(test)]
+mod patch_props;
+pub mod position;
 pub mod queue;
 pub mod refusal;
 pub mod walk;
@@ -47,6 +52,8 @@ use serat_core::{
 pub use echo::EchoSuppressor;
 pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
+pub use patch::Edit;
+pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
 
@@ -421,6 +428,181 @@ impl Vault {
 
         Ok(hash)
     }
+
+    /// Apply a patch set against `base_hash` and write the result, atomically
+    /// (ADR-0016 §2, C-04).
+    ///
+    /// This is the editor save path — the one this crate offers as an
+    /// alternative to [`Vault::write_atomic`] when the caller holds an edit
+    /// script rather than a whole new document. Unlike `write_atomic`, it never
+    /// creates a file: a save is always against a base that was read, so a
+    /// missing target is [`VaultError::NotFound`], and `write_file`'s
+    /// `base_hash: None` creation case stays `write_atomic`'s alone (ADR-0016
+    /// §2, closing paragraph).
+    ///
+    /// The steps are ADR-0016 §2's, in order:
+    ///
+    /// 1. Re-read the file and refuse with [`VaultError::StaleHash`] if its hash
+    ///    is not `base_hash` — the optimistic lock.
+    /// 2. Map each edit's positions onto byte offsets and check the ranges are
+    ///    ordered and disjoint ([`patch::apply_edits`]).
+    /// 3. Convert every `\n` in an insert to the note's own line ending.
+    /// 4. Splice and write the temporary file, then **re-hash the target
+    ///    immediately before the rename** and refuse with `StaleHash` — removing
+    ///    the temporary file — if it moved. The remaining window (one hash plus
+    ///    one `rename`) is stated as a bound, not hidden: an external write
+    ///    landing inside it is overwritten, silently, exactly as ADR-0016 §2
+    ///    records.
+    /// 5. Rename and return the new hash.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotAMarkdownTarget`] for a non-Markdown target (T-06,
+    /// mirroring `write_atomic`). [`VaultError::NotFound`] if the file does not
+    /// exist. [`VaultError::PathEscapesVault`] if it resolves through a symlink
+    /// (T-07). [`VaultError::StaleHash`] per steps 1 and 4 above.
+    /// [`VaultError::MalformedPatch`] if the edits do not apply to the base
+    /// cleanly. [`VaultError::AtomicWriteFailed`] if the write itself fails, in
+    /// which case the original file is untouched.
+    pub fn write_patch(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+    ) -> Result<ContentHash, VaultError> {
+        self.write_patch_hooked(path, base_hash, edits, || {})
+    }
+
+    /// [`Vault::write_patch`] with a hook that runs after the temporary file is
+    /// complete and before the re-hash: the window the hostile tests (an external
+    /// write, a crash) need to reach deterministically.
+    fn write_patch_hooked(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        before_rehash: impl FnOnce(),
+    ) -> Result<ContentHash, VaultError> {
+        if !path.is_markdown() {
+            return Err(VaultError::NotAMarkdownTarget {
+                path: path.as_str().to_owned(),
+            });
+        }
+
+        let target = self.resolve(path)?;
+        let stale = |found: ContentHash| VaultError::StaleHash {
+            path: path.as_str().to_owned(),
+            expected: base_hash.to_hex(),
+            found: found.to_hex(),
+        };
+
+        // Step 1: the hash lock. A delete or a rewrite between the caller's read
+        // and this call surfaces here rather than silently patching the wrong
+        // bytes.
+        let current_bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let current_hash = hash_bytes(&current_bytes);
+        if current_hash != base_hash {
+            return Err(stale(current_hash));
+        }
+        let base_text =
+            std::str::from_utf8(&current_bytes).map_err(|_| VaultError::MalformedPatch {
+                path: path.as_str().to_owned(),
+                reason: "base is not valid utf-8; a non-utf-8 file is never opened for editing"
+                    .to_owned(),
+            })?;
+
+        // Steps 2 and 3: map, validate and splice. Nothing outside a patched
+        // range is touched — see `patch::apply_edits`'s own guarantee.
+        let new_text = patch::apply_edits(base_text, edits, path.as_str())?;
+        let new_bytes = new_text.into_bytes();
+        let new_hash = hash_bytes(&new_bytes);
+
+        let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
+            path: path.as_str().to_owned(),
+            reason: "has no parent directory".to_owned(),
+        })?;
+        let failed = |message: String| VaultError::AtomicWriteFailed {
+            path: path.as_str().to_owned(),
+            message,
+        };
+
+        // F-33's rule applies here too: the replacement inherits the original's
+        // permissions.
+        let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
+
+        let temp = unique_temp_path(parent, path.file_name());
+        let write_temp = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&temp)?;
+            file.write_all(&new_bytes)?;
+            file.sync_all()?;
+            if let Some(permissions) = existing_permissions.clone() {
+                fs::set_permissions(&temp, permissions)?;
+            }
+            Ok(())
+        };
+        if let Err(err) = write_temp() {
+            let _ = fs::remove_file(&temp);
+            return Err(failed(err.to_string()));
+        }
+
+        before_rehash();
+
+        // Step 4's re-hash, immediately before the rename (ADR-0016 §2). This is
+        // what "immediately before" means in code: nothing between this read and
+        // the `fs::rename` call below touches the disk.
+        let reread = match fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                return Err(VaultError::io(path.as_str(), &err));
+            }
+        };
+        let reread_hash = hash_bytes(&reread);
+        if reread_hash != base_hash {
+            let _ = fs::remove_file(&temp);
+            return Err(stale(reread_hash));
+        }
+
+        if let Err(err) = fs::rename(&temp, &target) {
+            let _ = fs::remove_file(&temp);
+            return Err(failed(err.to_string()));
+        }
+
+        Ok(new_hash)
+    }
+
+    /// The edit script from `base` to the file as it is on disk now, in `base`'s
+    /// coordinates (ADR-0016 §3; FR-VLT-05). The answer to a stale-base refusal and
+    /// to `request_external_diff`: the caller holds the base text, the vault holds
+    /// the disk.
+    ///
+    /// Returns the disk hash with the script, or `None` when the disk bytes hash to
+    /// `base_hash` (nothing to report). A disk change that is only a line-ending
+    /// flip returns `Some` with an empty script and the new hash.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] / [`VaultError::Io`] as for any read;
+    /// [`VaultError::MalformedPatch`] if the disk bytes are not UTF-8 (such a note
+    /// is never open for editing).
+    pub fn diff_against_disk(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        base: &str,
+    ) -> Result<Option<(ContentHash, diff::EditScript)>, VaultError> {
+        let target = self.resolve(path)?;
+        let bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let hash = hash_bytes(&bytes);
+        if hash == base_hash {
+            return Ok(None);
+        }
+        let other = std::str::from_utf8(&bytes).map_err(|_| VaultError::MalformedPatch {
+            path: path.as_str().to_owned(),
+            reason: "the file on disk is not valid utf-8".to_owned(),
+        })?;
+        Ok(Some((hash, diff::edit_script(base, other))))
+    }
 }
 
 impl EchoGuard for Vault {
@@ -535,6 +717,163 @@ mod tests {
     }
 
     #[test]
+    fn write_patch_touches_only_the_patched_range() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault
+            .write_atomic(&path, b"status:: draft\ntitle:: Serat\n")
+            .expect("seed");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 9),
+            position::Position::new(0, 14),
+            "active".to_owned(),
+        )];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"status:: active\ntitle:: Serat\n"
+        );
+    }
+
+    #[test]
+    fn write_patch_preserves_crlf_and_a_bom_it_did_not_touch() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault
+            .write_atomic(&path, "\u{FEFF}first\r\nsecond\r\n".as_bytes())
+            .expect("seed");
+
+        // Edit only the second line; the BOM, the first line and every CRLF must
+        // survive unchanged.
+        let edits = [patch::Edit::new(
+            position::Position::new(1, 0),
+            position::Position::new(1, 6),
+            "SECOND".to_owned(),
+        )];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            "\u{FEFF}first\r\nSECOND\r\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn write_patch_refuses_a_stale_base() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"original").expect("seed");
+        // Someone else writes before our patch lands.
+        vault
+            .write_atomic(&path, b"changed by someone else")
+            .expect("write");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 0),
+            position::Position::new(0, 8),
+            "patched".to_owned(),
+        )];
+        let result = vault.write_patch(&path, base_hash, &edits);
+        assert!(
+            matches!(result, Err(VaultError::StaleHash { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"changed by someone else",
+            "a refused patch must leave the file exactly as the other writer left it"
+        );
+    }
+
+    #[test]
+    fn write_patch_leaves_no_temporary_file_behind_on_a_stale_base() {
+        let (dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"original").expect("seed");
+        vault.write_atomic(&path, b"changed").expect("write");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 0),
+            position::Position::new(0, 8),
+            "patched".to_owned(),
+        )];
+        assert!(vault.write_patch(&path, base_hash, &edits).is_err());
+
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(ignore::TEMP_PREFIX))
+            .collect();
+        assert!(strays.is_empty(), "left behind {strays:?}");
+    }
+
+    #[test]
+    fn write_patch_refuses_a_malformed_patch_without_touching_the_file() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"short").expect("seed");
+
+        // A position past the end of the only line.
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 99),
+            position::Position::new(0, 99),
+            "x".to_owned(),
+        )];
+        let result = vault.write_patch(&path, base_hash, &edits);
+        assert!(
+            matches!(result, Err(VaultError::MalformedPatch { .. })),
+            "{result:?}"
+        );
+        assert_eq!(vault.read(&path).expect("read").bytes, b"short");
+    }
+
+    #[test]
+    fn write_patch_refuses_a_non_markdown_target() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("40-refs/contract.pdf").expect("path");
+        // No file exists, but the markdown check runs before any read.
+        let bogus_hash = hash_bytes(b"anything");
+        let result = vault.write_patch(&path, bogus_hash, &[]);
+        assert!(matches!(result, Err(VaultError::NotAMarkdownTarget { .. })));
+    }
+
+    #[test]
+    fn write_patch_on_a_file_the_property_test_style_random_patch_leaves_everything_else_alone() {
+        // NFR-MNT-03's property, exercised directly rather than only through
+        // `patch::apply_edits`'s unit tests: many small, non-overlapping edits
+        // against a realistic multi-line, mixed-content base, applied through
+        // the full `write_patch` path (hash lock, atomic write, re-hash before
+        // rename), and every byte outside a patched range must survive.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base = "status:: draft\ntitle:: Serat\nbody line one\nbody line two\n";
+        let base_hash = vault.write_atomic(&path, base.as_bytes()).expect("seed");
+
+        // Two disjoint, ascending edits: one on line 0, one on line 2.
+        let edits = [
+            patch::Edit::new(
+                position::Position::new(0, 9),
+                position::Position::new(0, 14),
+                "active".to_owned(),
+            ),
+            patch::Edit::new(
+                position::Position::new(2, 0),
+                position::Position::new(2, 0),
+                "ONE ".to_owned(),
+            ),
+        ];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"status:: active\ntitle:: Serat\nONE body line one\nbody line two\n"
+        );
+    }
+
+    #[test]
     fn writing_leaves_no_temporary_files_behind() {
         let (dir, vault) = vault();
         let path = VaultPath::new("note.md").expect("path");
@@ -640,6 +979,73 @@ mod tests {
             torn.load(Ordering::Relaxed),
             0,
             "a reader saw a file that was neither the old contents nor the new"
+        );
+    }
+
+    #[test]
+    fn write_patch_never_leaves_a_reader_with_a_torn_file() {
+        // FR-VLT-03's old-or-new property, for `write_patch` rather than
+        // `write_atomic`: a reader spinning on the file while a patch lands must
+        // see exactly the pre-patch bytes or exactly the post-patch bytes, never
+        // a mixture — `write_patch` shares `write_atomic`'s temp-and-rename tail,
+        // but it is its own code path (a hash lock and a re-hash sit in front of
+        // it), so the property is asserted against it directly rather than
+        // inferred from the other test.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("big.md").expect("path");
+        let old_line = "o".repeat(4 * 1024 * 1024);
+        let old_bytes = old_line.clone().into_bytes();
+        let mut hash = vault.write_atomic(&path, &old_bytes).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let absolute = vault.resolve(&path).expect("resolve");
+            let stop = Arc::clone(&stop);
+            let torn = Arc::clone(&torn);
+            let reads = Arc::clone(&reads);
+            let old_bytes = old_bytes.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(seen) = fs::read(&absolute) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        let all_o = seen.iter().all(|&b| b == b'o');
+                        let all_n = seen.iter().all(|&b| b == b'n');
+                        if seen.len() != old_bytes.len() || !(all_o || all_n) {
+                            torn.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+
+        // Each round replaces the whole line via one patch, alternating the
+        // character so a torn read is distinguishable from either valid state.
+        for round in 0..20 {
+            let replacement = if round % 2 == 0 { 'n' } else { 'o' };
+            let edits = [patch::Edit::new(
+                position::Position::new(0, 0),
+                position::Position::new(0, 4 * 1024 * 1024),
+                replacement.to_string().repeat(4 * 1024 * 1024),
+            )];
+            hash = vault.write_patch(&path, hash, &edits).expect("patch");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader");
+
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the reader never managed a read, so this proved nothing"
+        );
+        assert_eq!(
+            torn.load(Ordering::Relaxed),
+            0,
+            "a reader saw a file that was neither the pre-patch nor the post-patch contents"
         );
     }
 
