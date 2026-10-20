@@ -46,6 +46,7 @@ mod acl_manifest;
 pub mod cli;
 pub mod commands;
 pub mod error;
+pub mod folder;
 pub mod index;
 mod nav_guard;
 mod security_config;
@@ -263,6 +264,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::mark_first_paint,
             commands::mark_vault_usable,
             commands::refused_names,
+            commands::create_folder,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();

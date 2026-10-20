@@ -11,6 +11,7 @@
     "allow-mark-first-paint",
     "allow-mark-vault-usable",
     "allow-refused-names",
+    "allow-create-folder",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

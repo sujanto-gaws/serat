@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::ipc::{
-    FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, RefusedName,
-    VaultOpened, WriteFileArgs,
+    CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexStatus, IpcError,
+    OpenVaultArgs, ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -67,6 +67,19 @@ pub fn write_file(
 #[must_use]
 pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
+}
+
+/// `create_folder(args) -> Result<FolderCreated, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::create_folder`].
+#[tauri::command(async)]
+pub fn create_folder(
+    state: State<'_, Arc<AppState>>,
+    args: CreateFolderArgs,
+) -> Result<FolderCreated, IpcError> {
+    state.create_folder(args)
 }
 
 /// `refused_names() -> Vec<RefusedName>`

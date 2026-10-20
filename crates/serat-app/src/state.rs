@@ -33,8 +33,8 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    FileContents, FileWritten, IndexState, IndexStatus, IpcError, OpenVaultArgs, REFUSED_NAMES_CAP,
-    ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
+    CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexState, IndexStatus, IpcError,
+    OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
 };
 use crate::settings::Settings;
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -473,6 +473,16 @@ impl AppState {
                 refused_names: None,
             },
         }
+    }
+
+    /// `create_folder`. FR-VLT-11, NFR-SEC-06. See [`crate::folder`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::folder::create_folder`], plus [`IpcError::VaultNotFound`] with no
+    /// vault open.
+    pub fn create_folder(&self, args: CreateFolderArgs) -> Result<FolderCreated, IpcError> {
+        crate::folder::create_folder(&*self.vault()?, &args.path)
     }
 
     /// `refused_names`. FR-VLT-01, design goal 5.
