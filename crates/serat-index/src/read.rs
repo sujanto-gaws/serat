@@ -25,8 +25,14 @@ use serat_core::IndexError;
 
 use crate::schema::sqlite;
 
-/// The most hits one search returns (`SearchArgs::limit`'s ceiling).
+/// The most hits a search with free text returns (R1, R1 + R3): `SearchArgs::limit`'s
+/// ceiling for the statements that rank.
 pub const MAX_LIMIT: u16 = 50;
+
+/// The most hits a property-only `[key:value]` search returns (R3). R3 has no ranking
+/// to pay for, so the whole 500 comes back in one statement rather than ten pages
+/// (architecture.md §4.5, ruled on task #15's measurement).
+pub const MAX_PROPERTY_LIMIT: u16 = 500;
 
 /// How many characters of a block a backlink excerpt keeps.
 pub const EXCERPT_CHARS: usize = 300;
@@ -339,7 +345,6 @@ impl Reader {
         offset: u32,
         limit: u16,
     ) -> Result<SearchOutcome, IndexError> {
-        let limit = i64::from(limit.min(MAX_LIMIT));
         let (fts, property) = match parse_query(query) {
             ParsedQuery::UnbalancedQuote => return Ok(SearchOutcome::UnbalancedQuote),
             ParsedQuery::TooManyPropertyTerms => return Ok(SearchOutcome::TooManyPropertyTerms),
@@ -352,6 +357,15 @@ impl Reader {
             ParsedQuery::Terms { fts, property } => (fts, property),
         };
         let offset = i64::from(offset);
+        // Clamped, never rejected (`SearchArgs::limit`). The ceiling is the statement's:
+        // a property-only query is R3 and may ask for 500, anything with free text is
+        // ranked and stops at 50. Always bound as `:limit`; the SQL text never varies (C-03).
+        let ceiling = if fts.is_none() {
+            MAX_PROPERTY_LIMIT
+        } else {
+            MAX_LIMIT
+        };
+        let limit = i64::from(limit.min(ceiling));
 
         let result = match (&fts, &property) {
             (Some(fts), None) => self.run_r1(R1, fts, None, limit, offset),

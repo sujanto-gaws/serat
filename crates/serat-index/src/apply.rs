@@ -112,7 +112,7 @@ fn upsert_note(
     parsed: &ParsedNote,
     bulk_load: bool,
 ) -> Result<(), IndexError> {
-    remove(tx, &meta.path)?;
+    let existed = remove(tx, &meta.path)?;
 
     let word_count: i64 = parsed
         .blocks
@@ -177,7 +177,15 @@ fn upsert_note(
     // done, at a fraction of the cost.
     if !bulk_load {
         resolve_inbound(tx, &meta.path)?;
-        resolve_rivals(tx, &meta.path)?;
+        // A2 only when the path is new (NFR-PRF-03). A content save of an existing
+        // path cannot hand it any link it did not already win: INBOUND above has just
+        // re-pointed every inbound link through the same best-note rule, and the
+        // links that point at a rival were already resolved with this note present.
+        // Re-running RIVALS here rewrote every inbound link a second time (679 rows
+        // for the highest in-degree note of the 20k vault).
+        if !existed {
+            resolve_rivals(tx, &meta.path, note_id)?;
+        }
         // The note's own outbound links, inserted unresolved just above: point them at
         // whatever they name that already exists. Symmetric with resolve_inbound, and
         // both are needed -- one fixes what this save broke, the other finishes what it
@@ -239,11 +247,16 @@ fn resolve_inbound(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexEr
 /// Architecture §4.5 **A2**: a note appeared at `path`, so links that already resolve
 /// to *another* note under the same spelling may now prefer this one as the shorter
 /// path. Re-runs the resolver over exactly those links.
-fn resolve_rivals(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexError> {
+///
+/// `new_id` is the note that appeared: links already pointing at it are left alone,
+/// since rewriting them to the same value is pure cost.
+fn resolve_rivals(tx: &Transaction<'_>, path: &VaultPath, new_id: i64) -> Result<(), IndexError> {
     let s = spellings(path);
     tx.prepare_cached(resolve::RESOLVE_RIVALS)
         .map_err(sqlite)?
-        .execute(params![s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        .execute(params![
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], new_id
+        ])
         .map_err(sqlite)?;
     Ok(())
 }
@@ -269,7 +282,7 @@ fn resolve_outbound(tx: &Transaction<'_>, note_id: i64) -> Result<(), IndexError
 /// path and a hash, so it is linkable and queryable even though nothing can search
 /// inside it.
 fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Result<(), IndexError> {
-    remove(tx, &meta.path)?;
+    let existed = remove(tx, &meta.path)?;
     // Assets carry a file_name too: `![[report.pdf]]` names one, and §7.3
     // says an asset stays typed, linkable and queryable. Omitting it here
     // silently drops every embed (F-313).
@@ -288,6 +301,7 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
         fold_case(meta.path.file_name()),
     ])
     .map_err(sqlite)?;
+    let asset_id = tx.last_insert_rowid();
 
     // task #13. The remove() above nulled every inbound link the cascade could see,
     // same as upsert_note -- and F-313 is exactly why an asset needs this call too:
@@ -298,7 +312,9 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     // Skipped during a bulk load (F-371) -- see upsert_note's doc comment.
     if !bulk_load {
         resolve_inbound(tx, &meta.path)?;
-        resolve_rivals(tx, &meta.path)?;
+        if !existed {
+            resolve_rivals(tx, &meta.path, asset_id)?;
+        }
     }
 
     Ok(())
@@ -366,7 +382,7 @@ fn rename(
         .map_err(sqlite)?;
     resolve_inbound(tx, from)?;
     resolve_inbound(tx, to)?;
-    resolve_rivals(tx, to)?;
+    resolve_rivals(tx, to, id)?;
     Ok(())
 }
 
