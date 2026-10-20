@@ -30,6 +30,7 @@ pub mod hash;
 pub mod ignore;
 pub mod queue;
 pub mod refusal;
+pub mod tree;
 pub mod walk;
 #[cfg(all(test, unix))]
 mod walk_refusal_tests;
@@ -49,6 +50,7 @@ pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
+pub use tree::{TreeOut, TreeSession, TreeSource, WalkSummary};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 

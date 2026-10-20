@@ -31,6 +31,7 @@ pub mod path;
 pub mod span;
 pub mod task;
 pub mod traits;
+pub mod tree;
 
 pub use block::{Block, BlockKind};
 pub use error::{IndexError, ParseError, SeratError, VaultError};
@@ -44,3 +45,4 @@ pub use path::{Platform, VaultPath};
 pub use span::ByteRange;
 pub use task::Task;
 pub use traits::{EchoGuard, IndexWriter, NoteParser, NoteSource};
+pub use tree::{RawEntry, Snapshot, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings};

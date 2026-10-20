@@ -114,7 +114,7 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
 /// Only sound for paths the walk constructed by joining onto `vault.root()`, which is
 /// already canonical, and only after symlinks have been excluded. Anything arriving
 /// from outside the process goes through [`Vault::relativise`], which canonicalises.
-fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath, VaultError> {
+pub(crate) fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath, VaultError> {
     let relative = path
         .strip_prefix(vault.root())
         .map_err(|_| VaultError::PathEscapesVault {

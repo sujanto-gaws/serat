@@ -48,4 +48,18 @@ fn main() {
         assert_eq!(found.len(), count);
     }
     summarise("Vault::walk", walk, count);
+
+    // The tree walk: breadth-first, one listing per directory, names and kinds only.
+    let mut tree = Vec::new();
+    for _ in 0..runs {
+        let started = Instant::now();
+        let mut listed = 0usize;
+        let summary = vault
+            .walk_tree("", |_, entries| listed += entries.len())
+            .expect("tree walk");
+        tree.push(started.elapsed());
+        assert_eq!(summary.files as usize, count);
+        assert!(listed >= count);
+    }
+    summarise("Vault::walk_tree", tree, count);
 }
