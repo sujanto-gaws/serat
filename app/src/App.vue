@@ -94,6 +94,12 @@ function refusalMessage(error: unknown): string {
   return `the save was refused; nothing was written: ${JSON.stringify(error)}`;
 }
 
+/** Mod-Enter on a link. Opening notes needs the file tree and tabs (tasks #1-#4);
+ * until then the host only reports what the link resolved to. */
+function onFollowLink(link: { target: string; path: string | null }): void {
+  store.setMark(link.path ? `link: ${link.path}` : `no note named \u201C${link.target}\u201D`);
+}
+
 function onSaveOutcome(outcome: SaveOutcome): void {
   switch (outcome.kind) {
     case "saved":
@@ -131,6 +137,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       ref="editorRef"
       placeholder="No note open — the file tree (task #1-#4) arrives separately."
       @save-outcome="onSaveOutcome"
+      @follow-link="onFollowLink"
     />
   </main>
 

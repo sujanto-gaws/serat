@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
 import type { EditorIpcAdapter } from "@/ipc/editorAdapter";
 import type { FileWritten } from "@/ipc/generated/FileWritten";
+import type { LinkIpcAdapter } from "@/ipc/linkAdapter";
 
 // jsdom has no layout; CodeMirror's measure pass calls these on text ranges.
 if (!Range.prototype.getClientRects) {
@@ -27,8 +28,8 @@ function mockIpc(savePatch = vi.fn()): EditorIpcAdapter {
   };
 }
 
-function mountEditor(ipc: EditorIpcAdapter) {
-  const wrapper = mount(CodeMirrorEditor, { props: { ipc }, attachTo: document.body });
+function mountEditor(ipc: EditorIpcAdapter, linkIpc?: LinkIpcAdapter) {
+  const wrapper = mount(CodeMirrorEditor, { props: linkIpc ? { ipc, linkIpc } : { ipc }, attachTo: document.body });
   const host = wrapper.find(".cm-editor-host").element as HTMLElement;
   const content = host.shadowRoot!.querySelector(".cm-content") as HTMLElement;
   const view = EditorView.findFromDOM(content)!;
@@ -215,6 +216,70 @@ describe("CodeMirrorEditor startup window", () => {
     await api.loadNote("real", "a.md", "h0");
     api.setText("clobber");
     expect(api.getText()).toBe("real");
+    wrapper.unmount();
+  });
+});
+
+describe("CodeMirrorEditor links", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function linkIpcFor(path: string | null) {
+    let onChanged: (() => void) | null = null;
+    const ipc = {
+      resolveLinks: vi.fn(async ({ targets }: { targets: string[] }) =>
+        targets.map((target) => ({ target, path, subpath_found: path ? true : null, via: "index" as const })),
+      ),
+      noteAnchors: vi.fn(),
+      switcherQuery: vi.fn(),
+      onIndexChanged: vi.fn(async (handler: () => void) => {
+        onChanged = handler;
+        return () => undefined;
+      }),
+    } as unknown as LinkIpcAdapter & { resolveLinks: ReturnType<typeof vi.fn> };
+    return { ipc, fire: () => onChanged?.() };
+  }
+
+  it("Mod-Enter on a wikilink emits follow-link with the resolved path; the host navigates", async () => {
+    const { ipc } = linkIpcFor("notes/Alpha.md");
+    const { wrapper, view, api } = mountEditor(mockIpc(), ipc);
+    await api.loadNote("see [[Alpha#Intro|x]] here", "src.md", "h0");
+    view.dispatch({ selection: { anchor: 8 } });
+    const binding = view.state.facet(keymap)[0].find((b) => b.key === "Mod-Enter")!;
+    expect(binding.run!(view)).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wrapper.emitted("follow-link")).toEqual([
+      [{ target: "Alpha#Intro", subpath: "Intro", path: "notes/Alpha.md", subpathFound: true, isEmbed: false }],
+    ]);
+    expect(api.getText()).toBe("see [[Alpha#Intro|x]] here"); // never edits
+    wrapper.unmount();
+  });
+
+  it("an unresolved link is reported with path null (the host offers to create it)", async () => {
+    const { ipc } = linkIpcFor(null);
+    const { wrapper, view, api } = mountEditor(mockIpc(), ipc);
+    await api.loadNote("[[Nope]]", "src.md", "h0");
+    view.dispatch({ selection: { anchor: 3 } });
+    view.state.facet(keymap)[0].find((b) => b.key === "Mod-Enter")!.run!(view);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wrapper.emitted("follow-link")?.[0][0]).toMatchObject({ target: "Nope", path: null });
+    wrapper.unmount();
+  });
+
+  it("index://changed invalidates cached resolutions and re-resolves the viewport", async () => {
+    const { ipc, fire } = linkIpcFor("notes/Alpha.md");
+    const { wrapper, api } = mountEditor(mockIpc(), ipc);
+    await api.loadNote("[[Alpha]]", "src.md", "h0");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(ipc.resolveLinks).toHaveBeenCalledTimes(1);
+
+    fire();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(ipc.resolveLinks).toHaveBeenCalledTimes(2);
     wrapper.unmount();
   });
 });

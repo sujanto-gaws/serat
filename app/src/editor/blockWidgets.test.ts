@@ -174,6 +174,25 @@ describe("blockWidgetsField", () => {
     expect(dom.querySelector("img")).toBeNull();
   });
 
+  it("a resolved image embed builds its serat-asset URL from the RESOLVED path, not the written name", () => {
+    const doc = "x\n\n![[pic.png|200]]\n\nend";
+    const state = makeState(doc, 0, [resolution("pic.png", "deep/folder/pic.png")]);
+    const [found] = widgets(state);
+    const img = (found.widget as { toDOM(): HTMLElement }).toDOM() as HTMLImageElement;
+    expect(img.tagName).toBe("IMG");
+    expect(img.getAttribute("src")).toBe(assetUrl("deep/folder/pic.png"));
+    expect(img.getAttribute("src")).not.toContain("localhost/pic.png");
+    expect(img.width).toBe(200);
+    // A load failure degrades to the labelled placeholder, not a broken image.
+    img.dispatchEvent(new Event("error"));
+  });
+
+  it("an embed that resolves to nothing stays a placeholder", () => {
+    const state = makeState("x\n\n![[ghost.png]]\n\nend", 0, [resolution("ghost.png", null)]);
+    const dom = (widgets(state)[0].widget as { toDOM(): HTMLElement }).toDOM();
+    expect(dom.tagName).toBe("SPAN");
+  });
+
   it("a callout body is built from text nodes: markup in it stays text", () => {
     const state = makeState("x\n\n> [!note] T\n> <img src=x onerror=alert(1)>\n\nend", 0);
     const [found] = widgets(state);
