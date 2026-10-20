@@ -23,6 +23,7 @@
  * 4. it runs, while a `progress_handler` on that connection interrupts the
  *    statement as soon as the generation is no longer its own, so an interrupt
  *    that arrived before the statement started is not lost.
+ *
  * The handler is a callback, not an SQL function, so C-03 holds. Every older
  * call returns `SearchOutcome::Superseded` rather than an error. serat-app
  * waits for the lock inside `spawn_blocking`, off the async executor. So a superseded 230-560 ms

@@ -10,6 +10,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { Backlink } from "./generated/Backlink";
+import type { CreateFolderArgs } from "./generated/CreateFolderArgs";
+import type { FolderCreated } from "./generated/FolderCreated";
+import type { GitignoreAppended } from "./generated/GitignoreAppended";
+import type { GitignoreOffer } from "./generated/GitignoreOffer";
+import type { IndexRead } from "./generated/IndexRead";
+import type { NotePathArgs } from "./generated/NotePathArgs";
+import type { RefusedName } from "./generated/RefusedName";
+import type { SearchArgs } from "./generated/SearchArgs";
+import type { SearchOutcome } from "./generated/SearchOutcome";
+import type { SetKeybindingArgs } from "./generated/SetKeybindingArgs";
+import type { SetLivePreviewArgs } from "./generated/SetLivePreviewArgs";
+import type { UiSettings } from "./generated/UiSettings";
 import type { FileContents } from "./generated/FileContents";
 import type { FileWritten } from "./generated/FileWritten";
 import type { IndexStatus } from "./generated/IndexStatus";
@@ -49,6 +62,59 @@ export function writeFile(args: WriteFileArgs): Promise<FileWritten> {
 
 export function indexStatus(): Promise<IndexStatus> {
   return invoke("index_status");
+}
+
+// ---- P1 (task #18). Each wrapper is the command's name and its generated types and
+// nothing else; the rules are in contracts/ipc.rs and crates/serat-app.
+
+/** `refused_names`: the list behind `IndexStatus.refused_names` (FR-VLT-01). */
+export function refusedNames(): Promise<RefusedName[]> {
+  return invoke("refused_names");
+}
+
+/** `create_folder`: one directory, inside the vault (FR-VLT-11). */
+export function createFolder(args: CreateFolderArgs): Promise<FolderCreated> {
+  return invoke("create_folder", { args });
+}
+
+/** `search`: free text, phrases and at most one `[key:value]` (FR-NAV-02, FR-STR-03). */
+export function search(args: SearchArgs): Promise<IndexRead<SearchOutcome>> {
+  return invoke("search", { args });
+}
+
+/** `backlinks`: one entry per distinct (source note, source block) (FR-NAV-04). */
+export function backlinks(args: NotePathArgs): Promise<IndexRead<Backlink[]>> {
+  return invoke("backlinks", { args });
+}
+
+/** `get_ui_settings`: the front end's slice of the settings TOML (FR-PLT-05). */
+export function getUiSettings(): Promise<UiSettings> {
+  return invoke("get_ui_settings");
+}
+
+/** `set_live_preview`: `false` selects split preview (FR-EDT-10). */
+export function setLivePreview(args: SetLivePreviewArgs): Promise<void> {
+  return invoke("set_live_preview", { args });
+}
+
+/** `set_keybinding`: set, unbind or reset one command's binding (FR-PLT-05). */
+export function setKeybinding(args: SetKeybindingArgs): Promise<void> {
+  return invoke("set_keybinding", { args });
+}
+
+/** `gitignore_offer_status`: whether to show the `.serat/` ignore offer (NFR-CMP-04). */
+export function gitignoreOfferStatus(): Promise<GitignoreOffer> {
+  return invoke("gitignore_offer_status");
+}
+
+/** `append_gitignore_entry`: only from the offer's explicit confirmation. Takes no path. */
+export function appendGitignoreEntry(): Promise<GitignoreAppended> {
+  return invoke("append_gitignore_entry");
+}
+
+/** `decline_gitignore_offer`: "Don't ask again", kept in `.serat/prefs.json`. */
+export function declineGitignoreOffer(): Promise<void> {
+  return invoke("decline_gitignore_offer");
 }
 
 /**
