@@ -79,43 +79,84 @@ fn line_ending(bytes: &[u8]) -> &'static str {
 ///
 /// [`IpcError::Io`] if the file is a symlink, cannot be read, or cannot be written.
 pub fn append(root: &Path) -> Result<GitignoreAppended, IpcError> {
+    append_with(root, |_attempt| {})
+}
+
+/// [`append`] with a hook that runs after the temp file is written and before the
+/// lost-update check, which is the window a test mutates the file in.
+fn append_with(
+    root: &Path,
+    mut before_rename: impl FnMut(u32),
+) -> Result<GitignoreAppended, IpcError> {
     let path = root.join(IGNORE_FILE);
     let io = |message: String| IpcError::Io {
         path: IGNORE_FILE.to_owned(),
         message,
     };
 
-    let existing = match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(io(
-                ".gitignore is a symbolic link, so it was not modified".to_owned()
-            ));
+    // The lost-update guard (design goal 1): the file is read, a new version is built,
+    // and the file is read **again immediately before the rename**. If another program
+    // edited it in between, the work is discarded and redone once; a second collision is
+    // reported rather than overwriting someone's edit. This narrows the window to the
+    // gap between that last read and the rename. It cannot close it: a rename is not a
+    // compare-and-swap. That residue is stated, not hidden.
+    for attempt in 0..2 {
+        let existing = read_current(&path)?;
+
+        if existing.as_deref().is_some_and(has_entry) {
+            return Ok(GitignoreAppended {
+                created: false,
+                already_present: true,
+            });
         }
-        Ok(_) => Some(std::fs::read(&path).map_err(|e| io(e.to_string()))?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io(e.to_string())),
-    };
 
-    if existing.as_deref().is_some_and(has_entry) {
-        return Ok(GitignoreAppended {
-            created: false,
-            already_present: true,
-        });
-    }
-
-    let mut bytes = existing.clone().unwrap_or_default();
-    let ending = line_ending(&bytes);
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let mut bytes = existing.clone().unwrap_or_default();
+        let ending = line_ending(&bytes);
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.extend_from_slice(ending.as_bytes());
+        }
+        bytes.extend_from_slice(ENTRY.as_bytes());
         bytes.extend_from_slice(ending.as_bytes());
-    }
-    bytes.extend_from_slice(ENTRY.as_bytes());
-    bytes.extend_from_slice(ending.as_bytes());
 
-    write_atomic(&path, &bytes, existing.is_some()).map_err(|e| io(e.to_string()))?;
-    Ok(GitignoreAppended {
-        created: existing.is_none(),
-        already_present: false,
-    })
+        let temp = write_temp(&path, &bytes, existing.is_some()).map_err(|e| io(e.to_string()))?;
+        before_rename(attempt);
+
+        let unchanged = matches!(read_current(&path), Ok(ref now) if *now == existing);
+        if unchanged {
+            return match std::fs::rename(&temp, &path) {
+                Ok(()) => Ok(GitignoreAppended {
+                    created: existing.is_none(),
+                    already_present: false,
+                }),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&temp);
+                    Err(io(e.to_string()))
+                }
+            };
+        }
+        let _ = std::fs::remove_file(&temp);
+    }
+    Err(io(
+        ".gitignore was changed by another program while it was being updated, so it was \
+         not modified; try again"
+            .to_owned(),
+    ))
+}
+
+/// The ignore file's bytes, `None` if absent. A symlink is refused, never followed.
+fn read_current(path: &Path) -> Result<Option<Vec<u8>>, IpcError> {
+    let io = |message: String| IpcError::Io {
+        path: IGNORE_FILE.to_owned(),
+        message,
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io(
+            ".gitignore is a symbolic link, so it was not modified".to_owned(),
+        )),
+        Ok(_) => std::fs::read(path).map(Some).map_err(|e| io(e.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(e.to_string())),
+    }
 }
 
 /// Record "Don't ask again" in `.serat/prefs.json`.
@@ -166,36 +207,80 @@ fn declined(root: &Path) -> bool {
 
 /// Temp file in the same directory, fsync, rename; permissions copied when replacing.
 fn write_atomic(path: &Path, bytes: &[u8], replacing: bool) -> std::io::Result<()> {
+    let temp = write_temp(path, bytes, replacing)?;
+    let renamed = std::fs::rename(&temp, path);
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    renamed
+}
+
+/// Write `bytes` to a new temp file beside `path` and return its name.
+///
+/// The name carries a nonce and the file is made with `create_new` (`O_EXCL`), which
+/// does not follow a symlink: a link planted at a guessed name in a synced vault makes
+/// this fail, instead of being truncated and then written through.
+fn write_temp(path: &Path, bytes: &[u8], replacing: bool) -> std::io::Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let temp: PathBuf = dir.join(format!(".serat-tmp-{name}.{}", std::process::id()));
-    let result = (|| {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = dir.join(format!(
+        ".serat-tmp-{name}.{}.{nanos:x}.{nonce}",
+        std::process::id()
+    ));
+    let result: std::io::Result<()> = (|| {
+        write_new(&temp, bytes)?;
         if replacing {
             std::fs::set_permissions(&temp, std::fs::metadata(path)?.permissions())?;
         }
-        std::fs::rename(&temp, path)
+        Ok(())
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+    match result {
+        Ok(()) => Ok(temp),
+        Err(e) => {
+            // Only reached after `create_new` succeeded or failed with AlreadyExists;
+            // never remove something this call did not create.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&temp);
+            }
+            Err(e)
+        }
     }
-    result
+}
+
+/// Create `temp` exclusively and write it durably. Fails if anything, including a
+/// symlink, is already at that name.
+fn write_new(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn root(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("serat-gitignore-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("fixture");
-        dir
+    /// A temp directory that derefs to its path and is removed on drop.
+    struct Root(tempfile::TempDir);
+
+    impl std::ops::Deref for Root {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    fn root(_name: &str) -> Root {
+        Root(tempfile::tempdir().expect("fixture"))
     }
 
     #[test]
@@ -320,5 +405,87 @@ mod tests {
         decline(&r).unwrap();
         append(&r).unwrap();
         assert_eq!(status(&r), GitignoreOffer::AlreadyIgnored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_a_symlink_planted_at_the_temp_name_is_not_followed() {
+        let r = root("temp-symlink");
+        let outside = root("temp-symlink-outside");
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+
+        // The name a predictable scheme would use. Planted by someone with write
+        // access to a synced vault.
+        let planted = r.join(".serat-tmp-.gitignore.guess");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(write_new(&planted, b"/.serat/\n").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+
+        // And an append beside planted links at the old predictable name is unaffected.
+        let old = r.join(format!(".serat-tmp-.gitignore.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &old).unwrap();
+        append(&r).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert_eq!(
+            std::fs::read_to_string(r.join(".gitignore")).unwrap(),
+            "/.serat/\n"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_edit_before_the_rename_is_not_lost() {
+        let r = root("lost-update");
+        std::fs::write(r.join(".gitignore"), "target\n").unwrap();
+        let ignore = r.join(".gitignore");
+        // Another program edits the file once, between our read and our rename: the
+        // work is redone on top of its edit.
+        append_with(&r, |attempt| {
+            if attempt == 0 {
+                std::fs::write(&ignore, "target\n*.log\n").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "target\n*.log\n/.serat/\n"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&*r)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".serat-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn two_collisions_report_io_and_leave_the_others_edit() {
+        let r = root("lost-update-twice");
+        let ignore = r.join(".gitignore");
+        std::fs::write(&ignore, "a\n").unwrap();
+        let mut n = 0;
+        let err = append_with(&r, |_| {
+            n += 1;
+            std::fs::write(&ignore, format!("edit {n}\n")).unwrap();
+        })
+        .expect_err("a second collision is reported");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "edit 2\n");
+    }
+
+    #[test]
+    fn a_file_created_by_someone_else_before_the_rename_is_not_overwritten() {
+        let r = root("create-race");
+        let ignore = r.join(".gitignore");
+        append_with(&r, |attempt| {
+            if attempt == 0 {
+                std::fs::write(&ignore, "theirs\n").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "theirs\n/.serat/\n"
+        );
     }
 }

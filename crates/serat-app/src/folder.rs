@@ -132,20 +132,21 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn dirs(name: &str) -> (PathBuf, PathBuf, Vault) {
-        let base = std::env::temp_dir().join(format!("serat-folder-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let root = base.join("vault");
-        let outside = base.join("outside");
+    /// A vault and a sibling "outside" directory under one temp directory that is
+    /// removed when the first element is dropped.
+    fn dirs(_name: &str) -> (tempfile::TempDir, PathBuf, PathBuf, Vault) {
+        let base = tempfile::tempdir().expect("fixture");
+        let root = base.path().join("vault");
+        let outside = base.path().join("outside");
         std::fs::create_dir_all(root.join("parent")).expect("fixture");
         std::fs::create_dir_all(&outside).expect("fixture");
         let vault = Vault::open(&root).expect("open");
-        (root, outside, vault)
+        (base, root, outside, vault)
     }
 
     #[test]
     fn creates_one_directory_and_is_idempotent() {
-        let (root, _outside, vault) = dirs("basic");
+        let (_guard, root, _outside, vault) = dirs("basic");
         assert_eq!(
             create_folder(&vault, "parent/new").unwrap(),
             FolderCreated { created: true }
@@ -159,7 +160,7 @@ mod tests {
 
     #[test]
     fn a_missing_parent_is_not_found_and_creates_no_chain() {
-        let (root, _o, vault) = dirs("noparent");
+        let (_guard, root, _o, vault) = dirs("noparent");
         let err = create_folder(&vault, "nope/deeper").unwrap_err();
         assert!(matches!(err, IpcError::NotFound { .. }), "{err:?}");
         assert!(!root.join("nope").exists());
@@ -167,7 +168,7 @@ mod tests {
 
     #[test]
     fn a_file_at_the_path_is_io() {
-        let (root, _o, vault) = dirs("file");
+        let (_guard, root, _o, vault) = dirs("file");
         std::fs::write(root.join("parent/f"), b"x").unwrap();
         let err = create_folder(&vault, "parent/f").unwrap_err();
         assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
@@ -175,7 +176,7 @@ mod tests {
 
     #[test]
     fn ignored_directories_are_refused_case_insensitively() {
-        let (root, _o, vault) = dirs("ignored");
+        let (_guard, root, _o, vault) = dirs("ignored");
         for p in [
             ".serat/x",
             ".Obsidian",
@@ -191,7 +192,7 @@ mod tests {
 
     #[test]
     fn escaping_paths_are_refused() {
-        let (_r, _o, vault) = dirs("escape");
+        let (_guard, _r, _o, vault) = dirs("escape");
         for p in ["../x", "/abs", "a/../../x"] {
             let err = create_folder(&vault, p).unwrap_err();
             assert!(
@@ -216,7 +217,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hostile_a_swapped_parent_with_nothing_outside_is_refused_and_removed() {
-        let (root, outside, vault) = dirs("hostile-a");
+        let (_guard, root, outside, vault) = dirs("hostile-a");
         let err = create_folder_with(&vault, "parent/new", swap_parent(&root, &outside))
             .expect_err("the directory landed outside the vault");
         assert!(matches!(err, IpcError::PathEscapesVault { .. }), "{err:?}");
@@ -229,7 +230,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hostile_a_swapped_parent_with_an_existing_outside_dir_is_refused_and_left_alone() {
-        let (root, outside, vault) = dirs("hostile-b");
+        let (_guard, root, outside, vault) = dirs("hostile-b");
         std::fs::create_dir(outside.join("new")).unwrap();
         let err = create_folder_with(&vault, "parent/new", swap_parent(&root, &outside))
             .expect_err("the existing directory is outside the vault");

@@ -3197,6 +3197,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "toml 1.1.5+spec-1.1.0",
  "ts-rs",
  "webkit2gtk",
