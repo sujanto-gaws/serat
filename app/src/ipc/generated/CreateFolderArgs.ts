@@ -27,8 +27,16 @@
  *   the directory would then land outside the vault (NFR-SEC-06). This check
  *   closes that window, except that an empty directory can exist outside the
  *   vault for the moment before it is removed. That residue is stated rather
- *   than hidden. serat-app's hostile suite swaps a parent for a symlink between
- *   resolve and create, and asserts the refusal and the removal.
+ *   than hidden. **The `AlreadyExists` branch checks containment too** and
+ *   returns `IpcError::PathEscapesVault` if it fails, **but it never removes
+ *   anything**. `remove_dir` runs only on a directory this call created. If a
+ *   parent was swapped for a symlink to a place that already holds an empty
+ *   directory of that name, that directory is not Serat's to delete (goal 1).
+ *   serat-app's hostile suite swaps a parent for a symlink between resolve and
+ *   create, in two cases. (a) The target name is absent outside: the test
+ *   asserts the refusal and the removal. (b) An empty directory of that name
+ *   already exists outside: the test asserts `PathEscapesVault` and that the
+ *   outside directory still exists afterwards.
  *
  * It creates exactly one directory. **The parent must already exist**
  * (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
