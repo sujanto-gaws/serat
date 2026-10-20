@@ -21,6 +21,17 @@
 // every other image source becomes the labelled placeholder, never an
 // `<img>` pointed at a remote or `data:` URL.
 //
+// Incoming `data-*` attributes are never copied: they are the renderer's own
+// channel to the mounting component (`data-external`, `data-wikilink`, ...),
+// so letting a document supply them would let it forge that channel. The
+// sanitiser sets `data-external` itself, and `preview.ts` asks for the
+// wikilink/footnote/embed markers by emitting an unguessable per-render
+// nonce-prefixed href/title that is rewritten into the real markers only
+// *after* sanitising (`applyTrustedMarkers`).
+//
+// `class` is dropped everywhere except one exact value on `<li>`
+// (`serat-task-list-item`), because styling hooks are not content.
+//
 // External-link click interception (never navigate the webview; open only
 // on an explicit click, via the system opener) is a DOM event-listener
 // concern, not a sanitisation one, and lives in the component that mounts
@@ -70,22 +81,28 @@ const ALLOWED_TAGS = new Set([
 /** Attributes allowed per tag, beyond the universal rules below (never
  * `on*`, never `style`, never `download`). */
 const ALLOWED_ATTRS: Record<string, readonly string[]> = {
-  // `data-wikilink`/`data-resolved`/`data-footnote-ref` are this renderer's
-  // own markers (`preview.ts`), read by the mounting component's click
-  // handler and by task #22's resolver — never attacker-controlled markup,
-  // since `preview.ts` is the only place that ever emits them and it always
-  // HTML-escapes the value first.
-  A: ["href", "title", "data-external", "data-wikilink", "data-resolved", "data-footnote-ref"],
+  // No `data-*` anywhere: see the module note.
+  A: ["href", "title"],
   IMG: ["src", "alt", "title", "width", "height"],
   INPUT: ["type", "checked", "disabled"],
   TD: ["colspan", "rowspan", "align"],
   TH: ["colspan", "rowspan", "align"],
   OL: ["start"],
-  LI: ["value", "class"],
-  DIV: ["data-callout"],
-  SPAN: ["data-embed-placeholder", "data-serat-image-placeholder"],
+  LI: ["value"],
+  SPAN: ["title"], // carries only the nonce-prefixed embed request, rewritten after sanitising
 };
 
+/** The single `class` value kept (on `<li>` only) — markdown-it task lists. */
+const ALLOWED_LI_CLASS = "serat-task-list-item";
+
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+
+// ADR-0017: a `serat-asset:` URL is accepted here by prefix only. Path
+// containment (no `..`, absolute paths, `:` segments, device names, symlink
+// escapes) and the viewable-types check are the scheme handler's job in
+// serat-app, which resolves every request through the vault's containment
+// functions; this sanitiser deliberately neither normalises nor second-guesses
+// the path, so there is exactly one containment rule to get right.
 const SERAT_ASSET_ORIGINS = ["serat-asset:", "http://serat-asset.localhost"];
 
 function isSeratAssetUrl(value: string): boolean {
@@ -119,7 +136,10 @@ function truncateForLabel(value: string): string {
 }
 
 function sanitizeElement(doc: Document, el: Element): Node | null {
-  const tag = el.tagName;
+  // `localName`, not `tagName`: in a foreign namespace (`<svg><script>`,
+  // `<math><style>`) `tagName` keeps the source case, so a case-sensitive
+  // comparison would miss it and its text content would survive.
+  const tag = el.localName.toUpperCase();
 
   // Hard-refused tags: never kept, never their children either, for the
   // ones capable of carrying an active surface. Script and style content
@@ -132,7 +152,7 @@ function sanitizeElement(doc: Document, el: Element): Node | null {
   // <link>, <base>, <svg>, <video>) is unwrapped: its children are kept
   // (recursively sanitised) but the element itself is not, so legitimate
   // text nested inside an unrecognised wrapper is not lost.
-  if (!ALLOWED_TAGS.has(tag)) {
+  if (!ALLOWED_TAGS.has(tag) || el.namespaceURI !== XHTML_NS) {
     const fragment = doc.createDocumentFragment();
     for (const child of Array.from(el.childNodes)) {
       const sanitized = sanitizeNode(doc, child);
@@ -152,7 +172,12 @@ function sanitizeElement(doc: Document, el: Element): Node | null {
     if (name.startsWith("on")) continue; // every event-handler attribute
     if (name === "style") continue;
     if (name === "download") continue;
-    if (!allowedForTag.includes(name)) continue;
+    if (name.startsWith("data-")) continue; // never copy an incoming marker
+    if (name === "class") {
+      if (!(tag === "LI" && attr.value === ALLOWED_LI_CLASS)) continue;
+    } else if (!allowedForTag.includes(name)) {
+      continue;
+    }
 
     if (tag === "A" && name === "href") {
       if (isDangerousUrlScheme(attr.value)) continue; // javascript:/data:/vbscript:
@@ -162,7 +187,7 @@ function sanitizeElement(doc: Document, el: Element): Node | null {
       if (!isHttpLikeUrl(attr.value) && !attr.value.startsWith("#")) continue;
       out.setAttribute("data-external", isHttpLikeUrl(attr.value) ? "true" : "false");
     }
-    out.setAttribute(attr.name, attr.value);
+    out.setAttribute(name, attr.value);
   }
 
   if (tag === "INPUT") {
@@ -210,6 +235,52 @@ function sanitizeNode(doc: Document, node: Node): Node | null {
   return null;
 }
 
+export interface SanitizeOptions {
+  /** Per-render secret that `preview.ts` embeds in the hrefs/titles it wants
+   * rewritten into trusted markers. Absent means no marker is ever added. */
+  markerNonce?: string;
+}
+
+/** Adds the renderer's markers after sanitising, from nonce-prefixed
+ * requests only. A document cannot guess the nonce, so cannot forge them. */
+function applyTrustedMarkers(root: ParentNode, nonce: string): void {
+  const prefix = `serat-${nonce}:`;
+  for (const a of Array.from(root.querySelectorAll("a[href]"))) {
+    const href = a.getAttribute("href") ?? "";
+    if (!href.startsWith(`#${prefix}`)) continue;
+    const rest = href.slice(prefix.length + 1);
+    const colon = rest.indexOf(":");
+    if (colon < 0) continue;
+    const kind = rest.slice(0, colon);
+    let payload: string;
+    try {
+      payload = decodeURIComponent(rest.slice(colon + 1));
+    } catch {
+      continue;
+    }
+    a.removeAttribute("data-external");
+    a.setAttribute("href", "#");
+    if (kind === "wikilink") {
+      a.setAttribute("data-wikilink", payload);
+      a.setAttribute("data-resolved", "false");
+    } else if (kind === "fnref") {
+      a.setAttribute("href", `#fn-${payload}`);
+      a.setAttribute("data-footnote-ref", payload);
+    }
+  }
+  for (const span of Array.from(root.querySelectorAll("span[title]"))) {
+    const title = span.getAttribute("title") ?? "";
+    const embed = `${prefix}embed:`;
+    if (!title.startsWith(embed)) continue;
+    span.removeAttribute("title");
+    try {
+      span.setAttribute("data-embed-placeholder", decodeURIComponent(title.slice(embed.length)));
+    } catch {
+      /* leave unmarked */
+    }
+  }
+}
+
 /**
  * Sanitises a `markdown-it`-rendered HTML fragment (or any untrusted HTML —
  * a note is untrusted input: git, sync tools and agents all write into the
@@ -218,13 +289,18 @@ function sanitizeNode(doc: Document, node: Node): Node | null {
  * caller never has to run untrusted HTML through `innerHTML`/`v-html` a
  * second time after this function already parsed and rebuilt it once.
  */
-export function sanitizeToFragment(html: string, doc: Document = document): DocumentFragment {
+export function sanitizeToFragment(
+  html: string,
+  doc: Document = document,
+  options: SanitizeOptions = {},
+): DocumentFragment {
   const parsed = new DOMParser().parseFromString(html, "text/html");
   const fragment = doc.createDocumentFragment();
   for (const child of Array.from(parsed.body.childNodes)) {
     const sanitized = sanitizeNode(doc, child);
     if (sanitized) fragment.appendChild(sanitized);
   }
+  if (options.markerNonce) applyTrustedMarkers(fragment, options.markerNonce);
   return fragment;
 }
 
@@ -234,8 +310,8 @@ export function sanitizeToFragment(html: string, doc: Document = document): Docu
  * `DocumentFragment` we just built ourselves, from an allowlist, is not the
  * same risk as `v-html`ing untrusted markup — nothing here is untrusted by
  * this point. */
-export function sanitizeToHtml(html: string, doc: Document = document): string {
-  const fragment = sanitizeToFragment(html, doc);
+export function sanitizeToHtml(html: string, doc: Document = document, options: SanitizeOptions = {}): string {
+  const fragment = sanitizeToFragment(html, doc, options);
   const container = doc.createElement("div");
   container.appendChild(fragment);
   return container.innerHTML;

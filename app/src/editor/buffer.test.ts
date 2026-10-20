@@ -119,6 +119,61 @@ describe("EditorBuffer.save", () => {
     expect(buffer.isDirty).toBe(true);
   });
 
+  it("blocks every further save after StaleHash until applyExternal/rebaseOnto (no blind retry)", async () => {
+    const buffer = new EditorBuffer("a.md", "abc", "hash0");
+    buffer.recordChange(changesFor("abc", 3, 3, "d"));
+    const error = { kind: "stale_hash", path: "a.md", current_hash: "hashX" };
+    const savePatch = vi.fn().mockRejectedValue(error);
+    const ipc = mockIpc({ savePatch });
+
+    await buffer.save(ipc);
+    expect(buffer.isStale).toBe(true);
+    const again = await buffer.save(ipc);
+    expect(again).toEqual({ kind: "stale", error });
+    expect(savePatch).toHaveBeenCalledTimes(1);
+    expect(await buffer.flush(ipc)).toBe(false);
+
+    buffer.applyExternal("theirs", "hashX");
+    expect(buffer.isStale).toBe(false);
+    expect(buffer.baseHash).toBe("hashX");
+    expect(buffer.isDirty).toBe(false);
+  });
+
+  it("reports InvalidPatch/NotWritable as rejected, not stale, and does not block", async () => {
+    const buffer = new EditorBuffer("a.md", "abc", "hash0");
+    buffer.recordChange(changesFor("abc", 3, 3, "d"));
+    const error = { kind: "not_writable", path: "a.md" };
+    const written: FileWritten = { path: "a.md", hash: "hash1", mtime_ms: 0, bytes: 4 };
+    const savePatch = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(written);
+    const ipc = mockIpc({ savePatch });
+
+    expect(await buffer.save(ipc)).toEqual({ kind: "rejected", error });
+    expect(buffer.isStale).toBe(false);
+    expect(buffer.isDirty).toBe(true);
+    expect((await buffer.save(ipc)).kind).toBe("saved");
+  });
+
+  it("flush waits for an in-flight save and then saves what was typed meanwhile", async () => {
+    const buffer = new EditorBuffer("a.md", "abc", "hash0");
+    buffer.recordChange(changesFor("abc", 3, 3, "d"));
+    const first = deferred<FileWritten>();
+    const savePatch = vi
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ path: "a.md", hash: "hash2", mtime_ms: 0, bytes: 5 });
+    const ipc = mockIpc({ savePatch });
+
+    void buffer.save(ipc);
+    buffer.recordChange(changesFor("abcd", 4, 4, "e"));
+    const flushed = buffer.flush(ipc);
+    first.resolve({ path: "a.md", hash: "hash1", mtime_ms: 0, bytes: 4 });
+
+    expect(await flushed).toBe(true);
+    expect(savePatch).toHaveBeenCalledTimes(2);
+    expect(buffer.isDirty).toBe(false);
+    expect(buffer.baseHash).toBe("hash2");
+  });
+
   it("only ever composes changes made since the base, across many transactions", async () => {
     const buffer = new EditorBuffer("a.md", "a", "hash0");
     buffer.recordChange(changesFor("a", 1, 1, "b"));

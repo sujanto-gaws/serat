@@ -130,4 +130,44 @@ describe("sanitizeToHtml — hostile inputs", () => {
     expect(out).not.toContain("onerror");
     expect(out).not.toContain("<img");
   });
+
+  it("drops class everywhere except the exact task-list class on <li>", () => {
+    const out = sanitizeToHtml('<p class="x">a</p><ul><li class="serat-task-list-item">t</li><li class="evil">u</li></ul>');
+    expect(out).not.toContain('class="x"');
+    expect(out).not.toContain("evil");
+    expect(out).toContain('<li class="serat-task-list-item">');
+  });
+
+  it("never copies an incoming data-* attribute (no forging the renderer's markers)", () => {
+    const out = sanitizeToHtml(
+      '<a href="#x" data-wikilink="forged" data-external="true" data-resolved="true">a</a><span data-embed-placeholder="y">s</span>',
+    );
+    expect(out).not.toContain("data-wikilink");
+    expect(out).not.toContain("data-resolved");
+    expect(out).not.toContain("data-embed-placeholder");
+    expect(out).toContain('data-external="false"'); // the sanitiser's own, from the href
+  });
+
+  it("adds wikilink/embed markers only for the matching nonce, after sanitising", () => {
+    const html =
+      '<a href="#serat-n0nce:wikilink:Foo%20Bar">Foo</a>' +
+      '<a href="#serat-other:wikilink:Evil">E</a>' +
+      '<span title="serat-n0nce:embed:pic.png">e</span>';
+    const out = sanitizeToHtml(html, document, { markerNonce: "n0nce" });
+    expect(out).toContain('data-wikilink="Foo Bar"');
+    expect(out).toContain('data-resolved="false"');
+    expect(out).toContain('data-embed-placeholder="pic.png"');
+    expect(out.match(/data-wikilink/g)).toHaveLength(1);
+    expect(sanitizeToHtml(html)).not.toContain("data-wikilink");
+  });
+
+  it("drops script and style in a foreign namespace along with their text", () => {
+    const out = sanitizeToHtml(
+      "<p>a</p><svg><script>alert(1)</script><style>p{}</style></svg><math><style>x</style></math>",
+    );
+    expect(out).not.toContain("alert");
+    expect(out).not.toContain("p{}");
+    expect(out).not.toMatch(/<script|<style|<svg|<math/i);
+    expect(out).toContain("<p>a</p>");
+  });
 });

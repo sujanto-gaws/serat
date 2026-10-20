@@ -5,7 +5,7 @@
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
-import { composeSince, offsetAt, patchesFromChangeSet, posAt, textFromString } from "@/editor/patches";
+import { composeSince, InvalidPositionError, offsetAt, patchesFromChangeSet, posAt, textFromString } from "@/editor/patches";
 
 describe("textFromString / posAt / offsetAt", () => {
   it("splits on LF", () => {
@@ -154,5 +154,24 @@ describe("composeSince", () => {
     const doc = textFromString("abc");
     const composed = composeSince(doc, []);
     expect(composed.empty).toBe(true);
+  });
+});
+
+describe("offsetAt validation", () => {
+  const doc = textFromString("ab\n\u{1F600}x");
+  it("accepts the end of a line", () => {
+    expect(offsetAt(doc, { line: 0, col: 2 })).toBe(2);
+  });
+  it("throws for a column past the end of the line", () => {
+    expect(() => offsetAt(doc, { line: 0, col: 3 })).toThrow(InvalidPositionError);
+  });
+  it("throws for a line past the end of the document and for negatives", () => {
+    expect(() => offsetAt(doc, { line: 2, col: 0 })).toThrow(InvalidPositionError);
+    expect(() => offsetAt(doc, { line: 0, col: -1 })).toThrow(InvalidPositionError);
+  });
+  it("throws for a column inside a surrogate pair, accepts both sides of it", () => {
+    expect(() => offsetAt(doc, { line: 1, col: 1 })).toThrow(InvalidPositionError);
+    expect(offsetAt(doc, { line: 1, col: 0 })).toBe(3);
+    expect(offsetAt(doc, { line: 1, col: 2 })).toBe(5);
   });
 });

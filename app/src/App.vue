@@ -35,9 +35,16 @@ onMounted(async () => {
   // buffer, saves wired to the (stubbed) IPC adapter, and the reveal rule
   // live. `bench-hash` is a syntactically valid but obviously-fake hash —
   // nothing the harness types triggers a save, so it is never checked.
-  window.__seratBenchOpenNote = (text: string) => {
-    editorRef.value?.loadNote(text, "__bench__.md", "bench-hash-not-a-real-blake3");
-  };
+  //
+  // Installed ONLY in a `vite build --mode bench` build (`npm run build:bench`):
+  // `import.meta.env.MODE` is replaced at build time, so a release build
+  // contains neither the branch nor the global. A shipped app must not expose
+  // a window-level "replace the open note's buffer" entry point.
+  if (import.meta.env.MODE === "bench") {
+    window.__seratBenchOpenNote = (text: string) => {
+      void editorRef.value?.loadNote(text, "__bench__.md", "bench-hash-not-a-real-blake3");
+    };
+  }
 
   // The paint mark, first and synchronous — code-reviewer's SHOULD-FIX on #98's
   // review. This used to run after `await onIndexStatus(...)` below, which is an IPC
@@ -68,7 +75,7 @@ onMounted(async () => {
     // buffer from exactly that — no second read.
     await hydrateBuffer(store, editorRef.value, paintMark);
     if (store.openNote && store.baseHash) {
-      editorRef.value.loadNote(editorRef.value.getText(), store.openNote, store.baseHash);
+      await editorRef.value.loadNote(editorRef.value.getText(), store.openNote, store.baseHash);
     }
   }
 });
@@ -95,6 +102,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       } else {
         store.setMark(`not saved: ${JSON.stringify(outcome.error)}`);
       }
+      break;
+    case "rejected":
+      store.setMark(`not saved: ${JSON.stringify(outcome.error)}`);
       break;
     case "noop":
     case "coalesced":

@@ -54,9 +54,43 @@ export function posAt(doc: Text, offset: number): Pos {
   return { line: line.number - 1, col: offset - line.from };
 }
 
-/** The inverse of {@link posAt}: `{ line, col }` back to an offset into `doc`. */
+/** Raised by {@link offsetAt} for a position that does not name a place in
+ * `doc`. A caller holding externally supplied positions (e.g. an
+ * `ExternalChange` diff) must treat this as "the positions are unusable" and
+ * request the external diff / reload rather than clamp or guess. */
+export class InvalidPositionError extends RangeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidPositionError";
+  }
+}
+
+/**
+ * The inverse of {@link posAt}: `{ line, col }` back to an offset into `doc`.
+ * Throws {@link InvalidPositionError} when the line does not exist, `col`
+ * lies past the end of its line, or `col` falls between the two halves of a
+ * surrogate pair (ADR-0016 §1: columns are UTF-16 units but a patch may not
+ * split a scalar value). Silently running into the next line, or splitting
+ * an emoji, would corrupt the note.
+ */
 export function offsetAt(doc: Text, pos: Pos): number {
+  if (!Number.isInteger(pos.line) || !Number.isInteger(pos.col) || pos.line < 0 || pos.col < 0) {
+    throw new InvalidPositionError(`invalid position ${pos.line}:${pos.col}`);
+  }
+  if (pos.line + 1 > doc.lines) {
+    throw new InvalidPositionError(`line ${pos.line} is past the end of the document (${doc.lines} lines)`);
+  }
   const line = doc.line(pos.line + 1);
+  if (pos.col > line.length) {
+    throw new InvalidPositionError(`column ${pos.col} is past the end of line ${pos.line} (length ${line.length})`);
+  }
+  if (pos.col > 0 && pos.col < line.length) {
+    const before = line.text.charCodeAt(pos.col - 1);
+    const after = line.text.charCodeAt(pos.col);
+    if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
+      throw new InvalidPositionError(`column ${pos.col} on line ${pos.line} splits a surrogate pair`);
+    }
+  }
   return line.from + pos.col;
 }
 

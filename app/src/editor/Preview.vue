@@ -88,8 +88,11 @@ function onContainerClick(event: MouseEvent): void {
   if (!anchor) return;
   // Never let the webview navigate on a rendered link, of any kind
   // (§9.3) — every anchor click is prevented unconditionally, then routed
-  // by data attribute.
+  // by data attribute. `auxclick` (middle/other buttons) is intercepted
+  // too: it would otherwise open the href in a new webview window. Only a
+  // primary click activates a link.
   event.preventDefault();
+  if (event.type === "auxclick" || event.button !== 0) return;
   const wikilinkTarget = anchor.getAttribute("data-wikilink");
   if (wikilinkTarget !== null) {
     emit("wikilink-click", wikilinkTarget);
@@ -105,5 +108,5 @@ defineExpose({ renderNow: () => renderNow(props.source) });
 </script>
 
 <template>
-  <div ref="container" class="serat-preview" data-testid="serat-preview" @click="onContainerClick"></div>
+  <div ref="container" class="serat-preview" data-testid="serat-preview" @click="onContainerClick" @auxclick="onContainerClick"></div>
 </template>

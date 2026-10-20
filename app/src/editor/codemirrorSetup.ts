@@ -3,11 +3,20 @@
 // appears in exactly one place, and a test asserts that" — this file is
 // that one place for the editor surface; see `commands.ts`'s header note).
 
-import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
+import {
+  defaultKeymap,
+  deleteCharBackward,
+  history,
+  historyKeymap,
+  insertNewlineAndIndent,
+  redo,
+  undo,
+} from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { keymap, type EditorView, type KeyBinding } from "@codemirror/view";
 
 import { CommandRegistry, type CommandId } from "@/editor/commands";
+import { deleteMarkupBackward, insertNewlineContinueMarkup } from "@/editor/markdownLanguage";
 
 export interface EditorCommandHandlers {
   save: (view: EditorView) => boolean;
@@ -104,13 +113,33 @@ export function createEditorCommandRegistry(handlers: EditorCommandHandlers): Co
     run: (view) => redo(view),
   });
 
+  // The two Markdown list/quote commands that `@codemirror/lang-markdown`
+  // would otherwise install through its own high-precedence keymap
+  // (`addKeymap`), re-registered under Serat ids (§9.3). Each falls back to
+  // the plain CodeMirror command exactly as that keymap's fallthrough did,
+  // so Enter/Backspace outside a list behave as before.
+  registry.register({
+    id: "editor.markdown-newline",
+    name: "Insert newline (continue Markdown list/quote)",
+    defaultBinding: "Enter",
+    when: "editor",
+    run: (view) => insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view),
+  });
+  registry.register({
+    id: "editor.markdown-delete-backward",
+    name: "Delete backward (outdent Markdown marker)",
+    defaultBinding: "Backspace",
+    when: "editor",
+    run: (view) => deleteMarkupBackward(view) || deleteCharBackward(view),
+  });
+
   // Keys already given an explicit, named command above — never
   // double-registered under a generic passthrough id, which is what would
   // let the same physical key collide with itself under two different ids.
   // Shared across both passthrough calls (and mutated by them) so a key
   // repeated between `historyKeymap` and `defaultKeymap`, or within either
   // array, is registered exactly once.
-  const seenKeys = new Set(["Mod-s", "Mod-Shift-m", "Mod-Enter", "Mod-z", "Mod-y"]);
+  const seenKeys = new Set(["Mod-s", "Mod-Shift-m", "Mod-Enter", "Mod-z", "Mod-y", "Enter", "Backspace"]);
   registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys);
   registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys);
 

@@ -30,6 +30,22 @@ export interface WikiLinkResolver {
   resolve(target: string): string | null;
 }
 
+/** `md.render`'s `env`: carries this render's marker nonce to the rules. */
+interface RenderEnv {
+  nonce?: string;
+  [key: string]: unknown;
+}
+
+function markerPrefix(env?: RenderEnv): string {
+  return `serat-${env?.nonce ?? ""}:`;
+}
+
+function newNonce(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 let markdownItPromise: Promise<MarkdownIt> | null = null;
 
 async function getMarkdownIt(): Promise<MarkdownIt> {
@@ -86,23 +102,24 @@ function wikiLinkPlugin(md: MarkdownIt): void {
     return true;
   });
 
-  md.renderer.rules.serat_wikilink = (tokens: Token[], idx: number) => {
+  md.renderer.rules.serat_wikilink = (tokens: Token[], idx: number, _o: unknown, env?: RenderEnv) => {
     const { target, display } = tokens[idx].meta as { target: string; display: string };
-    const escapedTarget = md.utils.escapeHtml(target);
     const escapedDisplay = md.utils.escapeHtml(display);
     // Unresolved by default (see the module note above); `data-target`
     // carries the raw target text so a future resolver pass, or the
     // click handler, can look it up without re-parsing markup.
-    return `<a href="#" data-wikilink="${escapedTarget}" data-resolved="false">${escapedDisplay}</a>`;
+    // The marker is requested via a nonce-prefixed href, which the
+    // sanitiser rewrites into `data-wikilink` after sanitising.
+    return `<a href="#${markerPrefix(env)}wikilink:${encodeURIComponent(target)}">${escapedDisplay}</a>`;
   };
 
-  md.renderer.rules.serat_embed = (tokens: Token[], idx: number) => {
+  md.renderer.rules.serat_embed = (tokens: Token[], idx: number, _o: unknown, env?: RenderEnv) => {
     const { target } = tokens[idx].meta as { target: string; display: string };
     const escapedTarget = md.utils.escapeHtml(target);
     // Not an <img> here — the module note's "no resolver yet" case. Once
     // #22 supplies a `serat-asset:` path this becomes a real <img> through
     // the ordinary sanitiser rule (never a second, embed-specific one).
-    return `<span data-embed-placeholder="${escapedTarget}">[[embed: ${escapedTarget}]]</span>`;
+    return `<span title="${markerPrefix(env)}embed:${encodeURIComponent(target)}">[[embed: ${escapedTarget}]]</span>`;
   };
 }
 
@@ -162,10 +179,10 @@ function footnoteRefPlugin(md: MarkdownIt): void {
     return true;
   });
 
-  md.renderer.rules.serat_footnote_ref = (tokens: Token[], idx: number) => {
+  md.renderer.rules.serat_footnote_ref = (tokens: Token[], idx: number, _o: unknown, env?: RenderEnv) => {
     const { label } = tokens[idx].meta as { label: string };
     const escaped = md.utils.escapeHtml(label);
-    return `<sup><a href="#fn-${escaped}" data-footnote-ref="${escaped}">${escaped}</a></sup>`;
+    return `<sup><a href="#${markerPrefix(env)}fnref:${encodeURIComponent(label)}">${escaped}</a></sup>`;
   };
 }
 
@@ -178,8 +195,9 @@ function footnoteRefPlugin(md: MarkdownIt): void {
  */
 export async function renderMarkdownToFragment(markdownSource: string, doc: Document = document): Promise<DocumentFragment> {
   const md = await getMarkdownIt();
-  const html = md.render(markdownSource);
-  return sanitizeToFragment(html, doc);
+  const nonce = newNonce();
+  const html = md.render(markdownSource, { nonce } satisfies RenderEnv);
+  return sanitizeToFragment(html, doc, { markerNonce: nonce });
 }
 
 /**

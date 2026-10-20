@@ -26,7 +26,20 @@ export type SaveOutcome =
   | { kind: "noop" } // nothing dirty
   | { kind: "coalesced" } // a save was already in flight; this one will ride the next round
   | { kind: "saved"; written: FileWritten }
-  | { kind: "stale"; error: unknown }; // caller must call requestExternalDiff (ADR-0016 §2)
+  // The file changed on disk since the base (`StaleHash`), or an earlier save
+  // already found that and nothing has reconciled it yet. No IPC call is made
+  // while stale; the caller must call `requestExternalDiff` and then
+  // `applyExternal`/`rebaseOnto` (ADR-0016 §2/§4). Never retried blindly.
+  | { kind: "stale"; error: unknown }
+  // The patch itself was refused (`InvalidPatch`, `NotWritable`, `Io`, a
+  // transport failure). This is not a disk-divergence: the buffer stays dirty
+  // and the next trigger may try again, but it is reported distinctly so the
+  // UI does not offer a merge for something a merge cannot fix.
+  | { kind: "rejected"; error: unknown };
+
+function isStaleHash(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { kind?: unknown }).kind === "stale_hash";
+}
 
 export class EditorBuffer {
   readonly path: string;
@@ -39,6 +52,11 @@ export class EditorBuffer {
   private pending: ChangeSet[] = [];
   private saving = false;
   private saveAgainRequested = false;
+  /** Resolves when the whole current save chain (first save plus any
+   * coalesced follow-up) has finished. `null` when idle. */
+  private inflight: Promise<void> | null = null;
+  /** Set by a `StaleHash` refusal; blocks every save until reconciled. */
+  private staleError: { error: unknown } | null = null;
 
   constructor(path: string, baseText: string, baseHash: string) {
     this.path = path;
@@ -56,6 +74,11 @@ export class EditorBuffer {
 
   get isDirty(): boolean {
     return this.pending.length > 0;
+  }
+
+  /** True after a `StaleHash` refusal until `applyExternal`/`rebaseOnto`. */
+  get isStale(): boolean {
+    return this.staleError !== null;
   }
 
   /** Records one transaction's changes (relative to the document they were
@@ -83,24 +106,68 @@ export class EditorBuffer {
    * exactly one more save covering everything typed meanwhile.
    */
   async save(ipc: EditorIpcAdapter): Promise<SaveOutcome> {
+    if (this.staleError) {
+      return { kind: "stale", error: this.staleError.error };
+    }
     if (this.saving) {
       this.saveAgainRequested = true;
       return { kind: "coalesced" };
     }
-    return this.runSave(ipc);
-  }
-
-  private async runSave(ipc: EditorIpcAdapter): Promise<SaveOutcome> {
     if (this.pending.length === 0) {
       return { kind: "noop" };
     }
     this.saving = true;
+    const first = this.runSave(ipc);
+    this.inflight = (async () => {
+      try {
+        let outcome = await first;
+        while (outcome.kind === "saved" && this.saveAgainRequested && this.pending.length > 0) {
+          this.saveAgainRequested = false;
+          outcome = await this.runSave(ipc);
+        }
+      } finally {
+        this.saveAgainRequested = false;
+        this.saving = false;
+        this.inflight = null;
+      }
+    })();
+    return first;
+  }
+
+  /**
+   * Resolves once every pending edit is on disk (or cannot be written):
+   * waits for any in-flight save, then saves what remains, repeating until
+   * clean. Returns `true` only when the buffer is clean — `false` when it is
+   * stale or the write was rejected, in which case the edits are still held
+   * here and the caller must not discard this buffer.
+   */
+  async flush(ipc: EditorIpcAdapter): Promise<boolean> {
+    for (;;) {
+      if (this.inflight) {
+        await this.inflight;
+        continue;
+      }
+      if (!this.isDirty) return true;
+      const outcome = await this.save(ipc);
+      if (outcome.kind !== "saved") {
+        if (this.inflight) continue;
+        return !this.isDirty;
+      }
+    }
+  }
+
+  private async runSave(ipc: EditorIpcAdapter): Promise<SaveOutcome> {
     const sentCount = this.pending.length;
     const composed = composeSince(this.baseTextValue, this.pending.slice(0, sentCount));
+    if (composed.empty) {
+      // Edits that cancelled out (type, then undo): the document equals the
+      // base, so there is nothing to send and no reason to touch the disk.
+      this.pending = this.pending.slice(sentCount);
+      return { kind: "noop" };
+    }
     const patches: Patch[] = patchesFromChangeSet(this.baseTextValue, composed);
     const baseHashAtSend = this.baseHashValue;
 
-    let outcome: SaveOutcome;
     try {
       const written = await ipc.savePatch({ path: this.path, base_hash: baseHashAtSend, patches });
       // The base becomes the document as it was when the save was taken
@@ -109,26 +176,27 @@ export class EditorBuffer {
       this.baseTextValue = composed.apply(this.baseTextValue);
       this.baseHashValue = written.hash;
       this.pending = this.pending.slice(sentCount);
-      outcome = { kind: "saved", written };
+      return { kind: "saved", written };
     } catch (error) {
-      // A refused save (StaleHash or otherwise) leaves the buffer dirty and
-      // is never retried blindly — the caller (App-level buffer manager,
-      // task #23) is responsible for calling `requestExternalDiff`.
-      outcome = { kind: "stale", error };
-    } finally {
-      this.saving = false;
-    }
-
-    if (this.saveAgainRequested) {
-      this.saveAgainRequested = false;
-      if (this.pending.length > 0) {
-        // Fire-and-continue: the coalesced trigger's caller already got its
-        // `{ kind: "coalesced" }` answer; this run's result is what the
-        // *original* caller of `save` observes.
-        void this.runSave(ipc);
+      // A refused save leaves the buffer dirty and the base unmoved. Only a
+      // StaleHash means the disk diverged; that blocks all further saves
+      // until reconciled. Anything else is a rejection of this patch set.
+      if (isStaleHash(error)) {
+        this.staleError = { error };
+        return { kind: "stale", error };
       }
+      return { kind: "rejected", error };
     }
-    return outcome;
+  }
+
+  /**
+   * ADR-0016 §2 rule 3/4: the disk changed and the caller has reconciled it
+   * (no unsaved edits to keep, or they were rebased). Adopts `diskText` /
+   * `diskHash` as the base, drops pending changes and clears the stale
+   * block. Use `rebaseOnto` to keep local edits on top.
+   */
+  applyExternal(diskText: string, diskHash: string): void {
+    this.rebaseOnto(diskText, diskHash, null);
   }
 
   /**
@@ -146,5 +214,6 @@ export class EditorBuffer {
     this.baseTextValue = textFromString(diskText);
     this.baseHashValue = diskHash;
     this.pending = nextPending && !nextPending.empty ? [nextPending] : [];
+    this.staleError = null;
   }
 }

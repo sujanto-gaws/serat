@@ -72,10 +72,9 @@ let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
 const revealCompartment = new Compartment();
 const dirty = ref(false);
 const previewSource = ref("");
-/** True only for the one dispatch `loadNote`/`setText` issues to replace
- * the whole document — that transaction must not be recorded as a pending
- * edit against the fresh buffer it accompanies, or the note would be
- * "dirty" the instant it opens. */
+/** True only while `loadNote`/`setText` replace the whole state — that must
+ * not be recorded as a pending edit against the fresh buffer it accompanies,
+ * or the note would be "dirty" the instant it opens. */
 let suppressChangeTracking = false;
 
 function markDirty(): void {
@@ -178,39 +177,64 @@ watch(
   },
 );
 
+/** Latest `loadNote` call; a load superseded while it awaited the flush must
+ * not install its (now stale) text. */
+let loadToken = 0;
+
 /**
- * Replaces the whole document and starts a fresh buffer for `path`/`hash` —
- * used once per note, when it is opened (never on every keystroke: this is
- * the P1 analogue of P0's `setText`, now also resetting ADR-0016's base).
+ * Replaces the whole editor state: new document, no undo history, selection
+ * at 0. `view.setState` (not a dispatch) is what guarantees nothing of the
+ * old document can be undone into the new one — a dispatched replacement
+ * lands in CodeMirror's history, and Mod-z would then walk the document back
+ * to "" or to the previous note's text, which `recordChange` would record as
+ * "delete everything" against the loaded base and autosave to disk (C-04,
+ * NFR-REL-01). Never route a load through `view.dispatch`.
  */
-function loadNote(text: string, path: string, baseHash: string): void {
+function replaceState(text: string): void {
   if (!view) return;
-  buffer = new EditorBuffer(path, text, baseHash);
   suppressChangeTracking = true;
   try {
-    view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: text },
-      // The initial load is not an edit to undo back through.
-      selection: { anchor: 0 },
-    });
+    view.setState(EditorState.create({ doc: text, extensions: buildExtensions(props.livePreview) }));
   } finally {
     suppressChangeTracking = false;
   }
   previewSource.value = text;
-  dirty.value = false;
+}
+
+/**
+ * Starts editing `path` (content `text`, on-disk hash `baseHash`) — used once
+ * per note, when it is opened. Any previous note's edits are flushed to disk
+ * first (awaiting an in-flight save too) and the buffer is replaced only once
+ * they are safe. Resolves `false`, leaving the previous note untouched, if
+ * they could not be saved (stale or refused) or a newer `loadNote` superseded
+ * this one: the caller must reconcile (ADR-0016 §4) rather than lose edits.
+ */
+async function loadNote(text: string, path: string, baseHash: string): Promise<boolean> {
+  if (!view) return false;
+  const token = ++loadToken;
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
+  if (buffer) {
+    const old = buffer;
+    const clean = await old.flush(props.ipc);
+    markDirty();
+    if (token !== loadToken || !view) return false;
+    if (!clean) return false;
+  }
+  buffer = new EditorBuffer(path, text, baseHash);
+  replaceState(text);
+  markDirty();
+  return true;
 }
 
 /** Back-compat with the P0 shell's placeholder-content path (no note open
  * yet, or a read failure message) — does not touch the buffer, so it must
- * never be used for real note content once `loadNote` is available. */
+ * never be used for real note content once `loadNote` is available. Like
+ * `loadNote` it clears undo history. */
 function setText(text: string): void {
-  suppressChangeTracking = true;
-  try {
-    view?.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
-  } finally {
-    suppressChangeTracking = false;
-  }
-  previewSource.value = text;
+  replaceState(text);
 }
 
 function getText(): string {
