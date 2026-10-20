@@ -529,6 +529,8 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     let wal_bytes_start = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
 
     let mut recs: Vec<Rec> = Vec::with_capacity(a.iterations);
+    // A run that dies (the host's disk filled once, at save 903) still reports what it has.
+    let mut aborted: Option<String> = None;
     let mut build_samples: Vec<usize> = vec![builds_start];
     let mut jiff = cpu_jiffies();
     let run_started = Instant::now();
@@ -543,7 +545,10 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
             segs_before: levels.iter().sum(),
             ..Rec::default()
         };
-        one_save(&mut rec)?;
+        if let Err(e) = one_save(&mut rec) {
+            aborted = Some(format!("save {i} failed: {e}"));
+            break;
+        }
         last_flush = Instant::now();
         // Everything below is in the gap, outside every timed interval.
         let now_j = cpu_jiffies();
@@ -582,7 +587,19 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     let wal_bytes_end = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     drop(side);
     drop(ckpt_conn);
-    actor.shutdown().map_err(|e| e.to_string())?;
+    let shutdown = actor.shutdown().map_err(|e| e.to_string());
+    if let Some(why) = &aborted {
+        println!(
+            "ABORTED after {} of {} saves: {why}",
+            recs.len(),
+            a.iterations
+        );
+    } else {
+        shutdown?;
+    }
+    if recs.is_empty() {
+        return Err("no save completed".to_owned());
+    }
 
     report(
         a,
