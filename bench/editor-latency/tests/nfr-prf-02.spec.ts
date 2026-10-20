@@ -39,7 +39,7 @@ const pct = (x: number) => (x * 100).toFixed(1) + "%";
 const ENGINE = () => "headless Chromium (not gate-eligible)";
 const fmt = (m: import("./measure").RunSummary) =>
   `on time @-4/0/+4 ms = ${pct(m.onTimeAtMinus4)}/${pct(m.onTimeAtZero)}/${pct(m.onTimeAtPlus4)}; ` +
-  `${m.scoredOnTimeByAbsence}/${m.n} on time by absence of an Event Timing entry; ${m.staleAnchors} stale anchors (phase >= 1R); verdict ${m.verdict}`;
+  `${m.scoredOnTimeByAbsence}/${m.n} on time by absence of an Event Timing entry; ${m.staleAnchors} stale anchors (phase >= 1R); worst absent-key margin ${m.worstAbsentMarginMs === null ? "n/a" : m.worstAbsentMarginMs.toFixed(1) + " ms"}; verdict ${m.verdict}`;
 
 const CADENCES: [string, Cadence][] = [
   ["strict 100 ms", { kind: "strict" }],

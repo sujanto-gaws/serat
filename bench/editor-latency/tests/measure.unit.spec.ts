@@ -122,6 +122,23 @@ for (const [label, ns] of impls) {
       expect(ns.summarise([mk(-10, 40, 0), mk(-10, 5, 0)], 0.5, R).staleAnchors).toBe(1);
     });
 
+    test("summarise: worst absent-key margin is D - t - 16 over keys scored by absence", () => {
+      const mk = (t: number): KeystrokeScore => ({ t, tsJ: 0, deadline: 33.4, etEnd: null, late: false, framesToPaint: 1 });
+      const m = ns.summarise([mk(1), mk(16.5), mk(5)], 0.5, R);
+      expect(m.scoredOnTimeByAbsence).toBe(3);
+      expect(m.worstAbsentMarginMs).toBeCloseTo(33.4 - 16.5 - 16, 9);
+      const none = ns.summarise([{ ...mk(1), etEnd: 20 }], 0.5, R);
+      expect(none.worstAbsentMarginMs).toBeNull();
+    });
+
+    test("R below 16 ms is rejected as an invalid run; 16 and above are accepted", () => {
+      expect(() => ns.assertRefreshIntervalValid(8.33)).toThrow(/below 16 ms/);
+      expect(() => ns.assertRefreshIntervalValid(15.99)).toThrow();
+      expect(() => ns.assertRefreshIntervalValid(Number.NaN)).toThrow();
+      expect(() => ns.assertRefreshIntervalValid(16)).not.toThrow();
+      expect(() => ns.assertRefreshIntervalValid(16.7)).not.toThrow();
+    });
+
     test("scoreAll maps keystrokes one to one", () => {
       const frames = [0, R, 2 * R, 3 * R, 4 * R, 5 * R, 6 * R];
       const s = ns.scoreAll(frames, [], [R + 1, 3 * R + 1], R);

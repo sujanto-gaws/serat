@@ -7,7 +7,9 @@
 //   ts_j = the last rAF frame timestamp at or before t;
 //   D    = ts_j + 2R           (R = median rAF delta over 120 frames);
 //   ETend = max over the keystroke's keydown / keypress / beforeinput / input
-//           Event Timing entries of (startTime + duration), i.e. the moment the
+//           Event Timing entries whose startTime is in [t, t + 4 ms] (a TIME WINDOW, keyup
+//           excluded; NOT grouped by interactionId, which is 0 on input events in Chromium 141),
+//           of (startTime + duration), i.e. the moment the
 //           browser reports the frame after the event as PRESENTED
 //           (`PerformanceObserver({type:"event", durationThreshold:16})`);
 //   the keystroke is LATE iff ETend > D. An absent entry means the paint took
@@ -65,6 +67,10 @@ export interface RunSummary {
   onTimeAtPlus4: number;
   scoredOnTimeByAbsence: number;
   staleAnchors: number;
+  /** Smallest `D - t - 16` over the keys scored on time by absence: the headroom the
+   * absence argument guarantees (an absent entry means presented < 16 ms after `t`).
+   * `null` when no key was scored that way. Always > 0 when R >= 16. */
+  worstAbsentMarginMs: number | null;
   verdict: "PASS" | "FAIL" | "INDETERMINATE";
 }
 
@@ -186,12 +192,33 @@ export function summarise(
   const lenient = shareOnTime(scores, 4);
   let absent = 0;
   let stale = 0;
+  let worstAbsent: number | null = null;
   for (let i = 0; i < scores.length; i++) {
-    if (scores[i].etEnd === null && !scores[i].late) absent++;
+    if (scores[i].etEnd === null && !scores[i].late) {
+      absent++;
+      const margin = scores[i].deadline - scores[i].t - 16;
+      if (worstAbsent === null || margin < worstAbsent) worstAbsent = margin;
+    }
     if (scores[i].t - scores[i].tsJ >= refreshIntervalMs) stale++;
   }
   const verdict = strict >= bar ? "PASS" : lenient < bar ? "FAIL" : "INDETERMINATE";
-  return { n: scores.length, onTimeAtMinus4: strict, onTimeAtZero: nominal, onTimeAtPlus4: lenient, scoredOnTimeByAbsence: absent, staleAnchors: stale, verdict };
+  return { n: scores.length, onTimeAtMinus4: strict, onTimeAtZero: nominal, onTimeAtPlus4: lenient, scoredOnTimeByAbsence: absent, staleAnchors: stale, worstAbsentMarginMs: worstAbsent, verdict };
+}
+
+/** Smallest refresh interval at which "no Event Timing entry means presented in time" holds. */
+export const MIN_VALID_REFRESH_INTERVAL_MS = 16;
+
+/** A gated run is REJECTED at R < 16 ms (120/144 Hz): the absence argument needs
+ * D - t > R >= 16, i.e. an unreported event (< 16 ms) is before D. Not a verdict, an invalid run.
+ * @throws when R is below 16 ms. */
+export function assertRefreshIntervalValid(refreshIntervalMs: number): void {
+  if (!(refreshIntervalMs >= 16)) {
+    throw new Error(
+      "run rejected: refresh interval R=" + refreshIntervalMs + " ms is below 16 ms (>= 120 Hz). " +
+        "An absent Event Timing entry (duration < 16 ms) is scored on time only when R >= 16 ms, so " +
+        "this machine/display cannot produce a gated figure",
+    );
+  }
 }
 
 /** The functions the page runs, in dependency order. */
@@ -206,6 +233,7 @@ export const SeratLatencyFns = {
   scoreAll,
   shareOnTime,
   summarise,
+  assertRefreshIntervalValid,
 } as const;
 
 export type SeratLatencyNamespace = typeof SeratLatencyFns;
@@ -295,6 +323,8 @@ export async function installCapture(page: Page, src: string = namespaceSource()
     },
     { nsSrc: src, warmup: R_WARMUP_FRAMES },
   );
+  // Validity condition: the same function the page carries, run on the measured R.
+  loadNamespace(src).assertRefreshIntervalValid(refreshIntervalMs);
   return { refreshIntervalMs };
 }
 
