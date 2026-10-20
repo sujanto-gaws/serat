@@ -672,6 +672,13 @@ pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
 /// Message order: the root `Listing` alone first, then further `Listing`s
 /// breadth-first, then `Complete`; afterwards any mix of `Upsert`, `Remove`,
 /// differing catch-up `Listing`s and, once, `WalkSettled`.
+///
+/// **Two ordering obligations on Rust (ADR-0015 §1), which the front end relies
+/// on.** (1) Any `Listing` sent after a `Remove` already reflects that `Remove`.
+/// (2) Any `Upsert` into a directory whose `Listing` has not been sent yet is
+/// superseded by that `Listing`. So the front end treats a `Remove` for a
+/// directory it has no listing for as a no-op. serat-app and serat-vault keep
+/// both, and task #13 tests both in Rust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
