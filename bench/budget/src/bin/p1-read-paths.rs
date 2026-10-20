@@ -186,6 +186,43 @@ fn save_row(
     Ok(row)
 }
 
+/// One iteration = create `zz/index.md` and index it, delete it and index the removal.
+fn create_delete_row(
+    name: &str,
+    index_dir: &Path,
+    vault_root: &Path,
+    iterations: usize,
+) -> Result<Row, String> {
+    use serat_core::IndexWriter as _;
+    let source = serat_vault::Vault::open(vault_root).map_err(|e| format!("open vault: {e}"))?;
+    let handle = serat_index::IndexHandle::open(index_dir).map_err(|e| e.to_string())?;
+    let rel = "zz/index.md";
+    let path = serat_core::VaultPath::new(rel).map_err(|e| format!("{rel:?}: {e}"))?;
+    let file = vault_root.join(rel);
+    std::fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+    let row = time(name, Some(50.0), iterations, || {
+        for create in [true, false] {
+            if create {
+                std::fs::write(&file, "# Index zz\n").expect("write");
+            } else {
+                std::fs::remove_file(&file).expect("remove");
+            }
+            serat_index::apply(
+                &handle.writer(),
+                &source,
+                &serat_parse::CommonMarkParser,
+                &NoEcho,
+                &path,
+            )
+            .expect("apply");
+            handle.writer().flush().expect("flush");
+        }
+        1
+    });
+    handle.close().map_err(|e| e.to_string())?;
+    Ok(row)
+}
+
 /// Many notes sharing a file name: 300 `dN/index.md`, 300 `dN/README.md` and a root
 /// `index.md`, with 300 notes linking `[[index]]` and `[[README]]`. Saving any of the
 /// namesakes is the worst case for link re-resolution.
@@ -229,6 +266,16 @@ fn duplicate_names_rows(iterations: usize) -> Result<Vec<Row>, String> {
             iterations,
         )?);
     }
+    // The case where RIVALS still runs: a note appears under a spelling 301 others
+    // share (a content save of an existing path skips it), then goes again. Each
+    // iteration creates a 302nd index.md and then deletes it; both saves are timed
+    // together, plus two small file operations.
+    rows.push(create_delete_row(
+        "Create then delete a 302nd index.md (RIVALS runs on the create; one iteration = both saves)",
+        &index_dir,
+        &root,
+        iterations,
+    )?);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&index_dir);
     Ok(rows)
@@ -321,25 +368,57 @@ fn measure(
         iterations,
         || search_rows(&reader, &commonest, 0, 50),
     ));
-    // The same two reads on the vault's search connection, whose progress handler
-    // checks the search generation every 1,000 VM instructions. The cost of the
-    // handler is the difference between these rows and the two above.
+    // The progress handler's cost, measured on ONE search connection: the same
+    // connection, the same warm-up, the two states alternating iteration by iteration.
+    // #47 compared two different connections and read +8-12 ms, which was most likely
+    // page-cache warmth rather than the handler (task #51).
     let search_conn = serat_index::SearchConn::open(db).map_err(|e| e.to_string())?;
     let searched = Reader::open(db)
         .map_err(|e| e.to_string())?
-        .with_search(search_conn);
-    rows.push(time(
-        &format!("R1 top term {top_term:?}, top 50, on the search connection (with progress handler; no expectation)"),
-        None,
-        iterations,
-        || search_rows(&searched, &top_term, 0, 50),
-    ));
-    rows.push(time(
-        &format!("R1 {commonest:?}, top 50, on the search connection (with progress handler)"),
-        Some(100.0),
-        iterations,
-        || search_rows(&searched, &commonest, 0, 50),
-    ));
+        .with_search(search_conn.clone());
+    for (label, term, expectation) in [
+        (format!("R1 top term {top_term:?}"), &top_term, None),
+        (format!("R1 {commonest:?}"), &commonest, Some(100.0)),
+    ] {
+        let (mut with, mut without) = (Samples::new(), Samples::new());
+        let rows_n = search_rows(&searched, term, 0, 50);
+        // Warm both states, untimed.
+        for on in [true, false, true, false] {
+            search_conn
+                .set_progress_handler(on)
+                .map_err(|e| e.to_string())?;
+            search_rows(&searched, term, 0, 50);
+        }
+        for _ in 0..iterations {
+            for on in [true, false] {
+                search_conn
+                    .set_progress_handler(on)
+                    .map_err(|e| e.to_string())?;
+                let started = Instant::now();
+                assert_eq!(search_rows(&searched, term, 0, 50), rows_n);
+                (if on { &mut with } else { &mut without }).push(started.elapsed());
+            }
+        }
+        search_conn
+            .set_progress_handler(true)
+            .map_err(|e| e.to_string())?;
+        rows.push(Row {
+            name: format!(
+                "{label}, top 50, search connection, handler ON (same connection, alternating)"
+            ),
+            samples: with,
+            rows: rows_n,
+            expectation_ms: expectation,
+        });
+        rows.push(Row {
+            name: format!(
+                "{label}, top 50, search connection, handler OFF (same connection, alternating)"
+            ),
+            samples: without,
+            rows: rows_n,
+            expectation_ms: expectation,
+        });
+    }
     // ... and a query set spread across the 20%-restricted vocabulary, as one p95.
     let picks = [0usize, 1, 9, 99, 499, 999];
     let mut set = Samples::new();
