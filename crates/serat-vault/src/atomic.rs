@@ -119,11 +119,11 @@ pub(crate) struct PathLock<'a> {
 }
 
 impl PathLocks {
-    /// The lock for `path`. The key is case-folded: on a case-insensitive filesystem
+    /// The lock for `path`. The key is case-folded with `serat_core::fold_case`, the same fold link resolution uses: on a case-insensitive filesystem
     /// `A.md` and `a.md` are one file, and over-serialising on a case-sensitive one
     /// costs nothing.
     pub(crate) fn lock_for(&self, path: &str) -> PathLock<'_> {
-        let key = path.to_lowercase();
+        let key = serat_core::fold_case(path);
         let mut map = self
             .map
             .lock()

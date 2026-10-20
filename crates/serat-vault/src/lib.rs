@@ -63,6 +63,16 @@ pub use refusal::{Refusal, RefusalLog};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
+/// What [`Vault::write_atomic_if`] requires of the file as it is on disk, checked under
+/// the per-path lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// The file must not exist (a create).
+    Absent,
+    /// The file must exist with this content hash (an overwrite of a known base).
+    Hash(ContentHash),
+}
+
 /// An open vault: a root directory, and the rules for what inside it counts.
 #[derive(Debug, Clone)]
 pub struct Vault {
@@ -373,6 +383,39 @@ impl Vault {
     /// [`VaultError::AtomicWriteFailed`] if any step fails, in which case the
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
+        self.write_atomic_hooked(path, bytes, None, || {})
+    }
+
+    /// [`Vault::write_atomic`] guarded by what the caller believes is on disk, checked
+    /// **under the per-path lock** (ADR-0016 §2: the lock is held from step 1's
+    /// re-read to the rename in both write paths). This is `write_file`'s path: the
+    /// optimistic lock of architecture §6.1 and the create-only case, so that a
+    /// concurrent `write_patch` or a second create cannot slip in between the check
+    /// and the rename.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vault::write_atomic`], plus [`VaultError::StaleHash`] if the file exists
+    /// and `expect` is [`Expect::Absent`] or a different hash (`found` is what is on
+    /// disk), and [`VaultError::NotFound`] if `expect` is a hash and the file is gone.
+    pub fn write_atomic_if(
+        &self,
+        path: &VaultPath,
+        expect: Expect,
+        bytes: &[u8],
+    ) -> Result<ContentHash, VaultError> {
+        self.write_atomic_hooked(path, bytes, Some(expect), || {})
+    }
+
+    /// The shared body, with a hook that runs after the temporary file is complete and
+    /// before the rename: the window the race tests need to reach deterministically.
+    fn write_atomic_hooked(
+        &self,
+        path: &VaultPath,
+        bytes: &[u8],
+        expect: Option<Expect>,
+        before_rename: impl FnOnce(),
+    ) -> Result<ContentHash, VaultError> {
         // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
         // rewritten. The threat model's stated mechanism is that no write path accepts
         // a non-Markdown target, so the refusal belongs here — in the one function that
@@ -408,6 +451,36 @@ impl Vault {
         let lock = self.locks.lock_for(path.as_str());
         let _held = lock.hold();
 
+        // Step 1 of ADR-0016 §2, under the lock: what the caller believes is on disk.
+        if let Some(expect) = expect {
+            match (fs::read(&target), expect) {
+                (Ok(current), Expect::Absent) => {
+                    return Err(VaultError::StaleHash {
+                        path: path.as_str().to_owned(),
+                        expected: "absent".to_owned(),
+                        found: hash_bytes(&current).to_hex(),
+                    });
+                }
+                (Ok(current), Expect::Hash(want)) => {
+                    let found = hash_bytes(&current);
+                    if found != want {
+                        return Err(VaultError::StaleHash {
+                            path: path.as_str().to_owned(),
+                            expected: want.to_hex(),
+                            found: found.to_hex(),
+                        });
+                    }
+                }
+                (Err(err), Expect::Hash(_)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(VaultError::NotFound {
+                        path: path.as_str().to_owned(),
+                    });
+                }
+                (Err(err), _) if err.kind() == std::io::ErrorKind::NotFound => {}
+                (Err(err), _) => return Err(VaultError::io(path.as_str(), &err)),
+            }
+        }
+
         fs::create_dir_all(parent).map_err(|err| failed(err.to_string()))?;
 
         // F-33. The replacement inherits the original's permissions, because a
@@ -422,6 +495,7 @@ impl Vault {
 
         let temp = atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
             .map_err(|err| failed(err.to_string()))?;
+        before_rename();
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
         Ok(hash)
