@@ -169,6 +169,34 @@ fn a_shorter_path_appearing_takes_over_the_links_that_resolved_to_a_longer_one()
 }
 
 #[test]
+fn a_content_save_of_a_linked_note_with_a_rival_leaves_links_as_a_rebuild_would() {
+    // NFR-PRF-03: a content save no longer runs RIVALS. The links must come out the
+    // same anyway -- inbound links to the saved note, and links that point at the
+    // longer-path rival (via a path-qualified spelling) alike.
+    let mut live = Live::new();
+    live.save("a/Meeting.md", "# one\n");
+    live.save("a/b/Meeting.md", "# rival\n");
+    live.save(
+        "refs.md",
+        "[[Meeting]]\n[[a/b/Meeting]]\n[[a/Meeting]]\n[[Missing]]\n",
+    );
+    live.save("other.md", "[[Meeting]]\n");
+    live.assert_equals_a_rebuild("setup");
+    live.save("a/Meeting.md", "# one, edited\n[[refs]]\n");
+    assert_eq!(
+        live.dst_of("refs.md", "Meeting").as_deref(),
+        Some("a/Meeting.md")
+    );
+    assert_eq!(
+        live.dst_of("refs.md", "a/b/Meeting").as_deref(),
+        Some("a/b/Meeting.md")
+    );
+    live.assert_equals_a_rebuild("a content save of a linked note with a rival");
+    live.save("a/b/Meeting.md", "# rival, edited\n");
+    live.assert_equals_a_rebuild("a content save of the rival");
+}
+
+#[test]
 fn deleting_the_preferred_note_hands_its_links_to_the_next_one_or_unresolves_them() {
     // B1.
     let mut live = Live::new();

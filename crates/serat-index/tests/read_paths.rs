@@ -251,6 +251,39 @@ fn r1_pages_with_offset_and_limit_and_caps_the_limit_at_fifty() {
     );
 }
 
+#[test]
+fn r3_alone_returns_up_to_five_hundred_in_one_statement_and_clamps_beyond() {
+    let files: Vec<(String, String)> = (0..620)
+        .map(|i| (format!("n/{i:03}.md"), format!("# T{i}\ncommonword {i}\n")))
+        .collect();
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let f = fixture(&refs);
+    let conn = schema::open(&f.db).expect("writer");
+    conn.execute(
+        "INSERT INTO fields (note_id, block_id, key, val_text, source)
+         SELECT id, NULL, 'status', 'active', 'frontmatter' FROM notes",
+        [],
+    )
+    .expect("fields");
+    let len = |q: &str, limit: u16| match f.reader.search(q, 0, limit).unwrap() {
+        SearchOutcome::Hits(h) => h.len(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(len("[status:active]", 500), 500);
+    assert_eq!(
+        len("[status:active]", u16::MAX),
+        500,
+        "clamped, not rejected"
+    );
+    assert_eq!(len("[status:active]", 120), 120);
+    // Free text keeps R1's ceiling even beside a property term.
+    assert_eq!(len("commonword [status:active]", 500), 50);
+    assert_eq!(len("commonword", 500), 50);
+}
+
 // ------------------------------------------------------------------------- R3
 
 #[test]

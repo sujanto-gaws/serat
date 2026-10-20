@@ -2,9 +2,14 @@
 //!
 //! Serves **FR-NAV-02**, **FR-NAV-04**, **FR-STR-03**, **FR-BIN-02**. No NFR budgets
 //! search, backlinks or property lookup, so §4.5 states **expectations**: R1 top-50
-//! search <= 100 ms p95 (the single most common term reported separately as the
-//! worst case), R2 backlinks of the highest in-degree note <= 20 ms, R3 a 500-row
-//! property lookup <= 20 ms, R1 + R3 <= 100 ms. A miss is a finding for architect and
+//! search <= 100 ms p95 over terms matching at most 20% of blocks (the ruling on #15:
+//! the very common terms are reported, with their match count, and carry no
+//! expectation), R2 backlinks of the highest in-degree note <= 20 ms, R3 a 500-row
+//! property lookup in one `LIMIT 500` statement <= 20 ms, R1 + R3 <= 100 ms. The save
+//! of the highest in-degree note, and of a note whose file name is shared by hundreds
+//! of others, are timed too (NFR-PRF-03's 50 ms is asserted by prf03-save-to-index
+//! once serat-app exists; until then this is the only measurement of the link
+//! re-resolution a save pays). A miss is a finding for architect and
 //! product-analyst, not a red build, so this job exits 0 whatever it measures and
 //! only fails when it cannot measure.
 //!
@@ -31,10 +36,16 @@ struct Row {
     name: String,
     samples: Samples,
     rows: usize,
-    expectation_ms: f64,
+    /// `None`: reported with no expectation (the ruling on very common terms).
+    expectation_ms: Option<f64>,
 }
 
-fn time<F: FnMut() -> usize>(name: &str, expectation_ms: f64, iterations: usize, mut f: F) -> Row {
+fn time<F: FnMut() -> usize>(
+    name: &str,
+    expectation_ms: Option<f64>,
+    iterations: usize,
+    mut f: F,
+) -> Row {
     // One untimed run first: the page cache and the statement cache are warm in the
     // application by the second search, and a first-ever query is not what this measures.
     let rows = f();
@@ -64,34 +75,24 @@ fn search_rows(reader: &Reader, query: &str, offset: u32, limit: u16) -> usize {
     }
 }
 
-/// Page through a property lookup the way the panel does, up to `want` rows.
-fn paged_rows(reader: &Reader, query: &str, want: usize) -> usize {
-    let mut total = 0;
-    while total < want {
-        let n = search_rows(reader, query, u32::try_from(total).unwrap_or(u32::MAX), 50);
-        total += n;
-        if n < 50 {
-            break;
-        }
-    }
-    total
-}
-
-/// Terms by how many blocks contain them, most common first.
-fn terms_by_frequency(conn: &Connection, take: usize) -> Result<Vec<String>, String> {
-    conn.execute_batch("CREATE VIRTUAL TABLE temp.v USING fts5vocab(main, blocks_fts, 'row')")
-        .map_err(|e| format!("fts5vocab: {e}"))?;
+/// Terms by how many blocks contain them, most common first, with that count.
+/// `max_doc` keeps only terms matching at most that many blocks.
+fn terms_by_frequency(
+    conn: &Connection,
+    max_doc: i64,
+    take: usize,
+) -> Result<Vec<(String, i64)>, String> {
     let mut stmt = conn
         .prepare(
             // Only plain letters: a term like `0` or `---` is not what a person
             // searches for, and quoting makes the rest of the vocabulary safe.
-            "SELECT term FROM temp.v WHERE term GLOB '[a-z][a-z][a-z]*'
-              ORDER BY doc DESC, term LIMIT ?1",
+            "SELECT term, doc FROM temp.v WHERE term GLOB '[a-z][a-z][a-z]*' AND doc <= ?1
+              ORDER BY doc DESC, term LIMIT ?2",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([i64::try_from(take).unwrap_or(i64::MAX)], |r| {
-            r.get::<_, String>(0)
+        .query_map([max_doc, i64::try_from(take).unwrap_or(i64::MAX)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
@@ -139,6 +140,8 @@ fn run(args: &[String]) -> Result<(), String> {
     );
     let result = measure(
         &serat_index::index_path(&index_dir),
+        &index_dir,
+        &vault.path,
         &vault_name,
         iterations,
     );
@@ -146,15 +149,118 @@ fn run(args: &[String]) -> Result<(), String> {
     result
 }
 
-fn measure(db: &Path, vault_name: &str, iterations: usize) -> Result<(), String> {
+/// An echo guard that records nothing: the bench has no watcher to suppress.
+struct NoEcho;
+
+impl serat_core::EchoGuard for NoEcho {
+    fn record_echo(&self, _hash: serat_core::ContentHash) {}
+}
+
+/// Time one content save of `path` through the incremental path (parse, submit, commit),
+/// the work NFR-PRF-03 budgets. Re-saves the unchanged file, which the writer applies in
+/// full: there is no skip-if-same-hash.
+fn save_row(
+    name: &str,
+    index_dir: &Path,
+    vault_root: &Path,
+    path: &str,
+    iterations: usize,
+) -> Result<Row, String> {
+    use serat_core::IndexWriter as _;
+    let source = serat_vault::Vault::open(vault_root).map_err(|e| format!("open vault: {e}"))?;
+    let handle = serat_index::IndexHandle::open(index_dir).map_err(|e| e.to_string())?;
+    let path = serat_core::VaultPath::new(path).map_err(|e| format!("{path:?}: {e}"))?;
+    let row = time(name, Some(50.0), iterations, || {
+        serat_index::apply(
+            &handle.writer(),
+            &source,
+            &serat_parse::CommonMarkParser,
+            &NoEcho,
+            &path,
+        )
+        .expect("apply");
+        handle.writer().flush().expect("flush");
+        1
+    });
+    handle.close().map_err(|e| e.to_string())?;
+    Ok(row)
+}
+
+/// Many notes sharing a file name: 300 `dN/index.md`, 300 `dN/README.md` and a root
+/// `index.md`, with 300 notes linking `[[index]]` and `[[README]]`. Saving any of the
+/// namesakes is the worst case for link re-resolution.
+fn duplicate_names_rows(iterations: usize) -> Result<Vec<Row>, String> {
+    let root = std::env::temp_dir().join(format!("serat-bench-dupnames-{}", std::process::id()));
+    let index_dir =
+        std::env::temp_dir().join(format!("serat-bench-dupnames-ix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&index_dir);
+    let write = |rel: &str, body: &str| -> Result<(), String> {
+        let file = root.join(rel);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        std::fs::write(file, body).map_err(|e| e.to_string())
+    };
+    write("index.md", "# Root index\n")?;
+    for i in 0..300 {
+        write(&format!("d{i}/index.md"), &format!("# Index {i}\n"))?;
+        write(&format!("d{i}/README.md"), &format!("# Readme {i}\n"))?;
+        write(
+            &format!("n{i}.md"),
+            &format!("# Linker {i}\n\n[[index]] and [[README]] and [[d{i}/index]]\n"),
+        )?;
+    }
+    let source = serat_vault::Vault::open(&root).map_err(|e| format!("open vault: {e}"))?;
+    serat_index::rebuild(&source, &serat_parse::CommonMarkParser, &root, &index_dir)
+        .map_err(|e| format!("rebuild: {e}"))?;
+    let mut rows = Vec::new();
+    for (what, path) in [
+        (
+            "the root index.md, the shortest of 301 namesakes, 300 inbound",
+            "index.md",
+        ),
+        ("d7/index.md, one of 301 namesakes", "d7/index.md"),
+        ("d7/README.md, one of 300 namesakes", "d7/README.md"),
+    ] {
+        rows.push(save_row(
+            &format!("Save of {what}"),
+            &index_dir,
+            &root,
+            path,
+            iterations,
+        )?);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&index_dir);
+    Ok(rows)
+}
+
+fn measure(
+    db: &Path,
+    index_dir: &Path,
+    vault_root: &Path,
+    vault_name: &str,
+    iterations: usize,
+) -> Result<(), String> {
     // Discovery runs on its own read-write connection (a temp vocabulary table), never
     // on the Reader under test.
     let probe = Connection::open(db).map_err(|e| e.to_string())?;
-    let terms = terms_by_frequency(&probe, 1100)?;
+    probe
+        .execute_batch("CREATE VIRTUAL TABLE temp.v USING fts5vocab(main, blocks_fts, 'row')")
+        .map_err(|e| format!("fts5vocab: {e}"))?;
+    let blocks: i64 = probe
+        .query_row("SELECT count(*) FROM blocks", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    // Terms matching more than 20% of blocks are reported, not judged (the ruling on
+    // #15): a term in a fifth of the vault is not something a person searches for.
+    let (top_term, top_n) = terms_by_frequency(&probe, i64::MAX, 1)?
+        .into_iter()
+        .next()
+        .ok_or("the index has no terms")?;
+    let terms = terms_by_frequency(&probe, blocks / 5, 1100)?;
     if terms.len() < 3 {
         return Err("the index has too few terms to build a query set".to_owned());
     }
-    let commonest = terms[0].clone();
+    let (commonest, commonest_n) = terms[0].clone();
     let dense = one_string(
         &probe,
         "SELECT p.path FROM links l JOIN notes p ON p.id = l.dst_note
@@ -197,78 +303,119 @@ fn measure(db: &Path, vault_name: &str, iterations: usize) -> Result<(), String>
     let reader = Reader::open(db).map_err(|e| e.to_string())?;
     let mut rows: Vec<Row> = Vec::new();
 
-    // R1: the single most common term, alone (the worst case) ...
+    // R1, reported with no expectation: the single most common term of the whole index,
+    // and the most common one inside the 20% line.
     rows.push(time(
-        &format!("R1 worst case: most common term {commonest:?}, top 50"),
-        100.0,
+        &format!(
+            "R1 top term {top_term:?} ({top_n} of {blocks} blocks match), top 50 (no expectation)"
+        ),
+        None,
+        iterations,
+        || search_rows(&reader, &top_term, 0, 50),
+    ));
+    rows.push(time(
+        &format!(
+            "R1 most common term inside the 20% line {commonest:?} ({commonest_n} blocks), top 50"
+        ),
+        Some(100.0),
         iterations,
         || search_rows(&reader, &commonest, 0, 50),
     ));
-    // ... and a query set spread across the vocabulary, reported as one p95.
+    // The same two reads on the vault's search connection, whose progress handler
+    // checks the search generation every 1,000 VM instructions. The cost of the
+    // handler is the difference between these rows and the two above.
+    let search_conn = serat_index::SearchConn::open(db).map_err(|e| e.to_string())?;
+    let searched = Reader::open(db)
+        .map_err(|e| e.to_string())?
+        .with_search(search_conn);
+    rows.push(time(
+        &format!("R1 top term {top_term:?}, top 50, on the search connection (with progress handler; no expectation)"),
+        None,
+        iterations,
+        || search_rows(&searched, &top_term, 0, 50),
+    ));
+    rows.push(time(
+        &format!("R1 {commonest:?}, top 50, on the search connection (with progress handler)"),
+        Some(100.0),
+        iterations,
+        || search_rows(&searched, &commonest, 0, 50),
+    ));
+    // ... and a query set spread across the 20%-restricted vocabulary, as one p95.
     let picks = [0usize, 1, 9, 99, 499, 999];
     let mut set = Samples::new();
     let mut set_rows = 0;
     for &i in picks.iter().filter(|&&i| i < terms.len()) {
-        let q = &terms[i];
-        let r = time("", 100.0, iterations, || search_rows(&reader, q, 0, 50));
+        let q = &terms[i].0;
+        let r = time("", None, iterations, || search_rows(&reader, q, 0, 50));
         for v in r.samples.values() {
             set.push(std::time::Duration::from_secs_f64(v / 1000.0));
         }
         set_rows += r.rows;
     }
-    let pair = format!("{} {}", terms[0], terms[1]);
-    let r = time("", 100.0, iterations, || search_rows(&reader, &pair, 0, 50));
+    let pair = format!("{} {}", terms[0].0, terms[1].0);
+    let r = time("", None, iterations, || search_rows(&reader, &pair, 0, 50));
     for v in r.samples.values() {
         set.push(std::time::Duration::from_secs_f64(v / 1000.0));
     }
     rows.push(Row {
         name: format!(
-            "R1 query set: terms ranked {picks:?} by frequency + the AND of the top two ({} queries)",
+            "R1 query set (terms matching <= 20% of blocks): terms ranked {picks:?} by frequency + the AND of the top two ({} queries)",
             picks.len() + 1
         ),
         samples: set,
         rows: set_rows + r.rows,
-        expectation_ms: 100.0,
+        expectation_ms: Some(100.0),
     });
 
     // R2: the highest in-degree note.
     rows.push(time(
         &format!("R2 backlinks of {dense:?} (in-degree {indegree})"),
-        20.0,
+        Some(20.0),
         iterations,
         || reader.backlinks(&dense).map_or(0, |b| b.len()),
     ));
 
-    // R3: one page, then the whole 500-row lookup paged by 50.
+    // R3: one page of 50, then the whole 500-row lookup in one LIMIT 500 statement.
     let by_key = format!("[{big_key}:{near_500}]");
     rows.push(time(
         &format!("R3 {by_key} ({near_500_n} rows), first page of 50"),
-        20.0,
+        Some(20.0),
         iterations,
         || search_rows(&reader, &by_key, 0, 50),
     ));
     rows.push(time(
-        &format!("R3 {by_key}, paged to 500 rows"),
-        20.0,
+        &format!("R3 {by_key}, LIMIT 500"),
+        Some(20.0),
         iterations,
-        || paged_rows(&reader, &by_key, 500),
+        || search_rows(&reader, &by_key, 0, 500),
     ));
     let by_type = format!("[type:{type_val}]");
     rows.push(time(
-        &format!("R4 {by_type} ({type_n} rows, exact), paged to 500 rows"),
-        20.0,
+        &format!("R4 {by_type} ({type_n} rows, exact), LIMIT 500"),
+        Some(20.0),
         iterations,
-        || paged_rows(&reader, &by_type, 500),
+        || search_rows(&reader, &by_type, 0, 500),
     ));
 
-    // R1 + R3: the commonest term filtered by a property.
+    // R1 + R3: the commonest in-line term filtered by a property.
     let combined = format!("{commonest} {by_key}");
     rows.push(time(
         &format!("R1+R3 {combined:?}, top 50"),
-        100.0,
+        Some(100.0),
         iterations,
         || search_rows(&reader, &combined, 0, 50),
     ));
+    drop(reader);
+
+    // NFR-PRF-03 stand-ins: one save of the highest in-degree note of this vault.
+    rows.push(save_row(
+        &format!("Save of {dense:?}, the highest in-degree note ({indegree} inbound links)"),
+        index_dir,
+        vault_root,
+        &dense,
+        iterations,
+    )?);
+    rows.extend(duplicate_names_rows(iterations)?);
 
     println!(
         "P1 read paths · {vault_name} vault · {iterations} timed runs per read (expectations, not gates)"
@@ -276,20 +423,21 @@ fn measure(db: &Path, vault_name: &str, iterations: usize) -> Result<(), String>
     println!();
     for row in &rows {
         let p95 = row.samples.percentile(0.95);
-        let verdict = if p95 <= row.expectation_ms {
-            "within"
-        } else {
-            "OVER (a finding for architect and product-analyst, not a red build)"
+        let (expectation, verdict) = match row.expectation_ms {
+            None => ("none".to_owned(), ""),
+            Some(e) if p95 <= e => (format!("{e:.0} ms"), ": within"),
+            Some(e) => (
+                format!("{e:.0} ms"),
+                ": OVER (a finding for architect and product-analyst, not a red build)",
+            ),
         };
         println!(
-            "{}\n    p50 {:.2} ms · p95 {:.2} ms · max {:.2} ms · {} rows · expectation {:.0} ms: {}",
+            "{}\n    p50 {:.2} ms · p95 {:.2} ms · max {:.2} ms · {} rows · expectation {expectation}{verdict}",
             row.name,
             row.samples.percentile(0.5),
             p95,
             row.samples.max(),
             row.rows,
-            row.expectation_ms,
-            verdict
         );
     }
     Ok(())

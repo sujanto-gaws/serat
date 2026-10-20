@@ -86,7 +86,8 @@ pub(crate) const RESOLVE_INBOUND: &str = concat!(
 /// point at another note, because the shortest-path rule may now prefer the note that
 /// just appeared (architecture §4.5 A2). `?1..?4` are the four folded spellings and
 /// `?5..?8` those plus `.md`: the targets a link may carry to reach a note spelled any
-/// of them.
+/// of them. `?9` is the id of the note that appeared: links already pointing at it
+/// are not rewritten.
 ///
 /// The rivals are found through `ix_notes_path_fold` and `ix_notes_file_name`, and
 /// their inbound links through `ix_links_dst`; no index on `links(dst_fold)` beyond
@@ -96,6 +97,7 @@ pub(crate) const RESOLVE_RIVALS: &str = concat!(
     "UPDATE links SET dst_note = ",
     best_note!(),
     " WHERE kind <> 'tag' AND dst_fold IN (?1, ?2, ?3, ?4)
+        AND dst_note <> ?9
         AND dst_note IN (
             SELECT id FROM notes
              WHERE path_fold IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)

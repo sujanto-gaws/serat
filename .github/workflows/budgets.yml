@@ -131,6 +131,30 @@ jobs:
           path: bench/out/budgets/
           if-no-files-found: ignore
 
+  # Report-only (task #47): architecture §4.5 states latency *expectations* for the
+  # P1 read paths, not budgets, so this job never fails on a slow number. It fails
+  # only if it cannot measure. It exists so the numbers are produced on every run and
+  # land in an artifact rather than in someone's terminal.
+  p1-read-paths:
+    name: "FR-NAV-02 / NFR-PRF-03 · P1 read paths and link-resolving saves (report only)"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure and print the report
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin p1-read-paths -- --vault 20k | tee bench/out/p1-read-paths.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-read-paths
+          path: bench/out/p1-read-paths.txt
+          if-no-files-found: ignore
+
   # NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
   # confirms each budget has an asserting job". This job is that review, run
   # automatically, so a budget added to the PRD without a job fails the build

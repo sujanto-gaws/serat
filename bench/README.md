@@ -29,7 +29,7 @@ cargo run --release -p budget --bin prf03-save-to-index -- --profile reference
 cargo run --release -p budget --bin prf01-cold-start   -- --profile reference
 ```
 
-The P1 read paths (search, backlinks, property lookup) have latency *expectations* in architecture §4.5 and no budget, so their job reports and never fails the build on a miss:
+The P1 read paths (search, backlinks, property lookup) have latency *expectations* in architecture §4.5 and no budget, so the `p1-read-paths` job in `.github/workflows/budgets.yml` reports (the text lands in the `p1-read-paths` artifact) and never fails the build on a miss. It also times a save of the highest in-degree note and of namesake-heavy notes, the link re-resolution cost NFR-PRF-03 will assert once `prf03-save-to-index` can run:
 
 ```
 cargo run --release -p budget --bin p1-read-paths -- --vault 20k   # and --vault 50k
