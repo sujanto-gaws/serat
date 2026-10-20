@@ -107,6 +107,16 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::refused_names,
+            commands::create_folder,
+            commands::get_ui_settings,
+            commands::set_live_preview,
+            commands::set_keybinding,
+            commands::search,
+            commands::backlinks,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
         ])
         .build(tauri::generate_context!())
         .expect(
@@ -217,4 +227,42 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
         !matches!(&usable, Err(e) if is_acl_rejection(e)),
         "mark_vault_usable was refused by the ACL layer: {usable:?}"
     );
+
+    // The P1 grants: each must pass the ACL layer (a domain failure is fine, an ACL
+    // rejection is not), and `create_folder` must actually create.
+    let folder = invoke(
+        &webview,
+        "create_folder",
+        json!({ "args": { "path": "made" } }),
+    );
+    assert!(
+        !matches!(&folder, Err(e) if is_acl_rejection(e)),
+        "create_folder was refused by the ACL layer: {folder:?}"
+    );
+    folder.expect("create_folder must succeed once past the ACL");
+    assert!(vault.join("made").is_dir());
+
+    for (cmd, body) in [
+        ("refused_names", json!({})),
+        ("get_ui_settings", json!({})),
+        ("gitignore_offer_status", json!({})),
+        (
+            "search",
+            json!({ "args": { "query": "x", "offset": 0, "limit": 5 } }),
+        ),
+        ("backlinks", json!({ "args": { "path": "existing.md" } })),
+        ("decline_gitignore_offer", json!({})),
+        ("append_gitignore_entry", json!({})),
+        ("set_live_preview", json!({ "args": { "enabled": true } })),
+        (
+            "set_keybinding",
+            json!({ "args": { "command_id": "x.y", "change": { "kind": "reset" } } }),
+        ),
+    ] {
+        let answer = invoke(&webview, cmd, body);
+        assert!(
+            !matches!(&answer, Err(e) if is_acl_rejection(e)),
+            "{cmd} was refused by the ACL layer: {answer:?}"
+        );
+    }
 }

@@ -46,8 +46,11 @@ mod acl_manifest;
 pub mod cli;
 pub mod commands;
 pub mod error;
+pub mod folder;
+pub mod gitignore;
 pub mod index;
 mod nav_guard;
+pub mod reads;
 mod security_config;
 pub mod settings;
 pub mod startup;
@@ -262,6 +265,16 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::refused_names,
+            commands::create_folder,
+            commands::get_ui_settings,
+            commands::set_live_preview,
+            commands::set_keybinding,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
+            commands::search,
+            commands::backlinks,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();
