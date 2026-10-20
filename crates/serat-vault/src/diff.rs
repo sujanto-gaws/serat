@@ -149,6 +149,22 @@ fn myers(a: &[u32], b: &[u32], deadline: Instant) -> Option<Vec<Hunk>> {
     Some(hunks)
 }
 
+/// Whether deleting base lines `first..end` as `(first, 0)..(end, 0)` would leave a lone
+/// `\r` (the terminator of line `first - 1`) directly before a `\n` (the first byte of
+/// line `end`). Requires `0 < first < end < line_count`.
+fn lone_cr_then_lf(base: &str, ia: &LineIndex, first: usize, end: usize) -> bool {
+    let bytes = base.as_bytes();
+    let (Some((_, prev_end)), Some((next_start, _))) = (
+        ia.content_range((first - 1) as u32),
+        ia.content_range(end as u32),
+    ) else {
+        return false;
+    };
+    bytes.get(prev_end) == Some(&b'\r')
+        && bytes.get(prev_end + 1) != Some(&b'\n')
+        && bytes.get(next_start) == Some(&b'\n')
+}
+
 /// Position of byte offset `k` in `text`, where `text` begins at column 0 of
 /// line `first_line`.
 fn pos_in(text: &str, k: usize, first_line: usize) -> Position {
@@ -158,7 +174,7 @@ fn pos_in(text: &str, k: usize, first_line: usize) -> Position {
     Position::new((first_line + newlines) as u32, utf16_len(tail))
 }
 
-fn hunk_to_edit(la: &[&str], lb: &[&str], h: Hunk) -> Edit {
+fn hunk_to_edit(base: &str, ia: &LineIndex, la: &[&str], lb: &[&str], h: Hunk) -> Edit {
     let na = la.len();
     let a_text = la[h.a.0..h.a.1].join("\n");
     let b_text = lb[h.b.0..h.b.1].join("\n");
@@ -179,6 +195,17 @@ fn hunk_to_edit(la: &[&str], lb: &[&str], h: Hunk) -> Edit {
     if h.b.0 == h.b.1 {
         // Pure deletion of whole lines, with one separator.
         return if h.a.1 < na {
+            // The shape `(a.0, 0)..(a.1, 0)` joins the text before the run to the text
+            // after it. If the terminator before the run is a lone `\r` and the line
+            // after it starts with `\n`, those two would fuse into one `\r\n` and the
+            // patch would be refused (`LineEndingsWouldFuse`). The equivalent shape
+            // `(a.0 - 1, end)..(a.1 - 1, end)` takes the previous terminator out
+            // instead, leaving the run's own last terminator as the separator, and
+            // fuses with nothing. Only chosen when the first shape would fuse, so a
+            // note's terminators are otherwise left exactly as they are.
+            if h.a.0 > 0 && lone_cr_then_lf(base, ia, h.a.0, h.a.1) {
+                return Edit::new(end_of(h.a.0 - 1), end_of(h.a.1 - 1), String::new());
+            }
             Edit::new(
                 Position::new(h.a.0 as u32, 0),
                 Position::new(h.a.1 as u32, 0),
@@ -293,7 +320,7 @@ pub fn edit_script_within(base: &str, other: &str, deadline: Duration) -> EditSc
     EditScript {
         edits: hunks
             .into_iter()
-            .map(|h| hunk_to_edit(&la, &lb, h))
+            .map(|h| hunk_to_edit(base, &ia, &la, &lb, h))
             .collect(),
         whole: false,
     }
@@ -322,7 +349,14 @@ mod tests {
         }
     }
 
-    fn random_text(rng: &mut Rng, sep: &str) -> String {
+    /// A line terminator drawn from the three CodeMirror splits on.
+    fn any_sep(rng: &mut Rng) -> &'static str {
+        ["\n", "\r\n", "\r"][rng.below(3)]
+    }
+
+    /// Lines joined by `sep`, or, when `sep` is `None`, by a terminator drawn
+    /// independently for every gap (a mixed-ending note).
+    fn random_text(rng: &mut Rng, sep: Option<&str>) -> String {
         const WORDS: [&str; 7] = [
             "alpha",
             "beta",
@@ -333,10 +367,14 @@ mod tests {
             "- item",
         ];
         let lines = 1 + rng.below(12);
-        (0..lines)
-            .map(|_| WORDS[rng.below(WORDS.len())])
-            .collect::<Vec<_>>()
-            .join(sep)
+        let mut out = String::new();
+        for i in 0..lines {
+            if i > 0 {
+                out.push_str(sep.unwrap_or_else(|| any_sep(rng)));
+            }
+            out.push_str(WORDS[rng.below(WORDS.len())]);
+        }
+        out
     }
 
     fn mutate(rng: &mut Rng, text: &str, sep: &str) -> String {
@@ -359,10 +397,11 @@ mod tests {
     fn applying_the_script_reproduces_the_other_text_for_random_pairs() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         for round in 0..2000 {
-            let sep = ["\n", "\r\n"][round % 2];
+            // Uniform LF, uniform CRLF, uniform lone CR, then mixed (half the rounds).
+            let sep = [Some("\n"), Some("\r\n"), Some("\r"), None, None, None][round % 6];
             let base = random_text(&mut rng, sep);
             let other = if round % 5 == 0 {
-                random_text(&mut rng, "\n")
+                random_text(&mut rng, Some("\n"))
             } else {
                 mutate(&mut rng, &base, "\n")
             };
@@ -372,8 +411,62 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{e}: {base:?} -> {other:?}: {:?}", script.edits));
                 assert_eq!(norm(&got), norm(&other), "{base:?} -> {other:?}");
                 // Endings of untouched lines survive: a CRLF base stays CRLF.
-                if base.contains("\r\n") {
+                if sep == Some("\r\n") && base.contains("\r\n") {
                     assert!(!got.replace("\r\n", "").contains('\n'), "{got:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_a_line_after_a_lone_cr_uses_the_shape_that_cannot_fuse() {
+        // Code-reviewer-3's S2 on #33: `(1,0)..(2,0)` would leave `\r` before `\n`.
+        let base = "a\rx\n\nc";
+        let other = "a\n\nc";
+        let script = edit_script(base, other);
+        assert_eq!(
+            script.edits,
+            vec![Edit::new(
+                Position::new(0, 1),
+                Position::new(1, 1),
+                String::new()
+            )]
+        );
+        let got = apply_edits(base, &script.edits, "t.md").unwrap();
+        assert_eq!(norm(&got), norm(other));
+        // The accepted shape is untouched when nothing would fuse.
+        let plain = edit_script("a\rx\ny\nc", "a\ry\nc");
+        assert_eq!(
+            plain.edits,
+            vec![Edit::new(
+                Position::new(1, 0),
+                Position::new(2, 0),
+                String::new()
+            )]
+        );
+    }
+
+    #[test]
+    fn every_whole_line_deletion_in_a_mixed_ending_note_applies() {
+        // Exhaustive over the shape: three terminators in every slot of a small note,
+        // each interior line deleted in turn (the fuse needs an empty line to follow).
+        let seps = ["\n", "\r\n", "\r"];
+        for a in seps {
+            for b in seps {
+                for c in seps {
+                    for words in [["a", "x", "", "c"], ["a", "", "", "c"], ["", "x", "", ""]] {
+                        let base =
+                            format!("{}{a}{}{b}{}{c}{}", words[0], words[1], words[2], words[3]);
+                        for del in 0..words.len() {
+                            let mut kept: Vec<&str> = words.to_vec();
+                            kept.remove(del);
+                            let other = kept.join("\n");
+                            let script = edit_script_within(&base, &other, Duration::from_secs(5));
+                            let got = apply_edits(&base, &script.edits, "t.md")
+                                .unwrap_or_else(|e| panic!("{e}: {base:?} -> {other:?}"));
+                            assert_eq!(norm(&got), other, "{base:?} -> {other:?}");
+                        }
+                    }
                 }
             }
         }

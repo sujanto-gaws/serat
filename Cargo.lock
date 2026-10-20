@@ -3249,7 +3249,6 @@ dependencies = [
  "blake3",
  "notify",
  "serat-core",
- "serde",
  "tempfile",
 ]
 
