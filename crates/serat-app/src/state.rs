@@ -597,7 +597,8 @@ impl AppState {
     /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] as
     /// [`crate::gitignore::append`].
     pub fn append_gitignore_entry(&self) -> Result<GitignoreAppended, IpcError> {
-        crate::gitignore::append(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::append(&vault)
     }
 
     /// `decline_gitignore_offer`. Writes only inside `.serat/`.
@@ -606,7 +607,8 @@ impl AppState {
     ///
     /// As [`AppState::append_gitignore_entry`].
     pub fn decline_gitignore_offer(&self) -> Result<(), IpcError> {
-        crate::gitignore::decline(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::decline(&vault)
     }
 
     /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than

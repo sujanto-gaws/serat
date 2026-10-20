@@ -458,9 +458,15 @@ fn an_external_write_between_the_temp_file_and_the_rename_is_refused() {
         "1".to_owned(),
     )];
     let target = dir.path().join("note.md");
-    let result = vault.write_patch_hooked(&path, base_hash, &edits, || {
-        fs::write(&target, b"external edit\n").unwrap();
-    });
+    let result = vault.write_patch_hooked(
+        &path,
+        base_hash,
+        &edits,
+        || {
+            fs::write(&target, b"external edit\n").unwrap();
+        },
+        || {},
+    );
     assert!(
         matches!(result, Err(VaultError::StaleHash { .. })),
         "{result:?}"
@@ -484,7 +490,7 @@ fn a_crash_after_the_temp_file_is_written_leaves_the_old_note_and_the_next_save_
         "1".to_owned(),
     )];
     let crashed = catch_unwind(AssertUnwindSafe(|| {
-        let _ = vault.write_patch_hooked(&path, base_hash, &edits, || panic!("power cut"));
+        let _ = vault.write_patch_hooked(&path, base_hash, &edits, || panic!("power cut"), || {});
     }));
     assert!(crashed.is_err());
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), old);
