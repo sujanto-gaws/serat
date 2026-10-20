@@ -454,6 +454,7 @@ impl AppState {
                 vault_id: String::new(),
                 state: IndexState::Opening,
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
+                refused_names: None,
             },
         }
     }

@@ -156,6 +156,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             vault_id: self.vault_id.clone(),
             state: inner.state.clone(),
             since_process_start_ms: inner.since_process_start_ms,
+            refused_names: None, // wired by tauri-app-dev from Vault::refusals() (contracts/ipc.rs)
         }
     }
 
@@ -206,6 +207,7 @@ impl<S: StatusSink> StatusPublisher<S> {
                 vault_id: self.vault_id.clone(),
                 state: inner.state.clone(),
                 since_process_start_ms: inner.since_process_start_ms,
+                refused_names: None, // wired by tauri-app-dev from Vault::refusals() (contracts/ipc.rs)
             }
         };
 
