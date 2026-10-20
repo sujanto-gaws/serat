@@ -154,6 +154,9 @@ fn a_walk_found_tree_completes_with_source_walk_and_matches_the_vault_walk() {
         stream[stream.len() - 1],
         TreeOut::WalkSettled { empty_folders: 0 }
     );
+    let progress = session.progress();
+    assert!(progress.root_sent && progress.settled);
+    assert_eq!(progress.complete, Some((expected, TreeSource::Walk)));
 }
 
 #[test]
@@ -319,4 +322,35 @@ fn creates_and_deletes_racing_the_walk_never_leave_the_front_end_wrong() {
             );
         }
     }
+}
+
+#[test]
+fn progress_tells_the_app_what_a_front_end_mark_may_claim() {
+    // The hook for mark_tree (NFR-PRF-01, ADR-0015 §3): a FirstScreen stamp is only
+    // honest once the root listing has been written, and a Complete stamp only once
+    // Complete has, with the count the budget job compares against the manifest.
+    let (_dir, vault) = fixture();
+    let (session, _log) = session();
+    let none = session.progress();
+    assert!(!none.root_sent && none.complete.is_none() && !none.settled);
+
+    let rows: Vec<(String, TreeKind)> = vault
+        .walk()
+        .expect("walk")
+        .into_iter()
+        .map(|e| (e.path.to_string(), TreeKind::Note))
+        .collect();
+    assert!(session.populate_from_index(rows.iter().map(|(p, k)| (p.as_str(), *k))));
+    let after_index = session.progress();
+    assert!(after_index.root_sent && !after_index.settled);
+    assert_eq!(after_index.complete, Some((4, TreeSource::Index)));
+
+    session.populate_from_walk(&vault).expect("walk");
+    let after_walk = session.progress();
+    assert!(after_walk.settled);
+    assert_eq!(
+        after_walk.complete,
+        Some((4, TreeSource::Index)),
+        "the walk must not rewrite which source populated the tree"
+    );
 }

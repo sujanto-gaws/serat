@@ -50,7 +50,7 @@ pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
-pub use tree::{TreeOut, TreeSession, TreeSource, WalkSummary};
+pub use tree::{TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 

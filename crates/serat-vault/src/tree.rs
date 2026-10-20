@@ -185,6 +185,17 @@ impl Vault {
     }
 }
 
+/// What the session has delivered, for a caller validating a front-end mark against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeProgress {
+    /// The first listing (the root) has been written to the sink.
+    pub root_sent: bool,
+    /// The initial population finished: its file count and source.
+    pub complete: Option<(u32, TreeSource)>,
+    /// `WalkSettled` has been written.
+    pub settled: bool,
+}
+
 struct Inner {
     model: TreeModel,
     sink: Box<dyn FnMut(TreeOut) + Send>,
@@ -226,7 +237,9 @@ pub struct TreeSession {
 
 impl fmt::Debug for TreeSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TreeSession").finish_non_exhaustive()
+        f.debug_struct("TreeSession")
+            .field("progress", &self.progress())
+            .finish_non_exhaustive()
     }
 }
 
@@ -247,6 +260,23 @@ impl TreeSession {
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What has been delivered so far.
+    ///
+    /// This is the hook for the tree mark (NFR-PRF-01, ADR-0015 §3): the front end
+    /// stamps `tree_first_screen` and `tree_complete` after painting, through
+    /// `mark_tree`, and serat-app reads this to validate the stamp: `FirstScreen`
+    /// requires `root_sent`, `Complete` requires `complete`, and the budget job's
+    /// check of `entries_in_model` is against `complete.0`.
+    #[must_use]
+    pub fn progress(&self) -> TreeProgress {
+        let inner = self.lock();
+        TreeProgress {
+            root_sent: inner.root_sent,
+            complete: inner.complete,
+            settled: inner.settled,
+        }
     }
 
     /// The warm path: populate from the index's `(path, kind)` rows, root listing
