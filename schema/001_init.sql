@@ -1,7 +1,7 @@
 -- Serat index schema — 001_init.sql
 --
--- Serves:  FR-VLT-02, FR-STR-03, FR-NAV-02, FR-NAV-04, NFR-PRF-03, NFR-PRF-04,
---          NFR-PRF-05, NFR-REL-02
+-- Serves:  FR-VLT-02, FR-STR-03, FR-NAV-02, FR-NAV-04, FR-BIN-02, NFR-CMP-01,
+--          NFR-PRF-03, NFR-PRF-04, NFR-PRF-05, NFR-REL-02
 -- Honours: ADR-0001 (single-writer actor), ADR-0002 (rebuild instead of migrate),
 --          ADR-0003 (field pivot by LEFT JOIN, typed value columns)
 -- Design:  docs/03-design/architecture.md §3.4, §4; PRD appendix "Data dictionary"
@@ -17,21 +17,6 @@
 -- phase that adds them:
 --   P1  assets(note_id, mime, bytes, page_count, extractor, extractor_ver,
 --       content_hash, extracted_at, needs_ocr)      — FR-BIN-01, FR-BIN-02
---       ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL
---         — R3's sidecar-to-asset join (architecture §4.5); lands with the
---         writer that fills sidecar_path (task #17), not before
---       case-insensitive link resolution (§9.3, §4.5), all in ONE commit with
---         the resolver's comparisons and the rebuild bench, because any one
---         alone turns the per-link join into a scan (F-371). Per-character
---         Unicode lowercasing plus final sigma to sigma, done in Rust
---         (serat-core fold_case, compositional: fold(a+b) = fold(a)+fold(b)),
---         stored, so every read stays one statement; NOT COLLATE NOCASE, which
---         folds ASCII only. links.dst_fold is the one per-link cost and is what
---         task #15's rebuild bench must clear; no fallback is designed:
---           notes.file_name_fold, notes.path_fold, links.dst_fold   (new)
---           ix_notes_file_name            -> ON notes(file_name_fold)
---           ix_notes_path_fold ON notes(path_fold)                (new)
---           ix_links_unresolved           -> ON links(dst_fold)
 --   Withdrawn from this list by architecture §4.5 (task #4), reasons kept
 --   because a reason for an absence is the one a remover reads:
 --       ix_links_dst_path — shipped as the partial ix_links_unresolved; a full
@@ -108,7 +93,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 
 -- ============================================================================
 -- Tables
@@ -164,6 +149,17 @@ CREATE TABLE notes (
     -- and matches `file_name = target` directly. Assets are linkable by §7.3,
     -- so excluding them here silently drops every embed (F-313).
     file_name    TEXT,
+    -- Case-insensitive link resolution (user_version 6, task #15; architecture §4.5,
+    -- §9.3; NFR-CMP-01). fold_case() of file_name and of path, computed in RUST
+    -- (serat_core::fold_case: per-character Unicode lowercasing, final sigma to
+    -- sigma) and stored, so the resolver is a binary `=` against an ordinary index
+    -- and no SQL function is registered (C-03). NOT COLLATE NOCASE, which folds ASCII
+    -- only. The columns, ix_notes_file_name, ix_notes_path_fold, links.dst_fold,
+    -- ix_links_unresolved and EVERY comparison in crates/serat-index/src/resolve.rs
+    -- change together: any one left on the raw column turns the per-link join into a
+    -- scan (F-371). Changing fold_case is a schema change: drop and rebuild (ADR-0002).
+    file_name_fold TEXT,
+    path_fold    TEXT,
     title        TEXT,                     -- frontmatter title, else H1, else filename
     type         TEXT,                     -- declared type name; NULL = untyped (P2)
     lens         TEXT,                     -- role lens (P3)
@@ -262,6 +258,7 @@ CREATE TABLE links (
     src_note      INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     src_block     INTEGER REFERENCES blocks(id) ON DELETE CASCADE,
     dst_path      TEXT,                    -- raw target as written, before resolution
+    dst_fold      TEXT,                    -- fold_case(dst_path), computed in Rust: what resolution compares
     dst_note      INTEGER REFERENCES notes(id) ON DELETE SET NULL,
     dst_block_ref TEXT,                    -- targeted ^id
     kind          TEXT NOT NULL CHECK (kind IN ('wiki','embed','md','tag','unresolved')),
@@ -363,7 +360,18 @@ CREATE INDEX ix_notes_kind ON notes(kind);
 -- Link resolution matches a bare `[[wikilink]]` against this. Without it the
 -- join is a full scan of notes per link and the rebuild does not finish inside
 -- NFR-PRF-04's budget (F-312).
-CREATE INDEX ix_notes_file_name ON notes(file_name) WHERE file_name IS NOT NULL;
+CREATE INDEX ix_notes_file_name ON notes(file_name_fold) WHERE file_name_fold IS NOT NULL;
+
+-- The `n.path = links.dst_path` comparisons, on the folded column. notes.path's UNIQUE
+-- index stays binary and keeps its own job. 20,000 entries, not the 217,000 links.
+CREATE INDEX ix_notes_path_fold ON notes(path_fold);
+
+-- R3's sidecar-to-asset join (architecture §4.5, FR-BIN-02): "which asset has this
+-- note as its sidecar". At most one entry per asset (200 in the benchmark vault).
+-- Declared with R3, the first reader of it, although the writer that fills
+-- `sidecar_path` is task #17: an empty partial index costs the rebuild nothing, and
+-- without it the join is a scan of `notes` per result row.
+CREATE INDEX ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL;
 
 -- The pivot join, one lookup per referenced field key per row (ADR-0003).
 -- val_text is carried so the common untyped projection is answered from the
@@ -396,11 +404,11 @@ CREATE INDEX ix_fields_key_text ON fields(key, val_text) WHERE val_text IS NOT N
 CREATE INDEX ix_links_src ON links(src_note);
 CREATE INDEX ix_links_dst ON links(dst_note);
 
--- What the re-resolution pass reads (task #13): scoped by dst_path when a note is
+-- What the re-resolution pass reads (task #13): scoped by dst_fold when a note is
 -- saved, so it can find every link that might now name it without a table scan, and
 -- kept partial on the predicate the comment above CREATE TABLE links pins as the
 -- correct one -- dst_note IS NULL AND kind <> 'tag' -- so a tag never enters it.
-CREATE INDEX ix_links_unresolved ON links(dst_path)
+CREATE INDEX ix_links_unresolved ON links(dst_fold)
     WHERE dst_note IS NULL AND kind <> 'tag';
 
 -- Every open-task query, and it is always ordered by due date. Partial on
@@ -409,15 +417,17 @@ CREATE INDEX ix_links_unresolved ON links(dst_path)
 CREATE INDEX ix_tasks_open ON tasks(due, note_id) WHERE done = 0;
 
 -- ============================================================================
--- Full-text search (FR-NAV-02)
+-- Full-text search (FR-NAV-02 for note bodies; FR-NAV-08 for extracted binary content)
 -- ============================================================================
 -- External content: the text lives once, in blocks. An external-content FTS5
 -- table over blocks is what makes a phrase inside a PDF and a phrase inside a
 -- note come out of the same search box with no second code path — an extracted
--- block is a block (§7).
+-- block is a block (§7). The note half is FR-NAV-02 (P1); the PDF half is
+-- FR-NAV-08 (P2), which split from it at the owner's P1 ruling.
 --
 -- rowid = blocks.id, so a hit joins straight back to its note, byte range or
--- locator, which is what "a snippet and a precise location" in FR-NAV-02 means.
+-- locator, which is what "a snippet and a precise location" in FR-NAV-02 (notes)
+-- and FR-NAV-08 (binaries, FR-BIN-06's locator) means.
 --
 -- Not here on purpose: prefix='2 3'. Search-as-you-type (NFR-PRF-06) wants it and
 -- it costs rebuild time and file size, both of which P0 is measuring. P1 adds it

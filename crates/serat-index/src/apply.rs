@@ -18,12 +18,13 @@
 //! the top of the file rather than beside one of the eight. The cache capacity is
 //! pinned in `schema::STATEMENT_CACHE` for the same reason: outgrowing it is silent.
 
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serat_core::{
     Block, BlockKind, Field, FieldValue, IndexError, IndexOp, Link, LinkKind, NoteMeta, ParsedNote,
-    Task, VaultPath,
+    Task, VaultPath, fold_case,
 };
 
+use crate::resolve;
 use crate::schema::sqlite;
 
 /// How many rows a batch touched, so the caller can decide about `ANALYZE`.
@@ -63,13 +64,19 @@ pub(crate) fn apply(
         }
         IndexOp::Remove { path } => {
             let gone = remove(tx, path)?;
+            // B1 (architecture §4.5): `ON DELETE SET NULL` unresolved every inbound link;
+            // those whose written target also names a remaining note go back to it.
+            // Without this the index differs from a rebuild's, which C-02 forbids.
+            if gone && !bulk_load {
+                resolve_inbound(tx, path)?;
+            }
             Ok(Applied {
                 notes: 0,
                 removed: usize::from(gone),
             })
         }
         IndexOp::Rename { from, to } => {
-            rename(tx, from, to)?;
+            rename(tx, from, to, bulk_load)?;
             Ok(Applied::default())
         }
     }
@@ -114,8 +121,9 @@ fn upsert_note(
         .sum();
 
     tx.prepare_cached(
-        "INSERT INTO notes (path, file_name, title, type, kind, mtime, hash, word_count)
-         VALUES (?1, ?2, ?3, ?4, 'note', ?5, ?6, ?7)",
+        "INSERT INTO notes (path, file_name, path_fold, file_name_fold,
+                            title, type, kind, mtime, hash, word_count)
+         VALUES (?1, ?2, ?8, ?9, ?3, ?4, 'note', ?5, ?6, ?7)",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -129,6 +137,9 @@ fn upsert_note(
         meta.mtime_ms,
         meta.hash.to_hex(),
         word_count,
+        // The folded keys link resolution compares by (architecture §4.5).
+        fold_case(meta.path.as_str()),
+        fold_case(meta.path.file_name()),
     ])
     .map_err(sqlite)?;
     let note_id = tx.last_insert_rowid();
@@ -166,6 +177,7 @@ fn upsert_note(
     // done, at a fraction of the cost.
     if !bulk_load {
         resolve_inbound(tx, &meta.path)?;
+        resolve_rivals(tx, &meta.path)?;
         // The note's own outbound links, inserted unresolved just above: point them at
         // whatever they name that already exists. Symmetric with resolve_inbound, and
         // both are needed -- one fixes what this save broke, the other finishes what it
@@ -177,66 +189,61 @@ fn upsert_note(
     Ok(())
 }
 
-/// Point every currently-unresolved link that could name `path` at the note it now
-/// identifies.
+/// The four folded spellings under which a link can name the note at `path`, then
+/// each with `.md` appended: the written targets that can reach it
+/// (`resolve::RESOLVE_RIVALS`).
 ///
-/// Scoped by `dst_path`, not a pass over the whole `links` table: an incremental save
-/// touches one note, and paying for a full scan on every save is what left this path
-/// silently skipping FR-NAV-04 in the first place (see `IndexHandle::apply`'s doc
-/// comment on the gap this closes). `ix_links_unresolved` (schema/001_init.sql) is
-/// what keeps the `IN` lookup cheap rather than a table scan wearing an index's name.
-///
-/// The four candidates are `writer::resolve_links`'s matching rule read in reverse:
-/// a link's `dst_path` matches a note `n` when `n.path` equals it exactly, equals it
-/// with `.md` appended, or -- when the written target has no `/`, i.e. names a file
-/// rather than a path (F-312) -- `n.file_name` equals it either way. So the spellings
-/// that could name *this* note are its own path, its path without a trailing `.md`,
-/// its file name, and its file name without a trailing `.md`; always four slots, with
-/// a duplicate where a candidate does not apply (an asset's path never ends in
-/// `.md`), so this always prepares the same SQL text rather than one shape per call
-/// (`schema::STATEMENT_CACHE`'s whole point).
-fn resolve_inbound(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexError> {
-    const RESOLVE_INBOUND: &str = "
-        UPDATE links
-           SET dst_note = (
-                SELECT n.id FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-              ORDER BY length(n.path), n.path
-                 LIMIT 1
-           )
-         WHERE dst_note IS NULL
-           AND kind <> 'tag'
-           AND dst_path IN (?1, ?2, ?3, ?4)
-           AND EXISTS (
-                SELECT 1 FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-           )";
-
+/// The first four are `resolve`'s matching rule read in reverse: a link's `dst_fold`
+/// names a note `n` when `n.path_fold` equals it, or equals it plus `.md`, or -- when
+/// the written target has no `/`, i.e. names a file rather than a path (F-312) --
+/// `n.file_name_fold` equals it either way. So what could name *this* note is its
+/// path, its path without a trailing `.md`, its file name, and its file name without a
+/// trailing `.md`. Always four slots, with a duplicate where a spelling does not apply
+/// (an asset's path never ends in `.md`), so the SQL text never varies
+/// (`schema::STATEMENT_CACHE`'s whole point). Folded here, in Rust, by the function
+/// that folded the stored columns: the statements contain no folding of their own.
+fn spellings(path: &VaultPath) -> [String; 8] {
     let whole = path.as_str();
     let name = path.file_name();
-    let candidates = [
+    let four = [
         whole,
         whole.strip_suffix(".md").unwrap_or(whole),
         name,
         name.strip_suffix(".md").unwrap_or(name),
-    ];
+    ]
+    .map(fold_case);
+    let [a, b, c, d] = four;
+    let [e, f, g, h] = [&a, &b, &c, &d].map(|s| format!("{s}.md"));
+    [a, b, c, d, e, f, g, h]
+}
 
-    tx.prepare_cached(RESOLVE_INBOUND)
+/// Point every currently-unresolved link that could name `path` at the note it now
+/// identifies. Architecture §4.5 **A1** (a note appears) and **B1** (a note
+/// disappears: its orphaned inbound links, nulled by `ON DELETE SET NULL`, are
+/// re-pointed at a remaining same-named note or left unresolved).
+///
+/// Scoped by `dst_fold`, not a pass over the whole `links` table: an incremental save
+/// touches one note, and paying for a full scan on every save is what left this path
+/// silently skipping FR-NAV-04 in the first place. `ix_links_unresolved`
+/// (schema/001_init.sql) keeps the `IN` lookup cheap rather than a table scan wearing
+/// an index's name.
+fn resolve_inbound(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexError> {
+    let s = spellings(path);
+    tx.prepare_cached(resolve::RESOLVE_INBOUND)
         .map_err(sqlite)?
-        .execute(params![
-            candidates[0],
-            candidates[1],
-            candidates[2],
-            candidates[3]
-        ])
+        .execute(params![s[0], s[1], s[2], s[3]])
+        .map_err(sqlite)?;
+    Ok(())
+}
+
+/// Architecture §4.5 **A2**: a note appeared at `path`, so links that already resolve
+/// to *another* note under the same spelling may now prefer this one as the shorter
+/// path. Re-runs the resolver over exactly those links.
+fn resolve_rivals(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexError> {
+    let s = spellings(path);
+    tx.prepare_cached(resolve::RESOLVE_RIVALS)
+        .map_err(sqlite)?
+        .execute(params![s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
         .map_err(sqlite)?;
     Ok(())
 }
@@ -249,32 +256,7 @@ fn resolve_inbound(tx: &Transaction<'_>, path: &VaultPath) -> Result<(), IndexEr
 /// resolvable, so the general pass over every unresolved link in the vault
 /// (`writer::resolve_links`, the rebuild's one full pass) is not needed here.
 fn resolve_outbound(tx: &Transaction<'_>, note_id: i64) -> Result<(), IndexError> {
-    const RESOLVE_OUTBOUND: &str = "
-        UPDATE links
-           SET dst_note = (
-                SELECT n.id FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-              ORDER BY length(n.path), n.path
-                 LIMIT 1
-           )
-         WHERE dst_note IS NULL
-           AND kind <> 'tag'
-           AND src_note = ?1
-           AND dst_path IS NOT NULL
-           AND EXISTS (
-                SELECT 1 FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-           )";
-
-    tx.prepare_cached(RESOLVE_OUTBOUND)
+    tx.prepare_cached(resolve::RESOLVE_OUTBOUND)
         .map_err(sqlite)?
         .execute(params![note_id])
         .map_err(sqlite)?;
@@ -292,15 +274,18 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     // says an asset stays typed, linkable and queryable. Omitting it here
     // silently drops every embed (F-313).
     tx.prepare_cached(
-        "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash)
-         VALUES (?1, ?2, 'asset', ?1, ?3, ?4)",
+        "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash,
+                            path_fold, file_name_fold)
+         VALUES (?1, ?2, 'asset', ?1, ?3, ?4, ?5, ?6)",
     )
     .map_err(sqlite)?
     .execute(params![
         meta.path.as_str(),
         meta.path.file_name(),
         meta.mtime_ms,
-        meta.hash.to_hex()
+        meta.hash.to_hex(),
+        fold_case(meta.path.as_str()),
+        fold_case(meta.path.file_name()),
     ])
     .map_err(sqlite)?;
 
@@ -313,6 +298,7 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     // Skipped during a bulk load (F-371) -- see upsert_note's doc comment.
     if !bulk_load {
         resolve_inbound(tx, &meta.path)?;
+        resolve_rivals(tx, &meta.path)?;
     }
 
     Ok(())
@@ -328,16 +314,59 @@ fn remove(tx: &Transaction<'_>, path: &VaultPath) -> Result<bool, IndexError> {
     Ok(removed > 0)
 }
 
-/// Move a note without disturbing its inbound links.
+/// Move a note, keeping its rows and re-resolving the links the move changes.
 ///
-/// Distinct from remove-then-insert because deleting the row would set every inbound
-/// `links.dst_note` to NULL, and the backlinks would have to be rediscovered. A
-/// rename changes where a file is, not what points at it.
-fn rename(tx: &Transaction<'_>, from: &VaultPath, to: &VaultPath) -> Result<(), IndexError> {
-    tx.prepare_cached("UPDATE notes SET path = ?2 WHERE path = ?1")
+/// The row keeps its id, so its blocks, fields and outbound links stay. What a move
+/// changes is which *written targets* name it, so (architecture §4.5):
+///
+/// 1. set `path`, `file_name` and their folds;
+/// 2. unresolve its inbound links -- a link written `[[old/P]]` must stop pointing at
+///    the note now at `Q`;
+/// 3. **B1** for the old path: those links go to another same-named note, or stay
+///    unresolved;
+/// 4. **A1 and A2** for the new path: links whose written target names `Q` resolve
+///    back to it, and rivals that now lose to the shorter path are re-pointed.
+///
+/// `title` is left alone: the op carries no parse, and a title taken from the file
+/// name is only corrected by the next `UpsertNote` for the new path.
+fn rename(
+    tx: &Transaction<'_>,
+    from: &VaultPath,
+    to: &VaultPath,
+    bulk_load: bool,
+) -> Result<(), IndexError> {
+    let id: Option<i64> = tx
+        .prepare_cached("SELECT id FROM notes WHERE path = ?1")
         .map_err(sqlite)?
-        .execute(params![from.as_str(), to.as_str()])
+        .query_row(params![from.as_str()], |row| row.get(0))
+        .optional()
         .map_err(sqlite)?;
+    let Some(id) = id else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "UPDATE notes SET path = ?2, file_name = ?3, path_fold = ?4, file_name_fold = ?5
+          WHERE id = ?1",
+    )
+    .map_err(sqlite)?
+    .execute(params![
+        id,
+        to.as_str(),
+        to.file_name(),
+        fold_case(to.as_str()),
+        fold_case(to.file_name())
+    ])
+    .map_err(sqlite)?;
+    if bulk_load {
+        return Ok(());
+    }
+    tx.prepare_cached("UPDATE links SET dst_note = NULL WHERE dst_note = ?1 AND kind <> 'tag'")
+        .map_err(sqlite)?
+        .execute(params![id])
+        .map_err(sqlite)?;
+    resolve_inbound(tx, from)?;
+    resolve_inbound(tx, to)?;
+    resolve_rivals(tx, to)?;
     Ok(())
 }
 
@@ -489,8 +518,8 @@ fn insert_link(
         LinkKind::Tag => "tag",
     };
     tx.prepare_cached(
-        "INSERT INTO links (src_note, src_block, dst_path, dst_block_ref, kind, alias)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO links (src_note, src_block, dst_path, dst_fold, dst_block_ref, kind, alias)
+         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6)",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -500,6 +529,8 @@ fn insert_link(
         link.target.block_ref.as_deref(),
         kind,
         link.target.alias.as_deref(),
+        // Stored folded, in Rust, so resolution is a binary `=` (architecture §4.5).
+        fold_case(&link.target.note),
     ])
     .map_err(sqlite)?;
     Ok(())

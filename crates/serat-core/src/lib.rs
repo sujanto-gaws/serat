@@ -22,6 +22,7 @@
 pub mod block;
 pub mod error;
 pub mod field;
+pub mod fold;
 pub mod hash;
 pub mod ids;
 pub mod link;
@@ -34,6 +35,7 @@ pub mod traits;
 pub use block::{Block, BlockKind};
 pub use error::{IndexError, ParseError, SeratError, VaultError};
 pub use field::{Field, FieldKind, FieldSource, FieldValue};
+pub use fold::fold_case;
 pub use hash::ContentHash;
 pub use ids::{BlockId, FieldId, NoteId};
 pub use link::{Link, LinkKind, LinkTarget};

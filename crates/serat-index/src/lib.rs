@@ -15,13 +15,16 @@ mod apply;
 pub mod identity;
 pub mod incremental;
 pub mod open;
+pub mod read;
 pub mod rebuild;
+mod resolve;
 pub mod schema;
 pub mod writer;
 
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild};
+pub use read::{Backlink, Reader, SearchHit, SearchOutcome};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
 pub use schema::{DDL, INDEX_VERSION, IndexState, UnusableReason, bootstrap, inspect, open};
 pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
