@@ -35,6 +35,7 @@ mod patch_props;
 pub mod position;
 pub mod queue;
 pub mod refusal;
+pub mod tree;
 pub mod walk;
 #[cfg(all(test, unix))]
 mod walk_refusal_tests;
@@ -56,6 +57,7 @@ pub use patch::Edit;
 pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
+pub use tree::{TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 

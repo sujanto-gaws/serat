@@ -24,6 +24,7 @@ pub mod read;
 pub mod rebuild;
 mod resolve;
 pub mod schema;
+pub mod tree;
 pub mod writer;
 
 pub use identity::canonical_root;

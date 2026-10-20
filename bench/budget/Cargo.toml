@@ -47,6 +47,12 @@ path = "src/bin/prf04-full-rebuild.rs"
 name = "p1-read-paths"
 path = "src/bin/p1-read-paths.rs"
 
+# FR-VLT-01's tree path, Rust side (ADR-0015): warm and no-index arms, reported. The
+# binding tree_complete - T_open is task #9's.
+[[bin]]
+name = "p1-tree-path"
+path = "src/bin/p1-tree-path.rs"
+
 [dependencies]
 vaultgen = { path = "../vaultgen" }
 # Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
