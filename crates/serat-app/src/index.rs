@@ -332,6 +332,13 @@ pub trait IndexOpen: Send + 'static {
 /// design goal 5, applied to a race rather than to a missing capability.
 pub type IndexHandleSlot = std::sync::Arc<Mutex<Option<serat_index::IndexHandle>>>;
 
+/// App-owned identity of the index database a vault currently has: bumped by
+/// [`IndexActor::spawn`]'s thread each time it puts a new handle in the
+/// [`IndexHandleSlot`]. [`crate::reads::SearchSlot`] keys its connection on it, because
+/// file metadata is not an identity (NTFS tunnelling lets a recreated `index.db`
+/// inherit the old creation time).
+pub type HandleEpoch = Arc<std::sync::atomic::AtomicU64>;
+
 /// The real open check, wired to the vault and the production parser.
 ///
 /// Architecture §3.4 specifies six ordered steps over `user_version`, `index_meta` and
@@ -500,6 +507,8 @@ impl IndexActor {
     /// what the thread does next — which is the first row of §3.4's table, expressed as
     /// code rather than as a comment.
     ///
+    /// `epoch` is bumped whenever the slot receives a handle (see [`HandleEpoch`]).
+    ///
     /// Also returns an [`IndexHandleSlot`], empty until `opener` finishes and
     /// [`IndexOpen::into_handle`] fills it (task #89). The caller polls it rather than
     /// waiting on it, for the same reason the caller does not wait on this thread at
@@ -548,6 +557,7 @@ impl IndexActor {
         mut opener: O,
         vault_root: PathBuf,
         index_dir: PathBuf,
+        epoch: HandleEpoch,
     ) -> std::io::Result<(Self, IndexHandleSlot)> {
         let slot: IndexHandleSlot = Arc::new(Mutex::new(None));
         let slot_for_thread = Arc::clone(&slot);
@@ -573,6 +583,7 @@ impl IndexActor {
                     *slot_for_thread
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index_handle);
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 if let Some(state) = terminal.borrow_mut().take() {
                     publisher.publish(state);
@@ -774,6 +785,7 @@ mod tests {
             SlowRebuild,
             PathBuf::from("."),
             PathBuf::from("./.serat"),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         let spawn_cost = started.elapsed();
@@ -826,6 +838,7 @@ mod tests {
             SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();
@@ -862,6 +875,7 @@ mod tests {
             SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();
@@ -962,6 +976,7 @@ mod tests {
             },
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         slot_cell.set(Arc::clone(&slot)).expect("shared once");
@@ -1071,6 +1086,7 @@ mod tests {
             FailsWithNoHandle,
             PathBuf::from("."),
             PathBuf::from("./.serat"),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();

@@ -34,6 +34,13 @@
 //! types a second time, into `crates/serat-app/bindings/`. That directory is ignored
 //! and is not the committed copy.
 
+// Feature unification must not smuggle serat-index's test hooks into a release build
+// (task #52): `cargo build --workspace --release` unifies them in via bench/budget.
+const _: () = assert!(
+    !serat_index::TEST_HOOKS || cfg!(debug_assertions),
+    "test-hooks must not reach a release build"
+);
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;

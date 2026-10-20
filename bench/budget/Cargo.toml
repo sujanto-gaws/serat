@@ -54,7 +54,8 @@ vaultgen = { path = "../vaultgen" }
 # vault digest. serat-index already links it, so this costs no build time.
 rusqlite = { workspace = true }
 serat-core = { path = "../../crates/serat-core" }
-serat-index = { path = "../../crates/serat-index" }
+# test-hooks: p1-read-paths toggles the progress handler on one connection (task #51).
+serat-index = { path = "../../crates/serat-index", features = ["test-hooks"] }
 serat-parse = { path = "../../crates/serat-parse" }
 serat-vault = { path = "../../crates/serat-vault" }
 
