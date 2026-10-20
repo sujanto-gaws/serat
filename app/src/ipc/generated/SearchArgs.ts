@@ -12,10 +12,20 @@
  *
  * **At most one full-text search is in flight per open vault** (§4.5, #15
  * ruling). A query with free text (R1, or R1 + R3) runs on serat-index's one
- * dedicated search connection, which is not part of the read pool. A new
- * full-text search interrupts the one still running there, through rusqlite's
- * `get_interrupt_handle()`, and the older call returns
- * `SearchOutcome::Superseded` rather than an error. So a superseded 230-560 ms
+ * dedicated search connection, which is not part of the read pool. Each
+ * full-text search does four things in order:
+ * 1. it increments the vault's search generation (an `AtomicU64`) and keeps
+ *    the new value;
+ * 2. it calls `interrupt()` through rusqlite's `get_interrupt_handle()`;
+ * 3. it takes the connection's lock, and returns `SearchOutcome::Superseded`
+ *    without running a statement if the generation has moved on, so a queued
+ *    stale search never runs;
+ * 4. it runs, while a `progress_handler` on that connection interrupts the
+ *    statement as soon as the generation is no longer its own, so an interrupt
+ *    that arrived before the statement started is not lost.
+ * The handler is a callback, not an SQL function, so C-03 holds. Every older
+ * call returns `SearchOutcome::Superseded` rather than an error. serat-app
+ * waits for the lock inside `spawn_blocking`, off the async executor. So a superseded 230-560 ms
  * search never holds a pooled connection that backlinks or a property lookup
  * is waiting for. A property-only query (R3) runs on the pool and is never
  * interrupted, and neither are `backlinks` or any other read. The front end
