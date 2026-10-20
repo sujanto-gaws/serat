@@ -34,6 +34,7 @@ import { EditorState, RangeSetBuilder, StateField, Text, type Extension, type Tr
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
+import { assetUrl } from "@/editor/assetUrl";
 import { selectedLineNumbers, type Span } from "@/editor/reveal";
 
 // ---------------------------------------------------------------------------
@@ -51,16 +52,6 @@ export function isImageTarget(target: string): boolean {
   const dot = clean.lastIndexOf(".");
   if (dot < 0) return false;
   return IMAGE_EXTENSIONS.has(clean.slice(dot + 1).toLowerCase());
-}
-
-/** Builds the `serat-asset:` URL for a vault-relative path (ADR-0017):
- * `serat-asset://localhost/<percent-encoded path>`. Percent-encodes each
- * path segment separately so a literal `/` in a file name (which cannot
- * occur on any of the three platforms) is never produced by encoding, and a
- * real `/` path separator is never encoded away. */
-export function seratAssetUrl(vaultRelativePath: string): string {
-  const segments = vaultRelativePath.split("/").map((segment) => encodeURIComponent(segment));
-  return `serat-asset://localhost/${segments.join("/")}`;
 }
 
 export interface CalloutHeader {
@@ -120,14 +111,6 @@ export function readTableModel(doc: Text, tableNode: SyntaxNode): TableModel {
   return { header, rows };
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
@@ -174,35 +157,50 @@ class TableWidget extends WidgetType {
   }
 }
 
+/** An image embed. With a RESOLVED vault path it renders a plain
+ * `<img src=serat-asset…>` (platform-aware URL, ADR-0017); with none (not
+ * resolved yet, or the scheme handler is not there) or when the image fails
+ * to load, it renders a labelled placeholder, never a broken image. */
 class ImageEmbedWidget extends WidgetType {
   constructor(
-    private readonly target: string,
+    private readonly label: string,
+    private readonly resolvedPath: string | null,
     private readonly widthAttr: string | null,
   ) {
     super();
   }
 
   eq(other: ImageEmbedWidget): boolean {
-    return this.target === other.target && this.widthAttr === other.widthAttr;
+    return (
+      this.label === other.label && this.resolvedPath === other.resolvedPath && this.widthAttr === other.widthAttr
+    );
+  }
+
+  private placeholder(): HTMLElement {
+    const span = document.createElement("span");
+    span.className = "serat-embed-placeholder";
+    span.textContent = `[image not loaded: ${this.label}]`;
+    return span;
   }
 
   toDOM(): HTMLElement {
     // components.md §4's rule, restated once and enforced everywhere: "a
     // plain <img src='serat-asset://…'>, and nothing else". Never
-    // <object>/<iframe>/inline SVG/v-html — a real DOM `<img>` element,
-    // built directly, is the only path this widget has.
+    // <object>/<iframe>/inline SVG/v-html.
+    if (this.resolvedPath === null) return this.placeholder();
     const img = document.createElement("img");
-    img.src = seratAssetUrl(this.target);
-    img.alt = this.target;
+    img.src = assetUrl(this.resolvedPath);
+    img.alt = this.label;
     img.className = "serat-embed-widget";
     if (this.widthAttr && /^\d+$/.test(this.widthAttr)) {
       img.width = Number(this.widthAttr);
     }
+    img.addEventListener("error", () => img.replaceWith(this.placeholder()), { once: true });
     return img;
   }
 
   ignoreEvent(): boolean {
-    return true;
+    return false; // a click may place the cursor on the embed (revealing its source)
   }
 }
 
@@ -233,12 +231,16 @@ class CalloutWidget extends WidgetType {
     if (this.bodyText.trim()) {
       const body = document.createElement("div");
       body.className = "serat-callout-body";
-      // Escaped plain text, newlines as <br> — a synchronous, sanitiser-free
-      // render (the string is built entirely by this widget from escaped
-      // source text, never from untrusted markup): full inline-Markdown
+      // Text nodes and <br>, no HTML parsing at all: full inline-Markdown
       // rendering inside a callout body is split-preview's job for now, the
       // same trade-off `readTableModel` documents for table cells.
-      body.innerHTML = escapeHtml(this.bodyText.trim()).replace(/\n/g, "<br>");
+      this.bodyText
+        .trim()
+        .split("\n")
+        .forEach((line, index) => {
+          if (index > 0) body.appendChild(document.createElement("br"));
+          body.appendChild(document.createTextNode(line));
+        });
       container.appendChild(body);
     }
     return container;
@@ -272,10 +274,14 @@ function decorationForNode(doc: Text, node: SyntaxNode): BlockDecoration | null 
     const text = doc.sliceString(node.from, node.to);
     const match = /^!\[\[([^\]|]+)(?:\|(\d+))?\]\]$/.exec(text);
     if (match && isImageTarget(match[1])) {
+      // No resolver yet (task #22): the written name is NOT a vault path, so
+      // no URL is built from it; a labelled placeholder is shown instead.
       return {
         from: node.from,
         to: node.to,
-        decoration: Decoration.replace({ widget: new ImageEmbedWidget(match[1].trim(), match[2] ?? null) }),
+        decoration: Decoration.replace({
+          widget: new ImageEmbedWidget(match[1].trim(), null, match[2] ?? null),
+        }),
       };
     }
     return null;
@@ -308,8 +314,16 @@ function decorationsInRange(state: EditorState, from: number, to: number, select
       if (node.type.name !== "Table" && node.type.name !== "SeratEmbed" && node.type.name !== "Blockquote") {
         return;
       }
-      const lineFrom = state.doc.lineAt(node.from).number;
-      const lineTo = state.doc.lineAt(node.to).number;
+      const startLine = state.doc.lineAt(node.from);
+      const endLine = state.doc.lineAt(node.to);
+      // A block widget replaces whole lines. A table or callout nested in a
+      // list item or an outer blockquote starts after a marker, mid-line;
+      // it stays raw source rather than getting a block replace that cuts a line.
+      if (node.type.name !== "SeratEmbed" && (node.from !== startLine.from || node.to !== endLine.to)) {
+        return undefined;
+      }
+      const lineFrom = startLine.number;
+      const lineTo = endLine.number;
       for (let line = lineFrom; line <= lineTo; line++) {
         if (selectedLines.has(line)) {
           return; // any touched line reveals the whole construct's source
@@ -326,9 +340,20 @@ function decorationsInRange(state: EditorState, from: number, to: number, select
   return results;
 }
 
-/** The full-document build, used only for the field's initial `create` —
- * every subsequent update is the bounded, per-region recompute below. */
-function buildAll(state: EditorState): DecorationSet {
+/** Field value: the decorations plus a watermark. `examined` is the document
+ * position up to which the decorations reflect the current text and parse
+ * tree. It maps through edits and NEVER moves back when CodeMirror cuts the
+ * tree back to the viewport after an edit, so a later "growth" of the tree
+ * only re-examines territory that was never examined (or has since changed),
+ * not the whole note on every keystroke. */
+export interface BlockWidgetState {
+  deco: DecorationSet;
+  examined: number;
+}
+
+/** The full-document build, used for the field's initial `create` and when
+ * link resolutions change; every other update is the bounded recompute below. */
+function buildAll(state: EditorState): BlockWidgetState {
   const selectedLines = selectedLineNumbers(
     state.doc,
     state.selection.ranges.map((r) => ({ from: r.from, to: r.to })),
@@ -338,7 +363,7 @@ function buildAll(state: EditorState): DecorationSet {
   for (const { from, to, decoration } of found) {
     builder.add(from, to, decoration);
   }
-  return builder.finish();
+  return { deco: builder.finish(), examined: syntaxTree(state).length };
 }
 
 /** The top-level block node (a direct child of `Document`) enclosing `pos`,
@@ -386,7 +411,13 @@ function replaceRegion(deco: DecorationSet, state: EditorState, region: Span, se
   });
 }
 
-function computeDirtyRegions(tr: Transaction): Span[] {
+/** Territory the tree newly covers that was never examined. Pure, so the
+ * "never moves back" rule is testable without provoking a partial parse. */
+export function growthRegion(examined: number, treeLength: number): Span | null {
+  return treeLength > examined ? { from: examined, to: treeLength } : null;
+}
+
+function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
   const regions: Span[] = [];
   if (tr.docChanged) {
     tr.changes.iterChanges((_fromA, _toA, fromB, toB) => {
@@ -394,14 +425,13 @@ function computeDirtyRegions(tr: Transaction): Span[] {
       regions.push(region ?? { from: fromB, to: Math.max(toB, fromB + 1) });
     });
   }
-  // CodeMirror parses a long note in time-sliced chunks after the state is
-  // created; the tree grows via a later (non-doc) transaction. Newly parsed
-  // territory has never been examined, so it is the one region to build.
-  const treeBefore = syntaxTree(tr.startState).length;
-  const treeAfter = syntaxTree(tr.state).length;
-  if (treeAfter > treeBefore) {
-    const start = enclosingTopLevelBlock(tr.state, Math.min(treeBefore, tr.state.doc.length));
-    regions.push({ from: start ? Math.min(start.from, treeBefore) : treeBefore, to: treeAfter });
+  // CodeMirror parses a long note in time-sliced chunks, and cuts the tree
+  // back to the viewport after an edit. Only territory beyond the watermark
+  // has never been examined.
+  const growth = growthRegion(examined, syntaxTree(tr.state).length);
+  if (growth) {
+    const start = enclosingTopLevelBlock(tr.state, Math.min(growth.from, tr.state.doc.length));
+    regions.push({ from: start ? Math.min(start.from, growth.from) : growth.from, to: growth.to });
   }
   if (!tr.startState.selection.eq(tr.state.selection)) {
     for (const range of tr.startState.selection.ranges) {
@@ -421,7 +451,7 @@ function computeDirtyRegions(tr: Transaction): Span[] {
  * on/off per `livePreview` the same way `reveal.ts`'s plugin is toggled —
  * `CodeMirrorEditor.vue` wraps both in the same `Compartment` so split mode
  * (no hide/reveal at all, per FR-EDT-10) drops both together. */
-export const blockWidgetsField = StateField.define<DecorationSet>({
+export const blockWidgetsField = StateField.define<BlockWidgetState>({
   create(state) {
     return buildAll(state);
   },
@@ -433,21 +463,25 @@ export const blockWidgetsField = StateField.define<DecorationSet>({
     ) {
       return value;
     }
-    let mapped = value.map(tr.changes);
-    const regions = computeDirtyRegions(tr);
+    const deco = value.deco.map(tr.changes);
+    const examined = tr.docChanged ? tr.changes.mapPos(value.examined, -1) : value.examined;
+    const regions = computeDirtyRegions(tr, examined);
+    const treeLength = syntaxTree(tr.state).length;
+    const nextExamined = Math.max(examined, Math.min(treeLength, tr.state.doc.length));
     if (regions.length === 0) {
-      return mapped;
+      return { deco, examined: nextExamined };
     }
     const selectedLines = selectedLineNumbers(
       tr.state.doc,
       tr.state.selection.ranges.map((r) => ({ from: r.from, to: r.to })),
     );
+    let next = deco;
     for (const region of regions) {
-      mapped = replaceRegion(mapped, tr.state, region, selectedLines);
+      next = replaceRegion(next, tr.state, region, selectedLines);
     }
-    return mapped;
+    return { deco: next, examined: nextExamined };
   },
-  provide: (field) => EditorView.decorations.from(field),
+  provide: (field) => EditorView.decorations.from(field, (value) => value.deco),
 });
 
 /** Minimal widget styling (serat-identity.md tokens, with fallbacks). Injected

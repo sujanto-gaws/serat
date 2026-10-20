@@ -266,7 +266,8 @@ function footnoteSectionPlugin(md: MarkdownIt): void {
     push("hr", "hr", 0);
     push("ordered_list_open", "ol", 1);
     for (const def of defs) {
-      push("list_item_open", "li", 1);
+      const item = push("list_item_open", "li", 1);
+      item.attrSet("title", `serat-${(state.env as RenderEnv).nonce ?? ""}:fnitem:${encodeURIComponent(def.label)}`);
       push("paragraph_open", "p", 1);
       const inline = push("inline", "", 0);
       inline.content = def.content;

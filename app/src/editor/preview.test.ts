@@ -47,7 +47,8 @@ describe("renderMarkdownToFragment", () => {
   it("collects footnote definitions into a numbered section after the content", async () => {
     const html = await renderToHtml("see this[^1]\n\n[^1]: the *note*\n");
     expect(html).toContain("<hr>");
-    expect(html).toMatch(/<ol>[\s\S]*<li>[\s\S]*the <em>note<\/em>[\s\S]*<\/ol>/);
+    expect(html).toContain('<li id="fn-1">');
+    expect(html).toMatch(/<ol>[\s\S]*<li [\s\S]*the <em>note<\/em>[\s\S]*<\/ol>/);
     expect(html).not.toContain("[^1]:");
   });
 

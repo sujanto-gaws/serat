@@ -21,6 +21,8 @@
 // every other image source becomes the labelled placeholder, never an
 // `<img>` pointed at a remote or `data:` URL.
 //
+import { isSeratAssetUrl } from "@/editor/assetUrl";
+
 // Incoming `data-*` attributes are never copied: they are the renderer's own
 // channel to the mounting component (`data-external`, `data-wikilink`, ...),
 // so letting a document supply them would let it forge that channel. The
@@ -88,7 +90,7 @@ const ALLOWED_ATTRS: Record<string, readonly string[]> = {
   TD: ["colspan", "rowspan", "align"],
   TH: ["colspan", "rowspan", "align"],
   OL: ["start"],
-  LI: ["value"],
+  LI: ["value", "title"], // title only carries the nonce-gated footnote request
   DIV: ["title"], // callout request, nonce-gated like the embed one below
   SPAN: ["title"], // carries only the nonce-prefixed embed request, rewritten after sanitising
 };
@@ -104,11 +106,6 @@ const XHTML_NS = "http://www.w3.org/1999/xhtml";
 // serat-app, which resolves every request through the vault's containment
 // functions; this sanitiser deliberately neither normalises nor second-guesses
 // the path, so there is exactly one containment rule to get right.
-const SERAT_ASSET_ORIGINS = ["serat-asset:", "http://serat-asset.localhost"];
-
-function isSeratAssetUrl(value: string): boolean {
-  return SERAT_ASSET_ORIGINS.some((origin) => value.startsWith(origin));
-}
 
 /** `javascript:`, `vbscript:` and any `data:` URL of any kind are refused
  * outright — never rendered as a link either, not only as an image. */
@@ -242,6 +239,14 @@ export interface SanitizeOptions {
   markerNonce?: string;
 }
 
+function safeDecode(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
 /** Adds the renderer's markers after sanitising, from nonce-prefixed
  * requests only. A document cannot guess the nonce, so cannot forge them. */
 function applyTrustedMarkers(root: ParentNode, nonce: string): void {
@@ -275,8 +280,17 @@ function applyTrustedMarkers(root: ParentNode, nonce: string): void {
     // Always drop the title: a div never legitimately keeps one.
     div.removeAttribute("title");
     if (!title.startsWith(callout)) continue;
-    const type = decodeURIComponent(title.slice(callout.length));
-    if (/^[\w-]+$/.test(type)) div.setAttribute("data-callout", type);
+    const type = safeDecode(title.slice(callout.length));
+    if (type !== null && /^[\w-]+$/.test(type)) div.setAttribute("data-callout", type);
+  }
+  for (const li of Array.from(root.querySelectorAll("li[title]"))) {
+    const title = li.getAttribute("title") ?? "";
+    const item = `${prefix}fnitem:`;
+    li.removeAttribute("title"); // an <li> never legitimately keeps one
+    if (!title.startsWith(item)) continue;
+    const label = safeDecode(title.slice(item.length));
+    // Only after sanitising and only for the nonce: a document cannot plant ids.
+    if (label !== null) li.setAttribute("id", `fn-${label}`);
   }
   for (const span of Array.from(root.querySelectorAll("span[title]"))) {
     const title = span.getAttribute("title") ?? "";

@@ -8,11 +8,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   blockWidgetsField,
+  growthRegion,
   isImageTarget,
   parseCalloutHeader,
-  seratAssetUrl,
   stripBlockquoteMarkers,
 } from "@/editor/blockWidgets";
+import { assetUrl, isSeratAssetUrl } from "@/editor/assetUrl";
 import { seratMarkdown } from "@/editor/markdownLanguage";
 
 function makeState(doc: string, anchor = 0): EditorState {
@@ -28,7 +29,7 @@ function makeState(doc: string, anchor = 0): EditorState {
 
 function widgets(state: EditorState): Array<{ from: number; to: number; widget: unknown; block: boolean }> {
   const out: Array<{ from: number; to: number; widget: unknown; block: boolean }> = [];
-  const iter = state.field(blockWidgetsField).iter();
+  const iter = state.field(blockWidgetsField).deco.iter();
   while (iter.value) {
     const spec = iter.value.spec as { widget?: unknown; block?: boolean };
     out.push({ from: iter.from, to: iter.to, widget: spec.widget, block: !!spec.block });
@@ -46,8 +47,15 @@ describe("pure helpers", () => {
     expect(isImageTarget("note")).toBe(false);
     expect(isImageTarget("doc.pdf")).toBe(false);
   });
-  it("builds a percent-encoded serat-asset URL per segment", () => {
-    expect(seratAssetUrl("a b/c#d.png")).toBe("serat-asset://localhost/a%20b/c%23d.png");
+  it("builds the platform's asset URL form, percent-encoded per segment", () => {
+    expect(assetUrl("a b/c#d.png", "other")).toBe("serat-asset://localhost/a%20b/c%23d.png");
+    expect(assetUrl("a b/c#d.png", "windows")).toBe("http://serat-asset.localhost/a%20b/c%23d.png");
+  });
+  it("sanitize accepts both asset origins and nothing that merely starts like one", () => {
+    expect(isSeratAssetUrl("serat-asset://localhost/x.png")).toBe(true);
+    expect(isSeratAssetUrl("http://serat-asset.localhost/x.png")).toBe(true);
+    expect(isSeratAssetUrl("http://serat-asset.localhost.evil.test/x.png")).toBe(false);
+    expect(isSeratAssetUrl("https://example.com/x.png")).toBe(false);
   });
   it("parses callout headers and strips quote markers", () => {
     expect(parseCalloutHeader("> [!warning] Careful")).toEqual({ type: "warning", title: "Careful" });
@@ -123,5 +131,47 @@ describe("blockWidgetsField", () => {
     expect(reused).toBeGreaterThanOrEqual(before.length - 2);
     // Loose guard against an accidental whole-document walk (jsdom/CI noise tolerated).
     expect(elapsed).toBeLessThan(100);
+  });
+
+  it("the examined watermark maps through edits and never moves back", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const w0 = s0.field(blockWidgetsField).examined;
+    expect(w0).toBe(doc.length);
+    const s1 = s0.update({ changes: { from: 0, insert: "xx" }, selection: { anchor: 2 } }).state;
+    expect(s1.field(blockWidgetsField).examined).toBe(doc.length + 2);
+    // Deleting before the watermark pulls it back by exactly that much, not further.
+    const s2 = s1.update({ changes: { from: 0, to: 2 } }).state;
+    expect(s2.field(blockWidgetsField).examined).toBe(doc.length);
+  });
+
+  it("growth re-examines only never-examined territory; a cut-back tree causes none", () => {
+    expect(growthRegion(1000, 400)).toBeNull(); // tree cut back to the viewport: nothing to do
+    expect(growthRegion(1000, 1000)).toBeNull();
+    expect(growthRegion(400, 1000)).toEqual({ from: 400, to: 1000 });
+  });
+
+  it("leaves a table nested in a blockquote or list as raw source (no mid-line block replace)", () => {
+    const quoted = `> ${TABLE.split("\n").join("\n> ")}\n\nend`;
+    expect(widgets(makeState(quoted, quoted.length))).toHaveLength(0);
+    const listed = `- item\n  ${TABLE.split("\n").join("\n  ")}\n\nend`;
+    expect(widgets(makeState(listed, listed.length))).toHaveLength(0);
+  });
+
+  it("an image embed is a labelled placeholder until a resolved path exists, never an <img> from the name", () => {
+    const state = makeState("x\n\n![[pic.png|200]]\n\nend", 0);
+    const [found] = widgets(state);
+    const dom = (found.widget as { toDOM(): HTMLElement }).toDOM();
+    expect(dom.tagName).toBe("SPAN");
+    expect(dom.textContent).toContain("pic.png");
+    expect(dom.querySelector("img")).toBeNull();
+  });
+
+  it("a callout body is built from text nodes: markup in it stays text", () => {
+    const state = makeState("x\n\n> [!note] T\n> <img src=x onerror=alert(1)>\n\nend", 0);
+    const [found] = widgets(state);
+    const dom = (found.widget as { toDOM(): HTMLElement }).toDOM();
+    expect(dom.querySelector("img")).toBeNull();
+    expect(dom.textContent).toContain("<img src=x onerror=alert(1)>");
   });
 });
