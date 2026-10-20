@@ -561,6 +561,9 @@ pub struct SearchConn {
     /// Test hook: called after the statement is prepared and bound, before its first step.
     #[cfg(test)]
     after_prepare: Mutex<Option<TestHook>>,
+    /// Test hook: how many times the progress handler has been called.
+    #[cfg(test)]
+    handler_calls: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -576,8 +579,11 @@ impl std::fmt::Debug for SearchConn {
 /// the statement is prepared and bound (a no-op outside tests).
 type Statement<'a> = dyn Fn(&Connection, &dyn Fn()) -> Result<Vec<SearchHit>, rusqlite::Error> + 'a;
 
-/// VM instructions between progress-handler calls (about a millisecond of work).
-const PROGRESS_OPS: i32 = 1000;
+/// VM instructions between progress-handler calls: about 0.7 ms of work on the 20k
+/// vault. It was 1,000, which cost +8-12 ms on a 50-100 ms search (task #47); the
+/// generation needs noticing within about a millisecond, not a microsecond
+/// (architecture 4.5, task #51).
+const PROGRESS_OPS: i32 = 10_000;
 
 impl SearchConn {
     /// Open the vault's search connection, read-only, configured like a pool member.
@@ -597,9 +603,17 @@ impl SearchConn {
         let latest = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicU64::new(0));
         let (l, r) = (Arc::clone(&latest), Arc::clone(&running));
+        #[cfg(test)]
+        let handler_calls = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let calls = Arc::clone(&handler_calls);
         conn.progress_handler(
             PROGRESS_OPS,
-            Some(move || l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)),
+            Some(move || {
+                #[cfg(test)]
+                calls.fetch_add(1, Ordering::SeqCst);
+                l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
+            }),
         )
         .map_err(sqlite)?;
         let interrupt = conn.get_interrupt_handle();
@@ -610,7 +624,40 @@ impl SearchConn {
             conn: Mutex::new(conn),
             #[cfg(test)]
             after_prepare: Mutex::new(None),
+            #[cfg(test)]
+            handler_calls,
         }))
+    }
+
+    /// Install (`true`) or remove (`false`) the progress handler on this same connection.
+    ///
+    /// For `bench/budget`'s p1-read-paths only: it measures the handler's overhead on
+    /// ONE connection, warmed the same way, because comparing two connections measured
+    /// page-cache warmth rather than the handler (task #51). Not part of any caller's
+    /// contract; the application never calls it.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`].
+    #[doc(hidden)]
+    pub fn set_progress_handler(&self, on: bool) -> Result<(), IndexError> {
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        if on {
+            let (l, r) = (Arc::clone(&self.latest), Arc::clone(&self.running));
+            #[cfg(test)]
+            let calls = Arc::clone(&self.handler_calls);
+            conn.progress_handler(
+                PROGRESS_OPS,
+                Some(move || {
+                    #[cfg(test)]
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
+                }),
+            )
+        } else {
+            conn.progress_handler(0, None::<fn() -> bool>)
+        }
+        .map_err(sqlite)
     }
 
     /// Run one full-text search as the newest. `None` means superseded.
@@ -863,6 +910,49 @@ mod tests {
             t.elapsed() < full / 2,
             "stopped in {:?}, a full run takes {full:?}",
             t.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_superseded_statement_stops_within_two_handler_calls() {
+        // Deterministic bound (architecture 4.5): once the generation moves, the
+        // statement stops within two handler calls, which is at most 20,000 VM steps.
+        // Counted through the test hook, so CI load cannot fail it. Wall clock is
+        // asserted only at a generous 50 ms, as a gross-regression net.
+        let (_dir, path) = db_with(20_000);
+        let sc = SearchConn::open(&path).expect("search conn");
+        let reader = reader_on(&path, &sc);
+        let before = sc.handler_calls.load(Ordering::SeqCst);
+        assert!(is_hits(&reader.search("commonword", 0, 50).unwrap()));
+        let full_run_calls = sc.handler_calls.load(Ordering::SeqCst) - before;
+        // Enough work that a handler which never stopped it would be called many times.
+        assert!(
+            full_run_calls > 2,
+            "fixture too small: {full_run_calls} calls"
+        );
+
+        let latest = sc.latest.clone();
+        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
+            latest.fetch_add(1, Ordering::SeqCst);
+        }));
+        let before = sc.handler_calls.load(Ordering::SeqCst);
+        let t = Instant::now();
+        assert_eq!(
+            reader.search("commonword", 0, 50).unwrap(),
+            SearchOutcome::Superseded
+        );
+        let wall = t.elapsed();
+        let calls = sc.handler_calls.load(Ordering::SeqCst) - before;
+        eprintln!(
+            "stopped after {calls} handler call(s) in {wall:?}; a full run is {full_run_calls} calls"
+        );
+        assert!(
+            (1..=2).contains(&calls),
+            "{calls} handler calls after the generation moved; the bound is 2 (20,000 VM steps)"
+        );
+        assert!(
+            wall < std::time::Duration::from_millis(50),
+            "stopped in {wall:?}"
         );
     }
 
