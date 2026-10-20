@@ -19,6 +19,11 @@
  * | `Io`                | `IpcError::Io`                              |
  * | `AtomicWriteFailed` | `IpcError::Io`                              |
  * | `Watcher`           | never reaches a command; reported as status   |
+ * | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
+ * | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
+ *
+ * The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
+ * §2). Until it merges, no `VaultError` produces either `IpcError`.
  *
  * `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
  * variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -66,7 +71,15 @@ path: string,
 /**
  * What was wrong, for the log.
  */
-message: string, } | { "kind": "io", 
+message: string, } | { "kind": "line_endings_would_fuse", 
+/**
+ * Vault-relative path.
+ */
+path: string, 
+/**
+ * 0-based line, in base coordinates, of the `\r` that would fuse.
+ */
+line: number, } | { "kind": "io", 
 /**
  * Vault-relative path, or the best available description of the target.
  */
