@@ -874,6 +874,9 @@ dependencies = [
 [[package]]
 name = "doclint"
 version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "dom_query"
