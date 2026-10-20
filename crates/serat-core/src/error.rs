@@ -118,6 +118,19 @@ pub enum VaultError {
         /// Why the patch was refused.
         reason: String,
     },
+
+    /// A patch is well formed but applying it would fuse a lone `\r` and a `\n` of a
+    /// mixed-ending note into one `\r\n`, swallowing a line (ADR-0016 §2).
+    ///
+    /// Not a client bug and not a race: the user made a legitimate edit and the only
+    /// byte-preserving outcome is to refuse it. The file is untouched.
+    #[error("saving {path} would fuse two line endings at line {line}")]
+    LineEndingsWouldFuse {
+        /// Vault-relative path of the target.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
+    },
 }
 
 impl VaultError {

@@ -58,18 +58,17 @@ pub fn from_vault_error(error: VaultError) -> IpcError {
             path,
             current_hash: found,
         },
-        // No dedicated contract variant yet: `contracts/ipc.rs` has not caught up
-        // with ADR-0016's patch-set save path (the IPC contract is still the one
-        // piece of that design not yet merged, per the task that added this arm).
-        // A malformed patch is a client bug — ranges out of order, a position past
-        // a line's end — not an operating-system failure, but until the contract
-        // grows its own variant this is the closest existing one and, like the
-        // `Watcher` arm above, a plausible mapping is safer than leaving the match
-        // non-exhaustive. Revisit when tauri-app-dev lands the patch-set IPC types.
-        VaultError::MalformedPatch { path, reason } => IpcError::Io {
+        // A malformed patch is a client bug (contracts/ipc.rs `InvalidPatch`); the
+        // file is untouched.
+        VaultError::MalformedPatch { path, reason } => IpcError::InvalidPatch {
             path,
             message: reason,
         },
+        // A legitimate edit refused to keep bytes outside it intact; the user is told
+        // (contracts/ipc.rs `LineEndingsWouldFuse`).
+        VaultError::LineEndingsWouldFuse { path, line } => {
+            IpcError::LineEndingsWouldFuse { path, line }
+        }
     }
 }
 
@@ -174,9 +173,19 @@ mod tests {
                     path: "a.md".into(),
                     reason: "edits overlap".into(),
                 },
-                IpcError::Io {
+                IpcError::InvalidPatch {
                     path: "a.md".into(),
                     message: "edits overlap".into(),
+                },
+            ),
+            (
+                VaultError::LineEndingsWouldFuse {
+                    path: "a.md".into(),
+                    line: 3,
+                },
+                IpcError::LineEndingsWouldFuse {
+                    path: "a.md".into(),
+                    line: 3,
                 },
             ),
         ];

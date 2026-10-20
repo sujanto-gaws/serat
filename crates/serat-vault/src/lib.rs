@@ -25,10 +25,13 @@
 //! Nothing here sits on the keystroke path, which is this pipeline's actual design
 //! constraint — not throughput (design goal 2).
 
+pub mod diff;
 pub mod echo;
 pub mod hash;
 pub mod ignore;
 pub mod patch;
+#[cfg(test)]
+mod patch_props;
 pub mod position;
 pub mod queue;
 pub mod refusal;
@@ -467,6 +470,19 @@ impl Vault {
         base_hash: ContentHash,
         edits: &[patch::Edit],
     ) -> Result<ContentHash, VaultError> {
+        self.write_patch_hooked(path, base_hash, edits, || {})
+    }
+
+    /// [`Vault::write_patch`] with a hook that runs after the temporary file is
+    /// complete and before the re-hash: the window the hostile tests (an external
+    /// write, a crash) need to reach deterministically.
+    fn write_patch_hooked(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        before_rehash: impl FnOnce(),
+    ) -> Result<ContentHash, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
                 path: path.as_str().to_owned(),
@@ -483,17 +499,17 @@ impl Vault {
         // Step 1: the hash lock. A delete or a rewrite between the caller's read
         // and this call surfaces here rather than silently patching the wrong
         // bytes.
-        let current_bytes =
-            fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let current_bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
         let current_hash = hash_bytes(&current_bytes);
         if current_hash != base_hash {
             return Err(stale(current_hash));
         }
-        let base_text = std::str::from_utf8(&current_bytes).map_err(|_| VaultError::MalformedPatch {
-            path: path.as_str().to_owned(),
-            reason: "base is not valid utf-8; a non-utf-8 file is never opened for editing"
-                .to_owned(),
-        })?;
+        let base_text =
+            std::str::from_utf8(&current_bytes).map_err(|_| VaultError::MalformedPatch {
+                path: path.as_str().to_owned(),
+                reason: "base is not valid utf-8; a non-utf-8 file is never opened for editing"
+                    .to_owned(),
+            })?;
 
         // Steps 2 and 3: map, validate and splice. Nothing outside a patched
         // range is touched — see `patch::apply_edits`'s own guarantee.
@@ -529,6 +545,8 @@ impl Vault {
             return Err(failed(err.to_string()));
         }
 
+        before_rehash();
+
         // Step 4's re-hash, immediately before the rename (ADR-0016 §2). This is
         // what "immediately before" means in code: nothing between this read and
         // the `fs::rename` call below touches the disk.
@@ -551,6 +569,39 @@ impl Vault {
         }
 
         Ok(new_hash)
+    }
+
+    /// The edit script from `base` to the file as it is on disk now, in `base`'s
+    /// coordinates (ADR-0016 §3; FR-VLT-05). The answer to a stale-base refusal and
+    /// to `request_external_diff`: the caller holds the base text, the vault holds
+    /// the disk.
+    ///
+    /// Returns the disk hash with the script, or `None` when the disk bytes hash to
+    /// `base_hash` (nothing to report). A disk change that is only a line-ending
+    /// flip returns `Some` with an empty script and the new hash.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] / [`VaultError::Io`] as for any read;
+    /// [`VaultError::MalformedPatch`] if the disk bytes are not UTF-8 (such a note
+    /// is never open for editing).
+    pub fn diff_against_disk(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        base: &str,
+    ) -> Result<Option<(ContentHash, diff::EditScript)>, VaultError> {
+        let target = self.resolve(path)?;
+        let bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let hash = hash_bytes(&bytes);
+        if hash == base_hash {
+            return Ok(None);
+        }
+        let other = std::str::from_utf8(&bytes).map_err(|_| VaultError::MalformedPatch {
+            path: path.as_str().to_owned(),
+            reason: "the file on disk is not valid utf-8".to_owned(),
+        })?;
+        Ok(Some((hash, diff::edit_script(base, other))))
     }
 }
 
@@ -678,9 +729,7 @@ mod tests {
             position::Position::new(0, 14),
             "active".to_owned(),
         )];
-        vault
-            .write_patch(&path, base_hash, &edits)
-            .expect("patch");
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
 
         assert_eq!(
             vault.read(&path).expect("read").bytes,
@@ -703,9 +752,7 @@ mod tests {
             position::Position::new(1, 6),
             "SECOND".to_owned(),
         )];
-        vault
-            .write_patch(&path, base_hash, &edits)
-            .expect("patch");
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
 
         assert_eq!(
             vault.read(&path).expect("read").bytes,
@@ -719,7 +766,9 @@ mod tests {
         let path = VaultPath::new("note.md").expect("path");
         let base_hash = vault.write_atomic(&path, b"original").expect("seed");
         // Someone else writes before our patch lands.
-        vault.write_atomic(&path, b"changed by someone else").expect("write");
+        vault
+            .write_atomic(&path, b"changed by someone else")
+            .expect("write");
 
         let edits = [patch::Edit::new(
             position::Position::new(0, 0),
@@ -788,10 +837,7 @@ mod tests {
         // No file exists, but the markdown check runs before any read.
         let bogus_hash = hash_bytes(b"anything");
         let result = vault.write_patch(&path, bogus_hash, &[]);
-        assert!(matches!(
-            result,
-            Err(VaultError::NotAMarkdownTarget { .. })
-        ));
+        assert!(matches!(result, Err(VaultError::NotAMarkdownTarget { .. })));
     }
 
     #[test]
@@ -819,9 +865,7 @@ mod tests {
                 "ONE ".to_owned(),
             ),
         ];
-        vault
-            .write_patch(&path, base_hash, &edits)
-            .expect("patch");
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
 
         assert_eq!(
             vault.read(&path).expect("read").bytes,

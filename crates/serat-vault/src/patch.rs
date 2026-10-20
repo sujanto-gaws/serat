@@ -12,7 +12,7 @@
 
 use serat_core::VaultError;
 
-use crate::position::{self, Position};
+use crate::position::{LineIndex, Position, byte_offset_to_position};
 
 /// One replace-range edit against a base document, in `{line, col}` coordinates.
 ///
@@ -39,26 +39,48 @@ impl Edit {
     }
 }
 
-/// The line ending [`apply_edits`] uses for every `\n` inside an inserted string:
-/// the base document's own first terminator, or `\n` when it has none.
+/// The note's line ending: the one [`apply_edits`] writes for every separator in an
+/// insert (ADR-0016 §2 step 3).
 ///
-/// ADR-0016 §2 step 3. CodeMirror always joins with `\n` internally, so an insert
-/// arriving from the front end is `\n`-delimited regardless of what the file on
-/// disk uses; converting it back to the file's own ending is what keeps a CRLF or
-/// a mixed-ending note from acquiring a stray LF the one time a word on one of its
-/// lines changes.
-fn line_ending(text: &str) -> &'static str {
+/// The most common terminator in `text`, `\r\n` against `\n`, with a tie going to
+/// whichever appears first. A lone `\r` is the ending only when it is the note's
+/// only kind of terminator, so one stray `\r` in an LF note does not turn every new
+/// line into a lone `\r`. A note with no terminator uses `\n`. Stateless: read from
+/// the base at every save, remembered nowhere.
+#[must_use]
+pub fn line_ending(text: &str) -> &'static str {
     let bytes = text.as_bytes();
+    let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
+    let mut first_is_crlf = None;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\r' if bytes.get(i + 1) == Some(&b'\n') => return "\r\n",
-            b'\r' => return "\r",
-            b'\n' => return "\n",
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                crlf += 1;
+                first_is_crlf.get_or_insert(true);
+                i += 2;
+            }
+            b'\r' => {
+                cr += 1;
+                i += 1;
+            }
+            b'\n' => {
+                lf += 1;
+                first_is_crlf.get_or_insert(false);
+                i += 1;
+            }
             _ => i += 1,
         }
     }
-    "\n"
+    if crlf == 0 && lf == 0 {
+        return if cr > 0 { "\r" } else { "\n" };
+    }
+    match crlf.cmp(&lf) {
+        std::cmp::Ordering::Greater => "\r\n",
+        std::cmp::Ordering::Less => "\n",
+        std::cmp::Ordering::Equal if first_is_crlf == Some(true) => "\r\n",
+        std::cmp::Ordering::Equal => "\n",
+    }
 }
 
 /// Apply `edits` to `base`, returning the new document text.
@@ -66,7 +88,7 @@ fn line_ending(text: &str) -> &'static str {
 /// # Errors
 ///
 /// [`VaultError::MalformedPatch`] if any position does not map to a byte offset in
-/// `base` ([`position::position_to_byte_offset`]), or if the edits are not given in
+/// `base` ([`LineIndex::offset`]), or if the edits are not given in
 /// ascending, non-overlapping order — ADR-0016 §2 step 2's "the ranges are ordered
 /// and disjoint". A client bug, not a race (the hash lock is what catches a race),
 /// so it is reported rather than silently reordered or clamped.
@@ -83,16 +105,17 @@ pub fn apply_edits(base: &str, edits: &[Edit], path: &str) -> Result<String, Vau
         reason,
     };
     let ending = line_ending(base);
+    let index = LineIndex::new(base);
 
     let mut offsets = Vec::with_capacity(edits.len());
     for edit in edits {
-        let from = position::position_to_byte_offset(base, edit.from).ok_or_else(|| {
+        let from = index.offset(base, edit.from).ok_or_else(|| {
             malformed(format!(
                 "edit `from` position {:?} does not map to a byte offset in the base",
                 edit.from
             ))
         })?;
-        let to = position::position_to_byte_offset(base, edit.to).ok_or_else(|| {
+        let to = index.offset(base, edit.to).ok_or_else(|| {
             malformed(format!(
                 "edit `to` position {:?} does not map to a byte offset in the base",
                 edit.to
@@ -118,20 +141,73 @@ pub fn apply_edits(base: &str, edits: &[Edit], path: &str) -> Result<String, Vau
 
     let mut out = String::with_capacity(base.len());
     let mut cursor = 0usize;
+    // Base offset of the lone `\r` the output currently ends with, if it came from
+    // a copied gap. A following `\n` would fuse with it (the deletion form).
+    let mut lone_cr: Option<usize> = None;
+    let fuse = |at: usize| VaultError::LineEndingsWouldFuse {
+        path: path.to_owned(),
+        line: byte_offset_to_position(base, at).line,
+    };
     for (edit, (from, to)) in edits.iter().zip(&offsets) {
-        // The gap since the last edit, copied verbatim — this is the invariant:
+        // The gap since the last edit, copied verbatim -- this is the invariant:
         // nothing between patched ranges is ever re-derived.
-        out.push_str(&base[cursor..*from]);
-        for ch in edit.insert.chars() {
-            if ch == '\n' {
-                out.push_str(ending);
-            } else {
-                out.push(ch);
+        let gap = &base[cursor..*from];
+        if let (Some(cr_at), true) = (lone_cr, gap.starts_with('\n')) {
+            return Err(fuse(cr_at));
+        }
+        out.push_str(gap);
+        if !gap.is_empty() {
+            lone_cr = gap.ends_with('\r').then(|| *from - 1);
+        }
+        // Every separator in the insert (`\n`, `\r\n` or a lone `\r`, the three CM6
+        // splits on) becomes the note's ending. The front end only ever sends
+        // `\n`; accepting the others keeps a stray `\r` from landing in the file
+        // as a separator the position model never counted.
+        let mut chars = edit.insert.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' | '\n' => {
+                    if ch == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    // The insert form of a fuse is avoided by choosing what Serat
+                    // writes: `\n` straight after a lone `\r` would read as one
+                    // `\r\n`, so write `\r\n`, which fuses with nothing.
+                    if ending == "\n" && out.ends_with('\r') {
+                        out.push_str("\r\n");
+                    } else {
+                        out.push_str(ending);
+                    }
+                }
+                other => out.push(other),
             }
+        }
+        if !edit.insert.is_empty() {
+            lone_cr = None;
         }
         cursor = *to;
     }
-    out.push_str(&base[cursor..]);
+    let tail = &base[cursor..];
+    if let (Some(cr_at), true) = (lone_cr, tail.starts_with('\n')) {
+        return Err(fuse(cr_at));
+    }
+    out.push_str(tail);
+
+    // Backstop: the patched text must have the lines the edits promise. No position
+    // falls inside a `\r\n`, so the only way the count can differ is two separators
+    // becoming one. Reachable only if the junction checks above missed a case.
+    let mut expected = index.line_count() as isize;
+    for (edit, &(from, to)) in edits.iter().zip(&offsets) {
+        expected += LineIndex::new(&edit.insert).line_count() as isize - 1;
+        expected -= LineIndex::new(&base[from..to]).line_count() as isize - 1;
+    }
+    if LineIndex::new(&out).line_count() as isize != expected {
+        let line = edits.first().map_or(0, |e| e.from.line);
+        return Err(VaultError::LineEndingsWouldFuse {
+            path: path.to_owned(),
+            line,
+        });
+    }
 
     Ok(out)
 }
@@ -147,11 +223,7 @@ mod tests {
     #[test]
     fn a_single_word_edit_touches_nothing_else() {
         let base = "status:: draft\ntitle:: Serat\n";
-        let edits = [Edit::new(
-            pos(0, 9),
-            pos(0, 14),
-            "active".to_owned(),
-        )];
+        let edits = [Edit::new(pos(0, 9), pos(0, 14), "active".to_owned())];
         let out = apply_edits(base, &edits, "note.md").expect("apply");
         assert_eq!(out, "status:: active\ntitle:: Serat\n");
     }

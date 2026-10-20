@@ -47,7 +47,11 @@ pub fn line_starts(text: &str) -> Vec<usize> {
     while i < bytes.len() {
         match bytes[i] {
             b'\r' => {
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 starts.push(i);
             }
             b'\n' => {
@@ -60,55 +64,99 @@ pub fn line_starts(text: &str) -> Vec<usize> {
     starts
 }
 
-/// The byte range of line `line`'s content, excluding its terminator.
+/// Line boundaries of one text, computed once.
 ///
-/// `None` if `line` does not exist in `text`.
-fn line_content_range(text: &str, line: u32) -> Option<(usize, usize)> {
-    let starts = line_starts(text);
-    let start = *starts.get(line as usize)?;
-    // The content ends at the next line's start minus its terminator, or at the
-    // text's end for the last line (which has none).
-    let content_end = match starts.get(line as usize + 1) {
-        Some(&next_start) => {
-            let bytes = text.as_bytes();
-            // Walk back over the one or two terminator bytes that separate this
-            // line's content from the next line's start.
-            if next_start >= 2 && &bytes[next_start - 2..next_start] == b"\r\n" {
-                next_start - 2
-            } else {
-                next_start - 1
+/// Mapping N positions with a per-call scan is O(N * size); a patch set of many
+/// edits against a large note builds this once instead.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    /// `(start, content_end)` byte offsets of each line; the terminator lies in
+    /// `content_end..next start`.
+    lines: Vec<(usize, usize)>,
+}
+
+impl LineIndex {
+    /// Index `text`'s lines under CM6's splitting rule.
+    #[must_use]
+    pub fn new(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut lines = Vec::new();
+        let (mut start, mut i) = (0usize, 0usize);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    lines.push((start, i));
+                    i += if bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    start = i;
+                }
+                b'\n' => {
+                    lines.push((start, i));
+                    i += 1;
+                    start = i;
+                }
+                _ => i += 1,
             }
         }
-        None => text.len(),
-    };
-    Some((start, content_end))
+        lines.push((start, bytes.len()));
+        Self { lines }
+    }
+
+    /// Number of lines (at least 1).
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The byte range of line `line`'s content, excluding its terminator.
+    #[must_use]
+    pub fn content_range(&self, line: u32) -> Option<(usize, usize)> {
+        self.lines.get(line as usize).copied()
+    }
+
+    /// Map a position to a byte offset in `text` (which must be the text this
+    /// index was built from). `None` if the line does not exist, the column is past
+    /// the end of the line's content, or the column falls inside a surrogate pair.
+    #[must_use]
+    pub fn offset(&self, text: &str, pos: Position) -> Option<usize> {
+        let (content_start, content_end) = self.content_range(pos.line)?;
+        if pos.col == 0 {
+            return Some(content_start);
+        }
+        let mut units = 0u32;
+        let mut offset = content_start;
+        for ch in text[content_start..content_end].chars() {
+            units += ch.len_utf16() as u32;
+            offset += ch.len_utf8();
+            if units == pos.col {
+                return Some(offset);
+            }
+            if units > pos.col {
+                return None;
+            }
+        }
+        None
+    }
+}
+
+/// The byte range of line `line`'s content, excluding its terminator.
+#[cfg(test)]
+fn line_content_range(text: &str, line: u32) -> Option<(usize, usize)> {
+    LineIndex::new(text).content_range(line)
 }
 
 /// Map a `{line, col}` position to a byte offset into `text`.
 ///
-/// `None` if `line` does not exist, or `col` lands past the end of that line's
-/// content (inside or beyond its terminator) — both client bugs, per ADR-0016 §2
+/// `None` if `line` does not exist, `col` lands past the end of that line's
+/// content, or inside a surrogate pair -- all client bugs, per ADR-0016 §2
 /// step 2, which the caller reports as [`serat_core::VaultError::MalformedPatch`]
-/// rather than clamping silently.
+/// rather than clamping silently. For many positions in one text use [`LineIndex`].
 #[must_use]
 pub fn position_to_byte_offset(text: &str, pos: Position) -> Option<usize> {
-    let (content_start, content_end) = line_content_range(text, pos.line)?;
-    let mut units = 0u32;
-    let mut offset = content_start;
-    if pos.col == 0 {
-        return Some(content_start);
-    }
-    for ch in text[content_start..content_end].chars() {
-        if units == pos.col {
-            return Some(offset);
-        }
-        units += ch.len_utf16() as u32;
-        offset += ch.len_utf8();
-        if units == pos.col {
-            return Some(offset);
-        }
-    }
-    None
+    LineIndex::new(text).offset(text, pos)
 }
 
 /// Map a byte offset in `text` back to a `{line, col}` position.
@@ -128,7 +176,9 @@ pub fn byte_offset_to_position(text: &str, offset: usize) -> Position {
     );
     let starts = line_starts(text);
     // The line containing `offset` is the last line whose start is <= offset.
-    let line = starts.partition_point(|&start| start <= offset).saturating_sub(1);
+    let line = starts
+        .partition_point(|&start| start <= offset)
+        .saturating_sub(1);
     let content_start = starts[line];
     let units: u32 = text[content_start..offset]
         .chars()
@@ -273,10 +323,7 @@ mod shared_table_tests {
     fn keeps_a_bom_as_the_first_character_of_line_zeros_text() {
         let doc = "\u{FEFF}title\nbody";
         assert_eq!(byte_offset_to_position(doc, 3), Position::new(0, 1));
-        assert_eq!(
-            position_to_byte_offset(doc, Position::new(0, 1)),
-            Some(3)
-        );
+        assert_eq!(position_to_byte_offset(doc, Position::new(0, 1)), Some(3));
     }
 
     #[test]
@@ -286,15 +333,11 @@ mod shared_table_tests {
         let doc = "a\u{1F600}b";
         assert_eq!(byte_offset_to_position(doc, 1), Position::new(0, 1)); // right after "a"
         assert_eq!(byte_offset_to_position(doc, 5), Position::new(0, 3)); // after the pair, before "b"
-        assert_eq!(
-            position_to_byte_offset(doc, Position::new(0, 3)),
-            Some(5)
-        );
+        assert_eq!(position_to_byte_offset(doc, Position::new(0, 3)), Some(5));
     }
 
     #[test]
-    fn offset_and_position_are_exact_inverses_across_a_whole_document_mixed_terminators_included()
-     {
+    fn offset_and_position_are_exact_inverses_across_a_whole_document_mixed_terminators_included() {
         // The fixture the amendment specifically asked for: CRLF, a lone CR and
         // LF, all three, in one document — exactly the front end's
         // "offsetAt is the exact inverse of posAt" fixture.
@@ -328,6 +371,89 @@ mod shared_table_tests {
                     break;
                 }
                 offset += doc[offset..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+}
+
+/// The CodeMirror offset model, restated: a document offset counts UTF-16 units of
+/// line text plus **one per separator, whatever its width in the file**. The
+/// fixtures are the ones in `app/src/editor/patches.test.ts`, with the `posAt`
+/// results written out, so the two halves are checked against the same numbers.
+#[cfg(test)]
+mod cm_offset_table {
+    use super::*;
+
+    /// `(file text, CM doc offset, expected {line, col})` from patches.test.ts.
+    const TABLE: &[(&str, usize, (u32, u32))] = &[
+        ("one\ntwo\nthree", 0, (0, 0)),
+        ("one\ntwo\nthree", 4, (1, 0)),
+        ("one\ntwo\nthree", 5, (1, 1)),
+        ("one\r\ntwo\r\nthree", 3, (0, 3)),
+        ("one\r\ntwo\r\nthree", 4, (1, 0)), // line(2).from: ONE offset per CRLF
+        ("one\r\ntwo\r\nthree", 8, (2, 0)),
+        ("one\rtwo\rthree", 4, (1, 0)),
+        ("\u{FEFF}title\nbody", 1, (0, 1)),
+        ("a\u{1F600}b", 1, (0, 1)),
+        ("a\u{1F600}b", 3, (0, 3)),
+        ("alpha\r\nbeta\rgamma\ndelta", 6, (1, 0)),
+        ("alpha\r\nbeta\rgamma\ndelta", 11, (2, 0)),
+        ("alpha\r\nbeta\rgamma\ndelta", 17, (3, 0)),
+    ];
+
+    /// CM's `posAt`, from an independent line split.
+    fn pos_at(text: &str, cm_offset: usize) -> Position {
+        let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut remaining = cm_offset;
+        for (line, content) in normalised.split('\n').enumerate() {
+            let len = content.encode_utf16().count();
+            if remaining <= len {
+                return Position::new(line as u32, remaining as u32);
+            }
+            remaining -= len + 1;
+        }
+        panic!("offset {cm_offset} past the end of {text:?}");
+    }
+
+    #[test]
+    fn the_front_end_fixtures_give_the_same_line_and_column() {
+        for &(text, offset, (line, col)) in TABLE {
+            assert_eq!(
+                pos_at(text, offset),
+                Position::new(line, col),
+                "{text:?} @ {offset}"
+            );
+            // And the Rust mapping lands on the byte where that line/col is.
+            let byte = position_to_byte_offset(text, Position::new(line, col))
+                .unwrap_or_else(|| panic!("{text:?} {line}:{col}"));
+            assert_eq!(
+                byte_offset_to_position(text, byte),
+                Position::new(line, col)
+            );
+        }
+    }
+
+    #[test]
+    fn every_cm_offset_of_every_fixture_maps_to_a_byte_and_back() {
+        for &(text, ..) in TABLE {
+            let total = text
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .encode_utf16()
+                .count();
+            for offset in 0..=total {
+                let pos = pos_at(text, offset);
+                let Some(byte) = position_to_byte_offset(text, pos) else {
+                    // The only offsets without a byte are inside a surrogate pair,
+                    // which CM addresses and the patch protocol must reject.
+                    assert!(text.contains('\u{1F600}'), "{text:?} @ {offset}");
+                    continue;
+                };
+                assert_eq!(
+                    byte_offset_to_position(text, byte),
+                    pos,
+                    "{text:?} @ {offset}"
+                );
             }
         }
     }
