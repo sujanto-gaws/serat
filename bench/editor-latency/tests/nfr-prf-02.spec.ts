@@ -1,104 +1,120 @@
-// NFR-PRF-02 budget, per architecture.md §9.3 (task/p1-05-editor @
-// bdd4fd5, task #5): at least 95% of keystrokes in a 5,000-line note are
-// painted in the first display frame after the keystroke, in every
-// scenario, with a bare-contenteditable control arm at >=99% required on
-// every run. Task #11 (P1/test), depends on task #5 (landed, this file)
-// and #21 (vue-frontend-dev implementation, not yet landed — the real
-// subject still throws, see subject.ts).
+// NFR-PRF-02 budget job, rule E0 (see measure.ts). Serves NFR-PRF-02, NFR-PRF-08, US-35, C-06.
 //
-// Acceptance wording (§9.3, offered to product-analyst as task #32):
-// "Given a 5,000-line note in the editor, when each benchmark scenario is
-// typed through the browser's input pipeline, then at least 95% of
-// keystrokes are painted in the first display frame after the keystroke,
-// in every scenario, and a bare-contenteditable control arm on the same
-// run is at 99% or better; the editor's own per-keystroke work is
-// reported beside it."
+// Gates, in order (serial: if a control fails, the later tests are skipped, because a
+// subject result is meaningless on a harness or machine that fails its controls):
+//   1. positive control   bare contenteditable, 300 keys, strict 100 ms AND phase-swept: >= 99% on time
+//   2. negative control   2.2R busy-wait in the input handler, 100 keys: >= 95% late
+//   3. negative control 2 2.2R busy-wait in a rAF queued by the input handler, 100 keys: >= 95% late
+//   4. mutation           verdict forced "on time" must turn BOTH negative arms red
+//   5. subject            5,000-line note in the real editor build: >= 95% on time
+// Reported, never gated: graded 1.5R (expected band 85-95% late) and the keydown->presentation diagnostic.
 //
-// Fails loudly rather than silently, per the same rule `bench/budget`
-// follows (test-plan.md rule 1: a budget with no job is not a budget) — a
-// harness that reported "skipped" here could be mistaken for a green run
-// once this file is wired into CI.
+// Engine label: this runs in headless Chromium. Presentation timing there is a proxy for a
+// real compositor, so a result is NOT gate-eligible for NFR-PRF-02 until it is reproduced on a
+// reference machine (WebView2). Event Timing is Chromium/WebView2 only.
 import { test, expect } from "@playwright/test";
+import {
+  namespaceSource,
+  percentLate,
+  percentOnTime,
+  p95FramesToPaint,
+  latencyDiagnostic,
+  installCapture,
+  runKeystrokes,
+  type Cadence,
+} from "./measure";
+import {
+  measureArm,
+  POSITIVE_MIN_ON_TIME,
+  NEGATIVE_MIN_LATE,
+  SUBJECT_MIN_ON_TIME,
+  GRADED_BAND,
+  type ArmName,
+} from "./arms";
 import { openNoteForLatencyTest } from "./subject";
-import { runScenario, percentPaintedFirstFrame, p95FramesToPaint } from "./measure";
-import { measureControlArm, CONTROL_ARM_MIN_ON_TIME } from "./control-arm";
-import { measureNegativeControlArm, NEGATIVE_CONTROL_MIN_LATE } from "./negative-control-arm";
 
-const SUBJECT_MIN_ON_TIME = 0.95;
-const SAMPLE_COUNT = 500; // §9.3: "each at least 500 keystrokes"
-const CONTROL_SAMPLE_COUNT = 500;
-const NEGATIVE_CONTROL_SAMPLE_COUNT = 100; // cheaper: this arm exists to prove the harness can fail, not to be precise
+test.describe.configure({ mode: "serial" });
 
-test("control arm: a bare contenteditable is on time at least 99% of the time", async ({
-  page,
-}) => {
-  // Runs unconditionally, whatever the state of #5/#21 — see
-  // control-arm.ts. Required on every run per §9.3: if this fails, the
-  // subject result below (whenever it is unblocked) cannot be trusted —
-  // the harness or machine itself cannot keep up with a trivial editor.
-  const { percentOnTime, samples } = await measureControlArm(page, CONTROL_SAMPLE_COUNT);
-  console.log(
-    `control arm: ${(percentOnTime * 100).toFixed(2)}% on time over ${CONTROL_SAMPLE_COUNT} keystrokes ` +
-      `(must be >= ${(CONTROL_ARM_MIN_ON_TIME * 100).toFixed(0)}%); p95 frames_to_paint = ` +
-      `${p95FramesToPaint(samples)}`,
-  );
-  expect(
-    percentOnTime,
-    `control arm on-time rate is ${(percentOnTime * 100).toFixed(2)}%, not >= ` +
-      `${(CONTROL_ARM_MIN_ON_TIME * 100).toFixed(0)}% — the NFR-PRF-02 subject result cannot be ` +
-      `trusted until this passes (architecture.md §9.3)`,
-  ).toBeGreaterThanOrEqual(CONTROL_ARM_MIN_ON_TIME);
+const pct = (x: number) => (x * 100).toFixed(1) + "%";
+const ENGINE = () => "headless Chromium (not gate-eligible)";
+const fmt = (m: import("./measure").RunSummary) =>
+  `on time @-4/0/+4 ms = ${pct(m.onTimeAtMinus4)}/${pct(m.onTimeAtZero)}/${pct(m.onTimeAtPlus4)}; ` +
+  `${m.scoredOnTimeByAbsence}/${m.n} on time by absence of an Event Timing entry; ${m.staleAnchors} stale anchors (phase >= 1R); verdict ${m.verdict}`;
+
+const CADENCES: [string, Cadence][] = [
+  ["strict 100 ms", { kind: "strict" }],
+  ["phase-swept", { kind: "swept", seed: 1 }],
+];
+for (const [label, cadence] of CADENCES) {
+  test(`positive control (${label}): bare contenteditable >= 99% on time over 300 keystrokes`, async ({ page }) => {
+    test.setTimeout(120_000);
+    const { scores, summary, refreshIntervalMs } = await measureArm(page, "positive", 300, cadence);
+    expect(scores.length, "exactly 300 positive keys, none dropped").toBe(300);
+    const on = percentOnTime(scores);
+    console.log(`positive ${label}: n=300 R=${refreshIntervalMs.toFixed(2)} ${pct(on)} on time, p95 frames=${p95FramesToPaint(scores)}; ${fmt(summary)}; ${ENGINE()}`);
+    expect(on, `positive control ${pct(on)} < ${pct(POSITIVE_MIN_ON_TIME)}: the harness or machine cannot show a trivial editor keeping up; the subject result cannot be trusted`).toBeGreaterThanOrEqual(POSITIVE_MIN_ON_TIME);
+  });
+}
+
+for (const arm of ["negative", "render2"] as ArmName[]) {
+  test(`negative control (${arm}): >= 95% late over 100 keystrokes`, async ({ page }) => {
+    test.setTimeout(60_000);
+    const { scores, summary, refreshIntervalMs } = await measureArm(page, arm, 100);
+    expect(scores.length, "at least 100 keys, none dropped").toBeGreaterThanOrEqual(100);
+    const late = percentLate(scores);
+    console.log(`${arm}: n=100 R=${refreshIntervalMs.toFixed(2)} ${pct(late)} late; ${fmt(summary)}; ${ENGINE()}`);
+    expect(late, `${arm} control ${pct(late)} late < ${pct(NEGATIVE_MIN_LATE)}: the harness failed to detect a deliberately blocking subject`).toBeGreaterThanOrEqual(NEGATIVE_MIN_LATE);
+  });
+}
+
+test("mutation: forcing the verdict on time turns BOTH negative arms red", async ({ context }) => {
+  test.setTimeout(60_000);
+  const mutant = namespaceSource({ isLate: "function isLate(etEnd, deadlineMs) { return false; }" });
+  for (const arm of ["negative", "render2"] as ArmName[]) {
+    const fresh = await context.newPage(); // one document per capture install
+    const { scores } = await measureArm(fresh, arm, 40, { kind: "strict" }, mutant);
+    await fresh.close();
+    const late = percentLate(scores);
+    console.log(`mutant (isLate -> false) on ${arm}: ${pct(late)} late (gate needs >= ${pct(NEGATIVE_MIN_LATE)}, so it is red)`);
+    expect(late, `the mutant must fail the ${arm} gate`).toBeLessThan(NEGATIVE_MIN_LATE);
+  }
 });
 
-test("negative control arm: a deliberately-blocking contenteditable is late at least 95% of the time", async ({
-  page,
-}) => {
-  // The complement of the positive control above (code review,
-  // 2026-09-24): proves the harness can report a bad result for a
-  // genuinely bad subject, not just a good one for a good subject — a
-  // harness that always reports "on time" regardless of the subject would
-  // pass the positive control too.
-  const { percentLate, refreshIntervalMs } = await measureNegativeControlArm(
-    page,
-    NEGATIVE_CONTROL_SAMPLE_COUNT,
-  );
-  console.log(
-    `negative control arm: ${(percentLate * 100).toFixed(2)}% late over ` +
-      `${NEGATIVE_CONTROL_SAMPLE_COUNT} keystrokes (must be >= ` +
-      `${(NEGATIVE_CONTROL_MIN_LATE * 100).toFixed(0)}%; busy-wait 3R = ` +
-      `${(refreshIntervalMs * 3).toFixed(1)}ms)`,
-  );
-  expect(
-    percentLate,
-    `negative control arm's late rate is ${(percentLate * 100).toFixed(2)}%, not >= ` +
-      `${(NEGATIVE_CONTROL_MIN_LATE * 100).toFixed(0)}% — the harness failed to detect a ` +
-      `deliberately blocking handler, which means it cannot be trusted to detect a real one`,
-  ).toBeGreaterThanOrEqual(NEGATIVE_CONTROL_MIN_LATE);
+test("graded 1.5R (reported, not gated; expected band 85-95% late)", async ({ page }) => {
+  test.setTimeout(90_000);
+  const { scores, summary } = await measureArm(page, "graded", 200);
+  const late = percentLate(scores);
+  const inBand = late >= GRADED_BAND[0] && late <= GRADED_BAND[1];
+  console.log(`graded: n=200 ${pct(late)} late; ${fmt(summary)}; band ${pct(GRADED_BAND[0])}-${pct(GRADED_BAND[1])}: ${inBand ? "in band" : "OUT OF BAND (informational)"}`);
+  test.info().annotations.push({ type: "graded-late", description: pct(late) });
 });
 
-test("NFR-PRF-02: at least 95% of keystrokes painted in the first frame, 5,000-line note", async ({
-  page,
-}) => {
-  // This call throws today (see subject.ts) — the test is expected to fail
-  // until #5's implementation (#21) lands, and it fails with the blocking
-  // task numbers in the message rather than a generic timeout, so whoever
-  // reads a red CI run does not have to rediscover why.
-  const editor = await openNoteForLatencyTest(page);
-
-  const { samples, actualCadenceMs } = await runScenario(editor, SAMPLE_COUNT);
-
-  const percentOnTime = percentPaintedFirstFrame(samples);
-  const missedFrameSamples = samples.filter((s) => s.framesToPaint > 1);
-  const meanHandlerMs =
-    samples.reduce((sum, s) => sum + s.handlerMs, 0) / samples.length;
-  const meanRenderMs = samples.reduce((sum, s) => sum + s.renderMs, 0) / samples.length;
-
-  console.log(
-    `NFR-PRF-02: ${(percentOnTime * 100).toFixed(2)}% on time over ${SAMPLE_COUNT} keystrokes ` +
-      `(budget >= ${(SUBJECT_MIN_ON_TIME * 100).toFixed(0)}%); p95 frames_to_paint = ` +
-      `${p95FramesToPaint(samples)}; ${missedFrameSamples.length}/${SAMPLE_COUNT} missed a frame; ` +
-      `diagnostic (b) mean handler ${meanHandlerMs.toFixed(2)}ms, mean render ${meanRenderMs.toFixed(2)}ms; ` +
-      `cadence recorded, ${actualCadenceMs.length} intervals`,
-  );
-  expect(percentOnTime).toBeGreaterThanOrEqual(SUBJECT_MIN_ON_TIME);
+test("NFR-PRF-02 subject: >= 95% painted in the first frame, 5,000-line note, real editor build", async ({ page }) => {
+  test.setTimeout(240_000);
+  const subject = await openNoteForLatencyTest(page);
+  try {
+    const { refreshIntervalMs } = await installCapture(page);
+    const rows: string[] = [];
+    let worst = 1;
+    const verdicts: string[] = [];
+    const subjectCadences: [string, Cadence][] = [
+      ["strict", { kind: "strict" }],
+      ["swept", { kind: "swept", seed: 1 }],
+    ];
+    for (const [label, cadence] of subjectCadences) {
+      await subject.editor.focus();
+      await page.keyboard.press("Control+Home");
+      const { scores, summary } = await runKeystrokes(page, subject.editor, 300, { cadence, bar: SUBJECT_MIN_ON_TIME });
+      verdicts.push(summary.verdict);
+      const on = percentOnTime(scores);
+      worst = Math.min(worst, on);
+      const d = latencyDiagnostic(scores);
+      rows.push(`${label}: ${fmt(summary)}; ${pct(on)} on time, p95 frames=${p95FramesToPaint(scores)}, ${d.withEntry}/300 with ET entry (mean ${d.meanMs.toFixed(1)} ms, max ${d.maxMs.toFixed(1)} ms)`);
+    }
+    console.log(`SUBJECT n=300 per cadence, typing at document start, R=${refreshIntervalMs.toFixed(2)}, ${ENGINE()}: ${rows.join(" | ")}`);
+    expect(verdicts, "every cadence must be PASS; INDETERMINATE (95% between the -4 and +4 ms shares) is not a pass").toEqual(["PASS", "PASS"]);
+    expect(worst).toBeGreaterThanOrEqual(SUBJECT_MIN_ON_TIME);
+  } finally {
+    await subject.close();
+  }
 });

@@ -18,7 +18,7 @@ export default defineConfig({
   retries: 0, // a budget harness that retries away a slow run is not a budget harness
   reporter: [["list"], ["json", { outputFile: "out/results.json" }]],
   use: {
-    trace: "retain-on-failure",
+    trace: "off", // tracing screenshots load the page being timed
   },
   projects: [
     {

@@ -1,158 +1,78 @@
-// The measurement primitive for NFR-PRF-02, implemented against
-// architecture.md §9.3 ("NFR-PRF-02: what is measured — frames, not
-// milliseconds"), landed by the architect on task/p1-05-editor @ bdd4fd5,
-// task #5, and corrected by code-reviewer's second pass (2026-09-24) —
-// see the two fixes below, both binding.
+// The measurement primitive for NFR-PRF-02 (task #11), rebuilt on RULE E0, the
+// rule selected empirically from recordings (bench/editor-latency/record/,
+// data/summary.txt) after rules A, B and C failed against recorded frames.
 //
-// **Binding definition (§9.3, being reworded by the architect to match
-// fix 1):** at least 95% of keystrokes are painted in the first display
-// frame after the keystroke, in every scenario, in a 5,000-line note.
+// **E0, in one paragraph.** For each trusted keystroke:
+//   t    = the keydown event's `timeStamp`;
+//   ts_j = the last rAF frame timestamp at or before t;
+//   D    = ts_j + 2R           (R = median rAF delta over 120 frames);
+//   ETend = max over the keystroke's keydown / keypress / beforeinput / input
+//           Event Timing entries of (startTime + duration), i.e. the moment the
+//           browser reports the frame after the event as PRESENTED
+//           (`PerformanceObserver({type:"event", durationThreshold:16})`);
+//   the keystroke is LATE iff ETend > D. An absent entry means the paint took
+//   under 16 ms, which is on time.
+//   frames_to_paint = 1 + max(0, ceil((ETend - D) / R)); on time iff it is 1.
+// Binding: >= 95% of keystrokes on time (§9.3). `run`, `p` (end of input
+// handling) and a post-paint MessageChannel are NOT in the scoring path: they
+// mis-score at phase >= 0.88R (rule C) or are blind to work done after the
+// recorder's own rAF callback, which is where CodeMirror's measure/DOM update
+// runs (rule D: a 36 ms rAF stall scored 0% late). Event Timing is the only
+// signal that includes presentation. It is Chromium/WebView2-only and rounds
+// `duration` to 8 ms; the recorded separation is ETend - D <= -5.3 ms for a
+// bare contenteditable and >= +7.9 ms for a blocked one, so threshold 0 sits
+// in the gap.
 //
-// **Fix 1 — f_k is when the frame's callback RUNS, not its scheduled
-// timestamp.** The previous version picked f_k as the first frame whose
-// `rAF` *timestamp* (`ts`) was `>= p`. Code review's probe found 18/18
-// "late" samples in a run had `p` land *after* a frame's `ts` but *before*
-// that frame's callback had actually executed (`ts < p < run`) — meaning
-// the edit was still synchronously visible when that frame's callback did
-// run, so the edit *was* captured in that frame, but the old rule skipped
-// it to the next one and miscounted a missed frame that never happened.
-// **f_k is now the first frame whose callback RUNS after `p`** — tracked
-// as `{ ts, run: performance.now() }` per frame — and `frames_to_paint` is
-// the count of frame timestamps in `(t, ts_k]`, **clamped to >= 1** (the
-// clamp is a floor against exactly this kind of boundary case, not a
-// normal outcome).
+// **One implementation measures, not two.** Every scoring function lives in
+// `SeratLatencyFns` below as a plain, self-contained `function` declaration.
+// The page runs them from that SAME source text (`namespaceSource()` ->
+// `new Function`), and the unit tests exercise both the direct import and the
+// `new Function` round trip, so the code under test is the code that runs in
+// the page. The mutation test substitutes a function's source through the same
+// seam (`namespaceSource({ isLate: ... })`) and expects the negative arms to go
+// red.
 //
-// **Fix 2 — one implementation measures, not two.** The in-page frame walk
-// used to reimplement the counting and long-frame logic inline inside the
-// `page.evaluate` closure, as a second, hand-copied version of
-// `countFrameStartsInRange`/`isLongFrame`/`medianRefreshInterval` below.
-// Code review mutated the in-page copy alone (`const framesToPaint = 1`)
-// and every unit test here stayed green, because the tests exercise the
-// Node-side originals, never the in-page copies — textbook "the guard was
-// tested and its caller was not" (test-plan.md). **The in-page walk now
-// calls these exact functions**, injected into the page verbatim via
-// `Function.prototype.toString()` in `installLatencyCapture` (see
-// `PURE_FUNCTION_SOURCE` below) rather than being retyped by hand a second
-// time. There is exactly one implementation of each; the page runs it by
-// reference, not by copy.
+// **No blanket try/catch.** A missing frame or a keystroke that never reached
+// the editor throws and fails the run; nothing is swallowed into a score.
 //
-// Serves NFR-PRF-02. The interval timed, per test-plan.md's rule that
-// every budget names it: from the trusted keydown's own `timeStamp` (`t`)
-// to the post-render macrotask of the frame in which the edit first
-// became visible (`f_k`, redefined above). Diagnostic (b), reported and
-// never gated: the editor's own work — handler time (`p - processingStart`,
-// `processingStart` approximated as `t`, see below) plus frame `k`'s own
-// render time.
-import type { ElementHandle, Locator, Page } from "@playwright/test";
+// **One document per capture install.** `installCapture` registers listeners on
+// `document`; it refuses a second install on the same document instead of
+// silently skipping (the `setContent` double-install hang found in round 2).
+import type { Locator, Page } from "@playwright/test";
 
-/** One keystroke's raw measurement, per §9.3. */
-export interface FrameSample {
-  /** Frame starts in `(t, ts_k]`, counting `ts_k`, clamped to >= 1, plus
-   * §9.3's long-frame adjustment. 1 = painted on time. */
+/** One Event Timing entry, reduced to what scoring needs. */
+export interface EtEntry {
+  name: string;
+  startTime: number;
+  duration: number;
+}
+
+/** One keystroke's verdict. */
+export interface KeystrokeScore {
+  t: number;
+  tsJ: number;
+  deadline: number;
+  /** `null`: no Event Timing entry >= 16 ms, i.e. presented in time. */
+  etEnd: number | null;
+  late: boolean;
   framesToPaint: number;
-  /** ms, `p - processingStart` (processingStart approximated as `t`). */
-  handlerMs: number;
-  /** ms, frame `k`'s own render time: `ts_k` to the post-paint macrotask
-   * fired from inside frame `k`'s `rAF` callback. */
-  renderMs: number;
+}
+
+export interface RunSummary {
+  n: number;
+  onTimeAtMinus4: number;
+  onTimeAtZero: number;
+  onTimeAtPlus4: number;
+  scoredOnTimeByAbsence: number;
+  staleAnchors: number;
+  verdict: "PASS" | "FAIL" | "INDETERMINATE";
 }
 
 // ---------------------------------------------------------------------
-// Pure functions — no page, no browser. Unit-tested directly in
-// measure.unit.spec.ts AND injected verbatim into the page (see
-// PURE_FUNCTION_SOURCE) so the code under test and the code being run
-// in-page are the same function, not a hand-copied lookalike (fix 2).
-// Written as plain `function` declarations, with no destructuring of
-// imported types inside the body, specifically so `.toString()` produces
-// self-contained source with nothing left to resolve.
+// Pure functions. Self-contained declarations (each may call the others
+// by name; nothing else is referenced) so `.toString()` round-trips.
 // ---------------------------------------------------------------------
 
-/** §9.3: a keystroke is "on time" iff it painted in the very first frame
- * after it — `frames_to_paint === 1`, not `<= 1`: a sample cannot
- * legitimately be *less* than 1 once the counting rule clamps to a floor
- * of 1, so `<= 1` and `=== 1` agree on every real sample and only diverge
- * on a corrupted one (`framesToPaint: 0`), which is exactly the case a
- * `<= 1` mutant would wrongly accept as on-time. */
-export function paintedFirstFrame(sample: FrameSample): boolean {
-  return sample.framesToPaint === 1;
-}
-
-/** Fraction (0..1) of samples painted on time. */
-export function percentPaintedFirstFrame(samples: FrameSample[]): number {
-  if (samples.length === 0) {
-    throw new Error("percentPaintedFirstFrame of zero samples is undefined");
-  }
-  return samples.filter(paintedFirstFrame).length / samples.length;
-}
-
-/** Nearest-rank p95 of `frames_to_paint`. */
-export function p95FramesToPaint(samples: FrameSample[]): number {
-  if (samples.length === 0) {
-    throw new Error("p95 of zero samples is undefined");
-  }
-  const sorted = samples.map((s) => s.framesToPaint).sort((a, b) => a - b);
-  const rank = Math.ceil(0.95 * sorted.length) - 1;
-  return sorted[Math.max(0, rank)];
-}
-
-/** One recorded frame: its scheduled `requestAnimationFrame` timestamp
- * (`ts`) and the wall-clock time its callback actually ran (`run`) —
- * fix 1's distinction. */
-export interface FrameRecord {
-  ts: number;
-  run: number;
-}
-
-/** Fix 1: `f_k` is the first frame whose callback **runs** after `p`, not
- * the first whose scheduled `ts` is `>= p` — code review's probe found
- * `ts < p < run` cases where the edit was still captured in that frame
- * (its callback had not run yet), which the old `ts >= p` rule wrongly
- * skipped past. Returns that frame's `ts` (what `countFrameStartsInRange`
- * needs as `fk`). Injected into the page — see `countFrameStartsInRange`'s
- * doc comment.
- *
- * @throws if no recorded frame's callback has run after `p` yet — the
- * caller's signal to keep waiting for more frames, not an error.
- */
-export function selectFk(frames: FrameRecord[], p: number): number {
-  const match = frames.find((f) => f.run > p);
-  if (!match) {
-    throw new Error("no frame's callback has run after p yet");
-  }
-  return match.ts;
-}
-
-/** §9.3's `frames_to_paint` counting rule: the count of frame-start
- * timestamps strictly after `t` and up to and including `fk` (`ts_k`),
- * **clamped to a floor of 1** — fix 1's boundary case (t < ts_k always in
- * an honest run, so this is a floor against clock/ordering edge cases,
- * not a normal path). Injected into the page (see
- * `PURE_FUNCTION_SOURCE`) — the in-page walk calls this exact function. */
-export function countFrameStartsInRange(
-  frameStarts: number[],
-  t: number,
-  fk: number,
-): number {
-  const count = frameStarts.filter((f) => f > t && f <= fk).length;
-  return Math.max(1, count);
-}
-
-/** §9.3's long-frame adjustment: frame `k` itself overran into the next
- * vsync if the gap to the following frame start exceeds 1.5x the
- * measured refresh interval. Injected into the page — see
- * `countFrameStartsInRange`'s doc comment. */
-export function isLongFrame(
-  fk: number,
-  fNext: number,
-  refreshIntervalMs: number,
-): boolean {
-  return fNext - fk > 1.5 * refreshIntervalMs;
-}
-
-/** §9.3's refresh-interval `R`: the median of consecutive frame-start
- * deltas over (at least) 120 consecutive frames. Injected into the page
- * — the in-page warmup calls this exact function, not a second hand-copied
- * median. */
 export function medianRefreshInterval(frameStarts: number[]): number {
   if (frameStarts.length < 2) {
     throw new Error("need at least 2 frame starts to compute deltas");
@@ -166,338 +86,311 @@ export function medianRefreshInterval(frameStarts: number[]): number {
   return deltas.length % 2 === 0 ? (deltas[mid - 1] + deltas[mid]) / 2 : deltas[mid];
 }
 
-/** The exact source of the three in-page pure functions, joined for
- * injection via `page.addInitScript`. `Function.prototype.toString()` on
- * a plain function declaration returns its own source text (types already
- * stripped by esbuild/tsc before this runs), so this is not a
- * transcription — it is the same bytes the functions above compile to,
- * read back. Declared as top-level `function` statements in the injected
- * script, so in a non-module `<script>` context they attach directly to
- * `window` and are callable in-page by name with no namespace object. */
-function pureFunctionSource(): string {
-  return [selectFk, countFrameStartsInRange, isLongFrame, medianRefreshInterval]
-    .map((fn) => fn.toString())
-    .join("\n");
+/** The last frame timestamp `<= t` (`ts_j`). Throws if there is none. */
+export function lastFrameAtOrBefore(frameStarts: number[], t: number): number {
+  let found: number | undefined;
+  for (let i = 0; i < frameStarts.length; i++) {
+    if (frameStarts[i] <= t) found = frameStarts[i];
+    else break;
+  }
+  if (found === undefined) {
+    throw new Error("no recorded frame at or before t=" + t);
+  }
+  return found;
+}
+
+/** D = ts_j + 2R: the vsync that ends the first display frame after the keystroke. */
+export function deadline(tsJ: number, refreshIntervalMs: number): number {
+  return tsJ + 2 * refreshIntervalMs;
+}
+
+/** Presentation time of the keystroke from its Event Timing entries: the max of
+ * `startTime + duration` over keydown, keypress, beforeinput and input entries that
+ * start within [t - 0.01, t + 4] ms of the keydown. `null` if there are none.
+ * keyup is excluded (a separate event, painted separately). */
+export function keystrokeEventEnd(entries: EtEntry[], t: number): number | null {
+  let end: number | null = null;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.name === "keyup") continue;
+    if (e.startTime < t - 0.01 || e.startTime > t + 4) continue;
+    const v = e.startTime + e.duration;
+    if (end === null || v > end) end = v;
+  }
+  return end;
+}
+
+/** E0's verdict. `etEnd === null` (no entry, duration < 16 ms) is on time. */
+export function isLate(etEnd: number | null, deadlineMs: number): boolean {
+  if (etEnd === null) return false;
+  return etEnd > deadlineMs;
+}
+
+/** 1 = painted in the first display frame; 2 = one frame late; ... */
+export function framesToPaint(etEnd: number | null, deadlineMs: number, refreshIntervalMs: number): number {
+  if (!isLate(etEnd, deadlineMs)) return 1;
+  return 1 + Math.max(1, Math.ceil(((etEnd as number) - deadlineMs) / refreshIntervalMs));
+}
+
+export function scoreKeystroke(
+  frameStarts: number[],
+  entries: EtEntry[],
+  t: number,
+  refreshIntervalMs: number,
+): KeystrokeScore {
+  const tsJ = lastFrameAtOrBefore(frameStarts, t);
+  const d = deadline(tsJ, refreshIntervalMs);
+  const etEnd = keystrokeEventEnd(entries, t);
+  return {
+    t,
+    tsJ,
+    deadline: d,
+    etEnd,
+    late: isLate(etEnd, d),
+    framesToPaint: framesToPaint(etEnd, d, refreshIntervalMs),
+  };
+}
+
+export function scoreAll(
+  frameStarts: number[],
+  entries: EtEntry[],
+  keydownTimes: number[],
+  refreshIntervalMs: number,
+): KeystrokeScore[] {
+  return keydownTimes.map((t) => scoreKeystroke(frameStarts, entries, t, refreshIntervalMs));
+}
+
+/** On-time share when the lateness threshold is moved by `thetaMs` (late iff ETend > D + theta).
+ * Goes through `isLate`, so the mutation seam reaches it. */
+export function shareOnTime(scores: KeystrokeScore[], thetaMs: number): number {
+  let on = 0;
+  for (let i = 0; i < scores.length; i++) {
+    if (!isLate(scores[i].etEnd, scores[i].deadline + thetaMs)) on++;
+  }
+  return on / scores.length;
+}
+
+/** Everything a run must report (architecture.md 9.3): the on-time share at theta = -4, 0 and +4 ms
+ * (the 8 ms rounding of Event Timing `duration` puts +-4 ms on ETend); keys scored on time by ABSENCE
+ * of an entry; keys with a stale anchor (t - ts_j >= R, the rAF loop missed a frame, D too early). Verdict
+ * against `bar`: PASS iff the strictest share (-4) meets it, FAIL iff even the most lenient (+4) misses it,
+ * otherwise INDETERMINATE (the bar falls between the shares), which is not a pass. */
+export function summarise(
+  scores: KeystrokeScore[],
+  bar: number,
+  refreshIntervalMs: number,
+): RunSummary {
+  if (scores.length === 0) throw new Error("summarise of zero scores is undefined");
+  const strict = shareOnTime(scores, -4);
+  const nominal = shareOnTime(scores, 0);
+  const lenient = shareOnTime(scores, 4);
+  let absent = 0;
+  let stale = 0;
+  for (let i = 0; i < scores.length; i++) {
+    if (scores[i].etEnd === null && !scores[i].late) absent++;
+    if (scores[i].t - scores[i].tsJ >= refreshIntervalMs) stale++;
+  }
+  const verdict = strict >= bar ? "PASS" : lenient < bar ? "FAIL" : "INDETERMINATE";
+  return { n: scores.length, onTimeAtMinus4: strict, onTimeAtZero: nominal, onTimeAtPlus4: lenient, scoredOnTimeByAbsence: absent, staleAnchors: stale, verdict };
+}
+
+/** The functions the page runs, in dependency order. */
+export const SeratLatencyFns = {
+  medianRefreshInterval,
+  lastFrameAtOrBefore,
+  deadline,
+  keystrokeEventEnd,
+  isLate,
+  framesToPaint,
+  scoreKeystroke,
+  scoreAll,
+  shareOnTime,
+  summarise,
+} as const;
+
+export type SeratLatencyNamespace = typeof SeratLatencyFns;
+
+/** Source of an IIFE returning the namespace object. `overrides` replaces a
+ * function's declaration source (mutation testing); the override must declare a
+ * function of the same name. */
+export function namespaceSource(overrides: Partial<Record<keyof SeratLatencyNamespace, string>> = {}): string {
+  const names = Object.keys(SeratLatencyFns) as (keyof SeratLatencyNamespace)[];
+  for (const k of Object.keys(overrides)) {
+    if (!names.includes(k as keyof SeratLatencyNamespace)) throw new Error("unknown function to override: " + k);
+  }
+  const decls = names.map((n) => overrides[n] ?? SeratLatencyFns[n].toString()).join("\n");
+  return "(function () {\n" + decls + "\nreturn { " + names.join(", ") + " };\n})()";
+}
+
+/** Builds the namespace in this (Node) process from the same source the page gets. */
+export function loadNamespace(src: string = namespaceSource()): SeratLatencyNamespace {
+  return new Function("return " + src)() as SeratLatencyNamespace;
 }
 
 // ---------------------------------------------------------------------
-// Browser-integration side.
+// Aggregates
 // ---------------------------------------------------------------------
 
-const INSTALLED_FLAG = "__seratLatencyCaptureInstalled";
-const FRAME_RECORDS_KEY = "__seratFrameRecords";
-const REFRESH_INTERVAL_KEY = "__seratRefreshIntervalR";
-const WATCH_TARGET_KEY = "__seratWatchTarget";
-const WATCH_TEXT_BEFORE_KEY = "__seratWatchTextBefore";
-const PENDING_SAMPLE_KEY = "__seratPendingSample";
-const PENDING_T_KEY = "__seratPendingT";
+export function percentOnTime(scores: KeystrokeScore[]): number {
+  if (scores.length === 0) throw new Error("percentOnTime of zero scores is undefined");
+  return scores.filter((s) => !s.late).length / scores.length;
+}
+
+export function percentLate(scores: KeystrokeScore[]): number {
+  return 1 - percentOnTime(scores);
+}
+
+/** Nearest-rank p95 of frames_to_paint. */
+export function p95FramesToPaint(scores: KeystrokeScore[]): number {
+  if (scores.length === 0) throw new Error("p95 of zero scores is undefined");
+  const sorted = scores.map((s) => s.framesToPaint).sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(0.95 * sorted.length) - 1)];
+}
+
+// ---------------------------------------------------------------------
+// Browser side
+// ---------------------------------------------------------------------
 
 const R_WARMUP_FRAMES = 121; // 120 deltas
 
+export interface Capture {
+  refreshIntervalMs: number;
+}
+
 /**
- * Installs, once per page: the injected pure functions (fix 2); the
- * continuous `requestAnimationFrame` loop that records, per frame, both
- * `ts` (the rAF timestamp argument) and `run` (`performance.now()` at the
- * moment the callback actually executes — fix 1's distinction) and, after
- * `R_WARMUP_FRAMES` frames, the median refresh interval `R` (via the
- * injected `medianRefreshInterval`); and the capture-phase `keydown` /
- * bubble-phase `input` listener pair that correlates a trusted keystroke
- * to its `frames_to_paint`, handler time and render time — only while
- * "armed" for a specific element via `measureKeystrokeToPaint` below.
- *
- * Idempotent — safe to call before every sample **against the same
- * document**. **Not safe across a `page.setContent`/navigation on the
- * same `page`:** the installed flag lives on `window`, which
- * `page.setContent` does not replace, but the DOM listeners it guards are
- * attached to `document`, which it does — so a second call after a
- * `setContent` sees the flag already set and silently skips
- * re-registering listeners that are already orphaned, and every
- * subsequent keystroke hangs waiting for a sample that can never arrive.
- * `negative-control-arm.ts`'s doc comment is where this was found; a
- * caller that needs a fresh document mid-run must build it once and
- * attach anything document-specific afterward, not navigate twice.
- * Resolves once `R` has been measured.
+ * Installs, once per document: the namespace (from `src`); a rAF loop recording
+ * frame timestamps; an Event Timing observer (durationThreshold 16); and
+ * capture-phase keydown / input listeners that record trusted keystrokes.
+ * Resolves with R once 120 frame deltas have been seen. Throws on a second
+ * install on the same document.
  */
-export async function installLatencyCapture(page: Page): Promise<void> {
-  // `addInitScript` only takes effect on the *next* navigation -- and
-  // `control-arm.ts` (and the real subject, once wired) calls
-  // `page.setContent`/navigates *before* this function ever runs, so
-  // relying on it alone left `window.selectFk` etc. undefined for the
-  // document already loaded, which silently threw inside the first rAF
-  // callback and hung every caller forever (the warmup promise never
-  // resolves once the loop that would set it has crashed). Registered
-  // anyway for any future navigation, but the actual, immediate
-  // definition is the indirect `eval` below: it runs in global scope (a
-  // direct `eval(src)` here would run in this arrow function's local
-  // scope instead), so the injected top-level function declarations
-  // attach to `window` synchronously, before the rAF loop below is ever
-  // scheduled.
-  await page.addInitScript({ content: pureFunctionSource() });
-  await page.evaluate((src) => {
-    (0, eval)(src);
-  }, pureFunctionSource());
-
-  await page.evaluate(
-    async ({
-      installedFlag,
-      framesKey,
-      refreshIntervalKey,
-      watchTargetKey,
-      watchTextBeforeKey,
-      pendingSampleKey,
-      pendingTKey,
-      warmupFrames,
-    }) => {
-      type FrameRecordJs = { ts: number; run: number };
-      const w = window as unknown as Record<string, unknown> & {
-        selectFk: (frames: FrameRecordJs[], p: number) => number;
-        countFrameStartsInRange: (frameStarts: number[], t: number, fk: number) => number;
-        isLongFrame: (fk: number, fNext: number, refreshIntervalMs: number) => boolean;
-        medianRefreshInterval: (frameStarts: number[]) => number;
+export async function installCapture(page: Page, src: string = namespaceSource()): Promise<Capture> {
+  const refreshIntervalMs = await page.evaluate(
+    async ({ nsSrc, warmup }) => {
+      const w = window as unknown as Record<string, any>;
+      if (w.__seratCapture) throw new Error("installCapture called twice on one document");
+      const ns = new Function("return " + nsSrc)();
+      const cap = { ns, frames: [] as number[], entries: [] as any[], keydowns: [] as number[], inputs: 0, R: 0 };
+      w.__seratCapture = cap;
+      const loop = (ts: number) => {
+        cap.frames.push(ts);
+        requestAnimationFrame(loop);
       };
-      if (w[installedFlag]) return;
-      w[installedFlag] = true;
-      w[framesKey] = [] as FrameRecordJs[];
-
-      // Continuous frame recorder ({ts, run} pairs, fix 1) + per-keystroke
-      // frame resolution, in one rAF loop so a keystroke's frame walk
-      // shares the same records the refresh-interval measurement uses.
-      const rafLoop = (ts: number) => {
-        const run = performance.now(); // fix 1: when this callback actually runs
-        const frames = w[framesKey] as FrameRecordJs[];
-        frames.push({ ts, run });
-
-        const pendingT = w[pendingTKey] as number | undefined;
-        const pendingFkIdx = (w as unknown as { __seratPendingFkIdx?: number }).__seratPendingFkIdx;
-
-        if (pendingT !== undefined && pendingFkIdx === undefined) {
-          const p = (w as unknown as { __seratPendingP?: number }).__seratPendingP;
-          if (p !== undefined) {
-            // Fix 1: f_k is the first frame whose callback RUNS after p
-            // (selectFk), not the first whose scheduled ts is >= p.
-            // Throws (caught here) until a qualifying frame has actually
-            // run -- that is the normal "keep waiting" path, not an error.
-            let tsK: number | undefined;
-            try {
-              tsK = w.selectFk(frames, p);
-            } catch {
-              tsK = undefined;
-            }
-            if (tsK !== undefined) {
-              (w as unknown as { __seratPendingFkIdx?: number }).__seratPendingFkIdx = frames.length - 1;
-              (w as unknown as { __seratFkTs?: number }).__seratFkTs = tsK;
-              const framesToPaint = w.countFrameStartsInRange(
-                frames.map((f) => f.ts),
-                pendingT,
-                tsK,
-              );
-              (w as unknown as { __seratFramesToPaint?: number }).__seratFramesToPaint = framesToPaint;
-              const channel = new MessageChannel();
-              channel.port2.onmessage = () => {
-                (w as unknown as { __seratPostPaintTs?: number }).__seratPostPaintTs = performance.now();
-              };
-              channel.port1.postMessage(null);
-            }
-          }
-        } else if (pendingT !== undefined && pendingFkIdx !== undefined) {
-          // This frame is the one immediately after f_k: finalise the
-          // long-frame check and the sample.
-          const refreshInterval = w[refreshIntervalKey] as number | undefined;
-          if (refreshInterval === undefined) {
-            throw new Error(
-              "the long-frame check ran before the refresh interval R was measured -- " +
-                "installLatencyCapture must finish its warmup before any keystroke is armed",
-            );
-          }
-          const fk = (w as unknown as { __seratFkTs: number }).__seratFkTs;
-          let framesToPaint = (w as unknown as { __seratFramesToPaint: number }).__seratFramesToPaint;
-          if (w.isLongFrame(fk, ts, refreshInterval)) framesToPaint += 1;
-
-          const target = w[watchTargetKey] as Element | undefined;
-          const textBefore = w[watchTextBeforeKey] as number | undefined;
-          const currentLength = target ? (target.textContent ?? "").length : -1;
-          const textGrew = textBefore !== undefined && currentLength === textBefore + 1;
-
-          const p = (w as unknown as { __seratPendingP: number }).__seratPendingP;
-          const postPaintTs =
-            (w as unknown as { __seratPostPaintTs?: number }).__seratPostPaintTs ?? fk;
-
-          w[pendingSampleKey] = {
-            framesToPaint,
-            handlerMs: p - pendingT,
-            renderMs: postPaintTs - fk,
-            textGrew,
-          };
-
-          w[pendingTKey] = undefined;
-          (w as unknown as { __seratPendingP?: number }).__seratPendingP = undefined;
-          (w as unknown as { __seratPendingFkIdx?: number }).__seratPendingFkIdx = undefined;
-          (w as unknown as { __seratFkTs?: number }).__seratFkTs = undefined;
-          (w as unknown as { __seratFramesToPaint?: number }).__seratFramesToPaint = undefined;
-          (w as unknown as { __seratPostPaintTs?: number }).__seratPostPaintTs = undefined;
+      requestAnimationFrame(loop);
+      const obs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          cap.entries.push({ name: e.name, startTime: e.startTime, duration: e.duration });
         }
-
-        if (frames.length === warmupFrames && w[refreshIntervalKey] === undefined) {
-          w[refreshIntervalKey] = w.medianRefreshInterval(frames.map((f) => f.ts));
-        }
-
-        requestAnimationFrame(rafLoop);
-      };
-      requestAnimationFrame(rafLoop);
-
-      document.addEventListener(
-        "keydown",
-        (event) => {
-          if (!event.isTrusted) return;
-          if (w[watchTargetKey] === undefined) return;
-          w[pendingTKey] = event.timeStamp;
-        },
-        { capture: true },
-      );
-      document.addEventListener(
-        "input",
-        (event) => {
-          if (!event.isTrusted) return;
-          if (w[pendingTKey] === undefined) return;
-          if ((w as unknown as { __seratPendingP?: number }).__seratPendingP !== undefined) return;
-          (w as unknown as { __seratPendingP?: number }).__seratPendingP = performance.now();
-        },
-        { capture: false },
-      );
-
+      });
+      obs.observe({ type: "event", durationThreshold: 16 } as PerformanceObserverInit);
+      w.__seratObs = obs;
+      document.addEventListener("keydown", (e) => { if (e.isTrusted) cap.keydowns.push(e.timeStamp); }, true);
+      document.addEventListener("input", (e) => { if (e.isTrusted) cap.inputs++; }, true);
       await new Promise<void>((resolve) => {
-        const check = () => {
-          if (w[refreshIntervalKey] !== undefined) resolve();
-          else requestAnimationFrame(check);
-        };
+        const check = () => (cap.frames.length >= warmup ? resolve() : requestAnimationFrame(check));
         requestAnimationFrame(check);
       });
+      cap.R = ns.medianRefreshInterval(cap.frames.slice(0, warmup));
+      return cap.R;
     },
-    {
-      installedFlag: INSTALLED_FLAG,
-      framesKey: FRAME_RECORDS_KEY,
-      refreshIntervalKey: REFRESH_INTERVAL_KEY,
-      watchTargetKey: WATCH_TARGET_KEY,
-      watchTextBeforeKey: WATCH_TEXT_BEFORE_KEY,
-      pendingSampleKey: PENDING_SAMPLE_KEY,
-      pendingTKey: PENDING_T_KEY,
-      warmupFrames: R_WARMUP_FRAMES,
-    },
+    { nsSrc: src, warmup: R_WARMUP_FRAMES },
   );
+  return { refreshIntervalMs };
 }
 
-/** The measured refresh interval `R` (ms), available after
- * `installLatencyCapture` resolves. */
-export async function getRefreshInterval(page: Page): Promise<number> {
-  return page.evaluate(
-    (key) => (window as unknown as Record<string, number>)[key],
-    REFRESH_INTERVAL_KEY,
-  );
+export type Cadence = { kind: "strict" } | { kind: "swept"; seed: number };
+
+/** Deterministic PRNG (mulberry32) so a swept run is reproducible from its seed. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-/**
- * Types one **trusted** character into `target` via `page.keyboard.press`
- * (CDP `Input.dispatchKeyEvent`) and returns its `FrameSample` per §9.3.
- *
- * **NIT, recorded rather than fixed:** the `input`-listener timing this
- * relies on for `p` (end of processing) has only been verified against a
- * bare contenteditable (`control-arm.ts`), where the browser's own native
- * edit handling is synchronous with `input`. CodeMirror 6 applies DOM
- * changes through a `MutationObserver`-driven update cycle that may not
- * be complete by the time `input` fires; this needs re-verifying against
- * a real CM6 instance once #21 lands, and `p` may need to move to a
- * different signal (e.g. a CM6 `updateListener`) at that point.
- */
-export async function measureKeystrokeToPaint(
-  target: Locator,
-  char: string,
-): Promise<FrameSample> {
-  const page = target.page();
-  await installLatencyCapture(page);
-  await target.focus();
-
-  const textBeforeLength = ((await target.textContent()) ?? "").length;
-  const elementHandle = (await target.elementHandle()) as ElementHandle<Element> | null;
-  if (!elementHandle) {
-    throw new Error("measureKeystrokeToPaint: target locator resolved to no element handle");
-  }
-
-  await page.evaluate(
-    ({ el, before, watchTargetKey, watchTextBeforeKey, pendingSampleKey }) => {
-      const w = window as unknown as Record<string, unknown>;
-      w[watchTargetKey] = el;
-      w[watchTextBeforeKey] = before;
-      w[pendingSampleKey] = null;
-    },
-    {
-      el: elementHandle,
-      before: textBeforeLength,
-      watchTargetKey: WATCH_TARGET_KEY,
-      watchTextBeforeKey: WATCH_TEXT_BEFORE_KEY,
-      pendingSampleKey: PENDING_SAMPLE_KEY,
-    },
-  );
-
-  await page.keyboard.press(char);
-
-  let handle;
-  try {
-    handle = await page.waitForFunction(
-      (pendingSampleKey) => (window as unknown as Record<string, unknown>)[pendingSampleKey] ?? null,
-      PENDING_SAMPLE_KEY,
-      { polling: 5, timeout: 2000 },
-    );
-  } catch {
-    await elementHandle.dispose();
-    throw new Error(
-      `no sample arrived within 2000ms of pressing ${JSON.stringify(char)} — either the ` +
-        `keystroke never reached the page as a trusted event, or its frame never resolved`,
-    );
-  }
-  const sample = (await handle.jsonValue()) as FrameSample & { textGrew: boolean };
-  await elementHandle.dispose();
-
-  await page.evaluate(
-    ({ watchTargetKey, watchTextBeforeKey }) => {
-      const w = window as unknown as Record<string, unknown>;
-      w[watchTargetKey] = undefined;
-      w[watchTextBeforeKey] = undefined;
-    },
-    { watchTargetKey: WATCH_TARGET_KEY, watchTextBeforeKey: WATCH_TEXT_BEFORE_KEY },
-  );
-
-  if (!sample.textGrew) {
-    throw new Error(
-      `keystroke ${JSON.stringify(char)} did not reach the editor: text length was ` +
-        `${textBeforeLength}, never observed at ${textBeforeLength + 1}. The harness would ` +
-        `otherwise have timed an idle frame.`,
-    );
-  }
-
-  return { framesToPaint: sample.framesToPaint, handlerMs: sample.handlerMs, renderMs: sample.renderMs };
+export interface RunOptions {
+  intervalMs?: number;
+  cadence?: Cadence;
+  /** Also require the target's textContent to grow by exactly `count` (bare fixtures). */
+  checkTextGrowth?: boolean;
+  /** The on-time bar the INDETERMINATE rule is judged against (default 0.99). */
+  bar?: number;
 }
 
 /**
- * Runs `count` keystrokes against `target`, each `intervalMs` apart
- * (§9.3: fixed 100ms cadence).
+ * Types `count` trusted "x" keystrokes (CDP Input.dispatchKeyEvent) into `target`
+ * and scores them with the page's own namespace. strict: fixed 100 ms cadence
+ * (a multiple of 6R, so keystroke phase is nearly locked); swept: 100 ms +
+ * U(0, R) from a seeded PRNG so the keystroke phase covers the whole frame.
  */
-export async function runScenario(
+export async function runKeystrokes(
+  page: Page,
   target: Locator,
   count: number,
-  intervalMs = 100,
-): Promise<{ samples: FrameSample[]; actualCadenceMs: number[] }> {
-  const samples: FrameSample[] = [];
-  const actualCadenceMs: number[] = [];
-  let lastStart: number | null = null;
+  opts: RunOptions = {},
+): Promise<{ scores: KeystrokeScore[]; summary: RunSummary; refreshIntervalMs: number; dropped: string[] }> {
+  const interval = opts.intervalMs ?? 100;
+  const cadence = opts.cadence ?? { kind: "strict" };
+  const next = cadence.kind === "swept" ? mulberry32(cadence.seed) : () => 0;
+  await target.focus();
+  const before = await page.evaluate(() => {
+    const c = (window as any).__seratCapture;
+    if (!c) throw new Error("installCapture was not called on this document");
+    return { keys: c.keydowns.length, inputs: c.inputs };
+  });
+  const textBefore = opts.checkTextGrowth ? ((await target.textContent()) ?? "").length : 0;
+  const R = await page.evaluate(() => (window as any).__seratCapture.R as number);
   for (let i = 0; i < count; i++) {
-    const now = Date.now();
-    if (lastStart !== null) {
-      actualCadenceMs.push(now - lastStart);
-      const wait = intervalMs - (now - lastStart);
-      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    }
-    lastStart = Date.now();
-    samples.push(await measureKeystrokeToPaint(target, "x"));
+    await page.keyboard.press("x");
+    await new Promise((r) => setTimeout(r, interval + next() * R));
   }
-  return { samples, actualCadenceMs };
+  // Let the last frames present and Event Timing deliver, then flush the observer.
+  await new Promise((r) => setTimeout(r, 500));
+  const result = await page.evaluate(
+    ({ keys0, inputs0, bar }) => {
+      const w = window as any;
+      const cap = w.__seratCapture;
+      for (const e of w.__seratObs.takeRecords()) {
+        cap.entries.push({ name: e.name, startTime: e.startTime, duration: e.duration });
+      }
+      const times = cap.keydowns.slice(keys0);
+      const r = {
+        keydowns: times.length,
+        inputs: cap.inputs - inputs0,
+        scores: cap.ns.scoreAll(cap.frames, cap.entries, times, cap.R),
+      };
+      return { ...r, summary: cap.ns.summarise(r.scores, bar, cap.R) };
+    },
+    { keys0: before.keys, inputs0: before.inputs, bar: opts.bar ?? 0.99 },
+  );
+  if (result.keydowns !== count || result.inputs !== count) {
+    throw new Error(
+      `${count} keystrokes were sent but the page saw ${result.keydowns} trusted keydown and ` +
+        `${result.inputs} input events: the keystrokes did not all reach the editor, so the run measures nothing`,
+    );
+  }
+  if (opts.checkTextGrowth) {
+    const grown = ((await target.textContent()) ?? "").length - textBefore;
+    if (grown !== count) throw new Error(`text grew by ${grown}, expected ${count}`);
+  }
+  // Nothing is dropped: every keydown is scored or the run throws. The list exists so a run can
+  // never lose a key without a logged reason; it is empty by construction.
+  const dropped: string[] = [];
+  if (result.scores.length !== count) throw new Error(`scored ${result.scores.length} of ${count} keystrokes with no logged reason`);
+  return { scores: result.scores as KeystrokeScore[], summary: result.summary as RunSummary, refreshIntervalMs: R, dropped };
+}
+
+/** Diagnostic (reported, never gates): keydown -> presentation, ms, over keystrokes
+ * that have an Event Timing entry (>= 16 ms); the rest are < 16 ms. */
+export function latencyDiagnostic(scores: KeystrokeScore[]): { withEntry: number; meanMs: number; maxMs: number } {
+  const v = scores.filter((s) => s.etEnd !== null).map((s) => (s.etEnd as number) - s.t);
+  return {
+    withEntry: v.length,
+    meanMs: v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0,
+    maxMs: v.length ? Math.max(...v) : 0,
+  };
 }
