@@ -16,11 +16,25 @@
 //! pool is several `Reader`s (ADR-0001: never a connection behind a mutex). It never
 //! waits for the writer, and before the index is `Ready` the caller does not make one
 //! (`contracts/ipc.rs` rule 1).
+//!
+//! # The one exception: [`SearchConn`]
+//!
+//! Full-text search (R1, R1 + R3) runs on one dedicated read-only connection per open
+//! vault, outside the pool, behind a `Mutex` (architecture §2.2 and §4.5). It is the one
+//! connection shared between threads, because a newer search has to reach the older
+//! one. At most one full-text search is in flight; each new one bumps a generation
+//! counter, interrupts the connection, and waits for the lock. Lock rules: no other
+//! lock is taken while the search lock is held (only atomics and the interrupt handle
+//! are touched beside it), and a poisoned lock is recovered with `into_inner` because
+//! the connection is read-only and a panic leaves no half-written state. R2, R3 and R4
+//! stay on the pool and are never interrupted.
 
 use std::cell::Cell;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use rusqlite::{Connection, OpenFlags, named_params};
+use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags, named_params};
 use serat_core::IndexError;
 
 use crate::schema::sqlite;
@@ -49,6 +63,8 @@ pub enum SearchOutcome {
     TooManyPropertyTerms,
     /// An unbalanced `"`. No statement was run.
     UnbalancedQuote,
+    /// A newer full-text search superseded this one (architecture §4.5). Not an error.
+    Superseded,
 }
 
 /// Whether a hit is a note or an asset.
@@ -294,6 +310,9 @@ pub const STATEMENTS: [(&str, &str); 6] = [
 pub struct Reader {
     conn: Connection,
     rejections: Cell<u32>,
+    /// The vault's search connection. Free-text searches run there when it is set;
+    /// without it (tests, benches) they run on `conn` and cannot be superseded.
+    search: Option<Arc<SearchConn>>,
 }
 
 impl Reader {
@@ -314,7 +333,16 @@ impl Reader {
         Ok(Self {
             conn,
             rejections: Cell::new(0),
+            search: None,
         })
+    }
+
+    /// Route this reader's free-text searches (R1, R1 + R3) to the vault's search
+    /// connection. R2, R3 and R4 stay on this reader's own connection.
+    #[must_use]
+    pub fn with_search(mut self, search: Arc<SearchConn>) -> Self {
+        self.search = Some(search);
+        self
     }
 
     /// Wrap an existing connection (tests, benches).
@@ -324,6 +352,7 @@ impl Reader {
         Self {
             conn,
             rejections: Cell::new(0),
+            search: None,
         }
     }
 
@@ -373,11 +402,12 @@ impl Reader {
                 let sql = if key == "type" { R1_TYPE } else { R1_FIELD };
                 self.run_r1(sql, fts, Some((key, value)), limit, offset)
             }
-            (None, Some((key, value))) => self.run_r3(key, value, limit, offset),
+            (None, Some((key, value))) => self.run_r3(key, value, limit, offset).map(Some),
             (None, None) => unreachable!("handled above"),
         };
         match result {
-            Ok(hits) => Ok(SearchOutcome::Hits(hits)),
+            Ok(Some(hits)) => Ok(SearchOutcome::Hits(hits)),
+            Ok(None) => Ok(SearchOutcome::Superseded),
             // FTS5 refused a query Rust had already quoted: a defect, surfaced as the
             // same "nothing to search for" and counted, never raised (architecture
             // §4.5).
@@ -389,6 +419,8 @@ impl Reader {
         }
     }
 
+    /// R1 and R1 + R3: on the search connection when one is attached (`None` is
+    /// "superseded"), otherwise on this reader's own connection.
     fn run_r1(
         &self,
         sql: &str,
@@ -396,44 +428,13 @@ impl Reader {
         property: Option<(&String, &String)>,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<SearchHit>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        bind_all(
-            &mut stmt,
-            &[
-                (":fts", &fts as &dyn rusqlite::ToSql),
-                (":limit", &limit),
-                (":offset", &offset),
-            ],
-        )?;
-        if let Some((key, value)) = property {
-            bind_all(
-                &mut stmt,
-                &[(":key", key as &dyn rusqlite::ToSql), (":val", value)],
-            )?;
+    ) -> Result<Option<Vec<SearchHit>>, rusqlite::Error> {
+        match &self.search {
+            Some(search) => {
+                search.run(&|conn, hook| r1_on(conn, sql, fts, property, limit, offset, hook))
+            }
+            None => r1_on(&self.conn, sql, fts, property, limit, offset, &|| {}).map(Some),
         }
-        let mut rows = stmt.raw_query();
-        let mut hits = Vec::new();
-        while let Some(row) = rows.next()? {
-            hits.push(SearchHit {
-                path: row.get(0)?,
-                title: row.get(1)?,
-                kind: HitKind::Note,
-                mime: None,
-                sidecar_path: None,
-                block: Some(BlockLocation {
-                    block_id: row.get(3)?,
-                    ord: row.get(4)?,
-                    heading_path: row.get(5)?,
-                    byte_start: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
-                    byte_end: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
-                    note_hash: row.get(2)?,
-                }),
-                snippet: row.get(8)?,
-                rank: row.get(9)?,
-            });
-        }
-        Ok(hits)
     }
 
     fn run_r3(
@@ -531,6 +532,175 @@ impl Reader {
     }
 }
 
+/// The vault's one search connection (architecture §2.2, §4.5): read-only, outside the
+/// read pool, behind a `Mutex`, shared by every thread that searches. At most one
+/// full-text search is in flight; a newer one supersedes the older.
+///
+/// Why a generation and not just `interrupt()`: `sqlite3_interrupt` only stops a
+/// statement that is *running*, so a call that lands before the old statement has
+/// started does nothing, and `Mutex` is not FIFO, so with three quick searches the
+/// third could run before the second. Each search therefore
+///
+/// 1. bumps `latest` and keeps the new value as its own;
+/// 2. calls `interrupt()` (lock-free, from outside the lock);
+/// 3. takes the lock, and returns superseded unrun if `latest` has moved on;
+/// 4. publishes its value as `running` and runs. A progress handler on the connection
+///    (a callback, not an SQL function: C-03) interrupts the statement whenever
+///    `latest != running`, so an interrupt that arrived early is not lost.
+///
+/// **A new search cannot be the one interrupted.** `interrupt()` is only a hint; the
+/// authority is `latest`. If a delayed `interrupt()` from an older search lands on a
+/// statement that is still the newest, `run` sees `SQLITE_INTERRUPT` with `latest`
+/// still its own and simply runs the statement again, so only a search that has really
+/// been superseded ever returns `None`.
+pub struct SearchConn {
+    latest: Arc<AtomicU64>,
+    running: Arc<AtomicU64>,
+    interrupt: InterruptHandle,
+    conn: Mutex<Connection>,
+    /// Test hook: called after the statement is prepared and bound, before its first step.
+    #[cfg(test)]
+    after_prepare: Mutex<Option<TestHook>>,
+}
+
+#[cfg(test)]
+type TestHook = Box<dyn Fn() + Send>;
+
+impl std::fmt::Debug for SearchConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchConn").finish_non_exhaustive()
+    }
+}
+
+/// What `SearchConn::run` runs: the statement on the connection, calling the hook once
+/// the statement is prepared and bound (a no-op outside tests).
+type Statement<'a> = dyn Fn(&Connection, &dyn Fn()) -> Result<Vec<SearchHit>, rusqlite::Error> + 'a;
+
+/// VM instructions between progress-handler calls (about a millisecond of work).
+const PROGRESS_OPS: i32 = 1000;
+
+impl SearchConn {
+    /// Open the vault's search connection, read-only, configured like a pool member.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if it cannot be opened.
+    pub fn open(db_path: &Path) -> Result<Arc<Self>, IndexError> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sqlite)?;
+        conn.set_prepared_statement_cache_capacity(16);
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
+            .map_err(sqlite)?;
+        let latest = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicU64::new(0));
+        let (l, r) = (Arc::clone(&latest), Arc::clone(&running));
+        conn.progress_handler(
+            PROGRESS_OPS,
+            Some(move || l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)),
+        )
+        .map_err(sqlite)?;
+        let interrupt = conn.get_interrupt_handle();
+        Ok(Arc::new(Self {
+            latest,
+            running,
+            interrupt,
+            conn: Mutex::new(conn),
+            #[cfg(test)]
+            after_prepare: Mutex::new(None),
+        }))
+    }
+
+    /// Run one full-text search as the newest. `None` means superseded.
+    fn run(&self, f: &Statement) -> Result<Option<Vec<SearchHit>>, rusqlite::Error> {
+        let own = self.latest.fetch_add(1, Ordering::SeqCst) + 1;
+        self.interrupt.interrupt();
+        // Only atomics and the interrupt handle are touched beside this lock.
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.latest.load(Ordering::SeqCst) != own {
+                return Ok(None);
+            }
+            self.running.store(own, Ordering::SeqCst);
+            let before_step = || {
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .after_prepare
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
+            };
+            let result = f(&conn, &before_step);
+            if self.latest.load(Ordering::SeqCst) != own {
+                return Ok(None);
+            }
+            match result {
+                Ok(hits) => return Ok(Some(hits)),
+                // Interrupted by a stale, late `interrupt()` while still the newest:
+                // run again.
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == ErrorCode::OperationInterrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// R1 and R1 + R3 on `conn`: one fixed statement, user text bound.
+fn r1_on(
+    conn: &Connection,
+    sql: &str,
+    fts: &str,
+    property: Option<(&String, &String)>,
+    limit: i64,
+    offset: i64,
+    before_step: &dyn Fn(),
+) -> Result<Vec<SearchHit>, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    bind_all(
+        &mut stmt,
+        &[
+            (":fts", &fts as &dyn rusqlite::ToSql),
+            (":limit", &limit),
+            (":offset", &offset),
+        ],
+    )?;
+    if let Some((key, value)) = property {
+        bind_all(
+            &mut stmt,
+            &[(":key", key as &dyn rusqlite::ToSql), (":val", value)],
+        )?;
+    }
+    before_step();
+    let mut rows = stmt.raw_query();
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next()? {
+        hits.push(SearchHit {
+            path: row.get(0)?,
+            title: row.get(1)?,
+            kind: HitKind::Note,
+            mime: None,
+            sidecar_path: None,
+            block: Some(BlockLocation {
+                block_id: row.get(3)?,
+                ord: row.get(4)?,
+                heading_path: row.get(5)?,
+                byte_start: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                byte_end: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                note_hash: row.get(2)?,
+            }),
+            snippet: row.get(8)?,
+            rank: row.get(9)?,
+        });
+    }
+    Ok(hits)
+}
+
 /// Bind named parameters, skipping any the statement does not contain.
 fn bind_all(
     stmt: &mut rusqlite::Statement<'_>,
@@ -568,4 +738,154 @@ fn mime_for(path: &str) -> Option<String> {
         _ => return None,
     };
     Some(mime.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Supersession on the search connection (architecture §4.5; task #47).
+
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::schema;
+
+    /// An index with `blocks` blocks that all contain "commonword".
+    fn db_with(blocks: u32) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        let conn = schema::open(&path).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        conn.execute(
+            "INSERT INTO notes (path, file_name, path_fold, file_name_fold, title, kind, mtime, hash)
+             VALUES ('a.md', 'a.md', 'a.md', 'a.md', 'A', 'note', 0, 'h')",
+            [],
+        )
+        .expect("note");
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?1 - 1)
+             INSERT INTO blocks (note_id, ord, kind, text, byte_start, byte_end)
+             SELECT 1, i, 'para', 'commonword filler ' || i, 0, 1 FROM n",
+            [blocks],
+        )
+        .expect("blocks");
+        (dir, path)
+    }
+
+    fn reader_on(path: &Path, sc: &Arc<SearchConn>) -> Reader {
+        Reader::open(path).expect("reader").with_search(sc.clone())
+    }
+
+    /// Park the first statement after it is prepared until `release` is sent.
+    fn park_first(sc: &SearchConn) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                parked_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        (parked_rx, release_tx)
+    }
+
+    fn is_hits(outcome: &SearchOutcome) -> bool {
+        matches!(outcome, SearchOutcome::Hits(h) if !h.is_empty())
+    }
+
+    #[test]
+    fn the_first_of_two_is_superseded_the_second_gets_hits_and_r2_does_not_wait() {
+        let (_dir, path) = db_with(4000);
+        let sc = SearchConn::open(&path).expect("search conn");
+        let (parked, release) = park_first(&sc);
+        let pool = Reader::open(&path).expect("pool reader");
+        std::thread::scope(|s| {
+            let first = s.spawn(|| reader_on(&path, &sc).search("commonword", 0, 50));
+            parked.recv().unwrap(); // A holds the search lock, mid-statement.
+            // R2 on the pool completes while A is still held: it never waits for it.
+            pool.backlinks("a.md").expect("R2");
+            let second = s.spawn(|| reader_on(&path, &sc).search("commonword", 0, 50));
+            while sc.latest.load(Ordering::SeqCst) < 2 {
+                std::thread::yield_now();
+            }
+            release.send(()).unwrap();
+            assert_eq!(first.join().unwrap().unwrap(), SearchOutcome::Superseded);
+            assert!(is_hits(&second.join().unwrap().unwrap()));
+        });
+    }
+
+    #[test]
+    fn three_back_to_back_only_the_last_returns_hits() {
+        let (_dir, path) = db_with(4000);
+        let sc = SearchConn::open(&path).expect("search conn");
+        let (parked, release) = park_first(&sc);
+        std::thread::scope(|s| {
+            let a = s.spawn(|| reader_on(&path, &sc).search("commonword", 0, 50));
+            parked.recv().unwrap();
+            let b = s.spawn(|| reader_on(&path, &sc).search("commonword", 0, 50));
+            while sc.latest.load(Ordering::SeqCst) < 2 {
+                std::thread::yield_now();
+            }
+            let c = s.spawn(|| reader_on(&path, &sc).search("commonword", 0, 50));
+            while sc.latest.load(Ordering::SeqCst) < 3 {
+                std::thread::yield_now();
+            }
+            release.send(()).unwrap();
+            assert_eq!(a.join().unwrap().unwrap(), SearchOutcome::Superseded);
+            assert_eq!(b.join().unwrap().unwrap(), SearchOutcome::Superseded);
+            assert!(is_hits(&c.join().unwrap().unwrap()));
+        });
+    }
+
+    #[test]
+    fn a_generation_bumped_after_prepare_but_before_the_first_step_stops_the_statement() {
+        let (_dir, path) = db_with(20_000);
+        let sc = SearchConn::open(&path).expect("search conn");
+        let reader = reader_on(&path, &sc);
+        let t = Instant::now();
+        assert!(is_hits(&reader.search("commonword", 0, 50).unwrap()));
+        let full = t.elapsed();
+        // The interrupt() that would have stopped it "arrived early": only the
+        // generation moved. The progress handler must still stop the statement.
+        let latest = sc.latest.clone();
+        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
+            latest.fetch_add(1, Ordering::SeqCst);
+        }));
+        let t = Instant::now();
+        assert_eq!(
+            reader.search("commonword", 0, 50).unwrap(),
+            SearchOutcome::Superseded
+        );
+        assert!(
+            t.elapsed() < full / 2,
+            "stopped in {:?}, a full run takes {full:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_late_stale_interrupt_does_not_supersede_the_newest_search() {
+        let (_dir, path) = db_with(2000);
+        let sc = SearchConn::open(&path).expect("search conn");
+        let reader = reader_on(&path, &sc);
+        // An older search's delayed interrupt() lands, repeatedly, on the newest
+        // statement for a while. It is still the newest, so it must run again and win.
+        let racer = sc.clone();
+        let fired = AtomicBool::new(false);
+        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                let racer = racer.clone();
+                std::thread::spawn(move || {
+                    let end = Instant::now() + std::time::Duration::from_millis(30);
+                    while Instant::now() < end {
+                        racer.interrupt.interrupt();
+                    }
+                });
+            }
+        }));
+        assert!(is_hits(&reader.search("commonword", 0, 50).unwrap()));
+    }
 }

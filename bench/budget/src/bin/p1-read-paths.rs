@@ -321,6 +321,25 @@ fn measure(
         iterations,
         || search_rows(&reader, &commonest, 0, 50),
     ));
+    // The same two reads on the vault's search connection, whose progress handler
+    // checks the search generation every 1,000 VM instructions. The cost of the
+    // handler is the difference between these rows and the two above.
+    let search_conn = serat_index::SearchConn::open(db).map_err(|e| e.to_string())?;
+    let searched = Reader::open(db)
+        .map_err(|e| e.to_string())?
+        .with_search(search_conn);
+    rows.push(time(
+        &format!("R1 top term {top_term:?}, top 50, on the search connection (with progress handler; no expectation)"),
+        None,
+        iterations,
+        || search_rows(&searched, &top_term, 0, 50),
+    ));
+    rows.push(time(
+        &format!("R1 {commonest:?}, top 50, on the search connection (with progress handler)"),
+        Some(100.0),
+        iterations,
+        || search_rows(&searched, &commonest, 0, 50),
+    ));
     // ... and a query set spread across the 20%-restricted vocabulary, as one p95.
     let picks = [0usize, 1, 9, 99, 499, 999];
     let mut set = Samples::new();
