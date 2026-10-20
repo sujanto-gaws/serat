@@ -44,15 +44,16 @@ fn asset(path: &str) -> IndexOp {
 fn analyzed_notes(path: &Path) -> Option<i64> {
     let conn = schema::open(path).expect("open");
     conn.query_row(
-        "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL LIMIT 1",
+        // sqlite_stat1.stat begins with the number of rows the index covers. The
+        // largest over all of `notes`' indexes: a partial index that happens to be
+        // empty (ix_notes_sidecar) reports 0 and must not be the one that is read.
+        "SELECT max(CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER))
+           FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL",
         [],
-        |row| row.get::<_, String>(0),
+        |row| row.get::<_, Option<i64>>(0),
     )
     .ok()
-    .and_then(|stat| {
-        // sqlite_stat1.stat begins with the number of rows the index covers.
-        stat.split_whitespace().next()?.parse().ok()
-    })
+    .flatten()
 }
 
 /// Fill an index with `n` assets through its own writer and report whether the
