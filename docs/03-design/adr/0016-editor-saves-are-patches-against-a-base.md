@@ -52,6 +52,17 @@ The front end keeps, per open note, the **base** — the `Text` as last loaded o
 
 **The remaining window is stated as a bound rather than hidden.** An external write between step 4's re-hash and the rename is overwritten. The window is one hash of the current file plus one `rename` system call. For a note of the benchmark vault's 2 KiB mean that is well under a millisecond, and it is proportional to file size. Closing it entirely needs a lock no other editor honours. **The loss in that window is silent.** The other writer's bytes are gone from disk, and nothing reports it: the watcher sees only our rename, which carries our own hash. What bounds the loss is the size of the window, not any detection. The upgrade path, if #23 shows the window matters, is an atomic exchange that fails when the target has moved: `renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS and `ReplaceFileW` on Windows. Each can detect the change after swapping and restore the other writer's bytes. #23's hostile test writes externally between the step-1 check and the rename, and asserts the step-4 refusal.
 
+**That window covers external writers only. Two of Serat's own writers are serialised by a lock** (code-reviewer-3, on #33). Without one, two in-process writes to the same path can both pass step 4's re-hash before either renames:
+- `save_patch` against `write_file` with a `base_hash`;
+- `save_patch` against a view's write-back (§6.1).
+
+Each renames over the other, and **one returns `Ok` with its bytes already lost**. That is worse than the external case: both writers are Serat, so a lock is available, and leaving the race open would be a choice rather than a bound. **The rule: `Vault` holds an in-process mutex per path, from step 1's re-read to the rename, in both `write_patch` and `write_atomic`.**
+- Every content write in the process goes through one of those two functions, so the lock covers every in-process writer.
+- The lock is keyed by `VaultPath` and held only for the duration of one write. Entries are removed when no writer holds them, so the map stays bounded by concurrent writes, not by vault size.
+- No other lock is taken while it is held, and nothing blocks on the index or the front end inside it.
+- **The second writer then sees the first writer's hash at step 1, and is refused with `StaleHash`**, which is the designed path (§4), instead of a silent loss.
+- Task #48 implements it. Its hostile test runs the two writers concurrently against one path, many times, and asserts that exactly one returns `Ok` and the other `StaleHash`, and that the file holds the bytes of the one that returned `Ok`.
+
 **Ordering between saves and external changes.** Tauri orders neither command responses against events nor events against responses. So the front end applies these rules, and nothing else:
 
 - An `ExternalChange` is applied **only when its `base_hash` equals the buffer's current base hash**.
@@ -104,9 +115,9 @@ A note deleted on disk while open keeps its buffer and shows a notice; the save 
 1. **The 399 CRLF notes and 79 BOM notes of the 20k benchmark vault.** They are the case that found the defect, and they become a test: for every note in the vault, apply a random patch set through the save path and assert that every byte outside the patched ranges is unchanged (the NFR-MNT-03 property, extended to the editor). Owned by test-engineer's task #12 corpus.
 2. **FR-VLT-05's acceptance case** — cursor at line 40, external edit at line 5 — in both the clean and the dirty-but-disjoint states, plus one overlapping edit that must produce a conflict and lose nothing. Task #23's hostile test.
 3. **A note with a lone `\r` line ending** — the only splitting rule CM6 and a naive Rust `lines()` disagree on. **Now covered on the front-end side** by app/src/editor/patches.test.ts *(planned)* on `task/p1-21-editor` (`b87755d`), together with the one-offset-per-separator rule above. The Rust half of the shared table test must carry the same case.
-4. **Patch application, as property and hostile tests**: crates/serat-vault/src/patch_props.rs *(planned)*, which arrives with task #33 (`task/p1-33-patch-apply` @ `7d39829`, in review). At that commit it covers bytes outside the patched ranges staying unchanged, the lone-`\r` ending, a CRLF+BOM note across many saves, and the stale-base and crash-mid-write cases. The edit script's own tests sit beside it in `diff.rs`: endings-only changes give `edits = []`, and the half-file fallback. **`7d39829` predates this amendment, so #33 owes five changes:**
-   - the majority ending rule, replacing first-terminator;
-   - the insert form written as `\r\n`, replacing that commit's refusal of it, with its test changed to assert the written bytes;
-   - `VaultError::LineEndingsWouldFuse` mapped to `IpcError::LineEndingsWouldFuse`;
-   - a test of the deletion form (`a\rx\nc` with `x` deleted);
-   - a test of the 50 ms deadline's one-hunk fallback.
+4. **Patch application, as property and hostile tests**: `crates/serat-vault/src/patch_props.rs`, merged with task #33 (`5be43ed`). It covers bytes outside the patched ranges staying unchanged, the lone-`\r` ending, a CRLF+BOM note across many saves, and the stale-base and crash-mid-write cases. The edit script's own tests sit beside it in `diff.rs`: endings-only changes give `edits = []`, and the half-file fallback. **The five changes this amendment required are in `5be43ed`:**
+   - the majority ending rule (`the_ending_is_the_majority_with_ties_to_the_first_and_a_lone_cr_only_alone`);
+   - the insert form written as `\r\n`, with a test that asserts the written bytes (`an_inserted_separator_after_a_lone_cr_is_written_as_crlf_not_refused`);
+   - `VaultError::LineEndingsWouldFuse` mapped to `IpcError::LineEndingsWouldFuse` (`crates/serat-app/src/error.rs`);
+   - the deletion form, both refused and leaving the file untouched (`deleting_the_text_between_a_lone_cr_and_an_lf_is_refused_with_the_line`, `the_refused_fuse_leaves_the_file_untouched_through_the_write_path`);
+   - the 50 ms deadline's one-hunk fallback (`diff.rs`, through `edit_script_within` with `Duration::ZERO`).

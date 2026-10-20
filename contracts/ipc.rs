@@ -504,8 +504,8 @@ pub enum RebuildReason {
 /// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
 /// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
 ///
-/// The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
-/// §2). Until it merges, no `VaultError` produces either `IpcError`.
+/// The last two rows are task #33's patch path in serat-vault (ADR-0016 §2,
+/// merged at `5be43ed`), mapped in `crates/serat-app/src/error.rs`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
