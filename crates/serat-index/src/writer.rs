@@ -543,10 +543,10 @@ fn end_bulk_load(conn: &Connection, triggers: &[String]) -> Result<(), IndexErro
 /// The second pass the foreign key forces: a link can name a note that has not been
 /// inserted yet, so `dst_note` starts NULL and is filled once every note is present.
 ///
-/// P0 resolves by exact path and by path plus the Markdown extension, which is what
-/// the benchmark vault and an Obsidian vault using full paths both produce. Obsidian's
-/// shortest-unique-name resolution is P1 and belongs with the rest of link handling;
-/// what matters here is that unresolved stays NULL rather than becoming wrong.
+/// Case-insensitive (Unicode, `serat_core::fold_case`, on the stored `*_fold` columns;
+/// the statement is `resolve::RESOLVE_ALL`, shared with the incremental passes). A
+/// link names a note by path, by path plus `.md`, or by file name (F-312).
+/// Unresolved stays NULL rather than becoming wrong.
 fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     // The EXISTS clause is load-bearing twice over. Without it the UPDATE touches
     // every unresolved link and sets dst_note to NULL again where the target is
@@ -573,30 +573,9 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     // names both keys so the choice is total rather than left to the planner: a
     // rebuild resolving the same link two ways on two runs would move the corpus
     // digest without the corpus moving.
-    const RESOLVE: &str = "
-        UPDATE links
-           SET dst_note = (
-                SELECT n.id FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-              ORDER BY length(n.path), n.path
-                 LIMIT 1
-           )
-         WHERE dst_note IS NULL
-           AND kind <> 'tag'
-           AND dst_path IS NOT NULL
-           AND EXISTS (
-                SELECT 1 FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-           )";
-    let resolved = conn.execute(RESOLVE, []).map_err(sqlite)?;
+    let resolved = conn
+        .execute(crate::resolve::RESOLVE_ALL, [])
+        .map_err(sqlite)?;
     Ok(resolved)
 }
 

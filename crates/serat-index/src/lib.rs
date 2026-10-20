@@ -16,6 +16,7 @@ pub mod identity;
 pub mod incremental;
 pub mod open;
 pub mod rebuild;
+mod resolve;
 pub mod schema;
 pub mod writer;
 
