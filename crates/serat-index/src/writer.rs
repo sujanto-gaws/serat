@@ -471,8 +471,10 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
     }
 }
 
-/// Capture the `blocks_fts` trigger definitions and `ix_links_unresolved`, then drop
-/// them.
+/// Capture the `blocks_fts` trigger definitions, `ix_links_unresolved` and the four
+/// foreign-key child indexes of user_version 7 (architecture §4.4, task #51), then
+/// drop them. The four exist only to serve the cascade on a delete; a rebuild deletes
+/// nothing, so it builds them once in [`end_bulk_load`] instead of maintaining them.
 ///
 /// F-373 (task #82): a trigger is not the only per-row obligation a bulk load cannot
 /// afford. `ix_links_unresolved` is maintained by SQLite on every insert into `links`
@@ -492,7 +494,9 @@ fn begin_bulk_load(conn: &Connection) -> Result<Vec<String>, IndexError> {
             .prepare(
                 "SELECT type, sql FROM sqlite_master
                   WHERE (type = 'trigger' AND tbl_name = 'blocks')
-                     OR (type = 'index' AND name = 'ix_links_unresolved')
+                     OR (type = 'index' AND name IN ('ix_links_unresolved',
+                         'ix_links_src_block', 'ix_fields_block', 'ix_tasks_block',
+                         'ix_tasks_note'))
                   ORDER BY type, name",
             )
             .map_err(sqlite)?;
