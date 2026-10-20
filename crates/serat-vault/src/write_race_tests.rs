@@ -232,3 +232,99 @@ fn the_lock_map_is_bounded_by_concurrent_writes_not_by_vault_size() {
     let _ = vault.write_patch(&missing, crate::hash::hash_bytes(b"x"), &edit("y"));
     assert_eq!(vault.path_locks().len(), 0);
 }
+
+use crate::Expect;
+
+/// `write_file` with a base hash racing `save_patch`: the patch is parked between its
+/// re-hash and its rename. The guarded whole-file write must wait, then see the patched
+/// file and refuse; without the check under the lock it passes the check first and both
+/// return `Ok`.
+#[test]
+fn write_atomic_if_hash_racing_write_patch_yields_one_ok_and_one_stale_hash() {
+    let (dir, vault) = vault();
+    let path = VaultPath::new("note.md").unwrap();
+    let base = vault.write_atomic(&path, b"aaa\nrest\n").unwrap();
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            vault.write_patch_hooked(
+                &path,
+                base,
+                &edit("AAA"),
+                || {},
+                move || {
+                    parked_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                },
+            )
+        });
+        parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let b = scope.spawn(|| vault.write_atomic_if(&path, Expect::Hash(base), b"whole\n"));
+        std::thread::sleep(Duration::from_millis(300));
+        release_tx.send(()).unwrap();
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(a.is_ok(), "{a:?}");
+    assert!(matches!(b, Err(VaultError::StaleHash { .. })), "{b:?}");
+    assert_eq!(
+        fs::read(dir.path().join("note.md")).unwrap(),
+        b"AAA\nrest\n"
+    );
+    assert!(temps(dir.path()).is_empty());
+}
+
+/// Two creates of one path: the first is parked before its rename; the second must
+/// wait and then find the file there.
+#[test]
+fn two_concurrent_creates_yield_one_ok_and_one_stale_hash() {
+    let (dir, vault) = vault();
+    let path = VaultPath::new("new.md").unwrap();
+    let (parked_tx, parked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            vault.write_atomic_hooked(&path, b"first\n", Some(Expect::Absent), move || {
+                parked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })
+        });
+        parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let b = scope.spawn(|| vault.write_atomic_if(&path, Expect::Absent, b"second\n"));
+        std::thread::sleep(Duration::from_millis(300));
+        release_tx.send(()).unwrap();
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(a.is_ok(), "{a:?}");
+    assert!(matches!(b, Err(VaultError::StaleHash { .. })), "{b:?}");
+    assert_eq!(fs::read(dir.path().join("new.md")).unwrap(), b"first\n");
+}
+
+#[test]
+fn write_atomic_if_refuses_a_mismatch_and_a_vanished_file() {
+    let (_dir, vault) = vault();
+    let path = VaultPath::new("n.md").unwrap();
+    let x = crate::hash::hash_bytes(b"x");
+    let missing = vault.write_atomic_if(&path, Expect::Hash(x), b"y");
+    assert!(
+        matches!(missing, Err(VaultError::NotFound { .. })),
+        "{missing:?}"
+    );
+    vault
+        .write_atomic_if(&path, Expect::Absent, b"one\n")
+        .unwrap();
+    let over = vault.write_atomic_if(&path, Expect::Absent, b"two\n");
+    assert!(
+        matches!(over, Err(VaultError::StaleHash { .. })),
+        "{over:?}"
+    );
+    let wrong = vault.write_atomic_if(&path, Expect::Hash(x), b"y");
+    assert!(
+        matches!(wrong, Err(VaultError::StaleHash { .. })),
+        "{wrong:?}"
+    );
+    let ok = crate::hash::hash_bytes(b"one\n");
+    vault
+        .write_atomic_if(&path, Expect::Hash(ok), b"three\n")
+        .unwrap();
+}
