@@ -18,6 +18,10 @@
 //!   ADR-0015 §3 names. `source = walk`. The rebuild runs to the end (untimed) so
 //!   each iteration starts from the same disk state.
 //!
+//! **Not recorded here:** ADR-0015 §3's validity condition 4 (`cpu_load_percent`,
+//! `concurrent_build_processes`, `gate_eligible`). This job reports; it is not
+//! gate-eligible evidence, and the budget job (task #9) records those fields.
+//!
 //! Each run is rejected, not recorded, unless `Complete.entries` equals the manifest's
 //! `notes + assets` and `source` matches the arm (ADR-0015 §3, validity conditions 1-2).
 //! After the warm arm's `Complete` the authoritative walk is timed too (catch-up and
@@ -134,8 +138,10 @@ fn run(args: &[String]) -> Result<(), String> {
     for round in 0..=iterations {
         let started = Instant::now();
         let (session, stream) = session(started);
+        // The snapshot goes before the read, as it must in the application.
+        let snapshot = session.begin_index_read().ok_or("session poisoned")?;
         let rows = serat_index::tree::read_tree_rows(&db).map_err(|e| format!("rows: {e}"))?;
-        if !session.populate_from_index(rows.iter().map(|(p, k)| (p.as_str(), *k))) {
+        if !session.populate_from_index(snapshot, rows.iter().map(|(p, k)| (p.as_str(), *k))) {
             return Err("warm arm: the index tree was not sent".into());
         }
         let (at, entries, source) = stream

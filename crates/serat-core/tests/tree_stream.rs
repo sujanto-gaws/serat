@@ -74,7 +74,7 @@ fn folder(name: &str) -> RawEntry {
 
 fn list(model: &mut TreeModel, dir: &str, raw: Vec<RawEntry>) -> Option<TreeOp> {
     let snap = model.begin_snapshot();
-    let op = model.list(snap, dir, raw);
+    let op = model.list(snap, dir, raw).into_iter().next();
     model.end_snapshot(snap);
     op
 }
@@ -160,8 +160,8 @@ fn a_listing_of_a_removed_directory_or_a_descendant_of_one_is_dropped() {
 
     let snap = model.begin_snapshot();
     front.apply(model.remove("", "old"));
-    assert!(model.list(snap, "old", vec![file("x.md")]).is_none());
-    assert!(model.list(snap, "old/deep", vec![file("x.md")]).is_none());
+    assert!(model.list(snap, "old", vec![file("x.md")]).is_empty());
+    assert!(model.list(snap, "old/deep", vec![file("x.md")]).is_empty());
     model.end_snapshot(snap);
     assert!(front.dirs.keys().all(|d| !d.starts_with("old")));
 }
@@ -355,4 +355,68 @@ fn a_random_create_delete_replay_ends_where_a_fresh_listing_does() {
             );
         }
     }
+}
+
+#[test]
+fn a_directory_removed_and_recreated_does_not_resurrect_its_stale_read() {
+    // code-reviewer-3's probe 1 (B1). The walk read a/b, then a/b was deleted and
+    // created again; the recreate replaced the overlay's "removed" mark, and the read
+    // was listed after Remove(a, b).
+    let mut model = TreeModel::new();
+    let mut front = Front::default();
+    front.apply(list(&mut model, "", vec![folder("a")]));
+    front.apply(list(&mut model, "a", vec![folder("b")]));
+    front.apply(list(&mut model, "a/b", vec![file("x.md")]));
+
+    let snap = model.begin_snapshot();
+    let stale = vec![file("x.md"), file("y.md")];
+    front.apply(model.remove("a", "b"));
+    front.apply(model.upsert("a", folder("b")));
+    let late = model.list(snap, "a/b", stale);
+    model.end_snapshot(snap);
+
+    assert!(late.is_empty(), "a pre-remove read was listed: {late:?}");
+    front.apply(late);
+    assert_eq!(front.names("a/b"), Vec::<String>::new());
+}
+
+#[test]
+fn an_ancestor_removed_and_recreated_does_not_resurrect_a_stale_read_beneath_it() {
+    // Probe 2: the same through an ancestor, and the later re-create of a/b must not
+    // find a stale listing already sitting in the model.
+    let mut model = TreeModel::new();
+    let mut front = Front::default();
+    front.apply(list(&mut model, "", vec![folder("a")]));
+    front.apply(list(&mut model, "a", vec![folder("b")]));
+
+    let snap = model.begin_snapshot();
+    let stale = vec![file("x.md")];
+    front.apply(model.remove("", "a"));
+    front.apply(model.upsert("", folder("a")));
+    let late = model.list(snap, "a/b", stale);
+    model.end_snapshot(snap);
+    assert!(late.is_empty(), "{late:?}");
+
+    front.apply(model.upsert("a", folder("b")));
+    assert_eq!(front.names("a/b"), Vec::<String>::new());
+    assert!(
+        front.dirs.contains_key("a/b"),
+        "the re-created folder has no listing"
+    );
+}
+
+#[test]
+fn a_folder_created_between_its_parents_read_and_listing_gets_a_listing() {
+    // Probe 3 (S1): the overlay adds the folder to the parent's listing, and no walk
+    // will ever queue it, so it would sit pending for ever.
+    let mut model = TreeModel::new();
+    let mut front = Front::default();
+    let snap = model.begin_snapshot();
+    let early = model.upsert("", folder("newdir"));
+    assert!(early.is_empty());
+    front.apply(model.list(snap, "", vec![file("a.md")]));
+    model.end_snapshot(snap);
+    assert_eq!(front.names(""), ["newdir", "a.md"]);
+    assert!(front.dirs.contains_key("newdir"), "newdir stayed pending");
+    assert!(model.is_listed("newdir"));
 }

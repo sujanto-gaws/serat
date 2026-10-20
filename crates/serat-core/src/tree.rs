@@ -215,6 +215,11 @@ pub struct TreeModel {
     /// Live changes made while a snapshot was outstanding: `(dir, name)` to the
     /// generation of the change and the state it left (`None` = removed).
     overlay: HashMap<(String, String), (u64, Option<TreeKind>)>,
+    /// Full path to the generation of the latest remove of it while a snapshot was
+    /// outstanding. Separate from `overlay` and never overwritten by a later upsert:
+    /// a directory removed and re-created is still a directory whose older reads
+    /// describe a tree that no longer exists (ADR-0015 §1, obligation 1).
+    removed: HashMap<String, u64>,
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -246,6 +251,7 @@ impl TreeModel {
     pub fn end_snapshot(&mut self, _snapshot: Snapshot) {
         self.outstanding = self.outstanding.saturating_sub(1);
         if self.outstanding == 0 {
+            self.removed.clear();
             self.overlay.clear();
         }
     }
@@ -263,42 +269,46 @@ impl TreeModel {
         self.dirs.values().map(DirState::files).sum()
     }
 
-    /// Whether this directory, or any directory above it, was removed after `snapshot`.
+    /// Whether this directory, or any directory above it, was removed after `snapshot`,
+    /// whatever has been created in its place since.
     fn removed_since(&self, snapshot: Snapshot, dir: &str) -> bool {
-        if self.overlay.is_empty() || dir.is_empty() {
+        if self.removed.is_empty() || dir.is_empty() {
             return false;
         }
         dir.match_indices('/')
             .map(|(i, _)| &dir[..i])
             .chain(std::iter::once(dir))
-            .any(|path| {
-                let (parent, name) = split(path);
-                matches!(
-                    self.overlay.get(&(parent.to_owned(), name.to_owned())),
-                    Some((generation, None)) if *generation > snapshot.0
-                )
-            })
+            .any(|path| self.removed.get(path).is_some_and(|g| *g > snapshot.0))
     }
 
-    /// Offer a directory read taken against `snapshot`. Returns the listing to send,
-    /// or `None` when it would repeat what was sent, or when the directory (or an
-    /// ancestor) has been removed since the read began.
-    pub fn list(&mut self, snapshot: Snapshot, dir: &str, raw: Vec<RawEntry>) -> Option<TreeOp> {
+    /// Offer a directory read taken against `snapshot`. Returns the messages to send:
+    /// the listing, then an empty listing for each folder the overlay added to it that
+    /// has none (created between this read and now, so no walk will ever queue it).
+    /// Empty when the read would repeat what was sent, or when the directory (or an
+    /// ancestor) was removed since the read began, even if it has been re-created: the
+    /// read describes a tree that no longer exists, and whoever re-created it lists it.
+    pub fn list(&mut self, snapshot: Snapshot, dir: &str, raw: Vec<RawEntry>) -> Vec<TreeOp> {
         if self.removed_since(snapshot, dir) {
-            return None;
+            return Vec::new();
         }
         let mut state = DirState::from_raw(raw);
+        let mut added_dirs = Vec::new();
         for ((d, name), (generation, kind)) in &self.overlay {
             if d == dir && *generation > snapshot.0 {
                 match kind {
-                    Some(kind) => state.insert(name.clone(), *kind),
+                    Some(kind) => {
+                        state.insert(name.clone(), *kind);
+                        if *kind == TreeKind::Dir {
+                            added_dirs.push(join(dir, name));
+                        }
+                    }
                     None => state.remove(name),
                 }
             }
         }
         if let Some(old) = self.dirs.get(dir) {
             if old.names == state.names {
-                return None;
+                return Vec::new();
             }
             let gone: Vec<String> = old
                 .names
@@ -314,10 +324,21 @@ impl TreeModel {
         }
         let entries = state.entries();
         self.dirs.insert(dir.to_owned(), state);
-        Some(TreeOp::Listing {
+        let mut ops = vec![TreeOp::Listing {
             dir: dir.to_owned(),
             entries,
-        })
+        }];
+        added_dirs.sort();
+        for child in added_dirs {
+            if !self.dirs.contains_key(&child) {
+                self.dirs.insert(child.clone(), DirState::default());
+                ops.push(TreeOp::Listing {
+                    dir: child,
+                    entries: Vec::new(),
+                });
+            }
+        }
+        ops
     }
 
     /// An entry was created (or is the new name of a rename). Returns the messages
@@ -360,6 +381,9 @@ impl TreeModel {
         if self.outstanding > 0 {
             self.overlay
                 .insert((dir.to_owned(), name.to_owned()), (self.generation, kind));
+            if kind.is_none() {
+                self.removed.insert(join(dir, name), self.generation);
+            }
         }
     }
 

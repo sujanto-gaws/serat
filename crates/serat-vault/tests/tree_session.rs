@@ -178,7 +178,10 @@ fn an_index_populated_tree_is_corrected_by_the_walk_with_only_the_differences() 
         })
         .chain([("ghost/gone.md".to_owned(), TreeKind::Note)])
         .collect();
-    assert!(session.populate_from_index(rows.iter().map(|(p, k)| (p.as_str(), *k))));
+    assert!(session.populate_from_index(
+        session.begin_index_read().expect("live"),
+        rows.iter().map(|(p, k)| (p.as_str(), *k))
+    ));
 
     {
         let stream = log.lock().expect("log");
@@ -237,7 +240,10 @@ fn once_the_walk_has_populated_the_index_tree_is_not_sent() {
     let (session, log) = session();
     session.populate_from_walk(&vault).expect("walk");
     let before = log.lock().expect("log").len();
-    assert!(!session.populate_from_index([("a.md", TreeKind::Note)]));
+    assert!(!session.populate_from_index(
+        session.begin_index_read().expect("live"),
+        [("a.md", TreeKind::Note)]
+    ));
     assert_eq!(log.lock().expect("log").len(), before);
 }
 
@@ -340,7 +346,10 @@ fn progress_tells_the_app_what_a_front_end_mark_may_claim() {
         .into_iter()
         .map(|e| (e.path.to_string(), TreeKind::Note))
         .collect();
-    assert!(session.populate_from_index(rows.iter().map(|(p, k)| (p.as_str(), *k))));
+    assert!(session.populate_from_index(
+        session.begin_index_read().expect("live"),
+        rows.iter().map(|(p, k)| (p.as_str(), *k))
+    ));
     let after_index = session.progress();
     assert!(after_index.root_sent && !after_index.settled);
     assert_eq!(after_index.complete, Some((4, TreeSource::Index)));
@@ -353,4 +362,39 @@ fn progress_tells_the_app_what_a_front_end_mark_may_claim() {
         Some((4, TreeSource::Index)),
         "the walk must not rewrite which source populated the tree"
     );
+}
+
+#[test]
+fn a_panic_in_the_sink_kills_the_session_and_progress_never_waits() {
+    // A poisoned lock is not recovered: the model is mutated before the emit, so it
+    // could claim messages the stream never got. The session goes dead, says so, and
+    // progress() (lock-free) still answers.
+    let (_dir, vault) = fixture();
+    let calls = Arc::new(Mutex::new(0u32));
+    let counter = Arc::clone(&calls);
+    let session = Arc::new(TreeSession::new(move |_| {
+        let n = {
+            let mut n = counter.lock().expect("calls");
+            *n += 1;
+            *n
+        };
+        assert!(n < 2, "sink failure");
+    }));
+    let doomed = Arc::clone(&session);
+    let _ = thread::spawn(move || {
+        let _ = doomed.populate_from_walk(&vault);
+    })
+    .join();
+    assert!(session.is_poisoned());
+    let _ = session.progress();
+    let before = *calls.lock().expect("calls");
+    session.created("x.md", TreeKind::Note);
+    session.deleted("a.md");
+    assert_eq!(
+        *calls.lock().expect("calls"),
+        before,
+        "a dead session wrote"
+    );
+    let (_dir2, vault2) = fixture();
+    assert!(session.populate_from_walk(&vault2).is_err());
 }

@@ -24,7 +24,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serat_core::{
     RawEntry, Snapshot, TreeKind, TreeModel, TreeOp, VaultError, VaultPath, group_listings,
@@ -62,7 +63,8 @@ pub enum TreeOut {
         /// Empty folders the walk added after `Complete`: folders with no file
         /// anywhere beneath them, which an index-sourced tree cannot know. Always 0
         /// when the walk itself populated the tree, because they arrived before
-        /// `Complete` (see [`WalkSummary::empty_folders`] for the count regardless).
+        /// `Complete`. serat-app reports the empty-folder count for ADR-0015 §3 from
+        /// [`WalkSummary::empty_folders`] (returned by the walk), not from this.
         empty_folders: u32,
     },
 }
@@ -85,7 +87,10 @@ impl Vault {
     ///
     /// Entries are unordered; ordering is [`TreeModel`]'s. A name this platform cannot
     /// represent as a [`VaultPath`] is recorded in [`Vault::refusals`] (without
-    /// clearing it: only [`Vault::walk`] does that) and left out. A subdirectory that
+    /// clearing it: only [`Vault::walk`] does that) and left out. That includes a
+    /// **directory** name, which makes an entry for the directory's path in a log
+    /// whose contract is one entry per refused file; [`Vault::walk`] would instead
+    /// report each file beneath it. A subdirectory that
     /// cannot be read is listed empty rather than left pending for ever (design goal
     /// 5).
     ///
@@ -196,23 +201,73 @@ pub struct TreeProgress {
     pub settled: bool,
 }
 
+/// Progress as atomics, outside the session lock: a synchronous `mark_tree` must never
+/// wait behind a sink call (architecture §2.2). Each flag is set after the sink returns,
+/// so a reader never sees a message claimed that has not been written.
+#[derive(Debug, Default)]
+struct ProgressCell {
+    root_sent: AtomicBool,
+    settled: AtomicBool,
+    /// 0 = not complete; otherwise `PRESENT | source << 32 | entries`.
+    complete: AtomicU64,
+}
+
+const PRESENT: u64 = 1 << 40;
+
+impl ProgressCell {
+    fn set_complete(&self, entries: u32, source: TreeSource) {
+        let tag = match source {
+            TreeSource::Index => 0,
+            TreeSource::Walk => 1,
+        };
+        self.complete.store(
+            PRESENT | (tag << 32) | u64::from(entries),
+            Ordering::Release,
+        );
+    }
+
+    fn complete(&self) -> Option<(u32, TreeSource)> {
+        let packed = self.complete.load(Ordering::Acquire);
+        if packed & PRESENT == 0 {
+            return None;
+        }
+        let source = if (packed >> 32) & 1 == 0 {
+            TreeSource::Index
+        } else {
+            TreeSource::Walk
+        };
+        Some((
+            u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(u32::MAX),
+            source,
+        ))
+    }
+}
+
 struct Inner {
     model: TreeModel,
     sink: Box<dyn FnMut(TreeOut) + Send>,
-    root_sent: bool,
+    progress: Arc<ProgressCell>,
     walk_sent: bool,
-    complete: Option<(u32, TreeSource)>,
-    settled: bool,
 }
 
 impl Inner {
     fn emit(&mut self, out: TreeOut) {
-        if let TreeOut::Op(TreeOp::Listing { dir, .. }) = &out
-            && dir.is_empty()
-        {
-            self.root_sent = true;
-        }
+        let root = matches!(&out, TreeOut::Op(TreeOp::Listing { dir, .. }) if dir.is_empty());
+        let settled = matches!(&out, TreeOut::WalkSettled { .. });
+        let complete = match &out {
+            TreeOut::Complete { entries, source } => Some((*entries, *source)),
+            _ => None,
+        };
         (self.sink)(out);
+        if root {
+            self.progress.root_sent.store(true, Ordering::Release);
+        }
+        if let Some((entries, source)) = complete {
+            self.progress.set_complete(entries, source);
+        }
+        if settled {
+            self.progress.settled.store(true, Ordering::Release);
+        }
     }
 
     fn emit_all(&mut self, ops: impl IntoIterator<Item = TreeOp>) {
@@ -231,8 +286,16 @@ impl Inner {
 /// The sink runs **under the session's lock** and must not block: it is a channel
 /// send. Coalescing small messages into batches (≤ 256 KiB or ≤ 16 ms, ADR-0015 §2) is
 /// the sink's business, since it changes nothing about order.
+///
+/// **A panic in the sink poisons the session, and a poisoned session is dead**, not
+/// recovered: the model is mutated before the message is emitted, so after a panic it
+/// may claim messages the stream never got. Every method then does nothing (the walk
+/// and populate methods report it), [`Self::is_poisoned`] says so, and the caller
+/// restarts the stream with a new session, which re-sends the tree from the root
+/// (`open_tree` already means that).
 pub struct TreeSession {
     inner: Mutex<Inner>,
+    progress: Arc<ProgressCell>,
 }
 
 impl fmt::Debug for TreeSession {
@@ -246,23 +309,40 @@ impl fmt::Debug for TreeSession {
 impl TreeSession {
     /// A session writing to `sink`.
     pub fn new(sink: impl FnMut(TreeOut) + Send + 'static) -> Self {
+        let progress = Arc::new(ProgressCell::default());
         Self {
             inner: Mutex::new(Inner {
                 model: TreeModel::new(),
                 sink: Box::new(sink),
-                root_sent: false,
+                progress: Arc::clone(&progress),
                 walk_sent: false,
-                complete: None,
-                settled: false,
             }),
+            progress,
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Run `f` under the lock; `None` if the session is poisoned (dead).
+    fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> Option<R> {
+        let mut guard = self.inner.lock().ok()?;
+        Some(f(&mut guard))
     }
 
-    /// What has been delivered so far.
+    fn poisoned() -> VaultError {
+        VaultError::io(
+            "tree session".to_owned(),
+            &std::io::Error::other(
+                "the tree session was poisoned by a panic in its sink; restart the stream",
+            ),
+        )
+    }
+
+    /// Whether the session died (a panic in its sink). Restart the stream.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
+    /// What has been delivered so far. Lock-free: it never waits for a sink call.
     ///
     /// This is the hook for the tree mark (NFR-PRF-01, ADR-0015 §3): the front end
     /// stamps `tree_first_screen` and `tree_complete` after painting, through
@@ -271,51 +351,71 @@ impl TreeSession {
     /// check of `entries_in_model` is against `complete.0`.
     #[must_use]
     pub fn progress(&self) -> TreeProgress {
-        let inner = self.lock();
         TreeProgress {
-            root_sent: inner.root_sent,
-            complete: inner.complete,
-            settled: inner.settled,
+            root_sent: self.progress.root_sent.load(Ordering::Acquire),
+            complete: self.progress.complete(),
+            settled: self.progress.settled.load(Ordering::Acquire),
         }
     }
 
-    /// The warm path: populate from the index's `(path, kind)` rows, root listing
-    /// first and alone, then breadth-first, then [`TreeOut::Complete`].
+    /// Mark the start of an index read. **Call this before reading the rows**: the
+    /// snapshot must be older than the read, or a delete that lands between the read
+    /// and the listing is not applied to it (ADR-0015 §1). Then pass the token to
+    /// [`Self::populate_from_index`], or to [`Self::abandon_index_read`] if the read
+    /// failed. `None` if the session is poisoned.
+    #[must_use]
+    pub fn begin_index_read(&self) -> Option<Snapshot> {
+        self.with(|inner| inner.model.begin_snapshot())
+    }
+
+    /// The index read failed; release its snapshot.
+    pub fn abandon_index_read(&self, snapshot: Snapshot) {
+        self.with(|inner| inner.model.end_snapshot(snapshot));
+    }
+
+    /// The warm path: populate from the index's `(path, kind)` rows, read after
+    /// [`Self::begin_index_read`] returned `snapshot`. Root listing first and alone,
+    /// then breadth-first, then [`TreeOut::Complete`].
     ///
     /// Returns `false`, having sent nothing further, if a walk listing has been sent
-    /// (before or during this call): the walk then populates alone and the index tree
-    /// is not sent (ADR-0015 §2). Directories with no indexed file beneath them are
-    /// absent until the walk arrives.
+    /// (before or during this call), or the session is poisoned: the walk then
+    /// populates alone and the index tree is not sent (ADR-0015 §2). Directories with
+    /// no indexed file beneath them are absent until the walk arrives.
     pub fn populate_from_index<'a>(
         &self,
+        snapshot: Snapshot,
         rows: impl IntoIterator<Item = (&'a str, TreeKind)>,
     ) -> bool {
         // The grouping is pure and can be long; it happens outside the lock.
         let listings = group_listings(rows);
-        let snapshot = self.lock().model.begin_snapshot();
         let mut proceeded = true;
         for (dir, raw) in listings {
-            let mut inner = self.lock();
-            if inner.walk_sent {
+            let sent = self.with(|inner| {
+                if inner.walk_sent {
+                    return false;
+                }
+                let ops = inner.model.list(snapshot, &dir, raw);
+                inner.emit_all(ops);
+                true
+            });
+            if sent != Some(true) {
                 proceeded = false;
                 break;
             }
-            if let Some(op) = inner.model.list(snapshot, &dir, raw) {
-                inner.emit(TreeOut::Op(op));
+        }
+        self.with(|inner| {
+            inner.model.end_snapshot(snapshot);
+            if !proceeded || inner.walk_sent {
+                return false;
             }
-        }
-        let mut inner = self.lock();
-        inner.model.end_snapshot(snapshot);
-        if !proceeded || inner.walk_sent {
-            return false;
-        }
-        let entries = inner.files();
-        inner.complete = Some((entries, TreeSource::Index));
-        inner.emit(TreeOut::Complete {
-            entries,
-            source: TreeSource::Index,
-        });
-        true
+            let entries = inner.files();
+            inner.emit(TreeOut::Complete {
+                entries,
+                source: TreeSource::Index,
+            });
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// The no-index path and, afterwards, the authoritative walk: list every directory
@@ -323,27 +423,31 @@ impl TreeSession {
     /// here with `source = Walk`; if the index did, these listings are catch-up and
     /// only differing ones are sent, and `WalkSettled` follows.
     ///
+    /// The returned [`WalkSummary::empty_folders`] is the count serat-app reports as
+    /// the arrival of empty folders (ADR-0015 §3); the `WalkSettled` message carries
+    /// only those added after `Complete`.
+    ///
     /// # Errors
     ///
-    /// As [`Vault::walk_tree`]. On error no `Complete` is sent.
+    /// As [`Vault::walk_tree`], and an I/O error if the session is poisoned. On error
+    /// no `Complete` is sent.
     pub fn populate_from_walk(&self, vault: &Vault) -> Result<WalkSummary, VaultError> {
         let summary = self.rescan_dir(vault, "", true)?;
-        let mut inner = self.lock();
-        if inner.complete.is_none() {
-            let entries = inner.files();
-            inner.complete = Some((entries, TreeSource::Walk));
-            inner.emit(TreeOut::Complete {
-                entries,
-                source: TreeSource::Walk,
-            });
-            inner.settled = true;
-            inner.emit(TreeOut::WalkSettled { empty_folders: 0 });
-        } else if !inner.settled {
-            inner.settled = true;
-            inner.emit(TreeOut::WalkSettled {
-                empty_folders: summary.empty_folders,
-            });
-        }
+        self.with(|inner| {
+            if inner.progress.complete().is_none() {
+                let entries = inner.files();
+                inner.emit(TreeOut::Complete {
+                    entries,
+                    source: TreeSource::Walk,
+                });
+                inner.emit(TreeOut::WalkSettled { empty_folders: 0 });
+            } else if !inner.progress.settled.load(Ordering::Acquire) {
+                inner.emit(TreeOut::WalkSettled {
+                    empty_folders: summary.empty_folders,
+                });
+            }
+        })
+        .ok_or_else(Self::poisoned)?;
         Ok(summary)
     }
 
@@ -353,7 +457,7 @@ impl TreeSession {
     ///
     /// # Errors
     ///
-    /// As [`Vault::walk_tree`].
+    /// As [`Vault::walk_tree`], and an I/O error if the session is poisoned.
     pub fn rescan(&self, vault: &Vault, dir: &str) -> Result<WalkSummary, VaultError> {
         self.rescan_dir(vault, dir, false)
     }
@@ -364,35 +468,40 @@ impl TreeSession {
         dir: &str,
         initial: bool,
     ) -> Result<WalkSummary, VaultError> {
-        let snapshot: Snapshot = self.lock().model.begin_snapshot();
+        let snapshot: Snapshot = self
+            .with(|inner| inner.model.begin_snapshot())
+            .ok_or_else(Self::poisoned)?;
         let result = vault.walk_tree(dir, |listed, raw| {
-            let mut inner = self.lock();
-            if initial {
-                inner.walk_sent = true;
-            }
-            if let Some(op) = inner.model.list(snapshot, listed, raw) {
-                inner.emit(TreeOut::Op(op));
-            }
+            self.with(|inner| {
+                if initial {
+                    inner.walk_sent = true;
+                }
+                let ops = inner.model.list(snapshot, listed, raw);
+                inner.emit_all(ops);
+            });
         });
-        self.lock().model.end_snapshot(snapshot);
+        self.with(|inner| inner.model.end_snapshot(snapshot))
+            .ok_or_else(Self::poisoned)?;
         result
     }
 
     /// A file or directory was created, or is the new name of a rename. `path` is
     /// vault-relative. A directory that arrives with contents needs a [`Self::rescan`]
-    /// as well.
+    /// as well; a new empty folder is listed empty here.
     pub fn created(&self, path: &str, kind: TreeKind) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let mut inner = self.lock();
-        let ops = inner.model.upsert(dir, RawEntry::new(name, kind));
-        inner.emit_all(ops);
+        self.with(|inner| {
+            let ops = inner.model.upsert(dir, RawEntry::new(name, kind));
+            inner.emit_all(ops);
+        });
     }
 
     /// A file or directory was deleted, or is the old name of a rename.
     pub fn deleted(&self, path: &str) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let mut inner = self.lock();
-        let ops = inner.model.remove(dir, name);
-        inner.emit_all(ops);
+        self.with(|inner| {
+            let ops = inner.model.remove(dir, name);
+            inner.emit_all(ops);
+        });
     }
 }
