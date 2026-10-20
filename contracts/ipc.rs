@@ -314,9 +314,12 @@ pub struct IndexStatus {
     /// never silently absent. The front end renders it as one status fact, "N
     /// names not shown", and fetches the list behind it with `refused_names`.
     ///
-    /// The count is of distinct paths, the length of the `refused_names` list,
-    /// so it saturates at
-    /// [`REFUSED_NAMES_CAP`]. At the cap the front end says "1000 or more".
+    /// The count is of distinct paths: `RefusalLog::len()`, the length of the
+    /// `refused_names` list. It saturates at [`REFUSED_NAMES_CAP`], and at the
+    /// cap the front end says "1000 or more". It does not add
+    /// `RefusalLog::overflowed()`. That counter counts refusal events past the
+    /// cap, not distinct paths, because an unstored path the watcher refuses
+    /// twice is counted twice. Adding it would overstate the number of names.
     /// `None` (absent on the wire) means serat-app is not counting yet, or no
     /// vault is open. It never means zero, so the front end shows nothing for
     /// it rather than "0 names not shown".
@@ -326,9 +329,10 @@ pub struct IndexStatus {
 }
 
 /// The most refused names the log holds, the status counts and `refused_names`
-/// returns. It matches serat-vault's `RefusalLog` bound (task #34), which drops
-/// the oldest entry when it is full, so memory stays bounded on a vault full of
-/// names one platform cannot hold.
+/// returns. It matches serat-vault's `RefusalLog` bound (task #34). The log keeps
+/// the first 1000 distinct paths, and counts later new ones in `overflowed()`
+/// without storing them, so memory stays bounded on a vault full of names one
+/// platform cannot hold.
 pub const REFUSED_NAMES_CAP: u32 = 1000;
 
 /// `refused_names() -> Vec<RefusedName>`
@@ -336,11 +340,12 @@ pub const REFUSED_NAMES_CAP: u32 = 1000;
 /// Serves FR-VLT-01 (design goal 5). The list behind `IndexStatus::refused_names`:
 /// every file name the walk or the watcher refused, with the reason, at most
 /// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
-/// distinct path**: a path refused again (the watcher sees it change) replaces
-/// its entry rather than adding one, so the count is a count of names, not of
-/// events. `RefusalLog` at task #34's `10603a1` appends per event and does not
-/// deduplicate, so either it or serat-app must, before this ships. A refused
-/// file that is deleted or renamed away leaves the list on the watcher's event.
+/// distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
+/// watcher sees it change) replaces its reason rather than adding an entry.
+/// **Entries leave only at the next walk**, which clears the log and refills it.
+/// A refused file that is deleted or renamed away stays listed until then, so
+/// the list can name a file that is already gone. That is accepted, because
+/// the list is a report, never a path a command acts on.
 /// **A read, not a
 /// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
 /// An empty list when nothing was refused or no vault is open. Granted to `main`
@@ -694,16 +699,28 @@ pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
 /// - `path` becomes a `VaultPath` under task #34's rules, or it is refused as
 ///   `IpcError::PathEscapesVault`;
 /// - it is resolved through `Vault::resolve`, which refuses a symlink component;
-/// - a path inside an ignored directory (`.serat/`, `.obsidian/`, `.git/`, ...)
-///   is refused as `IpcError::NotWritable`. NFR-CMP-01 keeps `.obsidian/`
-///   untouched, and `.serat/` is the index's.
+/// - **a path that is, or is inside, an ignored directory** (`.serat/`,
+///   `.obsidian/`, `.git/`, ...), **compared case-insensitively**, is refused as
+///   `IpcError::NotWritable`. On macOS and Windows `.Obsidian/x` lands in
+///   `.obsidian/`, so an exact comparison would let it through. NFR-CMP-01 keeps
+///   `.obsidian/` untouched, and `.serat/` is the index's;
+/// - **after `create_dir`, the new directory is canonicalised and must
+///   `starts_with` the canonical root.** If it does not, it is removed with
+///   `remove_dir` and the call returns `IpcError::PathEscapesVault`. Between the
+///   resolve and the `create_dir`, a parent could be swapped for a symlink, and
+///   the directory would then land outside the vault (NFR-SEC-06). This check
+///   closes that window, except that an empty directory can exist outside the
+///   vault for the moment before it is removed. That residue is stated rather
+///   than hidden. serat-app's hostile suite swaps a parent for a symlink between
+///   resolve and create, and asserts the refusal and the removal.
 ///
 /// It creates exactly one directory. **The parent must already exist**
 /// (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
 /// folders. It writes no file content. **It is idempotent**: an existing
 /// directory at `path` returns `created: false` and changes nothing. A file
-/// already at `path` is `IpcError::Io`, and the front end picks a unique name
-/// first, as it does for notes. The tree shows the new folder through
+/// already at `path` is `IpcError::Io`. The front end picks a unique name
+/// first, as it does for notes, and **compares names case-insensitively** when
+/// it does, because macOS and Windows file systems do. The tree shows the new folder through
 /// ADR-0015's live `Upsert` from the watcher, with no rebuild, and it is an empty
 /// folder (FR-VLT-01's gated mark does not count it). The index is not
 /// touched, because the index has no rows for folders. Granted to `main` in the
@@ -714,6 +731,9 @@ pub struct CreateFolderArgs {
     /// Vault-relative, `/`-separated path of the folder to create.
     pub path: String,
 }
+
+/// The command name for [`CreateFolderArgs`].
+pub const CREATE_FOLDER_COMMAND: &str = "create_folder";
 
 /// A `create_folder` that succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

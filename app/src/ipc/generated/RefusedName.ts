@@ -6,11 +6,12 @@
  * Serves FR-VLT-01 (design goal 5). The list behind `IndexStatus::refused_names`:
  * every file name the walk or the watcher refused, with the reason, at most
  * [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
- * distinct path**: a path refused again (the watcher sees it change) replaces
- * its entry rather than adding one, so the count is a count of names, not of
- * events. `RefusalLog` at task #34's `10603a1` appends per event and does not
- * deduplicate, so either it or serat-app must, before this ships. A refused
- * file that is deleted or renamed away leaves the list on the watcher's event.
+ * distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
+ * watcher sees it change) replaces its reason rather than adding an entry.
+ * **Entries leave only at the next walk**, which clears the log and refills it.
+ * A refused file that is deleted or renamed away stays listed until then, so
+ * the list can name a file that is already gone. That is accepted, because
+ * the list is a report, never a path a command acts on.
  * **A read, not a
  * wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
  * An empty list when nothing was refused or no vault is open. Granted to `main`

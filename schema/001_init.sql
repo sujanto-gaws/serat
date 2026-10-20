@@ -22,9 +22,12 @@
 --         writer that fills sidecar_path (task #17), not before
 --       case-insensitive link resolution (§9.3, §4.5), all in ONE commit with
 --         the resolver's comparisons and the rebuild bench, because any one
---         alone turns the per-link join into a scan (F-371). Unicode
---         lowercasing done in Rust (serat-core fold_case), stored, so every
---         read stays one statement; NOT COLLATE NOCASE, which folds ASCII only:
+--         alone turns the per-link join into a scan (F-371). Per-character
+--         Unicode lowercasing plus final sigma to sigma, done in Rust
+--         (serat-core fold_case, compositional: fold(a+b) = fold(a)+fold(b)),
+--         stored, so every read stays one statement; NOT COLLATE NOCASE, which
+--         folds ASCII only. links.dst_fold is the one per-link cost and is what
+--         task #15's rebuild bench must clear; no fallback is designed:
 --           notes.file_name_fold, notes.path_fold, links.dst_fold   (new)
 --           ix_notes_file_name            -> ON notes(file_name_fold)
 --           ix_notes_path_fold ON notes(path_fold)                (new)

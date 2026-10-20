@@ -15,16 +15,28 @@
  * - `path` becomes a `VaultPath` under task #34's rules, or it is refused as
  *   `IpcError::PathEscapesVault`;
  * - it is resolved through `Vault::resolve`, which refuses a symlink component;
- * - a path inside an ignored directory (`.serat/`, `.obsidian/`, `.git/`, ...)
- *   is refused as `IpcError::NotWritable`. NFR-CMP-01 keeps `.obsidian/`
- *   untouched, and `.serat/` is the index's.
+ * - **a path that is, or is inside, an ignored directory** (`.serat/`,
+ *   `.obsidian/`, `.git/`, ...), **compared case-insensitively**, is refused as
+ *   `IpcError::NotWritable`. On macOS and Windows `.Obsidian/x` lands in
+ *   `.obsidian/`, so an exact comparison would let it through. NFR-CMP-01 keeps
+ *   `.obsidian/` untouched, and `.serat/` is the index's;
+ * - **after `create_dir`, the new directory is canonicalised and must
+ *   `starts_with` the canonical root.** If it does not, it is removed with
+ *   `remove_dir` and the call returns `IpcError::PathEscapesVault`. Between the
+ *   resolve and the `create_dir`, a parent could be swapped for a symlink, and
+ *   the directory would then land outside the vault (NFR-SEC-06). This check
+ *   closes that window, except that an empty directory can exist outside the
+ *   vault for the moment before it is removed. That residue is stated rather
+ *   than hidden. serat-app's hostile suite swaps a parent for a symlink between
+ *   resolve and create, and asserts the refusal and the removal.
  *
  * It creates exactly one directory. **The parent must already exist**
  * (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
  * folders. It writes no file content. **It is idempotent**: an existing
  * directory at `path` returns `created: false` and changes nothing. A file
- * already at `path` is `IpcError::Io`, and the front end picks a unique name
- * first, as it does for notes. The tree shows the new folder through
+ * already at `path` is `IpcError::Io`. The front end picks a unique name
+ * first, as it does for notes, and **compares names case-insensitively** when
+ * it does, because macOS and Windows file systems do. The tree shows the new folder through
  * ADR-0015's live `Upsert` from the watcher, with no rebuild, and it is an empty
  * folder (FR-VLT-01's gated mark does not count it). The index is not
  * touched, because the index has no rows for folders. Granted to `main` in the
