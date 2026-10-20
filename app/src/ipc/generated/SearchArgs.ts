@@ -20,6 +20,10 @@ query: string,
  */
 offset: number, 
 /**
- * At most 50.
+ * At most 50 when the query has free text (R1, R1 + R3), and at most 500
+ * for a property-only `[key:value]` query (R3), which returns all 500 in
+ * one statement rather than ten pages (architecture.md §4.5, ruled on task
+ * #15's measurement). serat-index clamps to the ceiling for the statement
+ * the query selects. It is not an error to exceed it.
  */
 limit: number, };
