@@ -67,8 +67,9 @@ const POLICY: &[(&str, &[&str])] = &[
     // outside the product graph, and depended on by nothing inside it (see
     // `nothing_in_the_product_depends_on_a_bench_crate`).
     //
-    // The benchmark vault generator (NFR-MNT-02) takes no dependency at all, internal
-    // or external, by test-engineer's decision: it must build before any product
+    // The benchmark vault generator (NFR-MNT-02) takes no external dependency and one
+    // internal edge, `reporoot`, itself dependency-free (asserted by
+    // `reporoot_and_vaultgen_take_no_external_dependencies`), by test-engineer's decision: it must build before any product
     // crate does, and its determinism must not depend on another crate's PRNG staying
     // stable. Recorded here so that stops being a comment in its manifest and starts
     // being an assertion.
@@ -83,8 +84,8 @@ const POLICY: &[(&str, &[&str])] = &[
     // crate nothing in the product depends on cannot put a cycle in it.
     ("budget", BUDGET_MAY_LINK),
     // doclint (task #11, F-239) checks that paths cited in the design documents
-    // resolve. It reads Markdown, not the product, and takes no dependency at
-    // all -- the same reasoning as vaultgen: it must not need the product to
+    // resolve. It reads Markdown, not the product, and takes no product dependency
+    // (only `reporoot`, the bench tier's own root rule) -- the same reasoning as vaultgen: it must not need the product to
     // build in order to say something about the product's documentation.
     ("doclint", &["reporoot"]),
 ];
@@ -404,6 +405,34 @@ fn nothing_depends_on_serat_app() {
          Offenders: {}",
         offenders.join(", ")
     );
+}
+
+/// `violations_in` checks internal edges only, and `reporoot` / `vaultgen` sit in
+/// `NO_FORBID_LIST_YET`, so "no external dependencies" would otherwise be a comment.
+/// Both must build with no registry access (NFR-MNT-02): every non-dev dependency of
+/// `reporoot` is nothing, of `vaultgen` is `reporoot` alone. Dev-dependencies
+/// (`tempfile` for reporoot's own tests) are not part of the build the generator needs.
+#[test]
+fn reporoot_and_vaultgen_take_no_external_dependencies() {
+    let packages = workspace_metadata();
+    for (name, allowed) in [("reporoot", &[][..]), ("vaultgen", &["reporoot"][..])] {
+        let package = packages
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} is not a workspace member"));
+        let normal: Vec<&str> = package
+            .dependencies
+            .iter()
+            .filter(|d| d.kind.is_none() || d.kind.as_deref() == Some("build"))
+            .map(|d| d.name.as_str())
+            .collect();
+        let unexpected: Vec<&&str> = normal.iter().filter(|d| !allowed.contains(*d)).collect();
+        assert!(
+            unexpected.is_empty(),
+            "{name} must build with no registry access (NFR-MNT-02) and may depend only on \
+             {allowed:?}; it also depends on {unexpected:?}"
+        );
+    }
 }
 
 #[test]

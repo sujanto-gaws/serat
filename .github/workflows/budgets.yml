@@ -53,6 +53,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p serat-app --release
+      # The other direction: with test-hooks forced on, the same build MUST fail, and
+      # fail on the guard's own message (not on some unrelated error). If this step
+      # passes the assert is dead and the first step proves nothing.
+      - name: The guard fires when test-hooks is unified in
+        shell: bash
+        run: |
+          if out=$(cargo check -p serat-app --release --features serat-index/test-hooks 2>&1); then
+            echo "$out"
+            echo "::error::serat-app built in release with test-hooks on; the const assert is not firing"
+            exit 1
+          fi
+          echo "$out" | grep -q "test-hooks must not reach a release build" || {
+            echo "$out"
+            echo "::error::the build failed, but not on the test-hooks guard"
+            exit 1
+          }
 
   # NFR-MNT-02: the vault is generated from one command and is byte-identical.
   # Everything below is measured against it, so if this fails the other jobs

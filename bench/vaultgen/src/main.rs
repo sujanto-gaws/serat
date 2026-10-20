@@ -59,8 +59,24 @@ fn main() -> ExitCode {
 /// Repository root, resolved at run time (tasks #45, #54) by the shared `reporoot`
 /// crate. `--root` with no value is an error, from here as well as from the
 /// argument loop.
+fn resolved_root() -> Result<reporoot::Resolved, String> {
+    reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// The root to write under. Refuses the compiled-in fallback: vaultgen writes a
+/// whole vault, and a binary reused from another worktree must not write it into
+/// the tree that built the binary. Pass `--root`, set `SERAT_REPO_ROOT`, run from
+/// inside the checkout, or give `--out`.
 fn repo_root() -> Result<PathBuf, String> {
-    reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR"))).map(|r| r.path)
+    let r = resolved_root()?;
+    if r.rule == reporoot::Rule::CompiledIn {
+        return Err(format!(
+            "refusing to write under the compiled-in checkout {}: no [workspace] Cargo.toml \
+             above the working directory. Pass --root <dir>, set SERAT_REPO_ROOT, or give --out",
+            r.path.display()
+        ));
+    }
+    Ok(r.path)
 }
 
 fn run() -> Result<ExitCode, String> {
@@ -69,8 +85,9 @@ fn run() -> Result<ExitCode, String> {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
-    // A bare `--root` is an error even when `--out` means the root is never joined.
-    repo_root()?;
+    // A bare `--root` is an error even when `--out` means the root is never joined,
+    // and the root in force is always said (stderr, so `--quiet`'s digest stays clean).
+    eprintln!("vaultgen: {}", resolved_root()?.report_line());
 
     let mut opts = Options::default();
     let mut out_set = false;

@@ -1160,9 +1160,14 @@ pub fn parse_args(budget: &Budget, args: &[String]) -> Result<JobArgs, String> {
 /// # Panics
 /// On a `--root` with no value, when called without going through [`parse_args`].
 pub fn repo_root() -> PathBuf {
-    reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR")))
-        .unwrap_or_else(|e| panic!("{e}"))
-        .path
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    let r = reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Results are written under this root (bench/out/budgets) and the vault is read
+    // from it, so the one place the rule is applied also says which rule won, once,
+    // on stderr (the compiled-in fallback is the silent-wrong-tree case).
+    ANNOUNCED.call_once(|| eprintln!("budget: {}", r.report_line()));
+    r.path
 }
 
 /// Make sure the preset vault exists, generating it if it does not, then verify

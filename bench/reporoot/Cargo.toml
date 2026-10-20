@@ -2,8 +2,12 @@
 # bench tier (doclint, budget, vaultgen). Serves NFR-MNT-01, C-06 (tasks #45, #54).
 #
 # No external dependencies, for vaultgen's reason: the generator must build
-# before anything else does. It is a bench crate, so nothing under crates/ may
-# depend on it either (dependency_rule.rs enforces both).
+# before anything else does. That is asserted by
+# crates/serat-core/tests/dependency_rule.rs
+# (`reporoot_and_vaultgen_take_no_external_dependencies`). It is a bench crate, so
+# nothing under crates/ may depend on it either
+# (`nothing_in_the_product_depends_on_a_bench_crate`). The dev-dependency on
+# tempfile is for its own tests only.
 [package]
 name = "reporoot"
 version.workspace = true

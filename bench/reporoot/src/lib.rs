@@ -99,7 +99,7 @@ pub fn resolve_root(
             a.strip_prefix("--root=")
         };
         if let Some(v) = value {
-            if v.is_empty() {
+            if v.is_empty() || v.starts_with("--") {
                 return Err("--root needs a directory".to_string());
             }
             return Ok(Resolved {
@@ -203,6 +203,9 @@ mod tests {
         assert!(resolve_root(&[s("--root")], None, None, c).is_err());
         assert!(resolve_root(&[s("--root=")], None, None, c).is_err());
         assert!(resolve_root(&[s("--root"), s("")], None, None, c).is_err());
+        // A flag swallowed as the value would silently check the wrong tree.
+        assert!(resolve_root(&[s("--root"), s("--profile"), s("ci")], None, None, c).is_err());
+        assert!(resolve_root(&[s("--root=--x")], None, None, c).is_err());
     }
 
     #[test]

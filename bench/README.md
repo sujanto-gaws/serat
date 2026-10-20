@@ -45,7 +45,7 @@ All three are **red today, on purpose**: `serat-index` has no rebuild entry poin
 
 ## Repository root
 
-`budget`, `vaultgen` and `doclint` share one root rule (`bench/reporoot`): `--root <dir>`, else `SERAT_REPO_ROOT`, else the `[workspace]` manifest above the working directory, else the checkout the binary was built in. The doclint bins print `root: <path> (from <rule>)` as their first line, so the last (wrong whenever a binary is reused across worktrees) is never silent. A bare `--root` is an error.
+`budget`, `vaultgen` and `doclint` share one root rule (`bench/reporoot`): `--root <dir>`, else `SERAT_REPO_ROOT`, else the `[workspace]` manifest above the working directory, else the checkout the binary was built in. The doclint bins print `root: <path> (from <rule>)` as their first line, so the last (wrong whenever a binary is reused across worktrees) is never silent. A bare `--root` (or one followed by another flag) is an error. `vaultgen` and `budget` print the same line to stderr; `vaultgen` refuses to write under the compiled-in fallback (pass `--root`, `SERAT_REPO_ROOT` or `--out`). `p1-read-paths` and `p1-tree-path` have their own argument parsers and do **not** take `--root`; they pick the root up from `SERAT_REPO_ROOT` or the working directory only.
 
 ## Serves
 
