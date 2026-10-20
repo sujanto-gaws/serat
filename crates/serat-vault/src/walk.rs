@@ -4,8 +4,9 @@ use std::fs::{self, Metadata};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use serat_core::{NoteKind, SourceEntry, VaultError, VaultPath};
+use serat_core::{NoteKind, Platform, SourceEntry, VaultError, VaultPath};
 
+use crate::refusal::Refusal;
 use crate::{Vault, ignore::is_note_file};
 
 /// Every indexable file under the vault root, sorted by path.
@@ -22,6 +23,8 @@ use crate::{Vault, ignore::is_note_file};
 /// same rule [`Vault::resolve`] enforces for a path that arrives without going through
 /// this walk at all (T-07).
 pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
+    // The refusal log describes the vault as this walk finds it (one entry per file).
+    vault.refusals().clear();
     let mut entries = Vec::new();
     let mut pending = vec![vault.root().to_path_buf()];
 
@@ -72,8 +75,22 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
             // the process — watcher events, arguments, drag-and-drop — which is what
             // its documentation says it is for.
             let path = match relativise_walked(vault, &entry.path()) {
-                Some(path) => path,
-                None => continue,
+                Ok(path) => path,
+                // Task #34's amendment: a name this platform cannot represent as
+                // a `VaultPath` — a reserved Windows device found on a
+                // vault synced in from elsewhere, say — is reported rather than
+                // silently absent from the tree, search and backlinks
+                // (FR-VLT-01, design goal 5). Skipping the entry is still
+                // correct: there is no row to create for a name the current
+                // platform's filesystem could not itself hold.
+                Err(VaultError::InvalidPath { path, reason }) => {
+                    vault.refusals().record(Refusal { path, reason });
+                    continue;
+                }
+                // Anything else (the entry vanished mid-walk, or lies outside a
+                // root this loop could not have produced in the first place) is
+                // not a name refusal, so it is not reported as one.
+                Err(_) => continue,
             };
             entries.push(SourceEntry {
                 kind: if is_note_file(&name) {
@@ -97,9 +114,13 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
 /// Only sound for paths the walk constructed by joining onto `vault.root()`, which is
 /// already canonical, and only after symlinks have been excluded. Anything arriving
 /// from outside the process goes through [`Vault::relativise`], which canonicalises.
-fn relativise_walked(vault: &Vault, path: &Path) -> Option<VaultPath> {
-    let relative = path.strip_prefix(vault.root()).ok()?;
-    VaultPath::new(relative.to_string_lossy()).ok()
+fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath, VaultError> {
+    let relative = path
+        .strip_prefix(vault.root())
+        .map_err(|_| VaultError::PathEscapesVault {
+            path: path.to_string_lossy().into_owned(),
+        })?;
+    crate::vault_path_from_relative(Platform::current(), relative)
 }
 
 /// Modification time in milliseconds since the Unix epoch.
@@ -173,6 +194,76 @@ mod tests {
                 "40-refs/contract.pdf",
                 "README.markdown",
             ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn names_only_windows_would_refuse_are_indexed_on_this_platform() {
+        // Task #34's regression, pinned at the walk level rather than only at
+        // `VaultPath::new`'s: `aux.md`, a colon in a filename and a directory
+        // named with a trailing dot are all ordinary, legal names here, and the
+        // walk must produce a row for each rather than silently dropping it
+        // (FR-VLT-01, design goal 5). code-reviewer-2's probe named the first
+        // and third of these exactly.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write(dir.path(), "aux.md", b"# Aux\n");
+        write(dir.path(), "Meeting 10:30.md", b"# Meeting\n");
+        write(dir.path(), "Misc./n.md", b"# N\n");
+
+        let vault = Vault::open(dir.path()).expect("open");
+        let found: Vec<String> = vault
+            .walk()
+            .expect("walk")
+            .into_iter()
+            .map(|entry| entry.path.to_string())
+            .collect();
+
+        assert_eq!(
+            found,
+            vec!["Meeting 10:30.md", "Misc./n.md", "aux.md"],
+            "a name only illegal on Windows was dropped on this platform"
+        );
+        assert!(
+            vault.refusals().is_empty(),
+            "an ordinary, legal name was reported as refused: {:?}",
+            vault.refusals().snapshot()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_literal_backslash_in_a_real_file_name_is_reported_not_silently_aliased() {
+        // Task #34's amendment, nit (b). A backslash is an ordinary character in
+        // a Unix filename, but `VaultPath::new` also treats it as a separator —
+        // deliberately, for a path a user typed or pasted — so passing an OS
+        // path component straight through would silently re-read one file
+        // `"a\b.md"` as the two-segment path `"a/b.md"`, aliasing a real name to
+        // one nothing on disk actually has. `#[cfg(unix)]` because creating a
+        // file with a literal backslash in its name needs a filesystem that
+        // allows one; Windows cannot have this file to begin with.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = std::ffi::OsStr::from_bytes(b"a\\b.md");
+        fs::write(dir.path().join(path), b"# Odd name\n").expect("write");
+
+        let vault = Vault::open(dir.path()).expect("open");
+        let found = vault.walk().expect("walk");
+
+        assert!(
+            found.is_empty(),
+            "a literal backslash was silently split into a two-segment path: {found:?}"
+        );
+        let refusals = vault.refusals().snapshot();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "the refusal was not reported: {refusals:?}"
+        );
+        assert!(
+            refusals[0].reason.contains('\\'),
+            "the reported reason does not explain the backslash: {refusals:?}"
         );
     }
 
@@ -445,6 +536,6 @@ mod lexical_tests {
         let dir = tempfile::tempdir().expect("temp");
         let vault = Vault::open(dir.path()).expect("open");
         let outside = dir.path().parent().expect("parent").join("elsewhere.md");
-        assert!(relativise_walked(&vault, &outside).is_none());
+        assert!(relativise_walked(&vault, &outside).is_err());
     }
 }

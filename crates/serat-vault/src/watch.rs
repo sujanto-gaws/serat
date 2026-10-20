@@ -218,6 +218,11 @@ fn coalesce(
                             // never learns the new ones. A rescan is the honest answer
                             // and it is the mechanism that already exists.
                             Accepted::Subtree => raise(events, VaultEvent::RescanRequired),
+                            // Task #34's amendment: reported, not dropped
+                            // (FR-VLT-01, design goal 5). No further action —
+                            // there is still no row to create for a name this
+                            // platform's own filesystem could not hold.
+                            Accepted::Refused(refusal) => vault.refusals().record(refusal),
                             Accepted::Ignored => {}
                         }
                     }
@@ -294,6 +299,9 @@ enum Accepted {
     File(VaultPath),
     /// A directory, so an unknown number of files under it changed.
     Subtree,
+    /// A name this platform cannot represent as a `VaultPath` at all — reported
+    /// rather than silently ignored (task #34's amendment).
+    Refused(crate::refusal::Refusal),
     /// Nothing we index.
     Ignored,
 }
@@ -303,8 +311,18 @@ enum Accepted {
 /// Everything the walk skips, the watcher skips, using the same rules — a file the
 /// walk ignores and the watcher accepts would appear on edit and vanish on rebuild.
 fn accept(vault: &Vault, path: &Path) -> Accepted {
-    let Ok(relative) = vault.relativise(path) else {
-        return Accepted::Ignored;
+    let relative = match vault.relativise(path) {
+        Ok(relative) => relative,
+        // A name refusal (task #34's amendment) is reported; anything else —
+        // most commonly a path outside the vault root, which a recursive watch
+        // on the root should not produce but a rename crossing the boundary
+        // still could — is the ordinary "not ours" case and stays silent.
+        Err(err) => {
+            return match crate::refusal::from_invalid_path(&err) {
+                Some(refusal) => Accepted::Refused(refusal),
+                None => Accepted::Ignored,
+            };
+        }
     };
 
     // Any ignored directory anywhere in the path: .serat/index.db must not enqueue
@@ -384,6 +402,57 @@ mod tests {
         assert_eq!(
             queue.drain(),
             vec![VaultPath::new("note.md").expect("path")]
+        );
+        watcher.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_name_is_recorded_not_queued() {
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::write(dir.path().join("a\\b.md"), b"# Odd\n").expect("write");
+
+        assert!(
+            eventually(|| !vault.refusals().is_empty()),
+            "the watcher never recorded the refusal"
+        );
+        assert_eq!(
+            vault.refusals().len(),
+            1,
+            "{:?}",
+            vault.refusals().snapshot()
+        );
+        assert_eq!(queue.depth(), 0, "a refused name was queued");
+        watcher.stop();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_name_only_windows_would_refuse_reaches_the_queue_on_this_platform() {
+        // Task #34's regression, at the watcher rather than only the walk: a
+        // colon in a filename is ordinary here, and the watcher must queue it
+        // rather than silently drop the event (FR-VLT-01, design goal 5).
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::write(dir.path().join("Meeting 10:30.md"), b"# Meeting\n").expect("write");
+
+        assert!(
+            eventually(|| queue.depth() > 0),
+            "the watcher never reported a name only illegal on Windows"
+        );
+        assert_eq!(
+            queue.drain(),
+            vec![VaultPath::new("Meeting 10:30.md").expect("path")]
+        );
+        assert!(
+            vault.refusals().is_empty(),
+            "an ordinary, legal name was reported as refused: {:?}",
+            vault.refusals().snapshot()
         );
         watcher.stop();
     }
