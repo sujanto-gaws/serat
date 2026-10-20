@@ -585,6 +585,28 @@ type Statement<'a> = dyn Fn(&Connection, &dyn Fn()) -> Result<Vec<SearchHit>, ru
 /// (architecture 4.5, task #51).
 const PROGRESS_OPS: i32 = 10_000;
 
+/// The supersession progress handler (a callback, not an SQL function: C-03): stops the
+/// running statement whenever `latest != running`. One construction for `open` and the
+/// bench toggle.
+fn install_handler(
+    conn: &Connection,
+    latest: &Arc<AtomicU64>,
+    running: &Arc<AtomicU64>,
+    #[cfg(test)] calls: &Arc<AtomicU64>,
+) -> Result<(), rusqlite::Error> {
+    let (l, r) = (Arc::clone(latest), Arc::clone(running));
+    #[cfg(test)]
+    let calls = Arc::clone(calls);
+    conn.progress_handler(
+        PROGRESS_OPS,
+        Some(move || {
+            #[cfg(test)]
+            calls.fetch_add(1, Ordering::SeqCst);
+            l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
+        }),
+    )
+}
+
 impl SearchConn {
     /// Open the vault's search connection, read-only, configured like a pool member.
     ///
@@ -619,18 +641,14 @@ impl SearchConn {
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
             .map_err(sqlite)?;
         let running = Arc::new(AtomicU64::new(0));
-        let (l, r) = (Arc::clone(&latest), Arc::clone(&running));
         #[cfg(test)]
         let handler_calls = Arc::new(AtomicU64::new(0));
-        #[cfg(test)]
-        let calls = Arc::clone(&handler_calls);
-        conn.progress_handler(
-            PROGRESS_OPS,
-            Some(move || {
-                #[cfg(test)]
-                calls.fetch_add(1, Ordering::SeqCst);
-                l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
-            }),
+        install_handler(
+            &conn,
+            &latest,
+            &running,
+            #[cfg(test)]
+            &handler_calls,
         )
         .map_err(sqlite)?;
         let interrupt = conn.get_interrupt_handle();
@@ -660,26 +678,23 @@ impl SearchConn {
     ///
     /// For `bench/budget`'s p1-read-paths only: it measures the handler's overhead on
     /// ONE connection, warmed the same way, because comparing two connections measured
-    /// page-cache warmth rather than the handler (task #51). Not part of any caller's
-    /// contract; the application never calls it.
+    /// page-cache warmth rather than the handler (task #51). Behind `test-hooks`
+    /// because `set_progress_handler(false)` silently disables supersession (§4.5);
+    /// the application never enables that feature.
     ///
     /// # Errors
     ///
     /// [`IndexError::Sqlite`].
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_progress_handler(&self, on: bool) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if on {
-            let (l, r) = (Arc::clone(&self.latest), Arc::clone(&self.running));
-            #[cfg(test)]
-            let calls = Arc::clone(&self.handler_calls);
-            conn.progress_handler(
-                PROGRESS_OPS,
-                Some(move || {
-                    #[cfg(test)]
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
-                }),
+            install_handler(
+                &conn,
+                &self.latest,
+                &self.running,
+                #[cfg(test)]
+                &self.handler_calls,
             )
         } else {
             conn.progress_handler(0, None::<fn() -> bool>)
