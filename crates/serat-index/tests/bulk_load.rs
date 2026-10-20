@@ -223,23 +223,38 @@ fn begin_bulk_load_drops_ix_links_unresolved_and_end_bulk_load_restores_it() {
     let writer = actor.handle();
 
     let reader = schema::open(&path).expect("reader");
-    assert!(
-        index_exists(&reader, "ix_links_unresolved"),
-        "a freshly bootstrapped schema should carry ix_links_unresolved"
-    );
+    // ix_links_unresolved, and the four foreign-key child indexes of user_version 7
+    // (architecture §4.4, task #51), which are built once after the load.
+    let names = [
+        "ix_links_unresolved",
+        "ix_links_src_block",
+        "ix_fields_block",
+        "ix_tasks_block",
+        "ix_tasks_note",
+    ];
+    for name in names {
+        assert!(
+            index_exists(&reader, name),
+            "a freshly bootstrapped schema should carry {name}"
+        );
+    }
 
     let dropped = writer.begin_bulk_load().expect("begin");
-    assert!(
-        !index_exists(&reader, "ix_links_unresolved"),
-        "begin_bulk_load left ix_links_unresolved in place; every insert into links \
-         during the load will pay to keep it in step"
-    );
+    for name in names {
+        assert!(
+            !index_exists(&reader, name),
+            "begin_bulk_load left {name} in place; every insert during the load will \
+             pay to keep it in step"
+        );
+    }
 
     writer.end_bulk_load(dropped).expect("end");
-    assert!(
-        index_exists(&reader, "ix_links_unresolved"),
-        "end_bulk_load did not restore ix_links_unresolved"
-    );
+    for name in names {
+        assert!(
+            index_exists(&reader, name),
+            "end_bulk_load did not restore {name}"
+        );
+    }
 
     actor.shutdown().expect("shutdown");
 }
