@@ -73,9 +73,10 @@ const POLICY: &[(&str, &[&str])] = &[
     // stable. Recorded here so that stops being a comment in its manifest and starts
     // being an assertion.
     // Its one internal edge is `reporoot` (task #54), the bench tier's shared "which
-    // checkout am I in" rule; reporoot itself depends on nothing.
-    ("vaultgen", &["reporoot"]),
+    // checkout am I in" rule; reporoot itself depends on nothing, so it is listed first
+    // (the table must stay in dependency order).
     ("reporoot", &[]),
+    ("vaultgen", &["reporoot"]),
     // The budget harness (task B2, NFR-PRF-08) has the opposite need: it cannot
     // measure a rebuild without linking the crates that perform one. That is not a
     // hole in the rule. The rule exists to keep the product graph acyclic, and a
