@@ -18,12 +18,13 @@
 //! exhaustive with no `_` arm, so a new core outcome stops compiling here.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serat_index::read::{HitKind, Reader, SearchConn};
 use serat_index::{index_path, read};
 
-use crate::index::index_dir_for;
+use crate::index::{HandleEpoch, index_dir_for};
 use crate::ipc::{
     Backlink, BlockLocation, IndexRead, IndexState, SearchHit, SearchOutcome, TreeEntryKind,
 };
@@ -32,7 +33,8 @@ use crate::ipc::{
 ///
 /// Opened per call, deliberately: a rebuild replaces the database file, and a cached
 /// connection would keep reading the old inode. Opening read-only is sub-millisecond
-/// and the statements are prepared on first use.
+/// and the statements are prepared on first use. (The search connection is the one
+/// exception, and is replaced by [`SearchSlot`] when the index handle changes.)
 fn open_reader(root: &Path, search: Option<&SearchSlot>) -> Result<Reader, IndexRead<()>> {
     let path = index_path(&index_dir_for(root));
     let fail = |err: serat_core::IndexError| unavailable(&path, &err.to_string());
@@ -43,33 +45,34 @@ fn open_reader(root: &Path, search: Option<&SearchSlot>) -> Result<Reader, Index
     }
 }
 
-/// Identity of the index file: a rebuild replaces it, and a connection opened on the
-/// old one would keep reading the old inode.
-type FileId = (u64, u64);
-
-#[cfg(unix)]
-fn file_id(path: &Path) -> Option<FileId> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(path: &Path) -> Option<FileId> {
-    let created = std::fs::metadata(path).ok()?.created().ok()?;
-    let nanos = created
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some((u64::try_from(nanos).unwrap_or(u64::MAX), 0))
-}
-
 /// The open vault's one search connection (architecture §4.5 obligation 2), created
 /// once and shared by every search of that vault. It is created on the first search
 /// that finds the index `Ready` (the file may not exist when the vault opens) and is
-/// replaced only if a rebuild has replaced the file underneath it.
-#[derive(Default)]
+/// replaced when the app's [`HandleEpoch`] moves, that is when the index actor has
+/// delivered a new handle because the database was rebuilt.
+///
+/// # Identity is the epoch, not the file
+///
+/// File metadata (inode, creation time) is not used: NTFS tunnelling gives a deleted
+/// and recreated `index.db` the old creation time, so it cannot tell the two apart.
+///
+/// # One generation across reopens
+///
+/// The slot owns the generation counter and hands it to every connection it opens, so
+/// a search on a new connection supersedes one still running on the old (§4.5: at most
+/// one in flight), whichever connection each is on.
+///
+/// # Before a runtime rebuild: call [`SearchSlot::close`]
+///
+/// SQLite on Windows opens without delete sharing, so a held-open `index.db` makes the
+/// rebuild's `remove_file` fail (reported as `Corrupt`). Any code that deletes or
+/// replaces the index file while the vault is open **must** call `close()` first.
+/// Nothing does yet (rebuilds happen only in `open_or_rebuild`, before `Ready`); task
+/// #14 adds the first runtime rebuild.
 pub struct SearchSlot {
-    conn: Mutex<Option<(FileId, Arc<SearchConn>)>>,
+    pub(crate) epoch: HandleEpoch,
+    pub(crate) generation: Arc<AtomicU64>,
+    conn: Mutex<Option<(u64, Arc<SearchConn>)>>,
 }
 
 impl std::fmt::Debug for SearchSlot {
@@ -79,21 +82,40 @@ impl std::fmt::Debug for SearchSlot {
 }
 
 impl SearchSlot {
+    /// A slot keyed on `epoch`, which the index actor bumps for each new handle.
+    #[must_use]
+    pub fn new(epoch: HandleEpoch) -> Self {
+        Self {
+            epoch,
+            generation: Arc::new(AtomicU64::new(0)),
+            conn: Mutex::new(None),
+        }
+    }
+
     /// The vault's search connection for the index at `path`. The slot's lock is held
     /// only to clone or replace the `Arc`, never while a search runs.
-    fn get(&self, path: &Path) -> Result<Arc<SearchConn>, serat_core::IndexError> {
-        let id = file_id(path);
+    pub(crate) fn get(&self, path: &Path) -> Result<Arc<SearchConn>, serat_core::IndexError> {
         let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        if let (Some((have, conn)), Some(id)) = (slot.as_ref(), id)
-            && *have == id
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if let Some((have, conn)) = slot.as_ref()
+            && *have == epoch
         {
             return Ok(Arc::clone(conn));
         }
-        let conn = SearchConn::open(path)?;
-        if let Some(id) = id {
-            *slot = Some((id, Arc::clone(&conn)));
-        }
+        let conn = SearchConn::open_with_generation(path, Arc::clone(&self.generation))?;
+        *slot = Some((epoch, Arc::clone(&conn)));
         Ok(conn)
+    }
+
+    /// Supersede any search in flight and drop the connection, releasing the file.
+    ///
+    /// **Required before any runtime rebuild deletes `index.db`** (Windows; see the
+    /// type's documentation). A search still running returns `Superseded` at its next
+    /// progress-handler call and then releases its `Arc`; the next search reopens.
+    pub fn close(&self) {
+        let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *slot = None;
     }
 }
 
@@ -200,26 +222,41 @@ mod tests {
         ));
     }
 
+    fn make_db(db: &Path) {
+        let c = rusqlite::Connection::open(db).expect("db");
+        c.execute_batch("CREATE TABLE t(x);").expect("ddl");
+    }
+
     #[test]
-    fn the_search_slot_reuses_one_connection_until_the_file_is_replaced() {
-        let dir = std::env::temp_dir().join(format!("serat-slot-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let db = dir.join("index.db");
-        let make = || {
-            let c = rusqlite::Connection::open(&db).expect("db");
-            c.execute_batch("CREATE TABLE t(x);").expect("ddl");
-        };
-        make();
-        let slot = SearchSlot::default();
+    fn the_search_slot_reuses_one_connection_until_the_epoch_moves() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join("index.db");
+        make_db(&db);
+        let epoch = HandleEpoch::default();
+        let slot = SearchSlot::new(Arc::clone(&epoch));
         let a = slot.get(&db).expect("a");
         assert!(Arc::ptr_eq(&a, &slot.get(&db).expect("again")));
+        // A replaced file with no new handle is not noticed: identity is the epoch.
         std::fs::remove_file(&db).expect("rm");
-        make();
+        make_db(&db);
+        assert!(Arc::ptr_eq(&a, &slot.get(&db).expect("same epoch")));
+        epoch.fetch_add(1, Ordering::SeqCst);
         let b = slot.get(&db).expect("b");
-        assert!(
-            !Arc::ptr_eq(&a, &b),
-            "a replaced file gets a new connection"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(!Arc::ptr_eq(&a, &b), "a new handle gets a new connection");
+    }
+
+    #[test]
+    fn close_drops_the_connection_and_the_next_get_reopens() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join("index.db");
+        make_db(&db);
+        let slot = SearchSlot::new(HandleEpoch::default());
+        let a = slot.get(&db).expect("a");
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        slot.close();
+        assert!(weak.upgrade().is_none(), "the slot no longer holds it");
+        let b = slot.get(&db).expect("reopened");
+        assert!(weak.upgrade().is_none() && Arc::strong_count(&b) == 2);
     }
 }

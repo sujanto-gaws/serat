@@ -559,11 +559,11 @@ pub struct SearchConn {
     interrupt: InterruptHandle,
     conn: Mutex<Connection>,
     /// Test hook: called after the statement is prepared and bound, before its first step.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     after_prepare: Mutex<Option<TestHook>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 type TestHook = Box<dyn Fn() + Send>;
 
 impl std::fmt::Debug for SearchConn {
@@ -586,6 +586,24 @@ impl SearchConn {
     ///
     /// [`IndexError::Sqlite`] if it cannot be opened.
     pub fn open(db_path: &Path) -> Result<Arc<Self>, IndexError> {
+        Self::open_with_generation(db_path, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As [`SearchConn::open`], with the generation counter supplied by the caller.
+    ///
+    /// The counter is what makes "at most one full-text search in flight" (§4.5) true
+    /// *across* connections: an owner that reopens the connection (the index file was
+    /// replaced) passes the same counter to the new one, so a search on either
+    /// supersedes a search on the other. The owner may also bump it to supersede
+    /// whatever is in flight before it drops the connection.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if it cannot be opened.
+    pub fn open_with_generation(
+        db_path: &Path,
+        latest: Arc<AtomicU64>,
+    ) -> Result<Arc<Self>, IndexError> {
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -594,7 +612,6 @@ impl SearchConn {
         conn.set_prepared_statement_cache_capacity(16);
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
             .map_err(sqlite)?;
-        let latest = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicU64::new(0));
         let (l, r) = (Arc::clone(&latest), Arc::clone(&running));
         conn.progress_handler(
@@ -608,9 +625,19 @@ impl SearchConn {
             running,
             interrupt,
             conn: Mutex::new(conn),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             after_prepare: Mutex::new(None),
         }))
+    }
+
+    /// Install a hook called once a statement is prepared and bound, before its first
+    /// step, so a test can hold a search mid-flight. Not for production use.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_after_prepare(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .after_prepare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// Run one full-text search as the newest. `None` means superseded.
@@ -625,7 +652,7 @@ impl SearchConn {
             }
             self.running.store(own, Ordering::SeqCst);
             let before_step = || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 if let Some(hook) = self
                     .after_prepare
                     .lock()

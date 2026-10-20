@@ -274,11 +274,13 @@ impl AppState {
             }
         });
 
+        let epoch = crate::index::HandleEpoch::default();
         let (index, index_handle) = IndexActor::spawn(
             Arc::clone(&publisher),
             opener,
             root.clone(),
             index_dir_for(&root),
+            Arc::clone(&epoch),
         )
         .map_err(|err| IpcError::Io {
             path: root.display().to_string(),
@@ -333,7 +335,7 @@ impl AppState {
             publisher,
             _index: index,
             index_handle,
-            search: Arc::default(),
+            search: Arc::new(crate::reads::SearchSlot::new(epoch)),
             _walk: walk,
         });
 
@@ -2082,6 +2084,136 @@ mod tests {
             path: "../x.md".into(),
         });
         assert!(matches!(bad, Err(IpcError::PathEscapesVault { .. })));
+    }
+
+    /// Hold the first search on `slot`'s connection after its statement is prepared.
+    /// Returns (signalled when parked, send to release).
+    fn park_first_search(
+        slot: &crate::reads::SearchSlot,
+        path: &Path,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        slot.get(path)
+            .expect("search connection")
+            .set_after_prepare(move || {
+                if first.swap(false, Ordering::SeqCst) {
+                    parked_tx.send(()).expect("parked");
+                    release_rx.lock().expect("lock").recv().expect("release");
+                }
+            });
+        (parked_rx, release_tx)
+    }
+
+    fn zebra(state: &AppState) -> IndexRead<SearchOutcome> {
+        state
+            .search(SearchArgs {
+                query: "zebra".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search")
+    }
+
+    fn is_superseded(r: &IndexRead<SearchOutcome>) -> bool {
+        matches!(
+            r,
+            IndexRead::Ready {
+                value: SearchOutcome::Superseded
+            }
+        )
+    }
+
+    fn is_hit(r: &IndexRead<SearchOutcome>) -> bool {
+        matches!(
+            r,
+            IndexRead::Ready {
+                value: SearchOutcome::Hits { items }
+            } if items.len() == 1
+        )
+    }
+
+    fn wait_generation(slot: &crate::reads::SearchSlot, at_least: u64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while slot.generation.load(std::sync::atomic::Ordering::SeqCst) < at_least {
+            assert!(Instant::now() < deadline, "the search never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// FR-NAV-02, NFR-PRF-02, architecture 4.5. Nothing else fails if `search` stops
+    /// routing through `Reader::with_search`: this does (task #52).
+    #[test]
+    fn a_second_search_supersedes_the_first_and_backlinks_do_not_wait() {
+        let dir = fixture("supersede");
+        std::fs::write(dir.join("alpha.md"), "# Alpha\n\nsee [[beta]]\n").expect("fixture");
+        std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
+        let state = Arc::new(state(&dir));
+        wait_ready(&state);
+        let (root, _, slot) = state.read_context().expect("context");
+        let path = serat_index::index_path(&crate::index::index_dir_for(&root));
+        let (parked, release) = park_first_search(&slot, &path);
+
+        let first = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || zebra(&state))
+        };
+        parked
+            .recv_timeout(Duration::from_secs(30))
+            .expect("A parks");
+
+        // A holds the search lock mid-statement; backlinks use the pool, not that lock.
+        let started = Instant::now();
+        let links = state
+            .backlinks(NotePathArgs {
+                path: "beta.md".into(),
+            })
+            .expect("backlinks");
+        assert!(matches!(links, IndexRead::Ready { .. }), "{links:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "backlinks waited on the search: {:?}",
+            started.elapsed()
+        );
+
+        let second = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || zebra(&state))
+        };
+        // A bumped the generation to 1; B's bump makes it 2. Then A may finish.
+        wait_generation(&slot, 2);
+        release.send(()).expect("release");
+        assert!(is_superseded(&first.join().expect("A")));
+        assert!(is_hit(&second.join().expect("B")));
+    }
+
+    #[test]
+    fn a_search_on_a_reopened_connection_supersedes_one_on_the_old() {
+        let dir = fixture("supersede-reopen");
+        std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
+        let state = Arc::new(state(&dir));
+        wait_ready(&state);
+        let (root, _, slot) = state.read_context().expect("context");
+        let path = serat_index::index_path(&crate::index::index_dir_for(&root));
+        let (parked, release) = park_first_search(&slot, &path);
+
+        let first = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || zebra(&state))
+        };
+        parked
+            .recv_timeout(Duration::from_secs(30))
+            .expect("A parks");
+        // A new handle arrives: the next search is on a different connection.
+        slot.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // B runs on its own connection, so it does not need A released to finish.
+        assert!(is_hit(&zebra(&state)));
+        wait_generation(&slot, 2);
+        release.send(()).expect("release");
+        assert!(is_superseded(&first.join().expect("A")));
     }
 
     #[test]
