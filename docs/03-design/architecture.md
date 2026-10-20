@@ -102,6 +102,8 @@ Concurrency is designed by ownership rather than by locking. Each of the four co
 | Webview      | The main thread. Runs the UI and nothing else.                          | Anything that shares this thread can stall typing.                                                                                          |
 | Index writes | One thread owning the only write connection; work arrives on a channel. | SQLite in WAL permits one writer. Making that explicit removes lock contention from the design entirely — there is nothing to reason about. |
 | Index reads  | A small pool of read-only connections, plus **one search connection per open vault, outside the pool** (§4.5). | WAL readers never block the writer, so views and queries proceed during indexing. Full-text search has its own connection so that a slow or superseded search can be interrupted without holding a pooled connection, and nothing else can be interrupted. |
+| File tree stream | One `TreeSession` per open tree (crates/serat-vault/src/tree.rs *(planned)*, on `task/p1-13-tree-path`, task #13): the model of what was sent, and the sink it is sent to, **behind one `Mutex`**. | A message is emitted while the model is mutated, under the same lock, so mutation order is stream order (ADR-0015). There is no second ordering to reconcile. |
+| Tree rows from the index | `serat_index::tree::read_tree_rows` opens **its own read-only connection, outside the read pool**, runs one fixed `SELECT path, kind FROM notes`, and closes it (task #13). | It runs once per tree open, before the pool needs to exist, and holds nothing afterwards. It is not a pool exception that has to be managed. |
 | Parsing      | **Sequential today**, one file at a time on the rebuild's own thread.   | Parsing is pure and CPU-bound, so a pool remains available the moment a measurement asks for one — see below, and §Open design questions.   |
 | Extraction   | Separate processes, supervised, capped at min(cores−1, 4).              | A security boundary and a fault boundary, both of which a thread cannot provide.                                                            |
 
@@ -111,6 +113,13 @@ Concurrency is designed by ownership rather than by locking. Each of the four co
 - **Poisoning.** The connection is read-only, so a panic while it is held can leave no half-written state. A poisoned lock is recovered with `PoisonError::into_inner`, or the lock is a non-poisoning one. It is never `unwrap`ped into a panic of its own.
 
 `crates/serat-index/src/read.rs`'s module doc says "never a connection behind a mutex", and it must change in the implementation (task #47) to name this one exception.
+
+**The `TreeSession` lock has four rules** (task #13, from its review):
+
+- **The sink takes only leaf locks.** The sink runs under the session lock, so it is a channel send that must not block. It may take a lock that takes no other lock, such as the channel's own. It never takes the session lock (that would be re-entry), and never takes serat-app state.
+- **Progress is lock-free.** `TreeSession::progress()`, which `mark_tree` and the status read, comes from atomics updated beside the model. So a status read never waits behind a stream, and cannot deadlock with the sink. **At `1923a70`, `progress()` takes the session lock, so #13 changes it before it merges.**
+- **A poisoned session is discarded, and the stream restarts.** It is never recovered with `into_inner`, unlike the search connection. The model is mutated before the emit, so after a panic the model may hold an entry the front end never received. A recovered session would then send diffs against a state the front end does not have. So serat-app drops the session, and the front end gets a fresh stream from a new `TreeSession`, as it does on any reopen (ADR-0015).
+- **`read_tree_rows`'s connection is not a pool member.** It is read-only, it has `query_only` and `busy_timeout` set like the pool's, it runs one statement and it is dropped on return. So it adds no lock and nothing to tune.
 
 Why the parse pool is described in the past tense
 
