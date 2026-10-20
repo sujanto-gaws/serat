@@ -34,6 +34,7 @@ fn main() {
             "index_status",
             "mark_first_paint",
             "mark_vault_usable",
+            "refused_names",
         ]),
     ))
     .expect(

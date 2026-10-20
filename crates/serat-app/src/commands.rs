@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::ipc::{
-    FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, VaultOpened,
-    WriteFileArgs,
+    FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, RefusedName,
+    VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -67,6 +67,16 @@ pub fn write_file(
 #[must_use]
 pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
+}
+
+/// `refused_names() -> Vec<RefusedName>`
+///
+/// FR-VLT-01. A read of the refusal log, not a walk; empty with no vault open. Runs
+/// off the main thread (`async`) like every command that touches the vault.
+#[tauri::command(async)]
+#[must_use]
+pub fn refused_names(state: State<'_, Arc<AppState>>) -> Vec<RefusedName> {
+    state.refused_names()
 }
 
 /// The webview has composited its first frame.

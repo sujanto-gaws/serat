@@ -262,6 +262,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::refused_names,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();

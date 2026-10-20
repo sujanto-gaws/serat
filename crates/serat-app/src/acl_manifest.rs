@@ -203,6 +203,7 @@ mod tests {
             "index_status",
             "mark_first_paint",
             "mark_vault_usable",
+            "refused_names",
         ]
         .into_iter()
         .map(str::to_owned)

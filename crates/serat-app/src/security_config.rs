@@ -163,6 +163,7 @@ mod tests {
             "allow-mark-first-paint",
             "allow-mark-vault-usable",
             "allow-read-file",
+            "allow-refused-names",
             "allow-write-file",
             "core:default",
             "opener:allow-open-url",

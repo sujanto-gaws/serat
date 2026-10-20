@@ -33,8 +33,8 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    FileContents, FileWritten, IndexState, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs,
-    VaultOpened, WriteFileArgs,
+    FileContents, FileWritten, IndexState, IndexStatus, IpcError, OpenVaultArgs, REFUSED_NAMES_CAP,
+    ReadFileArgs, RefusedName, VaultOpened, WriteFileArgs,
 };
 use crate::settings::Settings;
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -247,11 +247,16 @@ impl AppState {
             "v{}",
             self.vaults_opened.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let publisher = Arc::new(Publisher::new(
-            vault_id.clone(),
-            Arc::clone(&self.startup),
-            Arc::clone(&self.events),
-        ));
+        let publisher = Arc::new(
+            Publisher::new(
+                vault_id.clone(),
+                Arc::clone(&self.startup),
+                Arc::clone(&self.events),
+            )
+            // FR-VLT-01: a name the walk or the watcher refused is counted into every
+            // status, so "N names not shown" is a fact of the status, not a second poll.
+            .with_refusals(vault.refusals().clone()),
+        );
 
         // §3.4's first `t_usable` precondition: the vault is not usable until the open
         // check has finished and the index state is *known*. The actor tells us by
@@ -281,6 +286,8 @@ impl AppState {
         // changing in the meantime is missed.
         let gate = Arc::clone(&self.startup);
         let startup = Arc::clone(&self.startup);
+        let walked = Arc::clone(&publisher);
+        let walked_refusals = vault.refusals().clone();
         let walk = VaultThread::spawn(
             Arc::clone(&vault),
             move || {
@@ -292,7 +299,16 @@ impl AppState {
                 // lost silently.
                 Stage::WatcherRegistered => startup.mark_watcher(WatcherOutcome::Registered),
                 Stage::WatcherFailed => startup.mark_watcher(WatcherOutcome::Failed),
-                Stage::WalkComplete(entries) => startup.mark_walk_complete(entries),
+                Stage::WalkComplete(entries) => {
+                    startup.mark_walk_complete(entries);
+                    // The walk clears the log and refills it, so the count is final
+                    // here and nothing else announces it (the index state does not
+                    // change when a name is refused). Only when there is something to
+                    // say: an ordinary vault emits nothing extra.
+                    if !walked_refusals.is_empty() {
+                        walked.re_emit();
+                    }
+                }
                 Stage::WalkStarted | Stage::WalkFailed => {}
             },
         )
@@ -457,6 +473,31 @@ impl AppState {
                 refused_names: None,
             },
         }
+    }
+
+    /// `refused_names`. FR-VLT-01, design goal 5.
+    ///
+    /// The list behind `IndexStatus::refused_names`: a read of the open vault's
+    /// refusal log as it stands, ordered by path in byte order (the log is a
+    /// `BTreeMap`), one entry per distinct path, at most [`REFUSED_NAMES_CAP`]. It
+    /// never triggers a walk and never waits. Empty with no vault open. Entries
+    /// leave only at the next walk, which clears the log, so the list may name a file
+    /// that has since been deleted -- it is a report, never a path a command acts on.
+    #[must_use]
+    pub fn refused_names(&self) -> Vec<RefusedName> {
+        let Some(vault) = self.vault().ok() else {
+            return Vec::new();
+        };
+        vault
+            .refusals()
+            .snapshot()
+            .into_iter()
+            .take(REFUSED_NAMES_CAP as usize)
+            .map(|refusal| RefusedName {
+                path: refusal.path,
+                reason: refusal.reason,
+            })
+            .collect()
     }
 
     /// `mark_first_paint`. NFR-PRF-01, NFR-PRF-08 (F-397, task #113).
@@ -1658,5 +1699,101 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- refused names (FR-VLT-01, task #34, contracts/ipc.rs) ---------------------
+
+    #[cfg(unix)]
+    fn write_non_utf8_names(dir: &Path, count: usize) {
+        use std::os::unix::ffi::OsStrExt as _;
+        for i in 0..count {
+            let mut name = format!("caf{i:05}").into_bytes();
+            name.extend_from_slice(b"\xe9.md");
+            std::fs::write(dir.join(std::ffi::OsStr::from_bytes(&name)), b"x").expect("fixture");
+        }
+    }
+
+    #[test]
+    fn refused_names_is_none_with_no_vault_and_counts_from_zero_with_one() {
+        // `None` means "not counting"; it must never be confused with a count of zero,
+        // or the front end shows "0 names not shown" before any vault exists.
+        let bare = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        assert_eq!(bare.index_status().refused_names, None);
+        assert!(bare.refused_names().is_empty());
+
+        let dir = fixture("refused-zero");
+        let state = state(&dir);
+        assert_eq!(state.index_status().refused_names, Some(0));
+        assert!(state.refused_names().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_status_count_and_the_list_come_from_the_same_refusal_log() {
+        let dir = fixture("refused-some");
+        write_non_utf8_names(&dir, 3);
+        let state = state(&dir);
+        // The vault thread walks after the first paint; drive the walk directly so the
+        // test does not wait on that gate.
+        state.vault().expect("open").walk().expect("walk");
+
+        let status = state.index_status();
+        let list = state.refused_names();
+        assert_eq!(status.refused_names, Some(3), "{status:?}");
+        assert_eq!(list.len(), 3, "{list:?}");
+        let paths: Vec<&str> = list.iter().map(|r| r.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "the list is ordered by path in byte order");
+        assert!(list.iter().all(|r| !r.reason.is_empty()), "{list:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_count_and_the_list_saturate_at_the_cap_and_agree() {
+        // `RefusalLog::len()` is the number of distinct stored paths; `overflowed()`
+        // counts events past the cap and is deliberately not added. 1005 refused
+        // names must read as exactly REFUSED_NAMES_CAP in both places.
+        let dir = fixture("refused-cap");
+        write_non_utf8_names(&dir, REFUSED_NAMES_CAP as usize + 5);
+        let state = state(&dir);
+        let vault = state.vault().expect("open");
+        vault.walk().expect("walk");
+        assert!(
+            vault.refusals().overflowed() >= 5,
+            "the fixture did not overflow the log"
+        );
+
+        assert_eq!(state.index_status().refused_names, Some(REFUSED_NAMES_CAP));
+        assert_eq!(state.refused_names().len(), REFUSED_NAMES_CAP as usize);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_refused_file_leaves_the_list_only_at_the_next_walk() {
+        // The contract states this limit rather than hiding it: the list is a report,
+        // so it may name a file that is already gone until the walk clears the log.
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = fixture("refused-stale");
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"gone\xe9.md"));
+        std::fs::write(&odd, b"x").expect("fixture");
+        let state = state(&dir);
+        let vault = state.vault().expect("open");
+        vault.walk().expect("walk");
+        assert_eq!(state.refused_names().len(), 1);
+
+        std::fs::remove_file(&odd).expect("rm");
+        assert_eq!(
+            state.refused_names().len(),
+            1,
+            "the list is not re-walked by a read"
+        );
+        vault.walk().expect("walk");
+        assert!(state.refused_names().is_empty());
+        assert_eq!(state.index_status().refused_names, Some(0));
     }
 }

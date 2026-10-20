@@ -10,6 +10,7 @@
     "allow-index-status",
     "allow-mark-first-paint",
     "allow-mark-vault-usable",
+    "allow-refused-names",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
