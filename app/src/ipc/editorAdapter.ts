@@ -15,13 +15,20 @@
 // own without any module-level mocking.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { ExternalChange } from "./generated/ExternalChange";
+import type { FileContents } from "./generated/FileContents";
 import type { FileWritten } from "./generated/FileWritten";
 import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
 import type { Patch } from "./generated/Patch";
+import type { ReadFileArgs } from "./generated/ReadFileArgs";
 import type { RebaseBufferArgs } from "./generated/RebaseBufferArgs";
 import type { SavePatchArgs } from "./generated/SavePatchArgs";
+import type { WriteFileArgs } from "./generated/WriteFileArgs";
+
+/** Event `note://external-change` (contracts/ipc.rs). Not throttled, not ordered against responses. */
+export const EXTERNAL_CHANGE_EVENT = "note://external-change";
 
 export interface EditorIpcAdapter {
   /** `note_opened(args) -> Result<(), IpcError>` (ADR-0016 §3). */
@@ -34,6 +41,12 @@ export interface EditorIpcAdapter {
   requestExternalDiff(args: NoteBufferArgs): Promise<ExternalChange | null>;
   /** `rebase_buffer(args) -> Result<Patch[], IpcError>` (ADR-0016 §4, *Keep mine*). */
   rebaseBuffer(args: RebaseBufferArgs): Promise<Patch[]>;
+  /** `read_file` — only for reconciliation when no edit script is available (ADR-0016 §2, `StaleHash` without a diff). */
+  readFile(args: ReadFileArgs): Promise<FileContents>;
+  /** `write_file` — recreating a note deleted on disk (`base_hash: null`); never used for an existing file's save. */
+  writeFile(args: WriteFileArgs): Promise<FileWritten>;
+  /** Subscribes to `note://external-change`. */
+  onExternalChange(handler: (change: ExternalChange) => void): Promise<UnlistenFn>;
 }
 
 /** The real adapter: one `invoke` per method, command names matching
@@ -54,5 +67,14 @@ export const defaultEditorIpc: EditorIpcAdapter = {
   },
   rebaseBuffer(args) {
     return invoke("rebase_buffer", { args });
+  },
+  readFile(args) {
+    return invoke("read_file", { args });
+  },
+  writeFile(args) {
+    return invoke("write_file", { args });
+  },
+  onExternalChange(handler) {
+    return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
   },
 };

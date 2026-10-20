@@ -11,7 +11,7 @@
 //   - `write_file` is never called for an existing note; only `save_patch`.
 //
 // External-change reconciliation (§3/§4) and *Keep mine*/`rebase_buffer`
-// are task #23's — this module exposes the hooks they need (`applyExternal`,
+// are reconciled by `reconcile.ts` and the component glue; this module holds the state (`adoptExternal`,
 // `rebaseOnto`) without implementing the conflict UI, so #23 does not have
 // to redesign the buffer to get them.
 
@@ -218,6 +218,36 @@ export class EditorBuffer {
    */
   applyExternal(diskText: string, diskHash: string): void {
     this.rebaseOnto(diskText, diskHash, null);
+  }
+
+  /**
+   * ADR-0016 §4 outcomes 1 and 2 (and the `edits = []` case): the external
+   * edit script `external` (base coordinates) has been applied to the live
+   * document. The base becomes the disk version (`external` applied to the
+   * old base, `newHash`); `rebasedLocal` is the unsaved work re-expressed on
+   * that new base, or null when there is none. Clears the stale block.
+   */
+  adoptExternal(external: ChangeSet, newHash: string, rebasedLocal: ChangeSet | null): void {
+    this.baseTextValue = external.apply(this.baseTextValue);
+    this.baseHashValue = newHash;
+    this.pending = rebasedLocal && !rebasedLocal.empty ? [rebasedLocal] : [];
+    this.staleError = null;
+    this.refusedError = null;
+  }
+
+  /** True while a save (including a coalesced follow-up) is in flight. */
+  get isSaving(): boolean {
+    return this.saving;
+  }
+
+  /** Resolves when no save is in flight. */
+  async settled(): Promise<void> {
+    while (this.inflight) await this.inflight;
+  }
+
+  /** Disk equals the base again after a `StaleHash`: the divergence is gone. */
+  clearStale(): void {
+    this.staleError = null;
   }
 
   /**

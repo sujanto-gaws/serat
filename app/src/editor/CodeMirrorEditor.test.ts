@@ -25,6 +25,9 @@ function mockIpc(savePatch = vi.fn()): EditorIpcAdapter {
     savePatch,
     requestExternalDiff: vi.fn().mockResolvedValue(null),
     rebaseBuffer: vi.fn().mockResolvedValue([]),
+    readFile: vi.fn(),
+    writeFile: vi.fn(),
+    onExternalChange: vi.fn().mockResolvedValue(() => undefined),
   };
 }
 

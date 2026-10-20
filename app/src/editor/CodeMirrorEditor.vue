@@ -28,8 +28,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { redo, undo } from "@codemirror/commands";
-import { Compartment, EditorState, type Extension } from "@codemirror/state";
+import { isolateHistory, redo, undo } from "@codemirror/commands";
+import { ChangeSet, Compartment, EditorState, type Extension, Transaction } from "@codemirror/state";
 import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
 
 import { buildEditorExtensions, createEditorCommandRegistry } from "@/editor/codemirrorSetup";
@@ -37,6 +37,9 @@ import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
 import { seratMarkdown } from "@/editor/markdownLanguage";
 import Preview from "@/editor/Preview.vue";
 import { blockWidgetsExtension } from "@/editor/blockWidgets";
+import { minimalReplacement, patchesToChangeSet, planExternal, externalChangeSet } from "@/editor/reconcile";
+import { textFromString } from "@/editor/patches";
+import type { ExternalChange } from "@/ipc/generated/ExternalChange";
 import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
 import { refreshLinks } from "@/editor/linkState";
@@ -72,6 +75,8 @@ const emit = defineEmits<{
   "external-link-click": [url: string];
   /** Follow-link command (FR-EDT-03): the host navigates. `path` is null when unresolved (offer to create). */
   "follow-link": [target: FollowLinkTarget];
+  /** *Compare* on an external-change conflict: the host opens a diff of the two texts. */
+  "compare-external": [payload: { path: string; mine: string; disk: string }];
 }>();
 
 const host = ref<HTMLDivElement | null>(null);
@@ -100,10 +105,260 @@ function markDirty(): void {
 
 async function performSave(explicit = false): Promise<SaveOutcome | null> {
   if (!buffer) return null;
-  const outcome = await buffer.save(props.ipc, { explicit });
+  if (deleted.value) {
+    // The note was deleted on disk (ADR-0016 §4): only the save command
+    // recreates it, never an idle or blur trigger.
+    return explicit ? recreateDeletedNote() : null;
+  }
+  const started = buffer;
+  const outcome = await started.save(props.ipc, { explicit });
   markDirty();
   emit("save-outcome", outcome);
+  // ADR-0016 §2: a StaleHash always asks for the diff right away; it does not
+  // wait for an event that may already have been dropped.
+  if (outcome.kind === "stale" && started === buffer && errorKind(outcome.error) === "stale_hash") {
+    void requestFreshDiff(started);
+  }
   return outcome;
+}
+
+function errorKind(error: unknown): string | null {
+  return typeof error === "object" && error !== null ? ((error as { kind?: string }).kind ?? null) : null;
+}
+
+// ---------------------------------------------------------------------------
+// External-change reconciliation (ADR-0016 §2-§4, FR-VLT-05, NFR-REL-01, C-04)
+// ---------------------------------------------------------------------------
+
+interface ExternalConflict {
+  /** The edit script, when one exists (null after a StaleHash with no diff). */
+  change: Extract<ExternalChange, { kind: "changed" }> | null;
+  /** The disk hash the conflict was found at. */
+  newHash: string;
+}
+
+const conflict = ref<ExternalConflict | null>(null);
+const deleted = ref(false);
+const notice = ref<string | null>(null);
+/** `ExternalChange`s that arrived while a save was in flight (§2: held, not applied). */
+let held: Array<Extract<ExternalChange, { kind: "changed" }>> = [];
+let draining = false;
+
+/** Dispatches reconciled changes into the live document: marked
+ * `addToHistory(false)` so the cursor and undo history map through them and
+ * undo never reverts someone else's edit, and never recorded as a local edit. */
+function dispatchExternal(changes: ChangeSet): void {
+  if (!view || changes.empty) return;
+  suppressChangeTracking = true;
+  try {
+    view.dispatch({ changes, annotations: Transaction.addToHistory.of(false) });
+  } finally {
+    suppressChangeTracking = false;
+  }
+}
+
+async function onExternalChange(change: ExternalChange): Promise<void> {
+  const b = buffer;
+  if (!b || change.path !== b.path) return;
+  if (change.kind === "deleted") {
+    deleted.value = true;
+    notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
+    return;
+  }
+  if (b.isSaving) {
+    held.push(change);
+    if (!draining) void drainHeld(b);
+    return;
+  }
+  await handleChange(b, change);
+}
+
+async function drainHeld(b: EditorBuffer): Promise<void> {
+  draining = true;
+  try {
+    await b.settled();
+    const queue = held;
+    held = [];
+    if (b !== buffer) return;
+    for (const change of queue) await handleChange(b, change);
+  } finally {
+    draining = false;
+  }
+}
+
+async function handleChange(b: EditorBuffer, change: Extract<ExternalChange, { kind: "changed" }>): Promise<void> {
+  if (b !== buffer) return;
+  // Only a change expressed against the current base is applied; anything else
+  // is dropped and a fresh diff is requested (§2).
+  if (change.base_hash !== b.baseHash) {
+    await requestFreshDiff(b);
+    return;
+  }
+  applyChange(b, change);
+}
+
+async function requestFreshDiff(b: EditorBuffer): Promise<void> {
+  let answer: ExternalChange | null;
+  try {
+    answer = await props.ipc.requestExternalDiff({ path: b.path, base_hash: b.baseHash });
+  } catch (error) {
+    if (b !== buffer) return;
+    if (errorKind(error) === "stale_hash") {
+      // serat-app no longer holds the base bytes: no guess, conflict path (§2).
+      conflict.value = { change: null, newHash: (error as { current_hash: string }).current_hash };
+    }
+    return;
+  }
+  if (b !== buffer) return;
+  if (answer === null) {
+    b.clearStale(); // disk equals the base: nothing diverged after all
+    return;
+  }
+  if (answer.kind === "deleted") {
+    deleted.value = true;
+    notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
+    return;
+  }
+  // Computed against the base we just sent, so it must match; if it somehow
+  // does not, do not loop: treat as an unmergeable conflict.
+  if (answer.base_hash !== b.baseHash) {
+    conflict.value = { change: null, newHash: answer.new_hash };
+    return;
+  }
+  applyChange(b, answer);
+}
+
+function applyChange(b: EditorBuffer, change: Extract<ExternalChange, { kind: "changed" }>): void {
+  let external;
+  try {
+    external = externalChangeSet(b.baseText, change.edits);
+  } catch {
+    conflict.value = { change: null, newHash: change.new_hash }; // unusable positions: no merge on guessed coordinates
+    return;
+  }
+  const local = b.isDirty ? b.composedPending() : null;
+  const plan = planExternal(external, local);
+  switch (plan.kind) {
+    case "hash-only":
+      // edits = [] with a new hash (e.g. CRLF<->LF flip): the base Text already
+      // equals disk in the line model; only the hash moves, silently.
+      b.adoptExternal(external, change.new_hash, local);
+      break;
+    case "apply-clean":
+      dispatchExternal(plan.external);
+      b.adoptExternal(plan.external, change.new_hash, null);
+      break;
+    case "apply-rebased":
+      dispatchExternal(plan.externalOnDoc);
+      b.adoptExternal(plan.external, change.new_hash, plan.localRebased);
+      break;
+    case "conflict":
+      conflict.value = { change, newHash: change.new_hash };
+      notice.value = null;
+      return;
+  }
+  conflict.value = null;
+  markDirty();
+  if (b.isDirty) scheduleAutosave();
+}
+
+/** The disk text behind a conflict: derived from the edit script when there is
+ * one, else read (and verified) from disk. */
+async function diskTextFor(b: EditorBuffer, c: ExternalConflict): Promise<{ text: string; hash: string } | null> {
+  if (c.change) {
+    try {
+      return { text: externalChangeSet(b.baseText, c.change.edits).apply(b.baseText).toString(), hash: c.newHash };
+    } catch {
+      /* fall through to a read */
+    }
+  }
+  const file = await props.ipc.readFile({ path: b.path });
+  if (file.hash !== c.newHash) {
+    // The disk moved again while the notice was up: ask for a fresh diff.
+    conflict.value = null;
+    await requestFreshDiff(b);
+    return null;
+  }
+  return { text: file.text, hash: file.hash };
+}
+
+/** *Keep mine* (§4): re-base the buffer onto the disk version. The edit script
+ * from disk to the buffer is computed in Rust by `rebase_buffer`; adopting the
+ * disk hash over the old-base ChangeSet would corrupt the file. */
+async function keepMine(): Promise<void> {
+  const b = buffer;
+  const c = conflict.value;
+  if (!b || !c || !view) return;
+  const disk = await diskTextFor(b, c);
+  if (!disk || b !== buffer) return;
+  let patches;
+  try {
+    patches = await props.ipc.rebaseBuffer({ path: b.path, disk_hash: disk.hash, buffer: view.state.doc.toString() });
+  } catch (error) {
+    if (errorKind(error) === "stale_hash") {
+      conflict.value = null;
+      await requestFreshDiff(b);
+    }
+    return;
+  }
+  b.rebaseOnto(disk.text, disk.hash, patchesToChangeSet(textFromString(disk.text), patches));
+  conflict.value = null;
+  markDirty();
+  if (b.isDirty) scheduleAutosave();
+}
+
+/** *Take theirs* (§4): replace the buffer in one history-recorded transaction,
+ * so undo brings back what was typed. Trimmed to the changed middle so a cursor
+ * outside it stays put. */
+async function takeTheirs(): Promise<void> {
+  const b = buffer;
+  const c = conflict.value;
+  if (!b || !c || !view) return;
+  const disk = await diskTextFor(b, c);
+  if (!disk || b !== buffer || !view) return;
+  const replacement = minimalReplacement(view.state.doc.toString(), textFromString(disk.text).toString());
+  suppressChangeTracking = true;
+  try {
+    // History-recorded on purpose, and isolated so one undo reverts exactly this step.
+    view.dispatch({ changes: replacement, annotations: isolateHistory.of("full") });
+  } finally {
+    suppressChangeTracking = false;
+  }
+  b.rebaseOnto(disk.text, disk.hash, null);
+  conflict.value = null;
+  markDirty();
+}
+
+/** *Compare*: hands both texts to the host; nothing is changed or discarded. */
+async function compareExternal(): Promise<void> {
+  const b = buffer;
+  const c = conflict.value;
+  if (!b || !c || !view) return;
+  const disk = await diskTextFor(b, c);
+  if (!disk) return;
+  emit("compare-external", { path: b.path, mine: view.state.doc.toString(), disk: disk.text });
+}
+
+/** ADR-0016 §4: a note deleted on disk keeps its buffer; the save command then
+ * recreates it through `write_file` with `base_hash: null`. */
+async function recreateDeletedNote(): Promise<SaveOutcome | null> {
+  const b = buffer;
+  if (!b || !view) return null;
+  const text = view.state.doc.toString();
+  try {
+    const written = await props.ipc.writeFile({ path: b.path, text, base_hash: null });
+    b.rebaseOnto(text, written.hash, null);
+    deleted.value = false;
+    notice.value = null;
+    markDirty();
+    const outcome: SaveOutcome = { kind: "saved", written };
+    emit("save-outcome", outcome);
+    return outcome;
+  } catch (error) {
+    const outcome: SaveOutcome = { kind: "rejected", error };
+    emit("save-outcome", outcome);
+    return outcome;
+  }
 }
 
 function scheduleAutosave(): void {
@@ -115,6 +370,7 @@ function scheduleAutosave(): void {
 
 const resolver = new LinkResolver(props.linkIpc);
 let unlistenIndexChanged: (() => void) | null = null;
+let unlistenExternal: (() => void) | null = null;
 
 export interface FollowLinkTarget {
   /** As written, minus brackets and `|display`. */
@@ -224,6 +480,15 @@ onMounted(() => {
     .catch(() => {
       /* no event channel (tests, early boot): links resolve on the next scan only */
     });
+  props.ipc
+    .onExternalChange((change) => void onExternalChange(change))
+    .then((unlisten) => {
+      if (view) unlistenExternal = unlisten;
+      else unlisten();
+    })
+    .catch(() => {
+      /* no event channel (tests, early boot): StaleHash still requests the diff */
+    });
   view = new EditorView({
     parent: shadowRoot,
     state: EditorState.create({
@@ -236,6 +501,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   unlistenIndexChanged?.();
   unlistenIndexChanged = null;
+  unlistenExternal?.();
+  unlistenExternal = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
   view?.destroy();
@@ -294,10 +561,18 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
     markDirty();
     if (token !== loadToken || !view) return false;
     if (!clean) return false;
+    void props.ipc.noteClosed({ path: old.path, base_hash: old.baseHash }).catch(() => undefined);
   }
   buffer = new EditorBuffer(path, text, baseHash);
+  held = [];
+  conflict.value = null;
+  deleted.value = false;
+  notice.value = null;
   replaceState(text);
   markDirty();
+  // Tells serat-app this pane holds the note at this base, so it emits
+  // `note://external-change` for it (ADR-0016 §3).
+  void props.ipc.noteOpened({ path, base_hash: baseHash }).catch(() => undefined);
   return true;
 }
 
@@ -334,6 +609,7 @@ defineExpose({
   loadNote,
   triggerSave,
   isDirty,
+  conflict,
   undo: () => view && undo(view),
   redo: () => view && redo(view),
 });
@@ -342,6 +618,13 @@ defineExpose({
 <template>
   <div class="serat-editor-surface" data-testid="serat-editor">
     <div ref="host" class="cm-editor-host"></div>
+    <div v-if="conflict" class="serat-external-notice" role="status" data-testid="external-conflict">
+      <span>This note changed on disk and your unsaved edits overlap the change. Nothing has been discarded.</span>
+      <button type="button" data-testid="keep-mine" @click="keepMine">Keep mine</button>
+      <button type="button" data-testid="take-theirs" @click="takeTheirs">Take theirs</button>
+      <button type="button" data-testid="compare" @click="compareExternal">Compare</button>
+    </div>
+    <div v-else-if="notice" class="serat-external-notice" role="status" data-testid="external-notice">{{ notice }}</div>
     <Preview
       v-if="!livePreview"
       class="serat-editor-split-preview"
@@ -353,7 +636,21 @@ defineExpose({
 </template>
 
 <style scoped>
+.serat-external-notice {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  gap: 0.5em;
+  align-items: center;
+  padding: 4px 10px;
+  border: 1px solid var(--serat-border-hairline, #ddd);
+  background: var(--serat-surface-raised, #fff);
+  font-size: 0.9em;
+}
 .serat-editor-surface {
+  position: relative;
   display: flex;
   height: 100%;
   width: 100%;
