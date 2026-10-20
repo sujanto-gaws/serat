@@ -93,7 +93,7 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 
 -- ============================================================================
 -- Tables
@@ -415,6 +415,19 @@ CREATE INDEX ix_links_unresolved ON links(dst_fold)
 -- done = 0, which is the only side anyone queries: a vault accumulates done
 -- tasks forever and never reads them in bulk.
 CREATE INDEX ix_tasks_open ON tasks(due, note_id) WHERE done = 0;
+
+-- Foreign-key child columns (user_version 7, task #51; architecture §4.4 ruling on
+-- #47). No query reads these. With foreign_keys = ON, deleting a note cascades to its
+-- blocks and SQLite then looks up every child row of each deleted block; with no
+-- index on the child column each lookup is a full scan (a 679-in-degree note's save
+-- took 924 ms p95 against NFR-PRF-03's 50 ms). The two on nullable columns are
+-- partial: `child = ?` implies IS NOT NULL, and a NULL child references nothing.
+-- serat-index's writer drops and recreates all four around a bulk load, like
+-- ix_links_unresolved, so a rebuild sorts them once instead of maintaining them.
+CREATE INDEX ix_links_src_block ON links(src_block) WHERE src_block IS NOT NULL;
+CREATE INDEX ix_fields_block ON fields(block_id) WHERE block_id IS NOT NULL;
+CREATE INDEX ix_tasks_block ON tasks(block_id);
+CREATE INDEX ix_tasks_note ON tasks(note_id);
 
 -- ============================================================================
 -- Full-text search (FR-NAV-02 for note bodies; FR-NAV-08 for extracted binary content)
