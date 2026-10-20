@@ -160,6 +160,9 @@ mod tests {
         permissions.sort();
         let mut expected: Vec<String> = vec![
             "allow-backlinks",
+            "allow-get-ui-settings",
+            "allow-set-keybinding",
+            "allow-set-live-preview",
             "allow-create-folder",
             "allow-index-status",
             "allow-mark-first-paint",

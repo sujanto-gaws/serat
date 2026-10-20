@@ -34,10 +34,11 @@ use crate::index::{
 };
 use crate::ipc::{
     Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexState,
-    IndexStatus, IpcError, NotePathArgs, OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs,
-    RefusedName, SearchArgs, SearchOutcome, VaultOpened, WriteFileArgs,
+    IndexStatus, IpcError, KeybindingChange, KeybindingOverride, NotePathArgs, OpenVaultArgs,
+    REFUSED_NAMES_CAP, ReadFileArgs, RefusedName, SearchArgs, SearchOutcome, SetKeybindingArgs,
+    SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
 };
-use crate::settings::Settings;
+use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
 use crate::vault::{Stage, VaultThread};
 
@@ -474,6 +475,104 @@ impl AppState {
                 refused_names: None,
             },
         }
+    }
+
+    /// `get_ui_settings`. FR-PLT-05. The front end's slice of the settings file.
+    #[must_use]
+    pub fn get_ui_settings(&self) -> UiSettings {
+        let settings = self.lock_settings();
+        UiSettings {
+            live_preview: settings.editor.live_preview,
+            keybindings: settings
+                .keybindings
+                .iter()
+                .map(|(command_id, key)| KeybindingOverride {
+                    command_id: command_id.clone(),
+                    key: (!key.is_empty()).then(|| key.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// `set_live_preview`. FR-EDT-10, FR-PLT-05.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] if the settings file cannot be written; nothing changes then.
+    pub fn set_live_preview(&self, args: SetLivePreviewArgs) -> Result<(), IpcError> {
+        self.update_settings(|settings| {
+            settings.editor.live_preview = args.enabled;
+            Ok(())
+        })
+    }
+
+    /// `set_keybinding`. FR-PLT-05.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] for an empty, over-long or control-character id or key (a client
+    /// bug; the contract has no closer variant), or if the file cannot be written.
+    pub fn set_keybinding(&self, args: SetKeybindingArgs) -> Result<(), IpcError> {
+        let bad = |what: &str| IpcError::Io {
+            path: args.command_id.chars().take(MAX_BINDING_TEXT).collect(),
+            message: format!("{what} is not acceptable"),
+        };
+        let valid = |text: &str| {
+            !text.is_empty()
+                && text.chars().count() <= MAX_BINDING_TEXT
+                && !text.chars().any(char::is_control)
+        };
+        if !valid(&args.command_id) || args.command_id.chars().any(char::is_whitespace) {
+            return Err(bad("the command id"));
+        }
+        if let KeybindingChange::Set { key } = &args.change
+            && !valid(key)
+        {
+            return Err(bad("the key"));
+        }
+        self.update_settings(|settings| {
+            match &args.change {
+                KeybindingChange::Set { key } => {
+                    settings
+                        .keybindings
+                        .insert(args.command_id.clone(), key.clone());
+                }
+                KeybindingChange::Unbind => {
+                    settings
+                        .keybindings
+                        .insert(args.command_id.clone(), String::new());
+                }
+                KeybindingChange::Reset => {
+                    settings.keybindings.remove(&args.command_id);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Apply `change` to a copy, write it, and only then keep it: a failed write leaves
+    /// memory and file agreeing on the old value.
+    fn update_settings(
+        &self,
+        change: impl FnOnce(&mut Settings) -> Result<(), IpcError>,
+    ) -> Result<(), IpcError> {
+        let mut guard = self.lock_settings();
+        let mut next = guard.clone();
+        change(&mut next)?;
+        if let Some(path) = &self.settings_path {
+            next.save_to(path).map_err(|message| IpcError::Io {
+                path: path.display().to_string(),
+                message,
+            })?;
+        }
+        *guard = next;
+        Ok(())
+    }
+
+    fn lock_settings(&self) -> std::sync::MutexGuard<'_, Settings> {
+        self.settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than
@@ -1981,5 +2080,119 @@ mod tests {
             ),
             "{answer:?}"
         );
+    }
+
+    // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
+
+    fn settings_state(name: &str) -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.toml");
+        let mut state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        state.settings_path = Some(path.clone());
+        (state, path)
+    }
+
+    #[test]
+    fn ui_settings_default_to_live_preview_and_no_overrides() {
+        let (state, _) = settings_state("defaults");
+        let ui = state.get_ui_settings();
+        assert!(ui.live_preview);
+        assert!(ui.keybindings.is_empty());
+    }
+
+    #[test]
+    fn live_preview_and_keybindings_persist_through_the_toml_file() {
+        let (state, path) = settings_state("persist");
+        state
+            .set_live_preview(SetLivePreviewArgs { enabled: false })
+            .expect("set");
+        for (id, change) in [
+            (
+                "editor.toggle-bold",
+                KeybindingChange::Set {
+                    key: "Mod-b".into(),
+                },
+            ),
+            ("editor.toggle-italic", KeybindingChange::Unbind),
+            (
+                "editor.toggle-code",
+                KeybindingChange::Set {
+                    key: "Mod-e".into(),
+                },
+            ),
+            ("editor.toggle-code", KeybindingChange::Reset),
+        ] {
+            state
+                .set_keybinding(SetKeybindingArgs {
+                    command_id: id.into(),
+                    change,
+                })
+                .expect("set");
+        }
+
+        // A fresh process reads the same answer from the file.
+        let reloaded = Settings::load_from(&path);
+        assert!(reloaded.problem.is_none(), "{:?}", reloaded.problem);
+        let fresh = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            reloaded.settings,
+        );
+        let ui = fresh.get_ui_settings();
+        assert!(!ui.live_preview);
+        let by_id: Vec<(&str, Option<&str>)> = ui
+            .keybindings
+            .iter()
+            .map(|k| (k.command_id.as_str(), k.key.as_deref()))
+            .collect();
+        assert_eq!(
+            by_id,
+            vec![
+                ("editor.toggle-bold", Some("Mod-b")),
+                ("editor.toggle-italic", None),
+            ],
+            "unbound is Some-less None, and a reset leaves no entry"
+        );
+    }
+
+    #[test]
+    fn nonsense_bindings_are_refused_and_change_nothing() {
+        let (state, path) = settings_state("nonsense");
+        for (id, change) in [
+            ("", KeybindingChange::Unbind),
+            ("has space", KeybindingChange::Unbind),
+            ("ok.id", KeybindingChange::Set { key: String::new() }),
+            ("ok.id", KeybindingChange::Set { key: "a\nb".into() }),
+            ("x".repeat(500).leak(), KeybindingChange::Unbind),
+        ] {
+            let err = state
+                .set_keybinding(SetKeybindingArgs {
+                    command_id: id.into(),
+                    change,
+                })
+                .expect_err("refused");
+            assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        }
+        assert!(state.get_ui_settings().keybindings.is_empty());
+        assert!(!path.exists(), "a refused change wrote the file");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_value_in_memory() {
+        let (mut state, path) = settings_state("unwritable");
+        // A file where the directory should be makes the write fail.
+        std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap(), b"not a dir").unwrap();
+        state.settings_path = Some(path);
+        let err = state
+            .set_live_preview(SetLivePreviewArgs { enabled: false })
+            .expect_err("unwritable");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        assert!(state.get_ui_settings().live_preview);
     }
 }

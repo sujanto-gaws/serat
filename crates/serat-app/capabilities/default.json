@@ -12,6 +12,9 @@
     "allow-mark-vault-usable",
     "allow-refused-names",
     "allow-create-folder",
+    "allow-get-ui-settings",
+    "allow-set-live-preview",
+    "allow-set-keybinding",
     "allow-search",
     "allow-backlinks",
     {

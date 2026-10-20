@@ -17,7 +17,7 @@ use tauri::State;
 use crate::ipc::{
     Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexStatus,
     IpcError, NotePathArgs, OpenVaultArgs, ReadFileArgs, RefusedName, SearchArgs, SearchOutcome,
-    VaultOpened, WriteFileArgs,
+    SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -70,19 +70,61 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
 }
 
-/// `search(args) -> Result<IndexRead<SearchOutcome>, IpcError>`
-///
-/// Off the main thread; never waits for the index.
+/// `get_ui_settings() -> UiSettings`
+#[tauri::command(async)]
+#[must_use]
+pub fn get_ui_settings(state: State<'_, Arc<AppState>>) -> UiSettings {
+    state.get_ui_settings()
+}
+
+/// `set_live_preview(args) -> Result<(), IpcError>`
 ///
 /// # Errors
 ///
-/// As [`AppState::search`].
+/// As [`AppState::set_live_preview`].
 #[tauri::command(async)]
-pub fn search(
+pub fn set_live_preview(
+    state: State<'_, Arc<AppState>>,
+    args: SetLivePreviewArgs,
+) -> Result<(), IpcError> {
+    state.set_live_preview(args)
+}
+
+/// `set_keybinding(args) -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::set_keybinding`].
+#[tauri::command(async)]
+pub fn set_keybinding(
+    state: State<'_, Arc<AppState>>,
+    args: SetKeybindingArgs,
+) -> Result<(), IpcError> {
+    state.set_keybinding(args)
+}
+
+/// `search(args) -> Result<IndexRead<SearchOutcome>, IpcError>`
+///
+/// Never waits for the index. The read itself runs in `spawn_blocking`: serat-index's
+/// search connection has one lock (a newer search interrupts the older, which returns
+/// `SearchOutcome::Superseded`, passed through unchanged), and waiting for it blocks a
+/// thread, which must never be a Tauri async worker or the webview main thread.
+///
+/// # Errors
+///
+/// As [`AppState::search`]; a panicked read thread is reported as [`IpcError::Io`].
+#[tauri::command]
+pub async fn search(
     state: State<'_, Arc<AppState>>,
     args: SearchArgs,
 ) -> Result<IndexRead<SearchOutcome>, IpcError> {
-    state.search(args)
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || state.search(args))
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: format!("the search thread failed: {err}"),
+        })?
 }
 
 /// `backlinks(args) -> Result<IndexRead<Vec<Backlink>>, IpcError>`

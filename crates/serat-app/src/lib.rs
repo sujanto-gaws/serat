@@ -266,6 +266,9 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::mark_vault_usable,
             commands::refused_names,
             commands::create_folder,
+            commands::get_ui_settings,
+            commands::set_live_preview,
+            commands::set_keybinding,
             commands::search,
             commands::backlinks,
         ])

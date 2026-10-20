@@ -205,6 +205,9 @@ mod tests {
             "mark_vault_usable",
             "refused_names",
             "create_folder",
+            "get_ui_settings",
+            "set_live_preview",
+            "set_keybinding",
             "search",
             "backlinks",
         ]
