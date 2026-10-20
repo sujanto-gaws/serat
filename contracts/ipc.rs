@@ -63,6 +63,7 @@
 //! | Surface | Commands / channels / events | Design |
 //! |---|---|---|
 //! | File tree | `open_tree` + `Channel<TreeMessage>` (streaming), `mark_tree` | ADR-0015, §3.5 |
+//! | Creating notes and folders | `write_file` with `base_hash: None` (a note), `create_folder` (a folder) | FR-VLT-11, ADR-0016, T-07 |
 //! | Choosing a vault | `choose_vault` (native dialog, no path parameter) | T-08 |
 //! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change` | ADR-0016, §3.3 |
 //! | Invalidation | event `index://changed` (throttled, invalidation only) | §3.1 step 6 |
@@ -495,6 +496,11 @@ pub enum RebuildReason {
 /// | `Io`                | `IpcError::Io`                              |
 /// | `AtomicWriteFailed` | `IpcError::Io`                              |
 /// | `Watcher`           | never reaches a command; reported as status   |
+/// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
+/// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
+///
+/// The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
+/// §2). Until it merges, no `VaultError` produces either `IpcError`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -564,6 +570,23 @@ pub enum IpcError {
         path: String,
         /// What was wrong, for the log.
         message: String,
+    },
+
+    /// A `save_patch` that is well formed but would delete the bytes between a
+    /// lone `\r` and a `\n` in a mixed-ending note, so the two would fuse into
+    /// one `\r\n` and swallow a line (P1, ADR-0016 §2). **Not a client bug,
+    /// and not a conflict**: the edit is one the user can legitimately make, and
+    /// the only byte-preserving outcome is to refuse it. The file is untouched
+    /// and the buffer stays dirty. The front end shows a clear, user-facing
+    /// error naming the line: the note mixes line-ending styles there, and the
+    /// user can edit that line differently or normalise the note's endings in
+    /// another tool. A save that is refused this way is never retried
+    /// automatically, because it would be refused again.
+    LineEndingsWouldFuse {
+        /// Vault-relative path.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
     },
 
     /// The operating system refused.
@@ -656,6 +679,49 @@ pub struct Span {
 /// (ADR-0012), and this command moves it only to where the user pointed in a
 /// native dialog. The FR-VLT-01 clock (ADR-0015 §3) starts when it returns.
 pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
+
+/// Arguments to `create_folder`.
+///
+/// `create_folder(args: CreateFolderArgs) -> Result<FolderCreated, IpcError>`
+///
+/// Serves FR-VLT-11 (US-41), the folder half. A note is created through
+/// `write_file` with `base_hash: None`. A folder has no content, so it does not
+/// go through `write_file`: ADR-0016 restricts that command to creating notes, and
+/// creating a placeholder file to make a folder exist would write something the
+/// user did not ask for (goal 1).
+///
+/// The T-07 boundary is the same as every other command that takes a path:
+/// - `path` becomes a `VaultPath` under task #34's rules, or it is refused as
+///   `IpcError::PathEscapesVault`;
+/// - it is resolved through `Vault::resolve`, which refuses a symlink component;
+/// - a path inside an ignored directory (`.serat/`, `.obsidian/`, `.git/`, ...)
+///   is refused as `IpcError::NotWritable`. NFR-CMP-01 keeps `.obsidian/`
+///   untouched, and `.serat/` is the index's.
+///
+/// It creates exactly one directory. **The parent must already exist**
+/// (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
+/// folders. It writes no file content. **It is idempotent**: an existing
+/// directory at `path` returns `created: false` and changes nothing. A file
+/// already at `path` is `IpcError::Io`, and the front end picks a unique name
+/// first, as it does for notes. The tree shows the new folder through
+/// ADR-0015's live `Upsert` from the watcher, with no rebuild, and it is an empty
+/// folder (FR-VLT-01's gated mark does not count it). The index is not
+/// touched, because the index has no rows for folders. Granted to `main` in the
+/// ACL (ADR-0012).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CreateFolderArgs {
+    /// Vault-relative, `/`-separated path of the folder to create.
+    pub path: String,
+}
+
+/// A `create_folder` that succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FolderCreated {
+    /// `false` when the directory already existed and nothing was done.
+    pub created: bool,
+}
 
 // ---------------------------------------------------------------------------
 // File tree (ADR-0015, §3.5) — streaming
@@ -838,6 +904,8 @@ pub struct NoteBufferArgs {
 /// the hash lock, re-hashed immediately before the rename. Errors: `StaleHash`
 /// (leave the buffer dirty, no blind retry — wait for or request the
 /// `ExternalChange`), `InvalidPatch` (a client bug; the file is untouched),
+/// `LineEndingsWouldFuse` (a deletion in a mixed-ending note would fuse a lone
+/// `\r` with a `\n`; shown to the user, the file is untouched, never retried),
 /// `NotWritable` (not Markdown, rule 3). On success `serat-app` moves its
 /// recorded base for this note to the new hash.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

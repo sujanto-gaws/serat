@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The P0 shell. build.rs declares an app ACL manifest (ADR-0012) naming all six commands in generate_handler!, so this file's grant is now enforcement, not documentation: it names the five commands the front end actually invokes -- authored in app/src/ipc/client.ts and shipped as the Vite output crates/serat-app/webview/boot.js, which since task #98 is generated rather than hand-written (F-467) -- read_file, write_file, index_status, mark_first_paint, mark_vault_usable. open_vault is deliberately withheld; nothing in the webview calls it (F-342), it is invoked only from Rust inside setup, and granting it here would reopen surface removing it was meant to close. Widening this set is a threat-model decision, not a convenience -- see docs/03-design/adr/0012-declare-the-tauri-app-acl-manifest.md.",
+  "description": "The P0 shell plus task #37's opener grant. build.rs declares an app ACL manifest (ADR-0012) naming all six commands in generate_handler!, so this file's grant is now enforcement, not documentation: it names the five commands the front end actually invokes -- authored in app/src/ipc/client.ts and shipped as the Vite output crates/serat-app/webview/boot.js, which since task #98 is generated rather than hand-written (F-467) -- read_file, write_file, index_status, mark_first_paint, mark_vault_usable. open_vault is deliberately withheld; nothing in the webview calls it (F-342), it is invoked only from Rust inside setup, and granting it here would reopen surface removing it was meant to close. Widening this set is a threat-model decision, not a convenience -- see docs/03-design/adr/0012-declare-the-tauri-app-acl-manifest.md. `opener:allow-open-url` is scoped here to exactly http/https/mailto (§9.3, T-09) -- narrower than tauri-plugin-opener's own `default` permission set, which also grants `tel:` and reveal-in-file-explorer; neither is used and both stay ungranted.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -9,6 +9,14 @@
     "allow-write-file",
     "allow-index-status",
     "allow-mark-first-paint",
-    "allow-mark-vault-usable"
+    "allow-mark-vault-usable",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://*" },
+        { "url": "http://*" },
+        { "url": "mailto:*" }
+      ]
+    }
   ]
 }
