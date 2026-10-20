@@ -28,14 +28,12 @@
 //     omitted with the HTML grammar they depend on.
 
 import { commonmarkLanguage, deleteMarkupBackward, insertNewlineContinueMarkup } from "@codemirror/lang-markdown";
-import { defineLanguageFacet, Language, LanguageSupport } from "@codemirror/language";
+import { Language, LanguageSupport } from "@codemirror/language";
 import { GFM, type MarkdownParser } from "@lezer/markdown";
 
 import { seratInlineSyntax } from "@/editor/mdExtensions";
 
 export { deleteMarkupBackward, insertNewlineContinueMarkup };
-
-const markdownData = defineLanguageFacet({ commentTokens: { block: { open: "<!--", close: "-->" } } });
 
 /** The one Markdown language configuration used everywhere a Lezer parse of
  * a note happens: the live editor and the reveal-rule decorator. (The
@@ -43,5 +41,5 @@ const markdownData = defineLanguageFacet({ commentTokens: { block: { open: "<!--
  * per §9.3's "three Markdown parsers" note; this module is not that one.) */
 export function seratMarkdown(): LanguageSupport {
   const parser = (commonmarkLanguage.parser as MarkdownParser).configure([GFM, seratInlineSyntax]);
-  return new LanguageSupport(new Language(markdownData, parser, [], "markdown"));
+  return new LanguageSupport(new Language(commonmarkLanguage.data, parser, [], "markdown"));
 }

@@ -241,7 +241,7 @@ describe("hydrateBuffer", () => {
       resolvePaint = resolve;
     });
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     const done = hydrateBuffer(store, editor, paintMark);
 
@@ -267,12 +267,14 @@ describe("hydrateBuffer", () => {
     });
     markVaultUsable.mockResolvedValue(31);
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     await hydrateBuffer(store, editor, Promise.resolve(9.0));
 
     expect(readFile).toHaveBeenCalledWith({ path: "a.md" });
-    expect(editor.setText).toHaveBeenCalledWith("# hello");
+    // The bytes that were READ, with the hash they were read at: never getText().
+    expect(editor.loadNote).toHaveBeenCalledWith("# hello", "a.md", "deadbeef");
+    expect(editor.setText).not.toHaveBeenCalled();
     expect(store.openNote).toBe("a.md");
     expect(store.baseHash).toBe("deadbeef");
     expect(markVaultUsable).toHaveBeenCalledWith("a.md");
@@ -283,7 +285,7 @@ describe("hydrateBuffer", () => {
     readFile.mockRejectedValue({ kind: "not_found", path: "missing.md" });
     markVaultUsable.mockResolvedValue(5);
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     await hydrateBuffer(store, editor, Promise.resolve(1.0));
 

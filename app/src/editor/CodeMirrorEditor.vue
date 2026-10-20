@@ -123,6 +123,10 @@ const registry = createEditorCommandRegistry({
 function buildExtensions(livePreview: boolean): Extension[] {
   return [
     lineNumbers(),
+    // Read-only until `loadNote` installs a buffer: text typed in any earlier
+    // window would have no base to be a patch against (C-04, NFR-REL-01).
+    EditorState.readOnly.of(!buffer),
+    EditorView.editable.of(!!buffer),
     seratMarkdown(),
     revealCompartment.of(livePreview ? [revealMarkersPlugin] : []),
     ...buildEditorExtensions(registry),
@@ -231,9 +235,13 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
 
 /** Back-compat with the P0 shell's placeholder-content path (no note open
  * yet, or a read failure message) — does not touch the buffer, so it must
- * never be used for real note content once `loadNote` is available. Like
+ * never be used for real note content; it is a no-op once a buffer exists, and the
+ * placeholder it shows is read-only. Like
  * `loadNote` it clears undo history. */
 function setText(text: string): void {
+  // With a buffer open this would desynchronise the document from its base
+  // (and silently discard edits): refuse. Real content goes through `loadNote`.
+  if (buffer) return;
   replaceState(text);
 }
 

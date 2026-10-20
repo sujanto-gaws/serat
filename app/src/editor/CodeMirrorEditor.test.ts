@@ -156,6 +156,44 @@ describe("CodeMirrorEditor load path", () => {
   });
 });
 
+describe("CodeMirrorEditor startup window", () => {
+  it("is read-only before a buffer exists, so nothing typed can become the base text", async () => {
+    const { wrapper, view, api } = mountEditor(mockIpc());
+    expect(view.state.readOnly).toBe(true);
+    expect(view.contentDOM.getAttribute("contenteditable")).toBe("false");
+    api.setText("placeholder");
+    expect(view.state.readOnly).toBe(true);
+
+    await api.loadNote("from disk", "a.md", "h0");
+    expect(view.state.readOnly).toBe(false);
+    expect(view.contentDOM.getAttribute("contenteditable")).toBe("true");
+    wrapper.unmount();
+  });
+
+  it("the base is the text passed to loadNote; a later edit patches against it", async () => {
+    const savePatch = vi.fn().mockResolvedValue(written("h1"));
+    const { wrapper, view, api } = mountEditor(mockIpc(savePatch));
+    api.setText("abc");
+    await api.loadNote("disk text", "a.md", "h0");
+    view.dispatch({ changes: { from: 9, insert: "Y" } });
+    await api.loadNote("disk text", "a.md", "h0").catch(() => undefined);
+    expect(savePatch).toHaveBeenCalledWith({
+      path: "a.md",
+      base_hash: "h0",
+      patches: [{ from: { line: 0, col: 9 }, to: { line: 0, col: 9 }, insert: "Y" }],
+    });
+    wrapper.unmount();
+  });
+
+  it("setText is refused once a buffer exists (it would desynchronise the base)", async () => {
+    const { wrapper, api } = mountEditor(mockIpc());
+    await api.loadNote("real", "a.md", "h0");
+    api.setText("clobber");
+    expect(api.getText()).toBe("real");
+    wrapper.unmount();
+  });
+});
+
 describe("CodeMirrorEditor keymap", () => {
   it("the built state has exactly one keymap entry, so no extension adds a bypass keymap (§9.3)", () => {
     const { wrapper, view } = mountEditor(mockIpc());

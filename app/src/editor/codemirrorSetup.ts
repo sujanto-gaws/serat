@@ -41,31 +41,69 @@ function registerPassthrough(
   bindings: readonly KeyBinding[],
   idPrefix: string,
   seenKeys: Set<string>,
+  platform: EditorPlatform,
 ): void {
   bindings.forEach((binding, index) => {
-    const key = binding.key ?? binding.mac;
+    // Per-platform key choice exactly as CodeMirror makes it: the platform's
+    // override (`mac` / `win` / `linux`) wins, else `key`. A binding with no
+    // key for this platform is skipped: the mac-only emacs bindings
+    // (Ctrl-v, Ctrl-k, Ctrl-f ...) must not exist on Windows/Linux, where
+    // they would cancel native paste and friends.
+    const key = binding[platform] ?? binding.key;
     // `@codemirror/commands`' own keymap arrays occasionally bind the same
     // literal key twice (once generically, once for a more specific
     // context CodeMirror itself disambiguates at dispatch time via `run`
     // returning `false` to fall through). This registry has no such
-    // fallthrough concept — one id, one binding — so the first array entry
+    // fallthrough concept: one id, one binding. So the first array entry
     // for a given key wins and later duplicates of the same key are
     // skipped, never registered under a second id (which is what would
     // make `buildKeymap` see a real collision).
-    if (!key || seenKeys.has(key) || !binding.run) {
+    if (!key || !binding.run) {
       return;
     }
-    seenKeys.add(key);
-    const { run } = binding;
-    const id = `${idPrefix}.${slugForKey(key)}-${index}`;
-    registry.register({
-      id,
-      name: `Editor: ${key}`,
-      defaultBinding: key,
-      when: "editor",
-      run: (view) => run(view),
-    });
+    const base = `${idPrefix}.${slugForKey(key)}-${index}`;
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      const { run } = binding;
+      registry.register({
+        id: base,
+        name: `Editor: ${key}`,
+        defaultBinding: key,
+        when: "editor",
+        // CodeMirror's own default (false): a key the command declines
+        // stays native.
+        preventDefault: binding.preventDefault ?? false,
+        run: (view) => run(view),
+      });
+    }
+    // `shift: run` is CodeMirror's shorthand for the same key with Shift held
+    // (selection-extending variants: Shift-ArrowLeft, Shift-Home ...).
+    if (binding.shift) {
+      const shiftKey = `Shift-${key}`;
+      if (!seenKeys.has(shiftKey)) {
+        seenKeys.add(shiftKey);
+        const shiftRun = binding.shift;
+        registry.register({
+          id: `${base}-shift`,
+          name: `Editor: ${shiftKey}`,
+          defaultBinding: shiftKey,
+          when: "editor",
+          preventDefault: binding.preventDefault ?? false,
+          run: (view) => shiftRun(view),
+        });
+      }
+    }
   });
+}
+
+export type EditorPlatform = "mac" | "win" | "linux";
+
+/** The same sniff CodeMirror itself uses for its platform key choice. */
+export function detectPlatform(): EditorPlatform {
+  const platform = typeof navigator === "undefined" ? "" : navigator.platform ?? "";
+  if (/Mac|iPhone|iPad/.test(platform)) return "mac";
+  if (/Win/.test(platform)) return "win";
+  return "linux";
 }
 
 /**
@@ -75,7 +113,10 @@ function registerPassthrough(
  * `historyKeymap`, wrapped so the registry — not `@codemirror/commands` — is
  * the single source every keybinding in the editor comes from.
  */
-export function createEditorCommandRegistry(handlers: EditorCommandHandlers): CommandRegistry {
+export function createEditorCommandRegistry(
+  handlers: EditorCommandHandlers,
+  platform: EditorPlatform = detectPlatform(),
+): CommandRegistry {
   const registry = new CommandRegistry();
 
   registry.register({
@@ -140,8 +181,8 @@ export function createEditorCommandRegistry(handlers: EditorCommandHandlers): Co
   // repeated between `historyKeymap` and `defaultKeymap`, or within either
   // array, is registered exactly once.
   const seenKeys = new Set(["Mod-s", "Mod-Shift-m", "Mod-Enter", "Mod-z", "Mod-y", "Enter", "Backspace"]);
-  registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys);
-  registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys);
+  registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys, platform);
+  registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys, platform);
 
   return registry;
 }

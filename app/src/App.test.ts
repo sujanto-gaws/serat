@@ -47,7 +47,7 @@ afterEach(() => {
 });
 
 describe("App", () => {
-  it("mounts a focusable editor before any IPC round trip has resolved", () => {
+  it("mounts the editor synchronously, read-only until a note buffer is installed (C-04)", () => {
     const wrapper = mount(App, { global: { plugins: [createPinia()] } });
 
     // CodeMirror mounts into a shadow root (code-reviewer-2's CSP finding), so
@@ -56,7 +56,8 @@ describe("App", () => {
     const host = wrapper.find(".cm-editor-host").element as HTMLElement;
     const content = host.shadowRoot?.querySelector(".cm-content");
     expect(content).not.toBeNull();
-    expect(content?.getAttribute("contenteditable")).toBe("true");
+    // Not editable yet: typing before `loadNote` would have no base to patch against.
+    expect(content?.getAttribute("contenteditable")).toBe("false");
   });
 
   it("schedules the paint mark synchronously, ahead of the index-status subscription", () => {

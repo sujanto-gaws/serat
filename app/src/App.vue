@@ -68,15 +68,11 @@ onMounted(async () => {
   indexStatus().then((status) => store.setIndexState(status.state));
 
   if (editorRef.value) {
-    // `hydrateBuffer` loads the text (`readFile`, for the vault-usable mark)
-    // via the editor's back-compat `setText`; it knows nothing about
-    // ADR-0016's base/hash bookkeeping. Once it resolves, `store.openNote`/
-    // `store.baseHash` hold what was read, and `loadNote` seeds the P1
-    // buffer from exactly that — no second read.
+    // `hydrateBuffer` reads the note and installs it with `loadNote` in one
+    // step, from the bytes that were read (never `getText()`): the editor is
+    // read-only until then, so nothing typed can become the base text
+    // paired with the on-disk hash (C-04, NFR-REL-01).
     await hydrateBuffer(store, editorRef.value, paintMark);
-    if (store.openNote && store.baseHash) {
-      await editorRef.value.loadNote(editorRef.value.getText(), store.openNote, store.baseHash);
-    }
   }
 });
 

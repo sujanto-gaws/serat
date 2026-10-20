@@ -177,6 +177,9 @@ export function schedulePaintMark(store: VaultStore): Promise<number | null> {
 /** What `App.vue`'s CodeMirrorEditor exposes — see `defineExpose` there. */
 export interface EditorHandle {
   setText(text: string): void;
+  /** Installs the note and its buffer in one step (no gap in which edits could
+   * be mistaken for the on-disk text). */
+  loadNote(text: string, path: string, baseHash: string): Promise<boolean>;
 }
 
 /**
@@ -209,8 +212,8 @@ export async function hydrateBuffer(
 
   try {
     const file = await readFile({ path: open });
-    editor.setText(file.text);
     store.setOpenBuffer(file.path, file.hash);
+    await editor.loadNote(file.text, file.path, file.hash);
   } catch (err) {
     // A refused read is an explanation, not a modal (§9.1).
     editor.setText(`${open} could not be read: ${JSON.stringify(err)}`);

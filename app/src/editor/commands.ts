@@ -38,6 +38,10 @@ export interface Command {
    * has a keyboard binding and appears in the palette" applies regardless
    * of focus). */
   when?: CommandContext;
+  /** Whether the key press is cancelled even when `run` returns false. Defaults
+   * to true; passthrough bindings carry CodeMirror's own value so native keys
+   * (paste, caret movement the editor does not handle) are not swallowed. */
+  preventDefault?: boolean;
   run: (view: EditorView) => boolean;
 }
 
@@ -106,7 +110,7 @@ export class CommandRegistry {
       seen.set(bucket, command.id);
       bindings.push({
         key,
-        preventDefault: true,
+        preventDefault: command.preventDefault ?? true,
         run: (view) => command.run(view),
       });
     }
