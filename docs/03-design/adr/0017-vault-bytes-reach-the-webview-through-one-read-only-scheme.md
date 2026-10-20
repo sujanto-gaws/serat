@@ -45,11 +45,28 @@ It is an ADR because it adds a third read path into the vault, beside `read_file
    - `Cache-Control: no-store`.
    - An `ETag` built from size and mtime (one stat). Combined with `If-Range`, a file changed during a load restarts cleanly instead of mixing versions. A false "changed" costs one reload.
 
-**The app CSP changes by exactly two sources.** It adds `img-src 'self' serat-asset: http://serat-asset.localhost`, and the same two origins in `connect-src`. It adds no remote origin, no `data:` (§9.3 drops `data:` URLs), no `blob:` and no `'unsafe-*'`.
+**The app CSP changes by exactly two sources and two explicit pins.** It adds `img-src 'self' serat-asset: http://serat-asset.localhost`, and the same two origins in `connect-src`. It pins **`frame-src 'none'; object-src 'none'`** explicitly (control (c) below). It adds no remote origin, no `data:` (§9.3 drops `data:` URLs), no `blob:` and no `'unsafe-*'`.
+
+**pdf.js is pinned at ≥ 4.2.67**, the release that fixes CVE-2024-4367 (arbitrary JavaScript through a crafted font). It also runs with `isEvalSupported: false`, which blocks that CVE's path independently.
 
 **pdf.js is bundled and inert.** Its worker, cMaps and standard fonts are served from `'self'`. It runs with `isEvalSupported: false` and **`enableScripting: false`**, so a PDF's JavaScript never runs. A link inside a PDF opens only on an explicit click, and only through the system opener (the same rule as §9.3's external links). **SVG is shown only through `<img>`**: never inline in the DOM and never as a navigated document, and the per-response `sandbox` CSP backs that up.
 
-**Two controls compensate for the ACL not covering the scheme.** ADR-0012's command ACL gates `invoke`; a scheme handler is reached by URL loads and is not in it. **First:** the scheme is read-only and serves only viewable types from contained paths (steps 1–10). **Second:** Tauri classifies `serat-asset` content as a **remote origin** (`is_local_url` is false for it), so a document loaded from the scheme **can invoke no IPC command at all**. A malicious SVG or PDF that somehow ran would be a remote page with no bridge. The hostile tests of task #19 are the scheme's ACL.
+**What stops a `serat-asset` document from reaching IPC — corrected.** ADR-0012's command ACL gates `invoke`, and a scheme handler is reached by URL loads, so the ACL does not cover it. **There is no origin-classification control.** An earlier version of this paragraph said Tauri classifies `serat-asset` content as a remote origin (`is_local_url` false), so a document loaded from it could invoke no IPC command. **That is false.** tauri-app-dev checked the tauri-2.11.5 source:
+
+- `webview/mod.rs:1698-1739` counts every scheme registered through `register_asynchronous_uri_scheme_protocol` as local.
+- `Origin::Local` matches the local capability unconditionally (`tauri-utils` `acl/authority.rs:57-66`).
+
+So a `serat-asset` document that became the main webview's top-level document, **or a frame inside it**, **could invoke every command granted to `main`**. Three controls actually hold, and all three must stay in place:
+
+- **(a) Top-level navigation — the main frame only.** serat-app's `on_navigation` refuses every URL that is not the app's own origin (architecture §9.3), including `serat-asset://…` and `http://serat-asset.localhost/…`. **It sees top-level navigations only.** wry-0.55.1 on WebView2 hooks `NavigationStarting`, which is main-frame only, and does not hook `FrameNavigationStarting`. So an `<iframe src="serat-asset://…">` never reaches `on_navigation`, and a framed scheme document is still `Local`. (a) keeps the scheme from becoming the top-level document; it does not keep it out of a frame.
+- **(b) No script runs in a scheme document.** Every response carries `Content-Security-Policy: default-src 'none'; …; sandbox` with **no `allow-scripts`** (step 10), so even a document that did load from the scheme, framed or top-level, executes nothing. That also covers an SVG with script, and anything a PDF carries. **Whether an engine honours a `sandbox` CSP on a custom-scheme response is engine-specific**, so (b) is proven on all three engines, never assumed from one.
+- **(c) No frames or plugin objects in the app document.** The app CSP pins **`frame-src 'none'; object-src 'none'`** explicitly. Until now that behaviour came, unnamed, from the `default-src 'self'` fallback, so any edit to the CSP could have removed it without a test noticing. The explicit pin is a change to `crates/serat-app/tauri.conf.json`, for task #37 or #19 to implement with its test. **The sanitiser is the markup layer of the same control**: it strips `iframe`, `object` and `embed` from rendered notes (§9.3), so a note cannot even ask for a frame.
+
+The read-only, viewable-types-only, contained-paths handler (steps 1–10) limits what the scheme can *serve*. It does not limit what a loaded document could *invoke*, so it is not a control against IPC.
+
+**Downloads are refused.** `<a download href="serat-asset://…">` would make the webview write a vault file somewhere outside the vault, which is a write path T-06 does not list. serat-app refuses every download: WebView2 `DownloadStarting` is cancelled, and WebKit's `download-started` is cancelled on WKWebView and WebKitGTK. The sanitiser also strips the `download` attribute, as a second layer. Recorded in T-06 and T-10.
+
+**The default context menu is disabled in release builds** (it offers "Save image as…", "Open frame in new window" and "Inspect"). Debug builds keep it for development.
 
 **Sidecar pairing matches bytes exactly, deliberately.** `X.PDF` and `x.pdf.md` are not a pair: ADR-0005 defines the sidecar name as the binary's full file name with `.md` appended, and on a case-sensitive filesystem the two could name different files. Folding case here would let one sidecar claim two binaries. A user who wants the pairing renames one of the two, and nothing is guessed.
 
@@ -59,7 +76,7 @@ If WebKitGTK or WKWebView does not deliver a custom-scheme 206 with these header
 
 ## Consequences
 
-**Positive.** One containment rule, with #34's hardening, serves the read command, the watcher's paths and now the viewer bytes. Large PDFs load a page's spans at a time on every platform, and no request holds more than 1,000 KiB. The CSP gains one first-party scheme. The scheme's content cannot reach IPC.
+**Positive.** One containment rule, with #34's hardening, serves the read command, the watcher's paths and now the viewer bytes. Large PDFs load a page's spans at a time on every platform, and no request holds more than 1,000 KiB. The CSP gains one first-party scheme. Scheme content is kept from IPC by the navigation guard and by the script-free sandbox CSP. Tauri still classifies the scheme as local, so both controls are load-bearing.
 
 **Negative.** **An image is held whole in memory while it is served**, because `<img>` cannot request spans. That costs up to 64 MiB per image request in the handler, plus the webview's decoded copy. The limit is what bounds it. A photo library with larger files degrades to "couldn't be displayed" (goal 5), never to a truncated image. It is a hand-written HTTP-ish handler, with range parsing, CORS and ten ordered steps to get right, and three platform-specific handle checks. The table of viewable types is a second allowlist beside the index's MIME table, which is why both come from the same function.
 
@@ -76,7 +93,7 @@ All of these are cases in task #19's hostile suite.
 - the gap between resolving a path and opening it (step 7);
 - CORS for cross-origin range fetches (step 8);
 - `UriSchemeResponder` having no streaming, answered by the span cap (step 9).
-The same review asked for the remote-origin classification as the second compensating control, single decoding, the host check, `enableScripting: false`, SVG only through `<img>`, pinning `useHttpsScheme`, and a stated sidecar case rule. **frontend-designer** (task #8) asked whether the fallback stays incremental; it does (§Fallback).
+The same review asked for the remote-origin classification as the second compensating control — **withdrawn: premise false (task #36)**; Tauri classifies the scheme as local — and for single decoding, the host check, `enableScripting: false`, SVG only through `<img>`, pinning `useHttpsScheme`, and a stated sidecar case rule. **frontend-designer** (task #8) asked whether the fallback stays incremental; it does (§Fallback).
 
 **tauri-app-dev** has not yet reviewed this ADR; lead is arranging it. The open question for them is whether Tauri v2's `register_asynchronous_uri_scheme_protocol` delivers a 206, these headers and an `OPTIONS` response on WebKitGTK and WKWebView. §Fallback is the answer for any platform where it does not.
 
@@ -95,6 +112,9 @@ Nothing yet. The cases that would break it are listed for task #19 and belong in
 - an `Origin` that is not the app's;
 - an SVG with script opened as a document;
 - a PDF with JavaScript;
+- **a real top-level navigation of the main webview to `serat-asset://…`** (and to `http://serat-asset.localhost/…` on Windows), asserting that it is refused (control (a)). Then, with the guard disabled in the test build only, assert that the loaded document runs no script, so no command is reachable. That second arm proves control (b) holds on its own, and it **runs on all three engines** (WebView2, WKWebView and WebKitGTK), because a `sandbox` CSP on a custom-scheme response is engine-specific. tauri-app-dev writes this test;
+- **an `<iframe>` and an `<object>` pointing at a scheme SVG that contains script**, inserted into the app document. The test asserts that no script runs and no `invoke` succeeds, and it **runs twice: with the `frame-src`/`object-src` pin on, and with it removed**. With the pin on, the frame must not load at all (control (c)). With it off, (b) alone must still hold. That pair is what ties a future CSP edit to a failing test;
+- `<a download href="serat-asset://…">` clicked in the app document: no file may be written anywhere;
 - range requests at the file boundaries and over the cap;
 - an image over the cap with no `Range`, which must arrive whole; an image over 64 MiB, which must get 404; and a file changed between two range requests, which must restart through `If-Range`;
 - a no-`Range` request for a file over the cap.
