@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serat_core::{ContentHash, VaultError, VaultPath};
 use serat_vault::diff;
-use serat_vault::patch::Edit;
-use serat_vault::{Position, Vault};
+use serat_vault::patch::{Edit, apply_edits};
+use serat_vault::{Position, Vault, hash_bytes};
 
 use crate::error::from_vault_error;
 use crate::ipc::{
@@ -246,10 +246,17 @@ impl Editor {
     /// `save_patch`, up to and including the write. The caller submits the note to the
     /// index afterwards, as for any write.
     ///
-    /// On success the registry's newest base for the note becomes the new hash. On
-    /// `StaleHash` the diff from the pane's base to the disk is announced as
-    /// `note://external-change` (if the registry holds that base) before the error
-    /// returns, so the pane has the diff whether or not it also asks for it.
+    /// **`request_external_diff` is the only diff path for a refused save.** A
+    /// `StaleHash` returns the error and nothing else: the pane always calls
+    /// `request_external_diff` and does not wait for an event (ADR-0016 §2), so an
+    /// event here would only duplicate the answer.
+    ///
+    /// On success the registry's newest base for the note becomes the new hash. The new
+    /// base's bytes are computed from the held base and the patches with the same
+    /// `apply_edits` the write used, not read back: an external write landing between
+    /// the rename and a read-back must not leave the registry without bytes Serat
+    /// itself wrote. They are advanced only if they hash to what `write_patch`
+    /// returned.
     ///
     /// # Errors
     ///
@@ -260,47 +267,39 @@ impl Editor {
         let path = markdown(&args.path)?;
         let base_hash = parse_hash(&args.base_hash)?;
         let edits: Vec<Edit> = args.patches.iter().map(to_edit).collect();
+        // Taken before the write: the registry may be moved by a watcher event while
+        // the write runs.
+        let held = self.buffers.find(&path, base_hash);
 
-        let new_hash = match self.vault.write_patch(&path, base_hash, &edits) {
-            Ok(hash) => hash,
-            Err(err @ VaultError::StaleHash { .. }) => {
-                self.announce_stale(&path, base_hash);
-                return Err(from_vault_error(err));
-            }
-            Err(err) => return Err(from_vault_error(err)),
-        };
+        let new_hash = self
+            .vault
+            .write_patch(&path, base_hash, &edits)
+            .map_err(from_vault_error)?;
 
-        // For the stat the contract returns, and for the bytes of the new base. If the
-        // file has already moved again, the base is not advanced: its bytes are not
-        // ours to claim, and the pane's next save is refused and diffed.
-        let written = self.vault.read(&path).map_err(from_vault_error)?;
-        let (mtime_ms, bytes) = (written.meta.mtime_ms, written.meta.size);
-        if written.meta.hash == new_hash
-            && let Ok(text) = String::from_utf8(written.bytes)
+        let mut bytes = 0;
+        if let Some(base) = held
+            && let Ok(text) = apply_edits(&base.text, &edits, path.as_str())
         {
-            self.buffers.advance(
-                &path,
-                Base {
-                    hash: new_hash,
-                    text: text.into(),
-                },
-            );
+            bytes = text.len() as u64;
+            if hash_bytes(text.as_bytes()) == new_hash {
+                self.buffers.advance(
+                    &path,
+                    Base {
+                        hash: new_hash,
+                        text: text.into(),
+                    },
+                );
+            }
         }
+        // The stat the contract returns. Size is ours when we computed the bytes.
+        let stat = self.vault.read(&path).map_err(from_vault_error)?;
         let written = FileWritten {
             path: path.to_string(),
             hash: new_hash.to_hex(),
-            mtime_ms,
-            bytes,
+            mtime_ms: stat.meta.mtime_ms,
+            bytes: if bytes == 0 { stat.meta.size } else { bytes },
         };
         Ok((path, written))
-    }
-
-    fn announce_stale(&self, path: &VaultPath, base_hash: ContentHash) {
-        if let Some(base) = self.buffers.find(path, base_hash)
-            && let Ok(Some(change)) = self.external_change(path, &base)
-        {
-            self.events.emit_external(&change);
-        }
     }
 
     /// `request_external_diff`.
@@ -413,7 +412,9 @@ impl Editor {
     }
 
     /// The watcher reported `path` changed. If a pane holds it, announce the change.
-    /// Our own save produces no event: the registry already holds the saved hash.
+    /// Our own save normally produces no event: the registry holds the saved hash. If the
+    /// watcher wins the race and reports first, the pane drops that change on its base
+    /// check (ADR-0016 §2) and the next save or `request_external_diff` settles it.
     pub fn path_changed(&self, path: &VaultPath) {
         let Some(base) = self.buffers.newest(path) else {
             return;
@@ -525,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_hash_always_carries_the_diff_before_the_error_returns() {
+    fn a_stale_save_is_only_an_error_and_request_external_diff_is_the_one_diff_path() {
         let fx = fixture(&[("a.md", b"one\ntwo\nthree\n")]);
         let base = open(&fx, "a.md");
         fs::write(fx.dir.path().join("a.md"), b"one\nTWO\nthree\n").expect("external");
@@ -540,34 +541,52 @@ mod tests {
             b"one\nTWO\nthree\n",
             "a refused save touches nothing"
         );
+        assert!(
+            fx.events.lock().expect("log").is_empty(),
+            "no duplicate event: the pane always asks"
+        );
 
-        let events = fx.events.lock().expect("log");
-        let [
-            ExternalChange::Changed {
-                base_hash,
-                new_hash,
-                edits,
-                whole,
-                ..
-            },
-        ] = events.as_slice()
-        else {
-            panic!("expected exactly one Changed, got {events:?}");
-        };
-        assert_eq!(base_hash, &base);
-        assert_eq!(new_hash, &hash_of(fx.dir.path(), "a.md"));
-        assert!(!whole);
-        assert_eq!(edits, &vec![patch((1, 0), (1, 3), "TWO")]);
-        drop(events);
-
-        // The pane asks as well, as ADR-0016 §2 says it always does: same answer, from
-        // the base it still holds even though the registry has moved on.
         let answer = fx
             .editor
             .request_external_diff(&args("a.md", &base))
             .expect("diff")
             .expect("changed");
-        assert!(matches!(answer, ExternalChange::Changed { ref edits, .. } if edits.len() == 1));
+        let ExternalChange::Changed {
+            base_hash,
+            new_hash,
+            edits,
+            whole,
+            ..
+        } = answer
+        else {
+            panic!("expected Changed");
+        };
+        assert_eq!(base_hash, base);
+        assert_eq!(new_hash, hash_of(fx.dir.path(), "a.md"));
+        assert!(!whole);
+        assert_eq!(edits, vec![patch((1, 0), (1, 3), "TWO")]);
+    }
+
+    #[test]
+    fn the_new_base_is_ours_even_if_the_file_moves_again_right_after_the_save() {
+        let fx = fixture(&[("a.md", b"one\ntwo\n")]);
+        let base = open(&fx, "a.md");
+        let (_, written) = fx
+            .editor
+            .save_patch(&save("a.md", &base, vec![patch((0, 0), (0, 3), "ONE")]))
+            .expect("saved");
+        // An external write lands after the rename. The registry still holds the bytes
+        // Serat wrote, so the diff from the saved hash is a real one, not a conflict.
+        fs::write(fx.dir.path().join("a.md"), b"ONE\nTWO\n").expect("external");
+        let change = fx
+            .editor
+            .request_external_diff(&args("a.md", &written.hash))
+            .expect("held")
+            .expect("changed");
+        assert!(matches!(
+            change,
+            ExternalChange::Changed { ref edits, .. } if edits == &vec![patch((1, 0), (1, 3), "TWO")]
+        ));
     }
 
     #[test]

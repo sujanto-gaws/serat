@@ -61,6 +61,9 @@ pub const MAX_RESTARTS: u32 = 3;
 /// Delivers one message to the front end. `false` means the receiver is gone (the
 /// channel was closed); the stream then stops sending. In the application it wraps a
 /// `tauri::ipc::Channel<TreeMessage>`; in tests, a `Vec`.
+///
+/// **The sender must never call back into the feed or the session**: it runs under the
+/// session's lock, and re-entry would deadlock.
 pub type TreeSender = Arc<dyn Fn(TreeMessage) -> bool + Send + Sync>;
 
 /// The contract's source in the vault's terms.
@@ -335,6 +338,9 @@ pub struct FeedConfig {
     /// Blocks until the walk may start: the first paint, in the application
     /// (ADR-0015 §2: "the walk always runs, after the first paint").
     pub gate: Arc<dyn Fn() + Send + Sync>,
+    /// Called once when the stream has exhausted [`MAX_RESTARTS`] and will not update
+    /// again (the application emits `tree://status`). Must not call back into the feed.
+    pub on_stopped: Box<dyn Fn() + Send + Sync>,
 }
 
 /// One per open vault.
@@ -344,6 +350,8 @@ pub struct TreeFeed {
     marks: Mutex<TreeMarks>,
     /// Generations of populate threads, so a stale one's `WalkSummary` is not reported.
     populating: AtomicU32,
+    /// `on_stopped` has fired for this `open`.
+    stopped: AtomicBool,
 }
 
 impl std::fmt::Debug for FeedConfig {
@@ -378,6 +386,7 @@ impl TreeFeed {
             state: Mutex::new(FeedState::default()),
             marks: Mutex::new(TreeMarks::default()),
             populating: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -397,6 +406,7 @@ impl TreeFeed {
     /// Only if the operating system refuses to create the populate thread.
     pub fn open(self: &Arc<Self>, send: TreeSender) -> std::io::Result<()> {
         *self.marks_lock() = TreeMarks::default();
+        self.stopped.store(false, Ordering::SeqCst);
         self.start(send, 0)
     }
 
@@ -453,6 +463,14 @@ impl TreeFeed {
         {
             self.marks_lock().empty_folders = Some(summary.empty_folders);
         }
+        // A restarted stream that got as far as `Complete` is healthy again: the
+        // budget is for consecutive failures, not for a vault's whole lifetime.
+        if session.progress().complete.is_some()
+            && let Some(active) = self.state().active.as_mut()
+            && std::ptr::eq(Arc::as_ptr(&active.session), session)
+        {
+            active.restarts = 0;
+        }
     }
 
     /// Replace a poisoned session with a fresh one on the same channel. Bounded.
@@ -467,6 +485,11 @@ impl TreeFeed {
             }
         };
         if restarts >= MAX_RESTARTS {
+            // Goal 5: a tree that stops updating is a fact the user is told, once.
+            if !self.stopped.swap(true, Ordering::SeqCst) {
+                eprintln!("serat: the file tree stream failed {MAX_RESTARTS} restarts and stopped");
+                (self.config.on_stopped)();
+            }
             return;
         }
         let _ = self.start(send, restarts + 1);
@@ -605,6 +628,7 @@ mod tests {
             index_db: dir.join(".serat/none.db"),
             index_ready: Box::new(move || ready),
             gate: Arc::new(|| {}),
+            on_stopped: Box::new(|| {}),
         })
     }
 
@@ -756,6 +780,12 @@ mod tests {
         });
         feed.open(send).expect("open");
         wait_for("a restarted stream completing", || has_complete(&log));
+        wait_for("the restart budget to reset", || {
+            feed.state()
+                .active
+                .as_ref()
+                .is_some_and(|a| a.restarts == 0)
+        });
         let log = log.lock().expect("log");
         assert!(
             matches!(&log[0], TreeMessage::Listing { dir, .. } if dir.is_empty()),
@@ -768,7 +798,17 @@ mod tests {
     fn a_sender_that_always_panics_is_given_up_on_not_looped() {
         let dir = tempfile::tempdir().expect("dir");
         write(dir.path(), "a.md");
-        let feed = feed_for(dir.path(), false);
+        let stops = Arc::new(AtomicU32::new(0));
+        let stopped = Arc::clone(&stops);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir.path()).expect("open")),
+            index_db: dir.path().join(".serat/none.db"),
+            index_ready: Box::new(|| false),
+            gate: Arc::new(|| {}),
+            on_stopped: Box::new(move || {
+                stopped.fetch_add(1, Ordering::SeqCst);
+            }),
+        });
         let calls = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&calls);
         let send: TreeSender = Arc::new(move |_| {
@@ -776,7 +816,13 @@ mod tests {
             panic!("always (test)");
         });
         feed.open(send).expect("open");
-        std::thread::sleep(Duration::from_millis(600));
+        wait_for("the stream to give up", || {
+            stops.load(Ordering::SeqCst) == 1
+        });
+        // Further events find a dead stream and do not announce it again.
+        feed.path_changed(&VaultPath::new("a.md").expect("path"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "announced once");
         let seen = calls.load(Ordering::SeqCst);
         assert!(
             seen <= MAX_RESTARTS + 1,

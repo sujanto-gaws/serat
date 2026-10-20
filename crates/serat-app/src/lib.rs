@@ -320,6 +320,17 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 }
             });
 
+            // 1c. And tree://status: the tree stream gave up (goal 5: say so).
+            let tree_status = handle.clone();
+            state.events.install_tree_status(move |status| {
+                if let Err(err) = tree_status.emit(ipc::TREE_STATUS_EVENT, status) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::TREE_STATUS_EVENT
+                    );
+                }
+            });
+
             // 2. Open the vault first. This spawns the index actor and the vault thread
             //    and returns; §3.4's "in parallel" column starts here, before the
             //    expensive part of the main thread's own row.

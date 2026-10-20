@@ -38,8 +38,8 @@ use crate::ipc::{
     GitignoreAppended, GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError,
     KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs, NotePathArgs,
     OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadFileArgs, RebaseBufferArgs, RefusedName,
-    SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings,
-    VaultOpened, WriteFileArgs,
+    SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, TreeStatus,
+    UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -57,7 +57,11 @@ use crate::vault::{Live, Stage, VaultThread};
 pub struct Events {
     sink: RwLock<Option<StatusFn>>,
     external: RwLock<Option<ExternalFn>>,
+    tree_status: RwLock<Option<TreeStatusFn>>,
 }
+
+/// The installed `tree://status` sink.
+type TreeStatusFn = Box<dyn Fn(&TreeStatus) + Send + Sync>;
 
 /// The installed sink. Named because the type is long enough that clippy is right to
 /// ask, and because `install` and the field should be describing the same thing.
@@ -100,6 +104,26 @@ impl Events {
             .as_ref()
         {
             sink(change);
+        }
+    }
+
+    /// Direct every future `tree://status` at `sink`.
+    pub fn install_tree_status(&self, sink: impl Fn(&TreeStatus) + Send + Sync + 'static) {
+        *self
+            .tree_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+
+    /// Announce that the tree stream stopped. A no-op until a sink is installed.
+    pub fn emit_tree_status(&self, status: &TreeStatus) {
+        if let Some(sink) = self
+            .tree_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sink(status);
         }
     }
 }
@@ -368,12 +392,20 @@ impl AppState {
         let tree_gate = Arc::clone(&self.startup);
         let gate_timeout = self.walk_gate;
         let ready = Arc::clone(&publisher);
+        let events = Arc::clone(&self.events);
+        let stopped_id = vault_id.clone();
         let tree = TreeFeed::new(FeedConfig {
             vault: Arc::clone(&vault),
             index_db: serat_index::index_path(&index_dir_for(&root)),
             index_ready: Box::new(move || matches!(ready.status().state, IndexState::Ready { .. })),
             gate: Arc::new(move || {
                 tree_gate.wait_for_first_paint(gate_timeout);
+            }),
+            on_stopped: Box::new(move || {
+                events.emit_tree_status(&TreeStatus {
+                    vault_id: stopped_id.clone(),
+                    stopped: true,
+                });
             }),
         });
         let editor = Editor::new(
