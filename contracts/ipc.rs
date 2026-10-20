@@ -442,6 +442,11 @@ pub enum RebuildReason {
 /// | `Io`                | `IpcError::Io`                              |
 /// | `AtomicWriteFailed` | `IpcError::Io`                              |
 /// | `Watcher`           | never reaches a command; reported as status   |
+/// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
+/// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
+///
+/// The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
+/// §2). Until it merges, no `VaultError` produces either `IpcError`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -511,6 +516,23 @@ pub enum IpcError {
         path: String,
         /// What was wrong, for the log.
         message: String,
+    },
+
+    /// A `save_patch` that is well formed but would delete the bytes between a
+    /// lone `\r` and a `\n` in a mixed-ending note, so the two would fuse into
+    /// one `\r\n` and swallow a line (P1, ADR-0016 §2). **Not a client bug,
+    /// and not a conflict**: the edit is one the user can legitimately make, and
+    /// the only byte-preserving outcome is to refuse it. The file is untouched
+    /// and the buffer stays dirty. The front end shows a clear, user-facing
+    /// error naming the line: the note mixes line-ending styles there, and the
+    /// user can edit that line differently or normalise the note's endings in
+    /// another tool. A save that is refused this way is never retried
+    /// automatically, because it would be refused again.
+    LineEndingsWouldFuse {
+        /// Vault-relative path.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
     },
 
     /// The operating system refused.
@@ -778,6 +800,8 @@ pub struct NoteBufferArgs {
 /// the hash lock, re-hashed immediately before the rename. Errors: `StaleHash`
 /// (leave the buffer dirty, no blind retry — wait for or request the
 /// `ExternalChange`), `InvalidPatch` (a client bug; the file is untouched),
+/// `LineEndingsWouldFuse` (a deletion in a mixed-ending note would fuse a lone
+/// `\r` with a `\n`; shown to the user, the file is untouched, never retried),
 /// `NotWritable` (not Markdown, rule 3). On success `serat-app` moves its
 /// recorded base for this note to the new hash.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
