@@ -281,6 +281,34 @@ impl Inner {
     }
 }
 
+/// The follow-up [`TreeSession::created`] owes: a created directory must be rescanned,
+/// because it may have arrived with contents. Run it with [`Self::run`].
+#[derive(Debug)]
+#[must_use = "a created directory may have arrived with contents; call .run(session, vault)"]
+pub struct RescanNeeded {
+    dir: Option<String>,
+}
+
+impl RescanNeeded {
+    /// The directory to rescan, or `None` for a created file.
+    #[must_use]
+    pub fn dir(&self) -> Option<&str> {
+        self.dir.as_deref()
+    }
+
+    /// Do the rescan, if one is owed: [`TreeSession::rescan`] of the directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeSession::rescan`].
+    pub fn run(self, session: &TreeSession, vault: &Vault) -> Result<(), VaultError> {
+        if let Some(dir) = self.dir {
+            session.rescan(vault, &dir)?;
+        }
+        Ok(())
+    }
+}
+
 /// One open tree stream: the model of what was sent, and the sink it is sent to.
 ///
 /// The sink runs **under the session's lock** and must not block: it is a channel
@@ -486,14 +514,22 @@ impl TreeSession {
     }
 
     /// A file or directory was created, or is the new name of a rename. `path` is
-    /// vault-relative. A directory that arrives with contents needs a [`Self::rescan`]
-    /// as well; a new empty folder is listed empty here.
-    pub fn created(&self, path: &str, kind: TreeKind) {
+    /// vault-relative.
+    ///
+    /// **A directory that arrives may arrive with contents** (a folder moved or
+    /// copied in): this lists it empty, and the returned [`RescanNeeded`] must be run
+    /// to list what is in it. It is `#[must_use]` so that a caller cannot forget:
+    /// every created directory is rescanned, unconditionally (code-reviewer-3's
+    /// obligation on #13). For a file it is a no-op.
+    pub fn created(&self, path: &str, kind: TreeKind) -> RescanNeeded {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         self.with(|inner| {
             let ops = inner.model.upsert(dir, RawEntry::new(name, kind));
             inner.emit_all(ops);
         });
+        RescanNeeded {
+            dir: (kind == TreeKind::Dir).then(|| path.to_owned()),
+        }
     }
 
     /// A file or directory was deleted, or is the old name of a rename.
