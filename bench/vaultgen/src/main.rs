@@ -54,9 +54,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// Repository root, resolved at compile time from this crate's location, so the
-/// default output path does not depend on the shell's working directory.
+/// Repository root, resolved at run time (task #45): `SERAT_REPO_ROOT`, else the
+/// nearest ancestor of the working directory whose `Cargo.toml` declares a
+/// `[workspace]`, else the compile-time location (a binary reused across
+/// worktrees via a shared `CARGO_TARGET_DIR` must not write into the tree that
+/// built it).
 fn repo_root() -> PathBuf {
+    if let Some(e) = std::env::var_os("SERAT_REPO_ROOT").filter(|e| !e.is_empty()) {
+        return PathBuf::from(e);
+    }
+    let from_cwd = std::env::current_dir().ok().and_then(|cwd| {
+        cwd.ancestors()
+            .find(|d| {
+                std::fs::read_to_string(d.join("Cargo.toml"))
+                    .is_ok_and(|t| t.lines().any(|l| l.trim() == "[workspace]"))
+            })
+            .map(PathBuf::from)
+    });
+    if let Some(r) = from_cwd {
+        return r;
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent() // bench/
         .and_then(|p| p.parent()) // repo root
