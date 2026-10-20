@@ -72,6 +72,7 @@
 //! | Links in the editor | `resolve_links` (batched per viewport), `note_anchors` | §9.3 |
 //! | Assets | `asset_info`; bytes via the `serat-asset` scheme (not a command); fallback `read_asset_range` (raw bytes) | §7.4, ADR-0017 |
 //! | Settings, command registry | `get_ui_settings`, `set_live_preview`, `set_keybinding` | §9.3, FR-PLT-05 |
+//! | Names the vault cannot show | `refused_names`; the count rides on `IndexStatus::refused_names` | FR-VLT-01, task #34 |
 //! | `.serat/` ignore offer | `gitignore_offer_status`, `append_gitignore_entry`, `decline_gitignore_offer` | NFR-CMP-04, T-06 |
 //!
 //! `write_file` stays, and in P1 its **only** job is creating a note: the editor
@@ -305,7 +306,59 @@ pub struct IndexStatus {
     /// is the application's, not the harness's.
     #[ts(type = "number")]
     pub since_process_start_ms: u64,
+    /// How many file names in this vault the walk and the watcher could not turn
+    /// into a vault path and so do not show (task #34's `Vault::refusals()`;
+    /// mostly Windows-only name rules: `:`, device names, a trailing dot or
+    /// space). FR-VLT-01, design goal 5: a file Serat cannot show is reported,
+    /// never silently absent. The front end renders it as one status fact, "N
+    /// names not shown", and fetches the list behind it with `refused_names`.
+    ///
+    /// The count is of distinct paths, the length of the `refused_names` list,
+    /// so it saturates at
+    /// [`REFUSED_NAMES_CAP`]. At the cap the front end says "1000 or more".
+    /// `None` (absent on the wire) means serat-app is not counting yet, or no
+    /// vault is open. It never means zero, so the front end shows nothing for
+    /// it rather than "0 names not shown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub refused_names: Option<u32>,
 }
+
+/// The most refused names the log holds, the status counts and `refused_names`
+/// returns. It matches serat-vault's `RefusalLog` bound (task #34), which drops
+/// the oldest entry when it is full, so memory stays bounded on a vault full of
+/// names one platform cannot hold.
+pub const REFUSED_NAMES_CAP: u32 = 1000;
+
+/// `refused_names() -> Vec<RefusedName>`
+///
+/// Serves FR-VLT-01 (design goal 5). The list behind `IndexStatus::refused_names`:
+/// every file name the walk or the watcher refused, with the reason, at most
+/// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
+/// distinct path**: a path refused again (the watcher sees it change) replaces
+/// its entry rather than adding one, so the count is a count of names, not of
+/// events. `RefusalLog` at task #34's `10603a1` appends per event and does not
+/// deduplicate, so either it or serat-app must, before this ships. A refused
+/// file that is deleted or renamed away leaves the list on the watcher's event.
+/// **A read, not a
+/// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
+/// An empty list when nothing was refused or no vault is open. Granted to `main`
+/// in the ACL (ADR-0012). It takes no argument and reveals only names inside the
+/// open vault, which the user can already see in their own file manager.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RefusedName {
+    /// The name as found on disk, relative to the vault root, `/`-separated.
+    /// It is not a `VaultPath`, because it failed to become one. It is for
+    /// display only and is never passed back to a command.
+    pub path: String,
+    /// Why it was refused, for the user (for example "contains a `:`, which is
+    /// a drive prefix or an NTFS alternate data stream on Windows").
+    pub reason: String,
+}
+
+/// The command name for [`RefusedName`]'s list.
+pub const REFUSED_NAMES_COMMAND: &str = "refused_names";
 
 // ============================================================================
 // Events
