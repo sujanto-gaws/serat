@@ -156,11 +156,23 @@ fn line(label: &str, a: &Samples, b: &Samples, a_name: &str, b_name: &str) {
         gap(b.percentile(0.5), a.percentile(0.5)),
         gap(b.min(), a.min()),
     );
+    // The first iterations as pairs, in run order of the arguments, so that a streak
+    // (a connection slow throughout) can be told from scatter.
+    let pairs: Vec<String> = a
+        .values()
+        .iter()
+        .zip(b.values())
+        .take(8)
+        .map(|(x, y)| format!("{x:.0}/{y:.0}"))
+        .collect();
+    println!("      first pairs {a_name}/{b_name}: {}", pairs.join(" "));
 }
 
 fn run(args: &[String]) -> Result<(), String> {
     let mut vault_name = "20k".to_owned();
     let mut n = 60usize;
+    let mut extra: Vec<String> = Vec::new();
+    let mut only: Option<Vec<String>> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -172,9 +184,23 @@ fn run(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("--iterations: {e}"))?;
             }
+            // A diagnostic setting applied to all three connections after they open,
+            // e.g. --pragma temp_store=2. Repeatable. The reported run uses none.
+            "--pragma" => extra.push(it.next().ok_or("--pragma needs name=value")?.clone()),
+            // Comma-separated terms in place of the default set.
+            "--terms" => {
+                only = Some(
+                    it.next()
+                        .ok_or("--terms needs a list")?
+                        .split(',')
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    let settings = Settings { extra, only };
     let vault = ensure_vault(&vault_name)?;
     let index_dir = std::env::temp_dir().join(format!("serat-bench-gap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&index_dir);
@@ -186,12 +212,28 @@ fn run(args: &[String]) -> Result<(), String> {
         &index_dir,
     )
     .map_err(|e| format!("rebuild: {e}"))?;
-    let result = measure(&serat_index::index_path(&index_dir), &vault_name, n);
+    let result = measure(
+        &serat_index::index_path(&index_dir),
+        &vault_name,
+        n,
+        &settings,
+    );
     let _ = std::fs::remove_dir_all(&index_dir);
     result
 }
 
-fn measure(db: &std::path::Path, vault_name: &str, n: usize) -> Result<(), String> {
+/// Diagnostic options; the reported run uses neither.
+struct Settings {
+    extra: Vec<String>,
+    only: Option<Vec<String>>,
+}
+
+fn measure(
+    db: &std::path::Path,
+    vault_name: &str,
+    n: usize,
+    settings: &Settings,
+) -> Result<(), String> {
     let env = budget::env::Environment::detect();
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!(
@@ -210,6 +252,14 @@ fn measure(db: &std::path::Path, vault_name: &str, n: usize) -> Result<(), Strin
         .with_search(sc.clone());
     let p = Reader::open(db).map_err(|e| e.to_string())?;
     let p2 = Reader::open(db).map_err(|e| e.to_string())?;
+    for pragma in &settings.extra {
+        let sql = format!("PRAGMA {pragma}");
+        let apply = |c: &Connection| c.execute_batch(&sql).map_err(|e| e.to_string());
+        p.with_connection(apply)?;
+        p2.with_connection(apply)?;
+        sc.with_connection(apply)?;
+        println!("diagnostic setting applied to all three connections: {sql}");
+    }
 
     // Step 2: pragmas, read back from the connections themselves.
     println!();
@@ -255,9 +305,13 @@ fn measure(db: &std::path::Path, vault_name: &str, n: usize) -> Result<(), Strin
             .query_row("SELECT doc FROM temp.v WHERE term = ?1", [t], |r| r.get(0))
             .unwrap_or(0)
     };
-    let terms: Vec<(String, i64)> = ["the", "due", "of"]
+    let wanted: Vec<String> = settings
+        .only
+        .clone()
+        .unwrap_or_else(|| ["the", "due", "of"].map(str::to_owned).to_vec());
+    let terms: Vec<(String, i64)> = wanted
         .iter()
-        .map(|t| ((*t).to_owned(), doc(t)))
+        .map(|t| (t.clone(), doc(t)))
         .filter(|(_, d)| *d > 0)
         .collect();
     drop(probe);
