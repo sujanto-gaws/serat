@@ -11,11 +11,12 @@
 //! here, where a caller — `serat-app`, eventually, as one status fact with the
 //! list — can read it rather than infer a gap from a note that never appears.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// A vault-relative-ish path that could not become a [`VaultPath`], and why.
 ///
-/// `path` is the best available text for the offending entry — the OS path
+/// `path` is the best available text for the offending entry -- the OS path
 /// relative to the root when one exists, lossily rendered, because the whole
 /// point is to name a thing the strict type could not represent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,23 +27,28 @@ pub struct Refusal {
     pub reason: String,
 }
 
-/// How many refusals [`RefusalLog`] keeps before it starts dropping the oldest.
-///
-/// A vault refusing at a rate that would exhaust memory has a bigger problem
-/// than this log, so the log itself stays bounded (the same shape as
-/// [`crate::echo::EchoSuppressor`]) — "unbounded growth" turns into "unbounded
-/// but reported", which is design goal 5's own rule applied to this mechanism.
+/// How many distinct refused paths [`RefusalLog`] keeps. Past it, further new
+/// paths are counted in [`RefusalLog::overflowed`] but not stored: a vault
+/// refusing this many names has a bigger problem than this list, and the count
+/// still says so (design goal 5: reported, not silent).
 const CAPACITY: usize = 1000;
 
-/// A bounded, shareable log of [`Refusal`]s, accumulated across the walk and the
-/// watcher.
+#[derive(Debug, Default)]
+struct Inner {
+    by_path: BTreeMap<String, String>,
+    overflowed: usize,
+}
+
+/// A bounded, shareable record of refused paths, **one entry per file**.
 ///
-/// One log per open [`crate::Vault`] (like [`crate::echo::EchoSuppressor`]),
-/// because the walk and the watcher must both be able to add to the same list —
-/// a refusal the walk reported and the watcher reported again under a different
-/// count would be two mechanisms disagreeing about one fact.
+/// Keyed by path: a file refused on ten walks is one refusal, re-recording
+/// replaces the reason, and [`RefusalLog::clear`] (called at the start of every
+/// walk) makes the log describe the vault as the last walk found it, so a file
+/// that was renamed or deleted stops being reported. One log per open
+/// [`crate::Vault`], shared by the walk and the watcher. The library prints
+/// nothing: the data is returned and the application logs it.
 #[derive(Debug, Clone, Default)]
-pub struct RefusalLog(Arc<Mutex<Vec<Refusal>>>);
+pub struct RefusalLog(Arc<Mutex<Inner>>);
 
 impl RefusalLog {
     /// An empty log.
@@ -51,44 +57,57 @@ impl RefusalLog {
         Self::default()
     }
 
-    /// Record a refusal, and print it to stderr.
-    ///
-    /// The `eprintln!` is the whole of "logged" until `serat-app` wires this to a
-    /// real sink — deliberately no new dependency for that: `snapshot` and
-    /// `len` are the structured, testable surface, and stderr is a bound of
-    /// last resort so a refusal is visible even from a build that never reads
-    /// either.
-    pub(crate) fn record(&self, refusal: Refusal) {
-        eprintln!(
-            "serat-vault: refused to index {:?}: {}",
-            refusal.path, refusal.reason
-        );
-        let mut log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if log.len() >= CAPACITY {
-            log.remove(0);
-        }
-        log.push(refusal);
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Every refusal recorded so far, oldest first.
+    /// Record a refusal, replacing any earlier one for the same path.
+    pub(crate) fn record(&self, refusal: Refusal) {
+        let mut inner = self.lock();
+        if inner.by_path.len() >= CAPACITY && !inner.by_path.contains_key(&refusal.path) {
+            inner.overflowed += 1;
+            return;
+        }
+        inner.by_path.insert(refusal.path, refusal.reason);
+    }
+
+    /// Forget everything. A walk calls this first, because it is about to
+    /// re-discover every refusal that still applies.
+    pub(crate) fn clear(&self) {
+        let mut inner = self.lock();
+        inner.by_path.clear();
+        inner.overflowed = 0;
+    }
+
+    /// Every refused path, in path order.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Refusal> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.lock()
+            .by_path
+            .iter()
+            .map(|(path, reason)| Refusal {
+                path: path.clone(),
+                reason: reason.clone(),
+            })
+            .collect()
     }
 
-    /// How many refusals are recorded right now.
+    /// How many distinct paths are recorded right now.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.lock().by_path.len()
     }
 
     /// Whether nothing has been refused.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// How many further paths were refused after the log filled up.
+    #[must_use]
+    pub fn overflowed(&self) -> usize {
+        self.lock().overflowed
     }
 }
 
@@ -114,22 +133,43 @@ pub(crate) fn from_invalid_path(error: &serat_core::VaultError) -> Option<Refusa
 mod tests {
     use super::*;
 
+    fn refusal(path: &str, reason: &str) -> Refusal {
+        Refusal {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+
     #[test]
-    fn recording_beyond_capacity_drops_the_oldest() {
+    fn one_file_refused_many_times_is_one_entry_with_the_latest_reason() {
+        let log = RefusalLog::new();
+        for i in 0..10 {
+            log.record(refusal("a\\b.md", &format!("reason {i}")));
+        }
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.snapshot()[0].reason, "reason 9");
+    }
+
+    #[test]
+    fn clear_forgets_everything() {
+        let log = RefusalLog::new();
+        log.record(refusal("x.md", "r"));
+        log.clear();
+        assert!(log.is_empty());
+        assert_eq!(log.overflowed(), 0);
+    }
+
+    #[test]
+    fn past_capacity_new_paths_are_counted_not_stored_and_known_paths_still_update() {
         let log = RefusalLog::new();
         for i in 0..CAPACITY + 5 {
-            log.record(Refusal {
-                path: format!("note-{i}.md"),
-                reason: "test".to_owned(),
-            });
+            log.record(refusal(&format!("note-{i:05}.md"), "test"));
         }
         assert_eq!(log.len(), CAPACITY);
-        let snapshot = log.snapshot();
-        assert_eq!(snapshot.first().unwrap().path, "note-5.md");
-        assert_eq!(
-            snapshot.last().unwrap().path,
-            format!("note-{}.md", CAPACITY + 4)
-        );
+        assert_eq!(log.overflowed(), 5);
+        log.record(refusal("note-00000.md", "updated"));
+        assert_eq!(log.len(), CAPACITY);
+        assert_eq!(log.snapshot()[0].reason, "updated");
     }
 
     #[test]

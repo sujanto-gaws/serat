@@ -23,6 +23,8 @@ use crate::{Vault, ignore::is_note_file};
 /// same rule [`Vault::resolve`] enforces for a path that arrives without going through
 /// this walk at all (T-07).
 pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
+    // The refusal log describes the vault as this walk finds it (one entry per file).
+    vault.refusals().clear();
     let mut entries = Vec::new();
     let mut pending = vec![vault.root().to_path_buf()];
 
@@ -113,9 +115,11 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
 /// already canonical, and only after symlinks have been excluded. Anything arriving
 /// from outside the process goes through [`Vault::relativise`], which canonicalises.
 fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath, VaultError> {
-    let relative = path.strip_prefix(vault.root()).map_err(|_| VaultError::PathEscapesVault {
-        path: path.to_string_lossy().into_owned(),
-    })?;
+    let relative = path
+        .strip_prefix(vault.root())
+        .map_err(|_| VaultError::PathEscapesVault {
+            path: path.to_string_lossy().into_owned(),
+        })?;
     crate::vault_path_from_relative(Platform::current(), relative)
 }
 
@@ -193,6 +197,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn names_only_windows_would_refuse_are_indexed_on_this_platform() {
         // Task #34's regression, pinned at the walk level rather than only at
@@ -251,7 +256,11 @@ mod tests {
             "a literal backslash was silently split into a two-segment path: {found:?}"
         );
         let refusals = vault.refusals().snapshot();
-        assert_eq!(refusals.len(), 1, "the refusal was not reported: {refusals:?}");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "the refusal was not reported: {refusals:?}"
+        );
         assert!(
             refusals[0].reason.contains('\\'),
             "the reported reason does not explain the backslash: {refusals:?}"

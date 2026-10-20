@@ -48,7 +48,11 @@ impl Platform {
     /// The platform this binary is actually running on.
     #[must_use]
     pub const fn current() -> Self {
-        if cfg!(windows) { Self::Windows } else { Self::Other }
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
     }
 }
 
@@ -104,6 +108,12 @@ impl VaultPath {
             reason: reason.to_owned(),
         };
 
+        // A NUL ends a C string: every filesystem API in the stack would see a
+        // shorter name than the one validated here. No platform has such a name.
+        if raw.contains('\0') {
+            return Err(invalid("contains a NUL byte"));
+        }
+
         let unified = raw.replace('\\', "/");
         let mut segments = Vec::new();
         for segment in unified.split('/') {
@@ -120,7 +130,7 @@ impl VaultPath {
         // an absolute path arrived where a vault-relative one was required. A user
         // who pastes "C:\Users\..." made the same mistake regardless of what this
         // binary runs on, so this stays outside the `platform` gate below.
-        if unified.starts_with('/') || segments[0].ends_with(':') {
+        if unified.starts_with('/') || is_drive_letter(segments[0]) {
             return Err(invalid(
                 "is absolute; pass a path relative to the vault root",
             ));
@@ -213,6 +223,50 @@ impl VaultPath {
     }
 }
 
+/// `C:` -- one ASCII letter and a colon, the shape of a drive prefix. A looser test
+/// (any segment ending in `:`) refused a Linux root entry called `Notes:`.
+fn is_drive_letter(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// The reserved device names, case-insensitive, with or without an extension.
+pub(crate) const RESERVED: &[&str] = &[
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "CLOCK$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
 /// Whether a segment names a reserved Windows device, with or without an
 /// extension (`"NUL"` and `"NUL.txt"` both address the null device, never a
 /// file called that).
@@ -233,12 +287,6 @@ fn is_reserved_windows_name(segment: &str) -> bool {
     // renders 1/2/3 that way, and both spellings are reserved so a name copied
     // from a Windows error message is caught too. CONIN$, CONOUT$ and CLOCK$
     // round out the device list.
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM0", "COM1", "COM2", "COM3",
-        "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM\u{b9}", "COM\u{b2}", "COM\u{b3}",
-        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT\u{b9}",
-        "LPT\u{b2}", "LPT\u{b3}",
-    ];
     let stem = segment
         .split('.')
         .next()
@@ -403,7 +451,13 @@ mod tests {
         }
         // And the near-misses must not be caught by an over-eager match, on
         // either platform.
-        for ok in ["CONtent.md", "console.md", "NULL.md", "COM10.md", "LPT10.md"] {
+        for ok in [
+            "CONtent.md",
+            "console.md",
+            "NULL.md",
+            "COM10.md",
+            "LPT10.md",
+        ] {
             assert!(
                 VaultPath::new_for_platform(ok, Platform::Windows).is_ok(),
                 "rejected on Windows: {ok:?}"
@@ -423,7 +477,13 @@ mod tests {
         // ordinary, distinct filenames — a directory literally named "Misc." is
         // legal on Linux and macOS, and was one of the probe's three dropped
         // files under the regression this test now pins against returning.
-        for bad in ["note.md.", "note.md ", "dir./note.md", "dir /note.md", "Misc./n.md"] {
+        for bad in [
+            "note.md.",
+            "note.md ",
+            "dir./note.md",
+            "dir /note.md",
+            "Misc./n.md",
+        ] {
             assert!(
                 VaultPath::new_for_platform(bad, Platform::Windows).is_err(),
                 "accepted on Windows: {bad:?}"
@@ -435,6 +495,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nul_is_refused_on_every_platform() {
+        for platform in [Platform::Windows, Platform::Other] {
+            assert!(VaultPath::new_for_platform("a\0b.md", platform).is_err());
+            assert!(VaultPath::new_for_platform("a/b\0", platform).is_err());
+        }
+    }
+
+    #[test]
+    fn only_a_drive_letter_shape_counts_as_an_absolute_prefix_everywhere() {
+        assert!(VaultPath::new_for_platform("C:", Platform::Other).is_err());
+        assert!(VaultPath::new_for_platform("c:/x.md", Platform::Other).is_err());
+        // A root entry that merely ends in a colon is an ordinary name on Linux.
+        assert!(VaultPath::new_for_platform("Notes:/x.md", Platform::Other).is_ok());
+        assert!(VaultPath::new_for_platform("ab:/x.md", Platform::Other).is_ok());
+    }
+
+    #[test]
+    fn every_entry_of_the_reserved_table_is_refused_on_windows() {
+        for name in RESERVED {
+            for spelled in [
+                (*name).to_owned(),
+                name.to_lowercase(),
+                format!("{name}.md"),
+            ] {
+                assert!(
+                    VaultPath::new_for_platform(&spelled, Platform::Windows).is_err(),
+                    "accepted on Windows: {spelled:?}"
+                );
+                assert!(
+                    VaultPath::new_for_platform(&spelled, Platform::Other).is_ok(),
+                    "refused elsewhere: {spelled:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn the_probes_three_dropped_files_are_accepted_on_the_platform_that_can_have_them() {
         // The exact three names code-reviewer-2's probe found silently vanishing

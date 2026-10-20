@@ -406,6 +406,30 @@ mod tests {
         watcher.stop();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_name_is_recorded_not_queued() {
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::write(dir.path().join("a\\b.md"), b"# Odd\n").expect("write");
+
+        assert!(
+            eventually(|| !vault.refusals().is_empty()),
+            "the watcher never recorded the refusal"
+        );
+        assert_eq!(
+            vault.refusals().len(),
+            1,
+            "{:?}",
+            vault.refusals().snapshot()
+        );
+        assert_eq!(queue.depth(), 0, "a refused name was queued");
+        watcher.stop();
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn a_name_only_windows_would_refuse_reaches_the_queue_on_this_platform() {
         // Task #34's regression, at the watcher rather than only the walk: a

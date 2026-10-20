@@ -31,6 +31,8 @@ pub mod ignore;
 pub mod queue;
 pub mod refusal;
 pub mod walk;
+#[cfg(all(test, unix))]
+mod walk_refusal_tests;
 pub mod watch;
 
 use std::fs;
@@ -472,7 +474,14 @@ pub(crate) fn vault_path_from_relative(
     let joined = display(relative);
     if platform != Platform::Windows {
         for component in relative.components() {
-            let text = component.as_os_str().to_string_lossy();
+            let Some(text) = component.as_os_str().to_str() else {
+                // Lossy rendering would map two different non-UTF-8 names onto one
+                // string, and `VaultPath` is UTF-8 by construction.
+                return Err(VaultError::InvalidPath {
+                    path: joined,
+                    reason: "file name is not valid UTF-8".to_owned(),
+                });
+            };
             if text.contains('\\') {
                 return Err(VaultError::InvalidPath {
                     path: joined,
@@ -775,14 +784,8 @@ mod tests {
         // paths, independent of how the candidate was built. See
         // `resolve_segments_containment_check_is_reachable_directly` below for
         // the same check exercised end-to-end through `Vault::resolve_segments`.
-        assert!(!is_contained(
-            Path::new("/vault"),
-            Path::new("/etc/passwd")
-        ));
-        assert!(!is_contained(
-            Path::new("/vault"),
-            Path::new("C:Users")
-        ));
+        assert!(!is_contained(Path::new("/vault"), Path::new("/etc/passwd")));
+        assert!(!is_contained(Path::new("/vault"), Path::new("C:Users")));
         // A sibling directory that merely shares the root's text prefix is not
         // contained either — `Path::starts_with` is component-wise, and a naive
         // string-prefix reimplementation of this check would get this wrong.
@@ -832,6 +835,36 @@ mod tests {
         assert_eq!(vault.relativise(&absolute).expect("relativise"), path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn relativise_refuses_a_real_name_with_a_literal_backslash() {
+        // `a\b.md` is one file name on Unix; `VaultPath::new` would re-read it as
+        // `a/b.md`, aliasing a real file to a path nothing on disk has.
+        let (dir, vault) = vault();
+        let odd = dir.path().join("a\\b.md");
+        std::fs::write(&odd, b"x").expect("write");
+        let result = vault.relativise(&odd);
+        assert!(
+            matches!(result, Err(VaultError::InvalidPath { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relativise_refuses_a_name_that_is_not_utf8_rather_than_aliasing_it() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let (dir, vault) = vault();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        std::fs::write(&odd, b"x").expect("write");
+        let result = vault.relativise(&odd);
+        assert!(
+            matches!(result, Err(VaultError::InvalidPath { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn relativise_accepts_names_only_windows_would_refuse() {
         // Task #34's regression, at `relativise` directly: `aux.md`, a colon in
