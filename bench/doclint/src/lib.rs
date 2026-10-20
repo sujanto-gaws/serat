@@ -336,71 +336,54 @@ pub fn judge(citations: &[Citation], exists: impl Fn(&str) -> bool) -> Report {
     }
 }
 
-/// Environment variable that names the repository root explicitly.
-pub const ROOT_ENV: &str = "SERAT_REPO_ROOT";
-
-/// Repository root, resolved **at run time** (task #45).
-///
-/// The old rule was `env!("CARGO_MANIFEST_DIR")`, which is fixed when the binary
-/// is built. Several worktrees sharing one `CARGO_TARGET_DIR` reuse one binary,
-/// so the check silently read whichever tree built it (code-reviewer-2 got
-/// "88 Musts" on a branch whose PRD has 89). Precedence:
-///
-/// 1. `--root <dir>` / `--root=<dir>` on the command line;
-/// 2. the `SERAT_REPO_ROOT` environment variable;
-/// 3. the nearest ancestor of the current directory whose `Cargo.toml` declares
-///    a `[workspace]`;
-/// 4. the compile-time manifest location, only as a last resort.
-#[must_use]
-pub fn repo_root() -> PathBuf {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let env = std::env::var_os(ROOT_ENV).map(PathBuf::from);
-    let cwd = std::env::current_dir().ok();
-    resolve_root(&args, env.as_deref(), cwd.as_deref())
-}
-
-/// The pure form of [`repo_root`], so each rule is testable without touching
-/// process state.
-#[must_use]
-pub fn resolve_root(args: &[String], env: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--root" {
-            if let Some(v) = it.next() {
-                return PathBuf::from(v);
-            }
-        } else if let Some(v) = a.strip_prefix("--root=") {
-            return PathBuf::from(v);
-        }
-    }
-    if let Some(e) = env.filter(|p| !p.as_os_str().is_empty()) {
-        return e.to_path_buf();
-    }
-    if let Some(found) = cwd.and_then(workspace_root_above) {
-        return found;
-    }
-    compiled_root()
-}
-
-/// Nearest ancestor of `start` (inclusive) whose `Cargo.toml` has a
-/// `[workspace]` table.
-fn workspace_root_above(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find_map(|dir| {
-        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-        text.lines()
-            .any(|l| l.trim() == "[workspace]")
-            .then(|| dir.to_path_buf())
-    })
-}
+pub use reporoot::{ROOT_ENV, Resolved, Rule};
 
 /// Where this crate was built from. A fallback only: it is the wrong answer
 /// whenever the binary is reused from another checkout.
 fn compiled_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    reporoot::compiled_root(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Repository root and the rule that chose it, resolved **at run time** (tasks
+/// #45, #54). The rules and their precedence live in the `reporoot` crate, shared
+/// with `budget` and `vaultgen`: `--root`, `SERAT_REPO_ROOT`, a `[workspace]`
+/// manifest above the working directory, the compiled-in location.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn resolve_repo_root() -> Result<Resolved, String> {
+    reporoot::from_process(&compiled_root())
+}
+
+/// The pure form, so each rule is testable without touching process state.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn resolve_root(
+    args: &[String],
+    env: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<Resolved, String> {
+    reporoot::resolve_root(args, env, cwd, &compiled_root())
+}
+
+/// What every bin starts with: resolve the root and print `root: <path> (from
+/// <rule>)` as the first line of the report, so a run that fell back to the
+/// compiled-in checkout says so instead of silently reading the builder's tree.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn announce_root() -> Result<PathBuf, String> {
+    let r = resolve_repo_root()?;
+    println!("{}", r.report_line());
+    Ok(r.path)
+}
+
+/// Root for the in-crate tests, which read the real tree. A bad `--root` cannot
+/// reach them: the test harness does not take one.
+#[must_use]
+pub fn repo_root() -> PathBuf {
+    resolve_repo_root().map_or_else(|_| compiled_root(), |r| r.path)
 }
 
 /// Every markdown file the check scans: `docs/03-design/**.md` and

@@ -54,6 +54,7 @@ name = "p1-tree-path"
 path = "src/bin/p1-tree-path.rs"
 
 [dependencies]
+reporoot = { path = "../reporoot" }
 vaultgen = { path = "../vaultgen" }
 # Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
 # number the code under test reports -- the same argument as recomputing the

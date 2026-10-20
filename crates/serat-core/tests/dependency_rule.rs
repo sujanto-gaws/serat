@@ -72,7 +72,10 @@ const POLICY: &[(&str, &[&str])] = &[
     // crate does, and its determinism must not depend on another crate's PRNG staying
     // stable. Recorded here so that stops being a comment in its manifest and starts
     // being an assertion.
-    ("vaultgen", &[]),
+    // Its one internal edge is `reporoot` (task #54), the bench tier's shared "which
+    // checkout am I in" rule; reporoot itself depends on nothing.
+    ("vaultgen", &["reporoot"]),
+    ("reporoot", &[]),
     // The budget harness (task B2, NFR-PRF-08) has the opposite need: it cannot
     // measure a rebuild without linking the crates that perform one. That is not a
     // hole in the rule. The rule exists to keep the product graph acyclic, and a
@@ -82,7 +85,7 @@ const POLICY: &[(&str, &[&str])] = &[
     // resolve. It reads Markdown, not the product, and takes no dependency at
     // all -- the same reasoning as vaultgen: it must not need the product to
     // build in order to say something about the product's documentation.
-    ("doclint", &[]),
+    ("doclint", &["reporoot"]),
 ];
 
 /// What the budget harness may link.
@@ -103,13 +106,14 @@ const BUDGET_MAY_LINK: &[&str] = &[
     "serat-parse",
     "serat-index",
     "vaultgen",
+    "reporoot",
 ];
 
 /// Workspace members that are tools rather than product.
 ///
 /// The direction of the arrow is the whole point: a bench crate may depend on the
 /// product, and nothing in the product may depend on a bench crate.
-const BENCH_CRATES: &[&str] = &["vaultgen", "budget"];
+const BENCH_CRATES: &[&str] = &["vaultgen", "budget", "doclint", "reporoot"];
 
 /// External crates each product crate may **not** take, and why.
 ///
@@ -323,7 +327,14 @@ fn capability_violations(packages: &[Package]) -> Vec<String> {
 /// The tool-tier crates are here because the dependency rule governs the product graph
 /// and they sit outside it, which `nothing_in_the_product_depends_on_a_bench_crate`
 /// already enforces from the direction that matters.
-const NO_FORBID_LIST_YET: &[&str] = &["serat-core", "serat-app", "vaultgen", "budget", "doclint"];
+const NO_FORBID_LIST_YET: &[&str] = &[
+    "serat-core",
+    "serat-app",
+    "vaultgen",
+    "budget",
+    "doclint",
+    "reporoot",
+];
 
 #[test]
 fn every_crate_either_has_a_forbid_list_or_is_recorded_as_not_having_one() {
