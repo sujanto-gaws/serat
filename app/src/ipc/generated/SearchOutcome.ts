@@ -8,4 +8,4 @@ export type SearchOutcome = { "kind": "hits",
 /**
  * The hits.
  */
-items: Array<SearchHit>, } | { "kind": "nothing_to_search" } | { "kind": "too_many_property_terms" } | { "kind": "unbalanced_quote" };
+items: Array<SearchHit>, } | { "kind": "nothing_to_search" } | { "kind": "too_many_property_terms" } | { "kind": "unbalanced_quote" } | { "kind": "superseded" };
