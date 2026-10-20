@@ -7,6 +7,7 @@ import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
 import {
+  blockWidgetsExtension,
   blockWidgetsField,
   growthRegion,
   isImageTarget,
@@ -14,17 +15,23 @@ import {
   stripBlockquoteMarkers,
 } from "@/editor/blockWidgets";
 import { assetUrl, isSeratAssetUrl } from "@/editor/assetUrl";
+import { setResolutions } from "@/editor/linkState";
 import { seratMarkdown } from "@/editor/markdownLanguage";
+import type { LinkResolution } from "@/ipc/generated/LinkResolution";
 
-function makeState(doc: string, anchor = 0): EditorState {
+function resolution(target: string, path: string | null): LinkResolution {
+  return { target, path, subpath_found: null, via: "index" };
+}
+
+function makeState(doc: string, anchor = 0, resolutions: LinkResolution[] = []): EditorState {
   const state = EditorState.create({
     doc,
     selection: { anchor },
-    extensions: [seratMarkdown(), blockWidgetsField],
+    extensions: [seratMarkdown(), blockWidgetsExtension()],
   });
   ensureSyntaxTree(state, state.doc.length, 5000);
   // `create` may have parsed only a prefix; rebuild the field against the full tree.
-  return state.update({ selection: { anchor } }).state;
+  return state.update({ selection: { anchor }, effects: setResolutions.of(resolutions) }).state;
 }
 
 function widgets(state: EditorState): Array<{ from: number; to: number; widget: unknown; block: boolean }> {
@@ -68,7 +75,7 @@ describe("pure helpers", () => {
 describe("blockWidgetsField", () => {
   it("replaces a table, a callout and an image embed with widgets when the cursor is elsewhere", () => {
     const doc = `intro\n\n${TABLE}\n\n> [!note] Hi\n> body\n\nx ![[pic.png]] y\n\nend`;
-    const found = widgets(makeState(doc, 0));
+    const found = widgets(makeState(doc, 0, [resolution("pic.png", "assets/pic.png")]));
     expect(found).toHaveLength(3);
     expect(found.filter((w) => w.block)).toHaveLength(2);
     // The text itself is untouched (C-04).

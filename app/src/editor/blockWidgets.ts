@@ -35,6 +35,7 @@ import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemir
 import type { SyntaxNode } from "@lezer/common";
 
 import { assetUrl } from "@/editor/assetUrl";
+import { hasResolutionEffect, innerOfLinkNode, linkKey, parseLinkInner, resolutionsField } from "@/editor/linkState";
 import { selectedLineNumbers, type Span } from "@/editor/reveal";
 
 // ---------------------------------------------------------------------------
@@ -261,7 +262,8 @@ interface BlockDecoration {
   decoration: ReturnType<typeof Decoration.replace>;
 }
 
-function decorationForNode(doc: Text, node: SyntaxNode): BlockDecoration | null {
+function decorationForNode(state: EditorState, node: SyntaxNode): BlockDecoration | null {
+  const doc = state.doc;
   if (node.type.name === "Table") {
     const model = readTableModel(doc, node);
     return {
@@ -271,20 +273,24 @@ function decorationForNode(doc: Text, node: SyntaxNode): BlockDecoration | null 
     };
   }
   if (node.type.name === "SeratEmbed") {
-    const text = doc.sliceString(node.from, node.to);
-    const match = /^!\[\[([^\]|]+)(?:\|(\d+))?\]\]$/.exec(text);
-    if (match && isImageTarget(match[1])) {
-      // No resolver yet (task #22): the written name is NOT a vault path, so
-      // no URL is built from it; a labelled placeholder is shown instead.
-      return {
-        from: node.from,
-        to: node.to,
-        decoration: Decoration.replace({
-          widget: new ImageEmbedWidget(match[1].trim(), null, match[2] ?? null),
-        }),
-      };
-    }
-    return null;
+    // The URL is built from the RESOLVED vault path only (ADR-0017), never
+    // from the name as written: `![[pic.png]]` may live in any folder. Until
+    // the resolver has answered (or if it cannot find the file) the widget
+    // is a labelled placeholder, not a guessed or broken <img>.
+    const inner = innerOfLinkNode(doc.sliceString(node.from, node.to));
+    if (inner === null) return null;
+    const link = parseLinkInner(inner);
+    const resolution = state.field(resolutionsField, false)?.get(linkKey(link.target));
+    const resolvedPath = resolution?.path ?? null;
+    if (!isImageTarget(link.note) && !(resolvedPath !== null && isImageTarget(resolvedPath))) return null;
+    const width = link.display !== null && /^\d+$/.test(link.display.trim()) ? link.display.trim() : null;
+    return {
+      from: node.from,
+      to: node.to,
+      decoration: Decoration.replace({
+        widget: new ImageEmbedWidget(link.note || link.target, resolvedPath, width),
+      }),
+    };
   }
   if (node.type.name === "Blockquote") {
     const source = doc.sliceString(node.from, node.to);
@@ -329,7 +335,7 @@ function decorationsInRange(state: EditorState, from: number, to: number, select
           return; // any touched line reveals the whole construct's source
         }
       }
-      const built = decorationForNode(state.doc, node.node);
+      const built = decorationForNode(state, node.node);
       if (built) {
         results.push(built);
         return false; // do not also decorate nested nodes (e.g. a table's own cells)
@@ -456,6 +462,12 @@ export const blockWidgetsField = StateField.define<BlockWidgetState>({
     return buildAll(state);
   },
   update(value, tr) {
+    // Resolved paths arrived (or were refreshed): embed widgets depend on them
+    // and the answer can touch any embed in view, so rebuild once. This is an
+    // IPC-arrival event, not a keystroke.
+    if (hasResolutionEffect(tr.effects)) {
+      return buildAll(tr.state);
+    }
     if (
       !tr.docChanged &&
       tr.startState.selection.eq(tr.state.selection) &&
@@ -505,5 +517,5 @@ const widgetTheme = EditorView.baseTheme({
 });
 
 export function blockWidgetsExtension(): Extension {
-  return [blockWidgetsField, widgetTheme];
+  return [resolutionsField, blockWidgetsField, widgetTheme];
 }

@@ -12,6 +12,7 @@ import {
   redo,
   undo,
 } from "@codemirror/commands";
+import { acceptCompletion, closeCompletion, moveCompletionSelection, startCompletion } from "@codemirror/autocomplete";
 import type { Extension } from "@codemirror/state";
 import { keymap, type EditorView, type KeyBinding } from "@codemirror/view";
 
@@ -164,7 +165,41 @@ export function createEditorCommandRegistry(
     name: "Insert newline (continue Markdown list/quote)",
     defaultBinding: "Enter",
     when: "editor",
-    run: (view) => insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view),
+    // An open completion popup takes Enter first (accept), exactly as the
+    // autocompletion keymap would — but through this registry.
+    run: (view) => acceptCompletion(view) || insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view),
+  });
+
+  // Completion popup navigation: each key first drives the popup when one is
+  // open (the command returns false otherwise) and then falls through to the
+  // ordinary CodeMirror command for that key.
+  const defaultRuns = new Map<string, (view: EditorView) => boolean>();
+  for (const binding of defaultKeymap) {
+    if (binding.key && binding.run && !defaultRuns.has(binding.key)) defaultRuns.set(binding.key, binding.run);
+  }
+  const popupKeys: Array<[string, string, string, (view: EditorView) => boolean]> = [
+    ["ArrowDown", "editor.completion-next", "Next completion", moveCompletionSelection(true)],
+    ["ArrowUp", "editor.completion-previous", "Previous completion", moveCompletionSelection(false)],
+    ["PageDown", "editor.completion-page-next", "Next completion page", moveCompletionSelection(true, "page")],
+    ["PageUp", "editor.completion-page-previous", "Previous completion page", moveCompletionSelection(false, "page")],
+    ["Escape", "editor.completion-close", "Close completion", closeCompletion],
+  ];
+  for (const [key, id, name, popupRun] of popupKeys) {
+    const fallback = defaultRuns.get(key);
+    registry.register({
+      id,
+      name,
+      defaultBinding: key,
+      when: "editor",
+      run: (view) => popupRun(view) || (fallback ? fallback(view) : false),
+    });
+  }
+  registry.register({
+    id: "editor.start-completion",
+    name: "Show completions",
+    defaultBinding: "Ctrl-Space",
+    when: "editor",
+    run: startCompletion,
   });
   registry.register({
     id: "editor.markdown-delete-backward",
@@ -180,7 +215,21 @@ export function createEditorCommandRegistry(
   // Shared across both passthrough calls (and mutated by them) so a key
   // repeated between `historyKeymap` and `defaultKeymap`, or within either
   // array, is registered exactly once.
-  const seenKeys = new Set(["Mod-s", "Mod-Shift-m", "Mod-Enter", "Mod-z", "Mod-y", "Enter", "Backspace"]);
+  const seenKeys = new Set([
+    "Mod-s",
+    "Mod-Shift-m",
+    "Mod-Enter",
+    "Mod-z",
+    "Mod-y",
+    "Enter",
+    "Backspace",
+    "ArrowDown",
+    "ArrowUp",
+    "PageDown",
+    "PageUp",
+    "Escape",
+    "Ctrl-Space",
+  ]);
   registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys, platform);
   registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys, platform);
 

@@ -37,7 +37,12 @@ import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
 import { seratMarkdown } from "@/editor/markdownLanguage";
 import Preview from "@/editor/Preview.vue";
 import { blockWidgetsExtension } from "@/editor/blockWidgets";
+import { LinkResolver } from "@/editor/linkResolver";
+import { linkExtensions, linkNodeAt } from "@/editor/links";
+import { refreshLinks } from "@/editor/linkState";
 import { revealMarkersPlugin } from "@/editor/reveal";
+import { syntaxTree } from "@codemirror/language";
+import { defaultLinkIpc, type LinkIpcAdapter } from "@/ipc/linkAdapter";
 import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
 
 /** How long after the last keystroke an idle auto-save fires — ADR-0016 §2:
@@ -53,8 +58,10 @@ const props = withDefaults(
      * editor without losing the document, selection or undo history. */
     livePreview?: boolean;
     ipc?: EditorIpcAdapter;
+    /** `resolve_links` / `note_anchors` / `switcher_query` / `index://changed`. */
+    linkIpc?: LinkIpcAdapter;
   }>(),
-  { livePreview: true, ipc: () => defaultEditorIpc },
+  { livePreview: true, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
 
 const emit = defineEmits<{
@@ -63,6 +70,8 @@ const emit = defineEmits<{
   "toggle-live-preview": [];
   "wikilink-click": [target: string];
   "external-link-click": [url: string];
+  /** Follow-link command (FR-EDT-03): the host navigates. `path` is null when unresolved (offer to create). */
+  "follow-link": [target: FollowLinkTarget];
 }>();
 
 const host = ref<HTMLDivElement | null>(null);
@@ -104,6 +113,52 @@ function scheduleAutosave(): void {
   }, AUTOSAVE_IDLE_MS);
 }
 
+const resolver = new LinkResolver(props.linkIpc);
+let unlistenIndexChanged: (() => void) | null = null;
+
+export interface FollowLinkTarget {
+  /** As written, minus brackets and `|display`. */
+  target: string;
+  /** The `#Heading` / `^id` part, if any. */
+  subpath: string | null;
+  /** Resolved vault path, or null if unresolved. */
+  path: string | null;
+  subpathFound: boolean | null;
+  isEmbed: boolean;
+}
+
+/** Mod-Enter: a wikilink/embed under the cursor is resolved and handed to the
+ * host to open; an external URL goes to the system-opener event. Never
+ * navigates itself, never edits the document. */
+function followLinkUnderCursor(v: EditorView): boolean {
+  const pos = v.state.selection.main.head;
+  const node = linkNodeAt(v.state, pos);
+  if (node) {
+    const source = buffer?.path ?? null;
+    void (async () => {
+      const [answer] = source ? await resolver.resolve(source, [node.link.target]) : [];
+      emit("follow-link", {
+        target: node.link.target,
+        subpath: node.link.subpath,
+        path: answer?.path ?? null,
+        subpathFound: answer?.subpath_found ?? null,
+        isEmbed: node.isEmbed,
+      });
+    })();
+    return true;
+  }
+  for (let n: ReturnType<ReturnType<typeof syntaxTree>["resolveInner"]> | null = syntaxTree(v.state).resolveInner(pos, -1); n; n = n.parent) {
+    if (n.name === "URL") {
+      const url = v.state.sliceDoc(n.from, n.to);
+      if (/^https?:\/\//i.test(url)) {
+        emit("external-link-click", url);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 const registry = createEditorCommandRegistry({
   save: () => {
     void performSave(true); // an explicit command may retry a refused save
@@ -113,15 +168,7 @@ const registry = createEditorCommandRegistry({
     emit("toggle-live-preview");
     return true;
   },
-  followLink: () => {
-    // Task #22's scope (wikilink resolution / autocompletion) also owns
-    // "follow link under cursor" — the binding is registered here (it is
-    // part of #21's keymap surface, components.md §7) but does nothing yet
-    // rather than mis-navigating. Consuming the keystroke (returning
-    // `true`) is still correct: there is no sane default CodeMirror action
-    // for Mod-Enter to fall back to.
-    return true;
-  },
+  followLink: (v) => followLinkUnderCursor(v),
 });
 
 function buildExtensions(livePreview: boolean): Extension[] {
@@ -133,6 +180,7 @@ function buildExtensions(livePreview: boolean): Extension[] {
     EditorView.editable.of(!!buffer),
     seratMarkdown(),
     revealCompartment.of(livePreview ? liveExtensions : []),
+    ...linkExtensions({ ipc: props.linkIpc, resolver, getSourcePath: () => buffer?.path ?? null }),
     ...buildEditorExtensions(registry),
     EditorView.lineWrapping,
     EditorView.contentAttributes.of({ spellcheck: "false", "aria-label": "editor" }),
@@ -162,6 +210,20 @@ onMounted(() => {
     return;
   }
   const shadowRoot = host.value.attachShadow({ mode: "open" });
+  // `index://changed` is invalidation only (§3.4): drop cached resolutions and
+  // ask the links plugin to rescan the viewport.
+  props.linkIpc
+    .onIndexChanged(() => {
+      resolver.invalidate();
+      view?.dispatch({ effects: refreshLinks.of(null) });
+    })
+    .then((unlisten) => {
+      if (view) unlistenIndexChanged = unlisten;
+      else unlisten();
+    })
+    .catch(() => {
+      /* no event channel (tests, early boot): links resolve on the next scan only */
+    });
   view = new EditorView({
     parent: shadowRoot,
     state: EditorState.create({
@@ -172,6 +234,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  unlistenIndexChanged?.();
+  unlistenIndexChanged = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
   view?.destroy();
