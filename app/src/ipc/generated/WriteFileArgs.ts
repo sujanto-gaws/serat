@@ -14,10 +14,15 @@
  * *watcher* number. NFR-PRF-03 measures the save path of §3.1.1, which
  * arrives with the direct submit in I5.
  *
- * P0 writes a whole file because P0 has a text box and no views. The byte-range
- * patcher of ADR-0008 arrives in P2 as a separate command. This command never
- * becomes the write-back path — write-back patches a range and this replaces a
- * document, and conflating them is how C-04 gets broken by accident.
+ * **From P1 this command only creates notes** (`base_hash: None`). Editor saves
+ * go through `save_patch` (ADR-0016), because CodeMirror joins lines with `\n`
+ * and a whole-document save would rewrite every line ending of a CRLF note.
+ * `serat-app` refuses a `Some(base_hash)` here with `IpcError::NotWritable`
+ * once `save_patch` lands, so the old path cannot be reached by accident. The
+ * byte-range patcher of ADR-0008 (view write-back) arrives in P2 as another
+ * separate command. This command never becomes either path — both patch a
+ * range and this writes a document, and conflating them is how C-04 gets
+ * broken by accident.
  */
 export type WriteFileArgs = { 
 /**

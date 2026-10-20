@@ -41,6 +41,20 @@ ts-rs = "12.0.1"
 # the cold-start table). `dirs` is what knows where that is on three platforms.
 toml = "1.1.5"
 dirs = "6.0.0"
+# §9.3: opening an external link, a mailto link or (P2) a PDF's internal link
+# goes through the system opener, never a webview navigation (T-09). Scoped to
+# exactly http/https/mailto in capabilities/default.json -- narrower than the
+# plugin's own `default` permission set, which also grants `tel:` -- task #37.
+tauri-plugin-opener = "2.5.5"
+
+# Task #37: WebKitGTK's own `context-menu` signal is how the default
+# right-click menu is cancelled in release builds (nav_guard.rs); Tauri's
+# `PlatformWebview::inner()` already returns this exact type, so this pins
+# the version rather than adding a new API surface. Windows and macOS need
+# their own platform crates for the same job and are not implemented yet
+# (nav_guard.rs's doc comment) -- so there is nothing to add here for them.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+webkit2gtk = "2.0.2"
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -52,6 +66,8 @@ tauri-build = { version = "2.6.3", features = [] }
 # directly (§2.1 -- that is serat-index's job).
 [dev-dependencies]
 rusqlite = { workspace = true }
+# Test fixtures that clean up after themselves.
+tempfile = { workspace = true }
 
 # `tauri`'s "test" feature (`tauri::test`, `MockRuntime`) is a target-specific
 # dev-dependency rather than a plain one: `tests/acl_behaviour.rs` is

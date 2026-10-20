@@ -43,6 +43,13 @@ The tree crosses from Rust to the front end as a sequence of `DirListing { dir, 
 | `TreeUpsert { dir, entry, after }` | A file or directory created, or the new name of a rename | One entry. `after` names the sibling it follows (`None` = first), so the front end inserts without comparing names and cannot disagree with Rust's collation |
 | `TreeRemove { dir, name }` | A file or directory deleted, or the old name of a rename | One entry |
 
+**Rust guarantees two ordering properties on the stream, and the front end relies on them** (#24's review). Both concern a live message that arrives before or after the listing of the directory it names, which can happen while the initial population or a catch-up walk is still in progress.
+
+- **Any `DirListing` sent after a `TreeRemove` already reflects that remove.** A listing is built from the state at the time it is sent, never from a snapshot older than a remove already on the stream. So a removed entry cannot come back through a later listing.
+- **Any `TreeUpsert` into a directory whose `DirListing` has not been sent yet is superseded by that listing.** When the listing arrives it contains the upserted entry (if the entry still exists), and it replaces whatever the front end held for that directory.
+
+Given those two, the front end treats a `TreeRemove` for a directory it has no listing for as a no-op, and it may drop or keep an early `TreeUpsert`, because the listing that follows is authoritative either way. **These are serat-app's and serat-vault's obligations, not the front end's, and task #13 must test both in Rust**: a remove racing a pending listing, and an upsert racing a pending listing, each asserting the stream the front end would see.
+
 **A content change to an existing file sends nothing at all.** Saving a note in a 5,000-entry flat folder therefore costs the tree zero messages, which is what design goal 2 and NFR-PRF-02 need from it. An earlier draft of this ADR re-sent the whole parent listing on every watcher event, and that was a keystroke-adjacent cost proportional to folder size (lead's review of task #2).
 
 Listings travel on an **ordered, lossless per-session stream** (a Tauri `ipc::Channel` bound to the open-vault session), never on the throttled `index://` event bus: §3.4 already rules that throttled events are for invalidation, never for establishing that something has occurred, and a tree listing is data. The stream ends its initial population with `TreeComplete { entries, source }`, where `entries` is the count of file entries delivered and `source` is `index` or `walk`.

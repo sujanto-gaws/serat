@@ -26,7 +26,7 @@ owner: lead
 | 4 | `[P1/design] Specify the P1 read paths: note search, block backlinks, frontmatter lookup` | architect | 1 | **merged** b2d2f1c |
 | 5 | `[P1/design] Specify editor integration: reconciliation, links/embeds, command registry, split preview` | architect | — | **merged** d0d5300 |
 | 6 | `[P1/design] Specify assets, sidecars and the viewers' file-serving path` | architect | 1 | **merged** (this commit) |
-| 7 | `[P1/design] Cut the P1 subset of contracts/ipc.rs` | architect | 2–6 | pending |
+| 7 | `[P1/design] Cut the P1 subset of contracts/ipc.rs` | architect | 2–6 | **merged** be8baa7 |
 | 8 | `[P1/design] Write P1 screen specs and tokens` | frontend-designer | 3, 5 | **merged** 8fe20a3 |
 | 9 | `[P1/test] Budget jobs for FR-VLT-01 tree ≤2 s and FR-VLT-04 ≤500 ms` | test-engineer | 2 | pending |
 | 10 | `[P1/test] Budget jobs for the quick switcher (FR-NAV-01, NFR-PRF-06)` | test-engineer | 3 | pending |
@@ -53,6 +53,9 @@ owner: lead
 | 32 | `[P1/req] Amend FR-VLT-01 and NFR-PRF-02 to the owner-approved definitions` (PRD v1.6) | product-analyst | 2, 5 | in review |
 | 33 | `[P1/impl] Implement ADR-0016 patch-set application and edit-script in serat-vault` | rust-core-dev | 5 | pending |
 | 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | in progress |
+| 35 | `[P1/impl] Report, never drop, vault files whose names Serat refuses` — Windows-only name rules apply on Windows only; refused names are reported with a count (FR-VLT-01, NFR-SEC-06) | rust-core-dev | 34 | in progress |
+| 36 | `[P1/design] Correct ADR-0017's false remote-origin control claim` — real controls: (a) top-level navigation guard, (b) sandbox CSP on scheme responses, (c) app CSP `frame-src 'none'; object-src 'none'` + sanitiser | architect | 6 | **merged** |
+| 37 | `[P1/impl] Install the webview navigation guard, scope the opener to http/https/mailto, pin frame-src/object-src 'none', refuse downloads, disable release context menu` — implements controls (a) and (c) with tests (NFR-SEC-01, NFR-SEC-06, T-09, T-10) | tauri-app-dev | 5, 36 | in progress |
 
 Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
 

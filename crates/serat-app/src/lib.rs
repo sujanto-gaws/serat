@@ -46,7 +46,11 @@ mod acl_manifest;
 pub mod cli;
 pub mod commands;
 pub mod error;
+pub mod folder;
+pub mod gitignore;
 pub mod index;
+mod nav_guard;
+pub mod reads;
 mod security_config;
 pub mod settings;
 pub mod startup;
@@ -247,6 +251,12 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
     let setup_exit_code = Arc::clone(&exit_code);
 
     tauri::Builder::default()
+        // §9.3: opening an external link goes through the system opener, and
+        // only on an explicit click (vue-frontend-dev's side). This crate's
+        // job is registering the plugin and narrowing its capability grant
+        // (capabilities/default.json) to exactly http/https/mailto -- task
+        // #37 -- rather than the plugin's own wider `tel:`-including default.
+        .plugin(tauri_plugin_opener::init())
         .manage(Arc::clone(&state))
         .invoke_handler(tauri::generate_handler![
             commands::open_vault,
@@ -255,6 +265,16 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::refused_names,
+            commands::create_folder,
+            commands::get_ui_settings,
+            commands::set_live_preview,
+            commands::set_keybinding,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
+            commands::search,
+            commands::backlinks,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();
@@ -322,11 +342,74 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             // 3. Then the window.
             let geometry = settings_geometry();
-            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-                .title("Serat")
-                .inner_size(geometry.0, geometry.1)
-                .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
-                .build()?;
+            // §9.3 / task #37: read once, here, rather than inside the closure
+            // below -- `is_app_navigation_target` stays a pure function over
+            // its arguments, and `debug_assertions` is a property of this
+            // build regardless of what ships in the config (see that
+            // function's doc comment).
+            let dev_server_origin = app.config().build.dev_url.clone();
+            let window = WebviewWindowBuilder::new(
+                app,
+                MAIN_WINDOW_LABEL,
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("Serat")
+            .inner_size(geometry.0, geometry.1)
+            .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
+            // T-09, ADR-0017's correction (task #36): the only control
+            // keeping a top-level navigation off the app's own origin --
+            // including a `serat-asset://…` document, which Tauri
+            // classifies as local and would otherwise reach every
+            // command granted to `main` (nav_guard's doc comment).
+            .on_navigation(move |url| {
+                nav_guard::is_app_navigation_target(
+                    url,
+                    dev_server_origin.as_ref(),
+                    nav_guard::Platform::current(),
+                )
+            })
+            // §9.3: "window.open and new-window requests are refused the
+            // same way." One window in P1; nothing opens a second one.
+            .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+            // A browser-native download writes outside the vault, outside
+            // write_atomic, outside every containment check serat-vault
+            // owns (design goal 1, T-07). Nothing in P1 wants one.
+            .on_download(|_webview, event| {
+                !matches!(event, tauri::webview::DownloadEvent::Requested { .. })
+            })
+            .build()?;
+
+            // Task #37, release builds only: the native right-click menu offers
+            // "Open Link", "View Frame Source" and similar actions that exist
+            // outside every guard above -- a user picking "Open Link in New
+            // Window" from it would reach exactly the window on_new_window just
+            // refused, by a path this crate never sees. Left enabled in debug
+            // builds because it is how a developer reaches "Inspect Element"
+            // without a keybinding. Linux/WebKitGTK only today: WebView2's
+            // equivalent is `ICoreWebView2Settings::put_AreDefaultContextMenusEnabled`
+            // through unsafe COM calls, and WKWebView has no settings-level
+            // equivalent at all (it needs an NSView/WKUIDelegate override) --
+            // both are real, separate pieces of platform-specific work, named
+            // rather than silently left undone (task #37's report to the lead).
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            if !cfg!(debug_assertions) {
+                nav_guard::disable_default_context_menu(&window);
+            }
+            // `window` is read on Linux/BSD only, above; elsewhere consume it.
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
+            let _ = window;
 
             // Diagnostic only, and emphatically not "window visible": see
             // crate::startup for why the two are separate values.

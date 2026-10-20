@@ -33,10 +33,13 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    FileContents, FileWritten, IndexState, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs,
-    VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, GitignoreAppended,
+    GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError, KeybindingChange,
+    KeybindingOverride, NotePathArgs, OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs, RefusedName,
+    SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened,
+    WriteFileArgs,
 };
-use crate::settings::Settings;
+use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
 use crate::vault::{Stage, VaultThread};
 
@@ -105,6 +108,8 @@ struct OpenVault {
     /// thread has produced one (task #90; see `index::IndexHandleSlot`'s doc comment
     /// for the window in which this is still empty).
     index_handle: IndexHandleSlot,
+    /// The vault's one full-text search connection (§4.5 obligation 2).
+    search: Arc<crate::reads::SearchSlot>,
     /// Dropping this stops the watcher and the walk.
     _walk: VaultThread,
 }
@@ -247,11 +252,16 @@ impl AppState {
             "v{}",
             self.vaults_opened.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let publisher = Arc::new(Publisher::new(
-            vault_id.clone(),
-            Arc::clone(&self.startup),
-            Arc::clone(&self.events),
-        ));
+        let publisher = Arc::new(
+            Publisher::new(
+                vault_id.clone(),
+                Arc::clone(&self.startup),
+                Arc::clone(&self.events),
+            )
+            // FR-VLT-01: a name the walk or the watcher refused is counted into every
+            // status, so "N names not shown" is a fact of the status, not a second poll.
+            .with_refusals(vault.refusals().clone()),
+        );
 
         // §3.4's first `t_usable` precondition: the vault is not usable until the open
         // check has finished and the index state is *known*. The actor tells us by
@@ -281,6 +291,8 @@ impl AppState {
         // changing in the meantime is missed.
         let gate = Arc::clone(&self.startup);
         let startup = Arc::clone(&self.startup);
+        let walked = Arc::clone(&publisher);
+        let walked_refusals = vault.refusals().clone();
         let walk = VaultThread::spawn(
             Arc::clone(&vault),
             move || {
@@ -292,7 +304,16 @@ impl AppState {
                 // lost silently.
                 Stage::WatcherRegistered => startup.mark_watcher(WatcherOutcome::Registered),
                 Stage::WatcherFailed => startup.mark_watcher(WatcherOutcome::Failed),
-                Stage::WalkComplete(entries) => startup.mark_walk_complete(entries),
+                Stage::WalkComplete(entries) => {
+                    startup.mark_walk_complete(entries);
+                    // The walk clears the log and refills it, so the count is final
+                    // here and nothing else announces it (the index state does not
+                    // change when a name is refused). Only when there is something to
+                    // say: an ordinary vault emits nothing extra.
+                    if !walked_refusals.is_empty() {
+                        walked.re_emit();
+                    }
+                }
                 Stage::WalkStarted | Stage::WalkFailed => {}
             },
         )
@@ -312,6 +333,7 @@ impl AppState {
             publisher,
             _index: index,
             index_handle,
+            search: Arc::default(),
             _walk: walk,
         });
 
@@ -454,8 +476,226 @@ impl AppState {
                 vault_id: String::new(),
                 state: IndexState::Opening,
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
+                refused_names: None,
             },
         }
+    }
+
+    /// `get_ui_settings`. FR-PLT-05. The front end's slice of the settings file.
+    #[must_use]
+    pub fn get_ui_settings(&self) -> UiSettings {
+        let settings = self.lock_settings();
+        UiSettings {
+            live_preview: settings.editor.live_preview,
+            keybindings: settings
+                .keybindings
+                .iter()
+                .map(|(command_id, key)| KeybindingOverride {
+                    command_id: command_id.clone(),
+                    key: (!key.is_empty()).then(|| key.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// `set_live_preview`. FR-EDT-10, FR-PLT-05.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] if the settings file cannot be written; nothing changes then.
+    pub fn set_live_preview(&self, args: SetLivePreviewArgs) -> Result<(), IpcError> {
+        self.update_settings(|settings| {
+            settings.editor.live_preview = args.enabled;
+            Ok(())
+        })
+    }
+
+    /// `set_keybinding`. FR-PLT-05.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] for an empty, over-long or control-character id or key (a client
+    /// bug; the contract has no closer variant), or if the file cannot be written.
+    pub fn set_keybinding(&self, args: SetKeybindingArgs) -> Result<(), IpcError> {
+        let bad = |what: &str| IpcError::Io {
+            path: args.command_id.chars().take(MAX_BINDING_TEXT).collect(),
+            message: format!("{what} is not acceptable"),
+        };
+        let valid = |text: &str| {
+            !text.is_empty()
+                && text.chars().count() <= MAX_BINDING_TEXT
+                && !text.chars().any(char::is_control)
+        };
+        if !valid(&args.command_id) || args.command_id.chars().any(char::is_whitespace) {
+            return Err(bad("the command id"));
+        }
+        if let KeybindingChange::Set { key } = &args.change
+            && !valid(key)
+        {
+            return Err(bad("the key"));
+        }
+        self.update_settings(|settings| {
+            match &args.change {
+                KeybindingChange::Set { key } => {
+                    settings
+                        .keybindings
+                        .insert(args.command_id.clone(), key.clone());
+                }
+                KeybindingChange::Unbind => {
+                    settings
+                        .keybindings
+                        .insert(args.command_id.clone(), String::new());
+                }
+                KeybindingChange::Reset => {
+                    settings.keybindings.remove(&args.command_id);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Apply `change` to a copy, write it, and only then keep it: a failed write leaves
+    /// memory and file agreeing on the old value.
+    fn update_settings(
+        &self,
+        change: impl FnOnce(&mut Settings) -> Result<(), IpcError>,
+    ) -> Result<(), IpcError> {
+        let mut guard = self.lock_settings();
+        let mut next = guard.clone();
+        change(&mut next)?;
+        if let Some(path) = &self.settings_path {
+            next.save_to(path).map_err(|message| IpcError::Io {
+                path: path.display().to_string(),
+                message,
+            })?;
+        }
+        *guard = next;
+        Ok(())
+    }
+
+    fn lock_settings(&self) -> std::sync::MutexGuard<'_, Settings> {
+        self.settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `gitignore_offer_status`. NFR-CMP-04. See [`crate::gitignore`].
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open.
+    pub fn gitignore_offer_status(&self) -> Result<GitignoreOffer, IpcError> {
+        Ok(crate::gitignore::status(self.vault()?.root()))
+    }
+
+    /// `append_gitignore_entry`: the single named exception to T-06. Takes no path.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] as
+    /// [`crate::gitignore::append`].
+    pub fn append_gitignore_entry(&self) -> Result<GitignoreAppended, IpcError> {
+        crate::gitignore::append(self.vault()?.root())
+    }
+
+    /// `decline_gitignore_offer`. Writes only inside `.serat/`.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::append_gitignore_entry`].
+    pub fn decline_gitignore_offer(&self) -> Result<(), IpcError> {
+        crate::gitignore::decline(self.vault()?.root())
+    }
+
+    /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than
+    /// waiting (rule 1). Limits are the core's: `Reader::search` clamps (#15 ruling).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open.
+    pub fn search(&self, args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError> {
+        let (root, state, search) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(
+            state,
+            &root,
+            Some(&search),
+            |reader| {
+                reader
+                    .search(&args.query, args.offset, args.limit)
+                    .map(crate::reads::map_outcome)
+            },
+        ))
+    }
+
+    /// `backlinks`. FR-NAV-04.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PathEscapesVault`] for a bad path; [`IpcError::VaultNotFound`] with
+    /// no vault open.
+    pub fn backlinks(&self, args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
+        let path = Self::vault_path(&args.path)?;
+        let (root, state, _) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(
+            state,
+            &root,
+            None,
+            |reader| {
+                reader
+                    .backlinks(path.as_str())
+                    .map(|links| links.into_iter().map(crate::reads::map_backlink).collect())
+            },
+        ))
+    }
+
+    /// The root, the last published index state and the search slot, read without blocking.
+    fn read_context(
+        &self,
+    ) -> Result<(PathBuf, IndexState, Arc<crate::reads::SearchSlot>), IpcError> {
+        let guard = self.open_lock();
+        let open = guard.as_ref().ok_or_else(|| IpcError::VaultNotFound {
+            path: String::new(),
+        })?;
+        Ok((
+            open.vault.root().to_path_buf(),
+            open.publisher.status().state,
+            Arc::clone(&open.search),
+        ))
+    }
+
+    /// `create_folder`. FR-VLT-11, NFR-SEC-06. See [`crate::folder`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::folder::create_folder`], plus [`IpcError::VaultNotFound`] with no
+    /// vault open.
+    pub fn create_folder(&self, args: CreateFolderArgs) -> Result<FolderCreated, IpcError> {
+        crate::folder::create_folder(&*self.vault()?, &args.path)
+    }
+
+    /// `refused_names`. FR-VLT-01, design goal 5.
+    ///
+    /// The list behind `IndexStatus::refused_names`: a read of the open vault's
+    /// refusal log as it stands, ordered by path in byte order (the log is a
+    /// `BTreeMap`), one entry per distinct path, at most [`REFUSED_NAMES_CAP`]. It
+    /// never triggers a walk and never waits. Empty with no vault open. Entries
+    /// leave only at the next walk, which clears the log, so the list may name a file
+    /// that has since been deleted -- it is a report, never a path a command acts on.
+    #[must_use]
+    pub fn refused_names(&self) -> Vec<RefusedName> {
+        let Some(vault) = self.vault().ok() else {
+            return Vec::new();
+        };
+        vault
+            .refusals()
+            .snapshot()
+            .into_iter()
+            .take(REFUSED_NAMES_CAP as usize)
+            .map(|refusal| RefusedName {
+                path: refusal.path,
+                reason: refusal.reason,
+            })
+            .collect()
     }
 
     /// `mark_first_paint`. NFR-PRF-01, NFR-PRF-08 (F-397, task #113).
@@ -1657,5 +1897,347 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- refused names (FR-VLT-01, task #34, contracts/ipc.rs) ---------------------
+
+    #[cfg(unix)]
+    fn write_non_utf8_names(dir: &Path, count: usize) {
+        use std::os::unix::ffi::OsStrExt as _;
+        for i in 0..count {
+            let mut name = format!("caf{i:05}").into_bytes();
+            name.extend_from_slice(b"\xe9.md");
+            std::fs::write(dir.join(std::ffi::OsStr::from_bytes(&name)), b"x").expect("fixture");
+        }
+    }
+
+    #[test]
+    fn refused_names_is_none_with_no_vault_and_counts_from_zero_with_one() {
+        // `None` means "not counting"; it must never be confused with a count of zero,
+        // or the front end shows "0 names not shown" before any vault exists.
+        let bare = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        assert_eq!(bare.index_status().refused_names, None);
+        assert!(bare.refused_names().is_empty());
+
+        let dir = fixture("refused-zero");
+        let state = state(&dir);
+        assert_eq!(state.index_status().refused_names, Some(0));
+        assert!(state.refused_names().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_status_count_and_the_list_come_from_the_same_refusal_log() {
+        let dir = fixture("refused-some");
+        write_non_utf8_names(&dir, 3);
+        let state = state(&dir);
+        // The vault thread walks after the first paint; drive the walk directly so the
+        // test does not wait on that gate.
+        state.vault().expect("open").walk().expect("walk");
+
+        let status = state.index_status();
+        let list = state.refused_names();
+        assert_eq!(status.refused_names, Some(3), "{status:?}");
+        assert_eq!(list.len(), 3, "{list:?}");
+        let paths: Vec<&str> = list.iter().map(|r| r.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "the list is ordered by path in byte order");
+        assert!(list.iter().all(|r| !r.reason.is_empty()), "{list:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_count_and_the_list_saturate_at_the_cap_and_agree() {
+        // `RefusalLog::len()` is the number of distinct stored paths; `overflowed()`
+        // counts events past the cap and is deliberately not added. 1005 refused
+        // names must read as exactly REFUSED_NAMES_CAP in both places.
+        let dir = fixture("refused-cap");
+        write_non_utf8_names(&dir, REFUSED_NAMES_CAP as usize + 5);
+        let state = state(&dir);
+        let vault = state.vault().expect("open");
+        vault.walk().expect("walk");
+        assert!(
+            vault.refusals().overflowed() >= 5,
+            "the fixture did not overflow the log"
+        );
+
+        assert_eq!(state.index_status().refused_names, Some(REFUSED_NAMES_CAP));
+        assert_eq!(state.refused_names().len(), REFUSED_NAMES_CAP as usize);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_refused_file_leaves_the_list_only_at_the_next_walk() {
+        // The contract states this limit rather than hiding it: the list is a report,
+        // so it may name a file that is already gone until the walk clears the log.
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = fixture("refused-stale");
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"gone\xe9.md"));
+        std::fs::write(&odd, b"x").expect("fixture");
+        let state = state(&dir);
+        let vault = state.vault().expect("open");
+        vault.walk().expect("walk");
+        assert_eq!(state.refused_names().len(), 1);
+
+        std::fs::remove_file(&odd).expect("rm");
+        assert_eq!(
+            state.refused_names().len(),
+            1,
+            "the list is not re-walked by a read"
+        );
+        vault.walk().expect("walk");
+        assert!(state.refused_names().is_empty());
+        assert_eq!(state.index_status().refused_names, Some(0));
+    }
+
+    // -- index reads (FR-NAV-02, FR-NAV-04) -----------------------------------------
+
+    fn wait_ready(state: &AppState) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if matches!(state.index_status().state, IndexState::Ready { .. }) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the index never became Ready: {:?}", state.index_status());
+    }
+
+    #[test]
+    fn reads_with_no_vault_open_are_refused_by_name() {
+        let bare = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        let search = bare.search(SearchArgs {
+            query: "x".into(),
+            offset: 0,
+            limit: 10,
+        });
+        assert!(matches!(search, Err(IpcError::VaultNotFound { .. })));
+        let links = bare.backlinks(NotePathArgs {
+            path: "a.md".into(),
+        });
+        assert!(matches!(links, Err(IpcError::VaultNotFound { .. })));
+    }
+
+    #[test]
+    fn search_and_backlinks_answer_from_a_ready_index_in_the_contracts_terms() {
+        let dir = fixture("reads");
+        std::fs::write(dir.join("alpha.md"), "# Alpha\n\nsee [[beta]]\n").expect("fixture");
+        std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
+        let state = state(&dir);
+        wait_ready(&state);
+
+        let found = state
+            .search(SearchArgs {
+                query: "zebra".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        let IndexRead::Ready {
+            value: SearchOutcome::Hits { items },
+        } = found
+        else {
+            panic!("expected hits, got {found:?}");
+        };
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].path, "beta.md");
+        assert!(items[0].block.is_some() && items[0].snippet.is_some());
+
+        let nothing = state
+            .search(SearchArgs {
+                query: "\"unbalanced".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(matches!(
+            nothing,
+            IndexRead::Ready {
+                value: SearchOutcome::UnbalancedQuote
+            }
+        ));
+
+        let links = state
+            .backlinks(NotePathArgs {
+                path: "beta.md".into(),
+            })
+            .expect("backlinks");
+        let IndexRead::Ready { value } = links else {
+            panic!("expected ready, got {links:?}");
+        };
+        assert_eq!(value.len(), 1, "{value:?}");
+        assert_eq!(value[0].source_path, "alpha.md");
+        assert!(value[0].excerpt.contains("[[beta]]"), "{value:?}");
+
+        let bad = state.backlinks(NotePathArgs {
+            path: "../x.md".into(),
+        });
+        assert!(matches!(bad, Err(IpcError::PathEscapesVault { .. })));
+    }
+
+    #[test]
+    fn a_read_before_the_index_is_ready_reports_the_state_instead_of_waiting() {
+        // Rule 1. A scripted opener that never finishes keeps the state at `Opening`.
+        struct Never;
+        impl IndexOpen for Never {
+            fn open(&mut self, _: &Path, _: &Path, _: &dyn Fn(IndexState)) {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+        let dir = fixture("reads-not-ready");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                Never,
+            )
+            .expect("open");
+        let started = Instant::now();
+        let answer = state
+            .search(SearchArgs {
+                query: "x".into(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(
+                answer,
+                IndexRead::NotReady {
+                    state: IndexState::Opening
+                }
+            ),
+            "{answer:?}"
+        );
+    }
+
+    // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
+
+    fn settings_state(name: &str) -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.toml");
+        let mut state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        state.settings_path = Some(path.clone());
+        (state, path)
+    }
+
+    #[test]
+    fn ui_settings_default_to_live_preview_and_no_overrides() {
+        let (state, _) = settings_state("defaults");
+        let ui = state.get_ui_settings();
+        assert!(ui.live_preview);
+        assert!(ui.keybindings.is_empty());
+    }
+
+    #[test]
+    fn live_preview_and_keybindings_persist_through_the_toml_file() {
+        let (state, path) = settings_state("persist");
+        state
+            .set_live_preview(SetLivePreviewArgs { enabled: false })
+            .expect("set");
+        for (id, change) in [
+            (
+                "editor.toggle-bold",
+                KeybindingChange::Set {
+                    key: "Mod-b".into(),
+                },
+            ),
+            ("editor.toggle-italic", KeybindingChange::Unbind),
+            (
+                "editor.toggle-code",
+                KeybindingChange::Set {
+                    key: "Mod-e".into(),
+                },
+            ),
+            ("editor.toggle-code", KeybindingChange::Reset),
+        ] {
+            state
+                .set_keybinding(SetKeybindingArgs {
+                    command_id: id.into(),
+                    change,
+                })
+                .expect("set");
+        }
+
+        // A fresh process reads the same answer from the file.
+        let reloaded = Settings::load_from(&path);
+        assert!(reloaded.problem.is_none(), "{:?}", reloaded.problem);
+        let fresh = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            reloaded.settings,
+        );
+        let ui = fresh.get_ui_settings();
+        assert!(!ui.live_preview);
+        let by_id: Vec<(&str, Option<&str>)> = ui
+            .keybindings
+            .iter()
+            .map(|k| (k.command_id.as_str(), k.key.as_deref()))
+            .collect();
+        assert_eq!(
+            by_id,
+            vec![
+                ("editor.toggle-bold", Some("Mod-b")),
+                ("editor.toggle-italic", None),
+            ],
+            "unbound is Some-less None, and a reset leaves no entry"
+        );
+    }
+
+    #[test]
+    fn nonsense_bindings_are_refused_and_change_nothing() {
+        let (state, path) = settings_state("nonsense");
+        for (id, change) in [
+            ("", KeybindingChange::Unbind),
+            ("has space", KeybindingChange::Unbind),
+            ("ok.id", KeybindingChange::Set { key: String::new() }),
+            ("ok.id", KeybindingChange::Set { key: "a\nb".into() }),
+            ("x".repeat(500).leak(), KeybindingChange::Unbind),
+        ] {
+            let err = state
+                .set_keybinding(SetKeybindingArgs {
+                    command_id: id.into(),
+                    change,
+                })
+                .expect_err("refused");
+            assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        }
+        assert!(state.get_ui_settings().keybindings.is_empty());
+        assert!(!path.exists(), "a refused change wrote the file");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_value_in_memory() {
+        let (mut state, path) = settings_state("unwritable");
+        // A file where the directory should be makes the write fail.
+        std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap(), b"not a dir").unwrap();
+        state.settings_path = Some(path);
+        let err = state
+            .set_live_preview(SetLivePreviewArgs { enabled: false })
+            .expect_err("unwritable");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        assert!(state.get_ui_settings().live_preview);
     }
 }

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ipc::{IndexState, IndexStatus, RebuildReason};
+use crate::ipc::{IndexState, IndexStatus, REFUSED_NAMES_CAP, RebuildReason};
 use crate::startup::Startup;
 
 /// Minimum gap between two `index://status` emissions that do not change the kind of
@@ -69,6 +69,10 @@ pub struct StatusPublisher<S> {
     throttle: Duration,
     inner: Mutex<Published>,
     observer: Mutex<Option<Observer>>,
+    /// The open vault's refusal log, when this publisher belongs to one. Read at the
+    /// moment a status is built, so the count is never older than the poll or the
+    /// emission that carries it.
+    refusals: Option<serat_vault::RefusalLog>,
 }
 
 #[derive(Debug)]
@@ -132,7 +136,19 @@ impl<S: StatusSink> StatusPublisher<S> {
                 last_emit: None,
             }),
             observer: Mutex::new(None),
+            refusals: None,
         }
+    }
+
+    /// Count the names `refusals` holds into every status this publisher builds
+    /// (`IndexStatus::refused_names`, FR-VLT-01, task #34).
+    ///
+    /// Without it `refused_names` is `None`, which the contract defines as "not
+    /// counting" -- the right answer for a publisher with no vault behind it.
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: serat_vault::RefusalLog) -> Self {
+        self.refusals = Some(refusals);
+        self
     }
 
     /// Watch every published state, including the ones the throttle swallows.
@@ -156,13 +172,40 @@ impl<S: StatusSink> StatusPublisher<S> {
             vault_id: self.vault_id.clone(),
             state: inner.state.clone(),
             since_process_start_ms: inner.since_process_start_ms,
+            refused_names: self.refused_count(),
         }
+    }
+
+    /// `RefusalLog::len()`, saturating at [`REFUSED_NAMES_CAP`]; `None` with no log.
+    ///
+    /// `len()` is the count of distinct stored paths and the length of the
+    /// `refused_names` list. It is deliberately not added to `overflowed()`, which
+    /// counts refusal *events* past the cap (a path refused twice counts twice) and
+    /// would overstate the number of names. The log already stops storing at the
+    /// same cap, so the `min` is a belt over braces: the contract's "saturates at
+    /// 1000" holds even if the log's bound is later raised.
+    fn refused_count(&self) -> Option<u32> {
+        self.refusals.as_ref().map(|log| {
+            u32::try_from(log.len())
+                .unwrap_or(REFUSED_NAMES_CAP)
+                .min(REFUSED_NAMES_CAP)
+        })
     }
 
     /// The vault this publisher belongs to.
     #[must_use]
     pub fn vault_id(&self) -> &str {
         &self.vault_id
+    }
+
+    /// Emit the current state again, unthrottled, so a fact that is not part of the
+    /// state -- the refused-name count, which the walk changes while the state stays
+    /// `Ready` -- reaches a front end that only listens (invalidation, not proof:
+    /// `index_status()` is still what establishes it).
+    pub fn re_emit(&self) {
+        let status = self.status();
+        self.lock().last_emit = Some(Instant::now());
+        self.sink.emit(&status);
     }
 
     /// Publish a new state.
@@ -206,6 +249,7 @@ impl<S: StatusSink> StatusPublisher<S> {
                 vault_id: self.vault_id.clone(),
                 state: inner.state.clone(),
                 since_process_start_ms: inner.since_process_start_ms,
+                refused_names: self.refused_count(),
             }
         };
 

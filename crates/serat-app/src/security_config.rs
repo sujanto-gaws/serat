@@ -44,6 +44,7 @@ pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acl_manifest::permission_identifier;
     use serde_json::Value;
 
     /// `tauri.conf.json`, compiled in rather than read at test time.
@@ -114,36 +115,67 @@ mod tests {
              enforcement silently; confirmed with vue-frontend-dev that nothing in \
              app/src makes any other network-shaped call (F-423(c), #117)."
         );
+        assert!(
+            directives.contains(&"frame-src 'none'"),
+            "tauri.conf.json's CSP no longer pins frame-src to 'none' (was {csp:?}) — \
+             task #37, from the ADR-0017 correction review: WebView2's \
+             NavigationStarting event in wry only fires for main-frame navigation, so \
+             `on_navigation` (nav_guard.rs) never sees a navigation inside an <iframe>. \
+             A framed serat-asset:// (or any other) document would still be classified \
+             `Origin::Local` by Tauri and able to invoke every command granted to \
+             `main` (ADR-0017's correction), with no guard watching it. default-src \
+             'self' would fall back to permitting a same-origin frame; frame-src \
+             'none' is the only directive that forbids framing at all, from any origin, \
+             so it has to be explicit rather than left to the fallback."
+        );
+        assert!(
+            directives.contains(&"object-src 'none'"),
+            "tauri.conf.json's CSP no longer pins object-src to 'none' (was {csp:?}) — \
+             task #37: <object>/<embed> are another way to load a plugin-handled \
+             sub-document (including, on some engines, one served from a registered \
+             URI scheme) outside on_navigation's main-frame-only reach, and ADR-0017's \
+             own §Decision step 10 already forbids `object`/`embed` from rendered \
+             Markdown; this is the same rule enforced at the CSP layer rather than \
+             only by the sanitiser."
+        );
     }
 
     #[test]
-    fn capabilities_still_grant_exactly_core_default_and_the_five_adr_0012_commands() {
+    fn capabilities_still_grant_exactly_core_default_the_five_adr_0012_commands_and_opener() {
         // capabilities/default.json's own `description` says widening this list is a
         // threat-model decision, not a convenience. ADR-0012 widened it once, on
         // purpose, from ["core:default"] to core:default plus the five commands
-        // boot.js invokes; this pins the *new* narrow set so the next widening is
-        // equally deliberate. acl_manifest.rs checks the granted set against
-        // generate_handler! and build.rs directly — this test only guards against the
-        // list drifting silently within this one file.
+        // boot.js invokes; task #37 widened it a second time, on purpose, to a
+        // *scoped* opener grant (see the dedicated scope test below). This pins the
+        // *new* narrow set so the next widening is equally deliberate.
+        // acl_manifest.rs checks the app-command grant against generate_handler! and
+        // build.rs directly — this test only guards against the list drifting
+        // silently within this one file, for both command grants and scoped ones.
         let mut permissions: Vec<String> = capabilities_default()["permissions"]
             .as_array()
             .expect("capabilities/default.json must have a permissions array")
             .iter()
-            .map(|entry| {
-                entry
-                    .as_str()
-                    .expect("permission entries must be strings")
-                    .to_owned()
-            })
+            .map(permission_identifier)
             .collect();
         permissions.sort();
         let mut expected: Vec<String> = vec![
+            "allow-append-gitignore-entry",
+            "allow-backlinks",
+            "allow-decline-gitignore-offer",
+            "allow-gitignore-offer-status",
+            "allow-get-ui-settings",
+            "allow-set-keybinding",
+            "allow-set-live-preview",
+            "allow-create-folder",
             "allow-index-status",
             "allow-mark-first-paint",
             "allow-mark-vault-usable",
             "allow-read-file",
+            "allow-refused-names",
+            "allow-search",
             "allow-write-file",
             "core:default",
+            "opener:allow-open-url",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -152,10 +184,53 @@ mod tests {
         assert_eq!(
             permissions, expected,
             "capabilities/default.json's permissions are {permissions:?}, expected \
-             {expected:?} (ADR-0012's five commands plus core:default) — its own \
-             description says widening this is a threat-model decision; if that \
-             decision was made deliberately, update this assertion in the same commit \
-             as the reasoning"
+             {expected:?} (ADR-0012's five commands, core:default, and task #37's scoped \
+             opener grant) — its own description says widening this is a threat-model \
+             decision; if that decision was made deliberately, update this assertion in \
+             the same commit as the reasoning"
+        );
+    }
+
+    #[test]
+    fn the_opener_grant_is_scoped_to_exactly_http_https_and_mailto() {
+        // Task #37, §9.3, T-09: the opener plugin's own `default` permission set
+        // (tauri-plugin-opener-2.5.5/permissions/allow-default-urls.toml) also grants
+        // `tel:*` and reveal-in-file-explorer; Serat wants neither. This asserts the
+        // capability file grants the narrower, hand-scoped set instead of ever
+        // widening to the plugin's own `opener:default` -- a switch to `"opener:default"`
+        // would pass `capabilities_still_grant_exactly_core_default_the_five_adr_0012_commands_and_opener`
+        // if its expected set were updated carelessly to match, but this test reads the
+        // actual scope urls and would still catch `tel:*` arriving with it.
+        let permissions = capabilities_default()["permissions"]
+            .as_array()
+            .expect("capabilities/default.json must have a permissions array")
+            .clone();
+        let opener_entry = permissions
+            .iter()
+            .find(|entry| permission_identifier(entry) == "opener:allow-open-url")
+            .expect("capabilities/default.json must grant opener:allow-open-url");
+        let mut urls: Vec<String> = opener_entry["allow"]
+            .as_array()
+            .expect("the opener grant must carry an \"allow\" scope array")
+            .iter()
+            .map(|scope_entry| {
+                scope_entry["url"]
+                    .as_str()
+                    .expect("each opener scope entry must have a \"url\" string")
+                    .to_owned()
+            })
+            .collect();
+        urls.sort();
+        let mut expected: Vec<String> = vec!["http://*", "https://*", "mailto:*"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        expected.sort();
+        assert_eq!(
+            urls, expected,
+            "opener:allow-open-url's scope is {urls:?}, expected exactly {expected:?} — \
+             in particular this must never include \"tel:*\", which the plugin's own \
+             default permission set grants and Serat does not want"
         );
     }
 

@@ -29,6 +29,12 @@ cargo run --release -p budget --bin prf03-save-to-index -- --profile reference
 cargo run --release -p budget --bin prf01-cold-start   -- --profile reference
 ```
 
+The P1 read paths (search, backlinks, property lookup) have latency *expectations* in architecture §4.5 and no budget, so the `p1-read-paths` job in `.github/workflows/budgets.yml` reports (the text lands in the `p1-read-paths` artifact) and never fails the build on a miss. It also times a save of the highest in-degree note and of namesake-heavy notes, the link re-resolution cost NFR-PRF-03 will assert once `prf03-save-to-index` can run:
+
+```
+cargo run --release -p budget --bin p1-read-paths -- --vault 20k   # and --vault 50k
+```
+
 Record the machine conditions either side of a series with `cargo run --release -p budget --bin environment`; on Windows a run with the on-access virus scanner disabled is marked not gate eligible, because the gate figure has to be the one a user would see.
 
 All three are **red today, on purpose**: `serat-index` has no rebuild entry point (I4) or incremental save path (I5), and there is no application to start (D2, S1). Each prints the entry point it needs and the task that unblocks it. Documentation: `docs/05-testing/budget-harness.md`. CI: `.github/workflows/budgets.yml`, one job per budget.

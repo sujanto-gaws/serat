@@ -1,6 +1,9 @@
-//! Serat IPC contract — the P0 subset.
+//! Serat IPC contract — P0, plus the P1 subset (task #7).
 //!
-//! Serves:  FR-VLT-01, FR-VLT-02, FR-VLT-03, NFR-PRF-01, NFR-MNT-01, NFR-REL-02
+//! Serves:  FR-VLT-01, FR-VLT-02, FR-VLT-03, NFR-PRF-01, NFR-MNT-01, NFR-REL-02;
+//!          P1: FR-VLT-04, FR-VLT-05, FR-VLT-08, FR-NAV-01, FR-NAV-02, FR-NAV-04,
+//!          FR-NAV-06, FR-STR-03, FR-EDT-03, FR-EDT-10, FR-BIN-01, FR-BIN-02,
+//!          FR-BIN-03, FR-BIN-11, FR-BIN-12, NFR-CMP-04, NFR-USE-01
 //! Honours: ADR-0007 (generated TypeScript from Rust), ADR-0002 (rebuild, never
 //!          migrate), ADR-0001 (the index is reached through one actor; no
 //!          command handler ever opens it)
@@ -55,14 +58,44 @@
 //! Open a vault, read one file, write one file, and know what the index is
 //! doing. Four commands and one event. That is the whole surface.
 //!
-//! # What P1 adds, named so their absence reads as a decision
+//! # What P1 adds (task #7) — the section headed "P1" at the end of this file
 //!
-//! - `list_notes`, `search`, `resolve_link`, `backlinks` — the navigation surface.
-//! - `index://changed`, the throttled invalidation event of §3.1 step 6. P0 has
-//!   nothing to invalidate: the shell is one text box (task S2).
-//! - `ExternalChange` carrying the minimal edit script of §3.3. P0 reloads the
-//!   buffer instead, because P0 ships no editor a user could lose their place in.
-//! - Asset and extraction state (`ExtractionState`, FR-BIN-*).
+//! | Surface | Commands / channels / events | Design |
+//! |---|---|---|
+//! | File tree | `open_tree` + `Channel<TreeMessage>` (streaming), `mark_tree` | ADR-0015, §3.5 |
+//! | Creating notes and folders | `write_file` with `base_hash: None` (a note), `create_folder` (a folder) | FR-VLT-11, ADR-0016, T-07 |
+//! | Choosing a vault | `choose_vault` (native dialog, no path parameter) | T-08 |
+//! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change` | ADR-0016, §3.3 |
+//! | Invalidation | event `index://changed` (throttled, invalidation only) | §3.1 step 6 |
+//! | Switcher + link completion | `switcher_query` | §9.2 |
+//! | Search, property lookup | `search` | §4.5 R1/R3 |
+//! | Backlinks | `backlinks` | §4.5 R2 |
+//! | Links in the editor | `resolve_links` (batched per viewport), `note_anchors` | §9.3 |
+//! | Assets | `asset_info`; bytes via the `serat-asset` scheme (not a command); fallback `read_asset_range` (raw bytes) | §7.4, ADR-0017 |
+//! | Settings, command registry | `get_ui_settings`, `set_live_preview`, `set_keybinding` | §9.3, FR-PLT-05 |
+//! | Names the vault cannot show | `refused_names`; the count rides on `IndexStatus::refused_names` | FR-VLT-01, task #34 |
+//! | `.serat/` ignore offer | `gitignore_offer_status`, `append_gitignore_entry`, `decline_gitignore_offer` | NFR-CMP-04, T-06 |
+//!
+//! `write_file` stays, and in P1 its **only** job is creating a note: the editor
+//! saves through `save_patch` (ADR-0016). Extraction state (`ExtractionState`) is
+//! P2's, with extraction.
+//!
+//! **Streaming**, stated per surface because the front end must treat them
+//! differently: the tree is an ordered, lossless per-session `Channel`;
+//! `Channel::send` never blocks, so the transport guarantees ordering and
+//! nothing else. What bounds the backlog is ADR-0015 §2's batching (at most
+//! 256 KiB or 16 ms of walking per message), not the channel;
+//! `note://external-change` is an event (unthrottled, unordered against command
+//! responses — ADR-0016's ordering rule is what makes that safe);
+//! `index://changed` and `index://status` are throttled and are for invalidation,
+//! never for establishing that something happened (§3.4). Everything else is
+//! request/response.
+//!
+//! **ACL (ADR-0012).** Every P1 command above is granted to the `main` window in
+//! `capabilities/default.json`, and the app manifest names them all. `open_vault`
+//! stays withheld: a webview must not move the boundary T-07 guards, which is why
+//! a user-initiated open is `choose_vault`, whose only input is the user's choice
+//! in a native dialog.
 //!
 //! P2 adds the query surface — `run_query`, streamed rows, cell anchors and
 //! write-back; P4 the proposal queue. None of them changes a type below. They
@@ -215,10 +248,15 @@ pub struct FileContents {
 /// *watcher* number. NFR-PRF-03 measures the save path of §3.1.1, which
 /// arrives with the direct submit in I5.
 ///
-/// P0 writes a whole file because P0 has a text box and no views. The byte-range
-/// patcher of ADR-0008 arrives in P2 as a separate command. This command never
-/// becomes the write-back path — write-back patches a range and this replaces a
-/// document, and conflating them is how C-04 gets broken by accident.
+/// **From P1 this command only creates notes** (`base_hash: None`). Editor saves
+/// go through `save_patch` (ADR-0016), because CodeMirror joins lines with `\n`
+/// and a whole-document save would rewrite every line ending of a CRLF note.
+/// `serat-app` refuses a `Some(base_hash)` here with `IpcError::NotWritable`
+/// once `save_patch` lands, so the old path cannot be reached by accident. The
+/// byte-range patcher of ADR-0008 (view write-back) arrives in P2 as another
+/// separate command. This command never becomes either path — both patch a
+/// range and this writes a document, and conflating them is how C-04 gets
+/// broken by accident.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct WriteFileArgs {
@@ -269,7 +307,64 @@ pub struct IndexStatus {
     /// is the application's, not the harness's.
     #[ts(type = "number")]
     pub since_process_start_ms: u64,
+    /// How many file names in this vault the walk and the watcher could not turn
+    /// into a vault path and so do not show (task #34's `Vault::refusals()`;
+    /// mostly Windows-only name rules: `:`, device names, a trailing dot or
+    /// space). FR-VLT-01, design goal 5: a file Serat cannot show is reported,
+    /// never silently absent. The front end renders it as one status fact, "N
+    /// names not shown", and fetches the list behind it with `refused_names`.
+    ///
+    /// The count is of distinct paths: `RefusalLog::len()`, the length of the
+    /// `refused_names` list. It saturates at [`REFUSED_NAMES_CAP`], and at the
+    /// cap the front end says "1000 or more". It does not add
+    /// `RefusalLog::overflowed()`. That counter counts refusal events past the
+    /// cap, not distinct paths, because an unstored path the watcher refuses
+    /// twice is counted twice. Adding it would overstate the number of names.
+    /// `None` (absent on the wire) means serat-app is not counting yet, or no
+    /// vault is open. It never means zero, so the front end shows nothing for
+    /// it rather than "0 names not shown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub refused_names: Option<u32>,
 }
+
+/// The most refused names the log holds, the status counts and `refused_names`
+/// returns. It matches serat-vault's `RefusalLog` bound (task #34). The log keeps
+/// the first 1000 distinct paths, and counts later new ones in `overflowed()`
+/// without storing them, so memory stays bounded on a vault full of names one
+/// platform cannot hold.
+pub const REFUSED_NAMES_CAP: u32 = 1000;
+
+/// `refused_names() -> Vec<RefusedName>`
+///
+/// Serves FR-VLT-01 (design goal 5). The list behind `IndexStatus::refused_names`:
+/// every file name the walk or the watcher refused, with the reason, at most
+/// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
+/// distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
+/// watcher sees it change) replaces its reason rather than adding an entry.
+/// **Entries leave only at the next walk**, which clears the log and refills it.
+/// A refused file that is deleted or renamed away stays listed until then, so
+/// the list can name a file that is already gone. That is accepted, because
+/// the list is a report, never a path a command acts on.
+/// **A read, not a
+/// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
+/// An empty list when nothing was refused or no vault is open. Granted to `main`
+/// in the ACL (ADR-0012). It takes no argument and reveals only names inside the
+/// open vault, which the user can already see in their own file manager.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RefusedName {
+    /// The name as found on disk, relative to the vault root, `/`-separated.
+    /// It is not a `VaultPath`, because it failed to become one. It is for
+    /// display only and is never passed back to a command.
+    pub path: String,
+    /// Why it was refused, for the user (for example "contains a `:`, which is
+    /// a drive prefix or an NTFS alternate data stream on Windows").
+    pub reason: String,
+}
+
+/// The command name for [`RefusedName`]'s list.
+pub const REFUSED_NAMES_COMMAND: &str = "refused_names";
 
 // ============================================================================
 // Events
@@ -406,6 +501,11 @@ pub enum RebuildReason {
 /// | `Io`                | `IpcError::Io`                              |
 /// | `AtomicWriteFailed` | `IpcError::Io`                              |
 /// | `Watcher`           | never reaches a command; reported as status   |
+/// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
+/// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
+///
+/// The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
+/// §2). Until it merges, no `VaultError` produces either `IpcError`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -467,6 +567,33 @@ pub enum IpcError {
         current_hash: String,
     },
 
+    /// A `save_patch` whose ranges are out of order, overlapping, or outside the
+    /// base's lines or columns (P1, ADR-0016). A client bug, never a conflict:
+    /// the file is untouched.
+    InvalidPatch {
+        /// Vault-relative path.
+        path: String,
+        /// What was wrong, for the log.
+        message: String,
+    },
+
+    /// A `save_patch` that is well formed but would delete the bytes between a
+    /// lone `\r` and a `\n` in a mixed-ending note, so the two would fuse into
+    /// one `\r\n` and swallow a line (P1, ADR-0016 §2). **Not a client bug,
+    /// and not a conflict**: the edit is one the user can legitimately make, and
+    /// the only byte-preserving outcome is to refuse it. The file is untouched
+    /// and the buffer stays dirty. The front end shows a clear, user-facing
+    /// error naming the line: the note mixes line-ending styles there, and the
+    /// user can edit that line differently or normalise the note's endings in
+    /// another tool. A save that is refused this way is never retried
+    /// automatically, because it would be refused again.
+    LineEndingsWouldFuse {
+        /// Vault-relative path.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
+    },
+
     /// The operating system refused.
     Io {
         /// Vault-relative path, or the best available description of the target.
@@ -475,3 +602,892 @@ pub enum IpcError {
         message: String,
     },
 }
+
+// ============================================================================
+// P1 (task #7)
+// ============================================================================
+//
+// Every command below is scoped to the open vault, like the P0 ones. Each one
+// that reads the index returns `IndexRead::NotReady` rather than waiting (rule
+// 1). Integer fields that are 64-bit carry `#[ts(type = "number")]` (rule 5).
+// Positions in a note are ADR-0016's `Pos`: 0-based line, UTF-16 column.
+
+// ---------------------------------------------------------------------------
+// Shared
+// ---------------------------------------------------------------------------
+
+/// The answer of any command that reads the index. Rule 1: no command waits for
+/// the index; one that needs it says what the index is doing instead.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum IndexRead<T> {
+    /// The index is `Ready` and this is its answer.
+    Ready {
+        /// The answer.
+        value: T,
+    },
+    /// The index is not `Ready`. Render the state; retry on `index://status`.
+    NotReady {
+        /// What the index is doing.
+        state: IndexState,
+    },
+}
+
+/// A position in a note: ADR-0016's one coordinate system. `line` is 0-based;
+/// `col` counts UTF-16 code units within the line (CodeMirror's unit). Lines
+/// split on `\r\n`, `\n` and a lone `\r`, exactly as CodeMirror splits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Pos {
+    /// 0-based line.
+    pub line: u32,
+    /// UTF-16 code units from the start of the line.
+    pub col: u32,
+}
+
+/// One replacement, in the coordinates of a named base. Used in both
+/// directions: a save sends them (`SavePatchArgs`), an external change
+/// receives them (`ExternalChange::Changed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Patch {
+    /// Start of the replaced range, in base coordinates.
+    pub from: Pos,
+    /// End of the replaced range (exclusive), in base coordinates.
+    pub to: Pos,
+    /// Replacement text. A `\n` in it is written as the note's own line ending
+    /// (ADR-0016 §2 step 3); the front end never writes `\r`.
+    pub insert: String,
+}
+
+/// A half-open range of UTF-16 code units in a string, for highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Span {
+    /// First code unit.
+    pub start: u32,
+    /// One past the last code unit.
+    pub end: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Choosing a vault (T-08)
+// ---------------------------------------------------------------------------
+
+/// `choose_vault() -> Result<Option<VaultOpened>, IpcError>`
+///
+/// Serves FR-VLT-01. Opens the operating system's folder picker from Rust and,
+/// if the user picks a folder, opens it exactly as `open_vault` does; `None` if
+/// the user cancelled. **Takes no path**, which is the point: `open_vault`
+/// moves the boundary T-07 guards and stays withheld from the webview
+/// (ADR-0012), and this command moves it only to where the user pointed in a
+/// native dialog. The FR-VLT-01 clock (ADR-0015 §3) starts when it returns.
+pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
+
+/// Arguments to `create_folder`.
+///
+/// `create_folder(args: CreateFolderArgs) -> Result<FolderCreated, IpcError>`
+///
+/// Serves FR-VLT-11 (US-41), the folder half. A note is created through
+/// `write_file` with `base_hash: None`. A folder has no content, so it does not
+/// go through `write_file`: ADR-0016 restricts that command to creating notes, and
+/// creating a placeholder file to make a folder exist would write something the
+/// user did not ask for (goal 1).
+///
+/// The T-07 boundary is the same as every other command that takes a path:
+/// - `path` becomes a `VaultPath` under task #34's rules, or it is refused as
+///   `IpcError::PathEscapesVault`;
+/// - it is resolved through `Vault::resolve`, which refuses a symlink component;
+/// - **a path that is, or is inside, an ignored directory** (`.serat/`,
+///   `.obsidian/`, `.git/`, ...), **compared case-insensitively**, is refused as
+///   `IpcError::NotWritable`. On macOS and Windows `.Obsidian/x` lands in
+///   `.obsidian/`, so an exact comparison would let it through. NFR-CMP-01 keeps
+///   `.obsidian/` untouched, and `.serat/` is the index's;
+/// - **after `create_dir`, the new directory is canonicalised and must
+///   `starts_with` the canonical root.** If it does not, it is removed with
+///   `remove_dir` and the call returns `IpcError::PathEscapesVault`. Between the
+///   resolve and the `create_dir`, a parent could be swapped for a symlink, and
+///   the directory would then land outside the vault (NFR-SEC-06). This check
+///   closes that window, except that an empty directory can exist outside the
+///   vault for the moment before it is removed. That residue is stated rather
+///   than hidden. **The `AlreadyExists` branch checks containment too** and
+///   returns `IpcError::PathEscapesVault` if it fails, **but it never removes
+///   anything**. `remove_dir` runs only on a directory this call created. If a
+///   parent was swapped for a symlink to a place that already holds an empty
+///   directory of that name, that directory is not Serat's to delete (goal 1).
+///   serat-app's hostile suite swaps a parent for a symlink between resolve and
+///   create, in two cases. (a) The target name is absent outside: the test
+///   asserts the refusal and the removal. (b) An empty directory of that name
+///   already exists outside: the test asserts `PathEscapesVault` and that the
+///   outside directory still exists afterwards.
+///
+/// It creates exactly one directory. **The parent must already exist**
+/// (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
+/// folders. It writes no file content. **It is idempotent**: an existing
+/// directory at `path` returns `created: false` and changes nothing. A file
+/// already at `path` is `IpcError::Io`. The front end picks a unique name
+/// first, as it does for notes, and **compares names case-insensitively** when
+/// it does, because macOS and Windows file systems do. The tree shows the new folder through
+/// ADR-0015's live `Upsert` from the watcher, with no rebuild, and it is an empty
+/// folder (FR-VLT-01's gated mark does not count it). The index is not
+/// touched, because the index has no rows for folders. Granted to `main` in the
+/// ACL (ADR-0012).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CreateFolderArgs {
+    /// Vault-relative, `/`-separated path of the folder to create.
+    pub path: String,
+}
+
+/// The command name for [`CreateFolderArgs`].
+pub const CREATE_FOLDER_COMMAND: &str = "create_folder";
+
+/// A `create_folder` that succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FolderCreated {
+    /// `false` when the directory already existed and nothing was done.
+    pub created: bool,
+}
+
+// ---------------------------------------------------------------------------
+// File tree (ADR-0015, §3.5) — streaming
+// ---------------------------------------------------------------------------
+
+/// `open_tree(on_message: Channel<TreeMessage>) -> Result<(), IpcError>`
+///
+/// Serves FR-VLT-01, FR-VLT-04, FR-VLT-08, FR-BIN-03. Starts delivering the
+/// open vault's tree on a Tauri `ipc::Channel`: ordered and lossless, bound to
+/// this session, **never** the throttled event bus (a listing is data, not an
+/// invalidation — §3.4). Returns immediately. Calling it again (a reload)
+/// replaces the channel and re-sends the whole tree from the root.
+///
+/// Message order: the root `Listing` alone first, then further `Listing`s
+/// breadth-first, then `Complete`; afterwards any mix of `Upsert`, `Remove`,
+/// differing catch-up `Listing`s and, once, `WalkSettled`.
+///
+/// **Two ordering obligations on Rust (ADR-0015 §1), which the front end relies
+/// on.** (1) Any `Listing` sent after a `Remove` already reflects that `Remove`.
+/// (2) Any `Upsert` into a directory whose `Listing` has not been sent yet is
+/// superseded by that `Listing`. So the front end treats a `Remove` for a
+/// directory it has no listing for as a no-op. serat-app and serat-vault keep
+/// both, and task #13 tests both in Rust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum TreeMessage {
+    /// The complete, final-order contents of one directory. Replaces any
+    /// earlier listing for `dir`. The front end never sorts.
+    Listing {
+        /// Vault-relative directory; `""` is the root.
+        dir: String,
+        /// Display order: directories first, then files, case-folded by name.
+        entries: Vec<TreeEntry>,
+    },
+    /// One entry created (or the new name of a rename). Insert after `after`.
+    Upsert {
+        /// Parent directory.
+        dir: String,
+        /// The entry. Replaces an existing entry of the same name.
+        entry: TreeEntry,
+        /// The sibling this entry follows; `None` = first in `dir`. Decided in
+        /// Rust so the front end never compares names.
+        after: Option<String>,
+    },
+    /// One entry deleted (or the old name of a rename). Removing a directory
+    /// removes its whole subtree from the model.
+    Remove {
+        /// Parent directory.
+        dir: String,
+        /// Entry name.
+        name: String,
+    },
+    /// The initial population is complete. The front end stamps
+    /// `TreeMark::Complete` after painting it.
+    Complete {
+        /// File entries delivered — every file the ignore rules admit. The
+        /// budget job compares it with the vault manifest (ADR-0015 §3).
+        entries: u32,
+        /// Which source populated the tree.
+        source: TreeSource,
+    },
+    /// The authoritative walk has finished: every catch-up listing and every
+    /// empty folder has been sent. Reported, never gated (ADR-0015 §3).
+    WalkSettled {
+        /// Empty folders the walk added after `Complete`.
+        empty_folders: u32,
+    },
+}
+
+/// One entry in a directory listing. Deliberately no size or mtime: the tree
+/// shows neither, and an entry carrying them would change on every save.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TreeEntry {
+    /// File or directory name, no path.
+    pub name: String,
+    /// What it is.
+    pub kind: TreeEntryKind,
+    /// `true` when this asset has a sidecar note (`<name>.md`, ADR-0005) that
+    /// is folded into this entry and not listed separately (FR-BIN-03). Always
+    /// `false` for notes and directories.
+    pub sidecar: bool,
+}
+
+/// Kind of a tree entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TreeEntryKind {
+    /// A Markdown note.
+    Note,
+    /// Any other file (FR-VLT-08).
+    Asset,
+    /// A directory.
+    Dir,
+}
+
+/// Which source produced the initial population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TreeSource {
+    /// One read of the `Ready` index.
+    Index,
+    /// The breadth-first streaming walk.
+    Walk,
+}
+
+/// Arguments to `mark_tree`.
+///
+/// `mark_tree(args: MarkTreeArgs) -> ()`
+///
+/// The front end's two FR-VLT-01 marks (ADR-0015 §3), stamped on the Rust
+/// monotonic clock like `mark_first_paint`: after the tree component's
+/// post-flush watcher for the commit, on the second `requestAnimationFrame`.
+/// `FirstScreen` is also NFR-PRF-01's tree precondition (ADR-0015 §5).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MarkTreeArgs {
+    /// Which mark.
+    pub mark: TreeMark,
+    /// File entries the front-end model holds at this mark; the budget job
+    /// checks it against the manifest at `Complete`.
+    pub entries_in_model: u32,
+}
+
+/// The two tree marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TreeMark {
+    /// Root listing applied and painted.
+    FirstScreen,
+    /// `TreeMessage::Complete` applied and painted.
+    Complete,
+}
+
+// ---------------------------------------------------------------------------
+// Editor buffers (ADR-0016, §3.3)
+// ---------------------------------------------------------------------------
+
+/// Arguments to `note_opened`, `note_closed` and `request_external_diff`.
+///
+/// `note_opened(args: NoteBufferArgs) -> Result<(), IpcError>`
+/// `note_closed(args: NoteBufferArgs) -> ()`
+/// `request_external_diff(args: NoteBufferArgs) -> Result<Option<ExternalChange>, IpcError>`
+///
+/// Serves FR-VLT-05, FR-NAV-01. `note_opened` tells `serat-app` that an editor
+/// pane holds this note at this base, so it keeps the base bytes and emits
+/// `note://external-change` for it (ADR-0016 §3); it also records one open in
+/// `.serat/history.json` for the switcher's frecency (§9.2). It is called for a
+/// note opened in an editor pane **only** — never for an embed, a preview or a
+/// search snippet. `note_closed` releases the base.
+///
+/// `request_external_diff` is ADR-0016 §2's recovery path: the front end
+/// dropped an `ExternalChange` whose `base_hash` did not match, or a save came
+/// back `StaleHash` (which **always** calls it). `serat-app` diffs
+/// `base_hash`'s bytes against the disk as it is now; `None` means the disk
+/// equals the base. When `serat-app` no longer holds the bytes for
+/// `base_hash`, the answer is `IpcError::StaleHash` with the current disk hash
+/// — never a guessed diff — and the front end takes the conflict path
+/// (ADR-0016 §2, §4).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NoteBufferArgs {
+    /// Vault-relative path.
+    pub path: String,
+    /// The hash of the text the buffer is based on (`FileContents::hash`, or
+    /// the last `FileWritten::hash` / `ExternalChange::Changed::new_hash`).
+    pub base_hash: String,
+}
+
+/// Arguments to `save_patch`.
+///
+/// `save_patch(args: SavePatchArgs) -> Result<FileWritten, IpcError>`
+///
+/// Serves FR-VLT-03, NFR-REL-01, C-04. The editor's only save (ADR-0016 §2):
+/// patches in base coordinates, applied by serat-vault to the base bytes under
+/// the hash lock, re-hashed immediately before the rename. Errors: `StaleHash`
+/// (leave the buffer dirty, no blind retry — wait for or request the
+/// `ExternalChange`), `InvalidPatch` (a client bug; the file is untouched),
+/// `LineEndingsWouldFuse` (a deletion in a mixed-ending note would fuse a lone
+/// `\r` with a `\n`; shown to the user, the file is untouched, never retried),
+/// `NotWritable` (not Markdown, rule 3). On success `serat-app` moves its
+/// recorded base for this note to the new hash.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SavePatchArgs {
+    /// Vault-relative path of an existing Markdown note.
+    pub path: String,
+    /// The hash the patches are expressed against.
+    pub base_hash: String,
+    /// Ordered, non-overlapping patches in base coordinates. May be empty (a
+    /// no-op that still checks the hash).
+    pub patches: Vec<Patch>,
+}
+
+/// Arguments to `rebase_buffer`.
+///
+/// `rebase_buffer(args: RebaseBufferArgs) -> Result<Vec<Patch>, IpcError>`
+///
+/// ADR-0016 §4's *Keep mine*. Sent once, on that explicit action, with the
+/// whole buffer text. `serat-app` checks that `disk_hash` is the file's current
+/// hash (otherwise `StaleHash`), then serat-vault computes the edit script from
+/// the disk text to `buffer` — the same function as `ExternalChange` — and it
+/// returns those patches in **disk** coordinates. The front end then makes the
+/// disk text its base and those patches its pending changes, so the next
+/// `save_patch` turns the disk into exactly the buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RebaseBufferArgs {
+    /// Vault-relative path.
+    pub path: String,
+    /// The disk hash the user chose to keep their text over.
+    pub disk_hash: String,
+    /// The buffer's full text, as CodeMirror holds it.
+    pub buffer: String,
+}
+
+/// Event `note://external-change`, and the answer of `request_external_diff`.
+///
+/// Emitted for a note some editor pane holds when the disk bytes no longer
+/// equal its base (ADR-0016 §3). **Not throttled**, and **not ordered against
+/// command responses**: the front end applies it only when `base_hash` equals
+/// its current base, holds it while a save is in flight, and otherwise drops
+/// it and calls `request_external_diff` (ADR-0016 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExternalChange {
+    /// The file changed on disk.
+    Changed {
+        /// Session scope; discard if it is not the open vault.
+        vault_id: String,
+        /// Vault-relative path.
+        path: String,
+        /// The base the edits are expressed against.
+        base_hash: String,
+        /// The disk hash after the edits; the new base once applied.
+        new_hash: String,
+        /// Minimal edit script, base coordinates, ordered. When `whole` is
+        /// true it is one edit covering the whole document (§3.3 fallback).
+        edits: Vec<Patch>,
+        /// The diff exceeded half the file; position is not preserved.
+        whole: bool,
+    },
+    /// The file was deleted on disk. Keep the buffer; saving recreates it via
+    /// `write_file` with `base_hash: None`.
+    Deleted {
+        /// Session scope.
+        vault_id: String,
+        /// Vault-relative path.
+        path: String,
+    },
+}
+
+/// The external-change event name. Not throttled.
+pub const EXTERNAL_CHANGE_EVENT: &str = "note://external-change";
+
+// ---------------------------------------------------------------------------
+// Invalidation (§3.1 step 6)
+// ---------------------------------------------------------------------------
+
+/// Event `index://changed`: something in the index changed. Throttled to ten
+/// per second and coalesced. **Invalidation only**: open views, link caches and
+/// backlinks re-query; nothing may treat it as proof that a particular write
+/// was indexed (§3.4).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IndexChanged {
+    /// Session scope.
+    pub vault_id: String,
+    /// Monotonic per session; results from an older generation are stale.
+    #[ts(type = "number")]
+    pub generation: u64,
+}
+
+/// The invalidation event name.
+pub const INDEX_CHANGED_EVENT: &str = "index://changed";
+
+// ---------------------------------------------------------------------------
+// Quick switcher and link completion (§9.2, §9.3)
+// ---------------------------------------------------------------------------
+
+/// Arguments to `switcher_query`.
+///
+/// `switcher_query(args: SwitcherQueryArgs) -> SwitcherResults`
+///
+/// Serves FR-NAV-01, NFR-PRF-06, FR-EDT-03. Never fails and never waits:
+/// before the index is `Ready` it answers from the tree's paths
+/// (`corpus: Tree`). The newest `seq` wins; `serat-app` discards an older query
+/// still waiting, and the front end drops any response whose `seq` is not its
+/// latest.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SwitcherQueryArgs {
+    /// Increases with every keystroke.
+    pub seq: u32,
+    /// As typed. A `#` switches to heading mode (§9.2); empty returns the most
+    /// frecent notes.
+    pub query: String,
+    /// At most 50.
+    pub limit: u16,
+}
+
+/// Results of one switcher query.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SwitcherResults {
+    /// Echo of the query's `seq`.
+    pub seq: u32,
+    /// What the answer was computed from.
+    pub corpus: SwitcherCorpus,
+    /// Ranked, best first, one per note.
+    pub items: Vec<SwitcherItem>,
+}
+
+/// The corpus an answer came from (goal 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SwitcherCorpus {
+    /// Titles, paths, aliases and headings from the `Ready` index.
+    Index,
+    /// Paths and file names only, from the tree, before the index is `Ready`.
+    Tree,
+}
+
+/// One switcher result.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SwitcherItem {
+    /// Vault-relative path of the note.
+    pub path: String,
+    /// `notes.title`, when known.
+    pub title: Option<String>,
+    /// Which candidate matched.
+    pub matched: SwitcherMatch,
+    /// The matched candidate's text (a title, an alias, a path or a heading).
+    pub candidate: String,
+    /// Matched ranges in `candidate`, for highlighting.
+    pub highlight: Vec<Span>,
+    /// The heading, when `matched` is `Heading`.
+    pub heading: Option<HeadingRef>,
+    /// The shortest link text that resolves back to this note (§9.3), without
+    /// brackets — what link completion inserts.
+    pub link_text: String,
+}
+
+/// Which candidate of a note matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SwitcherMatch {
+    /// Frontmatter title, H1 or file name.
+    Title,
+    /// A frontmatter alias.
+    Alias,
+    /// The vault-relative path.
+    Path,
+    /// A heading (heading mode).
+    Heading,
+}
+
+/// A heading inside a note.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HeadingRef {
+    /// Heading text.
+    pub text: String,
+    /// Byte offset of the heading block as indexed; map with ADR-0016's
+    /// function when opening (the note may have changed since).
+    #[ts(type = "number")]
+    pub byte_start: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Search and property lookup (§4.5 R1, R3)
+// ---------------------------------------------------------------------------
+
+/// Arguments to `search`.
+///
+/// `search(args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError>`
+///
+/// Serves FR-NAV-02 (note bodies; FR-NAV-08 is P2), FR-STR-03, FR-BIN-02. The
+/// query is free text, `"phrases"` and at most one `[key:value]` (§4.5); it is
+/// parsed in Rust into one of three fixed statements and never reaches FTS5 as
+/// syntax.
+///
+/// **At most one full-text search is in flight per open vault** (§4.5, #15
+/// ruling). A query with free text (R1, or R1 + R3) runs on serat-index's one
+/// dedicated search connection, which is not part of the read pool. Each
+/// full-text search does four things in order:
+/// 1. it increments the vault's search generation (an `AtomicU64`) and keeps
+///    the new value;
+/// 2. it calls `interrupt()` through rusqlite's `get_interrupt_handle()`;
+/// 3. it takes the connection's lock, and returns `SearchOutcome::Superseded`
+///    without running a statement if the generation has moved on, so a queued
+///    stale search never runs;
+/// 4. it runs, while a `progress_handler` on that connection interrupts the
+///    statement as soon as the generation is no longer its own, so an interrupt
+///    that arrived before the statement started is not lost.
+///
+/// The handler is a callback, not an SQL function, so C-03 holds. Every older
+/// call returns `SearchOutcome::Superseded` rather than an error. serat-app
+/// waits for the lock inside `spawn_blocking`, off the async executor. So a
+/// superseded 230-560 ms search never holds a pooled connection that backlinks or a property lookup
+/// is waiting for. A property-only query (R3) runs on the pool and is never
+/// interrupted, and neither are `backlinks` or any other read. The front end
+/// also drops any response that is not for its latest request.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SearchArgs {
+    /// As typed.
+    pub query: String,
+    /// Hits to skip.
+    pub offset: u32,
+    /// At most 50 when the query has free text (R1, R1 + R3), and at most 500
+    /// for a property-only `[key:value]` query (R3), which returns all 500 in
+    /// one statement rather than ten pages (architecture.md §4.5, ruled on task
+    /// #15's measurement). serat-index clamps to the ceiling for the statement
+    /// the query selects. It is not an error to exceed it.
+    pub limit: u16,
+}
+
+/// What a search produced. Degenerate input is an outcome, never an error.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SearchOutcome {
+    /// Hits, best first. Empty is a valid answer.
+    Hits {
+        /// The hits.
+        items: Vec<SearchHit>,
+    },
+    /// The query tokenised to nothing.
+    NothingToSearch,
+    /// More than one `[key:value]` term.
+    TooManyPropertyTerms,
+    /// An unbalanced `"`. The search panel does not submit one; this answers
+    /// one that arrives anyway, without running a statement (§4.5).
+    UnbalancedQuote,
+    /// A newer full-text search interrupted this one (`SQLITE_INTERRUPT` on the
+    /// search connection). It is not an error, it is never shown to the user, and
+    /// the front end discards it, because it has already sent the newer request.
+    Superseded,
+}
+
+/// One search or property-lookup hit.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SearchHit {
+    /// Vault-relative path. For a sidecar hit, the **asset's** path (FR-BIN-02).
+    pub path: String,
+    /// Note title, when known.
+    pub title: Option<String>,
+    /// `note` or `asset`.
+    pub kind: TreeEntryKind,
+    /// For an asset hit, its MIME type.
+    pub mime: Option<String>,
+    /// For an asset hit, the sidecar note that matched.
+    pub sidecar_path: Option<String>,
+    /// The matching block for a full-text hit; `None` for a property-only hit.
+    pub block: Option<BlockLocation>,
+    /// Snippet with matches delimited by U+0002 … U+0003. Build text nodes only
+    /// (T-09); the delimiters can also occur in note text, harmlessly.
+    pub snippet: Option<String>,
+}
+
+/// Where a block is, as indexed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BlockLocation {
+    /// `blocks.id`, stable until the note is re-indexed.
+    #[ts(type = "number")]
+    pub block_id: i64,
+    /// Position of the block in the note.
+    pub ord: u32,
+    /// Heading breadcrumb, when inside a section.
+    pub heading_path: Option<String>,
+    /// Byte range of the block as indexed.
+    #[ts(type = "number")]
+    pub byte_start: u64,
+    /// End of that range.
+    #[ts(type = "number")]
+    pub byte_end: u64,
+    /// `notes.hash` the range was indexed from. If the file's hash differs when
+    /// it is opened, locate by `ord` and mark the location approximate (§4.5).
+    pub note_hash: String,
+}
+
+// ---------------------------------------------------------------------------
+// Backlinks and anchors (§4.5 R2, §9.3)
+// ---------------------------------------------------------------------------
+
+/// Arguments to `backlinks` and `note_anchors`.
+///
+/// `backlinks(args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError>`
+/// `note_anchors(args: NotePathArgs) -> Result<IndexRead<NoteAnchors>, IpcError>`
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NotePathArgs {
+    /// Vault-relative path of the target note.
+    pub path: String,
+}
+
+/// One backlink entry: one per distinct (source note, source block), FR-NAV-04.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Backlink {
+    /// Vault-relative path of the linking note.
+    pub source_path: String,
+    /// Its title, when known.
+    pub source_title: Option<String>,
+    /// The linking block; `None` when the link is in frontmatter.
+    pub block: Option<BlockLocation>,
+    /// Block text, cut to 300 characters in Rust; empty for frontmatter.
+    pub excerpt: String,
+}
+
+/// What `[[note#` and `[[note^` complete against (§9.3).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NoteAnchors {
+    /// Heading texts, in document order.
+    pub headings: Vec<String>,
+    /// Block ids (`^id`), in document order.
+    pub block_ids: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Link resolution in the editor (§9.3)
+// ---------------------------------------------------------------------------
+
+/// Arguments to `resolve_links`.
+///
+/// `resolve_links(args: ResolveLinksArgs) -> Vec<LinkResolution>`
+///
+/// Serves FR-EDT-03, NFR-CMP-01. One call per viewport change, all targets at
+/// once. Never fails and never waits: before `Ready` it resolves file names
+/// against the tree (`via: Tree`). Same rule as the index's resolver:
+/// case-insensitive, exact path first, then file name with shortest path.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ResolveLinksArgs {
+    /// The note the links are written in (for `[[#Heading]]`).
+    pub source_path: String,
+    /// Link targets as written, without brackets or `|display` text.
+    pub targets: Vec<String>,
+}
+
+/// How one link target resolved.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LinkResolution {
+    /// The target as sent.
+    pub target: String,
+    /// The note or asset it names; `None` = unresolved.
+    pub path: Option<String>,
+    /// For a `#heading` or `^block` subpath: whether it exists in the target;
+    /// `None` when there is no subpath or it cannot be checked yet.
+    pub subpath_found: Option<bool>,
+    /// What answered.
+    pub via: SwitcherCorpus,
+}
+
+// ---------------------------------------------------------------------------
+// Assets (§7.4, ADR-0017)
+// ---------------------------------------------------------------------------
+
+/// The custom scheme viewer bytes come through (ADR-0017). Not a command and
+/// not in the command ACL: `serat-asset://localhost/<percent-encoded path>`,
+/// or `http://serat-asset.localhost/<path>` on Windows (`useHttpsScheme:
+/// false`). GET/HEAD only, PDF and images only, spans capped at 1,000 KiB.
+pub const ASSET_SCHEME: &str = "serat-asset";
+
+/// Arguments to `asset_info` and `read_asset_range`'s path.
+///
+/// `asset_info(args: AssetArgs) -> Result<AssetInfo, IpcError>`
+///
+/// Serves FR-BIN-01, FR-BIN-11, FR-BIN-12. A vault operation, not an index
+/// read: MIME from the extension table, size from a stat, so pdf.js gets its
+/// `length` before the index is `Ready`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AssetArgs {
+    /// Vault-relative path.
+    pub path: String,
+}
+
+/// An asset's metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AssetInfo {
+    /// Vault-relative path.
+    pub path: String,
+    /// From `serat-core`'s one extension table.
+    pub mime: String,
+    /// Size on disk.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// Whether the scheme will serve it (PDF or image).
+    pub viewable: bool,
+    /// Its sidecar note, if one exists (ADR-0005, byte-exact name).
+    pub sidecar_path: Option<String>,
+}
+
+/// Arguments to `read_asset_range`, ADR-0017 §Fallback only.
+///
+/// `read_asset_range(args: ReadAssetRangeArgs) -> Result<ArrayBuffer, IpcError>`
+///
+/// Returns **raw bytes** (`tauri::ipc::Response`), which arrive in JavaScript
+/// as an `ArrayBuffer`, not JSON. Granted only on a platform whose webview will
+/// not deliver a custom-scheme 206; applies the scheme's steps 2–7 and its span
+/// cap.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ReadAssetRangeArgs {
+    /// Vault-relative path.
+    pub path: String,
+    /// First byte.
+    #[ts(type = "number")]
+    pub start: u64,
+    /// Bytes wanted; served up to 1,000 KiB.
+    pub len: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Settings and the command registry (§9.3, FR-PLT-05, FR-NAV-06, NFR-USE-01)
+// ---------------------------------------------------------------------------
+
+/// `get_ui_settings() -> UiSettings`
+///
+/// The front end's slice of the settings TOML (FR-PLT-05). The command registry
+/// itself lives in the front end; Rust stores only the user's overrides, keyed
+/// by command id.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UiSettings {
+    /// `editor.live_preview`; `false` selects split preview (FR-EDT-10).
+    pub live_preview: bool,
+    /// User rebindings, `[keybindings]` in the TOML.
+    pub keybindings: Vec<KeybindingOverride>,
+}
+
+/// One user rebinding.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KeybindingOverride {
+    /// Registry id, e.g. `editor.toggle-bold`.
+    pub command_id: String,
+    /// CodeMirror key notation (`Mod-b`); `None` = deliberately unbound.
+    pub key: Option<String>,
+}
+
+/// Arguments to `set_live_preview`.
+///
+/// `set_live_preview(args: SetLivePreviewArgs) -> Result<(), IpcError>`
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SetLivePreviewArgs {
+    /// The new value.
+    pub enabled: bool,
+}
+
+/// Arguments to `set_keybinding`.
+///
+/// `set_keybinding(args: SetKeybindingArgs) -> Result<(), IpcError>`
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SetKeybindingArgs {
+    /// Registry id.
+    pub command_id: String,
+    /// What to do with it.
+    pub change: KeybindingChange,
+}
+
+/// A rebinding.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum KeybindingChange {
+    /// Bind to this key (CodeMirror notation).
+    Set {
+        /// The key.
+        key: String,
+    },
+    /// Leave the command with no binding.
+    Unbind,
+    /// Remove the override; the registry default applies again.
+    Reset,
+}
+
+// ---------------------------------------------------------------------------
+// The `.serat/` ignore offer (NFR-CMP-04, T-06)
+// ---------------------------------------------------------------------------
+
+/// `gitignore_offer_status() -> GitignoreOffer`
+///
+/// Serves NFR-CMP-04. Whether to show the offer to add `/.serat/` to the
+/// vault's ignore file. "Don't ask again" persists in `.serat/prefs.json`,
+/// which is safe under C-02: losing the file only shows the offer again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum GitignoreOffer {
+    /// There is no repository directory at the vault root; nothing to offer.
+    NotAGitRepo,
+    /// The root ignore file already has a line ignoring `.serat` (`.serat`,
+    /// `.serat/`, `/.serat` or `/.serat/`).
+    AlreadyIgnored,
+    /// The user chose "Don't ask again".
+    Declined,
+    /// Show the offer.
+    Offer,
+}
+
+/// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`
+///
+/// The one write in P1 that is not a Markdown note: **the single named
+/// exception to T-06**. Takes **no path**. It appends exactly the line
+/// `/.serat/` to the ignore file at the vault root, creating it if absent and
+/// adding a newline first if the file does not end in one. Idempotent (a second
+/// call finds the line and writes nothing). Atomic (temp-and-rename, the file's
+/// existing bytes and line endings preserved). Called only from the offer's
+/// explicit confirmation; granted to `main` in the ACL (ADR-0012).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GitignoreAppended {
+    /// The ignore file did not exist and was created.
+    pub created: bool,
+    /// The entry was already there; nothing was written.
+    pub already_present: bool,
+}
+
+/// `decline_gitignore_offer() -> Result<(), IpcError>`
+///
+/// Records "Don't ask again" in `.serat/prefs.json`. Writes nothing in the
+/// vault outside `.serat/`.
+pub const DECLINE_GITIGNORE_OFFER_COMMAND: &str = "decline_gitignore_offer";
