@@ -108,6 +108,8 @@ struct OpenVault {
     /// thread has produced one (task #90; see `index::IndexHandleSlot`'s doc comment
     /// for the window in which this is still empty).
     index_handle: IndexHandleSlot,
+    /// The vault's one full-text search connection (§4.5 obligation 2).
+    search: Arc<crate::reads::SearchSlot>,
     /// Dropping this stops the watcher and the walk.
     _walk: VaultThread,
 }
@@ -331,6 +333,7 @@ impl AppState {
             publisher,
             _index: index,
             index_handle,
+            search: Arc::default(),
             _walk: walk,
         });
 
@@ -611,12 +614,17 @@ impl AppState {
     ///
     /// [`IpcError::VaultNotFound`] with no vault open.
     pub fn search(&self, args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError> {
-        let (root, state) = self.read_context()?;
-        Ok(crate::reads::read_when_ready(state, &root, |reader| {
-            reader
-                .search(&args.query, args.offset, args.limit)
-                .map(crate::reads::map_outcome)
-        }))
+        let (root, state, search) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(
+            state,
+            &root,
+            Some(&search),
+            |reader| {
+                reader
+                    .search(&args.query, args.offset, args.limit)
+                    .map(crate::reads::map_outcome)
+            },
+        ))
     }
 
     /// `backlinks`. FR-NAV-04.
@@ -627,16 +635,23 @@ impl AppState {
     /// no vault open.
     pub fn backlinks(&self, args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
         let path = Self::vault_path(&args.path)?;
-        let (root, state) = self.read_context()?;
-        Ok(crate::reads::read_when_ready(state, &root, |reader| {
-            reader
-                .backlinks(path.as_str())
-                .map(|links| links.into_iter().map(crate::reads::map_backlink).collect())
-        }))
+        let (root, state, _) = self.read_context()?;
+        Ok(crate::reads::read_when_ready(
+            state,
+            &root,
+            None,
+            |reader| {
+                reader
+                    .backlinks(path.as_str())
+                    .map(|links| links.into_iter().map(crate::reads::map_backlink).collect())
+            },
+        ))
     }
 
-    /// The root and the last published index state, read without blocking.
-    fn read_context(&self) -> Result<(PathBuf, IndexState), IpcError> {
+    /// The root, the last published index state and the search slot, read without blocking.
+    fn read_context(
+        &self,
+    ) -> Result<(PathBuf, IndexState, Arc<crate::reads::SearchSlot>), IpcError> {
         let guard = self.open_lock();
         let open = guard.as_ref().ok_or_else(|| IpcError::VaultNotFound {
             path: String::new(),
@@ -644,6 +659,7 @@ impl AppState {
         Ok((
             open.vault.root().to_path_buf(),
             open.publisher.status().state,
+            Arc::clone(&open.search),
         ))
     }
 
