@@ -336,9 +336,66 @@ pub fn judge(citations: &[Citation], exists: impl Fn(&str) -> bool) -> Report {
     }
 }
 
-/// Repository root, resolved at compile time from this crate's location.
+/// Environment variable that names the repository root explicitly.
+pub const ROOT_ENV: &str = "SERAT_REPO_ROOT";
+
+/// Repository root, resolved **at run time** (task #45).
+///
+/// The old rule was `env!("CARGO_MANIFEST_DIR")`, which is fixed when the binary
+/// is built. Several worktrees sharing one `CARGO_TARGET_DIR` reuse one binary,
+/// so the check silently read whichever tree built it (code-reviewer-2 got
+/// "88 Musts" on a branch whose PRD has 89). Precedence:
+///
+/// 1. `--root <dir>` / `--root=<dir>` on the command line;
+/// 2. the `SERAT_REPO_ROOT` environment variable;
+/// 3. the nearest ancestor of the current directory whose `Cargo.toml` declares
+///    a `[workspace]`;
+/// 4. the compile-time manifest location, only as a last resort.
 #[must_use]
 pub fn repo_root() -> PathBuf {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let env = std::env::var_os(ROOT_ENV).map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    resolve_root(&args, env.as_deref(), cwd.as_deref())
+}
+
+/// The pure form of [`repo_root`], so each rule is testable without touching
+/// process state.
+#[must_use]
+pub fn resolve_root(args: &[String], env: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--root" {
+            if let Some(v) = it.next() {
+                return PathBuf::from(v);
+            }
+        } else if let Some(v) = a.strip_prefix("--root=") {
+            return PathBuf::from(v);
+        }
+    }
+    if let Some(e) = env.filter(|p| !p.as_os_str().is_empty()) {
+        return e.to_path_buf();
+    }
+    if let Some(found) = cwd.and_then(workspace_root_above) {
+        return found;
+    }
+    compiled_root()
+}
+
+/// Nearest ancestor of `start` (inclusive) whose `Cargo.toml` has a
+/// `[workspace]` table.
+fn workspace_root_above(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        text.lines()
+            .any(|l| l.trim() == "[workspace]")
+            .then(|| dir.to_path_buf())
+    })
+}
+
+/// Where this crate was built from. A fallback only: it is the wrong answer
+/// whenever the binary is reused from another checkout.
+fn compiled_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
