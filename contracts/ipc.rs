@@ -1139,6 +1139,17 @@ pub struct HeadingRef {
 /// query is free text, `"phrases"` and at most one `[key:value]` (§4.5); it is
 /// parsed in Rust into one of three fixed statements and never reaches FTS5 as
 /// syntax.
+///
+/// **At most one full-text search is in flight per open vault** (§4.5, #15
+/// ruling). A query with free text (R1, or R1 + R3) runs on serat-index's one
+/// dedicated search connection, which is not part of the read pool. A new
+/// full-text search interrupts the one still running there, through rusqlite's
+/// `get_interrupt_handle()`, and the older call returns
+/// `SearchOutcome::Superseded` rather than an error. So a superseded 230-560 ms
+/// search never holds a pooled connection that backlinks or a property lookup
+/// is waiting for. A property-only query (R3) runs on the pool and is never
+/// interrupted, and neither are `backlinks` or any other read. The front end
+/// also drops any response that is not for its latest request.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SearchArgs {
@@ -1171,6 +1182,10 @@ pub enum SearchOutcome {
     /// An unbalanced `"`. The search panel does not submit one; this answers
     /// one that arrives anyway, without running a statement (§4.5).
     UnbalancedQuote,
+    /// A newer full-text search interrupted this one (`SQLITE_INTERRUPT` on the
+    /// search connection). It is not an error, it is never shown to the user, and
+    /// the front end discards it, because it has already sent the newer request.
+    Superseded,
 }
 
 /// One search or property-lookup hit.
