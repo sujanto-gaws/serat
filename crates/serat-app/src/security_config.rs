@@ -159,7 +159,10 @@ mod tests {
             .collect();
         permissions.sort();
         let mut expected: Vec<String> = vec![
+            "allow-append-gitignore-entry",
             "allow-backlinks",
+            "allow-decline-gitignore-offer",
+            "allow-gitignore-offer-status",
             "allow-get-ui-settings",
             "allow-set-keybinding",
             "allow-set-live-preview",

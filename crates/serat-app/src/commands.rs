@@ -15,9 +15,10 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::ipc::{
-    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexStatus,
-    IpcError, NotePathArgs, OpenVaultArgs, ReadFileArgs, RefusedName, SearchArgs, SearchOutcome,
-    SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, GitignoreAppended,
+    GitignoreOffer, IndexRead, IndexStatus, IpcError, NotePathArgs, OpenVaultArgs, ReadFileArgs,
+    RefusedName, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings,
+    VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -68,6 +69,38 @@ pub fn write_file(
 #[must_use]
 pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
+}
+
+/// `gitignore_offer_status() -> Result<GitignoreOffer, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::gitignore_offer_status`].
+#[tauri::command(async)]
+pub fn gitignore_offer_status(state: State<'_, Arc<AppState>>) -> Result<GitignoreOffer, IpcError> {
+    state.gitignore_offer_status()
+}
+
+/// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`. Takes no path.
+///
+/// # Errors
+///
+/// As [`AppState::append_gitignore_entry`].
+#[tauri::command(async)]
+pub fn append_gitignore_entry(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreAppended, IpcError> {
+    state.append_gitignore_entry()
+}
+
+/// `decline_gitignore_offer() -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::decline_gitignore_offer`].
+#[tauri::command(async)]
+pub fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<(), IpcError> {
+    state.decline_gitignore_offer()
 }
 
 /// `get_ui_settings() -> UiSettings`

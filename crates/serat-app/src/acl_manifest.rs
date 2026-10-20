@@ -208,6 +208,9 @@ mod tests {
             "get_ui_settings",
             "set_live_preview",
             "set_keybinding",
+            "gitignore_offer_status",
+            "append_gitignore_entry",
+            "decline_gitignore_offer",
             "search",
             "backlinks",
         ]

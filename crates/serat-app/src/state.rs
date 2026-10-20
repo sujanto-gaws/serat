@@ -33,10 +33,11 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, IndexRead, IndexState,
-    IndexStatus, IpcError, KeybindingChange, KeybindingOverride, NotePathArgs, OpenVaultArgs,
-    REFUSED_NAMES_CAP, ReadFileArgs, RefusedName, SearchArgs, SearchOutcome, SetKeybindingArgs,
-    SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, GitignoreAppended,
+    GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError, KeybindingChange,
+    KeybindingOverride, NotePathArgs, OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs, RefusedName,
+    SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened,
+    WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -573,6 +574,34 @@ impl AppState {
         self.settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `gitignore_offer_status`. NFR-CMP-04. See [`crate::gitignore`].
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open.
+    pub fn gitignore_offer_status(&self) -> Result<GitignoreOffer, IpcError> {
+        Ok(crate::gitignore::status(self.vault()?.root()))
+    }
+
+    /// `append_gitignore_entry`: the single named exception to T-06. Takes no path.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] as
+    /// [`crate::gitignore::append`].
+    pub fn append_gitignore_entry(&self) -> Result<GitignoreAppended, IpcError> {
+        crate::gitignore::append(self.vault()?.root())
+    }
+
+    /// `decline_gitignore_offer`. Writes only inside `.serat/`.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::append_gitignore_entry`].
+    pub fn decline_gitignore_offer(&self) -> Result<(), IpcError> {
+        crate::gitignore::decline(self.vault()?.root())
     }
 
     /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than

@@ -47,6 +47,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod folder;
+pub mod gitignore;
 pub mod index;
 mod nav_guard;
 pub mod reads;
@@ -269,6 +270,9 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::get_ui_settings,
             commands::set_live_preview,
             commands::set_keybinding,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
             commands::search,
             commands::backlinks,
         ])
