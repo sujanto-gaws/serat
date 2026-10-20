@@ -31,9 +31,29 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # A budget measured in a debug build is not a measurement.
+  #
+  # RULE: release builds are per package (`-p`), NEVER `--workspace`. budget links
+  # serat-index with its `test-hooks` feature, and a workspace-wide build unifies
+  # that feature into serat-app, whose const assert (crates/serat-app/src/lib.rs)
+  # then refuses to compile a release build carrying test hooks. Debug is
+  # unaffected. Every command in this file is already `-p`-scoped; keep it so. The
+  # `serat-app-release-guard` job below exercises the guard (task #54, NFR-MNT-01).
   CARGO_PROFILE: release
 
 jobs:
+  # The test-hooks guard, exercised: serat-app built alone in release must compile,
+  # i.e. nothing in ITS graph turns `test-hooks` on. If someone adds the feature to
+  # serat-app's own dependency edge, this fails here rather than at release time.
+  # Independent of `vault`, cheap, and runs on every PR and every push to main.
+  serat-app-release-guard:
+    name: "serat-app builds in release without test-hooks"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p serat-app --release
+
   # NFR-MNT-02: the vault is generated from one command and is byte-identical.
   # Everything below is measured against it, so if this fails the other jobs
   # are measuring something unknown and are not worth running.
