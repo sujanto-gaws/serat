@@ -85,9 +85,9 @@ function markDirty(): void {
   }
 }
 
-async function performSave(): Promise<SaveOutcome | null> {
+async function performSave(explicit = false): Promise<SaveOutcome | null> {
   if (!buffer) return null;
-  const outcome = await buffer.save(props.ipc);
+  const outcome = await buffer.save(props.ipc, { explicit });
   markDirty();
   emit("save-outcome", outcome);
   return outcome;
@@ -102,7 +102,7 @@ function scheduleAutosave(): void {
 
 const registry = createEditorCommandRegistry({
   save: () => {
-    void performSave();
+    void performSave(true); // an explicit command may retry a refused save
     return true;
   },
   toggleLivePreview: () => {
@@ -254,7 +254,7 @@ function focus(): void {
 }
 
 async function triggerSave(): Promise<SaveOutcome | null> {
-  return performSave();
+  return performSave(true);
 }
 
 const isDirty = computed(() => dirty.value);

@@ -35,7 +35,18 @@ export type SaveOutcome =
   // transport failure). This is not a disk-divergence: the buffer stays dirty
   // and the next trigger may try again, but it is reported distinctly so the
   // UI does not offer a merge for something a merge cannot fix.
-  | { kind: "rejected"; error: unknown };
+  | { kind: "rejected"; error: unknown }
+  // `LineEndingsWouldFuse`: the save was refused because applying it would
+  // fuse a lone CR with an LF in a note that mixes line endings; nothing was
+  // written. The buffer stays dirty and intact, and NO automatic trigger
+  // (idle, blur, note switch) retries it: only an explicit save command does.
+  | { kind: "refused"; error: unknown };
+
+function isLineEndingsWouldFuse(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && (error as { kind?: unknown }).kind === "line_endings_would_fuse"
+  );
+}
 
 function isStaleHash(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as { kind?: unknown }).kind === "stale_hash";
@@ -57,6 +68,8 @@ export class EditorBuffer {
   private inflight: Promise<void> | null = null;
   /** Set by a `StaleHash` refusal; blocks every save until reconciled. */
   private staleError: { error: unknown } | null = null;
+  /** Set by a `LineEndingsWouldFuse` refusal; blocks automatic saves only. */
+  private refusedError: { error: unknown } | null = null;
 
   constructor(path: string, baseText: string, baseHash: string) {
     this.path = path;
@@ -105,9 +118,13 @@ export class EditorBuffer {
    * it coalesces, and the run already in flight will, on resolving, issue
    * exactly one more save covering everything typed meanwhile.
    */
-  async save(ipc: EditorIpcAdapter): Promise<SaveOutcome> {
+  async save(ipc: EditorIpcAdapter, options: { explicit?: boolean } = {}): Promise<SaveOutcome> {
     if (this.staleError) {
       return { kind: "stale", error: this.staleError.error };
+    }
+    if (this.refusedError) {
+      if (!options.explicit) return { kind: "refused", error: this.refusedError.error };
+      this.refusedError = null; // the user asked again: one attempt
     }
     if (this.saving) {
       this.saveAgainRequested = true;
@@ -185,6 +202,10 @@ export class EditorBuffer {
         this.staleError = { error };
         return { kind: "stale", error };
       }
+      if (isLineEndingsWouldFuse(error)) {
+        this.refusedError = { error };
+        return { kind: "refused", error };
+      }
       return { kind: "rejected", error };
     }
   }
@@ -215,5 +236,6 @@ export class EditorBuffer {
     this.baseHashValue = diskHash;
     this.pending = nextPending && !nextPending.empty ? [nextPending] : [];
     this.staleError = null;
+    this.refusedError = null;
   }
 }

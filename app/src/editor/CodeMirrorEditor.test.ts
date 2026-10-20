@@ -156,6 +156,31 @@ describe("CodeMirrorEditor load path", () => {
   });
 });
 
+describe("CodeMirrorEditor refused save", () => {
+  it("a LineEndingsWouldFuse refusal is emitted as 'refused', keeps the buffer dirty and is not retried by idle or blur", async () => {
+    vi.useFakeTimers();
+    try {
+      const error = { kind: "line_endings_would_fuse", path: "a.md", line: 2 };
+      const savePatch = vi.fn().mockRejectedValue(error);
+      const { wrapper, view, api } = mountEditor(mockIpc(savePatch));
+      await api.loadNote("one", "a.md", "h0");
+      view.dispatch({ changes: { from: 3, insert: "!" } });
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(savePatch).toHaveBeenCalledTimes(1);
+      expect(wrapper.emitted("save-outcome")?.[0][0]).toEqual({ kind: "refused", error });
+      expect(api.isDirty).toBe(true);
+      expect(api.getText()).toBe("one!");
+
+      view.contentDOM.dispatchEvent(new FocusEvent("blur"));
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(savePatch).toHaveBeenCalledTimes(1); // never retried automatically
+      wrapper.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("CodeMirrorEditor startup window", () => {
   it("is read-only before a buffer exists, so nothing typed can become the base text", async () => {
     const { wrapper, view, api } = mountEditor(mockIpc());

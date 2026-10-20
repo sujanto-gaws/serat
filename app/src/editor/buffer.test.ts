@@ -153,6 +153,29 @@ describe("EditorBuffer.save", () => {
     expect((await buffer.save(ipc)).kind).toBe("saved");
   });
 
+  it("LineEndingsWouldFuse is its own outcome: buffer intact, no automatic retry, explicit save may retry", async () => {
+    const buffer = new EditorBuffer("a.md", "abc", "hash0");
+    buffer.recordChange(changesFor("abc", 3, 3, "d"));
+    const error = { kind: "line_endings_would_fuse", path: "a.md", line: 4 };
+    const written: FileWritten = { path: "a.md", hash: "hash1", mtime_ms: 0, bytes: 4 };
+    const savePatch = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(written);
+    const ipc = mockIpc({ savePatch });
+
+    expect(await buffer.save(ipc)).toEqual({ kind: "refused", error });
+    expect(buffer.isDirty).toBe(true);
+    expect(buffer.isStale).toBe(false);
+    expect(buffer.baseHash).toBe("hash0");
+
+    // Idle/blur/flush-style triggers do not retry...
+    expect(await buffer.save(ipc)).toEqual({ kind: "refused", error });
+    expect(await buffer.flush(ipc)).toBe(false);
+    expect(savePatch).toHaveBeenCalledTimes(1);
+
+    // ...only the user's explicit save does.
+    expect((await buffer.save(ipc, { explicit: true })).kind).toBe("saved");
+    expect(savePatch).toHaveBeenCalledTimes(2);
+  });
+
   it("flush waits for an in-flight save and then saves what was typed meanwhile", async () => {
     const buffer = new EditorBuffer("a.md", "abc", "hash0");
     buffer.recordChange(changesFor("abc", 3, 3, "d"));

@@ -86,6 +86,14 @@ onUnmounted(() => {
  * `CodeMirrorEditor.vue`. This only reflects the outcome in the status
  * strip (§9.1: no modal on the write path; a refusal resolves in place).
  */
+/** The save was refused outright; say exactly why and that nothing was written. */
+function refusalMessage(error: unknown): string {
+  if (isIpcError(error) && error.kind === "line_endings_would_fuse") {
+    return `the save was refused because the note mixes line-ending styles at line ${error.line + 1}; nothing was written`;
+  }
+  return `the save was refused; nothing was written: ${JSON.stringify(error)}`;
+}
+
 function onSaveOutcome(outcome: SaveOutcome): void {
   switch (outcome.kind) {
     case "saved":
@@ -98,6 +106,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       } else {
         store.setMark(`not saved: ${JSON.stringify(outcome.error)}`);
       }
+      break;
+    case "refused":
+      store.setMark(refusalMessage(outcome.error));
       break;
     case "rejected":
       store.setMark(`not saved: ${JSON.stringify(outcome.error)}`);
