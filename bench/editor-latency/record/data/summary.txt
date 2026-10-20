@@ -1,0 +1,168 @@
+
+pos.json  arm=positive n=297 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.00 med 0.53 max 0.99;  frac phase>=0.88:  12.8%;  k=j+1:  96.3%
+  A  count rAF ts in (t,ts_k]>1              late   0/297  100.0% on time
+  B  round((ts_k-ts_j)/R)>1                  late   0/297  100.0% on time
+  C  q_k > D (post-paint MC)                 late   8/297   97.3% on time
+  D  run_k > D                               late   0/297  100.0% on time
+  D+ run_k>D or LoAF end>D (LoAF render)     late   0/297  100.0% on time
+  E0 ET end > D                              late   0/297  100.0% on time
+  E4 ET end > D+4 (rounding)                 late   0/297  100.0% on time
+  E8 ET end > D+8                            late   0/297  100.0% on time
+  F  run_k>D or ET end>D+4                   late   0/297  100.0% on time
+  G  ET dur-based: end-t > 2R+4              late   0/297  100.0% on time
+  M  mutant: framesToPaint=1                 late   0/297  100.0% on time
+
+posj.json  arm=positive+jitter n=297 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.01 med 0.51 max 1.00;  frac phase>=0.88:  11.4%;  k=j+1:  95.6%
+  A  count rAF ts in (t,ts_k]>1              late   0/297  100.0% on time
+  B  round((ts_k-ts_j)/R)>1                  late   0/297  100.0% on time
+  C  q_k > D (post-paint MC)                 late  13/297   95.6% on time
+  D  run_k > D                               late   0/297  100.0% on time
+  D+ run_k>D or LoAF end>D (LoAF render)     late   0/297  100.0% on time
+  E0 ET end > D                              late   0/297  100.0% on time
+  E4 ET end > D+4 (rounding)                 late   0/297  100.0% on time
+  E8 ET end > D+8                            late   0/297  100.0% on time
+  F  run_k>D or ET end>D+4                   late   0/297  100.0% on time
+  G  ET dur-based: end-t > 2R+4              late   0/297  100.0% on time
+  M  mutant: framesToPaint=1                 late   0/297  100.0% on time
+
+neg.json  arm=negative n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.04 med 0.50 max 1.00;  frac phase>=0.88:  13.4%;  k=j+1:  99.0%
+  A  count rAF ts in (t,ts_k]>1              late   0/97    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/97    0.0% late
+  C  q_k > D (post-paint MC)                 late  97/97  100.0% late
+  D  run_k > D                               late  97/97  100.0% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late  97/97  100.0% late
+  E0 ET end > D                              late  97/97  100.0% late
+  E4 ET end > D+4 (rounding)                 late  97/97  100.0% late
+  E8 ET end > D+8                            late  95/97   97.9% late
+  F  run_k>D or ET end>D+4                   late  97/97  100.0% late
+  G  ET dur-based: end-t > 2R+4              late  97/97  100.0% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
+
+negj.json  arm=negative+jitter n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.01 med 0.49 max 0.99;  frac phase>=0.88:  13.4%;  k=j+1:  96.9%
+  A  count rAF ts in (t,ts_k]>1              late   0/97    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/97    0.0% late
+  C  q_k > D (post-paint MC)                 late  97/97  100.0% late
+  D  run_k > D                               late  97/97  100.0% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late  97/97  100.0% late
+  E0 ET end > D                              late  97/97  100.0% late
+  E4 ET end > D+4 (rounding)                 late  97/97  100.0% late
+  E8 ET end > D+8                            late  97/97  100.0% late
+  F  run_k>D or ET end>D+4                   late  97/97  100.0% late
+  G  ET dur-based: end-t > 2R+4              late  97/97  100.0% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
+
+gr1.json  arm=graded n=197 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.00 med 0.59 max 1.07;  frac phase>=0.88:  12.7%;  k=j+1:  97.5%
+  A  count rAF ts in (t,ts_k]>1              late   1/197    0.5% late
+  B  round((ts_k-ts_j)/R)>1                  late   1/197    0.5% late
+  C  q_k > D (post-paint MC)                 late 164/197   83.2% late
+  D  run_k > D                               late 135/197   68.5% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late 135/197   68.5% late
+  E0 ET end > D                              late 183/197   92.9% late
+  E4 ET end > D+4 (rounding)                 late 141/197   71.6% late
+  E8 ET end > D+8                            late 104/197   52.8% late
+  F  run_k>D or ET end>D+4                   late 149/197   75.6% late
+  G  ET dur-based: end-t > 2R+4              late   6/197    3.0% late
+  M  mutant: framesToPaint=1                 late   0/197    0.0% late
+
+gr2.json  arm=graded n=197 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.03 med 0.55 max 0.99;  frac phase>=0.88:  13.2%;  k=j+1: 100.0%
+  A  count rAF ts in (t,ts_k]>1              late   0/197    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/197    0.0% late
+  C  q_k > D (post-paint MC)                 late 159/197   80.7% late
+  D  run_k > D                               late 131/197   66.5% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late 131/197   66.5% late
+  E0 ET end > D                              late 185/197   93.9% late
+  E4 ET end > D+4 (rounding)                 late 147/197   74.6% late
+  E8 ET end > D+8                            late  97/197   49.2% late
+  F  run_k>D or ET end>D+4                   late 154/197   78.2% late
+  G  ET dur-based: end-t > 2R+4              late   2/197    1.0% late
+  M  mutant: framesToPaint=1                 late   0/197    0.0% late
+
+gr3.json  arm=graded n=197 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.01 med 0.53 max 0.99;  frac phase>=0.88:  12.7%;  k=j+1:  97.0%
+  A  count rAF ts in (t,ts_k]>1              late   0/197    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/197    0.0% late
+  C  q_k > D (post-paint MC)                 late 135/197   68.5% late
+  D  run_k > D                               late 123/197   62.4% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late 123/197   62.4% late
+  E0 ET end > D                              late 170/197   86.3% late
+  E4 ET end > D+4 (rounding)                 late 128/197   65.0% late
+  E8 ET end > D+8                            late  81/197   41.1% late
+  F  run_k>D or ET end>D+4                   late 141/197   71.6% late
+  G  ET dur-based: end-t > 2R+4              late   1/197    0.5% late
+  M  mutant: framesToPaint=1                 late   0/197    0.0% late
+
+grj.json  arm=graded+jitter n=197 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.01 med 0.50 max 1.00;  frac phase>=0.88:  10.2%;  k=j+1:  99.0%
+  A  count rAF ts in (t,ts_k]>1              late   0/197    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/197    0.0% late
+  C  q_k > D (post-paint MC)                 late 142/197   72.1% late
+  D  run_k > D                               late 121/197   61.4% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late 121/197   61.4% late
+  E0 ET end > D                              late 176/197   89.3% late
+  E4 ET end > D+4 (rounding)                 late 128/197   65.0% late
+  E8 ET end > D+8                            late  79/197   40.1% late
+  F  run_k>D or ET end>D+4                   late 137/197   69.5% late
+  G  ET dur-based: end-t > 2R+4              late   1/197    0.5% late
+  M  mutant: framesToPaint=1                 late   0/197    0.0% late
+
+render2.json  arm=render2 n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.03 med 0.59 max 0.98;  frac phase>=0.88:   7.2%;  k=j+1:  91.8%
+  A  count rAF ts in (t,ts_k]>1              late   0/97    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/97    0.0% late
+  C  q_k > D (post-paint MC)                 late  97/97  100.0% late
+  D  run_k > D                               late   0/97    0.0% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late  96/97   99.0% late
+  E0 ET end > D                              late  97/97  100.0% late
+  E4 ET end > D+4 (rounding)                 late  97/97  100.0% late
+  E8 ET end > D+8                            late  96/97   99.0% late
+  F  run_k>D or ET end>D+4                   late  97/97  100.0% late
+  G  ET dur-based: end-t > 2R+4              late  97/97  100.0% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
+
+render1.json  arm=render1 n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.06 med 0.56 max 0.99;  frac phase>=0.88:  17.5%;  k=j+1:  99.0%
+  A  count rAF ts in (t,ts_k]>1              late   0/97    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   0/97    0.0% late
+  C  q_k > D (post-paint MC)                 late  96/97   99.0% late
+  D  run_k > D                               late   0/97    0.0% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late   0/97    0.0% late
+  E0 ET end > D                              late  93/97   95.9% late
+  E4 ET end > D+4 (rounding)                 late  58/97   59.8% late
+  E8 ET end > D+8                            late   9/97    9.3% late
+  F  run_k>D or ET end>D+4                   late  58/97   59.8% late
+  G  ET dur-based: end-t > 2R+4              late   3/97    3.1% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
+
+render05.json  arm=render05 n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.01 med 0.60 max 0.99;  frac phase>=0.88:  13.4%;  k=j+1:  91.8%
+  A  count rAF ts in (t,ts_k]>1              late   1/97    1.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   1/97    1.0% late
+  C  q_k > D (post-paint MC)                 late  13/97   13.4% late
+  D  run_k > D                               late   1/97    1.0% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late   1/97    1.0% late
+  E0 ET end > D                              late   8/97    8.2% late
+  E4 ET end > D+4 (rounding)                 late   2/97    2.1% late
+  E8 ET end > D+8                            late   1/97    1.0% late
+  F  run_k>D or ET end>D+4                   late   2/97    2.1% late
+  G  ET dur-based: end-t > 2R+4              late   0/97    0.0% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
+
+paint.json  arm=paint n=97 R=16.70 headless chromium 141.0.7390.37
+  phase(t in frame, /R): min 0.00 med 0.56 max 4.98;  frac phase>=0.88:  21.6%;  k=j+1:  86.6%
+  A  count rAF ts in (t,ts_k]>1              late   0/97    0.0% late
+  B  round((ts_k-ts_j)/R)>1                  late   2/97    2.1% late
+  C  q_k > D (post-paint MC)                 late  62/97   63.9% late
+  D  run_k > D                               late   9/97    9.3% late
+  D+ run_k>D or LoAF end>D (LoAF render)     late  10/97   10.3% late
+  E0 ET end > D                              late  97/97  100.0% late
+  E4 ET end > D+4 (rounding)                 late  97/97  100.0% late
+  E8 ET end > D+8                            late  97/97  100.0% late
+  F  run_k>D or ET end>D+4                   late  97/97  100.0% late
+  G  ET dur-based: end-t > 2R+4              late  97/97  100.0% late
+  M  mutant: framesToPaint=1                 late   0/97    0.0% late
