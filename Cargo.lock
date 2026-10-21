@@ -3238,6 +3238,8 @@ version = "0.0.0"
 dependencies = [
  "rusqlite",
  "serat-core",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
