@@ -42,7 +42,12 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use serat_core::VaultPath;
-use serat_core::mime::{is_image, is_viewable, mime_for_extension};
+use serat_core::mime::{OCTET_STREAM, VIEWABLE, is_viewable, mime_for_extension};
+
+/// A viewable image type (served whole: an `<img>` cannot ask for spans).
+fn is_image(mime: &str) -> bool {
+    mime != "application/pdf" && VIEWABLE.contains(&mime)
+}
 use serat_vault::Vault;
 
 use crate::ipc::{AssetInfo, IpcError};
@@ -161,7 +166,7 @@ fn viewable_mime(vault: &Vault, path: &VaultPath) -> Option<&'static str> {
     if !under_no_ignored_dir(vault, path) {
         return None;
     }
-    let mime = mime_for_extension(&path.extension()?);
+    let mime = mime_for_extension(&path.extension()?).unwrap_or(OCTET_STREAM);
     is_viewable(mime).then_some(mime)
 }
 
@@ -686,7 +691,7 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
         return Err(missing());
     }
     let opened = locate(vault, path).ok_or_else(missing)?;
-    let mime = mime_for_extension(&path.extension().unwrap_or_default());
+    let mime = mime_for_extension(&path.extension().unwrap_or_default()).unwrap_or(OCTET_STREAM);
     Ok(AssetInfo {
         path: path.to_string(),
         mime: mime.to_owned(),

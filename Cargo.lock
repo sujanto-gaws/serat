@@ -339,6 +339,7 @@ dependencies = [
 name = "budget"
 version = "0.0.0"
 dependencies = [
+ "reporoot",
  "rusqlite",
  "serat-core",
  "serat-index",
@@ -874,6 +875,10 @@ dependencies = [
 [[package]]
 name = "doclint"
 version = "0.0.0"
+dependencies = [
+ "reporoot",
+ "tempfile",
+]
 
 [[package]]
 name = "dom_query"
@@ -2995,6 +3000,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "reporoot"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3200,6 +3212,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "toml 1.1.5+spec-1.1.0",
  "ts-rs",
  "webkit2gtk",
@@ -3228,6 +3241,8 @@ version = "0.0.0"
 dependencies = [
  "rusqlite",
  "serat-core",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -4487,6 +4502,9 @@ dependencies = [
 [[package]]
 name = "vaultgen"
 version = "0.0.0"
+dependencies = [
+ "reporoot",
+]
 
 [[package]]
 name = "vcpkg"

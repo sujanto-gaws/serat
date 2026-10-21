@@ -57,6 +57,15 @@ pub struct NoteStats {
     pub frontmatter_keys: u32,
     /// `^blockid` anchors.
     pub block_ids: u32,
+    /// Block-style `aliases:` items written to frontmatter (one per row a
+    /// conforming parser must index under the `aliases` key; task #57).
+    pub aliases: u32,
+    /// Items of block-style `tags:` lists (task #57 review).
+    pub block_tags: u32,
+    /// Items of flow-style `tags: [a, b]` lists.
+    pub flow_tags: u32,
+    /// Items of the block-style `attendees:` list on meeting notes.
+    pub attendees: u32,
     /// Whether the note opens with a YAML frontmatter block.
     pub has_frontmatter: bool,
     /// Whether the file uses CRLF line endings.
@@ -79,6 +88,10 @@ impl NoteStats {
         self.decoy_fields += other.decoy_fields;
         self.frontmatter_keys += other.frontmatter_keys;
         self.block_ids += other.block_ids;
+        self.aliases += other.aliases;
+        self.block_tags += other.block_tags;
+        self.flow_tags += other.flow_tags;
+        self.attendees += other.attendees;
     }
 }
 
@@ -220,6 +233,7 @@ fn frontmatter(
         s.push_str(&alias_for(&note.title, r));
         s.push_str("\"\n");
         keys += 1;
+        stats.aliases += 1;
     }
 
     match note.kind {
@@ -300,6 +314,7 @@ fn frontmatter(
                 s.push_str("]]\"\n");
                 targets.push(t);
                 stats.links_out += 1;
+                stats.attendees += 1;
             }
             keys += 2;
         }
@@ -357,6 +372,7 @@ fn frontmatter(
                     s.push_str(", ");
                 }
                 s.push_str(r.pick(TAGS));
+                stats.flow_tags += 1;
             }
             s.push_str("]\n");
         } else {
@@ -365,6 +381,7 @@ fn frontmatter(
                 s.push_str("  - ");
                 s.push_str(r.pick(TAGS));
                 s.push('\n');
+                stats.block_tags += 1;
             }
         }
     }

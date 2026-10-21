@@ -203,6 +203,23 @@ mod tests {
             "index_status",
             "mark_first_paint",
             "mark_vault_usable",
+            "refused_names",
+            "create_folder",
+            "get_ui_settings",
+            "set_live_preview",
+            "set_keybinding",
+            "gitignore_offer_status",
+            "append_gitignore_entry",
+            "decline_gitignore_offer",
+            "search",
+            "backlinks",
+            "open_tree",
+            "mark_tree",
+            "note_opened",
+            "note_closed",
+            "save_patch",
+            "request_external_diff",
+            "rebase_buffer",
         ]
         .into_iter()
         .map(str::to_owned)

@@ -58,6 +58,7 @@ pub fn parse_pool_threads() -> usize {
 pub struct IndexHandle {
     actor: IndexActor,
     index_dir: PathBuf,
+    after_unclean_shutdown: bool,
 }
 
 impl IndexHandle {
@@ -84,10 +85,25 @@ impl IndexHandle {
         }
         let conn = schema::open(&path)?;
         schema::bootstrap_if_empty(&conn)?;
+        let after_unclean_shutdown = !schema::begin_session(&conn)?;
         Ok(Self {
             actor: IndexActor::with_capacity(conn, queue_depth),
             index_dir: index_dir.to_path_buf(),
+            after_unclean_shutdown,
         })
+    }
+
+    /// Whether the previous session did not close the index cleanly (task #14).
+    ///
+    /// True means a commit may have been lost to a power cut, because the index side of
+    /// a save does no fsync (architecture §3.1.1 item 6), so the catch-up walk must
+    /// compare mtimes as well as paths: pass this to [`crate::external::CatchUp`].
+    /// True for a freshly created index too, which is harmless: it holds nothing to
+    /// be stale. Fixed at open; the marker itself is cleared as this handle opens and
+    /// set again by [`IndexHandle::close`].
+    #[must_use]
+    pub fn opened_after_unclean_shutdown(&self) -> bool {
+        self.after_unclean_shutdown
     }
 
     /// A writer handle, for callers that want to submit without waiting.
@@ -223,12 +239,59 @@ impl IndexHandle {
         apply(&self.actor.handle(), source, parser, echo, path)
     }
 
-    /// Stop the writer, applying anything queued.
+    /// Replace the index while the vault stays open: stop this handle's writer, call
+    /// `release`, delete the index and rebuild it from `source`, and open a new handle.
+    ///
+    /// **`release` is where every other holder of `index.db` lets go**, and it runs after
+    /// the writer has stopped and immediately before the file is deleted. serat-app
+    /// passes `|| search_slot.close()` (`SearchSlot::close`, task #52): SQLite on
+    /// Windows opens without delete sharing, so a search connection still open makes
+    /// the rebuild's `remove_file` fail, reported as `Corrupt`. Per-call readers are
+    /// already gone by construction; the search connection is the one that lives long
+    /// enough to matter. Any other runtime rebuild path must go through here, or call
+    /// `SearchSlot::close()` itself before deleting the file.
+    ///
+    /// The old handle is consumed and does not mark a clean close: the index it
+    /// described is being discarded. The caller bumps its handle epoch for the new one.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::rebuild`], and as [`IndexHandle::open`] for the new handle. **A failure
+    /// after the old file is deleted leaves no handle at all**: the caller must fall
+    /// back to `open_or_rebuild` and report the index as unavailable. And the search
+    /// slot must not lazily reopen the file between `release()` and the delete, or
+    /// the delete fails on Windows; hold its lock across the call.
+    pub fn rebuild_in_place(
+        self,
+        release: &dyn Fn(),
+        source: &dyn NoteSource,
+        parser: &dyn NoteParser,
+        vault_root: &Path,
+    ) -> Result<(Self, crate::RebuildReport), IndexError> {
+        let Self {
+            actor, index_dir, ..
+        } = self;
+        actor.shutdown()?;
+        release();
+        let report = crate::rebuild(source, parser, vault_root, &index_dir)?;
+        Ok((Self::open(&index_dir)?, report))
+    }
+
+    /// Close the index cleanly: apply anything queued, checkpoint, and set the
+    /// clean-close marker, so the next open can skip the content comparison.
+    ///
+    /// **Call this** (serat-app: on vault close and at exit). Dropping the handle
+    /// stops the writer and loses nothing, but leaves the marker cleared, so the next
+    /// session treats the shutdown as unclean. That costs one stat per file and a hash
+    /// of the files whose mtime moved; it is the safe direction.
     ///
     /// # Errors
     ///
     /// [`IndexError::WriterStopped`] if it had already died.
     pub fn close(self) -> Result<(), IndexError> {
+        // The marker not being set (a pinned reader) is not an error; see
+        // `WriterHandle::close_clean`.
+        let _marked = self.actor.handle().close_clean()?;
         self.actor.shutdown()
     }
 }
@@ -266,18 +329,18 @@ pub fn apply(
     path: &VaultPath,
 ) -> Result<(), IndexError> {
     let (op, hash) = match source.load(path) {
-        // A file the save path was told about but cannot read has been deleted.
-        // Nothing was indexed, so there is nothing to record an echo for.
-        Err(_) => (IndexOp::Remove { path: path.clone() }, None),
+        // Only a file that is not there has been deleted. One that exists and cannot be
+        // read right now (a scanner holding it on Windows, permissions) keeps its row
+        // and submits nothing, with no echo recorded, so the watcher's own event still
+        // reaches the note. Nothing was indexed, so there is nothing to record.
+        Err(serat_core::VaultError::NotFound { .. }) => {
+            (IndexOp::Remove { path: path.clone() }, None)
+        }
+        Err(_) => return Ok(()),
         Ok(loaded) => {
             let hash = loaded.meta.hash;
-            match build_op(parser, path, loaded) {
-                Some((op, _)) => (op, Some(hash)),
-                // Nothing to index: the previous row stays, which is better than
-                // deleting a note because one save of it did not parse. Nothing was
-                // submitted, so again nothing to record.
-                None => return Ok(()),
-            }
+            let (op, _, _) = build_op(parser, path, loaded);
+            (op, Some(hash))
         }
     };
 
@@ -290,39 +353,55 @@ pub fn apply(
     // See the doc comment on `IndexHandle::apply` for why "after" rather than "before"
     // is the whole fix.
     if let Some(hash) = hash {
-        echo.record_echo(hash);
+        echo.record_echo(path, hash);
     }
     Ok(())
 }
 
-/// Turn a loaded file into the operation that indexes it, or `None` if it cannot be.
+/// Turn a loaded file into the operation that indexes it. The one place a file becomes
+/// an op, shared by the save path, the external-change path and the rebuild, so the
+/// three cannot disagree about what a vault contains (C-02).
 ///
-/// A note the parser refuses is skipped, which is the behaviour I4 established and
-/// which this deliberately does not change.
+/// A note the parser refuses is indexed as a **bare row** (architecture 3.1.2 step 4,
+/// task #58): `UpsertNote` with a `ParsedNote` that has only a title from the file
+/// stem, and the hash of the bytes that failed so the hash gate works. The writer's
+/// upsert removes the path's earlier rows first, in the same transaction, so no stale
+/// blocks, fields, links or FTS rows survive an edit into a refused form. The note
+/// stays listable, searchable by path and linkable. There is no parse-error column:
+/// a refused note is a `kind = 'note'` row with no `blocks` row. The returned flag
+/// says the parser refused.
 ///
-/// It is worth flagging rather than quietly deciding: design goal 5 says capability
-/// degrades and nothing breaks, and skipping means the vault's *contents* depend on
-/// whether the parser understood a file — an unparseable note vanishes from the index
-/// rather than appearing without blocks. Indexing it as a bare row instead would keep
-/// it listable and linkable and lose only its text. That is a change to what the index
-/// contains, so it belongs to architect and not to a timing task.
-fn build_op(
+/// One short-lived state is accepted: a file an outside process is still writing in
+/// place can be read half-written, refused, and held as a bare row until the next
+/// event for that path re-indexes it.
+pub(crate) fn build_op(
     parser: &dyn NoteParser,
     path: &VaultPath,
     loaded: LoadedNote,
-) -> Option<(IndexOp, Duration)> {
+) -> (IndexOp, Duration, bool) {
     match loaded.meta.kind {
-        NoteKind::Asset => Some((IndexOp::UpsertAsset { meta: loaded.meta }, Duration::ZERO)),
+        NoteKind::Asset => (
+            IndexOp::UpsertAsset { meta: loaded.meta },
+            Duration::ZERO,
+            false,
+        ),
         NoteKind::Note => {
             let parsing = Instant::now();
-            let parsed = parser.parse(path, &loaded.bytes).ok()?;
-            Some((
+            let result = parser.parse(path, &loaded.bytes);
+            let elapsed = parsing.elapsed();
+            let refused = result.is_err();
+            let parsed = result.unwrap_or_else(|_| serat_core::ParsedNote {
+                title: Some(path.stem().to_owned()),
+                ..serat_core::ParsedNote::default()
+            });
+            (
                 IndexOp::UpsertNote {
                     meta: loaded.meta,
                     parsed: Box::new(parsed),
                 },
-                parsing.elapsed(),
-            ))
+                elapsed,
+                refused,
+            )
         }
     }
 }
@@ -370,12 +449,15 @@ mod tests {
     /// recorded and in what order — including "nothing".
     #[derive(Default)]
     struct SpyEcho {
-        recorded: Mutex<Vec<ContentHash>>,
+        recorded: Mutex<Vec<(VaultPath, ContentHash)>>,
     }
 
     impl EchoGuard for SpyEcho {
-        fn record_echo(&self, hash: ContentHash) {
-            self.recorded.lock().expect("lock").push(hash);
+        fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
+            self.recorded
+                .lock()
+                .expect("lock")
+                .push((path.clone(), hash));
         }
     }
 
@@ -503,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             *echo.recorded.lock().expect("lock"),
-            vec![hash],
+            vec![(path("note.md"), hash)],
             "a successful submit did not record exactly the hash it indexed"
         );
     }

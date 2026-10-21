@@ -33,7 +33,7 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 /// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
 /// [`DDL`], which is asserted by a test rather than remembered by two people — under
 /// ADR-0002 a silent drift costs every user a full reindex.
-pub const INDEX_VERSION: i64 = 5;
+pub const INDEX_VERSION: i64 = 10;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,15 +133,25 @@ pub fn open_in_memory() -> Result<Connection, IndexError> {
 /// without the addition being the thing that undoes the fix.
 const STATEMENT_CACHE: usize = 32;
 
+/// The ordinary durability level of every connection.
+pub(crate) const SYNCHRONOUS_NORMAL: &str = "NORMAL";
+/// The level used for the few commits that must be on stable storage when they return.
+pub(crate) const SYNCHRONOUS_FULL: &str = "FULL";
+/// How long a connection waits on a lock.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
+/// How long closing waits for a checkpoint that a reader is holding up.
+const CLOSE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The pragmas, applied to every connection, writer and reader alike.
 fn configure(conn: &Connection) -> Result<(), IndexError> {
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;",
-    )
+         PRAGMA synchronous = {SYNCHRONOUS_NORMAL};
+         PRAGMA busy_timeout = {};",
+        BUSY_TIMEOUT.as_millis()
+    ))
     .map_err(sqlite)
 }
 
@@ -269,6 +279,88 @@ pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, 
     }
 }
 
+/// Run one write with `synchronous = FULL`, so its commit has reached stable storage
+/// when this returns, then put the connection back to the ordinary `NORMAL`.
+fn durably<T>(
+    conn: &Connection,
+    write: impl FnOnce() -> rusqlite::Result<T>,
+) -> Result<T, IndexError> {
+    conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)
+        .map_err(sqlite)?;
+    let result = write();
+    let restored = conn.pragma_update(None, "synchronous", SYNCHRONOUS_NORMAL);
+    let value = result.map_err(sqlite)?;
+    restored.map_err(sqlite)?;
+    Ok(value)
+}
+
+/// A session opens the index (task #14, architecture §3.1.1 item 6). Returns whether
+/// the previous session closed cleanly, and clears `index_meta.clean_close`.
+///
+/// **The clear is durable before this returns.** That is the whole of why the marker
+/// works: commits are not fsynced (`synchronous = NORMAL`), and SQLite's WAL loses a
+/// *suffix* of commits on power loss, never a middle. If the clear could be lost, so
+/// could every commit after it, and the next open would find `clean_close = 1` over
+/// an index that is behind the disk, with nothing to say the catch-up must look at
+/// content. Forcing this one commit to `FULL` fsyncs the WAL up to and including it,
+/// so a lost commit can only be one made after the marker said "unclean".
+///
+/// The crash test (`external_change.rs`) shows the clear is *in the log* that survives a
+/// rollback; it cannot show it is durable. That half is the `FULL` level, tested in
+/// `durably_forces_full_inside_the_write_and_restores_normal_after`.
+///
+/// Runs on the connection before the writer actor owns it, like `open_or_rebuild`'s
+/// adoption of a changed vault root: ADR-0001's single writer is about the actor
+/// being the only writer while it runs.
+pub(crate) fn begin_session(conn: &Connection) -> Result<bool, IndexError> {
+    let clean: i64 = conn
+        .query_row(
+            "SELECT clean_close FROM index_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite)?;
+    if clean != 0 {
+        durably(conn, || {
+            conn.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
+        })?;
+    }
+    Ok(clean != 0)
+}
+
+/// A session closes the index: checkpoint everything into the database file, and only
+/// if that completed, durably set `clean_close`. Returns whether the marker was set.
+///
+/// `false` is not an error. A reader pinning the WAL makes the `TRUNCATE` checkpoint
+/// report busy, and then the honest answer is "unclean": the next open does the extra
+/// work and nothing is lost. The order matters the other way round too: the marker is
+/// set only after the checkpoint has moved every earlier commit into the file.
+pub(crate) fn end_session(conn: &Connection) -> Result<bool, IndexError> {
+    // A reader pinning the WAL makes the checkpoint wait; closing must not hang for the
+    // connection's usual five seconds on a reader that is not going to leave.
+    conn.busy_timeout(CLOSE_BUSY_TIMEOUT).map_err(sqlite)?;
+    let checkpoint = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(sqlite);
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(sqlite)?;
+    let (busy, log, moved) = checkpoint?;
+    if busy != 0 || log != moved {
+        return Ok(false);
+    }
+    durably(conn, || {
+        conn.execute("UPDATE index_meta SET clean_close = 1 WHERE id = 1", [])
+    })?;
+    // Best effort: leave no -wal behind. The marker is already durable.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    Ok(true)
+}
+
 pub(crate) fn sqlite(error: rusqlite::Error) -> IndexError {
     IndexError::Sqlite {
         message: error.to_string(),
@@ -278,6 +370,23 @@ pub(crate) fn sqlite(error: rusqlite::Error) -> IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durably_forces_full_inside_the_write_and_restores_normal_after() {
+        // S4: the crash test shows the clear is in the log, not that it is durable.
+        // This is the half it cannot show: the level is FULL while the write runs
+        // (2) and NORMAL again afterwards (1).
+        let dir = tempfile::tempdir().expect("temp");
+        let conn = open(&dir.path().join("t.db")).expect("open");
+        let level = || -> i64 {
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .expect("pragma")
+        };
+        assert_eq!(level(), 1);
+        let inside = durably(&conn, || Ok(level())).expect("durably");
+        assert_eq!(inside, 2, "not FULL while the write runs");
+        assert_eq!(level(), 1, "not restored to NORMAL");
+    }
 
     #[test]
     fn the_ddl_runs_as_delivered() {
@@ -323,9 +432,9 @@ mod tests {
 
     #[test]
     fn the_bundled_sqlite_has_fts5() {
-        // FR-NAV-02 and the P2 "phrase inside a PDF findable from the note search
-        // box" gate both sit on this. The bundled build is not the host's SQLite, so
-        // this asserts a property of what we ship.
+        // FR-NAV-02 (note bodies) and, in P2, FR-NAV-08 (the "phrase inside a PDF
+        // findable from the note search box" gate) both sit on this. The bundled
+        // build is not the host's SQLite, so this asserts a property of what we ship.
         let conn = open_in_memory().expect("open");
         conn.execute_batch("CREATE VIRTUAL TABLE probe USING fts5(body);")
             .expect("the bundled SQLite must have FTS5 compiled in");

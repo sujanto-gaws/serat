@@ -1019,7 +1019,7 @@ pub struct JobArgs {
 #[must_use]
 pub fn usage(budget: &Budget) -> String {
     format!(
-        "usage: {id} [--profile reference|ci] [--iterations N] [--help]
+        "usage: {id} [--profile reference|ci] [--iterations N] [--root DIR] [--help]
 
   --profile <name>    Which machine profile's threshold applies.
                       One of: reference (default), ci.
@@ -1027,6 +1027,8 @@ pub fn usage(budget: &Budget) -> String {
                       what this budget's acceptance criterion names. Any other
                       value marks the result indicative: it is printed, and it
                       must not be recorded as a gate number.
+  --root <DIR>        Repository root (also SERAT_REPO_ROOT). Default: the
+                      [workspace] above the working directory.
   --help, -h          Print this and measure nothing.
 
 Both value flags also accept the --flag=value form.
@@ -1079,6 +1081,21 @@ pub fn parse_args(budget: &Budget, args: &[String]) -> Result<JobArgs, String> {
             "--help" | "-h" => {
                 help = true;
                 i += 1;
+            }
+            // Read by `repo_root()` from the process arguments (shared `reporoot`
+            // rule); here it is only checked and skipped so it is not "unknown".
+            "--root" => {
+                if inline.as_deref().is_some_and(str::is_empty)
+                    || (inline.is_none() && args.get(i + 1).is_none())
+                {
+                    return Err(format!(
+                        "--root needs a directory
+
+{}",
+                        usage(budget)
+                    ));
+                }
+                i += if inline.is_some() { 1 } else { 2 };
             }
             "--profile" | "--iterations" => {
                 let value = match inline {
@@ -1135,13 +1152,22 @@ pub fn parse_args(budget: &Budget, args: &[String]) -> Result<JobArgs, String> {
     })
 }
 
-/// Repository root, resolved at compile time from this crate's location.
+/// Repository root, resolved at run time (tasks #45, #54) by the shared `reporoot`
+/// crate: `--root`, `SERAT_REPO_ROOT`, a `[workspace]` manifest above the working
+/// directory, then the compile-time location. [`parse_args`] has already rejected
+/// a `--root` with no value, so the error arm is unreachable from a bin.
+///
+/// # Panics
+/// On a `--root` with no value, when called without going through [`parse_args`].
 pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    let r = reporoot::from_process(&reporoot::compiled_root(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Results are written under this root (bench/out/budgets) and the vault is read
+    // from it, so the one place the rule is applied also says which rule won, once,
+    // on stderr (the compiled-in fallback is the silent-wrong-tree case).
+    ANNOUNCED.call_once(|| eprintln!("budget: {}", r.report_line()));
+    r.path
 }
 
 /// Make sure the preset vault exists, generating it if it does not, then verify
@@ -4064,6 +4090,21 @@ mod tests {
             "{}",
             outcome.to_json()
         );
+    }
+
+    #[test]
+    fn root_is_accepted_with_a_value_and_refused_without_one() {
+        // Task #54: shared with doclint/vaultgen through `reporoot`; `repo_root()`
+        // reads the value, `parse_args` only guards against a bare flag.
+        for args in [&["--root", "/x"][..], &["--root=/x"][..]] {
+            let a: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(parse_args(&PRF04_FULL_REBUILD, &a).is_ok(), "{args:?}");
+        }
+        for args in [&["--root"][..], &["--root="][..]] {
+            let a: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let err = parse_args(&PRF04_FULL_REBUILD, &a).expect_err("bare --root");
+            assert!(err.contains("--root needs a directory"), "{err}");
+        }
     }
 
     #[test]

@@ -41,14 +41,56 @@ path = "src/bin/prf03-save-to-index.rs"
 name = "prf04-full-rebuild"
 path = "src/bin/prf04-full-rebuild.rs"
 
+# Task #15: latency expectations for the P1 read paths (architecture §4.5). Reports,
+# does not gate.
+[[bin]]
+name = "p1-read-paths"
+path = "src/bin/p1-read-paths.rs"
+
+# Task #53: attributes the hub-note save tail (architecture 3.1.1) and diagnoses the
+# search-connection gap (architecture 4.5). Reports, applies no remedy, gates nothing.
+[[bin]]
+name = "p1-save-tail"
+path = "src/bin/p1-save-tail.rs"
+
+[[bin]]
+name = "p1-search-gap"
+path = "src/bin/p1-search-gap.rs"
+
+# FR-VLT-01's tree path, Rust side (ADR-0015): warm and no-index arms, reported. The
+# binding tree_complete - T_open is task #9's.
+[[bin]]
+name = "p1-tree-path"
+path = "src/bin/p1-tree-path.rs"
+
+# NFR-PRF-06's 20 ms allocation to Switcher::query (architecture §9.2), 20k and 50k.
+# Reports, does not gate; the binding figure is task #10's.
+[[bin]]
+name = "p1-switcher"
+path = "src/bin/p1-switcher.rs"
+
+# Task #14: FR-VLT-04, an external change visible in the index within 500 ms. Reports
+# p95 for one edited note and for a batch of 100, with --assert as the gate.
+[[bin]]
+name = "p1-external-change"
+path = "src/bin/p1-external-change.rs"
+
+# Task #14 review: the walk with an ignore file and the open-time catch-up, reported.
+[[bin]]
+name = "p1-catch-up"
+path = "src/bin/p1-catch-up.rs"
+
 [dependencies]
+reporoot = { path = "../reporoot" }
 vaultgen = { path = "../vaultgen" }
 # Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
 # number the code under test reports -- the same argument as recomputing the
 # vault digest. serat-index already links it, so this costs no build time.
-rusqlite = { workspace = true }
+# "trace": the save-tail and search-gap benches read statement profile events.
+rusqlite = { workspace = true, features = ["trace"] }
 serat-core = { path = "../../crates/serat-core" }
-serat-index = { path = "../../crates/serat-index" }
+# test-hooks: p1-read-paths toggles the progress handler on one connection (task #51).
+serat-index = { path = "../../crates/serat-index", features = ["test-hooks"] }
 serat-parse = { path = "../../crates/serat-parse" }
 serat-vault = { path = "../../crates/serat-vault" }
 

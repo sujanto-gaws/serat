@@ -24,7 +24,12 @@ It is an ADR because it adds a third read path into the vault, beside `read_file
 1. **Allows `GET` and `HEAD` only.** Everything else gets 405. The one exception is `OPTIONS`, answered as in step 8, so that preflight is covered whatever a webview decides to send. The scheme cannot write.
 2. **Refuses any host but `localhost`** with a 404.
 3. **Decodes the path exactly once, and that is the only rule.** A decoded path containing NUL or invalid UTF-8 gets a 404. The decoded text is the file name, literally: a `%` left in it is an ordinary character and is never decoded again. So `%252e` names a file literally called `%2e`, and a real file named `a%41.pdf` stays servable, because the front end requests it as `a%2541.pdf`.
-4. **Builds a `VaultPath` under task #34's rules, which this ADR relies on and does not restate as its own guard.** `VaultPath::new` rejects `..`, absolute paths and empty segments. #34 adds: **`:` in any segment**, which closes the Windows drive-relative escape (`C:Users` replaces the whole path in `PathBuf::push`) and NTFS alternate data streams; **Windows device names** (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, with or without an extension); and **trailing dots or spaces**. The check that existed before #34 is not relied on. **Until #34 lands, this scheme must not ship.**
+4. **Builds a `VaultPath` under task #34's rules, which this ADR relies on and does not restate as its own guard.** **Some of those rules apply on every platform, and some only on Windows.**
+   - **On every platform**, `VaultPath::new` rejects `..`, empty paths and absolute paths. A leading `/`, or a first segment that is exactly a drive letter (one ASCII letter and `:`, as in `C:/Users/…`), counts as absolute. A first segment such as `Notes:` is not a drive letter and is an ordinary name outside Windows. `\` is read as a separator.
+   - **On Windows only**, #34 adds three rules. It rejects **`:` in any segment**, which closes the drive-relative escape (`C:Users` replaces the whole path in `PathBuf::push`) and NTFS alternate data streams. It rejects **Windows device names** (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `CLOCK$`, `COM0`–`9`, `LPT0`–`9`, in any case, with or without an extension or a trailing space). And it rejects **trailing dots or spaces**, which Windows strips silently.
+   - **Elsewhere, those three are ordinary file names, and refusing them would be a defect.** On Linux and macOS, `C:Users.png`, `CON.pdf` and `aux.png` are legitimate files that a user can have in a vault, with none of the Windows hazards. They pass step 4 and are judged by steps 5–7 like any other name. This is `serat_core::path::Platform`. The rules are a function of an explicit platform value, so both directions are testable from any runner (#34's own regression: universal rules made `aux.md` and `Meeting 10:30.md` vanish from Linux vaults).
+
+   The check that existed before #34 is not relied on. **Until #34 lands, this scheme must not ship.**
 5. **Refuses anything but a viewable asset**, using the one extension→MIME table in `serat-core`. `application/pdf` and `image/png|jpeg|gif|webp|avif|bmp|svg+xml` pass. Everything else gets 404, including Markdown and any path under an ignored directory. The ignored-directory check folds case, which is #34's fourth rule.
 6. **Resolves through `Vault::resolve`**, which refuses a symlink component anywhere in the path (T-07). Then, per #34, it **asserts that the result `starts_with` the canonical root**. A refusal gets 404 with no detail.
 7. **Opens, then re-verifies the open handle, which closes the gap between resolving a path and opening it (TOCTOU).** Between step 6 and `open`, a component could be swapped for a symlink. After `open`, the handle's real path is read back — `GetFinalPathNameByHandleW` on Windows, `fcntl(F_GETPATH)` on macOS, `readlink("/proc/self/fd/N")` on Linux — and must `starts_with` the canonical root. On Windows the result carries the `\\?\` verbatim prefix, which is stripped (`\\?\UNC\` becomes `\\`) before the comparison. **The handle's metadata must also say `is_file()`**: a FIFO or device would otherwise block the read forever. Either failure closes the handle and returns 404. This is recorded in T-10.
@@ -66,7 +71,7 @@ The read-only, viewable-types-only, contained-paths handler (steps 1–10) limit
 
 **Downloads are refused.** `<a download href="serat-asset://…">` would make the webview write a vault file somewhere outside the vault, which is a write path T-06 does not list. serat-app refuses every download: WebView2 `DownloadStarting` is cancelled, and WebKit's `download-started` is cancelled on WKWebView and WebKitGTK. The sanitiser also strips the `download` attribute, as a second layer. Recorded in T-06 and T-10.
 
-**The default context menu is disabled in release builds** (it offers "Save image as…", "Open frame in new window" and "Inspect"). Debug builds keep it for development.
+**The default context menu is disabled in release builds** (it offers "Save image as…", "Open frame in new window" and "Inspect"). Debug builds keep it for development. **Today (task #37) it is disabled on Linux only.** Windows and macOS wait for task #39, which needs platform access, and until then the menu is a known gap on those two platforms, recorded in T-10.
 
 **Sidecar pairing matches bytes exactly, deliberately.** `X.PDF` and `x.pdf.md` are not a pair: ADR-0005 defines the sidecar name as the binary's full file name with `.md` appended, and on a case-sensitive filesystem the two could name different files. Folding case here would let one sidecar claim two binaries. A user who wants the pairing renames one of the two, and nothing is guessed.
 
@@ -105,7 +110,10 @@ Nothing yet. The cases that would break it are listed for task #19 and belong in
 - a FIFO;
 - a link pointing into `.serat/`;
 - `%2e%2e`, `%2f`, `%252e` and `%00`;
-- `C:Users`, `C%3AUsers`, `CON.pdf` and a trailing dot;
+- the Windows name rules, **with expectations split by platform**. Each case runs through `VaultPath::new_for_platform` on both `Platform` values, and through the real handler on the runner's own platform:
+  - **on every platform**, `C:/Users/x.png` and `C%3A/Users/x.png` (a leading drive) get 404 at step 4;
+  - **on Windows**, `C:Users.png`, `C%3AUsers.png`, `CON.pdf`, `con .pdf`, `a.png:hidden` and `photo.png.` get 404 at step 4;
+  - **on Linux and macOS**, a real file named `C:Users.png` or `CON.pdf`, created inside the test vault, is **served with its own bytes**. The test also asserts that what was served is that file and nothing outside the root. `photo.png.` passes step 4 and gets 404 from step 5, because it has no viewable extension. A 404 for `CON.pdf` on Linux is a failure, not a pass;
 - an ignored directory in different case;
 - a `.md` path;
 - a non-GET method;

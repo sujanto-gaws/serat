@@ -78,7 +78,11 @@ tauri-build = { version = "2.6.3", features = [] }
 # assertion that would catch it. Dev-only: no production code opens the database
 # directly (§2.1 -- that is serat-index's job).
 [dev-dependencies]
+# task #52: the command-layer supersession test parks a search mid-flight.
+serat-index = { path = "../serat-index", features = ["test-hooks"] }
 rusqlite = { workspace = true }
+# Test fixtures that clean up after themselves.
+tempfile = { workspace = true }
 
 # `tauri`'s "test" feature (`tauri::test`, `MockRuntime`) is a target-specific
 # dev-dependency rather than a plain one: `tests/acl_behaviour.rs` is

@@ -69,6 +69,8 @@ enum Command {
     EndBulkLoad(Vec<String>, SyncSender<Result<(), IndexError>>),
     /// Resolve every link whose target is now present.
     ResolveLinks(SyncSender<Result<usize, IndexError>>),
+    /// Commit anything in hand, checkpoint, and mark the index as cleanly closed.
+    CloseClean(SyncSender<Result<bool, IndexError>>),
     /// Apply anything in hand and end the loop.
     ///
     /// An explicit message rather than relying on every sender being dropped: handles
@@ -190,6 +192,24 @@ impl WriterHandle {
         answer.recv().map_err(|_| IndexError::WriterStopped)?
     }
 
+    /// End the session: apply everything queued, checkpoint the WAL into the database
+    /// file and, only if that completed, durably set `index_meta.clean_close`. Returns
+    /// whether it was set; `false` (a reader pinned the WAL) means the next open will
+    /// treat this shutdown as unclean, which costs a little work and loses nothing.
+    ///
+    /// A barrier, called once per session at close, never on the save path.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::WriterStopped`], or whatever SQLite says.
+    pub fn close_clean(&self) -> Result<bool, IndexError> {
+        let (reply, answer) = sync_channel(1);
+        self.tx
+            .send(Command::CloseClean(reply))
+            .map_err(|_| IndexError::WriterStopped)?;
+        answer.recv().map_err(|_| IndexError::WriterStopped)?
+    }
+
     /// Run `ANALYZE` and wait for it.
     ///
     /// # Errors
@@ -200,7 +220,9 @@ impl WriterHandle {
         self.round_trip(Command::Analyze)
     }
 
-    /// Mark the index usable, after a rebuild has committed everything.
+    /// Mark the index usable, after a rebuild has committed everything. Also sets
+    /// `clean_close`: a finished rebuild owes nothing, and the connection's close
+    /// checkpoints it.
     ///
     /// # Errors
     ///
@@ -346,6 +368,12 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
     // BeginBulkLoad and cleared by EndBulkLoad, so a writer that never sees either --
     // the incremental path -- keeps the opportunistic ANALYZE it was designed for.
     let mut bulk_load = false;
+    // Set once the session has been closed cleanly (clean_close = 1 is durable). Any
+    // commit after that clears it again, durably, in the same transaction: an op
+    // submitted by a handle clone between CloseClean and the writer stopping would
+    // otherwise commit at synchronous = NORMAL under a marker saying nothing is owed,
+    // and a power cut would lose it for good.
+    let mut closed = false;
     // A command taken off the channel while draining a batch that cannot be folded
     // into it. Held here rather than pushed back, because a channel has no way to
     // un-receive and dropping it would lose a caller's barrier.
@@ -360,7 +388,14 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
+                    let _ = commit(
+                        &conn,
+                        &mut pending,
+                        &mut since_analyze,
+                        bulk_load,
+                        fault,
+                        &mut closed,
+                    );
                     return;
                 }
             },
@@ -403,8 +438,15 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             // about all paths; a test claims less and is therefore safe to get partly
             // wrong. FaultInjector is the seam that makes the real route testable.
             Command::BeginBulkLoad(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
-                    .and_then(|()| begin_bulk_load(&conn));
+                let result = commit(
+                    &conn,
+                    &mut pending,
+                    &mut since_analyze,
+                    bulk_load,
+                    fault,
+                    &mut closed,
+                )
+                .and_then(|()| begin_bulk_load(&conn));
                 // Only once the triggers are actually off. Setting it before would
                 // suppress ANALYZE for a bulk load that failed to start.
                 bulk_load = result.is_ok();
@@ -412,8 +454,15 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 continue;
             }
             Command::EndBulkLoad(triggers, reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
-                    .and_then(|()| end_bulk_load(&conn, &triggers));
+                let result = commit(
+                    &conn,
+                    &mut pending,
+                    &mut since_analyze,
+                    bulk_load,
+                    fault,
+                    &mut closed,
+                )
+                .and_then(|()| end_bulk_load(&conn, &triggers));
                 // Cleared either way: a failed end_bulk_load leaves the index without
                 // its triggers and the caller must not mark it ready, but the writer
                 // is no longer bulk loading and must not keep suppressing ANALYZE.
@@ -421,14 +470,47 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 let _ = reply.send(result);
                 continue;
             }
+            Command::CloseClean(reply) => {
+                let result = commit(
+                    &conn,
+                    &mut pending,
+                    &mut since_analyze,
+                    bulk_load,
+                    fault,
+                    &mut closed,
+                )
+                .and_then(|()| schema::end_session(&conn));
+                if matches!(result, Ok(true)) {
+                    closed = true;
+                }
+                let _ = reply.send(result);
+                continue;
+            }
+            // ResolveLinks, Analyze and EndBulkLoad write outside `commit()`, so they do not
+            // re-open the clean marker the way a commit after a clean close does. Nothing
+            // calls them after `close_clean` today; one that did would need the same latch.
             Command::ResolveLinks(reply) => {
-                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
-                    .and_then(|()| resolve_links(&conn));
+                let result = commit(
+                    &conn,
+                    &mut pending,
+                    &mut since_analyze,
+                    bulk_load,
+                    fault,
+                    &mut closed,
+                )
+                .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);
                 continue;
             }
             Command::Stop => {
-                let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
+                let _ = commit(
+                    &conn,
+                    &mut pending,
+                    &mut since_analyze,
+                    bulk_load,
+                    fault,
+                    &mut closed,
+                );
                 return;
             }
         }
@@ -443,7 +525,14 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     barrier = Some((reply, Barrier::MarkReady(root)));
                 }
                 Ok(Command::Stop) => {
-                    let _ = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
+                    let _ = commit(
+                        &conn,
+                        &mut pending,
+                        &mut since_analyze,
+                        bulk_load,
+                        fault,
+                        &mut closed,
+                    );
                     return;
                 }
                 Ok(other) => {
@@ -454,7 +543,14 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             }
         }
 
-        let mut result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault);
+        let mut result = commit(
+            &conn,
+            &mut pending,
+            &mut since_analyze,
+            bulk_load,
+            fault,
+            &mut closed,
+        );
 
         if let Some((reply, extra)) = barrier {
             if result.is_ok() {
@@ -471,8 +567,10 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
     }
 }
 
-/// Capture the `blocks_fts` trigger definitions and `ix_links_unresolved`, then drop
-/// them.
+/// Capture the `blocks_fts` trigger definitions, `ix_links_unresolved` and the four
+/// foreign-key child indexes of user_version 7 (architecture §4.4, task #51), then
+/// drop them. The four exist only to serve the cascade on a delete; a rebuild deletes
+/// nothing, so it builds them once in [`end_bulk_load`] instead of maintaining them.
 ///
 /// F-373 (task #82): a trigger is not the only per-row obligation a bulk load cannot
 /// afford. `ix_links_unresolved` is maintained by SQLite on every insert into `links`
@@ -492,7 +590,9 @@ fn begin_bulk_load(conn: &Connection) -> Result<Vec<String>, IndexError> {
             .prepare(
                 "SELECT type, sql FROM sqlite_master
                   WHERE (type = 'trigger' AND tbl_name = 'blocks')
-                     OR (type = 'index' AND name = 'ix_links_unresolved')
+                     OR (type = 'index' AND name IN ('ix_links_unresolved',
+                         'ix_links_src_block', 'ix_fields_block', 'ix_tasks_block',
+                         'ix_tasks_note'))
                   ORDER BY type, name",
             )
             .map_err(sqlite)?;
@@ -543,10 +643,10 @@ fn end_bulk_load(conn: &Connection, triggers: &[String]) -> Result<(), IndexErro
 /// The second pass the foreign key forces: a link can name a note that has not been
 /// inserted yet, so `dst_note` starts NULL and is filled once every note is present.
 ///
-/// P0 resolves by exact path and by path plus the Markdown extension, which is what
-/// the benchmark vault and an Obsidian vault using full paths both produce. Obsidian's
-/// shortest-unique-name resolution is P1 and belongs with the rest of link handling;
-/// what matters here is that unresolved stays NULL rather than becoming wrong.
+/// Case-insensitive (Unicode, `serat_core::fold_case`, on the stored `*_fold` columns;
+/// the statement is `resolve::RESOLVE_ALL`, shared with the incremental passes). A
+/// link names a note by path, by path plus `.md`, or by file name (F-312).
+/// Unresolved stays NULL rather than becoming wrong.
 fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     // The EXISTS clause is load-bearing twice over. Without it the UPDATE touches
     // every unresolved link and sets dst_note to NULL again where the target is
@@ -573,31 +673,32 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     // names both keys so the choice is total rather than left to the planner: a
     // rebuild resolving the same link two ways on two runs would move the corpus
     // digest without the corpus moving.
-    const RESOLVE: &str = "
-        UPDATE links
-           SET dst_note = (
-                SELECT n.id FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-              ORDER BY length(n.path), n.path
-                 LIMIT 1
-           )
-         WHERE dst_note IS NULL
-           AND kind <> 'tag'
-           AND dst_path IS NOT NULL
-           AND EXISTS (
-                SELECT 1 FROM notes n
-                 WHERE n.path = links.dst_path
-                    OR n.path = links.dst_path || '.md'
-                    OR (instr(links.dst_path, '/') = 0
-                        AND (n.file_name = links.dst_path
-                             OR n.file_name = links.dst_path || '.md'))
-           )";
-    let resolved = conn.execute(RESOLVE, []).map_err(sqlite)?;
+    let resolved = conn
+        .execute(crate::resolve::RESOLVE_ALL, [])
+        .map_err(sqlite)?;
+    pair_sidecars(conn)?;
     Ok(resolved)
+}
+
+/// Pair every asset with its sidecar note, in one `UPDATE` (task #17; architecture
+/// §7.4; FR-BIN-02).
+///
+/// `x.pdf.md` is `x.pdf`'s sidecar when both exist; the comparison is byte for byte
+/// (`notes.path` is the unique binary index), so `X.PDF` and `x.pdf.md` are not a pair
+/// (ADR-0017). Run after the load beside the link resolution because a bulk load skips
+/// the per-row pairing, and because it must see both orders (sidecar first, asset
+/// first). It touches only the asset rows (~200 on the 20k vault), one unique-index
+/// probe each, so NFR-PRF-04 pays nothing measurable. The incremental path pairs in
+/// `apply`, one probe per upsert, and the equivalence test holds the two together.
+fn pair_sidecars(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute(
+        "UPDATE notes SET sidecar_path =
+                (SELECT s.path FROM notes s WHERE s.path = notes.path || '.md' AND s.kind = 'note')
+          WHERE kind = 'asset'",
+        [],
+    )
+    .map_err(sqlite)?;
+    Ok(())
 }
 
 enum Barrier {
@@ -645,6 +746,7 @@ fn commit(
     since_analyze: &mut usize,
     bulk_load: bool,
     fault: &FaultInjector,
+    closed: &mut bool,
 ) -> Result<(), IndexError> {
     if pending.is_empty() {
         return Ok(());
@@ -656,14 +758,36 @@ fn commit(
         });
     }
 
-    let tx = conn.unchecked_transaction().map_err(sqlite)?;
-    let mut touched = 0usize;
-    for op in pending.iter() {
-        let applied = apply::apply(&tx, op, bulk_load)?;
-        touched += applied.notes + applied.removed;
+    // The first commit after a clean close re-opens the session: clear the marker in
+    // this transaction and make the commit durable (see `closed` in `run`).
+    let reopen = *closed;
+    if reopen {
+        conn.pragma_update(None, "synchronous", schema::SYNCHRONOUS_FULL)
+            .map_err(sqlite)?;
     }
-    apply::sync_note_count(&tx)?;
-    tx.commit().map_err(sqlite)?;
+    let committed = (|| -> Result<usize, IndexError> {
+        let tx = conn.unchecked_transaction().map_err(sqlite)?;
+        let mut touched = 0usize;
+        for op in pending.iter() {
+            let applied = apply::apply(&tx, op, bulk_load)?;
+            touched += applied.notes + applied.removed;
+        }
+        apply::sync_note_count(&tx)?;
+        if reopen {
+            tx.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
+                .map_err(sqlite)?;
+        }
+        tx.commit().map_err(sqlite)?;
+        Ok(touched)
+    })();
+    if reopen {
+        let restored = conn.pragma_update(None, "synchronous", schema::SYNCHRONOUS_NORMAL);
+        if committed.is_ok() {
+            *closed = false;
+        }
+        restored.map_err(sqlite)?;
+    }
+    let touched = committed?;
 
     pending.clear();
     *since_analyze += touched;

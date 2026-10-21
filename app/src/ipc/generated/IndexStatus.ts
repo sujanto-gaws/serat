@@ -24,4 +24,23 @@ state: IndexState,
  * reads this instead of timing an IPC round trip, so the number it reports
  * is the application's, not the harness's.
  */
-since_process_start_ms: number, };
+since_process_start_ms: number, 
+/**
+ * How many file names in this vault the walk and the watcher could not turn
+ * into a vault path and so do not show (task #34's `Vault::refusals()`;
+ * mostly Windows-only name rules: `:`, device names, a trailing dot or
+ * space). FR-VLT-01, design goal 5: a file Serat cannot show is reported,
+ * never silently absent. The front end renders it as one status fact, "N
+ * names not shown", and fetches the list behind it with `refused_names`.
+ *
+ * The count is of distinct paths: `RefusalLog::len()`, the length of the
+ * `refused_names` list. It saturates at [`REFUSED_NAMES_CAP`], and at the
+ * cap the front end says "1000 or more". It does not add
+ * `RefusalLog::overflowed()`. That counter counts refusal events past the
+ * cap, not distinct paths, because an unstored path the watcher refuses
+ * twice is counted twice. Adding it would overstate the number of names.
+ * `None` (absent on the wire) means serat-app is not counting yet, or no
+ * vault is open. It never means zero, so the front end shows nothing for
+ * it rather than "0 names not shown".
+ */
+refused_names?: number, };

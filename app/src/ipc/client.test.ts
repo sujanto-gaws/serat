@@ -48,14 +48,19 @@ describe("the IPC client stays inside ADR-0012's grant", () => {
   }
 
   /**
-   * Tauri names a command permission `allow-<command-with-dashes>`; everything else
-   * in the list (`core:default`) is not a command grant.
+   * Tauri names an app-command permission `allow-<command-with-dashes>`; everything
+   * else (`core:default`, plugin permissions like `opener:allow-open-url`) is not a
+   * command grant. A permission is either a bare string or an object form
+   * `{ identifier, allow?, deny? }` (scoped grants); both are read by identifier.
    */
   function grantedCommands(): string[] {
-    const capability = JSON.parse(readFileSync(capabilityPath, "utf8")) as { permissions: string[] };
+    const capability = JSON.parse(readFileSync(capabilityPath, "utf8")) as {
+      permissions: Array<string | { identifier: string }>;
+    };
     return capability.permissions
-      .filter((permission) => permission.startsWith("allow-"))
-      .map((permission) => permission.slice("allow-".length).replaceAll("-", "_"))
+      .map((permission) => (typeof permission === "string" ? permission : permission.identifier))
+      .filter((identifier) => identifier.startsWith("allow-"))
+      .map((identifier) => identifier.slice("allow-".length).replaceAll("-", "_"))
       .sort();
   }
 

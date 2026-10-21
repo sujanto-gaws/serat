@@ -11,6 +11,8 @@ import type { Patch } from "./Patch";
  * the hash lock, re-hashed immediately before the rename. Errors: `StaleHash`
  * (leave the buffer dirty, no blind retry — wait for or request the
  * `ExternalChange`), `InvalidPatch` (a client bug; the file is untouched),
+ * `LineEndingsWouldFuse` (a deletion in a mixed-ending note would fuse a lone
+ * `\r` with a `\n`; shown to the user, the file is untouched, never retried),
  * `NotWritable` (not Markdown, rule 3). On success `serat-app` moves its
  * recorded base for this note to the new hash.
  */
