@@ -51,7 +51,10 @@ fn a_refused_directory_is_one_entry_in_both_walks_and_is_not_entered() {
 
     vault.walk_tree("", |_, _| {}).expect("tree walk");
     let by_tree = vault.refusals().snapshot();
-    assert_eq!(by_walk, by_tree, "the two walks disagree about the refusals");
+    assert_eq!(
+        by_walk, by_tree,
+        "the two walks disagree about the refusals"
+    );
 }
 
 #[test]

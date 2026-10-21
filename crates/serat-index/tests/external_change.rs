@@ -86,9 +86,11 @@ fn paths_in(index: &Path) -> Vec<String> {
 
 fn clean_close(index: &Path) -> i64 {
     let conn = schema::open(&serat_index::index_path(index)).expect("open");
-    conn.query_row("SELECT clean_close FROM index_meta WHERE id = 1", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT clean_close FROM index_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
     .expect("marker")
 }
 
@@ -180,7 +182,10 @@ fn a_file_the_save_path_already_submitted_is_skipped_as_an_echo() {
         )
         .expect("index");
 
-    assert_eq!((echoed.get(), outcome.unchanged, outcome.upserted), (1, 1, 0));
+    assert_eq!(
+        (echoed.get(), outcome.unchanged, outcome.upserted),
+        (1, 1, 0)
+    );
     handle.close().expect("close");
 }
 
@@ -356,7 +361,11 @@ fn the_marker_is_cleared_at_open_and_set_at_close() {
 
     let handle = IndexHandle::open(&f.index).expect("open");
     assert!(!handle.opened_after_unclean_shutdown());
-    assert_eq!(clean_close(&f.index), 0, "not cleared while a session holds it");
+    assert_eq!(
+        clean_close(&f.index),
+        0,
+        "not cleared while a session holds it"
+    );
 
     handle.close().expect("close");
     assert_eq!(clean_close(&f.index), 1, "not set by a clean close");
@@ -463,7 +472,10 @@ fn a_commit_lost_after_the_marker_cleared_is_recovered_by_the_mtime_catch_up() {
 
     crash_back_to(&before, &f.index);
     let stale = hash_of(&f.index, "a.md").expect("row");
-    assert_ne!(stale, committed, "the simulated crash did not lose the commit");
+    assert_ne!(
+        stale, committed,
+        "the simulated crash did not lose the commit"
+    );
 
     // Reopen. The marker is what tells us.
     let reopened = IndexHandle::open(&f.index).expect("reopen");

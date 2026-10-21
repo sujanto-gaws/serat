@@ -31,6 +31,8 @@ pub mod echo;
 mod gitignore;
 pub mod hash;
 pub mod ignore;
+#[cfg(test)]
+mod ignore_file_tests;
 pub mod patch;
 #[cfg(test)]
 mod patch_props;
@@ -39,8 +41,6 @@ pub mod queue;
 pub mod refusal;
 pub mod tree;
 pub mod walk;
-#[cfg(test)]
-mod ignore_file_tests;
 #[cfg(all(test, unix))]
 mod walk_refusal_tests;
 pub mod watch;

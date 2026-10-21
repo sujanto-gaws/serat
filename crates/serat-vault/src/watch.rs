@@ -739,7 +739,10 @@ mod tests {
         fs::write(dir.path().join("kept.md"), b"# Kept\n").expect("write");
         assert!(eventually(|| queue.depth() > 0));
         std::thread::sleep(COALESCE_WINDOW * 2);
-        assert_eq!(queue.drain(), vec![VaultPath::new("kept.md").expect("path")]);
+        assert_eq!(
+            queue.drain(),
+            vec![VaultPath::new("kept.md").expect("path")]
+        );
         let _ = watcher.take_events();
 
         // Un-ignoring it: the rules reload, and the vault must be walked again.

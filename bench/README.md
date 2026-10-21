@@ -42,6 +42,12 @@ cargo run --release -p budget --bin p1-save-tail  -- --vault 20k --iterations 10
 cargo run --release -p budget --bin p1-search-gap -- --vault 20k --iterations 60
 ```
 
+`p1-external-change` (task #14) times FR-VLT-04 on the real pipeline: the `notify` watcher and its 150 ms window, the work queue, `Reconciler::index_paths` (hash gate, `CommonMarkParser`, bulk-side submit, flush) over an index rebuilt from a **copy** of the preset vault in the temp directory (the pinned vault is never written). It edits one note at a time the way an editor saves (temp file, then rename) and then batches of 100, and reports write-to-visible p95 split into the watcher delay and the processing. A run is rejected unless every edit was reported and the index holds the bytes written. It reports by default and gates with `--assert`; it has its own argument parser and takes the root from `SERAT_REPO_ROOT` or the working directory only. Needs a quiet machine and about 400 MB of temp space:
+
+```
+cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert
+```
+
 Record the machine conditions either side of a series with `cargo run --release -p budget --bin environment`; on Windows a run with the on-access virus scanner disabled is marked not gate eligible, because the gate figure has to be the one a user would see.
 
 All three are **red today, on purpose**: `serat-index` has no rebuild entry point (I4) or incremental save path (I5), and there is no application to start (D2, S1). Each prints the entry point it needs and the task that unblocks it. Documentation: `docs/05-testing/budget-harness.md`. CI: `.github/workflows/budgets.yml`, one job per budget.

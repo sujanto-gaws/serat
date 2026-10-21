@@ -184,7 +184,8 @@ impl Reconciler {
                         gone.push(path.clone());
                     }
                     for victim in gone {
-                        self.writer.submit_blocking(IndexOp::Remove { path: victim })?;
+                        self.writer
+                            .submit_blocking(IndexOp::Remove { path: victim })?;
                         outcome.removed += 1;
                     }
                 }
@@ -336,7 +337,9 @@ impl Reconciler {
 enum Step {
     /// The file could not be read. `not_found` distinguishes a vanished file from one
     /// that exists and cannot be read (permissions, a symlink, a directory).
-    Gone { not_found: bool },
+    Gone {
+        not_found: bool,
+    },
     Done(Outcome),
 }
 
@@ -382,9 +385,7 @@ fn rows_under(conn: &Connection, dir: Option<&str>) -> Result<HashMap<String, Ro
     let collected = match dir {
         Some(dir) => {
             let mut statement = conn
-                .prepare(
-                    "SELECT path, hash, mtime, kind FROM notes WHERE path >= ?1 AND path < ?2",
-                )
+                .prepare("SELECT path, hash, mtime, kind FROM notes WHERE path >= ?1 AND path < ?2")
                 .map_err(sqlite)?;
             statement
                 .query_map(params![format!("{dir}/"), format!("{dir}0")], map)

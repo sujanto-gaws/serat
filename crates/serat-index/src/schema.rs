@@ -300,9 +300,11 @@ fn durably<T>(
 /// being the only writer while it runs.
 pub(crate) fn begin_session(conn: &Connection) -> Result<bool, IndexError> {
     let clean: i64 = conn
-        .query_row("SELECT clean_close FROM index_meta WHERE id = 1", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT clean_close FROM index_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
         .map_err(sqlite)?;
     if clean != 0 {
         durably(conn, || {
@@ -326,7 +328,11 @@ pub(crate) fn end_session(conn: &Connection) -> Result<bool, IndexError> {
         .map_err(sqlite)?;
     let checkpoint = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .map_err(sqlite);
     conn.busy_timeout(std::time::Duration::from_millis(5000))
