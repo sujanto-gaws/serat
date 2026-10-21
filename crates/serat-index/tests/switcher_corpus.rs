@@ -1,4 +1,4 @@
-//! The switcher corpus as the index loads it (architecture §9.2; FR-NAV-01, US-02).
+//! The switcher corpus as the index loads it (architecture §9.2; FR-NAV-01, US-04).
 //!
 //! Serves **FR-NAV-01**. The corpus comes from three fixed-shape reads over the delivered
 //! schema; this runs them against it, with rows shaped as serat-parse emits them.

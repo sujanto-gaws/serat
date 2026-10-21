@@ -1,7 +1,7 @@
 //! NFR-PRF-06 allocation, Rust side: `Corpus::query` over the benchmark vault's index
 //! (architecture §9.2) · reported, not the gate.
 //!
-//! Serves **NFR-PRF-06**, **FR-NAV-01**, **US-02**. The binding figure is keystroke to
+//! Serves **NFR-PRF-06**, **FR-NAV-01**, **US-04**. The binding figure is keystroke to
 //! painted results, under 50 ms at p95 at 20,000 notes, in the real binary (task #10's
 //! job, unmerged). §9.2 allots **20 ms p95** of it to `Switcher::query`, and that is
 //! what this times: the matcher alone, in-process, over the corpus built from the vault's
@@ -23,8 +23,8 @@
 //! three-letter prefix of "Activation 12" is shared by hundreds of notes).
 //!
 //! ```text
-//! cargo run --release -p budget --bin p1-switcher -- --vault 20k
-//! cargo run --release -p budget --bin p1-switcher -- --vault 50k --passes 3
+//! cargo run --release -p budget --bin p1-switcher
+//! cargo run --release -p budget --bin p1-switcher -- --vault 20k --passes 3
 //! ```
 
 use std::process::ExitCode;
@@ -230,12 +230,12 @@ fn line(label: &str, s: &Samples) {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let mut vault_name = "20k".to_owned();
+    let mut vault_names = "20k,50k".to_owned();
     let mut passes = 2usize;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--vault" => vault_name = it.next().ok_or("--vault needs a name")?.clone(),
+            "--vault" => vault_names = it.next().ok_or("--vault needs names")?.clone(),
             "--passes" => {
                 passes = it
                     .next()
@@ -247,6 +247,44 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    for name in vault_names.split(',') {
+        measure(name, passes)?;
+    }
+    stress();
+    Ok(())
+}
+
+/// Adversarial candidates: long, dense in one letter, 50k of them (review S1). No vault
+/// is involved; the corpus is built from generated paths.
+fn stress() {
+    let paths: Vec<String> = (0..50_000)
+        .map(|i| format!("d{}/{}{i}.md", i % 50, "e".repeat(120)))
+        .collect();
+    let corpus = Corpus::from_paths(&paths);
+    println!("\nstress: 50000 notes with 120-character e-dense names, history absent");
+    let history = History::default();
+    for (label, query) in [
+        ("3 chars \"mee\" (no match)", "mee".to_owned()),
+        ("3 chars \"eee\"", "eee".to_owned()),
+        ("16 x \"e\"", "e".repeat(16)),
+        (
+            "23-character spaced query",
+            "e e e e e e e e e e e ee".to_owned(),
+        ),
+    ] {
+        let mut samples = Samples::new();
+        for _ in 0..5 {
+            let started = Instant::now();
+            std::hint::black_box(corpus.query(&query, 50, &history, NOW_MS));
+            samples.push(started.elapsed());
+        }
+        line(&format!("  {label}"), &samples);
+    }
+}
+
+fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
+    let vault_name = vault_name.to_owned();
+    println!("\n==================== vault {vault_name} ====================");
     let under_test = ensure_vault(&vault_name)?;
     let vault = Vault::open(&under_test.path).map_err(|e| format!("open vault: {e}"))?;
     let scratch = std::env::temp_dir().join(format!("serat-bench-switcher-{}", std::process::id()));
@@ -327,6 +365,15 @@ fn run(args: &[String]) -> Result<(), String> {
         corpus.heading_count(),
         set.len()
     );
+    println!(
+        "alias-prefix queries: 0 generated, 0 excluded (the index holds {} alias rows: \
+         block-style aliases are not indexed until #57)",
+        corpus.alias_count()
+    );
+    println!(
+        "validity: the top-10 rule is asserted for full-title queries; 3-character prefixes are \
+         checked non-empty only; no-match queries return zero; heading-mode queries return results."
+    );
     println!("query set: derived from the index, deterministic; headings drawn from vaultgen's");
     println!("small fixed vocabulary, so heading-mode match counts overstate a real vault.\n");
     line("corpus build (from index)", &build);
@@ -371,6 +418,17 @@ fn run(args: &[String]) -> Result<(), String> {
         line("    default mode", &gated_default);
         line("    heading mode", &gated_heading);
         line("  every keystroke (reported)", &all);
+        let heading_p95 = gated_heading.percentile(0.95);
+        println!(
+            "  heading mode, own row, history {label}: p95 {heading_p95:.2} ms against \
+             {ALLOCATION_MS:.0} ms ({:.0}% of allocation). {}",
+            100.0 * heading_p95 / ALLOCATION_MS,
+            if heading_p95 <= ALLOCATION_MS {
+                "Within."
+            } else {
+                "OVER."
+            }
+        );
         let p95 = gated.percentile(0.95);
         println!(
             "  NFR-PRF-06 allocation, history {label}: Switcher::query p95 {p95:.2} ms against \
@@ -388,6 +446,9 @@ fn run(args: &[String]) -> Result<(), String> {
          and render. The binding figure is keystroke to painted results in the real binary (task #10)."
     );
     let _ = std::fs::remove_dir_all(&scratch);
+    if vault_name == "50k" {
+        println!("(50k is reported beside the 20k figures; 20k gates.)");
+    }
     Ok(())
 }
 

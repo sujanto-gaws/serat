@@ -1,5 +1,5 @@
 //! The quick switcher's corpus and matcher (architecture §9.2; FR-NAV-01, NFR-PRF-06,
-//! US-02).
+//! US-04).
 //!
 //! A [`Corpus`] is an immutable snapshot: per note its title, its vault path and its
 //! aliases, plus the headings of every note. It is built from the index by fixed-shape
@@ -22,11 +22,12 @@
 //! 2. frecency, descending;
 //! 3. the scorer's score, descending (a two-state dynamic programme in the shape of
 //!    fzf v2: match, word-boundary and consecutive bonuses, affine gap penalties);
-//! 4. shorter candidate, then path in byte order.
+//! 4. shorter candidate (in bytes), then path in byte order.
 //!
 //! A `#` switches to heading mode: the text before it filters notes exactly as above
 //! (empty matches every note), the text after it matches those notes' headings. An
-//! empty query returns the 20 most frecent notes.
+//! empty query returns the most frecent notes, then fills to 20 with the most recently
+//! modified (`notes.mtime`, then path); a tree corpus has no mtime and is frecent-only.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -54,7 +55,21 @@ const BONUS_CAMEL: i32 = 7;
 const BONUS_CONSECUTIVE: i32 = 5;
 const GAP_OPEN: i32 = 3;
 const GAP_EXTEND: i32 = 1;
+/// Largest query-length by window-width the DP will fill; beyond it the leftmost
+/// alignment is scored instead.
+const MAX_DP_CELLS: usize = 2048;
 const NEG: i32 = i32::MIN / 2;
+
+/// The corpus reads (§9.2): fixed shapes, no schema change. Notes in path order.
+pub const SQL_NOTES: &str =
+    "SELECT id, path, title, mtime FROM notes WHERE kind = 'note' ORDER BY path";
+/// Frontmatter aliases, one row per list item as serat-parse emits them.
+pub const SQL_ALIASES: &str = "SELECT note_id, val_text FROM fields \
+     WHERE source = 'frontmatter' AND key IN ('aliases', 'alias') \
+     AND val_text IS NOT NULL ORDER BY note_id, id";
+/// Headings, in document order.
+pub const SQL_HEADINGS: &str = "SELECT note_id, text, byte_start FROM blocks \
+     WHERE kind = 'heading' AND text IS NOT NULL ORDER BY note_id, ord";
 
 /// What a [`Corpus`] was built from (`SwitcherCorpus` in the IPC contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +122,8 @@ struct NoteEntry {
     aliases: (u32, u32),
     headings: (u32, u32),
     stem_unique: bool,
+    /// `notes.mtime`; 0 for a tree corpus, which has none.
+    mtime: i64,
 }
 
 #[derive(Debug)]
@@ -202,7 +219,7 @@ impl Corpus {
         for path in sorted {
             let stem = stem_range(&path);
             let title = path[stem.0 as usize..stem.1 as usize].to_owned();
-            b.note(path, title, &[], &[]);
+            b.note(path, title, &[], &[], 0);
         }
         b.finish()
     }
@@ -232,35 +249,28 @@ impl Corpus {
     pub fn from_connection(conn: &Connection) -> Result<Self, IndexError> {
         let e = |e: rusqlite::Error| sqlite(&e);
         // Notes in path order, so the corpus is deterministic and ids can be binary-searched.
-        let mut rows: Vec<(i64, String, Option<String>)> = Vec::new();
+        let mut rows: Vec<(i64, String, Option<String>, i64)> = Vec::new();
         {
-            let mut stmt = conn
-                .prepare("SELECT id, path, title FROM notes WHERE kind = 'note' ORDER BY path")
-                .map_err(e)?;
+            let mut stmt = conn.prepare(SQL_NOTES).map_err(e)?;
             let mut q = stmt.query([]).map_err(e)?;
             while let Some(r) = q.next().map_err(e)? {
                 rows.push((
                     r.get(0).map_err(e)?,
                     r.get(1).map_err(e)?,
                     r.get(2).map_err(e)?,
+                    r.get(3).map_err(e)?,
                 ));
             }
         }
         let id_to_idx: HashMap<i64, usize> = rows
             .iter()
             .enumerate()
-            .map(|(i, (id, _, _))| (*id, i))
+            .map(|(i, (id, ..))| (*id, i))
             .collect();
 
         let mut aliases: Vec<Vec<String>> = vec![Vec::new(); rows.len()];
         {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT note_id, val_text FROM fields \
-                     WHERE source = 'frontmatter' AND key IN ('aliases', 'alias') \
-                     AND val_text IS NOT NULL ORDER BY note_id, id",
-                )
-                .map_err(e)?;
+            let mut stmt = conn.prepare(SQL_ALIASES).map_err(e)?;
             let mut q = stmt.query([]).map_err(e)?;
             while let Some(r) = q.next().map_err(e)? {
                 let id: i64 = r.get(0).map_err(e)?;
@@ -273,12 +283,7 @@ impl Corpus {
 
         let mut headings: Vec<Vec<(String, u64)>> = vec![Vec::new(); rows.len()];
         {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT note_id, text, byte_start FROM blocks \
-                     WHERE kind = 'heading' AND text IS NOT NULL ORDER BY note_id, ord",
-                )
-                .map_err(e)?;
+            let mut stmt = conn.prepare(SQL_HEADINGS).map_err(e)?;
             let mut q = stmt.query([]).map_err(e)?;
             while let Some(r) = q.next().map_err(e)? {
                 let id: i64 = r.get(0).map_err(e)?;
@@ -291,12 +296,12 @@ impl Corpus {
         }
 
         let mut b = Builder::new(CorpusSource::Index);
-        for (i, (_, path, title)) in rows.into_iter().enumerate() {
+        for (i, (_, path, title, mtime)) in rows.into_iter().enumerate() {
             let stem = stem_range(&path);
             let title = title
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| path[stem.0 as usize..stem.1 as usize].to_owned());
-            b.note(path, title, &aliases[i], &headings[i]);
+            b.note(path, title, &aliases[i], &headings[i], mtime);
         }
         Ok(b.finish())
     }
@@ -321,6 +326,7 @@ impl Builder {
         title: String,
         aliases: &[String],
         headings: &[(String, u64)],
+        mtime: i64,
     ) {
         let c = &mut self.corpus;
         let stem = stem_range(&path);
@@ -345,6 +351,7 @@ impl Builder {
             aliases: (a0, to_u32(c.aliases.len())),
             headings: (h0, to_u32(c.headings.len())),
             stem_unique: false,
+            mtime,
         });
     }
 
@@ -435,6 +442,8 @@ struct Matcher {
     g: Vec<i32>,
     /// Matched character indexes of the last call that asked for them.
     positions: Vec<usize>,
+    /// The leftmost alignment of the query, found by the early reject.
+    greedy: Vec<usize>,
 }
 
 impl Matcher {
@@ -484,10 +493,14 @@ impl Matcher {
         if m == 0 || m > n {
             return None;
         }
-        // Reject early: all query characters, in order.
+        // Reject early: all query characters, in order. The leftmost alignment found
+        // here is also the fallback when the DP would be too large.
+        self.greedy.clear();
         let mut at = 0;
         for &q in &pat.chars {
-            at += self.cmp[at..].iter().position(|&c| c == q)? + 1;
+            at += self.cmp[at..].iter().position(|&c| c == q)?;
+            self.greedy.push(at);
+            at += 1;
         }
 
         if want_positions {
@@ -530,93 +543,114 @@ impl Matcher {
             self.bonus.push(b);
         }
 
-        self.m.clear();
-        self.m.resize(m * n, NEG);
-        self.g.clear();
-        self.g.resize(m * n, NEG);
-        for i in 0..m {
-            for j in i..n {
-                let k = i * n + j;
-                if self.cmp[j] == pat.chars[i] {
-                    self.m[k] = if i == 0 {
-                        SCORE_MATCH + self.bonus[j]
-                    } else if j == 0 {
-                        NEG
-                    } else {
-                        let consecutive = self.m[k - n - 1];
-                        let gapped = self.g[k - n - 1];
-                        let a = if consecutive > NEG {
-                            consecutive + SCORE_MATCH + BONUS_CONSECUTIVE
-                        } else {
-                            NEG
-                        };
-                        let b = if gapped > NEG {
-                            gapped + SCORE_MATCH + self.bonus[j]
-                        } else {
-                            NEG
-                        };
-                        a.max(b)
-                    };
-                }
-                if j > 0 {
-                    let open = if self.m[k - 1] > NEG {
-                        self.m[k - 1] - GAP_OPEN
-                    } else {
-                        NEG
-                    };
-                    let extend = if self.g[k - 1] > NEG {
-                        self.g[k - 1] - GAP_EXTEND
-                    } else {
-                        NEG
-                    };
-                    self.g[k] = open.max(extend);
-                }
-            }
-        }
-        let last = (m - 1) * n;
-        let (mut best_j, mut best) = (usize::MAX, NEG);
-        for j in 0..n {
-            if self.m[last + j] > best {
-                best = self.m[last + j];
-                best_j = j;
-            }
-        }
-        if best_j == usize::MAX {
-            return None;
-        }
-
-        // Trace back; needed for the class as well as for highlighting.
+        // The DP runs only over the window from the first occurrence of the first query
+        // character to the last occurrence of the last one (fzf v2), and only if that
+        // window is small enough; otherwise the leftmost alignment stands in, so the
+        // work per candidate is bounded whatever the text.
+        let lo = self.greedy[0];
+        let hi = self.cmp.iter().rposition(|&c| c == pat.chars[m - 1])?;
+        let w = hi + 1 - lo;
         let mut positions = std::mem::take(&mut self.positions);
         positions.clear();
-        let (mut i, mut j) = (m - 1, best_j);
-        loop {
-            positions.push(j);
-            if i == 0 {
-                break;
+        let best;
+        if m * w > MAX_DP_CELLS {
+            positions.extend_from_slice(&self.greedy);
+            let mut score = 0;
+            for (i, &p) in positions.iter().enumerate() {
+                score += SCORE_MATCH + self.bonus[p];
+                if i > 0 && p != positions[i - 1] + 1 {
+                    score -= GAP_OPEN;
+                }
             }
-            let k = i * n + j;
-            let here = self.m[k];
-            let consecutive = self.m[k - n - 1];
-            if consecutive > NEG && here == consecutive + SCORE_MATCH + BONUS_CONSECUTIVE {
-                i -= 1;
-                j -= 1;
-                continue;
+            best = score;
+        } else {
+            self.m.clear();
+            self.m.resize(m * w, NEG);
+            self.g.clear();
+            self.g.resize(m * w, NEG);
+            for i in 0..m {
+                for j in (lo + i)..=hi {
+                    let k = i * w + (j - lo);
+                    if self.cmp[j] == pat.chars[i] {
+                        self.m[k] = if i == 0 {
+                            SCORE_MATCH + self.bonus[j]
+                        } else if j == lo {
+                            NEG
+                        } else {
+                            let consecutive = self.m[k - w - 1];
+                            let gapped = self.g[k - w - 1];
+                            let a = if consecutive > NEG {
+                                consecutive + SCORE_MATCH + BONUS_CONSECUTIVE
+                            } else {
+                                NEG
+                            };
+                            let b = if gapped > NEG {
+                                gapped + SCORE_MATCH + self.bonus[j]
+                            } else {
+                                NEG
+                            };
+                            a.max(b)
+                        };
+                    }
+                    if j > lo {
+                        let open = if self.m[k - 1] > NEG {
+                            self.m[k - 1] - GAP_OPEN
+                        } else {
+                            NEG
+                        };
+                        let extend = if self.g[k - 1] > NEG {
+                            self.g[k - 1] - GAP_EXTEND
+                        } else {
+                            NEG
+                        };
+                        self.g[k] = open.max(extend);
+                    }
+                }
             }
-            // From a gap: walk G back to the M cell it started from.
-            i -= 1;
-            let mut gj = j - 1;
+            let last = (m - 1) * w;
+            let (mut best_j, mut top) = (usize::MAX, NEG);
+            for j in 0..w {
+                if self.m[last + j] > top {
+                    top = self.m[last + j];
+                    best_j = j;
+                }
+            }
+            if best_j == usize::MAX {
+                return None;
+            }
+            best = top;
+
+            // Trace back; needed for the class as well as for highlighting.
+            let (mut i, mut j) = (m - 1, best_j);
             loop {
-                let gk = i * n + gj;
-                let from_open = self.m[gk - 1];
-                if from_open > NEG && self.g[gk] == from_open - GAP_OPEN {
-                    gj -= 1;
+                positions.push(lo + j);
+                if i == 0 {
                     break;
                 }
-                gj -= 1;
+                let k = i * w + j;
+                let here = self.m[k];
+                let consecutive = self.m[k - w - 1];
+                if consecutive > NEG && here == consecutive + SCORE_MATCH + BONUS_CONSECUTIVE {
+                    i -= 1;
+                    j -= 1;
+                    continue;
+                }
+                // From a gap: walk G back to the M cell it started from.
+                i -= 1;
+                let mut gj = j - 1;
+                loop {
+                    let gk = i * w + gj;
+                    let from_open = self.m[gk - 1];
+                    if from_open > NEG && self.g[gk] == from_open - GAP_OPEN {
+                        gj -= 1;
+                        break;
+                    }
+                    gj -= 1;
+                }
+                j = gj;
             }
-            j = gj;
+            positions.reverse();
         }
-        positions.reverse();
 
         let contiguous = positions.windows(2).all(|w| w[1] == w[0] + 1);
         let word_starts = positions.iter().all(|&p| self.bonus[p] >= BONUS_BOUNDARY);
@@ -706,7 +740,11 @@ impl Corpus {
             }
             return Some(s);
         }
-        mt.score(&n.path, pat, positions)
+        // A prefix of the whole path is a substring, not a file-name match: the top two
+        // classes belong to titles, aliases and file names (§9.2).
+        let mut s = mt.score(&n.path, pat, positions)?;
+        s.class = s.class.max(WORD_OR_SUBSTRING);
+        Some(s)
     }
 
     /// The best of a note's title, aliases and path against `pat`.
@@ -822,7 +860,39 @@ impl Corpus {
                     });
                 }
             }
-            return self.finish(&mut mt, ranked, limit.min(EMPTY_QUERY_RESULTS), None, None);
+            let limit = limit.min(EMPTY_QUERY_RESULTS);
+            let mut hits = self.finish(&mut mt, ranked, limit, None, None);
+            // Fill with the most recently modified notes, once there is an index to say
+            // which those are (§9.2); a tree corpus has no mtime and stays frecent-only.
+            if self.source == CorpusSource::Index && hits.len() < limit {
+                let mut rest: Vec<u32> = (0..to_u32(self.notes.len()))
+                    .filter(|&i| frecency[i as usize] <= 0.0)
+                    .collect();
+                let by_mtime = |a: &u32, b: &u32| {
+                    let (a, b) = (&self.notes[*a as usize], &self.notes[*b as usize]);
+                    b.mtime
+                        .cmp(&a.mtime)
+                        .then_with(|| a.path.as_bytes().cmp(b.path.as_bytes()))
+                };
+                let want = limit - hits.len();
+                if rest.len() > want {
+                    rest.select_nth_unstable_by(want - 1, by_mtime);
+                    rest.truncate(want);
+                }
+                rest.sort_by(by_mtime);
+                for note in rest {
+                    let r = Ranked {
+                        note,
+                        which: Which::Title,
+                        class: SCATTERED,
+                        frecency: 0.0,
+                        score: 0,
+                        len: 0,
+                    };
+                    hits.push(self.hit(&mut mt, &r, None));
+                }
+            }
+            return hits;
         }
 
         if let Some((prefix, text)) = query.split_once('#') {
@@ -948,7 +1018,13 @@ mod tests {
                 .enumerate()
                 .map(|(i, h)| ((*h).to_owned(), i as u64 * 10))
                 .collect();
-            b.note((*path).to_owned(), (*title).to_owned(), &aliases, &headings);
+            b.note(
+                (*path).to_owned(),
+                (*title).to_owned(),
+                &aliases,
+                &headings,
+                0,
+            );
         }
         b.finish()
     }
@@ -1064,20 +1140,109 @@ mod tests {
         assert!(q(&c, "abcd").is_empty());
     }
 
+    fn mtime_corpus(n: usize) -> Corpus {
+        let mut b = Builder::new(CorpusSource::Index);
+        for i in 0..n {
+            // Newest is the highest index.
+            b.note(
+                format!("n{i:02}.md"),
+                format!("note {i}"),
+                &[],
+                &[],
+                i as i64,
+            );
+        }
+        b.finish()
+    }
+
     #[test]
-    fn empty_query_returns_the_most_frecent_notes() {
-        let c = corpus(&[
-            ("a.md", "a", &[], &[]),
-            ("b.md", "b", &[], &[]),
-            ("c.md", "c", &[], &[]),
-        ]);
-        assert!(q(&c, "").is_empty(), "no history, nothing to rank");
+    fn empty_query_with_no_history_is_the_twenty_most_recently_modified() {
+        let c = mtime_corpus(30);
+        let hits = q(&c, "");
+        assert_eq!(hits.len(), 20);
+        assert_eq!(hits[0].path, "n29.md");
+        assert_eq!(hits[19].path, "n10.md");
+    }
+
+    #[test]
+    fn empty_query_puts_frecent_notes_first_then_fills_by_mtime_without_duplicates() {
+        let c = mtime_corpus(30);
         let mut h = History::default();
-        h.record_open("c.md", NOW - 86_400_000 * 30);
-        h.record_open("a.md", NOW);
+        h.record_open("n00.md", NOW - 3000);
+        h.record_open("n05.md", NOW - 2000);
+        h.record_open("n29.md", NOW - 1000);
         h.record_open("gone.md", NOW);
         let hits = c.query("", 50, &h, NOW);
-        assert_eq!(paths(&hits), vec!["a.md", "c.md"]);
+        let order = paths(&hits);
+        assert_eq!(order.len(), 20);
+        assert_eq!(&order[..3], ["n29.md", "n05.md", "n00.md"]);
+        assert_eq!(
+            order[3], "n28.md",
+            "then by mtime, the frecent ones not repeated"
+        );
+        assert_eq!(order[19], "n12.md");
+        let mut unique = order.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 20);
+    }
+
+    #[test]
+    fn a_tree_corpus_has_no_mtime_so_an_empty_query_is_frecent_only() {
+        let c = Corpus::from_paths(["a.md", "b.md"]);
+        assert!(q(&c, "").is_empty());
+        let mut h = History::default();
+        h.record_open("b.md", NOW);
+        assert_eq!(paths(&c.query("", 20, &h, NOW)), vec!["b.md"]);
+    }
+
+    #[test]
+    fn a_prefix_of_the_whole_path_is_a_substring_not_a_file_name_match() {
+        // "pro" is a prefix of the first note's path and a word start of the second's
+        // title; both are class 2, so the better score decides, never class 1 for a path.
+        let c = corpus(&[
+            ("projects/zeta.md", "Zeta", &[], &[]),
+            ("misc/my pro tips.md", "my pro tips", &[], &[]),
+        ]);
+        let hits = q(&c, "pro");
+        assert_eq!(hits.len(), 2);
+        let mut mt = Matcher::default();
+        let pat = Pattern::new("pro");
+        let n = &c.notes[c.by_path["projects/zeta.md"] as usize];
+        assert_eq!(
+            c.score_path(&mut mt, n, &pat, false).unwrap().class,
+            WORD_OR_SUBSTRING
+        );
+        // A file-name prefix is still class 1, and outranks both.
+        let c = corpus(&[
+            ("projects/zeta.md", "Zeta", &[], &[]),
+            ("misc/my pro tips.md", "my pro tips", &[], &[]),
+            ("x/prolog.md", "Prolog notes", &[], &[]),
+        ]);
+        assert_eq!(q(&c, "pro")[0].path, "x/prolog.md");
+        // And the exact full-path query is capped too.
+        let n = &c.notes[c.by_path["projects/zeta.md"] as usize];
+        let pat = Pattern::new("projects/zeta.md");
+        assert_eq!(
+            c.score_path(&mut mt, n, &pat, false).unwrap().class,
+            WORD_OR_SUBSTRING
+        );
+    }
+
+    #[test]
+    fn long_dense_candidates_and_queries_stay_bounded_and_correct() {
+        let long = "e".repeat(200);
+        let mut b = Builder::new(CorpusSource::Index);
+        b.note("a.md".into(), long.clone(), &[], &[], 0);
+        b.note("b.md".into(), format!("{long} tail"), &[], &[], 0);
+        let c = b.finish();
+        let started = std::time::Instant::now();
+        for query in ["mee", &"e".repeat(16), &"e e ".repeat(6)] {
+            let _ = q(&c, query);
+        }
+        assert_eq!(q(&c, &"e".repeat(16)).len(), 2);
+        assert!(q(&c, "mee").is_empty());
+        assert!(started.elapsed().as_millis() < 500);
     }
 
     #[test]
@@ -1134,7 +1299,7 @@ mod tests {
             .collect();
         let mut b = Builder::new(CorpusSource::Index);
         for (p, t) in &notes {
-            b.note(p.clone(), t.clone(), &[], &[]);
+            b.note(p.clone(), t.clone(), &[], &[], 0);
         }
         let c = b.finish();
         let all = c.query("note", 50, &History::default(), NOW);
