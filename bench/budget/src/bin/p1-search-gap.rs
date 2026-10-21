@@ -20,6 +20,16 @@
 //!    one statement object was reused (a hit), and would read 1 every time if each call
 //!    re-prepared. `RePrepare` is read beside it.
 //!
+//! **Task #56: which block gates.** Block I (R1 on S with pool R2 reads in between,
+//! against R1 on S alone) is the product's shape and the criterion at S = 64 MiB.
+//! Blocks A-H run R1 on a 2 MiB pool reader as well, which the architecture forbids, so
+//! with S at 64 MiB they show S 2-3x slower than P and that does not gate.
+//! *Unverified hypothesis:* SQLite's page cache keeps one LRU for every connection in the
+//! process, so a full 2 MiB cache recycles the oldest unpinned page of the group, which
+//! can be another connection's, instead of its own; at 256 MiB on all three nothing is
+//! ever full and the gap vanishes. Not tested here (it would need a source-level look at
+//! pcache1 or a cache-miss counter per connection).
+//!
 //! The handler is OFF on S unless a block says otherwise: #47's 15-30% was measured
 //! with it off. One block runs it ON for completeness.
 //!
