@@ -30,7 +30,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
 import { ChangeSet, Compartment, EditorState, type Extension, Transaction } from "@codemirror/state";
-import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
+import { EditorView, lineNumbers, placeholder, scrollPastEnd } from "@codemirror/view";
 
 import { buildEditorExtensions, createEditorCommandRegistry } from "@/editor/codemirrorSetup";
 import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
@@ -439,6 +439,12 @@ function buildExtensions(livePreview: boolean): Extension[] {
     ...linkExtensions({ ipc: props.linkIpc, resolver, getSourcePath: () => buffer?.path ?? null }),
     ...buildEditorExtensions(registry),
     EditorView.lineWrapping,
+    // NFR-PRF-02: CM must own the scroll. Without a bounded height the 5,000-line note becomes
+    // one ~110,000 px tall element in the outer page; every keystroke then repaints/composites
+    // that, and headless Chromium measured multi-second presentation stalls with an idle main thread.
+    scrollPastEnd(),
+    EditorView.scrollMargins.of(() => ({ top: 24, bottom: 48 })),
+    EditorView.theme({ "&": { height: "100%" }, ".cm-scroller": { overflow: "auto" } }),
     EditorView.contentAttributes.of({ spellcheck: "false", "aria-label": "editor" }),
     EditorView.domEventHandlers({
       blur: () => {
@@ -674,6 +680,8 @@ defineExpose({
 .serat-editor-surface {
   position: relative;
   display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
   height: 100%;
   width: 100%;
 }
