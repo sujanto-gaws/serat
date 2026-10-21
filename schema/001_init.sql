@@ -15,8 +15,10 @@
 -- SCOPE. This is the P0 subset: notes, blocks, fields, links, tasks, the
 -- full-text index, and the index's own stamp. Deliberately absent, with the
 -- phase that adds them:
---   P1  assets(note_id, mime, bytes, page_count, extractor, extractor_ver,
---       content_hash, extracted_at, needs_ocr)      — FR-BIN-01, FR-BIN-02
+--   P2  the extraction columns of assets: page_count, extractor, extractor_ver,
+--       content_hash, extracted_at, needs_ocr        — FR-BIN-04..
+--   (assets(note_id, mime, bytes) is the P1 slice and exists since user_version 8,
+--   task #17; sidecar_path has been written since the same version.)
 --   Withdrawn from this list by architecture §4.5 (task #4), reasons kept
 --   because a reason for an absence is the one a remover reads:
 --       ix_links_dst_path — shipped as the partial ix_links_unresolved; a full
@@ -93,9 +95,9 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
--- user_version 8 (task #57): no DDL change; serat-parse now reads block-style frontmatter
+-- user_version 9 (task #57): no DDL change; serat-parse now reads block-style frontmatter
 -- lists, so every `aliases:`/`tags:` item the old derivation skipped is a fields row.
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 
 -- ============================================================================
 -- Tables
@@ -171,8 +173,9 @@ CREATE TABLE notes (
     -- Both are vault-relative, canonical and / separated, exactly as `path` above.
     -- Stated rather than left to inference (task #120): `asset_path` is bound to the same
     -- parameter as `path` by `upsert_asset` and is byte-identical to it on every row that
-    -- has one, while `sidecar_path` has no writer yet -- so its premise holds VACUOUSLY,
-    -- which is the state in which the first writer breaks it without anyone noticing. An
+    -- has one, while `sidecar_path` is written (since user_version 8, task #17) as the path of the
+    -- sibling `<asset path>.md` note, by name alone and byte for byte (ADR-0005,
+    -- ADR-0017), so its premise is now exercised rather than vacuous. An
     -- absolute path in either column would silently break the open check's identity probe,
     -- which joins these names onto the vault root.
     asset_path   TEXT,                     -- kind='asset': the binary this row stands for
@@ -184,6 +187,21 @@ CREATE TABLE notes (
     -- kind='note' rows describe a Markdown file directly; only assets carry the
     -- two indirection paths. Enforced rather than assumed (design goal 3).
     CHECK (kind = 'asset' OR (asset_path IS NULL AND sidecar_path IS NULL))
+);
+
+-- ----------------------------------------------------------------------------
+-- assets — the P1 slice of the binary table (user_version 8, task #17)
+-- ----------------------------------------------------------------------------
+-- One row per notes row with kind = 'asset' (FR-BIN-01; architecture §7.4), written
+-- by the same upsert_asset call on the rebuild and the incremental path. MIME comes
+-- from the extension through serat_core::mime_for_path (never from content), size
+-- from the walk's stat. The extraction columns arrive with P2's schema change, which
+-- under ADR-0002 costs a rebuild and nothing else. note_id is the rowid, so no
+-- further index is needed, and the cascade is a rowid lookup.
+CREATE TABLE assets (
+    note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+    mime    TEXT    NOT NULL,
+    bytes   INTEGER NOT NULL
 );
 
 -- ----------------------------------------------------------------------------
@@ -371,8 +389,9 @@ CREATE INDEX ix_notes_path_fold ON notes(path_fold);
 -- R3's sidecar-to-asset join (architecture §4.5, FR-BIN-02): "which asset has this
 -- note as its sidecar". At most one entry per asset (200 in the benchmark vault).
 -- Declared with R3, the first reader of it, although the writer that fills
--- `sidecar_path` is task #17: an empty partial index costs the rebuild nothing, and
--- without it the join is a scan of `notes` per result row.
+-- `sidecar_path` is written by task #17 (user_version 8): the rebuild fills it with
+-- one UPDATE after the load, so the index is built once over ~200 rows, and without it
+-- the join is a scan of `notes` per result row.
 CREATE INDEX ix_notes_sidecar ON notes(sidecar_path) WHERE sidecar_path IS NOT NULL;
 
 -- The pivot join, one lookup per referenced field key per row (ADR-0003).

@@ -580,7 +580,29 @@ fn resolve_links(conn: &Connection) -> Result<usize, IndexError> {
     let resolved = conn
         .execute(crate::resolve::RESOLVE_ALL, [])
         .map_err(sqlite)?;
+    pair_sidecars(conn)?;
     Ok(resolved)
+}
+
+/// Pair every asset with its sidecar note, in one `UPDATE` (task #17; architecture
+/// §7.4; FR-BIN-02).
+///
+/// `x.pdf.md` is `x.pdf`'s sidecar when both exist; the comparison is byte for byte
+/// (`notes.path` is the unique binary index), so `X.PDF` and `x.pdf.md` are not a pair
+/// (ADR-0017). Run after the load beside the link resolution because a bulk load skips
+/// the per-row pairing, and because it must see both orders (sidecar first, asset
+/// first). It touches only the asset rows (~200 on the 20k vault), one unique-index
+/// probe each, so NFR-PRF-04 pays nothing measurable. The incremental path pairs in
+/// `apply`, one probe per upsert, and the equivalence test holds the two together.
+fn pair_sidecars(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute(
+        "UPDATE notes SET sidecar_path =
+                (SELECT s.path FROM notes s WHERE s.path = notes.path || '.md' AND s.kind = 'note')
+          WHERE kind = 'asset'",
+        [],
+    )
+    .map_err(sqlite)?;
+    Ok(())
 }
 
 enum Barrier {
