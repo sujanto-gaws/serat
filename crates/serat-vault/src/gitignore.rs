@@ -1,5 +1,5 @@
-//! The two named exceptions to T-06 (only Markdown is writable), and nothing else:
-//! [`Vault::append_gitignore_entry`] and [`Vault::update_prefs`] (NFR-CMP-04,
+//! The named exceptions to T-06 (only Markdown is writable), and nothing else:
+//! [`Vault::append_gitignore_entry`], [`Vault::update_prefs`] and [`Vault::update_history`] (NFR-CMP-04,
 //! NFR-SEC-06, FR-VLT-03; T-06, T-07; ADR-0008).
 //!
 //! Neither takes a path. The first writes the single line `/.serat/` to the vault
@@ -27,6 +27,7 @@ const ENTRY: &str = "/.serat/";
 const IGNORE_FILE: &str = ".gitignore";
 const SERAT_DIR: &str = ".serat";
 const PREFS_LABEL: &str = ".serat/prefs.json";
+const HISTORY_LABEL: &str = ".serat/history.json";
 
 /// What [`Vault::append_gitignore_entry`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,9 +130,35 @@ impl Vault {
         &self,
         update: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
     ) -> Result<(), VaultError> {
+        self.update_serat_file("prefs.json", PREFS_LABEL, update)
+    }
+
+    /// Read-modify-write `.serat/history.json`, the switcher's frecency record
+    /// (architecture §9.2; FR-NAV-01). A sibling of [`Vault::update_prefs`] on the same
+    /// guarded path, with the same contract: `update` gets the current bytes and returns
+    /// the complete new bytes, or `None` to leave the file alone, and it may run twice.
+    /// The record is a ranking signal and nothing depends on it (C-02), so losing it is
+    /// safe. Debouncing is the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vault::update_prefs`].
+    pub fn update_history(
+        &self,
+        update: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
+    ) -> Result<(), VaultError> {
+        self.update_serat_file("history.json", HISTORY_LABEL, update)
+    }
+
+    fn update_serat_file(
+        &self,
+        file: &str,
+        label: &str,
+        update: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
+    ) -> Result<(), VaultError> {
         let dir = self.root().join(SERAT_DIR);
         let failed = |message: String| VaultError::AtomicWriteFailed {
-            path: PREFS_LABEL.to_owned(),
+            path: label.to_owned(),
             message,
         };
         match fs::symlink_metadata(&dir) {
@@ -144,7 +171,7 @@ impl Vault {
             }
             Err(e) => return Err(failed(e.to_string())),
         }
-        self.replace_guarded(&dir.join("prefs.json"), PREFS_LABEL, update, |_| {})
+        self.replace_guarded(&dir.join(file), label, update, |_| {})
             .map(|_| ())
     }
 
@@ -376,6 +403,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read_to_string(&ignore).unwrap(), "theirs\n/.serat/\n");
+    }
+
+    #[test]
+    fn history_is_a_sibling_of_prefs_on_the_same_guarded_path() {
+        let (_d, v) = vault();
+        v.update_prefs(|_| Some(b"{}".to_vec())).unwrap();
+        v.update_history(|old| {
+            assert!(old.is_none());
+            Some(b"{\"h\":1}".to_vec())
+        })
+        .unwrap();
+        let dir = v.root().join(".serat");
+        assert_eq!(fs::read(dir.join("history.json")).unwrap(), b"{\"h\":1}");
+        assert_eq!(fs::read(dir.join("prefs.json")).unwrap(), b"{}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no temp left over");
     }
 
     #[test]
