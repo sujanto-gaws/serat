@@ -213,6 +213,13 @@ mod tests {
             "decline_gitignore_offer",
             "search",
             "backlinks",
+            "open_tree",
+            "mark_tree",
+            "note_opened",
+            "note_closed",
+            "save_patch",
+            "request_external_diff",
+            "rebase_buffer",
         ]
         .into_iter()
         .map(str::to_owned)

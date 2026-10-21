@@ -254,7 +254,10 @@ fn live_changes_are_single_messages_and_a_modification_is_none() {
     session.populate_from_walk(&vault).expect("walk");
     let before = log.lock().expect("log").len();
 
-    session.created("10-projects/new.md", TreeKind::Note);
+    session
+        .created("10-projects/new.md", TreeKind::Note)
+        .run(&session, &vault)
+        .expect("rescan");
     session.deleted("a.md");
     let stream = log.lock().expect("log").clone();
     assert_eq!(stream.len() - before, 2);
@@ -301,7 +304,8 @@ fn creates_and_deletes_racing_the_walk_never_leave_the_front_end_wrong() {
                         session.deleted(&gone);
                         let made = format!("d{d:02}/new{f:02}.md");
                         write(&root, &made);
-                        session.created(&made, TreeKind::Note);
+                        // A file: no rescan is owed (a directory would owe one).
+                        let _ = session.created(&made, TreeKind::Note);
                     }
                 }
             })
@@ -388,7 +392,7 @@ fn a_panic_in_the_sink_kills_the_session_and_progress_never_waits() {
     assert!(session.is_poisoned());
     let _ = session.progress();
     let before = *calls.lock().expect("calls");
-    session.created("x.md", TreeKind::Note);
+    let _ = session.created("x.md", TreeKind::Note);
     session.deleted("a.md");
     assert_eq!(
         *calls.lock().expect("calls"),
@@ -397,4 +401,31 @@ fn a_panic_in_the_sink_kills_the_session_and_progress_never_waits() {
     );
     let (_dir2, vault2) = fixture();
     assert!(session.populate_from_walk(&vault2).is_err());
+}
+
+#[test]
+fn a_created_directory_that_arrives_with_contents_is_listed_by_the_rescan_it_owes() {
+    // A folder moved in from elsewhere: the watcher reports the directory, never its
+    // children. `created` lists it empty; the `RescanNeeded` it returns is what lists
+    // the contents (code-reviewer-3's obligation on #13).
+    let (dir, vault) = fixture();
+    let (session, log) = session();
+    session.populate_from_walk(&vault).expect("walk");
+
+    write(dir.path(), "moved-in/inner/deep.md");
+    write(dir.path(), "moved-in/top.md");
+    let owed = session.created("moved-in", TreeKind::Dir);
+    assert_eq!(owed.dir(), Some("moved-in"));
+    owed.run(&session, &vault).expect("rescan");
+
+    let mut front = Front::default();
+    front.apply(&log.lock().expect("log"));
+    assert_eq!(front.dirs["moved-in"], ["inner", "top.md"]);
+    assert_eq!(front.dirs["moved-in/inner"], ["deep.md"]);
+    assert_eq!(
+        front.dirs[""].iter().filter(|n| *n == "moved-in").count(),
+        1
+    );
+
+    assert!(session.created("a2.md", TreeKind::Note).dir().is_none());
 }

@@ -13,15 +13,18 @@
 use std::sync::Arc;
 
 use tauri::State;
+use tauri::ipc::Channel;
 
 use crate::ipc::{
-    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, GitignoreAppended,
-    GitignoreOffer, IndexRead, IndexStatus, IpcError, NotePathArgs, OpenVaultArgs, ReadFileArgs,
-    RefusedName, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings,
-    VaultOpened, WriteFileArgs,
+    Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
+    GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError, MarkTreeArgs,
+    NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadFileArgs, RebaseBufferArgs,
+    RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
+    TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
+use crate::tree_stream::TreeSender;
 
 /// `open_vault(args) -> Result<VaultOpened, IpcError>`
 ///
@@ -184,6 +187,86 @@ pub fn create_folder(
     args: CreateFolderArgs,
 ) -> Result<FolderCreated, IpcError> {
     state.create_folder(args)
+}
+
+/// `open_tree(on_message: Channel<TreeMessage>) -> Result<(), IpcError>`
+///
+/// Starts the tree stream on the channel and returns at once (ADR-0015). The channel is
+/// ordered and lossless; a send that fails (the webview reloaded) ends the stream
+/// quietly, and the reload's own `open_tree` starts a fresh one from the root.
+///
+/// # Errors
+///
+/// As [`AppState::open_tree`].
+#[tauri::command(async)]
+pub fn open_tree(
+    state: State<'_, Arc<AppState>>,
+    on_message: Channel<TreeMessage>,
+) -> Result<(), IpcError> {
+    let send: TreeSender = Arc::new(move |message| on_message.send(message).is_ok());
+    state.open_tree(send)
+}
+
+/// `mark_tree(args)`: the front end's two FR-VLT-01 marks. Synchronous, lock-free, and
+/// never waits behind the stream (`TreeSession::progress`).
+#[tauri::command]
+pub fn mark_tree(state: State<'_, Arc<AppState>>, args: MarkTreeArgs) {
+    state.mark_tree(&args);
+}
+
+/// `note_opened(args) -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::note_opened`].
+#[tauri::command(async)]
+pub fn note_opened(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) -> Result<(), IpcError> {
+    state.note_opened(&args)
+}
+
+/// `note_closed(args)`
+#[tauri::command(async)]
+pub fn note_closed(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) {
+    state.note_closed(&args);
+}
+
+/// `save_patch(args) -> Result<FileWritten, IpcError>`: the editor's only save.
+///
+/// # Errors
+///
+/// As [`AppState::save_patch`].
+#[tauri::command(async)]
+pub fn save_patch(
+    state: State<'_, Arc<AppState>>,
+    args: SavePatchArgs,
+) -> Result<FileWritten, IpcError> {
+    state.save_patch(&args)
+}
+
+/// `request_external_diff(args) -> Result<Option<ExternalChange>, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::request_external_diff`].
+#[tauri::command(async)]
+pub fn request_external_diff(
+    state: State<'_, Arc<AppState>>,
+    args: NoteBufferArgs,
+) -> Result<Option<ExternalChange>, IpcError> {
+    state.request_external_diff(&args)
+}
+
+/// `rebase_buffer(args) -> Result<Vec<Patch>, IpcError>`: *Keep mine* (ADR-0016 §4).
+///
+/// # Errors
+///
+/// As [`AppState::rebase_buffer`].
+#[tauri::command(async)]
+pub fn rebase_buffer(
+    state: State<'_, Arc<AppState>>,
+    args: RebaseBufferArgs,
+) -> Result<Vec<Patch>, IpcError> {
+    state.rebase_buffer(&args)
 }
 
 /// `refused_names() -> Vec<RefusedName>`
