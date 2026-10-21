@@ -517,6 +517,88 @@ fn the_cleared_marker_survives_the_crash_that_loses_later_commits() {
     assert_eq!(clean_close(&f.index), 0);
 }
 
+// --- a note the parser refuses (task #58) -----------------------------------------
+
+fn table_counts(index: &Path) -> Vec<i64> {
+    let conn = schema::open(&serat_index::index_path(index)).expect("open");
+    ["notes", "blocks", "fields", "links", "tasks", "blocks_fts"]
+        .iter()
+        .map(|table| {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count")
+        })
+        .collect()
+}
+
+#[test]
+fn a_note_edited_into_a_refused_form_is_one_bare_row_and_a_rebuild_agrees() {
+    let f = fixture();
+    write(
+        &f.root,
+        "a.md",
+        "# A\nalpha\ntype:: person\n[[b]]\n- [ ] todo\n",
+    );
+    write(&f.root, "b.md", "# B\n[[a]]\n");
+    rebuild(&DiskVault::new(&f.root), &f.parser, &f.root, &f.index).expect("rebuild");
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let reconciler = Reconciler::new(&handle);
+    let source = DiskVault::new(&f.root);
+    let with_structure = table_counts(&f.index);
+
+    // Externally edited into a form the parser refuses, then indexed.
+    f.parser
+        .refuses
+        .lock()
+        .expect("lock")
+        .push("a.md".to_owned());
+    write(&f.root, "a.md", "\u{0}\u{0} not parseable\n");
+    let outcome = reconciler
+        .index_paths(&source, &f.parser, &never_echo, &[path("a.md")])
+        .expect("index");
+    assert_eq!((outcome.upserted, outcome.unparsed), (1, 1));
+    handle.close().expect("close");
+
+    let conn = schema::open(&serat_index::index_path(&f.index)).expect("open");
+    let (rows, title, blocks): (i64, String, i64) = conn
+        .query_row(
+            "SELECT count(*), max(title), (SELECT count(*) FROM blocks WHERE note_id = n.id)
+               FROM notes n WHERE path = 'a.md'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("row");
+    assert_eq!((rows, title.as_str(), blocks), (1, "a", 0));
+    let stale: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM fields f JOIN notes n ON n.id = f.note_id WHERE n.path = 'a.md')
+                  + (SELECT count(*) FROM links l JOIN notes n ON n.id = l.src_note WHERE n.path = 'a.md')
+                  + (SELECT count(*) FROM tasks t JOIN notes n ON n.id = t.note_id WHERE n.path = 'a.md')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stale");
+    assert_eq!(stale, 0, "structure from the earlier version survived");
+    // Still a link target: b's [[a]] resolves to the bare row.
+    let resolved: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM links l JOIN notes b ON b.id = l.src_note
+               JOIN notes a ON a.id = l.dst_note WHERE b.path = 'b.md' AND a.path = 'a.md'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("link");
+    assert_eq!(resolved, 1, "the bare row is not a link target");
+    drop(conn);
+    let incremental = table_counts(&f.index);
+    assert!(incremental[1] < with_structure[1]);
+
+    // A full rebuild of the same vault yields the same rows (C-02).
+    rebuild(&DiskVault::new(&f.root), &f.parser, &f.root, &f.index).expect("rebuild");
+    assert_eq!(table_counts(&f.index), incremental);
+}
+
 // --- runtime rebuild ------------------------------------------------------------
 
 #[test]

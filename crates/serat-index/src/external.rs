@@ -88,7 +88,7 @@ pub struct Outcome {
     pub removed: usize,
     /// Files read and hashed whose content the index already held.
     pub unchanged: usize,
-    /// Files the parser refused. The earlier row, if any, stays (`build_op`).
+    /// Of those upserted, how many the parser refused and are now bare rows (`build_op`).
     pub unparsed: usize,
 }
 
@@ -323,13 +323,10 @@ impl Reconciler {
             outcome.unchanged = 1;
             return Ok(Step::Done(outcome));
         }
-        match build_op(parser, path, loaded) {
-            Some((op, _)) => {
-                self.writer.submit_blocking(op)?;
-                outcome.upserted = 1;
-            }
-            None => outcome.unparsed = 1,
-        }
+        let (op, _, refused) = build_op(parser, path, loaded);
+        self.writer.submit_blocking(op)?;
+        outcome.upserted = 1;
+        outcome.unparsed = usize::from(refused);
         Ok(Step::Done(outcome))
     }
 }

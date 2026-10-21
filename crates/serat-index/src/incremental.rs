@@ -330,13 +330,8 @@ pub fn apply(
         Err(_) => (IndexOp::Remove { path: path.clone() }, None),
         Ok(loaded) => {
             let hash = loaded.meta.hash;
-            match build_op(parser, path, loaded) {
-                Some((op, _)) => (op, Some(hash)),
-                // Nothing to index: the previous row stays, which is better than
-                // deleting a note because one save of it did not parse. Nothing was
-                // submitted, so again nothing to record.
-                None => return Ok(()),
-            }
+            let (op, _, _) = build_op(parser, path, loaded);
+            (op, Some(hash))
         }
     };
 
@@ -354,34 +349,46 @@ pub fn apply(
     Ok(())
 }
 
-/// Turn a loaded file into the operation that indexes it, or `None` if it cannot be.
+/// Turn a loaded file into the operation that indexes it. The one place a file becomes
+/// an op, shared by the save path, the external-change path and the rebuild, so the
+/// three cannot disagree about what a vault contains (C-02).
 ///
-/// A note the parser refuses is skipped, which is the behaviour I4 established and
-/// which this deliberately does not change.
-///
-/// It is worth flagging rather than quietly deciding: design goal 5 says capability
-/// degrades and nothing breaks, and skipping means the vault's *contents* depend on
-/// whether the parser understood a file — an unparseable note vanishes from the index
-/// rather than appearing without blocks. Indexing it as a bare row instead would keep
-/// it listable and linkable and lose only its text. That is a change to what the index
-/// contains, so it belongs to architect and not to a timing task.
+/// A note the parser refuses is indexed as a **bare row** (architecture 3.1.2 step 4,
+/// task #58): `UpsertNote` with a `ParsedNote` that has only a title from the file
+/// stem, and the hash of the bytes that failed so the hash gate works. The writer's
+/// upsert removes the path's earlier rows first, in the same transaction, so no stale
+/// blocks, fields, links or FTS rows survive an edit into a refused form. The note
+/// stays listable, searchable by path and linkable. There is no parse-error column:
+/// a refused note is a `kind = 'note'` row with no `blocks` row. The returned flag
+/// says the parser refused.
 pub(crate) fn build_op(
     parser: &dyn NoteParser,
     path: &VaultPath,
     loaded: LoadedNote,
-) -> Option<(IndexOp, Duration)> {
+) -> (IndexOp, Duration, bool) {
     match loaded.meta.kind {
-        NoteKind::Asset => Some((IndexOp::UpsertAsset { meta: loaded.meta }, Duration::ZERO)),
+        NoteKind::Asset => (
+            IndexOp::UpsertAsset { meta: loaded.meta },
+            Duration::ZERO,
+            false,
+        ),
         NoteKind::Note => {
             let parsing = Instant::now();
-            let parsed = parser.parse(path, &loaded.bytes).ok()?;
-            Some((
+            let result = parser.parse(path, &loaded.bytes);
+            let elapsed = parsing.elapsed();
+            let refused = result.is_err();
+            let parsed = result.unwrap_or_else(|_| serat_core::ParsedNote {
+                title: Some(path.stem().to_owned()),
+                ..serat_core::ParsedNote::default()
+            });
+            (
                 IndexOp::UpsertNote {
                     meta: loaded.meta,
                     parsed: Box::new(parsed),
                 },
-                parsing.elapsed(),
-            ))
+                elapsed,
+                refused,
+            )
         }
     }
 }

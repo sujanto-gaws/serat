@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serat_core::{IndexError, IndexOp, IndexWriter, NoteKind, NoteParser, NoteSource, VaultPath};
+use serat_core::{IndexError, IndexWriter, NoteParser, NoteSource, VaultPath};
 
 use crate::schema;
 use crate::writer::{DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
@@ -252,18 +252,8 @@ fn index_one(
     let loaded = source.load(path).map_err(|_| Skip)?;
     timing.read_hash += reading.elapsed();
 
-    let op = match loaded.meta.kind {
-        NoteKind::Asset => IndexOp::UpsertAsset { meta: loaded.meta },
-        NoteKind::Note => {
-            let parsing = Instant::now();
-            let parsed = parser.parse(path, &loaded.bytes).map_err(|_| Skip)?;
-            timing.parse += parsing.elapsed();
-            IndexOp::UpsertNote {
-                meta: loaded.meta,
-                parsed: Box::new(parsed),
-            }
-        }
-    };
+    let (op, parse, _) = crate::incremental::build_op(parser, path, loaded);
+    timing.parse += parse;
 
     // Blocking submit, deliberately, and this is the one place it is right.
     //
