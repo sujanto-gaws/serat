@@ -85,6 +85,30 @@ fn expected() -> Vec<(&'static str, &'static str, Vec<FieldValue>)> {
             vec![text("[[Ada Lovelace]]"), text("[[Alan Turing]]")],
         ),
         (
+            "flow-mixed",
+            "tags",
+            vec![
+                FieldValue::Num(2026.0),
+                text("2026"),
+                FieldValue::Bool(true),
+                text("a, b"),
+                text("[[X]]"),
+                text("plain one"),
+            ],
+        ),
+        (
+            "block-mixed",
+            "tags",
+            vec![
+                FieldValue::Num(2026.0),
+                text("2026"),
+                FieldValue::Bool(true),
+                text("a, b"),
+                text("[[X]]"),
+                text("plain one"),
+            ],
+        ),
+        (
             "non-ascii",
             "aliases",
             vec![text("\u{e9}t\u{e9}"), text("\u{3bf}\u{3b4}\u{3cc}\u{3c2}")],
@@ -171,5 +195,12 @@ fn every_refused_shape_leaves_no_field_for_its_key_and_keeps_its_neighbours() {
         }
         seen += 1;
     }
-    assert!(seen >= 12, "the refused corpus shrank to {seen} cases");
+    assert!(seen >= 14, "the refused corpus shrank to {seen} cases");
+}
+
+#[test]
+fn the_flow_and_block_forms_of_the_same_items_give_the_same_values() {
+    let (_, flow) = fields_of("accepted", "flow-mixed", |t| t);
+    let (_, block) = fields_of("accepted", "block-mixed", |t| t);
+    assert_eq!(items_of(&flow, "tags"), items_of(&block, "tags"));
 }

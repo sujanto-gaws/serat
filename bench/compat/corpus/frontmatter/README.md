@@ -19,6 +19,7 @@ proves the neighbouring keys survive. The subset is written down in the module d
 | null-item-dropped | a bare `-` between items | the bare item is dropped |
 | typed-plain-items | `2026`, `"2026"`, `true` | number, text, bool: quoted is always text |
 | wikilinks-quoted | `- "[[Ada Lovelace]]"` | text `[[Ada Lovelace]]` (the link scanner finds the links separately) |
+| flow-mixed, block-mixed | the same six items as a flow list and as a block list | identical values: quoted is text, `"a, b"` is one item |
 | non-ascii | accented and Greek items | byte ranges stay on char boundaries |
 
 Every accepted case is also run with CRLF line endings.
@@ -37,6 +38,7 @@ Every accepted case is also run with CRLF line endings.
 | text-after-quote | `- "alpha" beta` |
 | unterminated-quote | `- "alpha` |
 | not-a-marker | `-alpha` |
+| hash-comment-value | `tags: #project`: a value starting with `#` is a YAML comment | no value, no field (it used to index as text `#project`) |
 | nested-map | `owner:` with indented `name:`/`type:` children; the children must not surface as top-level keys |
 
 Whether Obsidian agrees on each refused shape (it is a full YAML reader and accepts

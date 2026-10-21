@@ -86,14 +86,56 @@ pub(crate) fn infer_value(raw: &str) -> FieldValue {
         .and_then(|rest| rest.strip_suffix(']'))
     {
         return FieldValue::List(
-            list.split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(infer_scalar)
+            split_flow(list)
+                .into_iter()
+                .map(|item| match crate::frontmatter::item_scalar(item) {
+                    // Read exactly like a block-list item (quotes removed, quoted
+                    // means text), so the two YAML shapes give the same rows.
+                    Some(Some((value, _))) => value,
+                    // Anything item_scalar refuses in a block list (`[`, `{`, ...)
+                    // keeps its literal text here: a flow list has no field to
+                    // refuse as a whole without losing its other items.
+                    _ => infer_scalar(item),
+                })
                 .collect(),
         );
     }
     infer_scalar(raw)
+}
+
+/// Split a flow list's inside on commas that are not within quotes, trimming items and
+/// dropping empty ones. A quote only opens at the start of an item, as in YAML.
+fn split_flow(list: &str) -> Vec<&str> {
+    let bytes = list.as_bytes();
+    let mut items = Vec::new();
+    let (mut start, mut at) = (0, 0);
+    let mut quote = 0u8;
+    while at < bytes.len() {
+        let b = bytes[at];
+        if quote != 0 {
+            if b == b'\\' && quote == b'"' {
+                at += 1;
+            } else if b == quote {
+                if quote == b'\'' && bytes.get(at + 1) == Some(&b'\'') {
+                    at += 1;
+                } else {
+                    quote = 0;
+                }
+            }
+        } else if b == b',' {
+            items.push(&list[start..at]);
+            start = at + 1;
+        } else if (b == b'"' || b == b'\'') && list[start..at].trim().is_empty() {
+            quote = b;
+        }
+        at += 1;
+    }
+    items.push(&list[start..]);
+    items
+        .into_iter()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 pub(crate) fn infer_scalar(raw: &str) -> FieldValue {

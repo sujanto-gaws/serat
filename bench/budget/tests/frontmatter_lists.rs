@@ -58,17 +58,36 @@ fn alias_rows_equal_the_manifest(preset_name: &str) {
     let index = work.path().join("index");
     rebuild(&source, &serat_parse::CommonMarkParser, &vault, &index).expect("rebuild");
     let conn = schema::open(&index_path(&index)).expect("open index");
-    let rows: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM fields WHERE key = 'aliases' AND source = 'frontmatter'",
-            [],
+    let count = |key: &str| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM fields WHERE key = ?1 AND source = 'frontmatter'",
+            [key],
             |r| r.get(0),
         )
-        .expect("count");
+        .expect("count")
+    };
+    let rows = count("aliases");
     assert!(rows > 0, "no alias rows in the index");
     assert_eq!(
         rows, expected,
         "alias rows in the index vs aliases the generator wrote"
+    );
+
+    // The other block lists the generator writes: a parser that dropped block
+    // `tags` or `attendees` would pass the alias check alone.
+    let block_tags = i64::from(manifest.content.block_tags);
+    let flow_tags = i64::from(manifest.content.flow_tags);
+    let attendees = i64::from(manifest.content.attendees);
+    assert!(block_tags > 0 && flow_tags > 0 && attendees > 0);
+    assert_eq!(
+        count("tags"),
+        block_tags + flow_tags,
+        "tag rows vs block + flow tag items written"
+    );
+    assert_eq!(
+        count("attendees"),
+        attendees,
+        "attendee rows vs items written"
     );
 }
 

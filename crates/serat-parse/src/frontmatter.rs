@@ -31,6 +31,13 @@
 //!   indented `child: x`). Its children are consumed with it, so they no longer
 //!   surface as top-level fields of their own (before #57 they did: a type note's
 //!   `    type: date` line set the note's `type`).
+//! * A value that starts with `#` is a YAML comment, so `tags: #project` has no value
+//!   and no field (it used to index as the text `#project`; Obsidian agrees with YAML).
+//! * Indentation is whatever whitespace `trim_start` removes, tabs included. YAML
+//!   forbids tab indentation; the subset does not police it, because refusing would
+//!   lose lists that real vaults do contain.
+//! * Flow lists split on commas outside quotes, and each item is read exactly like a
+//!   block item, so `[a, "b, c"]` and the block form give the same values and rows.
 //! * No multi-line scalars, anchors or multi-document files -- a real YAML parser is
 //!   a P2-sized dependency decision, and pulling one in for a subset this small
 //!   would cost more in surface area than it returns.
@@ -98,7 +105,8 @@ pub(crate) fn parse(bytes: &[u8], content_range: ByteRange) -> Frontmatter {
             // Nothing inline: a block list, a nested map, or a null. Everything
             // indented under it (and any `- item` at the key's own indent) belongs
             // to it, so none of it is read as a key of its own.
-            let end = continuation_end(&lines, at);
+            let key_indent = raw_line.len() - raw_line.trim_start().len();
+            let end = continuation_end(&lines, at, key_indent);
             if let Some(field) = block_list(key, line_start, &lines[at..end]) {
                 fields.push(field);
             }
@@ -159,10 +167,9 @@ fn body_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
 }
 
 /// Split one YAML-subset line into `(key, value, value_offset_in_line)`, or `None`
-/// for anything this subset does not cover — a comment, a blank line, a nested
-/// map's second-level key, a list item continuing a `-`-style list (handled instead
-/// by [`parse`] noticing the previous key had no inline value — not yet: block
-/// lists are a documented gap, see the module doc).
+/// for anything this subset does not cover — a comment, a blank line, a `- item`
+/// line (block lists are read by [`parse`] when it sees a key with no inline value,
+/// see [`block_list`]).
 fn split_key_value(line: &str) -> Option<(&str, &str, usize)> {
     let trimmed = line.trim_start();
     let indent = line.len() - trimmed.len();
@@ -185,16 +192,18 @@ fn split_key_value(line: &str) -> Option<(&str, &str, usize)> {
 }
 
 /// The index one past the last line that belongs to the key whose value starts on
-/// `from`: blank and comment lines, indented lines, and `-` items at column 0.
-fn continuation_end(lines: &[(usize, &str)], from: usize) -> usize {
+/// `from`: blank and comment lines, lines indented deeper than the key, and `-`
+/// items at the key's own indent. A line at the key's indent that is not an item is
+/// the next sibling key, never a child.
+fn continuation_end(lines: &[(usize, &str)], from: usize, key_indent: usize) -> usize {
     let mut end = from;
     for (at, (_, raw)) in lines.iter().enumerate().skip(from) {
         let line = raw.trim_end_matches('\r');
         let trimmed = line.trim_start();
         let belongs = trimmed.is_empty()
             || trimmed.starts_with('#')
-            || line.len() > trimmed.len()
-            || is_item_marker(trimmed);
+            || line.len() - trimmed.len() > key_indent
+            || (line.len() - trimmed.len() == key_indent && is_item_marker(trimmed));
         if !belongs {
             break;
         }
@@ -257,7 +266,7 @@ fn block_list(key: &str, key_line_start: usize, lines: &[(usize, &str)]) -> Opti
 /// One block-list item's text. The outer `None` is a refusal; `Some(None)` is a null
 /// (empty) item; `Some(Some((value, len)))` is a scalar and how many bytes of `body`
 /// it spans (quotes included, trailing comment excluded).
-fn item_scalar(body: &str) -> Option<Option<(FieldValue, usize)>> {
+pub(crate) fn item_scalar(body: &str) -> Option<Option<(FieldValue, usize)>> {
     let quote = match body.chars().next() {
         None | Some('#') => return Some(None),
         Some(q @ ('"' | '\'')) => q as u8,
@@ -417,22 +426,28 @@ mod tests {
         // block-list scanner. The assertion is "returns, with ranges inside the
         // input and on char boundaries"; what it returns is covered above.
         let alphabet = [
-            "k:", "\n", " ", "-", "\"", "'", "#", "\\", "[", "\r", "\u{e9}",
+            "k:", "\n", " ", "-", "\"", "'", "#", "\\", "[", "\r", "\u{e9}", "\t",
         ];
         let mut stack: Vec<Vec<usize>> = vec![vec![]];
         while let Some(word) = stack.pop() {
             let body: String = word.iter().map(|&i| alphabet[i]).collect();
-            let doc = format!("---\nkey:\n{body}\n---\n");
-            let bytes = doc.as_bytes();
-            let fm = parse(bytes, ByteRange::new(0, bytes.len()));
-            for field in &fm.fields {
-                for range in [field.range, field.value_range] {
-                    assert!(
-                        range.start <= range.end && range.end <= bytes.len(),
-                        "{doc:?}"
-                    );
-                    assert!(range.slice(bytes).is_some(), "{doc:?}");
-                    assert!(doc.is_char_boundary(range.start) && doc.is_char_boundary(range.end));
+            for doc in [
+                format!("---\nkey:\n{body}\n---\n"),
+                format!("---\nkey: [{body}\n{body}"), // flow-ish, unclosed, no newline
+            ] {
+                let bytes = doc.as_bytes();
+                let fm = parse(bytes, ByteRange::new(0, bytes.len()));
+                for field in &fm.fields {
+                    for range in [field.range, field.value_range] {
+                        assert!(
+                            range.start <= range.end && range.end <= bytes.len(),
+                            "{doc:?}"
+                        );
+                        assert!(range.slice(bytes).is_some(), "{doc:?}");
+                        assert!(
+                            doc.is_char_boundary(range.start) && doc.is_char_boundary(range.end)
+                        );
+                    }
                 }
             }
             if word.len() < 5 {
@@ -443,5 +458,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_child_at_the_keys_own_nonzero_indent_is_a_sibling_not_swallowed() {
+        let bytes = b"---\n  parent:\n  child: x\n---\n";
+        let fm = parse(bytes, ByteRange::new(0, bytes.len()));
+        assert_eq!(fm.fields.len(), 1);
+        assert_eq!(fm.fields[0].key, "child");
+    }
+
+    #[test]
+    fn a_value_that_starts_with_a_hash_is_a_comment() {
+        let bytes = b"---\ntags: #project\n---\n";
+        let fm = parse(bytes, ByteRange::new(0, bytes.len()));
+        assert!(fm.fields.is_empty());
     }
 }
