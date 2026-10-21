@@ -73,6 +73,9 @@ pub struct StatusPublisher<S> {
     /// moment a status is built, so the count is never older than the poll or the
     /// emission that carries it.
     refusals: Option<serat_vault::RefusalLog>,
+    /// The checkpointer's facts, once the vault's `IndexHandle` exists (task #56). Set
+    /// by [`IndexActor::spawn`]'s thread; read, as atomics, whenever a status is built.
+    wal: Mutex<Option<Arc<serat_index::WalHealth>>>,
 }
 
 #[derive(Debug)]
@@ -137,6 +140,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             }),
             observer: Mutex::new(None),
             refusals: None,
+            wal: Mutex::new(None),
         }
     }
 
@@ -149,6 +153,35 @@ impl<S: StatusSink> StatusPublisher<S> {
     pub fn with_refusals(mut self, refusals: serat_vault::RefusalLog) -> Self {
         self.refusals = Some(refusals);
         self
+    }
+
+    /// Carry the checkpointer's pinned-WAL fact into every status this publisher builds
+    /// (`IndexStatus::wal_pinned_bytes`, task #56), and re-emit the status whenever the
+    /// fact appears, changes or clears, because it is not part of the state and would
+    /// otherwise reach a listening front end only with the next state change.
+    ///
+    /// The callback holds the publisher weakly: the health is owned by the index handle,
+    /// and a reference back would make a cycle.
+    pub fn watch_wal(self: &Arc<Self>, health: Arc<serat_index::WalHealth>) {
+        let weak = Arc::downgrade(self);
+        health.on_change(move || {
+            if let Some(publisher) = weak.upgrade() {
+                publisher.re_emit();
+            }
+        });
+        *self
+            .wal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(health);
+    }
+
+    /// The pinned-WAL size, if the checkpointer reports one. Atomics only.
+    fn wal_pinned_bytes(&self) -> Option<u64> {
+        self.wal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|health| health.pinned_bytes())
     }
 
     /// Watch every published state, including the ones the throttle swallows.
@@ -173,6 +206,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             state: inner.state.clone(),
             since_process_start_ms: inner.since_process_start_ms,
             refused_names: self.refused_count(),
+            wal_pinned_bytes: self.wal_pinned_bytes(),
         }
     }
 
@@ -250,6 +284,7 @@ impl<S: StatusSink> StatusPublisher<S> {
                 state: inner.state.clone(),
                 since_process_start_ms: inner.since_process_start_ms,
                 refused_names: self.refused_count(),
+                wal_pinned_bytes: self.wal_pinned_bytes(),
             }
         };
 
@@ -580,6 +615,9 @@ impl IndexActor {
                     }
                 });
                 if let Some(index_handle) = opener.into_handle() {
+                    // The checkpointer lives with this handle (stopped when the slot's
+                    // handle is dropped on vault close); the status carries its fact.
+                    publisher.watch_wal(index_handle.wal_health());
                     *slot_for_thread
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index_handle);
@@ -651,6 +689,33 @@ mod tests {
             total: 20_200,
             walk_complete: true,
         }
+    }
+
+    #[test]
+    fn the_pinned_wal_fact_rides_on_the_status_and_is_re_emitted_when_it_changes() {
+        // Task #56. The fact is not part of the state, so a listening front end gets it
+        // only if the change itself emits; and a poll reads it without SQLite.
+        let (publisher, recorder) = publisher(Duration::from_secs(60));
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+
+        let health = Arc::new(serat_index::WalHealth::default());
+        publisher.watch_wal(Arc::clone(&health));
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+        assert!(recorder.taken().is_empty());
+
+        health.set_pinned_for_test(Some(70 * 1024 * 1024));
+        assert_eq!(publisher.status().wal_pinned_bytes, Some(70 * 1024 * 1024));
+        let seen = recorder.taken();
+        assert_eq!(seen.len(), 1, "the change did not emit: {seen:?}");
+        assert_eq!(seen[0].wal_pinned_bytes, Some(70 * 1024 * 1024));
+
+        // Unchanged is not a change; clearing is.
+        health.set_pinned_for_test(Some(70 * 1024 * 1024));
+        assert_eq!(recorder.taken().len(), 1);
+        health.set_pinned_for_test(None);
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+        assert_eq!(recorder.taken().len(), 2);
+        assert_eq!(recorder.taken()[1].wal_pinned_bytes, None);
     }
 
     #[test]

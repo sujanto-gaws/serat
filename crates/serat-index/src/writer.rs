@@ -18,6 +18,7 @@
 //! channel.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -25,6 +26,7 @@ use rusqlite::Connection;
 use serat_core::{IndexError, IndexOp, IndexWriter};
 
 use crate::apply;
+use crate::checkpoint::{Bounds, Checkpointer, WalHealth, WalObserver, WriterHook, tune_writer};
 use crate::schema::{self, sqlite};
 
 /// How many operations may wait for the writer.
@@ -223,6 +225,38 @@ pub struct IndexActor {
     // sloppiness.
     #[cfg_attr(not(test), allow(dead_code))]
     fault: FaultInjector,
+    /// The WAL checkpointer (task #56), stopped after the writer. `None` for an
+    /// in-memory database, or when its connection could not be opened, in which case
+    /// SQLite's own auto-checkpoint stays on.
+    pub(crate) checkpointer: Option<Checkpointer>,
+    health: Arc<WalHealth>,
+}
+
+/// How an [`IndexActor`] is started, beyond its connection and queue depth.
+#[derive(Debug, Clone, Copy)]
+pub struct ActorOptions {
+    /// How many operations may wait for the writer.
+    pub capacity: usize,
+    /// Whether to start the checkpointer and turn the writer's auto-checkpoint off.
+    /// Off only for `p1-save-tail`'s diagnostic runs of the old behaviour.
+    pub checkpointer: bool,
+    /// The checkpointer's thresholds; the ruled values unless a test shrinks them.
+    pub bounds: Bounds,
+    /// Called from the writer's WAL hook with each commit's frame count. For the
+    /// benchmarks. When the checkpointer is off this *replaces* SQLite's auto-checkpoint,
+    /// so the observer is responsible for any checkpoint it wants.
+    pub wal_observer: Option<WalObserver>,
+}
+
+impl Default for ActorOptions {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_QUEUE_DEPTH,
+            checkpointer: true,
+            bounds: Bounds::default(),
+            wal_observer: None,
+        }
+    }
 }
 
 impl IndexActor {
@@ -256,23 +290,80 @@ impl IndexActor {
     /// Panics if `capacity` is zero.
     #[must_use]
     pub fn with_capacity(conn: Connection, capacity: usize) -> Self {
+        Self::with_options(
+            conn,
+            ActorOptions {
+                capacity,
+                ..ActorOptions::default()
+            },
+        )
+    }
+
+    /// As [`IndexActor::with_capacity`], with the checkpointer's switches and thresholds.
+    ///
+    /// Sets the writer's pragmas (task #56, §2.2, §3.1.1): `journal_size_limit` 16 MiB,
+    /// `cache_size` 16 MiB, and, when the checkpointer starts, `wal_autocheckpoint = 0`,
+    /// because the checkpointer is what checkpoints now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `options.capacity` is zero.
+    #[must_use]
+    pub fn with_options(conn: Connection, options: ActorOptions) -> Self {
         assert!(
-            capacity > 0,
+            options.capacity > 0,
             "a writer queue with no capacity accepts nothing"
         );
-        let (tx, rx) = sync_channel(capacity);
+        let (tx, rx) = sync_channel(options.capacity);
         let fault = FaultInjector::default();
         let actor_fault = fault.clone();
+        let health = Arc::new(WalHealth::default());
+
+        let db_path = conn
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(std::path::PathBuf::from);
+        let checkpointer = match (&db_path, options.checkpointer) {
+            (Some(path), true) => Checkpointer::start(path, options.bounds, Arc::clone(&health)),
+            _ => None,
+        };
+        // The pragma installs SQLite's hook as NULL, so it is set before the writer
+        // thread installs the checkpointer's hook. Pragma failures degrade rather than
+        // panic: a writer that kept SQLite's own auto-checkpoint is slower on the hub
+        // save, and is still correct.
+        let autocheckpoint_off = tune_writer(&conn, checkpointer.is_some());
+        let hook = match (&checkpointer, options.wal_observer) {
+            (Some(checkpointer), observer) if autocheckpoint_off => {
+                Some(checkpointer.writer_hook(observer))
+            }
+            (Some(_), _) => None,
+            (None, Some(observer)) => Some(WriterHook::observer_only(observer)),
+            (None, None) => None,
+        };
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
-            .spawn(move || run(conn, &rx, &actor_fault))
+            .spawn(move || {
+                if let Some(hook) = hook {
+                    hook.install(&conn);
+                }
+                run(conn, &rx, &actor_fault);
+            })
             .expect("spawn the index writer");
 
         Self {
             handle: WriterHandle { tx },
             join: Some(join),
             fault,
+            checkpointer,
+            health,
         }
+    }
+
+    /// What the checkpointer knows: the pinned-WAL fact and its counters. Safe to read
+    /// from any thread; touches no connection.
+    #[must_use]
+    pub fn wal_health(&self) -> Arc<WalHealth> {
+        Arc::clone(&self.health)
     }
 
     /// A handle to make this actor's *next* commit fail once, for tests.
@@ -322,6 +413,11 @@ impl IndexActor {
         let _ = self.handle.tx.send(Command::Stop);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+        // After the writer, so its last commit's signal is not sent into a stopped
+        // thread. The checkpointer is stopped on vault close, not left to the process.
+        if let Some(mut checkpointer) = self.checkpointer.take() {
+            checkpointer.stop();
         }
     }
 }

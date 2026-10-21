@@ -647,8 +647,14 @@ impl SearchConn {
         )
         .map_err(sqlite)?;
         conn.set_prepared_statement_cache_capacity(16);
-        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
-            .map_err(sqlite)?;
+        // 64 MiB, a ceiling and not an allocation (architecture §2.2, task #56): the
+        // only reads whose working set exceeds SQLite's default 2 MiB run here, and
+        // under alternation with another connection that default is bistable (#53).
+        conn.execute_batch(&format!(
+            "PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -{};",
+            crate::checkpoint::SEARCH_CACHE_BYTES / 1024
+        ))
+        .map_err(sqlite)?;
         let running = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let handler_calls = Arc::new(AtomicU64::new(0));
@@ -845,6 +851,9 @@ fn mime_for(path: &str) -> Option<String> {
     };
     Some(mime.to_owned())
 }
+
+#[cfg(test)]
+mod txn_invariant;
 
 #[cfg(test)]
 mod tests {

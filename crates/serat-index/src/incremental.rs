@@ -110,6 +110,16 @@ impl IndexHandle {
         self.actor.handle()
     }
 
+    /// The WAL checkpointer's facts (task #56): the pinned-WAL size, when there is one,
+    /// and its counters. Reads atomics only, so a status poll may call it.
+    ///
+    /// The checkpointer lives and dies with this handle: dropping the handle (vault
+    /// close) stops its thread after the writer's last commit.
+    #[must_use]
+    pub fn wal_health(&self) -> std::sync::Arc<crate::checkpoint::WalHealth> {
+        self.actor.wal_health()
+    }
+
     /// Where the index lives.
     #[must_use]
     pub fn index_dir(&self) -> &Path {

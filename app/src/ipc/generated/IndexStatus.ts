@@ -43,4 +43,19 @@ since_process_start_ms: number,
  * vault is open. It never means zero, so the front end shows nothing for
  * it rather than "0 names not shown".
  */
-refused_names?: number, };
+refused_names?: number, 
+/**
+ * The index's write-ahead log is pinned, and this is its size in bytes. Serves
+ * NFR-PRF-03, NFR-REL-01, task #56 (architecture §2.2 "WAL checkpoints"). The
+ * front end renders it as one quiet status fact, **"index WAL pinned"** with the
+ * size, never as an error or a modal.
+ *
+ * A checkpoint cannot pass a reader that holds a read transaction, so the index
+ * holds the invariant that no reader keeps one outside a single read call. If the
+ * WAL nevertheless passes 64 MiB, the checkpointer reports it here, tries one
+ * `RESTART` at idle, and, if that fails, leaves this fact in place until a
+ * checkpoint completes. The index still works; only disk use is affected.
+ * `None` (absent on the wire) means the WAL is not pinned, or no vault is open.
+ * It is a fact about a defect, so it is never `Some(0)`.
+ */
+wal_pinned_bytes?: number, };

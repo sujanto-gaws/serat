@@ -35,6 +35,15 @@
 //! `--bare` runs without the callback and the hook, on SQLite's own, to measure the
 //! instrumentation's cost.
 //!
+//! **Since task #56 the writer is the product's:** `IndexActor` sets
+//! `wal_autocheckpoint = 0` and runs the checkpointer (idle gate 250 ms, size bound 4,000
+//! frames), so `ckpt` is 0 by construction -- the writer's hook only signals -- and the
+//! checkpointer's own work is reported beside the table (runs, longest, and how many
+//! saves had a checkpoint in progress when they started or ended). The #53 behaviour is
+//! still reachable as a diagnostic: `--wal-autocheckpoint 1000` turns the checkpointer
+//! off and re-implements SQLite's inline auto-checkpoint in the hook, as before;
+//! `--checkpoint-between` does the same with an explicit PASSIVE between saves.
+//!
 //! ```text
 //! cargo run --release -p budget --bin p1-save-tail -- --vault 20k --iterations 1000 --gap-ms 1000
 //! ```
@@ -53,9 +62,11 @@ use rusqlite::{Connection, OpenFlags};
 use serat_core::{
     IndexOp, IndexWriter as _, LoadedNote, NoteKind, NoteParser as _, NoteSource as _, VaultPath,
 };
+use serat_index::{ActorOptions, CheckpointStats};
 
-/// The auto-checkpoint threshold the hook re-implements. 0 never checkpoints.
-static AUTOCKPT: AtomicI32 = AtomicI32::new(1000);
+/// The auto-checkpoint threshold the hook re-implements for the #53 diagnostic. 0 never
+/// checkpoints (the product's checkpointer does).
+static AUTOCKPT: AtomicI32 = AtomicI32::new(0);
 
 /// One commit's WAL hook report.
 #[derive(Clone, Copy, Default, Debug)]
@@ -302,6 +313,8 @@ struct Rec {
     n_log: i32,
     n_ckpt: i32,
     ckpt_err: bool,
+    /// The checkpointer had a checkpoint in progress when the save started or ended.
+    ckpt_overlap: bool,
     segs_before: u32,
     segs_after: u32,
     levels_after: Vec<u32>,
@@ -330,6 +343,14 @@ struct Args {
     csv: Option<String>,
 }
 
+impl Args {
+    /// Whether the product's checkpointer runs: not when a diagnostic asks for the #53
+    /// behaviour (inline auto-checkpoint, or an explicit checkpoint between saves).
+    fn checkpointer(&self) -> bool {
+        self.autockpt == 0 && !self.ckpt_between
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut a = Args {
         vault: "20k".to_owned(),
@@ -337,7 +358,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         gap_ms: 1000,
         warmup: 5,
         note: None,
-        autockpt: 1000,
+        autockpt: 0,
         automerge: None,
         ckpt_between: false,
         bare: false,
@@ -431,6 +452,8 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     let parser = serat_parse::CommonMarkParser;
 
     // The writer connection, built as `IndexHandle::open` builds it, then instrumented.
+    // The actor sets the writer's pragmas and starts the checkpointer; the hook below is
+    // its observer, so it sees the same commits the checkpointer is signalled for.
     AUTOCKPT.store(a.autockpt, Ordering::Relaxed);
     let conn = serat_index::open(&db).map_err(|e| e.to_string())?;
     serat_index::schema::bootstrap_if_empty(&conn).map_err(|e| e.to_string())?;
@@ -441,20 +464,21 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         )
         .map_err(|e| format!("automerge: {e}"))?;
     }
-    if a.bare {
-        // SQLite's own default hook, unless the bisect asks for another threshold.
-        conn.query_row(
-            &format!("PRAGMA wal_autocheckpoint = {}", a.autockpt),
-            [],
-            |r| r.get::<_, i32>(0),
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
+    if !a.bare {
         conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile));
-        conn.wal_hook(Some(on_wal));
     }
-    let actor = serat_index::IndexActor::with_connection(conn);
+    let actor = serat_index::IndexActor::with_options(
+        conn,
+        ActorOptions {
+            checkpointer: a.checkpointer(),
+            // Bare: no observer. With the checkpointer off and no observer SQLite's own
+            // auto-checkpoint stays on, at its default of 1000 frames.
+            wal_observer: (!a.bare).then_some(on_wal as serat_index::checkpoint::WalObserver),
+            ..ActorOptions::default()
+        },
+    );
     let writer = actor.handle();
+    let health = actor.wal_health();
 
     // Side connections for the FTS5 structure and the explicit checkpoint; used only in
     // the gap, never inside a timed interval.
@@ -466,6 +490,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         .map_err(|e| e.to_string())?;
 
     let one_save = |rec: &mut Rec| -> Result<(), String> {
+        let ck_at_start = health.checkpoint_in_progress();
         let t0 = Instant::now();
         let loaded: LoadedNote = source.load(&path).map_err(|e| format!("load: {e}"))?;
         let t1 = Instant::now();
@@ -484,6 +509,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         let t3 = Instant::now();
         writer.flush().map_err(|e| e.to_string())?;
         let t4 = Instant::now();
+        rec.ckpt_overlap = ck_at_start || health.checkpoint_in_progress();
         rec.read = ms(t1 - t0);
         rec.parse = ms(t2 - t1);
         rec.submit = ms(t3 - t2);
@@ -596,6 +622,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     let wal_bytes_end = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     drop(side);
     drop(ckpt_conn);
+    let ck_stats = (a.checkpointer() && !a.bare).then(|| (health.stats(), health.pinned_bytes()));
     let shutdown = actor.shutdown().map_err(|e| e.to_string());
     if let Some(why) = &aborted {
         println!(
@@ -620,7 +647,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         &env.summary(),
         (&load_start, &load_end),
         &build_samples,
-        (wal_bytes_start, wal_bytes_end),
+        (wal_bytes_start, wal_bytes_end, ck_stats),
         &recs,
     );
     if let Some(csv) = &a.csv {
@@ -693,7 +720,7 @@ fn report(
     env: &str,
     (load_start, load_end): (&str, &str),
     builds: &[usize],
-    (wal_start, wal_end): (u64, u64),
+    (wal_start, wal_end, ck_stats): (u64, u64, Option<(CheckpointStats, Option<u64>)>),
     recs: &[Rec],
 ) {
     let n = recs.len();
@@ -708,7 +735,7 @@ fn report(
         if a.bare {
             "BARE (SQLite's own hook, no trace)"
         } else {
-            "instrumented (trace_v2 profile + wal_hook)"
+            "instrumented (trace_v2 profile + wal_hook observer)"
         },
         if a.gap_ms == 1000 && a.iterations >= 1000 {
             ""
@@ -717,8 +744,17 @@ fn report(
         },
     );
     println!(
-        "settings: wal_autocheckpoint {} · fts5 automerge {} · explicit PASSIVE checkpoint between saves: {}",
-        a.autockpt,
+        "settings: checkpointer {} · wal_autocheckpoint {} · fts5 automerge {} · explicit PASSIVE checkpoint between saves: {}",
+        if a.checkpointer() {
+            "the product's (idle 250 ms, size 4,000 frames)"
+        } else {
+            "OFF (#53 diagnostic)"
+        },
+        if a.checkpointer() {
+            "0".to_owned()
+        } else {
+            a.autockpt.to_string()
+        },
         a.automerge.map_or("default".to_owned(), |v| v.to_string()),
         a.ckpt_between
     );
@@ -754,6 +790,18 @@ fn report(
     ];
     for (name, f) in rows {
         println!("  {}", stat_line(name, f, recs));
+    }
+    if let Some((stats, pinned)) = ck_stats {
+        let overlapped = recs.iter().filter(|r| r.ckpt_overlap).count();
+        println!(
+            "checkpointer (its own thread): {} PASSIVE runs · {} incomplete · {} RESTART · longest {:.1} ms · mean {:.1} ms · saves with a checkpoint in progress at their start or end: {overlapped} of {n} · index WAL pinned: {}",
+            stats.passive_runs,
+            stats.incomplete,
+            stats.restart_runs,
+            stats.passive_max_micros as f64 / 1000.0,
+            stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
+            pinned.map_or("no".to_owned(), |b| format!("{b} B")),
+        );
     }
     if a.bare {
         return;
