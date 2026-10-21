@@ -11,10 +11,11 @@
 //! `\r\n`, and a BOM is part of line 0's text, exactly as it is in CodeMirror's
 //! document, provided the caller built that document from a `String` that kept it.
 
-use serde::{Deserialize, Serialize};
-
 /// A position in a document: a 0-based line and a UTF-16 column within it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Not serialisable on purpose: the wire type is `contracts::Pos` (ADR-0007), and a
+/// second serde shape here would be a second contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position {
     /// 0-based line index.
     pub line: u32,

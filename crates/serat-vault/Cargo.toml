@@ -11,7 +11,6 @@ repository.workspace = true
 serat-core = { workspace = true }
 blake3 = { workspace = true }
 notify = { workspace = true }
-serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

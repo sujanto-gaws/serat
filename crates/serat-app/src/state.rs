@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
 
-use serat_core::{ContentHash, VaultError, VaultPath};
+use serat_core::{ContentHash, VaultPath};
 use serat_parse::CommonMarkParser;
 use serat_vault::Vault;
 
@@ -536,34 +536,12 @@ impl AppState {
 
         let vault = self.vault()?;
 
-        // Rule 4 — the optimistic lock of §6.1 step 2.
-        match vault.read(&path) {
-            Ok(current) => {
-                // `None` asserts the file does not exist. It does, so this is a create
-                // over something, which is a stale guard rather than a silent
-                // overwrite.
-                if base_hash != Some(current.meta.hash) {
-                    return Err(IpcError::StaleHash {
-                        path: path.to_string(),
-                        current_hash: current.meta.hash.to_hex(),
-                    });
-                }
-            }
-            Err(VaultError::NotFound { .. }) => {
-                // The caller read a hash and the file has since been deleted. That is
-                // not a stale guard the caller can resolve by re-reading, so it is
-                // reported as what it is.
-                if base_hash.is_some() {
-                    return Err(IpcError::NotFound {
-                        path: path.to_string(),
-                    });
-                }
-            }
-            Err(err) => return Err(from_vault_error(err)),
-        }
-
+        // Rule 4 — the optimistic lock of §6.1 step 2, checked by the vault under its
+        // per-path lock so no other in-process writer can land between the check and
+        // the rename (ADR-0016 §2). `None` asserts the file does not exist.
+        let expect = base_hash.map_or(serat_vault::Expect::Absent, serat_vault::Expect::Hash);
         vault
-            .write_atomic(&path, args.text.as_bytes())
+            .write_atomic_if(&path, expect, args.text.as_bytes())
             .map_err(from_vault_error)?;
 
         // §3.1.1's save path, steps 2-4: submit the note to the index writer with no
@@ -722,7 +700,8 @@ impl AppState {
     /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] as
     /// [`crate::gitignore::append`].
     pub fn append_gitignore_entry(&self) -> Result<GitignoreAppended, IpcError> {
-        crate::gitignore::append(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::append(&vault)
     }
 
     /// `decline_gitignore_offer`. Writes only inside `.serat/`.
@@ -731,7 +710,8 @@ impl AppState {
     ///
     /// As [`AppState::append_gitignore_entry`].
     pub fn decline_gitignore_offer(&self) -> Result<(), IpcError> {
-        crate::gitignore::decline(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::decline(&vault)
     }
 
     /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than
