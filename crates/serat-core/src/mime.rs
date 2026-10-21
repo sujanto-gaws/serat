@@ -82,10 +82,24 @@ pub fn mime_for_path(path: &str) -> &'static str {
         .unwrap_or(OCTET_STREAM)
 }
 
-/// Whether the `serat-asset` scheme serves this type: PDF and images (ADR-0017).
+/// The types the `serat-asset` scheme serves, exactly (ADR-0017 Decision step 5, the
+/// T-10 boundary). Everything else gets 404. Not a prefix match: `image/tiff` and
+/// `image/x-icon` are in the table and are not served.
+pub const VIEWABLE: [&str; 8] = [
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/bmp",
+    "image/svg+xml",
+];
+
+/// Whether the `serat-asset` scheme serves this type (ADR-0017).
 #[must_use]
 pub fn is_viewable(mime: &str) -> bool {
-    mime == "application/pdf" || mime.starts_with("image/")
+    VIEWABLE.contains(&mime)
 }
 
 /// The link that inserts an attachment, from the text that resolves to it (§9.3):
@@ -116,6 +130,22 @@ mod tests {
         assert_eq!(mime_for_path("Makefile"), OCTET_STREAM);
         assert_eq!(mime_for_path("v1.2/blob"), OCTET_STREAM);
         assert_eq!(mime_for_path("trailing."), OCTET_STREAM);
+    }
+
+    #[test]
+    fn exactly_the_eight_adr_0017_types_are_viewable_across_the_whole_table() {
+        let mut viewable: Vec<&str> = TABLE
+            .iter()
+            .map(|&(_, mime)| mime)
+            .filter(|mime| is_viewable(mime))
+            .collect();
+        viewable.sort_unstable();
+        viewable.dedup();
+        let mut expected = VIEWABLE.to_vec();
+        expected.sort_unstable();
+        assert_eq!(viewable, expected);
+        assert!(!is_viewable("image/tiff") && !is_viewable("image/x-icon"));
+        assert!(!is_viewable(OCTET_STREAM));
     }
 
     #[test]

@@ -272,22 +272,51 @@ fn attachments_list_every_asset_with_the_shortest_resolving_link() {
     assert_eq!(attachments.len(), 4);
     assert!(attachments.windows(2).all(|w| w[0].path < w[1].path));
 
+    let text = |p: &str| by_path(p).link_text.clone();
+    let link = |p: &str| by_path(p).link.clone();
     let report = by_path("refs/report.pdf");
     assert_eq!(report.mime, "application/pdf");
     assert_eq!(report.bytes, 4);
     assert_eq!(report.sidecar_path.as_deref(), Some("refs/report.pdf.md"));
-    assert_eq!(report.link_text, "report.pdf");
-    assert_eq!(report.link, "![[report.pdf]]");
+    assert_eq!(text("refs/report.pdf").as_deref(), Some("report.pdf"));
+    assert_eq!(link("refs/report.pdf").as_deref(), Some("![[report.pdf]]"));
 
     // Two assets named logo.png: the bare name resolves to the shorter path only.
-    let short = by_path("img/logo.png");
-    assert_eq!(short.link, "![[logo.png]]");
-    let long = by_path("deep/er/logo.png");
-    assert_eq!(long.link_text, "deep/er/logo.png");
-    assert_eq!(long.link, "![[deep/er/logo.png]]");
+    assert_eq!(link("img/logo.png").as_deref(), Some("![[logo.png]]"));
+    assert_eq!(
+        text("deep/er/logo.png").as_deref(),
+        Some("deep/er/logo.png")
+    );
+    assert_eq!(
+        link("deep/er/logo.png").as_deref(),
+        Some("![[deep/er/logo.png]]")
+    );
 
-    // Not an image or PDF: a plain link.
-    assert_eq!(by_path("data/sheet.xlsx").link, "[[sheet.xlsx]]");
+    // Not viewable: a plain link. image/tiff is in the MIME table but is not served.
+    assert_eq!(link("data/sheet.xlsx").as_deref(), Some("[[sheet.xlsx]]"));
+}
+
+#[test]
+fn a_tiff_is_linked_not_embedded() {
+    let mut live = Live::new();
+    live.save("scan.tiff", "II*");
+    let attachments = live.reader().attachments().expect("attachments");
+    assert_eq!(attachments[0].link.as_deref(), Some("[[scan.tiff]]"));
+}
+
+#[test]
+fn an_asset_no_link_form_resolves_to_has_no_link_text() {
+    // Case-sensitive file system: refs/X.PDF and refs/x.pdf. Both bare names fold alike
+    // and tie on length, so binary order picks X.PDF; the full path of x.pdf folds to
+    // X.PDF's path too. No link form reaches x.pdf, and none is offered.
+    let mut live = Live::new();
+    live.save("refs/X.PDF", "%PDF");
+    live.save("refs/x.pdf", "%PDF");
+    let attachments = live.reader().attachments().expect("attachments");
+    let get = |p: &str| attachments.iter().find(|a| a.path == p).expect(p);
+    assert_eq!(get("refs/X.PDF").link_text.as_deref(), Some("X.PDF"));
+    assert_eq!(get("refs/x.pdf").link_text, None);
+    assert_eq!(get("refs/x.pdf").link, None);
 }
 
 #[test]

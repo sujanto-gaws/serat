@@ -41,7 +41,9 @@ pub use fold::fold_case;
 pub use hash::ContentHash;
 pub use ids::{BlockId, FieldId, NoteId};
 pub use link::{Link, LinkKind, LinkTarget};
-pub use mime::{OCTET_STREAM, attachment_link, is_viewable, mime_for_extension, mime_for_path};
+pub use mime::{
+    OCTET_STREAM, VIEWABLE, attachment_link, is_viewable, mime_for_extension, mime_for_path,
+};
 pub use note::{IndexOp, LoadedNote, NoteKind, NoteMeta, ParsedNote, SourceEntry};
 pub use path::{Platform, VaultPath};
 pub use span::ByteRange;

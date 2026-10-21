@@ -476,6 +476,14 @@ fn measure(
         || search_rows(&reader, &by_type, 0, 500),
     ));
 
+    // Attachments (task #17): every asset with its resolving link, one statement.
+    rows.push(time(
+        "R5 attachments (all assets, resolver choice by name and path)",
+        Some(20.0),
+        iterations,
+        || reader.attachments().map_or(0, |a| a.len()),
+    ));
+
     // R1 + R3: the commonest in-line term filtered by a property.
     let combined = format!("{commonest} {by_key}");
     rows.push(time(

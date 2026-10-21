@@ -141,9 +141,10 @@ pub struct Attachment {
     pub sidecar_path: Option<String>,
     /// The shortest text that resolves back to this asset (§9.3), without brackets:
     /// the file name when the resolver would pick this file for it, else the path.
-    pub link_text: String,
+    /// `None` when neither the name nor the path resolves back to this asset.
+    pub link_text: Option<String>,
     /// What inserting it writes: `![[text]]` for an image or PDF, `[[text]]` otherwise.
-    pub link: String,
+    pub link: Option<String>,
 }
 
 /// A search box string, parsed.
@@ -312,33 +313,61 @@ const R2: &str = "SELECT s.path, s.title, s.hash, b.id, b.ord, b.heading_path,
                    GROUP BY l.src_note, l.src_block
                    ORDER BY s.path, b.ord";
 
-/// Attachments (FR-VLT-08), one statement. The last column is the path the link
-/// resolver would choose for the bare file name (the `resolve.rs` rule: path, path +
-/// `.md`, file name, file name + `.md`; shortest path, then binary order), so the
-/// shortest resolving form is the name only when that path is the asset itself.
-const ATTACHMENTS: &str = "SELECT a.path, x.mime, x.bytes, a.sidecar_path, a.file_name,
-        (SELECT c.path FROM (
-            SELECT n.path AS path FROM notes n WHERE n.path_fold = a.file_name_fold
-            UNION ALL
-            SELECT n.path FROM notes n WHERE n.path_fold = a.file_name_fold || '.md'
-            UNION ALL
-            SELECT n.path FROM notes n WHERE n.file_name_fold = a.file_name_fold
-            UNION ALL
-            SELECT n.path FROM notes n WHERE n.file_name_fold = a.file_name_fold || '.md'
-         ) c ORDER BY length(c.path), c.path LIMIT 1)
+/// The path the link resolver would choose for the folded target `$t`: the
+/// `resolve.rs` rule (path, path + `.md`, file name, file name + `.md`; shortest path,
+/// then binary order). `resolve.rs` guards the file-name arms with
+/// `instr(dst_fold, '/') = 0`; it is dropped here because a file name never contains
+/// '/', so for a target that has one those arms match nothing anyway.
+macro_rules! resolver_choice {
+    ($t:literal) => {
+        concat!(
+            "(SELECT c.path FROM (
+                SELECT n.path AS path FROM notes n WHERE n.path_fold = ",
+            $t,
+            "
+                UNION ALL
+                SELECT n.path FROM notes n WHERE n.path_fold = ",
+            $t,
+            " || '.md'
+                UNION ALL
+                SELECT n.path FROM notes n WHERE n.file_name_fold = ",
+            $t,
+            "
+                UNION ALL
+                SELECT n.path FROM notes n WHERE n.file_name_fold = ",
+            $t,
+            " || '.md'
+             ) c ORDER BY length(c.path), c.path LIMIT 1)"
+        )
+    };
+}
+
+/// Attachments (FR-VLT-08), one statement. The last two columns are what the resolver
+/// would choose for the bare file name and for the full path, so the shortest resolving
+/// form is the name when that is the asset itself, else the path when that is, else
+/// neither (two assets whose names differ only in case on a case-sensitive file system
+/// can leave one of them unreachable by any link).
+const ATTACHMENTS: &str = concat!(
+    "SELECT a.path, x.mime, x.bytes, a.sidecar_path, a.file_name, ",
+    resolver_choice!("a.file_name_fold"),
+    ", ",
+    resolver_choice!("a.path_fold"),
+    "
    FROM notes a JOIN assets x ON x.note_id = a.id
   WHERE a.kind = 'asset'
-  ORDER BY a.path";
+  ORDER BY a.path"
+);
 
 /// The statements, for tests that check their plans.
 #[doc(hidden)]
-pub const STATEMENTS: [(&str, &str); 6] = [
+pub const STATEMENTS: [(&str, &str); 7] = [
     ("R1", R1),
     ("R1+type", R1_TYPE),
     ("R1+field", R1_FIELD),
     ("R2", R2),
     ("R3 type", R3_TYPE),
     ("R3 field", R3_FIELD),
+    ("attachments", ATTACHMENTS),
 ];
 
 /// A read-only connection to the index and the four reads over it.
@@ -540,14 +569,19 @@ impl Reader {
             let path: String = row.get(0).map_err(sqlite)?;
             let mime: String = row.get(1).map_err(sqlite)?;
             let file_name: String = row.get(4).map_err(sqlite)?;
-            let best: Option<String> = row.get(5).map_err(sqlite)?;
-            let link_text = if best.as_deref() == Some(path.as_str()) {
-                file_name
+            let by_name: Option<String> = row.get(5).map_err(sqlite)?;
+            let by_path: Option<String> = row.get(6).map_err(sqlite)?;
+            let link_text = if by_name.as_deref() == Some(path.as_str()) {
+                Some(file_name)
+            } else if by_path.as_deref() == Some(path.as_str()) {
+                Some(path.clone())
             } else {
-                path.clone()
+                None
             };
             out.push(Attachment {
-                link: serat_core::attachment_link(&link_text, &mime),
+                link: link_text
+                    .as_deref()
+                    .map(|text| serat_core::attachment_link(text, &mime)),
                 link_text,
                 bytes: row.get::<_, i64>(2).map_err(sqlite)?.max(0) as u64,
                 sidecar_path: row.get(3).map_err(sqlite)?,
