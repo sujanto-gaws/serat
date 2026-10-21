@@ -39,6 +39,14 @@ Record the machine conditions either side of a series with `cargo run --release 
 
 All three are **red today, on purpose**: `serat-index` has no rebuild entry point (I4) or incremental save path (I5), and there is no application to start (D2, S1). Each prints the entry point it needs and the task that unblocks it. Documentation: `docs/05-testing/budget-harness.md`. CI: `.github/workflows/budgets.yml`, one job per budget.
 
+## Release builds are per package, never `--workspace`
+
+`budget` links `serat-index` with its `test-hooks` feature; a workspace-wide build unifies that feature into `serat-app`, whose const assert refuses any release build that carries it. So `cargo build/test --workspace --release` does not compile (debug is unaffected). Build release one package at a time (`-p budget`, `-p vaultgen`, `-p serat-app`); every command above and in `.github/workflows/budgets.yml` already does. The `serat-app-release-guard` job runs `cargo check -p serat-app --release` on every PR so the guard itself is exercised.
+
+## Repository root
+
+`budget`, `vaultgen` and `doclint` share one root rule (`bench/reporoot`): `--root <dir>`, else `SERAT_REPO_ROOT`, else the `[workspace]` manifest above the working directory, else the checkout the binary was built in. The doclint bins print `root: <path> (from <rule>)` as their first line, so the last (wrong whenever a binary is reused across worktrees) is never silent. A bare `--root` (or one followed by another flag) is an error. `vaultgen` and `budget` print the same line to stderr; `vaultgen` refuses to write under the compiled-in fallback (pass `--root`, `SERAT_REPO_ROOT` or `--out`). `p1-read-paths` and `p1-tree-path` have their own argument parsers and do **not** take `--root`; they pick the root up from `SERAT_REPO_ROOT` or the working directory only.
+
 ## Serves
 
 `vaultgen`: NFR-MNT-02 · US-35 · C-06. `budget`: NFR-PRF-08 · US-35 · C-06, asserting NFR-PRF-01, NFR-PRF-03 and NFR-PRF-04.

@@ -4,6 +4,11 @@
 //! Fixtures live in `bench/compat/corpus/fold/` (see its README). Each test copies a
 //! case into a temp vault, rebuilds the index with the real `fold_case` and the real
 //! resolver, and reads back which note each link landed on.
+//!
+//! Links are extracted by the test `LineParser` (`tests/support`: one `[[target]]`
+//! per line), **not** by the CommonMark parser, so these tests pin the *resolver*
+//! and `fold_case`, not link syntax. Whether `serat-parse` extracts the same
+//! targets from the same bytes is a separate question these cases do not answer.
 
 mod support;
 
@@ -137,6 +142,80 @@ fn nfd_file_name_is_found_by_its_nfc_link_if_obsidian_normalises() {
     assert_eq!(
         got.get("link-nfc.md"),
         Some(&Some(format!("{CAFE_NFD}.md"))),
+        "{got:?}"
+    );
+}
+
+// `Ǘ` U+01D7 and its lower case `ǘ` U+01D8: a letter with two stacked combining marks
+// (diaeresis, then acute), so the NFD spelling is three scalars and case folding and
+// normalisation interact.
+const U_NFC_UPPER: &str = "\u{1D7}";
+#[cfg(target_os = "linux")]
+const U_NFC_LOWER: &str = "\u{1D8}";
+/// Fully decomposed: `U` + diaeresis + acute.
+#[cfg(target_os = "linux")]
+const U_NFD_UPPER: &str = "U\u{308}\u{301}";
+/// Fully decomposed: `u` + diaeresis + acute.
+#[cfg(target_os = "linux")]
+const U_NFD_LOWER: &str = "u\u{308}\u{301}";
+
+/// NFR-CMP-01: the committed NFC case. `Ǘ.md` is found by `[[ǘ]]`, both precomposed:
+/// case folding alone, no normalisation involved.
+#[test]
+fn composed_u_diaeresis_acute_is_found_across_case() {
+    let vault = tmp_case("u-diaeresis-acute");
+    let got = resolutions(vault.path());
+    assert_eq!(
+        got.get("link-lower.md"),
+        Some(&Some(format!("{U_NFC_UPPER}.md"))),
+        "{got:?}"
+    );
+}
+
+/// The NFD side, built at test time for the reason `nfd_vault` is (fixtures README).
+#[cfg(target_os = "linux")]
+fn u_nfd_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp");
+    let root = dir.path();
+    fs::write(root.join(format!("{U_NFD_UPPER}.md")), "# U\n").expect("nfd note");
+    fs::write(
+        root.join("link-nfd-lower.md"),
+        format!("[[{U_NFD_LOWER}]]\n"),
+    )
+    .expect("nfd link");
+    fs::write(
+        root.join("link-nfc-lower.md"),
+        format!("[[{U_NFC_LOWER}]]\n"),
+    )
+    .expect("nfc link");
+    dir
+}
+
+/// Same-spelling half, asserted: the NFD file is found by its own spelling in lower
+/// case, which exercises case folding over a base letter followed by two marks.
+#[cfg(target_os = "linux")]
+#[test]
+fn decomposed_u_diaeresis_acute_is_found_by_its_own_spelling_across_case() {
+    let vault = u_nfd_vault();
+    let got = resolutions(vault.path());
+    assert_eq!(
+        got.get("link-nfd-lower.md"),
+        Some(&Some(format!("{U_NFD_UPPER}.md"))),
+        "{got:?}"
+    );
+}
+
+/// Cross-spelling half: `[[ǘ]]` (NFC) against the NFD-named `Ǘ`. Ignored for the same
+/// reason as the Café case: the expected outcome is Obsidian's and is not measured.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "expected outcome is Obsidian's and has not been measured (architecture §10 NFC/NFD question)"]
+fn decomposed_u_diaeresis_acute_is_found_by_its_nfc_link_if_obsidian_normalises() {
+    let vault = u_nfd_vault();
+    let got = resolutions(vault.path());
+    assert_eq!(
+        got.get("link-nfc-lower.md"),
+        Some(&Some(format!("{U_NFD_UPPER}.md"))),
         "{got:?}"
     );
 }

@@ -25,8 +25,10 @@
 //! Nothing here sits on the keystroke path, which is this pipeline's actual design
 //! constraint — not throughput (design goal 2).
 
+mod atomic;
 pub mod diff;
 pub mod echo;
+mod gitignore;
 pub mod hash;
 pub mod ignore;
 pub mod patch;
@@ -40,9 +42,10 @@ pub mod walk;
 #[cfg(all(test, unix))]
 mod walk_refusal_tests;
 pub mod watch;
+#[cfg(test)]
+mod write_race_tests;
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,15 +54,26 @@ use serat_core::{
 };
 
 pub use echo::EchoSuppressor;
+pub use gitignore::{GitignoreAppended, gitignore_ignores_serat};
 pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
 pub use patch::Edit;
 pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
-pub use tree::{TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
+pub use tree::{RescanNeeded, TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
+
+/// What [`Vault::write_atomic_if`] requires of the file as it is on disk, checked under
+/// the per-path lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// The file must not exist (a create).
+    Absent,
+    /// The file must exist with this content hash (an overwrite of a known base).
+    Hash(ContentHash),
+}
 
 /// An open vault: a root directory, and the rules for what inside it counts.
 #[derive(Debug, Clone)]
@@ -76,6 +90,9 @@ pub struct Vault {
     /// rather than dropped (task #34's amendment). Shared for the same reason
     /// `echo` is: the walk and the watcher must both be able to add to it.
     refusals: RefusalLog,
+    /// One mutex per path being written, shared by every clone (ADR-0016 §2): held
+    /// from the first read to the rename in every in-process content write.
+    locks: Arc<atomic::PathLocks>,
 }
 
 impl Vault {
@@ -114,7 +131,12 @@ impl Vault {
             ignore,
             echo: Arc::new(EchoSuppressor::new()),
             refusals: RefusalLog::new(),
+            locks: Arc::default(),
         })
+    }
+
+    pub(crate) fn path_locks(&self) -> &atomic::PathLocks {
+        &self.locks
     }
 
     /// The canonical root directory.
@@ -363,6 +385,39 @@ impl Vault {
     /// [`VaultError::AtomicWriteFailed`] if any step fails, in which case the
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
+        self.write_atomic_hooked(path, bytes, None, || {})
+    }
+
+    /// [`Vault::write_atomic`] guarded by what the caller believes is on disk, checked
+    /// **under the per-path lock** (ADR-0016 §2: the lock is held from step 1's
+    /// re-read to the rename in both write paths). This is `write_file`'s path: the
+    /// optimistic lock of architecture §6.1 and the create-only case, so that a
+    /// concurrent `write_patch` or a second create cannot slip in between the check
+    /// and the rename.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vault::write_atomic`], plus [`VaultError::StaleHash`] if the file exists
+    /// and `expect` is [`Expect::Absent`] or a different hash (`found` is what is on
+    /// disk), and [`VaultError::NotFound`] if `expect` is a hash and the file is gone.
+    pub fn write_atomic_if(
+        &self,
+        path: &VaultPath,
+        expect: Expect,
+        bytes: &[u8],
+    ) -> Result<ContentHash, VaultError> {
+        self.write_atomic_hooked(path, bytes, Some(expect), || {})
+    }
+
+    /// The shared body, with a hook that runs after the temporary file is complete and
+    /// before the rename: the window the race tests need to reach deterministically.
+    fn write_atomic_hooked(
+        &self,
+        path: &VaultPath,
+        bytes: &[u8],
+        expect: Option<Expect>,
+        before_rename: impl FnOnce(),
+    ) -> Result<ContentHash, VaultError> {
         // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
         // rewritten. The threat model's stated mechanism is that no write path accepts
         // a non-Markdown target, so the refusal belongs here — in the one function that
@@ -393,6 +448,41 @@ impl Vault {
             message,
         };
 
+        // ADR-0016 §2: no other in-process writer of this path between here and the
+        // rename.
+        let lock = self.locks.lock_for(path.as_str());
+        let _held = lock.hold();
+
+        // Step 1 of ADR-0016 §2, under the lock: what the caller believes is on disk.
+        if let Some(expect) = expect {
+            match (fs::read(&target), expect) {
+                (Ok(current), Expect::Absent) => {
+                    return Err(VaultError::StaleHash {
+                        path: path.as_str().to_owned(),
+                        expected: "absent".to_owned(),
+                        found: hash_bytes(&current).to_hex(),
+                    });
+                }
+                (Ok(current), Expect::Hash(want)) => {
+                    let found = hash_bytes(&current);
+                    if found != want {
+                        return Err(VaultError::StaleHash {
+                            path: path.as_str().to_owned(),
+                            expected: want.to_hex(),
+                            found: found.to_hex(),
+                        });
+                    }
+                }
+                (Err(err), Expect::Hash(_)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(VaultError::NotFound {
+                        path: path.as_str().to_owned(),
+                    });
+                }
+                (Err(err), _) if err.kind() == std::io::ErrorKind::NotFound => {}
+                (Err(err), _) => return Err(VaultError::io(path.as_str(), &err)),
+            }
+        }
+
         fs::create_dir_all(parent).map_err(|err| failed(err.to_string()))?;
 
         // F-33. The replacement inherits the original's permissions, because a
@@ -405,28 +495,10 @@ impl Vault {
         // mode; on Windows only the read-only flag exists to carry.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = unique_temp_path(parent, path.file_name());
-        let write_temp = || -> std::io::Result<()> {
-            let mut file = fs::File::create(&temp)?;
-            file.write_all(bytes)?;
-            // Flush before the rename. Without this the rename can be durable while
-            // the contents are not, which turns a power cut into a note full of
-            // zeroes — the exact outcome the temp file exists to prevent.
-            file.sync_all()?;
-            if let Some(permissions) = existing_permissions.clone() {
-                fs::set_permissions(&temp, permissions)?;
-            }
-            Ok(())
-        };
-        if let Err(err) = write_temp() {
-            let _ = fs::remove_file(&temp);
-            return Err(failed(err.to_string()));
-        }
-
-        if let Err(err) = fs::rename(&temp, &target) {
-            let _ = fs::remove_file(&temp);
-            return Err(failed(err.to_string()));
-        }
+        let temp = atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
+            .map_err(|err| failed(err.to_string()))?;
+        before_rename();
+        atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
         Ok(hash)
     }
@@ -472,7 +544,7 @@ impl Vault {
         base_hash: ContentHash,
         edits: &[patch::Edit],
     ) -> Result<ContentHash, VaultError> {
-        self.write_patch_hooked(path, base_hash, edits, || {})
+        self.write_patch_hooked(path, base_hash, edits, || {}, || {})
     }
 
     /// [`Vault::write_patch`] with a hook that runs after the temporary file is
@@ -484,6 +556,7 @@ impl Vault {
         base_hash: ContentHash,
         edits: &[patch::Edit],
         before_rehash: impl FnOnce(),
+        before_rename: impl FnOnce(),
     ) -> Result<ContentHash, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
@@ -497,6 +570,12 @@ impl Vault {
             expected: base_hash.to_hex(),
             found: found.to_hex(),
         };
+
+        // ADR-0016 §2: the per-path lock, from step 1's read to the rename. Without it
+        // two of Serat's own writers can both pass step 4's re-hash before either
+        // renames, and one returns `Ok` with its bytes already gone.
+        let lock = self.locks.lock_for(path.as_str());
+        let _held = lock.hold();
 
         // Step 1: the hash lock. A delete or a rewrite between the caller's read
         // and this call surfaces here rather than silently patching the wrong
@@ -532,20 +611,8 @@ impl Vault {
         // permissions.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = unique_temp_path(parent, path.file_name());
-        let write_temp = || -> std::io::Result<()> {
-            let mut file = fs::File::create(&temp)?;
-            file.write_all(&new_bytes)?;
-            file.sync_all()?;
-            if let Some(permissions) = existing_permissions.clone() {
-                fs::set_permissions(&temp, permissions)?;
-            }
-            Ok(())
-        };
-        if let Err(err) = write_temp() {
-            let _ = fs::remove_file(&temp);
-            return Err(failed(err.to_string()));
-        }
+        let temp = atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
+            .map_err(|err| failed(err.to_string()))?;
 
         before_rehash();
 
@@ -565,10 +632,9 @@ impl Vault {
             return Err(stale(reread_hash));
         }
 
-        if let Err(err) = fs::rename(&temp, &target) {
-            let _ = fs::remove_file(&temp);
-            return Err(failed(err.to_string()));
-        }
+        before_rename();
+
+        atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
         Ok(new_hash)
     }
@@ -613,17 +679,6 @@ impl EchoGuard for Vault {
     fn record_echo(&self, hash: ContentHash) {
         self.echo.record(hash);
     }
-}
-
-/// A temporary path beside the target, unique enough that two concurrent writes to
-/// the same note cannot collide.
-fn unique_temp_path(parent: &Path, file_name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    parent.join(format!("{}{file_name}.{pid}.{nonce}", ignore::TEMP_PREFIX))
 }
 
 /// Windows canonicalisation returns `\\?\D:\...`; every path we compare against and

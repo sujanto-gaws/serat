@@ -1,4 +1,6 @@
-//! Property and hostile tests for the editor save path (ADR-0016, task #33).
+//! Property and hostile tests for the editor save path (ADR-0016, tasks #33 and #55;
+//! FR-VLT-05 byte-range patching and its hash guard, NFR-CMP-02 line-ending
+//! preservation, US-07 editing a note without disturbing the rest of it).
 //!
 //! The reference model here is deliberately a different implementation from the
 //! one under test: it splits lines by walking `char`s and counts columns by
@@ -123,7 +125,20 @@ fn random_edits(rng: &mut Rng, text: &str) -> (Vec<Edit>, Vec<(usize, usize)>) {
     let mut edits = Vec::new();
     let mut ranges = Vec::new();
     for pair in points.chunks(2) {
-        let insert = ["", "NEW", "a\nb", "\n", "\u{1F600}"][rng.below(5)];
+        // All three separators CodeMirror splits on: the front end sends `\n`, but the
+        // patcher must treat `\r\n` and a lone `\r` in an insert as one separator each.
+        let insert = [
+            "",
+            "NEW",
+            "a\nb",
+            "\n",
+            "\u{1F600}",
+            "a\r\nb",
+            "a\rb",
+            "\r",
+            "\r\n",
+            "x\r\n\ny\r",
+        ][rng.below(10)];
         edits.push(Edit::new(pair[0].0, pair[1].0, insert.to_owned()));
         ranges.push((pair[0].1, pair[1].1));
     }
@@ -175,8 +190,12 @@ fn nothing_outside_the_patched_ranges_changes() {
         let mut promised = model_lines(&base).len() as isize;
         for (edit, &(from, to)) in edits.iter().zip(&ranges) {
             expect.push_str(&base[cursor..from]);
-            for c in edit.insert.chars() {
-                if c == '\n' {
+            let mut chars = edit.insert.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\r' || c == '\n' {
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
                     // The insert form of a fuse is written as CRLF.
                     expect.push_str(if ending == "\n" && expect.ends_with('\r') {
                         "\r\n"
@@ -187,7 +206,7 @@ fn nothing_outside_the_patched_ranges_changes() {
                     expect.push(c);
                 }
             }
-            promised += edit.insert.matches('\n').count() as isize;
+            promised += model_lines(&edit.insert).len() as isize - 1;
             promised -= model_lines(&base[from..to]).len() as isize - 1;
             cursor = to;
         }
@@ -458,9 +477,15 @@ fn an_external_write_between_the_temp_file_and_the_rename_is_refused() {
         "1".to_owned(),
     )];
     let target = dir.path().join("note.md");
-    let result = vault.write_patch_hooked(&path, base_hash, &edits, || {
-        fs::write(&target, b"external edit\n").unwrap();
-    });
+    let result = vault.write_patch_hooked(
+        &path,
+        base_hash,
+        &edits,
+        || {
+            fs::write(&target, b"external edit\n").unwrap();
+        },
+        || {},
+    );
     assert!(
         matches!(result, Err(VaultError::StaleHash { .. })),
         "{result:?}"
@@ -484,7 +509,7 @@ fn a_crash_after_the_temp_file_is_written_leaves_the_old_note_and_the_next_save_
         "1".to_owned(),
     )];
     let crashed = catch_unwind(AssertUnwindSafe(|| {
-        let _ = vault.write_patch_hooked(&path, base_hash, &edits, || panic!("power cut"));
+        let _ = vault.write_patch_hooked(&path, base_hash, &edits, || panic!("power cut"), || {});
     }));
     assert!(crashed.is_err());
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), old);

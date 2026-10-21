@@ -7,10 +7,17 @@
 // runtime, not at compile time — there is no generated command list yet, only
 // generated argument/return types.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { Backlink } from "./generated/Backlink";
+import type { ExternalChange } from "./generated/ExternalChange";
+import type { MarkTreeArgs } from "./generated/MarkTreeArgs";
+import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
+import type { Patch } from "./generated/Patch";
+import type { RebaseBufferArgs } from "./generated/RebaseBufferArgs";
+import type { SavePatchArgs } from "./generated/SavePatchArgs";
+import type { TreeMessage } from "./generated/TreeMessage";
 import type { CreateFolderArgs } from "./generated/CreateFolderArgs";
 import type { FolderCreated } from "./generated/FolderCreated";
 import type { GitignoreAppended } from "./generated/GitignoreAppended";
@@ -34,6 +41,9 @@ export type { IpcError };
 
 /** `contracts/ipc.rs::INDEX_STATUS_EVENT`. See that file for why it is not "/". */
 export const INDEX_STATUS_EVENT = "index://status";
+
+/** `contracts/ipc.rs::EXTERNAL_CHANGE_EVENT`. */
+export const EXTERNAL_CHANGE_EVENT = "note://external-change";
 
 // There is deliberately no `openVault` wrapper, and its absence is the point rather
 // than an omission. `open_vault` exists as a command, but
@@ -203,4 +213,52 @@ export function onIndexStatus(handler: (status: IndexStatus) => void): Promise<U
 /** True when `err` is the shape `IpcError` promises — Tauri rejects with `unknown`. */
 export function isIpcError(err: unknown): err is IpcError {
   return typeof err === "object" && err !== null && "kind" in err;
+}
+
+// ---- P1 (task #18c): the tree stream and the editor buffers (ADR-0015, ADR-0016).
+
+/**
+ * `open_tree(on_message: Channel<TreeMessage>)`: ordered and lossless, root listing
+ * first. `onMessage` is called once per message, in arrival order. Calling it again
+ * replaces the stream and re-sends the tree from the root.
+ */
+export async function openTree(onMessage: (message: TreeMessage) => void): Promise<void> {
+  const channel = new Channel<TreeMessage>();
+  channel.onmessage = onMessage;
+  await invoke("open_tree", { onMessage: channel });
+}
+
+/** `mark_tree`: `tree_first_screen` / `tree_complete`, stamped on the Rust clock. */
+export function markTree(args: MarkTreeArgs): Promise<void> {
+  return invoke("mark_tree", { args });
+}
+
+/** `note_opened`: an editor pane holds this note at this base (never an embed or preview). */
+export function noteOpened(args: NoteBufferArgs): Promise<void> {
+  return invoke("note_opened", { args });
+}
+
+/** `note_closed`: release the base. */
+export function noteClosed(args: NoteBufferArgs): Promise<void> {
+  return invoke("note_closed", { args });
+}
+
+/** `save_patch`: the editor's only save, patches in base coordinates (ADR-0016 §2). */
+export function savePatch(args: SavePatchArgs): Promise<FileWritten> {
+  return invoke("save_patch", { args });
+}
+
+/** `request_external_diff`: the recovery path; `null` means the disk equals the base. */
+export function requestExternalDiff(args: NoteBufferArgs): Promise<ExternalChange | null> {
+  return invoke("request_external_diff", { args });
+}
+
+/** `rebase_buffer`: *Keep mine* — patches from the disk text to the buffer, in disk coordinates. */
+export function rebaseBuffer(args: RebaseBufferArgs): Promise<Patch[]> {
+  return invoke("rebase_buffer", { args });
+}
+
+/** Subscribes to `note://external-change` (unthrottled, not ordered against responses). */
+export function onExternalChange(handler: (change: ExternalChange) => void): Promise<UnlistenFn> {
+  return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
 }

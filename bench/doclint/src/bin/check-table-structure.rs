@@ -9,8 +9,14 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let (scanned, problems) = match doclint::table_structure::check_repo_docs(&doclint::repo_root())
-    {
+    let root = match doclint::announce_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL  {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (scanned, problems) = match doclint::table_structure::check_repo_docs(&root) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("FAIL  could not run the table-structure check\n  {e}");

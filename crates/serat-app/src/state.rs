@@ -22,26 +22,29 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
 
-use serat_core::{ContentHash, VaultError, VaultPath};
+use serat_core::{ContentHash, VaultPath};
 use serat_parse::CommonMarkParser;
 use serat_vault::Vault;
 
 use crate::cli::Boot;
+use crate::editor::Editor;
 use crate::error::from_vault_error;
 use crate::index::{
     IndexActor, IndexHandleSlot, IndexOpen, SeratIndexOpen, StatusPublisher, StatusSink,
     index_dir_for,
 };
 use crate::ipc::{
-    Backlink, CreateFolderArgs, FileContents, FileWritten, FolderCreated, GitignoreAppended,
-    GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError, KeybindingChange,
-    KeybindingOverride, NotePathArgs, OpenVaultArgs, REFUSED_NAMES_CAP, ReadFileArgs, RefusedName,
-    SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened,
-    WriteFileArgs,
+    Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
+    GitignoreAppended, GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError,
+    KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs, NotePathArgs,
+    OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadFileArgs, RebaseBufferArgs, RefusedName,
+    SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, TreeStatus,
+    UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
-use crate::vault::{Stage, VaultThread};
+use crate::tree_stream::{FeedConfig, TreeFeed, TreeMarks, TreeSender};
+use crate::vault::{Live, Stage, VaultThread};
 
 /// Where `index://status` goes.
 ///
@@ -53,11 +56,19 @@ use crate::vault::{Stage, VaultThread};
 #[derive(Default)]
 pub struct Events {
     sink: RwLock<Option<StatusFn>>,
+    external: RwLock<Option<ExternalFn>>,
+    tree_status: RwLock<Option<TreeStatusFn>>,
 }
+
+/// The installed `tree://status` sink.
+type TreeStatusFn = Box<dyn Fn(&TreeStatus) + Send + Sync>;
 
 /// The installed sink. Named because the type is long enough that clippy is right to
 /// ask, and because `install` and the field should be describing the same thing.
 type StatusFn = Box<dyn Fn(&IndexStatus) + Send + Sync>;
+
+/// The installed `note://external-change` sink.
+type ExternalFn = Box<dyn Fn(&ExternalChange) + Send + Sync>;
 
 impl std::fmt::Debug for Events {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,6 +83,48 @@ impl Events {
             .sink
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+}
+
+impl Events {
+    /// Direct every future `note://external-change` at `sink`.
+    pub fn install_external(&self, sink: impl Fn(&ExternalChange) + Send + Sync + 'static) {
+        *self
+            .external
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+
+    /// Announce an external change. Unthrottled; a no-op until a sink is installed.
+    pub fn emit_external(&self, change: &ExternalChange) {
+        if let Some(sink) = self
+            .external
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sink(change);
+        }
+    }
+
+    /// Direct every future `tree://status` at `sink`.
+    pub fn install_tree_status(&self, sink: impl Fn(&TreeStatus) + Send + Sync + 'static) {
+        *self
+            .tree_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+
+    /// Announce that the tree stream stopped. A no-op until a sink is installed.
+    pub fn emit_tree_status(&self, status: &TreeStatus) {
+        if let Some(sink) = self
+            .tree_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sink(status);
+        }
     }
 }
 
@@ -110,8 +163,37 @@ struct OpenVault {
     index_handle: IndexHandleSlot,
     /// The vault's one full-text search connection (§4.5 obligation 2).
     search: Arc<crate::reads::SearchSlot>,
+    /// The file tree's stream and the threads that feed it (ADR-0015).
+    tree: Arc<TreeFeed>,
+    /// The base registry and the buffer commands (ADR-0016).
+    editor: Arc<Editor>,
     /// Dropping this stops the watcher and the walk.
     _walk: VaultThread,
+}
+
+/// What the vault thread's watcher output is handed to: the tree, then the buffers.
+/// Each is shielded, so a panic in one (a sink that panics) cannot take down the thread
+/// that owns the watcher.
+struct LiveBridge {
+    tree: Arc<TreeFeed>,
+    editor: Arc<Editor>,
+}
+
+impl Live for LiveBridge {
+    fn path_changed(&self, path: &VaultPath) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.tree.path_changed(path);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.editor.path_changed(path);
+        }));
+    }
+
+    fn rescan_required(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.tree.rescan_all();
+        }));
+    }
 }
 
 /// Which of §3.1.1's three outcomes a `write_file` call's index submission took.
@@ -153,6 +235,8 @@ pub struct AppState {
     pub boot: Boot,
     settings: Mutex<Settings>,
     settings_path: Option<PathBuf>,
+    /// How long the tree walk and the vault thread wait for the first paint.
+    walk_gate: std::time::Duration,
     open: RwLock<Option<OpenVault>>,
     vaults_opened: AtomicU64,
     /// Backing counters for [`AppState::save_path_outcomes`] (F-382). Process
@@ -186,6 +270,7 @@ impl AppState {
             boot,
             settings: Mutex::new(loaded.settings),
             settings_path: loaded.path,
+            walk_gate: WALK_GATE_TIMEOUT,
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
             save_handle_missing: AtomicU64::new(0),
@@ -204,12 +289,21 @@ impl AppState {
             boot,
             settings: Mutex::new(settings),
             settings_path: None,
+            walk_gate: WALK_GATE_TIMEOUT,
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
             save_handle_missing: AtomicU64::new(0),
             save_writer_refused: AtomicU64::new(0),
             save_submitted: AtomicU64::new(0),
         }
+    }
+
+    /// How long the tree walk and the vault thread wait for the first paint before
+    /// walking anyway (default five seconds). For tests and harnesses that never paint.
+    #[must_use]
+    pub fn with_walk_gate(mut self, gate: std::time::Duration) -> Self {
+        self.walk_gate = gate;
+        self
     }
 
     // -- commands -----------------------------------------------------------
@@ -295,10 +389,38 @@ impl AppState {
         let startup = Arc::clone(&self.startup);
         let walked = Arc::clone(&publisher);
         let walked_refusals = vault.refusals().clone();
-        let walk = VaultThread::spawn(
+        let tree_gate = Arc::clone(&self.startup);
+        let gate_timeout = self.walk_gate;
+        let ready = Arc::clone(&publisher);
+        let events = Arc::clone(&self.events);
+        let stopped_id = vault_id.clone();
+        let tree = TreeFeed::new(FeedConfig {
+            vault: Arc::clone(&vault),
+            index_db: serat_index::index_path(&index_dir_for(&root)),
+            index_ready: Box::new(move || matches!(ready.status().state, IndexState::Ready { .. })),
+            gate: Arc::new(move || {
+                tree_gate.wait_for_first_paint(gate_timeout);
+            }),
+            on_stopped: Box::new(move || {
+                events.emit_tree_status(&TreeStatus {
+                    vault_id: stopped_id.clone(),
+                    stopped: true,
+                });
+            }),
+        });
+        let editor = Editor::new(
+            Arc::clone(&vault),
+            vault_id.clone(),
+            Arc::clone(&self.events),
+        );
+        let live: Arc<dyn Live> = Arc::new(LiveBridge {
+            tree: Arc::clone(&tree),
+            editor: Arc::clone(&editor),
+        });
+        let walk = VaultThread::spawn_with(
             Arc::clone(&vault),
             move || {
-                gate.wait_for_first_paint(WALK_GATE_TIMEOUT);
+                gate.wait_for_first_paint(gate_timeout);
             },
             move |stage| match stage {
                 // Half of "vault usable": §3.4 will not call a vault usable while
@@ -318,6 +440,7 @@ impl AppState {
                 }
                 Stage::WalkStarted | Stage::WalkFailed => {}
             },
+            Some(live),
         )
         .map_err(|err| IpcError::Io {
             path: root.display().to_string(),
@@ -336,6 +459,8 @@ impl AppState {
             _index: index,
             index_handle,
             search: Arc::new(crate::reads::SearchSlot::new(epoch)),
+            tree,
+            editor,
             _walk: walk,
         });
 
@@ -411,34 +536,12 @@ impl AppState {
 
         let vault = self.vault()?;
 
-        // Rule 4 — the optimistic lock of §6.1 step 2.
-        match vault.read(&path) {
-            Ok(current) => {
-                // `None` asserts the file does not exist. It does, so this is a create
-                // over something, which is a stale guard rather than a silent
-                // overwrite.
-                if base_hash != Some(current.meta.hash) {
-                    return Err(IpcError::StaleHash {
-                        path: path.to_string(),
-                        current_hash: current.meta.hash.to_hex(),
-                    });
-                }
-            }
-            Err(VaultError::NotFound { .. }) => {
-                // The caller read a hash and the file has since been deleted. That is
-                // not a stale guard the caller can resolve by re-reading, so it is
-                // reported as what it is.
-                if base_hash.is_some() {
-                    return Err(IpcError::NotFound {
-                        path: path.to_string(),
-                    });
-                }
-            }
-            Err(err) => return Err(from_vault_error(err)),
-        }
-
+        // Rule 4 — the optimistic lock of §6.1 step 2, checked by the vault under its
+        // per-path lock so no other in-process writer can land between the check and
+        // the rename (ADR-0016 §2). `None` asserts the file does not exist.
+        let expect = base_hash.map_or(serat_vault::Expect::Absent, serat_vault::Expect::Hash);
         vault
-            .write_atomic(&path, args.text.as_bytes())
+            .write_atomic_if(&path, expect, args.text.as_bytes())
             .map_err(from_vault_error)?;
 
         // §3.1.1's save path, steps 2-4: submit the note to the index writer with no
@@ -597,7 +700,8 @@ impl AppState {
     /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] as
     /// [`crate::gitignore::append`].
     pub fn append_gitignore_entry(&self) -> Result<GitignoreAppended, IpcError> {
-        crate::gitignore::append(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::append(&vault)
     }
 
     /// `decline_gitignore_offer`. Writes only inside `.serat/`.
@@ -606,7 +710,8 @@ impl AppState {
     ///
     /// As [`AppState::append_gitignore_entry`].
     pub fn decline_gitignore_offer(&self) -> Result<(), IpcError> {
-        crate::gitignore::decline(self.vault()?.root())
+        let vault = self.vault()?;
+        crate::gitignore::decline(&vault)
     }
 
     /// `search`. FR-NAV-02, FR-STR-03, FR-BIN-02. Answers `NotReady` rather than
@@ -698,6 +803,110 @@ impl AppState {
                 reason: refusal.reason,
             })
             .collect()
+    }
+
+    /// `open_tree`. FR-VLT-01, FR-VLT-04. See [`crate::tree_stream`].
+    ///
+    /// Replaces any earlier stream and starts this one from the root. Returns at once;
+    /// the index read, the walk and everything after them run on threads of their own.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open; [`IpcError::Io`] if the
+    /// operating system refuses a thread.
+    pub fn open_tree(&self, send: TreeSender) -> Result<(), IpcError> {
+        self.tree()?.open(send).map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: format!("could not start the tree thread: {err}"),
+        })
+    }
+
+    /// `mark_tree`. NFR-PRF-01, ADR-0015 §3. A mark the stream has not earned (the
+    /// front end claims a paint of a message Rust never sent) is counted and ignored;
+    /// see [`TreeFeed::mark`]. With no vault open there is nothing to mark.
+    pub fn mark_tree(&self, args: &MarkTreeArgs) {
+        if let Ok(tree) = self.tree() {
+            tree.mark(args, self.startup.elapsed_ms());
+        }
+    }
+
+    /// The tree marks recorded for the open vault. `None` with no vault open.
+    #[must_use]
+    pub fn tree_marks(&self) -> Option<TreeMarks> {
+        self.tree().ok().map(|tree| tree.marks())
+    }
+
+    /// `note_opened`. FR-VLT-05. See [`Editor::note_opened`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::note_opened`], plus [`IpcError::VaultNotFound`] with no vault open.
+    pub fn note_opened(&self, args: &NoteBufferArgs) -> Result<(), IpcError> {
+        self.editor()?.note_opened(args)
+    }
+
+    /// `note_closed`. Nothing to release with no vault open.
+    pub fn note_closed(&self, args: &NoteBufferArgs) {
+        if let Ok(editor) = self.editor() {
+            editor.note_closed(args);
+        }
+    }
+
+    /// `save_patch`. FR-VLT-03, NFR-REL-01, C-04; ADR-0016 §2.
+    ///
+    /// The write is [`Vault::write_patch`]. A save is a write like `write_file`'s, so it
+    /// is submitted to the index the same way afterwards (§3.1.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::save_patch`], plus [`IpcError::VaultNotFound`] with no vault open.
+    pub fn save_patch(&self, args: &SavePatchArgs) -> Result<FileWritten, IpcError> {
+        let editor = self.editor()?;
+        let (path, written) = editor.save_patch(args)?;
+        let vault = self.vault()?;
+        self.submit_to_index(&vault, &path);
+        Ok(written)
+    }
+
+    /// `request_external_diff`. FR-VLT-05. See [`Editor::request_external_diff`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::request_external_diff`], plus [`IpcError::VaultNotFound`] with no
+    /// vault open.
+    pub fn request_external_diff(
+        &self,
+        args: &NoteBufferArgs,
+    ) -> Result<Option<ExternalChange>, IpcError> {
+        self.editor()?.request_external_diff(args)
+    }
+
+    /// `rebase_buffer`. FR-VLT-05. See [`Editor::rebase_buffer`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Editor::rebase_buffer`], plus [`IpcError::VaultNotFound`] with no vault
+    /// open.
+    pub fn rebase_buffer(&self, args: &RebaseBufferArgs) -> Result<Vec<Patch>, IpcError> {
+        self.editor()?.rebase_buffer(args)
+    }
+
+    fn tree(&self) -> Result<Arc<TreeFeed>, IpcError> {
+        self.open_lock()
+            .as_ref()
+            .map(|open| Arc::clone(&open.tree))
+            .ok_or_else(|| IpcError::VaultNotFound {
+                path: String::new(),
+            })
+    }
+
+    fn editor(&self) -> Result<Arc<Editor>, IpcError> {
+        self.open_lock()
+            .as_ref()
+            .map(|open| Arc::clone(&open.editor))
+            .ok_or_else(|| IpcError::VaultNotFound {
+                path: String::new(),
+            })
     }
 
     /// `mark_first_paint`. NFR-PRF-01, NFR-PRF-08 (F-397, task #113).
@@ -2371,5 +2580,292 @@ mod tests {
             .expect_err("unwritable");
         assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
         assert!(state.get_ui_settings().live_preview);
+    }
+
+    // -- task #18c: the tree stream and the editor-buffer commands, through AppState --
+
+    type TreeLog = Arc<Mutex<Vec<crate::ipc::TreeMessage>>>;
+
+    fn collecting_sender() -> (TreeSender, TreeLog) {
+        let log: TreeLog = Arc::default();
+        let sink = Arc::clone(&log);
+        (
+            Arc::new(move |message| {
+                sink.lock().expect("log").push(message);
+                true
+            }),
+            log,
+        )
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn settled(log: &TreeLog) -> bool {
+        log.lock()
+            .expect("log")
+            .iter()
+            .any(|m| matches!(m, crate::ipc::TreeMessage::WalkSettled { .. }))
+    }
+
+    fn gateless(dir: &Path) -> AppState {
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO);
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        state
+    }
+
+    #[test]
+    fn open_tree_with_no_vault_is_refused_by_name() {
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        let (send, _) = collecting_sender();
+        assert!(matches!(
+            state.open_tree(send),
+            Err(IpcError::VaultNotFound { .. })
+        ));
+        assert!(state.tree_marks().is_none());
+        state.mark_tree(&MarkTreeArgs {
+            mark: crate::ipc::TreeMark::Complete,
+            entries_in_model: 0,
+        });
+    }
+
+    #[test]
+    fn a_ready_index_populates_the_tree_and_the_walk_then_settles_it() {
+        // The warm path end to end: the real index file, the real `read_tree_rows`.
+        let dir = fixture("tree-warm");
+        let state = gateless(&dir);
+        wait_ready(&state);
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+
+        let log = log.lock().expect("log");
+        assert!(matches!(
+            &log[0],
+            crate::ipc::TreeMessage::Listing { dir, .. } if dir.is_empty()
+        ));
+        let complete = log
+            .iter()
+            .find_map(|m| match m {
+                crate::ipc::TreeMessage::Complete { entries, source } => Some((*entries, *source)),
+                _ => None,
+            })
+            .expect("complete");
+        // serat.md, broken.md (indexed or not, the tree lists what the index holds and
+        // the walk corrects the rest) -- the source is the point.
+        assert_eq!(complete.1, crate::ipc::TreeSource::Index);
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_that_is_not_ready_leaves_the_walk_to_populate_alone() {
+        struct NeverReady;
+        impl IndexOpen for NeverReady {
+            fn open(&mut self, _: &Path, _: &Path, publish: &dyn Fn(IndexState)) {
+                publish(IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 10,
+                    walk_complete: false,
+                });
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+        let dir = fixture("tree-cold");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO);
+        state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                NeverReady,
+            )
+            .expect("open");
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        assert!(log.lock().expect("log").iter().any(|m| matches!(
+            m,
+            crate::ipc::TreeMessage::Complete {
+                source: crate::ipc::TreeSource::Walk,
+                ..
+            }
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_watcher_reaches_the_tree_as_one_upsert_and_one_remove() {
+        // FR-VLT-04 through the real watcher and the vault thread's consumer.
+        let dir = fixture("tree-live");
+        let state = gateless(&dir);
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        let before = log.lock().expect("log").len();
+
+        std::fs::write(dir.join("arrived.md"), "# arrived\n").expect("write");
+        wait_until("the upsert", || {
+            log.lock()
+                .expect("log")
+                .iter()
+                .skip(before)
+                .any(|m| matches!(m, crate::ipc::TreeMessage::Upsert { entry, .. } if entry.name == "arrived.md"))
+        });
+        std::fs::remove_file(dir.join("arrived.md")).expect("rm");
+        wait_until("the remove", || {
+            log.lock().expect("log").iter().skip(before).any(|m| {
+                matches!(m, crate::ipc::TreeMessage::Remove { name, .. } if name == "arrived.md")
+            })
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_tree_is_stamped_only_after_the_stream_sent_what_it_claims() {
+        let dir = fixture("tree-marks");
+        let state = gateless(&dir);
+        let first = MarkTreeArgs {
+            mark: crate::ipc::TreeMark::FirstScreen,
+            entries_in_model: 0,
+        };
+        state.mark_tree(&first);
+        assert_eq!(state.tree_marks().expect("marks").rejected, 1);
+
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        state.mark_tree(&first);
+        state.mark_tree(&MarkTreeArgs {
+            mark: crate::ipc::TreeMark::Complete,
+            entries_in_model: 3,
+        });
+        let marks = state.tree_marks().expect("marks");
+        assert!(marks.first_screen_ms.is_some() && marks.complete_ms.is_some());
+        assert_eq!(marks.entries_in_model, Some(3));
+        assert!(marks.empty_folders.is_some(), "WalkSummary is reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_patch_save_is_submitted_to_the_index_like_any_other_write() {
+        let dir = fixture("save-patch");
+        let state = state(&dir);
+        wait_ready(&state);
+        std::thread::sleep(Duration::from_millis(50));
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        let buffer = NoteBufferArgs {
+            path: "10-projects/serat.md".into(),
+            base_hash: read.hash.clone(),
+        };
+        state.note_opened(&buffer).expect("opened");
+        let before = state.save_path_outcomes();
+        let written = state
+            .save_patch(&SavePatchArgs {
+                path: "10-projects/serat.md".into(),
+                base_hash: read.hash,
+                patches: vec![Patch {
+                    from: crate::ipc::Pos { line: 4, col: 2 },
+                    to: crate::ipc::Pos { line: 4, col: 7 },
+                    insert: "Patched".into(),
+                }],
+            })
+            .expect("save");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("10-projects/serat.md")).expect("read"),
+            "---\ntype: project\n---\n\n# Patched\n"
+        );
+        assert_eq!(
+            state.save_path_outcomes().submitted,
+            before.submitted + 1,
+            "a patch save is a write, so the index hears about it"
+        );
+        // A second save on the returned hash is accepted: the base moved with the save.
+        state
+            .save_patch(&SavePatchArgs {
+                path: "10-projects/serat.md".into(),
+                base_hash: written.hash,
+                patches: vec![],
+            })
+            .expect("no-op save on the new base");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_made_by_another_tool_reaches_the_event_sink_for_an_open_note_only() {
+        let dir = fixture("external-change");
+        let state = gateless(&dir);
+        let seen: Arc<Mutex<Vec<crate::ipc::ExternalChange>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        state
+            .events
+            .install_external(move |change| sink.lock().expect("seen").push(change.clone()));
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        state
+            .note_opened(&NoteBufferArgs {
+                path: "10-projects/serat.md".into(),
+                base_hash: read.hash.clone(),
+            })
+            .expect("opened");
+
+        // The watcher is registered before the walk ends, so a settled tree means it is live.
+        let (send, tree) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&tree));
+
+        // Not open: no event however the watcher sees it.
+        std::fs::write(dir.join("broken.md"), "now valid\n").expect("write");
+        std::fs::write(
+            dir.join("10-projects/serat.md"),
+            "---\ntype: project\n---\n\n# Serat, edited elsewhere\n",
+        )
+        .expect("external edit");
+        wait_until("note://external-change", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(matches!(
+            &seen[0],
+            crate::ipc::ExternalChange::Changed { path, base_hash, .. }
+                if path == "10-projects/serat.md" && base_hash == &read.hash
+        ));
+        drop(seen);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
