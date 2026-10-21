@@ -89,7 +89,7 @@ fn run(args: &[String]) -> Result<(), String> {
         } else {
             Some(text.as_bytes())
         });
-        let (mut walk, mut tree) = (Samples::new(), Samples::new());
+        let (mut walk, mut plain, mut tree) = (Samples::new(), Samples::new(), Samples::new());
         for _ in 0..passes {
             let started = Instant::now();
             let found = vault.walk().map_err(|e| e.to_string())?.len();
@@ -100,12 +100,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 ));
             }
             let started = Instant::now();
+            vault.walk_tree("", |_, _| {}).map_err(|e| e.to_string())?;
+            plain.push(started.elapsed());
+            let started = Instant::now();
             vault
                 .walk_tree_with_metadata("", |_, _| {})
                 .map_err(|e| e.to_string())?;
             tree.push(started.elapsed());
         }
         line(&format!("Vault::walk, {label}"), &walk);
+        line(&format!("walk_tree (names and kinds), {label}"), &plain);
         line(&format!("walk_tree_with_metadata, {label}"), &tree);
     }
     vault.ignore_rules().set_ignore_file(None);

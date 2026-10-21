@@ -486,6 +486,9 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 let _ = reply.send(result);
                 continue;
             }
+            // ResolveLinks, Analyze and EndBulkLoad write outside `commit()`, so they do not
+            // re-open the clean marker the way a commit after a clean close does. Nothing
+            // calls them after `close_clean` today; one that did would need the same latch.
             Command::ResolveLinks(reply) => {
                 let result = commit(
                     &conn,

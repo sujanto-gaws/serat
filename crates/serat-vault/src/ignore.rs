@@ -260,9 +260,9 @@ impl Patterns {
 }
 
 fn parse_line(line: &str) -> Option<Pattern> {
-    // Trailing spaces are not part of a pattern unless escaped (`name\ `), as in git.
+    // Trailing spaces (only spaces, as in git) are not part of a pattern unless escaped (`name\ `), as in git.
     let mut line = line.trim_end_matches('\r');
-    while let Some(rest) = line.strip_suffix([' ', '\t']) {
+    while let Some(rest) = line.strip_suffix(' ') {
         if rest.ends_with('\\') {
             break;
         }

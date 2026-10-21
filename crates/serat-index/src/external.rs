@@ -93,6 +93,9 @@ pub struct Outcome {
     pub unchanged: usize,
     /// Of those upserted, how many the parser refused and are now bare rows (`build_op`).
     pub unparsed: usize,
+    /// Files that exist and could not be read (permissions, a sharing violation); their
+    /// rows were kept.
+    pub unreadable: usize,
 }
 
 impl Outcome {
@@ -108,6 +111,7 @@ impl Outcome {
         self.removed += other.removed;
         self.unchanged += other.unchanged;
         self.unparsed += other.unparsed;
+        self.unreadable += other.unreadable;
     }
 }
 
@@ -184,7 +188,7 @@ impl Reconciler {
                     // It exists and cannot be read now (permissions, a sharing
                     // violation, a symlink, a directory in its place). That is not a
                     // delete: the row stays, and the next walk decides.
-                    outcome.unparsed += usize::from(known.is_some());
+                    outcome.unreadable += 1;
                 }
                 Step::Gone { not_found: true } => {
                     // The path itself, and everything beneath it: a directory that

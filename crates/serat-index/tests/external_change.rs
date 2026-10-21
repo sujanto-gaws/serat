@@ -129,7 +129,8 @@ fn an_edit_a_create_and_a_delete_reach_the_index_in_one_batch() {
             upserted: 2,
             removed: 1,
             unchanged: 0,
-            unparsed: 0
+            unparsed: 0,
+            unreadable: 0
         }
     );
     assert!(outcome.changed());
@@ -782,7 +783,9 @@ fn a_save_during_a_large_catch_up_is_accepted_not_refused() {
     for i in 0..3000 {
         write(&f.root, &format!("bulk/n{i:04}.md"), "# Bulk\nbody\n");
     }
-    let handle = IndexHandle::open(&f.index).expect("open");
+    // A channel only a little deeper than one pacing batch, so the catch-up would fill it
+    // if it were not paced, and the 3,000 entries are many times that.
+    let handle = IndexHandle::with_queue_depth(&f.index, 600).expect("open");
     let reconciler = Reconciler::new(&handle);
     let source = DiskVault::new(&f.root);
     let entries = walk(&f.root);
