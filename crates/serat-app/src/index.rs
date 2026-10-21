@@ -712,6 +712,10 @@ mod tests {
         // Unchanged is not a change; clearing is.
         health.set_pinned_for_test(Some(70 * 1024 * 1024));
         assert_eq!(recorder.taken().len(), 1);
+        // A size that only moves is carried by the next poll, not emitted.
+        health.set_pinned_for_test(Some(80 * 1024 * 1024));
+        assert_eq!(recorder.taken().len(), 1);
+        assert_eq!(publisher.status().wal_pinned_bytes, Some(80 * 1024 * 1024));
         health.set_pinned_for_test(None);
         assert_eq!(publisher.status().wal_pinned_bytes, None);
         assert_eq!(recorder.taken().len(), 2);

@@ -28,7 +28,9 @@
 //! [`Bounds::hard_bytes`] (64 MiB) the checkpointer reports **"index WAL pinned"** as a
 //! fact ([`WalHealth::pinned_bytes`], which serat-app puts on `IndexStatus`), and then,
 //! 250 ms idle, tries **one** `RESTART` with a busy timeout of at most 50 ms. If it fails
-//! the fact stays and nothing else is tried until a checkpoint completes.
+//! the fact stays and there is no further `RESTART` until a checkpoint completes;
+//! `PASSIVE` keeps retrying every [`Bounds::retry`] (2 s) while there are new frames,
+//! and on every further 4,000 frames of growth.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,9 +48,14 @@ pub const IDLE_GATE: Duration = Duration::from_millis(250);
 pub const SIZE_BOUND_FRAMES: i32 = 4_000;
 /// The WAL size past which it is presumed pinned and reported.
 pub const HARD_BOUND_BYTES: u64 = 64 * 1024 * 1024;
-/// The longest the one `RESTART` may wait for readers, so the most a save arriving at
-/// that moment can wait is this.
+/// The longest the one `RESTART` may wait for readers. It holds the WAL write lock while
+/// it waits, so a save arriving at that moment waits about this plus the checkpoint's
+/// own work (a probe measured 56.8 ms).
 pub const RESTART_BUSY: Duration = Duration::from_millis(50);
+/// The least time between two idle checkpoints (architect ruling, #59): typing with
+/// pauses over 250 ms would otherwise checkpoint after every save, two fsyncs each. The
+/// size bound and the pinned `RESTART` are not spaced.
+pub const IDLE_SPACING: Duration = Duration::from_secs(2);
 /// How long to wait before trying again after a checkpoint a reader held back.
 const RETRY_AFTER_INCOMPLETE: Duration = Duration::from_secs(2);
 
@@ -72,6 +79,10 @@ pub struct Bounds {
     pub hard_bytes: u64,
     /// How long to wait before trying again after a checkpoint a reader held back.
     pub retry: Duration,
+    /// The least time between two idle checkpoints. If the idle gate is reached sooner,
+    /// the checkpoint is re-armed for the previous idle one plus this, and runs then if
+    /// the writer is still idle.
+    pub idle_spacing: Duration,
 }
 
 impl Default for Bounds {
@@ -81,6 +92,7 @@ impl Default for Bounds {
             size_frames: SIZE_BOUND_FRAMES,
             hard_bytes: HARD_BOUND_BYTES,
             retry: RETRY_AFTER_INCOMPLETE,
+            idle_spacing: IDLE_SPACING,
         }
     }
 }
@@ -98,6 +110,11 @@ pub struct CheckpointStats {
     pub passive_max_micros: u64,
     /// Sum of every `PASSIVE`, microseconds.
     pub passive_total_micros: u64,
+    /// Frames moved into the database by all `PASSIVE` runs together.
+    pub frames_checkpointed: u64,
+    /// Shortest time between the starts of two idle `PASSIVE` runs, microseconds; 0 until
+    /// there have been two.
+    pub idle_min_gap_micros: u64,
 }
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -116,6 +133,8 @@ pub struct WalHealth {
     restart_runs: AtomicU64,
     passive_max_micros: AtomicU64,
     passive_total_micros: AtomicU64,
+    frames_checkpointed: AtomicU64,
+    idle_min_gap_micros: AtomicU64,
     on_change: Mutex<Option<Notify>>,
 }
 
@@ -155,6 +174,8 @@ impl WalHealth {
             restart_runs: self.restart_runs.load(Ordering::Relaxed),
             passive_max_micros: self.passive_max_micros.load(Ordering::Relaxed),
             passive_total_micros: self.passive_total_micros.load(Ordering::Relaxed),
+            frames_checkpointed: self.frames_checkpointed.load(Ordering::Relaxed),
+            idle_min_gap_micros: self.idle_min_gap_micros.load(Ordering::Relaxed),
         }
     }
 
@@ -177,7 +198,11 @@ impl WalHealth {
 
     fn set_pinned(&self, bytes: Option<u64>) {
         let new = bytes.unwrap_or(0);
-        if self.pinned_bytes.swap(new, Ordering::Relaxed) == new {
+        let old = self.pinned_bytes.swap(new, Ordering::Relaxed);
+        // Notify only when the fact appears or clears. A size that merely moves is
+        // carried by the next poll or status, and a growing WAL would otherwise emit a
+        // status per attempt.
+        if (old == 0) == (new == 0) {
             return;
         }
         let callback = self
@@ -344,30 +369,62 @@ struct State {
     last_commit: Instant,
     /// Frames at the last attempt; the size bound counts growth beyond it.
     base: i32,
+    /// Frames in the WAL as of the last commit signal.
+    frames: i32,
+    /// Bytes per WAL frame (page size + 24-byte frame header).
+    frame_bytes: u64,
     /// Do not attempt again before this (after an incomplete checkpoint).
     retry_at: Option<Instant>,
     /// The one `RESTART` of this pinned episode has been spent.
     restart_spent: bool,
+    /// When the last idle `PASSIVE` started.
+    last_idle: Option<Instant>,
+    /// Frames backfilled as of the last result, to count what each run moved.
+    prev_done: i64,
 }
 
 impl State {
-    /// When the next idle action is due, if any.
-    fn due(&self, bounds: Bounds, pinned: bool) -> Option<Instant> {
-        if (self.restart_spent || !pinned) && !self.dirty {
-            return None;
+    /// When the next idle `PASSIVE` may run: the idle gate, no sooner than the retry
+    /// back-off and the spacing from the previous idle one.
+    fn passive_at(&self, bounds: Bounds) -> Instant {
+        let mut at = self.last_commit + bounds.idle;
+        if let Some(retry) = self.retry_at {
+            at = at.max(retry);
         }
-        let idle = self.last_commit + bounds.idle;
-        Some(self.retry_at.map_or(idle, |retry| retry.max(idle)))
+        if let Some(last) = self.last_idle {
+            at = at.max(last + bounds.idle_spacing);
+        }
+        at
+    }
+
+    /// When the next idle action is due, if any: the `PASSIVE` (spaced) or the pinned
+    /// `RESTART` (the idle gate only).
+    fn due(&self, bounds: Bounds, pinned: bool) -> Option<Instant> {
+        let passive = self.dirty.then(|| self.passive_at(bounds));
+        let restart = (pinned && !self.restart_spent).then(|| self.last_commit + bounds.idle);
+        match (passive, restart) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
 fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth, wal: &Path) {
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|size| u64::try_from(size).ok())
+        .unwrap_or(4096);
     let mut state = State {
         dirty: false,
         last_commit: Instant::now(),
         base: 0,
+        frames: 0,
+        frame_bytes: page_size + 24,
         retry_at: None,
         restart_spent: false,
+        last_idle: None,
+        prev_done: 0,
     };
     loop {
         let pinned = health.pinned_bytes().is_some();
@@ -387,6 +444,7 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
             Some(Msg::Commit { frames }) => {
                 state.last_commit = Instant::now();
                 state.dirty = true;
+                state.frames = frames;
                 if frames < state.base {
                     // The writer reset the WAL; count growth from its start again.
                     state.base = 0;
@@ -415,7 +473,19 @@ fn attempt(
         Some(TransactionState::None),
         "the checkpointer connection must never be inside a transaction"
     );
-    if state.dirty || !idle {
+    let spaced_out = !idle || Instant::now() >= state.passive_at(bounds);
+    if state.dirty && spaced_out {
+        if idle {
+            if let Some(last) = state.last_idle {
+                let gap = u64::try_from(last.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let _ = health.idle_min_gap_micros.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |old| (old == 0 || gap < old).then_some(gap.max(1)),
+                );
+            }
+            state.last_idle = Some(Instant::now());
+        }
         health.running.store(true, Ordering::Relaxed);
         let started = Instant::now();
         let outcome = checkpoint(conn, "PASSIVE");
@@ -423,9 +493,23 @@ fn attempt(
         health.running.store(false, Ordering::Relaxed);
         let complete = outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done);
         health.record_passive(took, complete);
-        if let Some((_, log, _)) = outcome {
-            state.base = i32::try_from(log).unwrap_or(0).max(0);
+        if let Some((_, _, done)) = outcome {
+            // A smaller count than before means the writer reset the WAL in between.
+            let moved = if done >= state.prev_done {
+                done - state.prev_done
+            } else {
+                done
+            };
+            state.prev_done = done;
+            health
+                .frames_checkpointed
+                .fetch_add(u64::try_from(moved).unwrap_or(0), Ordering::Relaxed);
         }
+        // On an error there is no frame count from SQLite; use the last commit's, so a
+        // failing checkpoint is not re-fired by every later commit.
+        state.base = outcome.map_or(state.frames, |(_, log, _)| {
+            i32::try_from(log).unwrap_or(0).max(0)
+        });
         if complete {
             state.dirty = false;
             state.retry_at = None;
@@ -433,7 +517,7 @@ fn attempt(
             health.set_pinned(None);
         } else {
             state.retry_at = Some(Instant::now() + bounds.retry);
-            let size = std::fs::metadata(wal).map_or(0, |meta| meta.len());
+            let size = wal_bytes(outcome, state.frame_bytes, wal);
             health.set_pinned((size > bounds.hard_bytes).then_some(size));
         }
     }
@@ -453,9 +537,20 @@ fn attempt(
             health.set_pinned(None);
         } else {
             // The fact stays, with the size as it is now.
-            let size = std::fs::metadata(wal).map_or(0, |meta| meta.len());
+            let size = wal_bytes(outcome, state.frame_bytes, wal);
             health.set_pinned(Some(size.max(1)));
         }
+    }
+}
+
+/// The WAL's logical size from a checkpoint result: frames in use times frame size, plus
+/// the 32-byte header. The file's length is only a high-water mark (it keeps its size
+/// after a reset until `journal_size_limit` trims it), so it would report a pin that is
+/// long gone; it is the fallback when SQLite gave no count.
+fn wal_bytes(outcome: Option<(i64, i64, i64)>, frame_bytes: u64, wal: &Path) -> u64 {
+    match outcome {
+        Some((_, log, _)) if log >= 0 => u64::try_from(log).unwrap_or(0) * frame_bytes + 32,
+        _ => std::fs::metadata(wal).map_or(0, |meta| meta.len()),
     }
 }
 
@@ -529,6 +624,7 @@ mod tests {
             size_frames: i32::MAX,
             hard_bytes: u64::MAX,
             retry: Duration::from_millis(100),
+            idle_spacing: Duration::ZERO,
         }
     }
 
@@ -650,6 +746,7 @@ mod tests {
             size_frames: 100,
             hard_bytes: 256 * 1024,
             retry: Duration::from_millis(100),
+            idle_spacing: Duration::ZERO,
         });
         let health = actor.wal_health();
         let parked = Connection::open(&path).expect("reader");
@@ -702,6 +799,54 @@ mod tests {
             .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
             .expect("count");
         assert_eq!(notes, 1_000);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn idle_checkpoints_are_spaced_and_a_trailing_one_fires_after_typing_stops() {
+        // The idle gate (50 ms) is reached between every pair of saves 100 ms apart, so
+        // without spacing every save would be checkpointed. With 600 ms spacing,
+        // 2 s of typing gives at most four, never closer than the spacing, and a pause
+        // still gets a checkpoint within the spacing.
+        let spacing = Duration::from_millis(600);
+        let (dir, _path, actor) = actor(Bounds {
+            idle: Duration::from_millis(50),
+            idle_spacing: spacing,
+            ..never()
+        });
+        let health = actor.wal_health();
+        let typing_until = Instant::now() + Duration::from_millis(2_000);
+        let mut i = 0;
+        while Instant::now() < typing_until {
+            save(&actor, i);
+            i += 1;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let during = health.stats();
+        assert!(
+            during.passive_runs >= 2,
+            "no idle checkpoint while typing: {during:?}"
+        );
+        assert!(
+            during.passive_runs <= 4,
+            "{} checkpoints in 2 s at 600 ms spacing",
+            during.passive_runs
+        );
+        // One more save, then the writer stops: its frames are not yet checkpointed, and
+        // a trailing checkpoint fires within the spacing.
+        let before = health.stats().passive_runs;
+        save(&actor, i);
+        wait_for("the trailing checkpoint", Duration::from_secs(2), || {
+            health.stats().passive_runs > before
+        });
+        let after = health.stats();
+        assert!(
+            Duration::from_micros(after.idle_min_gap_micros) >= spacing,
+            "two idle checkpoints {} us apart; spacing is {spacing:?}",
+            after.idle_min_gap_micros
+        );
+        assert!(after.frames_checkpointed > 0);
         actor.shutdown().expect("shutdown");
         drop(dir);
     }

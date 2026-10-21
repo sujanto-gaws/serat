@@ -164,7 +164,8 @@ fn a_superseded_search_leaves_no_transaction_open() {
     );
     assert_eq!(search_state(&sc), TransactionState::None);
 
-    // Superseded before it ran at all (the lock was taken after a newer search began).
+    // A generation bumped before the call is not a supersession of it: the call takes its
+    // own, newer, number and runs to completion.
     sc.latest.fetch_add(1, Ordering::SeqCst);
     sc.set_after_prepare(|| {});
     assert!(matches!(

@@ -27,7 +27,11 @@
 //! *Unverified hypothesis:* SQLite's page cache keeps one LRU for every connection in the
 //! process, so a full 2 MiB cache recycles the oldest unpinned page of the group, which
 //! can be another connection's, instead of its own; at 256 MiB on all three nothing is
-//! ever full and the gap vanishes. Not tested here (it would need a source-level look at
+//! ever full and the gap vanishes. Source-level support (not proof that it causes the
+//! gap): `libsqlite3-sys` 0.38.2's `build.rs` (line 162) compiles SQLite with
+//! `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which sets `pcache1.separateCache = 0`
+//! (`sqlite3.c`, around line 58370 of the bundled amalgamation), so every connection shares one
+//! page-cache group and its LRU. Not tested here (it would need a source-level look at
 //! pcache1 or a cache-miss counter per connection).
 //!
 //! The handler is OFF on S unless a block says otherwise: #47's 15-30% was measured

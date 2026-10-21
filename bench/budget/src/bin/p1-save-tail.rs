@@ -466,6 +466,15 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     }
     if !a.bare {
         conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile));
+    } else if !a.checkpointer() {
+        // SQLite's own hook at the requested threshold, as before #56 (the actor leaves
+        // the pragma alone when the checkpointer is off).
+        conn.query_row(
+            &format!("PRAGMA wal_autocheckpoint = {}", a.autockpt),
+            [],
+            |r| r.get::<_, i32>(0),
+        )
+        .map_err(|e| e.to_string())?;
     }
     let actor = serat_index::IndexActor::with_options(
         conn,
@@ -622,7 +631,13 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     let wal_bytes_end = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     drop(side);
     drop(ckpt_conn);
-    let ck_stats = (a.checkpointer() && !a.bare).then(|| (health.stats(), health.pinned_bytes()));
+    let ck_stats = (a.checkpointer() && !a.bare).then(|| {
+        (
+            health.stats(),
+            health.pinned_bytes(),
+            run_started.elapsed().as_secs_f64(),
+        )
+    });
     let shutdown = actor.shutdown().map_err(|e| e.to_string());
     if let Some(why) = &aborted {
         println!(
@@ -714,13 +729,16 @@ struct Subject<'a> {
     notes: usize,
 }
 
+/// The checkpointer's stats, its pinned fact and the run's seconds; `None` when it is off.
+type CkReport = Option<(CheckpointStats, Option<u64>, f64)>;
+
 fn report(
     a: &Args,
     subject: &Subject<'_>,
     env: &str,
     (load_start, load_end): (&str, &str),
     builds: &[usize],
-    (wal_start, wal_end, ck_stats): (u64, u64, Option<(CheckpointStats, Option<u64>)>),
+    (wal_start, wal_end, ck_stats): (u64, u64, CkReport),
     recs: &[Rec],
 ) {
     let n = recs.len();
@@ -791,16 +809,19 @@ fn report(
     for (name, f) in rows {
         println!("  {}", stat_line(name, f, recs));
     }
-    if let Some((stats, pinned)) = ck_stats {
+    if let Some((stats, pinned, secs)) = ck_stats {
         let overlapped = recs.iter().filter(|r| r.ckpt_overlap).count();
         println!(
-            "checkpointer (its own thread): {} PASSIVE runs · {} incomplete · {} RESTART · longest {:.1} ms · mean {:.1} ms · saves with a checkpoint in progress at their start or end: {overlapped} of {n} · index WAL pinned: {}",
+            "checkpointer (its own thread): {} PASSIVE runs · {} incomplete · {} RESTART · longest {:.1} ms · mean {:.1} ms · saves with a checkpoint in progress at their start or end: {overlapped} of {n} · index WAL pinned: {} · {:.1} checkpoints per minute · {:.0} frames per checkpoint (mean) · idle spacing {} s",
             stats.passive_runs,
             stats.incomplete,
             stats.restart_runs,
             stats.passive_max_micros as f64 / 1000.0,
             stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
             pinned.map_or("no".to_owned(), |b| format!("{b} B")),
+            stats.passive_runs as f64 / (secs / 60.0).max(f64::EPSILON),
+            stats.frames_checkpointed as f64 / stats.passive_runs.max(1) as f64,
+            serat_index::checkpoint::IDLE_SPACING.as_secs(),
         );
     }
     if a.bare {

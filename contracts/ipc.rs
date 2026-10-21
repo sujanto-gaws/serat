@@ -335,7 +335,9 @@ pub struct IndexStatus {
     /// holds the invariant that no reader keeps one outside a single read call. If the
     /// WAL nevertheless passes 64 MiB, the checkpointer reports it here, tries one
     /// `RESTART` at idle, and, if that fails, leaves this fact in place until a
-    /// checkpoint completes. The index still works; only disk use is affected.
+    /// checkpoint completes: there is no further `RESTART`, while a `PASSIVE`
+    /// keeps retrying every 2 s as long as there are new frames. The status is
+    /// re-emitted when the fact appears or clears, not as the size moves. The index still works; only disk use is affected.
     /// `None` (absent on the wire) means the WAL is not pinned, or no vault is open.
     /// It is a fact about a defect, so it is never `Some(0)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
