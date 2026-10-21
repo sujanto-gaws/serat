@@ -258,14 +258,24 @@ fn run(args: &[String]) -> Result<(), String> {
 /// is involved; the corpus is built from generated paths.
 fn stress() {
     let paths: Vec<String> = (0..50_000)
-        .map(|i| format!("d{}/{}{i}.md", i % 50, "e".repeat(120)))
+        .map(|i| {
+            format!(
+                "{}/{}{i}.md",
+                "e".repeat(80 + i % 40),
+                "e".repeat(100 + i % 60)
+            )
+        })
         .collect();
     let corpus = Corpus::from_paths(&paths);
-    println!("\nstress: 50000 notes with 120-character e-dense names, history absent");
+    println!(
+        "\nstress (adversarial, reported and not gated): 50000 notes, 100-160 character e-dense \
+names under 80-120 character e-dense folders, history absent"
+    );
     let history = History::default();
     for (label, query) in [
         ("3 chars \"mee\" (no match)", "mee".to_owned()),
         ("3 chars \"eee\"", "eee".to_owned()),
+        ("8 x \"e\"", "e".repeat(8)),
         ("16 x \"e\"", "e".repeat(16)),
         (
             "23-character spaced query",

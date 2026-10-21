@@ -58,6 +58,11 @@ const GAP_EXTEND: i32 = 1;
 /// Largest query-length by window-width the DP will fill; beyond it the leftmost
 /// alignment is scored instead.
 const MAX_DP_CELLS: usize = 2048;
+/// DP cells one query may fill in total, consumed in candidate order (so results are
+/// reproducible); once spent, every remaining candidate takes the leftmost alignment.
+/// Ordinary queries use a fraction of it (about 13M at 50k notes for a 3-character
+/// query); it exists to bound an adversarial corpus to tens of milliseconds.
+const QUERY_CELL_BUDGET: usize = 20_000_000;
 const NEG: i32 = i32::MIN / 2;
 
 /// The corpus reads (§9.2): fixed shapes, no schema change. Notes in path order.
@@ -444,6 +449,8 @@ struct Matcher {
     positions: Vec<usize>,
     /// The leftmost alignment of the query, found by the early reject.
     greedy: Vec<usize>,
+    /// DP cells filled so far in this query.
+    spent: usize,
 }
 
 impl Matcher {
@@ -553,7 +560,7 @@ impl Matcher {
         let mut positions = std::mem::take(&mut self.positions);
         positions.clear();
         let best;
-        if m * w > MAX_DP_CELLS {
+        if m * w > MAX_DP_CELLS || self.spent + m * w > QUERY_CELL_BUDGET {
             positions.extend_from_slice(&self.greedy);
             let mut score = 0;
             for (i, &p) in positions.iter().enumerate() {
@@ -564,6 +571,7 @@ impl Matcher {
             }
             best = score;
         } else {
+            self.spent += m * w;
             self.m.clear();
             self.m.resize(m * w, NEG);
             self.g.clear();
@@ -938,6 +946,8 @@ impl Corpus {
             ranked.truncate(limit);
         }
         ranked.sort_by(cmp);
+        // The budget bounded the ranking pass; highlighting 50 hits needs none.
+        mt.spent = 0;
         ranked
             .iter()
             .map(|r| self.hit(mt, r, pat.or(heading_pat)))
@@ -1334,6 +1344,70 @@ mod tests {
         let greedy = mt.score("f_xxxxxxxx_foo_bar", &pat, true).unwrap();
         assert_eq!(mt.positions, vec![11, 15], "word starts of foo bar");
         assert_eq!(greedy.class, WORD_OR_SUBSTRING);
+    }
+
+    #[test]
+    fn above_the_cell_cap_the_leftmost_alignment_is_scored_and_classed() {
+        let q = "abcdefghij";
+        let pat = Pattern::new(q);
+        let mut mt = Matcher::default();
+
+        // Leftmost is contiguous: class 2 although the window (~210 chars x 10) is over the cap.
+        let tail = format!("{}{q}", "x".repeat(200));
+        let s = mt.score(&tail, &pat, true).unwrap();
+        assert_eq!(s.class, WORD_OR_SUBSTRING);
+        assert_eq!(mt.positions, (200..210).collect::<Vec<_>>());
+
+        // Leftmost is scattered and not at word starts, while a word-start alignment
+        // exists further along: the fallback does not see it and says SCATTERED.
+        let spread: String = q.chars().flat_map(|c| [c, 'x']).collect();
+        let starts: String = q.chars().flat_map(|c| [' ', c]).collect();
+        let cand = format!("{spread}{}{starts}", "x".repeat(200));
+        assert!(cand.chars().count() <= MAX_CANDIDATE_CHARS);
+        let s = mt.score(&cand, &pat, true).unwrap();
+        assert_eq!(s.class, SCATTERED);
+        assert_eq!(mt.positions, (0..10).map(|i| i * 2).collect::<Vec<_>>());
+        // Same text under the cap (short query): the DP would find the word starts.
+        let short = Pattern::new("ab");
+        let s = mt.score("axb a b", &short, true).unwrap();
+        assert_eq!(s.class, WORD_OR_SUBSTRING);
+        assert_eq!(mt.positions, vec![4, 6]);
+    }
+
+    #[test]
+    fn once_the_query_budget_is_spent_candidates_fall_back_deterministically() {
+        let pat = Pattern::new("ab");
+        let mut fresh = Matcher::default();
+        assert_eq!(
+            fresh.score("axb a b", &pat, true).unwrap().class,
+            WORD_OR_SUBSTRING
+        );
+        let mut spent = Matcher {
+            spent: QUERY_CELL_BUDGET,
+            ..Matcher::default()
+        };
+        let s = spent.score("axb a b", &pat, true).unwrap();
+        assert_eq!(s.class, SCATTERED);
+        assert_eq!(spent.positions, vec![0, 2]);
+        // The budget is consumed in candidate order: the first candidates get the DP.
+        let mut mt = Matcher {
+            spent: QUERY_CELL_BUDGET - 14 * 3,
+            ..Matcher::default()
+        };
+        let classes: Vec<Class> = (0..6)
+            .map(|_| mt.score("axb a b", &pat, false).unwrap().class)
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                WORD_OR_SUBSTRING,
+                WORD_OR_SUBSTRING,
+                WORD_OR_SUBSTRING,
+                SCATTERED,
+                SCATTERED,
+                SCATTERED
+            ]
+        );
     }
 
     #[test]
