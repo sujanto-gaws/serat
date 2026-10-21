@@ -314,6 +314,15 @@ fn measure(
         .map(|t| (t.clone(), doc(t)))
         .filter(|(_, d)| *d > 0)
         .collect();
+    // The product's other reads, for block I: the highest in-degree note's backlinks (R2).
+    let hub: String = probe
+        .query_row(
+            "SELECT p.path FROM links l JOIN notes p ON p.id = l.dst_note
+              GROUP BY l.dst_note ORDER BY count(*) DESC, p.path LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     drop(probe);
     println!();
     println!(
@@ -401,6 +410,19 @@ fn measure(
         let (hp2, hs2) = alternate(&p, &s, term, n, false);
         line("H  S then P, handler ON", &hp2, &hs2, "P", "S");
         sc.set_progress_handler(false).map_err(|e| e.to_string())?;
+        // I: the product's shape (task #56). R1 runs only on S; the pool does R2. S's
+        // R1 between pool backlinks reads, against S alone in a batch (the same
+        // connection, so a cache stolen by the pool shows as the difference).
+        warm(&p, &s);
+        let (mut alone, mut mixed) = (Samples::new(), Samples::new());
+        for _ in 0..n {
+            alone.push(timed(&s, term));
+        }
+        for _ in 0..n {
+            let _ = p.backlinks(&hub).map_err(|e| e.to_string())?;
+            mixed.push(timed(&s, term));
+        }
+        line("I  S alone | S between pool R2 reads", &alone, &mixed, "S", "S+R2");
     }
     Ok(())
 }
