@@ -35,6 +35,13 @@ The P1 read paths (search, backlinks, property lookup) have latency *expectation
 cargo run --release -p budget --bin p1-read-paths -- --vault 20k   # and --vault 50k
 ```
 
+Two diagnostic jobs, which measure and apply no remedy (task #53), attribute what §3.1.1 and §4.5 leave open. Neither gates. `p1-save-tail` runs 1,000 consecutive saves of the highest in-degree note at `--gap-ms` (1,000, the editor's debounce) after the previous `flush()`, timing read, parse, the transaction's statements, `COMMIT`, the auto-checkpoint and the post-commit work separately, with the WAL frame count at every commit, the FTS5 segments per level, and a `concurrent_build_processes` sample (taken from `/proc`, since `env.rs` reports none on Linux). A run on a machine with build processes running says so in its header. `--wal-autocheckpoint 0 --checkpoint-between` and `--fts-automerge 0` are the bisections, and `--bare` measures the instrumentation's own cost. `p1-search-gap` compares the search connection with pool readers under equal warm-up, swapped order and a second-pool-reader control, reads the pragmas back from each and shows from `SQLITE_STMTSTATUS_RUN` that `prepare_cached` hits. A reporting run of either needs a quiet machine and a disk with room for the index: the host's disk filled under one run.
+
+```
+cargo run --release -p budget --bin p1-save-tail  -- --vault 20k --iterations 1000 --gap-ms 1000
+cargo run --release -p budget --bin p1-search-gap -- --vault 20k --iterations 60
+```
+
 Record the machine conditions either side of a series with `cargo run --release -p budget --bin environment`; on Windows a run with the on-access virus scanner disabled is marked not gate eligible, because the gate figure has to be the one a user would see.
 
 All three are **red today, on purpose**: `serat-index` has no rebuild entry point (I4) or incremental save path (I5), and there is no application to start (D2, S1). Each prints the entry point it needs and the task that unblocks it. Documentation: `docs/05-testing/budget-harness.md`. CI: `.github/workflows/budgets.yml`, one job per budget.
