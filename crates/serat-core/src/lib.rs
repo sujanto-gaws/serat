@@ -49,4 +49,6 @@ pub use path::{Platform, VaultPath};
 pub use span::ByteRange;
 pub use task::Task;
 pub use traits::{EchoGuard, IndexWriter, NoteParser, NoteSource};
-pub use tree::{RawEntry, Snapshot, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings};
+pub use tree::{
+    RawEntry, Snapshot, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings, source_entries,
+};

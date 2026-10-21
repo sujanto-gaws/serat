@@ -454,11 +454,16 @@ fn accept(vault: &Vault, path: &Path, kind: &EventKind) -> Accepted {
         // its children, which report for themselves. Only a directory that came,
         // went or moved is a subtree event; without this every save on a platform
         // that reports the parent (Windows, macOS) would rescan the parent.
+        //
+        // A whitelist, not a blacklist: on Windows notify reports a directory's
+        // MODIFIED (raised on every child create, delete and rename) as
+        // `Modify(Any)`, which a blacklist of Data and Metadata lets through.
         return match kind {
-            EventKind::Modify(
-                notify::event::ModifyKind::Data(_) | notify::event::ModifyKind::Metadata(_),
-            ) => Accepted::Ignored,
-            _ => Accepted::Subtree(relative),
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+            | EventKind::Modify(notify::event::ModifyKind::Name(_)) => Accepted::Subtree(relative),
+            _ => Accepted::Ignored,
         };
     }
 

@@ -42,10 +42,16 @@ cargo run --release -p budget --bin p1-save-tail  -- --vault 20k --iterations 10
 cargo run --release -p budget --bin p1-search-gap -- --vault 20k --iterations 60
 ```
 
-`p1-external-change` (task #14) times FR-VLT-04 on the real pipeline: the `notify` watcher and its 150 ms window, the work queue, `Reconciler::index_paths` (hash gate, `CommonMarkParser`, bulk-side submit, flush) over an index rebuilt from a **copy** of the preset vault in the temp directory (the pinned vault is never written). It edits one note at a time the way an editor saves (temp file, then rename) and then batches of 100, and reports write-to-visible p95 split into the watcher delay and the processing. A run is rejected unless every edit was reported and the index holds the bytes written. It reports by default and gates with `--assert`; it has its own argument parser and takes the root from `SERAT_REPO_ROOT` or the working directory only. Needs a quiet machine and about 400 MB of temp space:
+`p1-external-change` (task #14) times FR-VLT-04 on the real pipeline: the `notify` watcher and its 150 ms window, the work queue, `Reconciler::index_paths` (hash gate, `CommonMarkParser`, bulk-side submit, flush) over an index rebuilt from a **copy** of the preset vault in the temp directory (the pinned vault is never written). It edits one note at a time the way an editor saves (temp file, then rename) and then batches of 100, and reports write-to-visible p95 split into the watcher delay and the processing. A run is rejected unless every edit was reported and the index holds the bytes written. It reports by default and gates with `--assert` on the **single-note** shape only; the 100-note batch is printed as "reported, not gated"; it has its own argument parser and takes the root from `SERAT_REPO_ROOT` or the working directory only. Needs a quiet machine and about 400 MB of temp space:
 
 ```
 cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert
+```
+
+`p1-catch-up` (task #14 review) reports what the ignore file and the open-time catch-up cost on the 20k vault: `Vault::walk` and `walk_tree_with_metadata` with no ignore file, a 50-line one and the 1,000-line cap (patterns applied in memory; the pinned vault is never written), and `Reconciler::catch_up` on an unchanged index in `PathsOnly` and `PathsAndMtime` modes. Reports only; it rejects a run in which an ignore file changed the file count or a catch-up changed the index.
+
+```
+cargo run --release -p budget --bin p1-catch-up -- --vault 20k --passes 5
 ```
 
 Record the machine conditions either side of a series with `cargo run --release -p budget --bin environment`; on Windows a run with the on-access virus scanner disabled is marked not gate eligible, because the gate figure has to be the one a user would see.

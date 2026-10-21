@@ -75,6 +75,11 @@ path = "src/bin/p1-switcher.rs"
 name = "p1-external-change"
 path = "src/bin/p1-external-change.rs"
 
+# Task #14 review: the walk with an ignore file and the open-time catch-up, reported.
+[[bin]]
+name = "p1-catch-up"
+path = "src/bin/p1-catch-up.rs"
+
 [dependencies]
 reporoot = { path = "../reporoot" }
 vaultgen = { path = "../vaultgen" }

@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
-use serat_core::{RawEntry, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings};
+use serat_core::{
+    NoteKind, RawEntry, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings, source_entries,
+};
 
 #[derive(Default)]
 struct Front {
@@ -419,4 +421,28 @@ fn a_folder_created_between_its_parents_read_and_listing_gets_a_listing() {
     assert_eq!(front.names(""), ["newdir", "a.md"]);
     assert!(front.dirs.contains_key("newdir"), "newdir stayed pending");
     assert!(model.is_listed("newdir"));
+}
+
+#[test]
+fn a_listing_converts_to_source_entries_without_its_directories() {
+    // ADR-0015 section 2, One walk at open: the tree walk feeds the catch-up.
+    let listing = [
+        RawEntry::new("notes", TreeKind::Dir),
+        RawEntry::new("a.md", TreeKind::Note).with_metadata(12, 1_700_000_000_123),
+        RawEntry::new("scan.pdf", TreeKind::Asset).with_metadata(900, 5),
+    ];
+    let converted = source_entries("10-projects", &listing);
+    let shown: Vec<_> = converted
+        .iter()
+        .map(|e| (e.path.as_str(), e.kind, e.size, e.mtime_ms))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("10-projects/a.md", NoteKind::Note, 12, 1_700_000_000_123),
+            ("10-projects/scan.pdf", NoteKind::Asset, 900, 5),
+        ]
+    );
+    let root = source_entries("", &listing);
+    assert_eq!(root[0].path.as_str(), "a.md");
 }

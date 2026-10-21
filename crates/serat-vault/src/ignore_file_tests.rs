@@ -74,6 +74,28 @@ fn the_tree_walk_and_the_directory_walk_apply_the_same_rules() {
 }
 
 #[test]
+fn only_the_metadata_walk_carries_size_and_mtime_and_the_catch_up_set_matches_the_full_walk() {
+    // ADR-0015 section 2: one walk at open. The tree walk, converted, is the set
+    // `Vault::walk` would have produced, with the same size and mtime.
+    let (_dir, vault) = fixture("/archive\n");
+    let mut plain = Vec::new();
+    vault
+        .walk_tree("", |_, entries| plain.extend(entries))
+        .expect("tree walk");
+    assert!(plain.iter().all(|e| e.size == 0 && e.mtime_ms == 0));
+
+    let mut converted = Vec::new();
+    vault
+        .walk_tree_with_metadata("", |dir, entries| {
+            converted.extend(serat_core::source_entries(dir, &entries));
+        })
+        .expect("tree walk");
+    converted.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(converted, vault.walk().expect("walk"));
+    assert!(converted.iter().all(|e| e.size > 0 && e.mtime_ms > 0));
+}
+
+#[test]
 fn a_reload_changes_the_next_walk() {
     let (dir, vault) = fixture("/archive\n");
     assert_eq!(vault.walk().expect("walk").len(), 4);

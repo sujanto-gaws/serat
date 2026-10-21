@@ -102,6 +102,32 @@ impl Vault {
     pub fn walk_tree(
         &self,
         start: &str,
+        on_dir: impl FnMut(&str, Vec<RawEntry>),
+    ) -> Result<WalkSummary, VaultError> {
+        self.walk_tree_inner(start, false, on_dir)
+    }
+
+    /// [`Vault::walk_tree`] with each file entry carrying `size` and `mtime_ms`, for the
+    /// warm path's catch-up (ADR-0015 section 2, *One walk at open*): convert each
+    /// listing with `serat_core::source_entries`, accumulate, and call
+    /// `Reconciler::catch_up` when the walk completes. The no-index path keeps using
+    /// [`Vault::walk_tree`], which is name-and-kind only (FR-VLT-01's timed walk).
+    ///
+    /// # Errors
+    ///
+    /// As [`Vault::walk_tree`].
+    pub fn walk_tree_with_metadata(
+        &self,
+        start: &str,
+        on_dir: impl FnMut(&str, Vec<RawEntry>),
+    ) -> Result<WalkSummary, VaultError> {
+        self.walk_tree_inner(start, true, on_dir)
+    }
+
+    fn walk_tree_inner(
+        &self,
+        start: &str,
+        metadata: bool,
         mut on_dir: impl FnMut(&str, Vec<RawEntry>),
     ) -> Result<WalkSummary, VaultError> {
         let start_path = if start.is_empty() {
@@ -187,7 +213,15 @@ impl Vault {
                     } else {
                         TreeKind::Asset
                     };
-                    entries.push(RawEntry::new(name, kind));
+                    let raw = RawEntry::new(name, kind);
+                    // One statx per file on Linux and macOS, free on Windows; read only
+                    // when the caller will compare it (the warm path's catch-up).
+                    entries.push(match entry.metadata() {
+                        Ok(stat) if metadata => {
+                            raw.with_metadata(stat.len(), crate::walk::mtime_ms(&stat))
+                        }
+                        _ => raw,
+                    });
                 }
             }
             nodes[index].1 = has_file;

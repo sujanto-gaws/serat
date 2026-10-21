@@ -98,7 +98,7 @@ pub struct RebuildReport {
 /// # Errors
 ///
 /// [`IndexError`] if the database cannot be created or a write fails. An individual
-/// file that cannot be read or parsed is counted in [`RebuildReport::skipped`], not
+/// file that cannot be read is counted in [`RebuildReport::skipped`], not
 /// returned as an error.
 pub fn rebuild(
     source: &dyn NoteSource,

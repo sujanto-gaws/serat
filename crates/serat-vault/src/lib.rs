@@ -186,7 +186,7 @@ impl Vault {
     /// The echo suppressor the watcher consults.
     ///
     /// The watcher asks it whether an event carries bytes we just indexed:
-    /// `if vault.echo().take_echo(loaded.meta.hash) { skip }` after the hash gate.
+    /// `if vault.echo().take_echo(&path, loaded.meta.hash) { skip }` after the hash gate.
     /// Recording an entry is [`EchoGuard::record_echo`], which `Vault` implements
     /// below — callers that write through the index's save path use that trait object
     /// rather than reaching in here directly.
@@ -708,8 +708,8 @@ impl Vault {
 impl EchoGuard for Vault {
     /// Delegates to the shared [`EchoSuppressor`], so the save path and the watcher
     /// consult the same set regardless of which clone of `Vault` each holds.
-    fn record_echo(&self, hash: ContentHash) {
-        self.echo.record(hash);
+    fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
+        self.echo.record(path, hash);
     }
 }
 
@@ -1183,7 +1183,7 @@ mod tests {
             .expect("write");
 
         assert!(
-            !vault.echo().take_echo(hash),
+            !vault.echo().take_echo(&path, hash),
             "write_atomic recorded an echo entry; it must be a plain write (F-224)"
         );
     }
@@ -1202,14 +1202,14 @@ mod tests {
             )
             .expect("write");
 
-        vault.record_echo(hash);
+        vault.record_echo(&path, hash);
 
         assert!(
-            vault.echo().take_echo(hash),
+            vault.echo().take_echo(&path, hash),
             "record_echo did not register the hash for suppression"
         );
         assert!(
-            !vault.echo().take_echo(hash),
+            !vault.echo().take_echo(&path, hash),
             "one recorded echo suppressed two events"
         );
     }
@@ -1228,7 +1228,7 @@ mod tests {
             .expect("read");
 
         assert!(
-            !vault.echo().take_echo(theirs.meta.hash),
+            !vault.echo().take_echo(&theirs.meta.path, theirs.meta.hash),
             "an external edit was mistaken for our own echo"
         );
     }
@@ -1429,6 +1429,15 @@ impl serat_core::NoteSource for Vault {
     }
 
     fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+        // The index never holds what the ignore file hides. A change accepted under the
+        // old rules during the watcher's window, or a path from a stale queue, is
+        // answered as gone, so the consumer removes the row rather than re-adding it.
+        // `read` itself is not restricted: the editor may open an ignored note.
+        if self.ignore.user_ignores_path(path.as_str()) {
+            return Err(VaultError::NotFound {
+                path: path.as_str().to_owned(),
+            });
+        }
         self.read(path)
     }
 }

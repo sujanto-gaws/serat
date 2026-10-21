@@ -256,7 +256,11 @@ impl IndexHandle {
     ///
     /// # Errors
     ///
-    /// As [`crate::rebuild`], and as [`IndexHandle::open`] for the new handle.
+    /// As [`crate::rebuild`], and as [`IndexHandle::open`] for the new handle. **A failure
+    /// after the old file is deleted leaves no handle at all**: the caller must fall
+    /// back to `open_or_rebuild` and report the index as unavailable. And the search
+    /// slot must not lazily reopen the file between `release()` and the delete, or
+    /// the delete fails on Windows; hold its lock across the call.
     pub fn rebuild_in_place(
         self,
         release: &dyn Fn(),
@@ -325,9 +329,14 @@ pub fn apply(
     path: &VaultPath,
 ) -> Result<(), IndexError> {
     let (op, hash) = match source.load(path) {
-        // A file the save path was told about but cannot read has been deleted.
-        // Nothing was indexed, so there is nothing to record an echo for.
-        Err(_) => (IndexOp::Remove { path: path.clone() }, None),
+        // Only a file that is not there has been deleted. One that exists and cannot be
+        // read right now (a scanner holding it on Windows, permissions) keeps its row
+        // and submits nothing, with no echo recorded, so the watcher's own event still
+        // reaches the note. Nothing was indexed, so there is nothing to record.
+        Err(serat_core::VaultError::NotFound { .. }) => {
+            (IndexOp::Remove { path: path.clone() }, None)
+        }
+        Err(_) => return Ok(()),
         Ok(loaded) => {
             let hash = loaded.meta.hash;
             let (op, _, _) = build_op(parser, path, loaded);
@@ -344,7 +353,7 @@ pub fn apply(
     // See the doc comment on `IndexHandle::apply` for why "after" rather than "before"
     // is the whole fix.
     if let Some(hash) = hash {
-        echo.record_echo(hash);
+        echo.record_echo(path, hash);
     }
     Ok(())
 }
@@ -361,6 +370,10 @@ pub fn apply(
 /// stays listable, searchable by path and linkable. There is no parse-error column:
 /// a refused note is a `kind = 'note'` row with no `blocks` row. The returned flag
 /// says the parser refused.
+///
+/// One short-lived state is accepted: a file an outside process is still writing in
+/// place can be read half-written, refused, and held as a bare row until the next
+/// event for that path re-indexes it.
 pub(crate) fn build_op(
     parser: &dyn NoteParser,
     path: &VaultPath,
@@ -436,12 +449,15 @@ mod tests {
     /// recorded and in what order — including "nothing".
     #[derive(Default)]
     struct SpyEcho {
-        recorded: Mutex<Vec<ContentHash>>,
+        recorded: Mutex<Vec<(VaultPath, ContentHash)>>,
     }
 
     impl EchoGuard for SpyEcho {
-        fn record_echo(&self, hash: ContentHash) {
-            self.recorded.lock().expect("lock").push(hash);
+        fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
+            self.recorded
+                .lock()
+                .expect("lock")
+                .push((path.clone(), hash));
         }
     }
 
@@ -569,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             *echo.recorded.lock().expect("lock"),
-            vec![hash],
+            vec![(path("note.md"), hash)],
             "a successful submit did not record exactly the hash it indexed"
         );
     }

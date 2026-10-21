@@ -23,6 +23,9 @@
 //! **watcher delay** (write to the consumer taking the path off the queue, which holds
 //! the 150 ms window) and the **processing** (taking it to committed and visible).
 //! The 500 ms is judged on the sum; the split says which half moved when it moves.
+//! **Only the single-note shape is gated** (FR-VLT-04 says "a file is modified"); the
+//! 100-note batch is a stress shape, printed as "reported, not gated", and its
+//! cost is the index writer's per-note upsert, not this path.
 //!
 //! **A run is rejected, not recorded, unless:** every iteration's edits were all
 //! reported upserted within 10 s, and every edited note's `notes.hash` in the index
@@ -282,7 +285,7 @@ fn run(args: &[String]) -> Result<bool, String> {
                 let first_taken = Instant::now();
                 let mut paths: Vec<VaultPath> = vec![first];
                 paths.extend(queue.drain());
-                let echo = |hash| vault.echo().take_echo(hash);
+                let echo = |path: &VaultPath, hash| vault.echo().take_echo(path, hash);
                 match reconciler.index_paths(&*vault, &*parser, &echo, &paths) {
                     Ok(outcome) => {
                         let _ = tx.send(Round {
@@ -357,11 +360,18 @@ fn run(args: &[String]) -> Result<bool, String> {
         line("  processing to committed", &series(|m| m.processing_ms));
         let within = total.percentile(0.95) <= BUDGET_MS;
         println!(
-            "{label}: p95 {:.1} ms against {BUDGET_MS} ms: {}",
+            "{label}: p95 {:.1} ms against {BUDGET_MS} ms: {}{}",
             total.percentile(0.95),
-            if within { "within" } else { "OVER" }
+            if within { "within" } else { "OVER" },
+            if label == "single" {
+                ""
+            } else {
+                " (reported, not gated)"
+            }
         );
-        pass &= within;
+        if label == "single" {
+            pass &= within;
+        }
     }
     Ok(pass || !assert)
 }

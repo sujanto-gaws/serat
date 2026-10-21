@@ -133,15 +133,25 @@ pub fn open_in_memory() -> Result<Connection, IndexError> {
 /// without the addition being the thing that undoes the fix.
 const STATEMENT_CACHE: usize = 32;
 
+/// The ordinary durability level of every connection.
+pub(crate) const SYNCHRONOUS_NORMAL: &str = "NORMAL";
+/// The level used for the few commits that must be on stable storage when they return.
+pub(crate) const SYNCHRONOUS_FULL: &str = "FULL";
+/// How long a connection waits on a lock.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
+/// How long closing waits for a checkpoint that a reader is holding up.
+const CLOSE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The pragmas, applied to every connection, writer and reader alike.
 fn configure(conn: &Connection) -> Result<(), IndexError> {
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;",
-    )
+         PRAGMA synchronous = {SYNCHRONOUS_NORMAL};
+         PRAGMA busy_timeout = {};",
+        BUSY_TIMEOUT.as_millis()
+    ))
     .map_err(sqlite)
 }
 
@@ -275,10 +285,10 @@ fn durably<T>(
     conn: &Connection,
     write: impl FnOnce() -> rusqlite::Result<T>,
 ) -> Result<T, IndexError> {
-    conn.pragma_update(None, "synchronous", "FULL")
+    conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)
         .map_err(sqlite)?;
     let result = write();
-    let restored = conn.pragma_update(None, "synchronous", "NORMAL");
+    let restored = conn.pragma_update(None, "synchronous", SYNCHRONOUS_NORMAL);
     let value = result.map_err(sqlite)?;
     restored.map_err(sqlite)?;
     Ok(value)
@@ -294,6 +304,10 @@ fn durably<T>(
 /// an index that is behind the disk, with nothing to say the catch-up must look at
 /// content. Forcing this one commit to `FULL` fsyncs the WAL up to and including it,
 /// so a lost commit can only be one made after the marker said "unclean".
+///
+/// The crash test (`external_change.rs`) shows the clear is *in the log* that survives a
+/// rollback; it cannot show it is durable. That half is the `FULL` level, tested in
+/// `durably_forces_full_inside_the_write_and_restores_normal_after`.
 ///
 /// Runs on the connection before the writer actor owns it, like `open_or_rebuild`'s
 /// adoption of a changed vault root: ADR-0001's single writer is about the actor
@@ -324,8 +338,7 @@ pub(crate) fn begin_session(conn: &Connection) -> Result<bool, IndexError> {
 pub(crate) fn end_session(conn: &Connection) -> Result<bool, IndexError> {
     // A reader pinning the WAL makes the checkpoint wait; closing must not hang for the
     // connection's usual five seconds on a reader that is not going to leave.
-    conn.busy_timeout(std::time::Duration::from_millis(250))
-        .map_err(sqlite)?;
+    conn.busy_timeout(CLOSE_BUSY_TIMEOUT).map_err(sqlite)?;
     let checkpoint = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((
@@ -335,8 +348,7 @@ pub(crate) fn end_session(conn: &Connection) -> Result<bool, IndexError> {
             ))
         })
         .map_err(sqlite);
-    conn.busy_timeout(std::time::Duration::from_millis(5000))
-        .map_err(sqlite)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(sqlite)?;
     let (busy, log, moved) = checkpoint?;
     if busy != 0 || log != moved {
         return Ok(false);
@@ -358,6 +370,23 @@ pub(crate) fn sqlite(error: rusqlite::Error) -> IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durably_forces_full_inside_the_write_and_restores_normal_after() {
+        // S4: the crash test shows the clear is in the log, not that it is durable.
+        // This is the half it cannot show: the level is FULL while the write runs
+        // (2) and NORMAL again afterwards (1).
+        let dir = tempfile::tempdir().expect("temp");
+        let conn = open(&dir.path().join("t.db")).expect("open");
+        let level = || -> i64 {
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .expect("pragma")
+        };
+        assert_eq!(level(), 1);
+        let inside = durably(&conn, || Ok(level())).expect("durably");
+        assert_eq!(inside, 2, "not FULL while the write runs");
+        assert_eq!(level(), 1, "not restored to NORMAL");
+    }
 
     #[test]
     fn the_ddl_runs_as_delivered() {

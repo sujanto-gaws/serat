@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
-use serat_core::{IndexWriter as _, NoteSource as _, SourceEntry, VaultPath};
+use serat_core::{IndexWriter as _, NoteSource, SourceEntry, VaultPath};
 use serat_index::external::{CatchUp, ChangeSignal, Outcome, Reconciler};
 use serat_index::{IndexHandle, rebuild, schema};
 use support::{DiskVault, LineParser, SpyEcho};
@@ -94,7 +94,7 @@ fn clean_close(index: &Path) -> i64 {
     .expect("marker")
 }
 
-fn never_echo(_: serat_core::ContentHash) -> bool {
+fn never_echo(_: &VaultPath, _: serat_core::ContentHash) -> bool {
     false
 }
 
@@ -174,7 +174,7 @@ fn a_file_the_save_path_already_submitted_is_skipped_as_an_echo() {
         .index_paths(
             &DiskVault::new(&f.root),
             &f.parser,
-            &|_| {
+            &|_, _| {
                 echoed.set(echoed.get() + 1);
                 true
             },
@@ -219,6 +219,22 @@ fn a_deleted_directory_takes_what_the_index_held_beneath_it() {
 
     assert_eq!(outcome.removed, 2);
     assert_eq!(paths_in(&f.index), ["a.md", "b.md"]);
+    // Nothing of theirs survives in the child tables either.
+    let conn = schema::open(&serat_index::index_path(&f.index)).expect("open");
+    for table in ["blocks", "fields", "links", "tasks"] {
+        let orphans: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM {table} WHERE note_id NOT IN (SELECT id FROM notes)"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(orphans, 0, "{table} kept rows of a removed note");
+    }
+    drop(conn);
+    assert_eq!(blocks_of(&f.index, "folder/c.md"), 0);
     handle.close().expect("close");
 }
 
@@ -597,6 +613,236 @@ fn a_note_edited_into_a_refused_form_is_one_bare_row_and_a_rebuild_agrees() {
     // A full rebuild of the same vault yields the same rows (C-02).
     rebuild(&DiskVault::new(&f.root), &f.parser, &f.root, &f.index).expect("rebuild");
     assert_eq!(table_counts(&f.index), incremental);
+}
+
+#[test]
+fn a_second_event_for_the_same_refused_bytes_is_discarded_by_the_hash_gate() {
+    // A2: the bare row stores the hash of the bytes that failed, so the gate works.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let reconciler = Reconciler::new(&handle);
+    let source = DiskVault::new(&f.root);
+    f.parser
+        .refuses
+        .lock()
+        .expect("lock")
+        .push("a.md".to_owned());
+    write(&f.root, "a.md", "unparseable\n");
+
+    let first = reconciler
+        .index_paths(&source, &f.parser, &never_echo, &[path("a.md")])
+        .expect("index");
+    assert_eq!((first.upserted, first.unparsed), (1, 1));
+    let calls = f.parser.calls.load(Ordering::Relaxed);
+
+    let second = reconciler
+        .index_paths(&source, &f.parser, &never_echo, &[path("a.md")])
+        .expect("index");
+    assert_eq!(second.unchanged, 1);
+    assert_eq!(f.parser.calls.load(Ordering::Relaxed), calls);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_save_of_a_refused_note_is_a_bare_row_and_records_its_echo() {
+    // A2, the save path.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    f.parser
+        .refuses
+        .lock()
+        .expect("lock")
+        .push("a.md".to_owned());
+    write(&f.root, "a.md", "unparseable\n");
+    let echo = SpyEcho::default();
+
+    handle
+        .apply(&DiskVault::new(&f.root), &f.parser, &echo, &path("a.md"))
+        .expect("apply");
+    handle.writer().flush().expect("flush");
+
+    let recorded = echo.recorded.lock().expect("lock").clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, path("a.md"));
+    assert_eq!(
+        hash_of(&f.index, "a.md").expect("row"),
+        recorded[0].1.to_hex()
+    );
+    handle.close().expect("close");
+}
+
+/// A source whose reads of one path fail the way a permission error or a scanner's
+/// sharing violation does: the file exists and cannot be read.
+struct Unreadable<'a> {
+    inner: DiskVault,
+    path: &'a str,
+}
+
+impl NoteSource for Unreadable<'_> {
+    fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+        self.inner.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        if path.as_str() == self.path {
+            return Err(serat_core::VaultError::Io {
+                path: path.as_str().to_owned(),
+                message: "permission denied".to_owned(),
+            });
+        }
+        self.inner.load(path)
+    }
+}
+
+fn blocks_of(index: &Path, relative: &str) -> i64 {
+    let conn = schema::open(&serat_index::index_path(index)).expect("open");
+    conn.query_row(
+        "SELECT count(*) FROM blocks b JOIN notes n ON n.id = b.note_id WHERE n.path = ?1",
+        [relative],
+        |row| row.get(0),
+    )
+    .expect("count")
+}
+
+#[test]
+fn an_unreadable_file_keeps_its_row_and_blocks_on_the_watcher_path_and_the_save_path() {
+    // A1/S1: only NotFound is a delete.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let before = blocks_of(&f.index, "a.md");
+    assert!(before > 0);
+    let source = Unreadable {
+        inner: DiskVault::new(&f.root),
+        path: "a.md",
+    };
+
+    let outcome = Reconciler::new(&handle)
+        .index_paths(&source, &f.parser, &never_echo, &[path("a.md")])
+        .expect("index");
+    assert_eq!(outcome.removed, 0);
+
+    let echo = SpyEcho::default();
+    handle
+        .apply(&source, &f.parser, &echo, &path("a.md"))
+        .expect("apply");
+    handle.writer().flush().expect("flush");
+    assert!(echo.recorded.lock().expect("lock").is_empty());
+
+    assert_eq!(paths_in(&f.index).len(), 3, "a row was removed");
+    assert_eq!(blocks_of(&f.index, "a.md"), before);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_copy_of_a_just_saved_note_is_indexed_and_the_saved_one_is_suppressed() {
+    // The (path, hash) key: save A, write A's bytes to B before A's event drains.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let source = DiskVault::new(&f.root);
+    write(&f.root, "A.md", "# Same bytes\n");
+    let echo = SpyEcho::default();
+    handle
+        .apply(&source, &f.parser, &echo, &path("A.md"))
+        .expect("save A");
+    handle.writer().flush().expect("flush");
+    write(&f.root, "B.md", "# Same bytes\n"); // cp A.md B.md
+
+    let pending = std::cell::RefCell::new(echo.recorded.lock().expect("lock").clone());
+    let take = |p: &VaultPath, h: serat_core::ContentHash| {
+        let mut pending = pending.borrow_mut();
+        match pending.iter().position(|(rp, rh)| rp == p && *rh == h) {
+            Some(i) => {
+                pending.remove(i);
+                true
+            }
+            None => false,
+        }
+    };
+    let reconciler = Reconciler::new(&handle);
+    let parsed = f.parser.calls.load(Ordering::Relaxed);
+
+    let b = reconciler
+        .index_paths(&source, &f.parser, &take, &[path("B.md")])
+        .expect("B");
+    assert_eq!(b.upserted, 1, "B was taken for A's echo");
+    assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed + 1);
+
+    let a = reconciler
+        .index_paths(&source, &f.parser, &take, &[path("A.md")])
+        .expect("A");
+    assert_eq!(a.unchanged, 1, "A's own event was not suppressed");
+    assert!(paths_in(&f.index).contains(&"B.md".to_owned()));
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_save_during_a_large_catch_up_is_accepted_not_refused() {
+    // ADR-0011 item 4: bulk work must not keep the writer's channel full.
+    let f = fixture();
+    for i in 0..3000 {
+        write(&f.root, &format!("bulk/n{i:04}.md"), "# Bulk\nbody\n");
+    }
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let reconciler = Reconciler::new(&handle);
+    let source = DiskVault::new(&f.root);
+    let entries = walk(&f.root);
+    let writer = handle.writer();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let mut refused = 0;
+    let mut saves = 0;
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            reconciler
+                .catch_up(&source, &f.parser, &entries, CatchUp::PathsOnly)
+                .expect("catch up");
+            done.store(true, Ordering::Relaxed);
+        });
+        while !done.load(Ordering::Relaxed) {
+            match serat_index::apply(
+                &writer,
+                &source,
+                &f.parser,
+                &SpyEcho::default(),
+                &path("a.md"),
+            ) {
+                Ok(()) => saves += 1,
+                Err(serat_core::IndexError::QueueFull { .. }) => refused += 1,
+                Err(other) => panic!("{other}"),
+            }
+            // Saves are keystroke-paced, not a hot loop.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    assert!(saves > 0, "the catch-up finished before a save was tried");
+    assert_eq!(
+        refused, 0,
+        "{refused} saves were refused during the catch-up"
+    );
+    handle.close().expect("close");
+}
+
+#[test]
+fn an_op_submitted_after_a_clean_close_reopens_the_marker() {
+    // B2: a clone of the writer handle outliving close_clean must not commit under
+    // clean_close = 1.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let writer = handle.writer();
+    assert!(writer.close_clean().expect("close_clean"));
+    assert_eq!(clean_close(&f.index), 1);
+
+    handle
+        .apply(
+            &DiskVault::new(&f.root),
+            &f.parser,
+            &SpyEcho::default(),
+            &path("a.md"),
+        )
+        .expect("apply");
+    writer.flush().expect("flush");
+    assert_eq!(clean_close(&f.index), 0, "committed under a clean marker");
+    drop(handle);
 }
 
 // --- runtime rebuild ------------------------------------------------------------

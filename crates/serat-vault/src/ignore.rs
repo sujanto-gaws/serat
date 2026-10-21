@@ -45,6 +45,11 @@ pub const IGNORE_FILE: &str = ".seratignore";
 /// absent: matching cost is linear in its lines for every entry of every walk.
 const MAX_IGNORE_FILE_BYTES: usize = 256 * 1024;
 
+/// The most lines read, as well as the bytes: one short pattern per line would otherwise
+/// allow a quarter of a million of them. 1,000 is far above any real ignore file and keeps the
+/// walk to seconds, not minutes, in the worst case.
+const MAX_IGNORE_LINES: usize = 1_000;
+
 /// The rules the walk and the watcher share.
 ///
 /// One type, used by both, because a file the walk skips and the watcher accepts
@@ -132,6 +137,27 @@ impl IgnoreRules {
         Arc::clone(&self.user.read().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// Whether the ignore file hides the file at `relative`, or a directory above it.
+    /// Built-in rules are not consulted: this is what `NoteSource::load` refuses.
+    #[must_use]
+    pub fn user_ignores_path(&self, relative: &str) -> bool {
+        let user = self.user_patterns();
+        if user.is_empty() {
+            return false;
+        }
+        let mut end = 0;
+        let mut segments = relative.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            end += segment.len();
+            let is_dir = segments.peek().is_some();
+            if user.is_ignored(&relative[..end], is_dir) {
+                return true;
+            }
+            end += 1;
+        }
+        false
+    }
+
     /// Whether the directory `relative`, or any directory above it, is excluded: a
     /// directory under an ignored one is not reachable by a walk from the root.
     #[must_use]
@@ -182,7 +208,9 @@ struct Pattern {
 /// re-included, because the directory is never entered.
 ///
 /// Matching folds ASCII case on every platform, as the built-in directory names do
-/// (task #34): the same vault must index the same notes on every machine (C-02).
+/// (task #34): the same vault should index the same notes on every machine (design
+/// goal 1, the vault survives the application). ASCII only: `É` and `é` are different
+/// names to a pattern, as they are to the built-in rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Patterns {
     list: Vec<Pattern>,
@@ -193,7 +221,11 @@ impl Patterns {
     #[must_use]
     pub fn parse(text: &str) -> Self {
         Self {
-            list: text.lines().filter_map(parse_line).collect(),
+            list: text
+                .lines()
+                .take(MAX_IGNORE_LINES)
+                .filter_map(parse_line)
+                .collect(),
         }
     }
 
@@ -209,7 +241,9 @@ impl Patterns {
         if self.list.is_empty() {
             return false;
         }
-        let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+        // Folded once per entry, not once per pattern.
+        let lowered = relative.to_ascii_lowercase();
+        let parts: Vec<&str> = lowered.split('/').filter(|p| !p.is_empty()).collect();
         let mut ignored = false;
         for pattern in &self.list {
             if (pattern.dir_only && !is_dir) || ignored != pattern.negated {
@@ -226,7 +260,14 @@ impl Patterns {
 }
 
 fn parse_line(line: &str) -> Option<Pattern> {
-    let line = line.trim_end_matches(['\r', ' ', '\t']);
+    // Trailing spaces are not part of a pattern unless escaped (`name\ `), as in git.
+    let mut line = line.trim_end_matches('\r');
+    while let Some(rest) = line.strip_suffix([' ', '\t']) {
+        if rest.ends_with('\\') {
+            break;
+        }
+        line = rest;
+    }
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -273,6 +314,16 @@ impl Pattern {
         if !self.anchored {
             return glob_segment(&self.segments[0], name);
         }
+        // No `**`: one segment against one segment, no table. Nearly every anchored
+        // pattern, and the walk asks this of every entry.
+        if !self.segments.iter().any(|segment| segment == "**") {
+            return self.segments.len() == path.len()
+                && self
+                    .segments
+                    .iter()
+                    .zip(path)
+                    .all(|(pattern, part)| glob_segment(pattern, part));
+        }
         // Reachability over (pattern segment, path segment): linear in the product,
         // so a pattern full of `**` cannot make a walk exponential.
         let (p, t) = (self.segments.len(), path.len());
@@ -298,29 +349,44 @@ impl Pattern {
 }
 
 /// Match one name against one glob segment (`*`, `?`, `[...]`, `\x`). The pattern
-/// side is already lower-case.
+/// side is already lower-case, and `name` must already be ASCII-lower-cased.
+///
+/// All-ASCII input, which is nearly every name, is matched as bytes without allocating;
+/// anything else as `char`s. The walk calls this for every entry against every
+/// pattern, so an allocation here is paid 20,000 times per line of the ignore file.
 fn glob_segment(pattern: &str, name: &str) -> bool {
+    if pattern.is_ascii() && name.is_ascii() {
+        return glob(pattern.as_bytes(), name.as_bytes());
+    }
     let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let name: Vec<char> = name.chars().collect();
+    glob(&pattern, &name)
+}
+
+fn glob<T: Copy + PartialOrd + From<u8>>(pattern: &[T], name: &[T]) -> bool {
+    let (star_c, any_c, open_c, escape_c) =
+        (T::from(b'*'), T::from(b'?'), T::from(b'['), T::from(b'\\'));
     let (mut p, mut n) = (0, 0);
     // Where the last `*` was, and how much of the name it has taken so far.
     let mut star: Option<(usize, usize)> = None;
     while n < name.len() {
         let advance = match pattern.get(p) {
-            Some('*') => {
+            Some(&c) if c == star_c => {
                 star = Some((p, n));
                 p += 1;
                 continue;
             }
-            Some('?') => Some((p + 1, n + 1)),
-            Some('[') => match class(&pattern, p, name[n]) {
+            Some(&c) if c == any_c => Some((p + 1, n + 1)),
+            Some(&c) if c == open_c => match class(pattern, p, name[n]) {
                 Some((true, next)) => Some((next, n + 1)),
                 Some((false, _)) => None,
                 // Never closed: a literal `[`.
-                None => (name[n] == '[').then_some((p + 1, n + 1)),
+                None => (name[n] == open_c).then_some((p + 1, n + 1)),
             },
-            Some('\\') if pattern.get(p + 1) == Some(&name[n]) => Some((p + 2, n + 1)),
-            Some(&c) if c != '\\' && c == name[n] => Some((p + 1, n + 1)),
+            Some(&c) if c == escape_c && pattern.get(p + 1) == Some(&name[n]) => {
+                Some((p + 2, n + 1))
+            }
+            Some(&c) if c != escape_c && c == name[n] => Some((p + 1, n + 1)),
             _ => None,
         };
         match (advance, star) {
@@ -333,7 +399,7 @@ fn glob_segment(pattern: &str, name: &str) -> bool {
             (None, None) => return false,
         }
     }
-    while pattern.get(p) == Some(&'*') {
+    while pattern.get(p) == Some(&star_c) {
         p += 1;
     }
     p == pattern.len()
@@ -341,20 +407,26 @@ fn glob_segment(pattern: &str, name: &str) -> bool {
 
 /// A `[...]` class starting at `pattern[start]`: whether `c` is in it, and where the
 /// pattern continues. `None` when the bracket is never closed.
-fn class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+fn class<T: Copy + PartialOrd + From<u8>>(
+    pattern: &[T],
+    start: usize,
+    c: T,
+) -> Option<(bool, usize)> {
+    let (bang, caret, close, dash) = (T::from(b'!'), T::from(b'^'), T::from(b']'), T::from(b'-'));
     let mut i = start + 1;
-    let negate = matches!(pattern.get(i), Some('!' | '^'));
+    let negate = matches!(pattern.get(i), Some(&x) if x == bang || x == caret);
     if negate {
         i += 1;
     }
     let first = i;
     let mut hit = false;
     while let Some(&current) = pattern.get(i) {
-        if current == ']' && i > first {
+        if current == close && i > first {
             return Some((hit != negate, i + 1));
         }
-        if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&end| end != ']') {
-            hit |= (current..=pattern[i + 2]).contains(&c);
+        if pattern.get(i + 1) == Some(&dash) && pattern.get(i + 2).is_some_and(|&end| end != close)
+        {
+            hit |= current <= c && c <= pattern[i + 2];
             i += 3;
         } else {
             hit |= current == c;
@@ -498,7 +570,7 @@ mod tests {
         // filesystems, so a case-sensitive comparison here would walk straight
         // into ".Obsidian", ".GIT" or "Node_Modules" on those platforms while
         // refusing to on Linux — the exact "my vault has different contents
-        // depending on the machine" outcome C-02 promises cannot happen.
+        // depending on the machine" outcome design goal 1 rules out.
         let rules = IgnoreRules::new().ignoring_dir("archive");
         for ignored in [
             ".Serat",

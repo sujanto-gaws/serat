@@ -48,6 +48,9 @@ use crate::incremental::{IndexHandle, build_op};
 use crate::schema::{self, sqlite};
 use crate::writer::WriterHandle;
 
+/// Whether a (path, hash) is the echo of our own save; see `EchoSuppressor::take_echo`.
+type EchoTest<'a> = &'a dyn Fn(&VaultPath, ContentHash) -> bool;
+
 /// What a comparison of the vault with the index may look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchUp {
@@ -147,10 +150,10 @@ impl Reconciler {
     /// Each path is read as it is *now*: gone means remove it (and anything the index
     /// holds beneath it, which is how a deleted or renamed directory leaves);
     /// present means hash it, and parse and submit it only if it is not already what
-    /// the index holds. `is_echo` is asked first with the hash, and should be
-    /// `|hash| vault.echo().take_echo(hash)`: it consumes the entry, so it is asked
-    /// once per file, and a `true` answer skips the file because the save path already
-    /// submitted exactly these bytes.
+    /// the index holds. `is_echo` is asked first with the path and the hash, and should
+    /// be `|path, hash| vault.echo().take_echo(path, hash)`: it consumes the entry, so
+    /// it is asked once per file, and a `true` answer skips the file because the save
+    /// path already submitted exactly these bytes at exactly this path.
     ///
     /// Call it with whatever the queue has accumulated (`WorkQueue::drain`) rather
     /// than once per path. It ends in one `flush`, so when it returns the changes are
@@ -164,7 +167,7 @@ impl Reconciler {
         &self,
         source: &dyn NoteSource,
         parser: &dyn NoteParser,
-        is_echo: &dyn Fn(ContentHash) -> bool,
+        is_echo: EchoTest<'_>,
         paths: &[VaultPath],
     ) -> Result<Outcome, IndexError> {
         let mut outcome = Outcome::default();
@@ -172,10 +175,18 @@ impl Reconciler {
             return Ok(outcome);
         }
         let reader = self.reader()?;
+        let mut flushed = 0;
         for path in paths {
+            self.pace(&outcome, &mut flushed)?;
             let known = row(&reader, path)?;
             match self.submit(source, parser, path, known.as_ref(), Some(is_echo))? {
-                Step::Gone { .. } => {
+                Step::Gone { not_found: false } => {
+                    // It exists and cannot be read now (permissions, a sharing
+                    // violation, a symlink, a directory in its place). That is not a
+                    // delete: the row stays, and the next walk decides.
+                    outcome.unparsed += usize::from(known.is_some());
+                }
+                Step::Gone { not_found: true } => {
                     // The path itself, and everything beneath it: a directory that
                     // was deleted or renamed away arrives here as the path of the
                     // directory, which the index knows only by its children.
@@ -241,6 +252,22 @@ impl Reconciler {
         self.finish(outcome)
     }
 
+    /// Keep at most one batch of this caller's work outstanding in the writer's channel.
+    ///
+    /// A large catch-up submitting freely keeps the 4,096-deep channel full, and the
+    /// save path's non-blocking `submit` is then refused and falls back to the watcher
+    /// (ADR-0011 item 4: bulk work must not starve the interactive producer). One flush
+    /// per `BATCH_SIZE` submits leaves the rest of the depth to saves, at the cost of
+    /// a round trip per batch.
+    fn pace(&self, outcome: &Outcome, flushed: &mut usize) -> Result<(), IndexError> {
+        let submitted = outcome.upserted + outcome.removed;
+        if submitted >= *flushed + crate::writer::BATCH_SIZE {
+            self.writer.flush()?;
+            *flushed = submitted;
+        }
+        Ok(())
+    }
+
     fn finish(&self, outcome: Outcome) -> Result<Outcome, IndexError> {
         // One barrier per batch, not per file: the caller learns "committed" once.
         if outcome.changed() {
@@ -258,7 +285,9 @@ impl Reconciler {
         mode: CatchUp,
     ) -> Result<Outcome, IndexError> {
         let mut outcome = Outcome::default();
+        let mut flushed = 0;
         for entry in entries {
+            self.pace(&outcome, &mut flushed)?;
             let known = rows.remove(entry.path.as_str());
             let candidate = match (&known, mode) {
                 (None, _) => true,
@@ -305,7 +334,7 @@ impl Reconciler {
         parser: &dyn NoteParser,
         path: &VaultPath,
         known: Option<&Row>,
-        is_echo: Option<&dyn Fn(ContentHash) -> bool>,
+        is_echo: Option<EchoTest<'_>>,
     ) -> Result<Step, IndexError> {
         let loaded = match source.load(path) {
             Ok(loaded) => loaded,
@@ -317,7 +346,9 @@ impl Reconciler {
         };
         let hash = loaded.meta.hash;
         let mut outcome = Outcome::default();
-        if is_echo.is_some_and(|is_echo| is_echo(hash))
+        // The echo is keyed by (path, hash): a copy of a just-saved note at another
+        // path carries the same hash and does not match.
+        if is_echo.is_some_and(|is_echo| is_echo(path, hash))
             || known.is_some_and(|row| row.hash == hash.to_hex() && row.kind == loaded.meta.kind)
         {
             outcome.unchanged = 1;
