@@ -95,8 +95,10 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
--- user_version 10 (task #14): index_meta.clean_close, the unclean-shutdown marker. (9 is task
--- #57's parser-only bump; it is unmerged, so this number may be renumbered at merge.)
+-- user_version 9 (task #57): no DDL change; serat-parse now reads block-style frontmatter
+-- lists, so every `aliases:`/`tags:` item the old derivation skipped is a fields row.
+-- user_version 10 (task #14): index_meta.clean_close, the unclean-shutdown marker; and a note
+-- the parser refuses is indexed as a bare row (task #58) rather than skipped.
 PRAGMA user_version = 10;
 
 -- ============================================================================

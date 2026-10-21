@@ -78,7 +78,7 @@ Text with a footnote reference[^1], which this parser does not resolve.\n\
 /// Pinned hash of `CommonMarkParser`'s output for [`CORPUS`]. Update it, in the same
 /// commit that bumps `INDEX_VERSION`, whenever a deliberate change to this parser's
 /// output makes this test fail — never as a change on its own.
-const CORPUS_DIGEST: &str = "c3001cfef219b162bda7ee76c779760fb379381a962ac346d6769682f88a39ec";
+const CORPUS_DIGEST: &str = "e31ce9c6dfc4c726a8f30d5a88598e5af216d8d7267d59c5353ec6cd7265c006";
 
 #[test]
 fn the_corpus_digest_matches_what_this_parser_currently_produces() {

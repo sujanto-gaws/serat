@@ -495,6 +495,13 @@ impl Manifest {
             self.content.frontmatter_keys
         ));
         s.push_str(&format!("    \"block_ids\": {},\n", self.content.block_ids));
+        s.push_str(&format!("    \"aliases\": {},\n", self.content.aliases));
+        s.push_str(&format!(
+            "    \"block_tags\": {},\n",
+            self.content.block_tags
+        ));
+        s.push_str(&format!("    \"flow_tags\": {},\n", self.content.flow_tags));
+        s.push_str(&format!("    \"attendees\": {},\n", self.content.attendees));
         s.push_str(&format!(
             "    \"notes_without_frontmatter\": {},\n",
             self.notes_without_frontmatter
