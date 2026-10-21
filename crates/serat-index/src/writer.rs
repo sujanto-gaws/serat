@@ -428,6 +428,14 @@ impl IndexActor {
         Ok(())
     }
 
+    /// Stop the checkpointer thread and wait for it. `IndexHandle::close` calls this
+    /// before `CloseClean`; idempotent.
+    pub(crate) fn stop_checkpointer(&mut self) {
+        if let Some(mut checkpointer) = self.checkpointer.take() {
+            checkpointer.stop();
+        }
+    }
+
     fn stop(&mut self) {
         // Send Stop rather than dropping the sender. Handles are clones, so the
         // channel only closes when the last one goes, and a caller that still holds
