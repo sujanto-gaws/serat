@@ -33,7 +33,7 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 /// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
 /// [`DDL`], which is asserted by a test rather than remembered by two people — under
 /// ADR-0002 a silent drift costs every user a full reindex.
-pub const INDEX_VERSION: i64 = 5;
+pub const INDEX_VERSION: i64 = 7;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,9 +323,9 @@ mod tests {
 
     #[test]
     fn the_bundled_sqlite_has_fts5() {
-        // FR-NAV-02 and the P2 "phrase inside a PDF findable from the note search
-        // box" gate both sit on this. The bundled build is not the host's SQLite, so
-        // this asserts a property of what we ship.
+        // FR-NAV-02 (note bodies) and, in P2, FR-NAV-08 (the "phrase inside a PDF
+        // findable from the note search box" gate) both sit on this. The bundled
+        // build is not the host's SQLite, so this asserts a property of what we ship.
         let conn = open_in_memory().expect("open");
         conn.execute_batch("CREATE VIRTUAL TABLE probe USING fts5(body);")
             .expect("the bundled SQLite must have FTS5 compiled in");

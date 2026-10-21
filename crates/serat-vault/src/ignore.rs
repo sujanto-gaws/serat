@@ -52,8 +52,17 @@ impl IgnoreRules {
     /// Whether a directory should be descended into.
     #[must_use]
     pub fn is_ignored_dir(&self, name: &str) -> bool {
-        IGNORED_DIRS.contains(&name)
-            || self.extra_dirs.iter().any(|extra| extra == name)
+        // Case-folded (task #34, NFR-SEC-06): Windows and macOS filesystems are
+        // case-insensitive by default, so ".Obsidian" or ".GIT" names the same
+        // directory a case-sensitive comparison would walk straight into —
+        // indexing a vault's own index, or a packfile, on those platforms only.
+        IGNORED_DIRS
+            .iter()
+            .any(|ignored| ignored.eq_ignore_ascii_case(name))
+            || self
+                .extra_dirs
+                .iter()
+                .any(|extra| extra.eq_ignore_ascii_case(name))
             // Every remaining dotted directory. A vault is a folder of files someone
             // reads; a hidden directory in it belongs to a tool, not to them.
             || name.starts_with('.')
@@ -112,6 +121,28 @@ mod tests {
         assert!(rules.is_ignored_dir("archive"));
         assert!(rules.is_ignored_dir(".serat"));
         assert!(!rules.is_ignored_dir("10-projects"));
+    }
+
+    #[test]
+    fn ignored_dir_matching_folds_case() {
+        // Task #34, NFR-SEC-06. Windows and macOS default to case-insensitive
+        // filesystems, so a case-sensitive comparison here would walk straight
+        // into ".Obsidian", ".GIT" or "Node_Modules" on those platforms while
+        // refusing to on Linux — the exact "my vault has different contents
+        // depending on the machine" outcome C-02 promises cannot happen.
+        let rules = IgnoreRules::new().ignoring_dir("archive");
+        for ignored in [
+            ".Serat",
+            ".OBSIDIAN",
+            ".Git",
+            ".Trash",
+            "Node_Modules",
+            "NODE_MODULES",
+            "ARCHIVE",
+            "Archive",
+        ] {
+            assert!(rules.is_ignored_dir(ignored), "{ignored} was not ignored");
+        }
     }
 
     #[test]

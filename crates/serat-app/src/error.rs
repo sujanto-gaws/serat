@@ -49,6 +49,26 @@ pub fn from_vault_error(error: VaultError) -> IpcError {
             path: String::new(),
             message,
         },
+        // ADR-0016 §2's editor-save path (task #33, serat-vault::Vault::write_patch).
+        // `IpcError::StaleHash` already exists for exactly this — the optimistic lock
+        // failing on a plain whole-document write and on a patch set are the same
+        // fact to the front end, "re-read and offer the choice" (§9.1) — so the
+        // patch path reuses it rather than growing a second variant for one race.
+        VaultError::StaleHash { path, found, .. } => IpcError::StaleHash {
+            path,
+            current_hash: found,
+        },
+        // A malformed patch is a client bug (contracts/ipc.rs `InvalidPatch`); the
+        // file is untouched.
+        VaultError::MalformedPatch { path, reason } => IpcError::InvalidPatch {
+            path,
+            message: reason,
+        },
+        // A legitimate edit refused to keep bytes outside it intact; the user is told
+        // (contracts/ipc.rs `LineEndingsWouldFuse`).
+        VaultError::LineEndingsWouldFuse { path, line } => {
+            IpcError::LineEndingsWouldFuse { path, line }
+        }
     }
 }
 
@@ -135,6 +155,37 @@ mod tests {
                 },
                 IpcError::NotWritable {
                     path: "contract.pdf".into(),
+                },
+            ),
+            (
+                VaultError::StaleHash {
+                    path: "a.md".into(),
+                    expected: "aa".repeat(32),
+                    found: "bb".repeat(32),
+                },
+                IpcError::StaleHash {
+                    path: "a.md".into(),
+                    current_hash: "bb".repeat(32),
+                },
+            ),
+            (
+                VaultError::MalformedPatch {
+                    path: "a.md".into(),
+                    reason: "edits overlap".into(),
+                },
+                IpcError::InvalidPatch {
+                    path: "a.md".into(),
+                    message: "edits overlap".into(),
+                },
+            ),
+            (
+                VaultError::LineEndingsWouldFuse {
+                    path: "a.md".into(),
+                    line: 3,
+                },
+                IpcError::LineEndingsWouldFuse {
+                    path: "a.md".into(),
+                    line: 3,
                 },
             ),
         ];

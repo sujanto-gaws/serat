@@ -1,0 +1,31 @@
+# reporoot -- the one definition of "which checkout am I running against" for the
+# bench tier (doclint, budget, vaultgen). Serves NFR-MNT-01, C-06 (tasks #45, #54).
+#
+# No external dependencies, for vaultgen's reason: the generator must build
+# before anything else does. That is asserted by
+# crates/serat-core/tests/dependency_rule.rs
+# (`reporoot_and_vaultgen_take_no_external_dependencies`). It is a bench crate, so
+# nothing under crates/ may depend on it either
+# (`nothing_in_the_product_depends_on_a_bench_crate`). The dev-dependency on
+# tempfile is for its own tests only.
+[package]
+name = "reporoot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Run-time repository-root resolution shared by the bench tools (task #54)"
+
+[lib]
+name = "reporoot"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

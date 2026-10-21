@@ -11,6 +11,11 @@ repository.workspace = true
 serat-core = { workspace = true }
 rusqlite = { workspace = true }
 
+[features]
+# Exposes SearchConn::set_after_prepare so serat-app's command-layer test can hold a
+# search mid-flight. Enabled only from serat-app's [dev-dependencies].
+test-hooks = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

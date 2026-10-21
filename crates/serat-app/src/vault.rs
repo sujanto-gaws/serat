@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use serat_core::SourceEntry;
+use serat_core::{SourceEntry, VaultPath};
 use serat_vault::{Vault, Watcher, WatcherConfig, WorkQueue};
 
 /// How far the vault thread has got, reported as it gets there.
@@ -102,12 +102,31 @@ impl VaultThread {
         F: Fn(Stage) + Send + 'static,
         G: FnOnce() + Send + 'static,
     {
+        Self::spawn_with(vault, gate, on_stage, None)
+    }
+
+    /// As [`Self::spawn`], with the consumer of what the watcher reports. Without one
+    /// the thread drains the queue and discards it, as at P0.
+    ///
+    /// # Errors
+    ///
+    /// Only if the operating system refuses to create a thread.
+    pub fn spawn_with<F, G>(
+        vault: Arc<Vault>,
+        gate: G,
+        on_stage: F,
+        live: Option<Arc<dyn Live>>,
+    ) -> std::io::Result<Self>
+    where
+        F: Fn(Stage) + Send + 'static,
+        G: FnOnce() + Send + 'static,
+    {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
 
         let handle = std::thread::Builder::new()
             .name("serat-vault".to_owned())
-            .spawn(move || run(&vault, gate, &on_stage, &thread_stop))?;
+            .spawn(move || run(&vault, gate, &on_stage, &thread_stop, live.as_deref()))?;
 
         Ok(Self {
             stop,
@@ -130,8 +149,26 @@ impl Drop for VaultThread {
     }
 }
 
+/// What the vault thread hands the watcher's output to (the file tree, the editor
+/// buffers). Called on the vault thread, so an implementation must not panic into it
+/// and must not block for long: the watcher's queue fills behind a slow consumer, and
+/// a full queue is a rescan.
+pub trait Live: Send + Sync {
+    /// A file the watcher reported, after its coalescing window.
+    fn path_changed(&self, path: &VaultPath);
+    /// The watcher lost events, or a directory changed under it: the whole vault may
+    /// disagree with what was last said.
+    fn rescan_required(&self);
+}
+
 /// The thread body, in the order §3.4 requires.
-fn run<F: Fn(Stage), G: FnOnce()>(vault: &Arc<Vault>, gate: G, on_stage: &F, stop: &AtomicBool) {
+fn run<F: Fn(Stage), G: FnOnce()>(
+    vault: &Arc<Vault>,
+    gate: G,
+    on_stage: &F,
+    stop: &AtomicBool,
+    live: Option<&dyn Live>,
+) {
     let queue = Arc::new(WorkQueue::new());
 
     // 1. Watcher first. A failure is reported and is not fatal.
@@ -162,8 +199,25 @@ fn run<F: Fn(Stage), G: FnOnce()>(vault: &Arc<Vault>, gate: G, on_stage: &F, sto
     //    reported as data loss when in fact there is no consumer yet (P0 finding F-11
     //    is about the recovery path; this is about not manufacturing the condition).
     while !stop.load(Ordering::Relaxed) {
-        if queue.pop_timeout(Duration::from_millis(50)).is_none() {
+        let popped = queue.pop_timeout(Duration::from_millis(50));
+        let Some(live) = live else {
             continue;
+        };
+        if let Some(path) = popped {
+            live.path_changed(&path);
+        }
+        // A directory changed, the platform dropped events, or the queue overflowed.
+        // The ticket is taken before the rescan so an overflow during it is not cleared.
+        let events = watcher
+            .as_ref()
+            .map(Watcher::take_events)
+            .unwrap_or_default();
+        let ticket = queue.rescan_needed();
+        if !events.is_empty() || ticket.is_some() {
+            live.rescan_required();
+            if let Some(ticket) = ticket {
+                queue.rescan_completed(ticket);
+            }
         }
     }
 

@@ -12,16 +12,25 @@
 //! in I6.
 
 mod apply;
+/// Whether the `test-hooks` feature is compiled in. serat-app asserts it is not in a
+/// release build, because the feature exposes `SearchConn::set_progress_handler`,
+/// which can disable supersession (§4.5).
+pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
+
 pub mod identity;
 pub mod incremental;
 pub mod open;
+pub mod read;
 pub mod rebuild;
+mod resolve;
 pub mod schema;
+pub mod tree;
 pub mod writer;
 
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild};
+pub use read::{Backlink, Reader, SearchConn, SearchHit, SearchOutcome};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
 pub use schema::{DDL, INDEX_VERSION, IndexState, UnusableReason, bootstrap, inspect, open};
 pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};

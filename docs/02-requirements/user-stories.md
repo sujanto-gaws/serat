@@ -92,6 +92,17 @@ As a pragmatist, I want a split source/preview mode available, so that a live-pr
 
 - Given live preview is disabled, when I open a note, then split mode offers full editing.
 
+### US-41 — Start a new note  (serves FR-VLT-11)
+**Phase:** P1 · **Size:** S
+
+As a daily user, I want to create a note or folder without leaving Serat, so that capturing a new thought never sends me to another tool.
+
+**Acceptance criteria**
+
+- Given a folder selected in the file tree, when I choose New note from the tree or the command palette, then a plain-Markdown file with a unique name appears in that folder, opens in the editor, and is listed in the tree without a rebuild.
+- Given a folder selected in the file tree, when I choose New folder, then the folder appears in the tree and I can create notes in it.
+- Given a note I created, when I open it in a plain text editor outside Serat, then it is ordinary Markdown with no template or proprietary syntax.
+
 ### US-38 — Arrange my workspace  (serves FR-EDT-09, NFR-USE-03)
 **Phase:** P2 · **Size:** M
 

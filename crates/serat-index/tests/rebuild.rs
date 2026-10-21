@@ -226,7 +226,10 @@ type:: project
     let conn = schema::open(&rebuild_path(dir.path())).expect("open");
     let recorded: String = conn
         .query_row(
-            "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL LIMIT 1",
+            // The largest count over `notes`' indexes: the partial ones (type, sidecar)
+            // legitimately cover fewer rows than the table.
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = 'notes' AND idx IS NOT NULL
+              ORDER BY CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER) DESC LIMIT 1",
             [],
             |row| row.get(0),
         )

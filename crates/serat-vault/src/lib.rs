@@ -25,11 +25,20 @@
 //! Nothing here sits on the keystroke path, which is this pipeline's actual design
 //! constraint — not throughput (design goal 2).
 
+pub mod diff;
 pub mod echo;
 pub mod hash;
 pub mod ignore;
+pub mod patch;
+#[cfg(test)]
+mod patch_props;
+pub mod position;
 pub mod queue;
+pub mod refusal;
+pub mod tree;
 pub mod walk;
+#[cfg(all(test, unix))]
+mod walk_refusal_tests;
 pub mod watch;
 
 use std::fs;
@@ -37,12 +46,18 @@ use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use serat_core::{ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, VaultError, VaultPath};
+use serat_core::{
+    ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, Platform, VaultError, VaultPath,
+};
 
 pub use echo::EchoSuppressor;
 pub use hash::hash_bytes;
 pub use ignore::{IgnoreRules, is_note_file};
+pub use patch::Edit;
+pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
+pub use refusal::{Refusal, RefusalLog};
+pub use tree::{RescanNeeded, TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
@@ -57,6 +72,10 @@ pub struct Vault {
     /// all — see [`Vault::write_atomic`] and the [`EchoGuard`] impl below for where
     /// recording now happens and why (F-224, F-226).
     echo: Arc<EchoSuppressor>,
+    /// Paths the walk or the watcher could not turn into a `VaultPath`, reported
+    /// rather than dropped (task #34's amendment). Shared for the same reason
+    /// `echo` is: the walk and the watcher must both be able to add to it.
+    refusals: RefusalLog,
 }
 
 impl Vault {
@@ -94,6 +113,7 @@ impl Vault {
             root: strip_verbatim(&canonical),
             ignore,
             echo: Arc::new(EchoSuppressor::new()),
+            refusals: RefusalLog::new(),
         })
     }
 
@@ -119,6 +139,18 @@ impl Vault {
     #[must_use]
     pub fn echo(&self) -> &Arc<EchoSuppressor> {
         &self.echo
+    }
+
+    /// Paths the walk or the watcher refused to index, because their name is
+    /// illegal on the platform this binary runs on (task #34's amendment,
+    /// FR-VLT-01, design goal 5).
+    ///
+    /// Empty on an ordinary vault. When it is not, a caller has a status fact
+    /// worth surfacing — "N files could not be indexed" plus the list — rather
+    /// than a gap in the tree nothing explains.
+    #[must_use]
+    pub fn refusals(&self) -> &RefusalLog {
+        &self.refusals
     }
 
     /// The absolute path of a vault-relative one, refusing to resolve through a
@@ -153,19 +185,59 @@ impl Vault {
     /// # Errors
     ///
     /// [`VaultError::PathEscapesVault`] if any path component between the root and the
-    /// target, inclusive, is a symlink.
+    /// target, inclusive, is a symlink, or if the accumulated path does not end up
+    /// inside the canonical root at all.
     pub fn resolve(&self, path: &VaultPath) -> Result<PathBuf, VaultError> {
+        self.resolve_segments(path.as_str().split('/'), path.as_str())
+    }
+
+    /// The body of [`Vault::resolve`], parameterised over raw segments rather
+    /// than a [`VaultPath`].
+    ///
+    /// A seam for tests (task #34's amendment): `VaultPath::new` refuses every
+    /// segment shape that would trip the containment check below — a `:` on
+    /// Windows, a leading `/` — which is correct, but it also means no test that
+    /// goes through `resolve` can reach that check's own line, and a check no
+    /// test can reach is not proven to do anything. Calling this directly with a
+    /// segment a `VaultPath` could never hold (`"/etc"`, which `PathBuf::push`
+    /// treats as absolute and uses to *replace* the accumulated path — on every
+    /// platform, not only Windows) exercises the containment check on its own
+    /// terms, independent of whichever upstream guard currently keeps that shape
+    /// from arising in practice.
+    fn resolve_segments<'a>(
+        &self,
+        segments: impl Iterator<Item = &'a str>,
+        reported_path: &str,
+    ) -> Result<PathBuf, VaultError> {
         let mut current = self.root.clone();
-        for component in path.as_str().split('/') {
+        for component in segments {
             current.push(component);
             let is_symlink = fs::symlink_metadata(&current)
                 .map(|meta| meta.is_symlink())
                 .unwrap_or(false);
             if is_symlink {
                 return Err(VaultError::PathEscapesVault {
-                    path: path.as_str().to_owned(),
+                    path: reported_path.to_owned(),
                 });
             }
+        }
+        // Defence in depth (task #34, NFR-SEC-06, T-07, T-10): `VaultPath::new`
+        // already refuses the segment shapes that let a `PathBuf::push` escape the
+        // root — a `:` anywhere on Windows, in particular, which lets a rootless
+        // drive-prefixed segment like "C:Users" *replace* the accumulated path
+        // instead of extending it — but a guard that lives only at construction is
+        // one mechanism, and one mechanism that regresses (a future segment shape
+        // nobody thought of, a change to `VaultPath` that loosens a check) fails
+        // open with nothing here to catch it. This is the narrowest point every
+        // resolution passes through, so it is where a second, independent check
+        // belongs: whatever `current` ended up being, it must still be inside
+        // `self.root`. Factored out as `is_contained` so the containment rule
+        // itself is unit-testable independently of how `current` was built, and
+        // reachable end-to-end through `resolve_segments` above.
+        if !is_contained(&self.root, &current) {
+            return Err(VaultError::PathEscapesVault {
+                path: reported_path.to_owned(),
+            });
         }
         Ok(current)
     }
@@ -200,7 +272,7 @@ impl Vault {
         let absolute = strip_verbatim(&absolute);
 
         let relative = absolute.strip_prefix(&self.root).map_err(|_| escaped())?;
-        VaultPath::new(display(relative))
+        vault_path_from_relative(Platform::current(), relative)
     }
 
     /// Every indexable file in the vault, in a deterministic order.
@@ -358,6 +430,181 @@ impl Vault {
 
         Ok(hash)
     }
+
+    /// Apply a patch set against `base_hash` and write the result, atomically
+    /// (ADR-0016 §2, C-04).
+    ///
+    /// This is the editor save path — the one this crate offers as an
+    /// alternative to [`Vault::write_atomic`] when the caller holds an edit
+    /// script rather than a whole new document. Unlike `write_atomic`, it never
+    /// creates a file: a save is always against a base that was read, so a
+    /// missing target is [`VaultError::NotFound`], and `write_file`'s
+    /// `base_hash: None` creation case stays `write_atomic`'s alone (ADR-0016
+    /// §2, closing paragraph).
+    ///
+    /// The steps are ADR-0016 §2's, in order:
+    ///
+    /// 1. Re-read the file and refuse with [`VaultError::StaleHash`] if its hash
+    ///    is not `base_hash` — the optimistic lock.
+    /// 2. Map each edit's positions onto byte offsets and check the ranges are
+    ///    ordered and disjoint ([`patch::apply_edits`]).
+    /// 3. Convert every `\n` in an insert to the note's own line ending.
+    /// 4. Splice and write the temporary file, then **re-hash the target
+    ///    immediately before the rename** and refuse with `StaleHash` — removing
+    ///    the temporary file — if it moved. The remaining window (one hash plus
+    ///    one `rename`) is stated as a bound, not hidden: an external write
+    ///    landing inside it is overwritten, silently, exactly as ADR-0016 §2
+    ///    records.
+    /// 5. Rename and return the new hash.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotAMarkdownTarget`] for a non-Markdown target (T-06,
+    /// mirroring `write_atomic`). [`VaultError::NotFound`] if the file does not
+    /// exist. [`VaultError::PathEscapesVault`] if it resolves through a symlink
+    /// (T-07). [`VaultError::StaleHash`] per steps 1 and 4 above.
+    /// [`VaultError::MalformedPatch`] if the edits do not apply to the base
+    /// cleanly. [`VaultError::AtomicWriteFailed`] if the write itself fails, in
+    /// which case the original file is untouched.
+    pub fn write_patch(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+    ) -> Result<ContentHash, VaultError> {
+        self.write_patch_hooked(path, base_hash, edits, || {})
+    }
+
+    /// [`Vault::write_patch`] with a hook that runs after the temporary file is
+    /// complete and before the re-hash: the window the hostile tests (an external
+    /// write, a crash) need to reach deterministically.
+    fn write_patch_hooked(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        before_rehash: impl FnOnce(),
+    ) -> Result<ContentHash, VaultError> {
+        if !path.is_markdown() {
+            return Err(VaultError::NotAMarkdownTarget {
+                path: path.as_str().to_owned(),
+            });
+        }
+
+        let target = self.resolve(path)?;
+        let stale = |found: ContentHash| VaultError::StaleHash {
+            path: path.as_str().to_owned(),
+            expected: base_hash.to_hex(),
+            found: found.to_hex(),
+        };
+
+        // Step 1: the hash lock. A delete or a rewrite between the caller's read
+        // and this call surfaces here rather than silently patching the wrong
+        // bytes.
+        let current_bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let current_hash = hash_bytes(&current_bytes);
+        if current_hash != base_hash {
+            return Err(stale(current_hash));
+        }
+        let base_text =
+            std::str::from_utf8(&current_bytes).map_err(|_| VaultError::MalformedPatch {
+                path: path.as_str().to_owned(),
+                reason: "base is not valid utf-8; a non-utf-8 file is never opened for editing"
+                    .to_owned(),
+            })?;
+
+        // Steps 2 and 3: map, validate and splice. Nothing outside a patched
+        // range is touched — see `patch::apply_edits`'s own guarantee.
+        let new_text = patch::apply_edits(base_text, edits, path.as_str())?;
+        let new_bytes = new_text.into_bytes();
+        let new_hash = hash_bytes(&new_bytes);
+
+        let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
+            path: path.as_str().to_owned(),
+            reason: "has no parent directory".to_owned(),
+        })?;
+        let failed = |message: String| VaultError::AtomicWriteFailed {
+            path: path.as_str().to_owned(),
+            message,
+        };
+
+        // F-33's rule applies here too: the replacement inherits the original's
+        // permissions.
+        let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
+
+        let temp = unique_temp_path(parent, path.file_name());
+        let write_temp = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&temp)?;
+            file.write_all(&new_bytes)?;
+            file.sync_all()?;
+            if let Some(permissions) = existing_permissions.clone() {
+                fs::set_permissions(&temp, permissions)?;
+            }
+            Ok(())
+        };
+        if let Err(err) = write_temp() {
+            let _ = fs::remove_file(&temp);
+            return Err(failed(err.to_string()));
+        }
+
+        before_rehash();
+
+        // Step 4's re-hash, immediately before the rename (ADR-0016 §2). This is
+        // what "immediately before" means in code: nothing between this read and
+        // the `fs::rename` call below touches the disk.
+        let reread = match fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                return Err(VaultError::io(path.as_str(), &err));
+            }
+        };
+        let reread_hash = hash_bytes(&reread);
+        if reread_hash != base_hash {
+            let _ = fs::remove_file(&temp);
+            return Err(stale(reread_hash));
+        }
+
+        if let Err(err) = fs::rename(&temp, &target) {
+            let _ = fs::remove_file(&temp);
+            return Err(failed(err.to_string()));
+        }
+
+        Ok(new_hash)
+    }
+
+    /// The edit script from `base` to the file as it is on disk now, in `base`'s
+    /// coordinates (ADR-0016 §3; FR-VLT-05). The answer to a stale-base refusal and
+    /// to `request_external_diff`: the caller holds the base text, the vault holds
+    /// the disk.
+    ///
+    /// Returns the disk hash with the script, or `None` when the disk bytes hash to
+    /// `base_hash` (nothing to report). A disk change that is only a line-ending
+    /// flip returns `Some` with an empty script and the new hash.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] / [`VaultError::Io`] as for any read;
+    /// [`VaultError::MalformedPatch`] if the disk bytes are not UTF-8 (such a note
+    /// is never open for editing).
+    pub fn diff_against_disk(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        base: &str,
+    ) -> Result<Option<(ContentHash, diff::EditScript)>, VaultError> {
+        let target = self.resolve(path)?;
+        let bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let hash = hash_bytes(&bytes);
+        if hash == base_hash {
+            return Ok(None);
+        }
+        let other = std::str::from_utf8(&bytes).map_err(|_| VaultError::MalformedPatch {
+            path: path.as_str().to_owned(),
+            reason: "the file on disk is not valid utf-8".to_owned(),
+        })?;
+        Ok(Some((hash, diff::edit_script(base, other))))
+    }
 }
 
 impl EchoGuard for Vault {
@@ -393,6 +640,58 @@ fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Turn a path already relative to the vault root into a [`VaultPath`], refusing
+/// a real path component that would otherwise be silently misread.
+///
+/// `VaultPath::new` splits on both `/` and `\`, which is right for a path a user
+/// typed or pasted — a Windows spelling reaching a text field — but wrong for a
+/// path the filesystem itself just handed back: on a platform where `\` is an
+/// ordinary filename character, a real file named `"a\b.md"` would otherwise
+/// silently alias to the two-segment path `"a/b.md"` (task #34's amendment, nit
+/// (b)). This checks every real [`Component`] for a literal `\` before joining
+/// them — on Windows the check is skipped, because `\` there is the separator
+/// and cannot appear inside a single component's text at all.
+pub(crate) fn vault_path_from_relative(
+    platform: Platform,
+    relative: &Path,
+) -> Result<VaultPath, VaultError> {
+    let joined = display(relative);
+    if platform != Platform::Windows {
+        for component in relative.components() {
+            let Some(text) = component.as_os_str().to_str() else {
+                // Lossy rendering would map two different non-UTF-8 names onto one
+                // string, and `VaultPath` is UTF-8 by construction.
+                return Err(VaultError::InvalidPath {
+                    path: joined,
+                    reason: "file name is not valid UTF-8".to_owned(),
+                });
+            };
+            if text.contains('\\') {
+                return Err(VaultError::InvalidPath {
+                    path: joined,
+                    reason: format!(
+                        "file name {text:?} contains a literal '\\', which this platform \
+                         allows in a name but which would otherwise be re-read as a path \
+                         separator"
+                    ),
+                });
+            }
+        }
+    }
+    VaultPath::new(joined)
+}
+
+/// Whether `candidate` is `root` itself, or lies inside it.
+///
+/// [`Vault::resolve`]'s defence-in-depth check (task #34, NFR-SEC-06, T-07, T-10):
+/// `Path::starts_with` compares components, not raw text, so a sibling directory
+/// that merely shares `root`'s string prefix (`/vault-old` against `/vault`) is
+/// correctly not contained — that distinction is `std`'s, not reimplemented here,
+/// which is the point of using it rather than a string comparison.
+fn is_contained(root: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +716,163 @@ mod tests {
         assert_eq!(loaded.meta.kind, NoteKind::Note);
         assert_eq!(loaded.meta.size, 25);
         assert_eq!(loaded.meta.path, path);
+    }
+
+    #[test]
+    fn write_patch_touches_only_the_patched_range() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault
+            .write_atomic(&path, b"status:: draft\ntitle:: Serat\n")
+            .expect("seed");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 9),
+            position::Position::new(0, 14),
+            "active".to_owned(),
+        )];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"status:: active\ntitle:: Serat\n"
+        );
+    }
+
+    #[test]
+    fn write_patch_preserves_crlf_and_a_bom_it_did_not_touch() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault
+            .write_atomic(&path, "\u{FEFF}first\r\nsecond\r\n".as_bytes())
+            .expect("seed");
+
+        // Edit only the second line; the BOM, the first line and every CRLF must
+        // survive unchanged.
+        let edits = [patch::Edit::new(
+            position::Position::new(1, 0),
+            position::Position::new(1, 6),
+            "SECOND".to_owned(),
+        )];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            "\u{FEFF}first\r\nSECOND\r\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn write_patch_refuses_a_stale_base() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"original").expect("seed");
+        // Someone else writes before our patch lands.
+        vault
+            .write_atomic(&path, b"changed by someone else")
+            .expect("write");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 0),
+            position::Position::new(0, 8),
+            "patched".to_owned(),
+        )];
+        let result = vault.write_patch(&path, base_hash, &edits);
+        assert!(
+            matches!(result, Err(VaultError::StaleHash { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"changed by someone else",
+            "a refused patch must leave the file exactly as the other writer left it"
+        );
+    }
+
+    #[test]
+    fn write_patch_leaves_no_temporary_file_behind_on_a_stale_base() {
+        let (dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"original").expect("seed");
+        vault.write_atomic(&path, b"changed").expect("write");
+
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 0),
+            position::Position::new(0, 8),
+            "patched".to_owned(),
+        )];
+        assert!(vault.write_patch(&path, base_hash, &edits).is_err());
+
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(ignore::TEMP_PREFIX))
+            .collect();
+        assert!(strays.is_empty(), "left behind {strays:?}");
+    }
+
+    #[test]
+    fn write_patch_refuses_a_malformed_patch_without_touching_the_file() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base_hash = vault.write_atomic(&path, b"short").expect("seed");
+
+        // A position past the end of the only line.
+        let edits = [patch::Edit::new(
+            position::Position::new(0, 99),
+            position::Position::new(0, 99),
+            "x".to_owned(),
+        )];
+        let result = vault.write_patch(&path, base_hash, &edits);
+        assert!(
+            matches!(result, Err(VaultError::MalformedPatch { .. })),
+            "{result:?}"
+        );
+        assert_eq!(vault.read(&path).expect("read").bytes, b"short");
+    }
+
+    #[test]
+    fn write_patch_refuses_a_non_markdown_target() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("40-refs/contract.pdf").expect("path");
+        // No file exists, but the markdown check runs before any read.
+        let bogus_hash = hash_bytes(b"anything");
+        let result = vault.write_patch(&path, bogus_hash, &[]);
+        assert!(matches!(result, Err(VaultError::NotAMarkdownTarget { .. })));
+    }
+
+    #[test]
+    fn write_patch_on_a_file_the_property_test_style_random_patch_leaves_everything_else_alone() {
+        // NFR-MNT-03's property, exercised directly rather than only through
+        // `patch::apply_edits`'s unit tests: many small, non-overlapping edits
+        // against a realistic multi-line, mixed-content base, applied through
+        // the full `write_patch` path (hash lock, atomic write, re-hash before
+        // rename), and every byte outside a patched range must survive.
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        let base = "status:: draft\ntitle:: Serat\nbody line one\nbody line two\n";
+        let base_hash = vault.write_atomic(&path, base.as_bytes()).expect("seed");
+
+        // Two disjoint, ascending edits: one on line 0, one on line 2.
+        let edits = [
+            patch::Edit::new(
+                position::Position::new(0, 9),
+                position::Position::new(0, 14),
+                "active".to_owned(),
+            ),
+            patch::Edit::new(
+                position::Position::new(2, 0),
+                position::Position::new(2, 0),
+                "ONE ".to_owned(),
+            ),
+        ];
+        vault.write_patch(&path, base_hash, &edits).expect("patch");
+
+        assert_eq!(
+            vault.read(&path).expect("read").bytes,
+            b"status:: active\ntitle:: Serat\nONE body line one\nbody line two\n"
+        );
     }
 
     #[test]
@@ -525,6 +981,73 @@ mod tests {
             torn.load(Ordering::Relaxed),
             0,
             "a reader saw a file that was neither the old contents nor the new"
+        );
+    }
+
+    #[test]
+    fn write_patch_never_leaves_a_reader_with_a_torn_file() {
+        // FR-VLT-03's old-or-new property, for `write_patch` rather than
+        // `write_atomic`: a reader spinning on the file while a patch lands must
+        // see exactly the pre-patch bytes or exactly the post-patch bytes, never
+        // a mixture — `write_patch` shares `write_atomic`'s temp-and-rename tail,
+        // but it is its own code path (a hash lock and a re-hash sit in front of
+        // it), so the property is asserted against it directly rather than
+        // inferred from the other test.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("big.md").expect("path");
+        let old_line = "o".repeat(4 * 1024 * 1024);
+        let old_bytes = old_line.clone().into_bytes();
+        let mut hash = vault.write_atomic(&path, &old_bytes).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let absolute = vault.resolve(&path).expect("resolve");
+            let stop = Arc::clone(&stop);
+            let torn = Arc::clone(&torn);
+            let reads = Arc::clone(&reads);
+            let old_bytes = old_bytes.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(seen) = fs::read(&absolute) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        let all_o = seen.iter().all(|&b| b == b'o');
+                        let all_n = seen.iter().all(|&b| b == b'n');
+                        if seen.len() != old_bytes.len() || !(all_o || all_n) {
+                            torn.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+
+        // Each round replaces the whole line via one patch, alternating the
+        // character so a torn read is distinguishable from either valid state.
+        for round in 0..20 {
+            let replacement = if round % 2 == 0 { 'n' } else { 'o' };
+            let edits = [patch::Edit::new(
+                position::Position::new(0, 0),
+                position::Position::new(0, 4 * 1024 * 1024),
+                replacement.to_string().repeat(4 * 1024 * 1024),
+            )];
+            hash = vault.write_patch(&path, hash, &edits).expect("patch");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader");
+
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the reader never managed a read, so this proved nothing"
+        );
+        assert_eq!(
+            torn.load(Ordering::Relaxed),
+            0,
+            "a reader saw a file that was neither the pre-patch nor the post-patch contents"
         );
     }
 
@@ -638,6 +1161,79 @@ mod tests {
     }
 
     #[test]
+    fn a_colon_bearing_vault_path_is_refused_before_it_ever_reaches_resolve_on_windows() {
+        // Task #34, amended after code-reviewer-2's regression finding. The
+        // public door is closed at `VaultPath::new` on `Platform::Windows`
+        // (NFR-SEC-06, T-07, T-10): a segment with a `:` anywhere — not just a
+        // leading drive prefix — must never become a `VaultPath` there, so it
+        // can never reach `resolve` to test `PathBuf::push`'s Windows
+        // replace-instead-of-extend behaviour in the first place. On every other
+        // platform the same names are ordinary and must be accepted — a colon
+        // has no special meaning to `PathBuf::push` there — which is exactly
+        // what made the first version of this fix a regression: it refused
+        // these names everywhere, dropping real Linux and macOS files.
+        for bad in ["a/C:/Windows/x", "a/C:Users/x", "note.md:hidden"] {
+            assert!(
+                serat_core::VaultPath::new_for_platform(bad, serat_core::Platform::Windows)
+                    .is_err(),
+                "accepted on Windows: {bad:?}"
+            );
+            assert!(
+                serat_core::VaultPath::new_for_platform(bad, serat_core::Platform::Other).is_ok(),
+                "refused on a platform where a colon is an ordinary character: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_contained_refuses_a_candidate_outside_the_root() {
+        // The containment check `resolve()` applies after the symlink loop
+        // (task #34, NFR-SEC-06), tested directly as a pure function of two
+        // paths, independent of how the candidate was built. See
+        // `resolve_segments_containment_check_is_reachable_directly` below for
+        // the same check exercised end-to-end through `Vault::resolve_segments`.
+        assert!(!is_contained(Path::new("/vault"), Path::new("/etc/passwd")));
+        assert!(!is_contained(Path::new("/vault"), Path::new("C:Users")));
+        // A sibling directory that merely shares the root's text prefix is not
+        // contained either — `Path::starts_with` is component-wise, and a naive
+        // string-prefix reimplementation of this check would get this wrong.
+        assert!(!is_contained(
+            Path::new("/vault"),
+            Path::new("/vault-old/secret.md")
+        ));
+        assert!(is_contained(
+            Path::new("/vault"),
+            Path::new("/vault/10-projects/note.md")
+        ));
+        assert!(is_contained(Path::new("/vault"), Path::new("/vault")));
+    }
+
+    #[test]
+    fn resolve_segments_containment_check_is_reachable_directly() {
+        // Task #34's amendment. `VaultPath::new` refuses every segment shape
+        // that would trip `is_contained` inside `resolve` — a `:` on Windows, a
+        // leading `/` — which is correct, but it also means nothing that goes
+        // through the public `resolve(&VaultPath)` can reach that check's own
+        // line on any platform, and a check nothing can reach is not proven to
+        // do anything. `resolve_segments` is the seam: called directly with a
+        // raw segment a `VaultPath` could never hold, it proves the check fires
+        // for real, not only in the `is_contained` unit test above.
+        //
+        // "/etc" is the segment: `PathBuf::push` of a string that is itself
+        // absolute *replaces* the accumulated path rather than extending it —
+        // this is ordinary, documented `std` behaviour on every platform
+        // (`PathBuf::push`'s own docs give exactly this example), not the
+        // Windows-only drive-letter case `VaultPath::new`'s `:` rule defends
+        // against. So this test needs no `#[cfg]` at all.
+        let (_dir, vault) = vault();
+        let result = vault.resolve_segments(["a", "/etc"].into_iter(), "a//etc");
+        assert!(
+            matches!(result, Err(VaultError::PathEscapesVault { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn an_absolute_path_inside_the_vault_relativises_to_one_spelling() {
         let (_dir, vault) = vault();
         let path = VaultPath::new("20-systems/indexing.md").expect("path");
@@ -645,6 +1241,57 @@ mod tests {
 
         let absolute = vault.resolve(&path).expect("resolve");
         assert_eq!(vault.relativise(&absolute).expect("relativise"), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relativise_refuses_a_real_name_with_a_literal_backslash() {
+        // `a\b.md` is one file name on Unix; `VaultPath::new` would re-read it as
+        // `a/b.md`, aliasing a real file to a path nothing on disk has.
+        let (dir, vault) = vault();
+        let odd = dir.path().join("a\\b.md");
+        std::fs::write(&odd, b"x").expect("write");
+        let result = vault.relativise(&odd);
+        assert!(
+            matches!(result, Err(VaultError::InvalidPath { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relativise_refuses_a_name_that_is_not_utf8_rather_than_aliasing_it() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let (dir, vault) = vault();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        std::fs::write(&odd, b"x").expect("write");
+        let result = vault.relativise(&odd);
+        assert!(
+            matches!(result, Err(VaultError::InvalidPath { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relativise_accepts_names_only_windows_would_refuse() {
+        // Task #34's regression, at `relativise` directly: `aux.md`, a colon in
+        // a filename and a directory named with a trailing dot are all
+        // ordinary, legal names on this platform, and `relativise` — the one
+        // door every path arriving from outside the process goes through
+        // (watcher events, IPC arguments, drag-and-drop) — must accept them
+        // rather than refuse a real file (FR-VLT-01, design goal 5).
+        let (dir, vault) = vault();
+        for legal in ["aux.md", "Meeting 10:30.md", "Misc./n.md"] {
+            let path = VaultPath::new(legal).expect("path");
+            vault.write_atomic(&path, b"body").expect("write");
+            let absolute = dir.path().join(legal);
+            assert_eq!(
+                vault.relativise(&absolute).expect("relativise"),
+                path,
+                "{legal} was refused"
+            );
+        }
     }
 
     #[test]
@@ -860,6 +1507,28 @@ mod permission_tests {
         let path = VaultPath::new("10-projects/new-subdir/note.md").expect("path");
         vault.write_atomic(&path, b"# New\n").expect("write");
         assert_eq!(vault.read(&path).expect("read").bytes, b"# New\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pathbuf_push_of_a_rootless_drive_prefixed_segment_replaces_the_path() {
+        // Task #34's actual mechanism, confirmed against the real platform rather
+        // than assumed: `PathBuf::push` of a segment like "C:Users" — a drive
+        // letter with no root, as opposed to "C:\Users" — discards whatever was
+        // accumulated so far instead of extending it. This is exactly what let
+        // "a/C:/Windows/x" escape the vault root with no symlink involved before
+        // `VaultPath::new` refused the `:` outright. The test documents the `std`
+        // behaviour the fix depends on continuing to hold; it does not call any
+        // Serat code, because `VaultPath::new`'s guard now makes the vulnerable
+        // call into `resolve()` unreachable through the public API.
+        let mut current = PathBuf::from(r"C:\vault\a");
+        current.push("C:Users");
+        assert_eq!(
+            current,
+            PathBuf::from("C:Users"),
+            "PathBuf::push no longer replaces on a rootless drive-prefixed push; \
+             re-examine whether the `:` guard in VaultPath::new is still load-bearing"
+        );
     }
 
     /// Creates an NTFS directory junction with `mklink /J`.

@@ -63,6 +63,7 @@
 //! | Surface | Commands / channels / events | Design |
 //! |---|---|---|
 //! | File tree | `open_tree` + `Channel<TreeMessage>` (streaming), `mark_tree` | ADR-0015, §3.5 |
+//! | Creating notes and folders | `write_file` with `base_hash: None` (a note), `create_folder` (a folder) | FR-VLT-11, ADR-0016, T-07 |
 //! | Choosing a vault | `choose_vault` (native dialog, no path parameter) | T-08 |
 //! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change` | ADR-0016, §3.3 |
 //! | Invalidation | event `index://changed` (throttled, invalidation only) | §3.1 step 6 |
@@ -72,6 +73,7 @@
 //! | Links in the editor | `resolve_links` (batched per viewport), `note_anchors` | §9.3 |
 //! | Assets | `asset_info`; bytes via the `serat-asset` scheme (not a command); fallback `read_asset_range` (raw bytes) | §7.4, ADR-0017 |
 //! | Settings, command registry | `get_ui_settings`, `set_live_preview`, `set_keybinding` | §9.3, FR-PLT-05 |
+//! | Names the vault cannot show | `refused_names`; the count rides on `IndexStatus::refused_names` | FR-VLT-01, task #34 |
 //! | `.serat/` ignore offer | `gitignore_offer_status`, `append_gitignore_entry`, `decline_gitignore_offer` | NFR-CMP-04, T-06 |
 //!
 //! `write_file` stays, and in P1 its **only** job is creating a note: the editor
@@ -305,7 +307,64 @@ pub struct IndexStatus {
     /// is the application's, not the harness's.
     #[ts(type = "number")]
     pub since_process_start_ms: u64,
+    /// How many file names in this vault the walk and the watcher could not turn
+    /// into a vault path and so do not show (task #34's `Vault::refusals()`;
+    /// mostly Windows-only name rules: `:`, device names, a trailing dot or
+    /// space). FR-VLT-01, design goal 5: a file Serat cannot show is reported,
+    /// never silently absent. The front end renders it as one status fact, "N
+    /// names not shown", and fetches the list behind it with `refused_names`.
+    ///
+    /// The count is of distinct paths: `RefusalLog::len()`, the length of the
+    /// `refused_names` list. It saturates at [`REFUSED_NAMES_CAP`], and at the
+    /// cap the front end says "1000 or more". It does not add
+    /// `RefusalLog::overflowed()`. That counter counts refusal events past the
+    /// cap, not distinct paths, because an unstored path the watcher refuses
+    /// twice is counted twice. Adding it would overstate the number of names.
+    /// `None` (absent on the wire) means serat-app is not counting yet, or no
+    /// vault is open. It never means zero, so the front end shows nothing for
+    /// it rather than "0 names not shown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub refused_names: Option<u32>,
 }
+
+/// The most refused names the log holds, the status counts and `refused_names`
+/// returns. It matches serat-vault's `RefusalLog` bound (task #34). The log keeps
+/// the first 1000 distinct paths, and counts later new ones in `overflowed()`
+/// without storing them, so memory stays bounded on a vault full of names one
+/// platform cannot hold.
+pub const REFUSED_NAMES_CAP: u32 = 1000;
+
+/// `refused_names() -> Vec<RefusedName>`
+///
+/// Serves FR-VLT-01 (design goal 5). The list behind `IndexStatus::refused_names`:
+/// every file name the walk or the watcher refused, with the reason, at most
+/// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
+/// distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
+/// watcher sees it change) replaces its reason rather than adding an entry.
+/// **Entries leave only at the next walk**, which clears the log and refills it.
+/// A refused file that is deleted or renamed away stays listed until then, so
+/// the list can name a file that is already gone. That is accepted, because
+/// the list is a report, never a path a command acts on.
+/// **A read, not a
+/// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
+/// An empty list when nothing was refused or no vault is open. Granted to `main`
+/// in the ACL (ADR-0012). It takes no argument and reveals only names inside the
+/// open vault, which the user can already see in their own file manager.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RefusedName {
+    /// The name as found on disk, relative to the vault root, `/`-separated.
+    /// It is not a `VaultPath`, because it failed to become one. It is for
+    /// display only and is never passed back to a command.
+    pub path: String,
+    /// Why it was refused, for the user (for example "contains a `:`, which is
+    /// a drive prefix or an NTFS alternate data stream on Windows").
+    pub reason: String,
+}
+
+/// The command name for [`RefusedName`]'s list.
+pub const REFUSED_NAMES_COMMAND: &str = "refused_names";
 
 // ============================================================================
 // Events
@@ -442,6 +501,11 @@ pub enum RebuildReason {
 /// | `Io`                | `IpcError::Io`                              |
 /// | `AtomicWriteFailed` | `IpcError::Io`                              |
 /// | `Watcher`           | never reaches a command; reported as status   |
+/// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
+/// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
+///
+/// The last two rows are task #33's patch path in serat-vault (ADR-0016 §2,
+/// merged at `5be43ed`), mapped in `crates/serat-app/src/error.rs`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -511,6 +575,23 @@ pub enum IpcError {
         path: String,
         /// What was wrong, for the log.
         message: String,
+    },
+
+    /// A `save_patch` that is well formed but would delete the bytes between a
+    /// lone `\r` and a `\n` in a mixed-ending note, so the two would fuse into
+    /// one `\r\n` and swallow a line (P1, ADR-0016 §2). **Not a client bug,
+    /// and not a conflict**: the edit is one the user can legitimately make, and
+    /// the only byte-preserving outcome is to refuse it. The file is untouched
+    /// and the buffer stays dirty. The front end shows a clear, user-facing
+    /// error naming the line: the note mixes line-ending styles there, and the
+    /// user can edit that line differently or normalise the note's endings in
+    /// another tool. A save that is refused this way is never retried
+    /// automatically, because it would be refused again.
+    LineEndingsWouldFuse {
+        /// Vault-relative path.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
     },
 
     /// The operating system refused.
@@ -604,6 +685,72 @@ pub struct Span {
 /// native dialog. The FR-VLT-01 clock (ADR-0015 §3) starts when it returns.
 pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
 
+/// Arguments to `create_folder`.
+///
+/// `create_folder(args: CreateFolderArgs) -> Result<FolderCreated, IpcError>`
+///
+/// Serves FR-VLT-11 (US-41), the folder half. A note is created through
+/// `write_file` with `base_hash: None`. A folder has no content, so it does not
+/// go through `write_file`: ADR-0016 restricts that command to creating notes, and
+/// creating a placeholder file to make a folder exist would write something the
+/// user did not ask for (goal 1).
+///
+/// The T-07 boundary is the same as every other command that takes a path:
+/// - `path` becomes a `VaultPath` under task #34's rules, or it is refused as
+///   `IpcError::PathEscapesVault`;
+/// - it is resolved through `Vault::resolve`, which refuses a symlink component;
+/// - **a path that is, or is inside, an ignored directory** (`.serat/`,
+///   `.obsidian/`, `.git/`, ...), **compared case-insensitively**, is refused as
+///   `IpcError::NotWritable`. On macOS and Windows `.Obsidian/x` lands in
+///   `.obsidian/`, so an exact comparison would let it through. NFR-CMP-01 keeps
+///   `.obsidian/` untouched, and `.serat/` is the index's;
+/// - **after `create_dir`, the new directory is canonicalised and must
+///   `starts_with` the canonical root.** If it does not, it is removed with
+///   `remove_dir` and the call returns `IpcError::PathEscapesVault`. Between the
+///   resolve and the `create_dir`, a parent could be swapped for a symlink, and
+///   the directory would then land outside the vault (NFR-SEC-06). This check
+///   closes that window, except that an empty directory can exist outside the
+///   vault for the moment before it is removed. That residue is stated rather
+///   than hidden. **The `AlreadyExists` branch checks containment too** and
+///   returns `IpcError::PathEscapesVault` if it fails, **but it never removes
+///   anything**. `remove_dir` runs only on a directory this call created. If a
+///   parent was swapped for a symlink to a place that already holds an empty
+///   directory of that name, that directory is not Serat's to delete (goal 1).
+///   serat-app's hostile suite swaps a parent for a symlink between resolve and
+///   create, in two cases. (a) The target name is absent outside: the test
+///   asserts the refusal and the removal. (b) An empty directory of that name
+///   already exists outside: the test asserts `PathEscapesVault` and that the
+///   outside directory still exists afterwards.
+///
+/// It creates exactly one directory. **The parent must already exist**
+/// (`IpcError::NotFound` otherwise), so a typo cannot create a chain of
+/// folders. It writes no file content. **It is idempotent**: an existing
+/// directory at `path` returns `created: false` and changes nothing. A file
+/// already at `path` is `IpcError::Io`. The front end picks a unique name
+/// first, as it does for notes, and **compares names case-insensitively** when
+/// it does, because macOS and Windows file systems do. The tree shows the new folder through
+/// ADR-0015's live `Upsert` from the watcher, with no rebuild, and it is an empty
+/// folder (FR-VLT-01's gated mark does not count it). The index is not
+/// touched, because the index has no rows for folders. Granted to `main` in the
+/// ACL (ADR-0012).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CreateFolderArgs {
+    /// Vault-relative, `/`-separated path of the folder to create.
+    pub path: String,
+}
+
+/// The command name for [`CreateFolderArgs`].
+pub const CREATE_FOLDER_COMMAND: &str = "create_folder";
+
+/// A `create_folder` that succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FolderCreated {
+    /// `false` when the directory already existed and nothing was done.
+    pub created: bool,
+}
+
 // ---------------------------------------------------------------------------
 // File tree (ADR-0015, §3.5) — streaming
 // ---------------------------------------------------------------------------
@@ -619,6 +766,13 @@ pub const CHOOSE_VAULT_COMMAND: &str = "choose_vault";
 /// Message order: the root `Listing` alone first, then further `Listing`s
 /// breadth-first, then `Complete`; afterwards any mix of `Upsert`, `Remove`,
 /// differing catch-up `Listing`s and, once, `WalkSettled`.
+///
+/// **Two ordering obligations on Rust (ADR-0015 §1), which the front end relies
+/// on.** (1) Any `Listing` sent after a `Remove` already reflects that `Remove`.
+/// (2) Any `Upsert` into a directory whose `Listing` has not been sent yet is
+/// superseded by that `Listing`. So the front end treats a `Remove` for a
+/// directory it has no listing for as a no-op. serat-app and serat-vault keep
+/// both, and task #13 tests both in Rust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
@@ -734,6 +888,23 @@ pub enum TreeMark {
     Complete,
 }
 
+/// Event `tree://status`: the tree stream gave up. Emitted once when the session
+/// was replaced `MAX_RESTARTS` times and kept dying (a panic in the stream's
+/// sink), after which the tree no longer updates. The front end shows "file tree
+/// stopped updating; reopen the vault"; calling `open_tree` again starts afresh.
+/// Not a `TreeMessage`: the stream it would travel on is the thing that failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TreeStatus {
+    /// Session scope; discard if it is not the open vault.
+    pub vault_id: String,
+    /// `true` once the stream has stopped for good.
+    pub stopped: bool,
+}
+
+/// The tree-status event name.
+pub const TREE_STATUS_EVENT: &str = "tree://status";
+
 // ---------------------------------------------------------------------------
 // Editor buffers (ADR-0016, §3.3)
 // ---------------------------------------------------------------------------
@@ -778,6 +949,8 @@ pub struct NoteBufferArgs {
 /// the hash lock, re-hashed immediately before the rename. Errors: `StaleHash`
 /// (leave the buffer dirty, no blind retry — wait for or request the
 /// `ExternalChange`), `InvalidPatch` (a client bug; the file is untouched),
+/// `LineEndingsWouldFuse` (a deletion in a mixed-ending note would fuse a lone
+/// `\r` with a `\n`; shown to the user, the file is untouched, never retried),
 /// `NotWritable` (not Markdown, rule 3). On success `serat-app` moves its
 /// recorded base for this note to the new hash.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -983,6 +1156,28 @@ pub struct HeadingRef {
 /// query is free text, `"phrases"` and at most one `[key:value]` (§4.5); it is
 /// parsed in Rust into one of three fixed statements and never reaches FTS5 as
 /// syntax.
+///
+/// **At most one full-text search is in flight per open vault** (§4.5, #15
+/// ruling). A query with free text (R1, or R1 + R3) runs on serat-index's one
+/// dedicated search connection, which is not part of the read pool. Each
+/// full-text search does four things in order:
+/// 1. it increments the vault's search generation (an `AtomicU64`) and keeps
+///    the new value;
+/// 2. it calls `interrupt()` through rusqlite's `get_interrupt_handle()`;
+/// 3. it takes the connection's lock, and returns `SearchOutcome::Superseded`
+///    without running a statement if the generation has moved on, so a queued
+///    stale search never runs;
+/// 4. it runs, while a `progress_handler` on that connection interrupts the
+///    statement as soon as the generation is no longer its own, so an interrupt
+///    that arrived before the statement started is not lost.
+///
+/// The handler is a callback, not an SQL function, so C-03 holds. Every older
+/// call returns `SearchOutcome::Superseded` rather than an error. serat-app
+/// waits for the lock inside `spawn_blocking`, off the async executor. So a
+/// superseded 230-560 ms search never holds a pooled connection that backlinks or a property lookup
+/// is waiting for. A property-only query (R3) runs on the pool and is never
+/// interrupted, and neither are `backlinks` or any other read. The front end
+/// also drops any response that is not for its latest request.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SearchArgs {
@@ -990,7 +1185,11 @@ pub struct SearchArgs {
     pub query: String,
     /// Hits to skip.
     pub offset: u32,
-    /// At most 50.
+    /// At most 50 when the query has free text (R1, R1 + R3), and at most 500
+    /// for a property-only `[key:value]` query (R3), which returns all 500 in
+    /// one statement rather than ten pages (architecture.md §4.5, ruled on task
+    /// #15's measurement). serat-index clamps to the ceiling for the statement
+    /// the query selects. It is not an error to exceed it.
     pub limit: u16,
 }
 
@@ -1011,6 +1210,10 @@ pub enum SearchOutcome {
     /// An unbalanced `"`. The search panel does not submit one; this answers
     /// one that arrives anyway, without running a statement (§4.5).
     UnbalancedQuote,
+    /// A newer full-text search interrupted this one (`SQLITE_INTERRUPT` on the
+    /// search connection). It is not an error, it is never shown to the user, and
+    /// the front end discards it, because it has already sent the newer request.
+    Superseded,
 }
 
 /// One search or property-lookup hit.

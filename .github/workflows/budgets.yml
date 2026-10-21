@@ -31,9 +31,45 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # A budget measured in a debug build is not a measurement.
+  #
+  # RULE: release builds are per package (`-p`), NEVER `--workspace`. budget links
+  # serat-index with its `test-hooks` feature, and a workspace-wide build unifies
+  # that feature into serat-app, whose const assert (crates/serat-app/src/lib.rs)
+  # then refuses to compile a release build carrying test hooks. Debug is
+  # unaffected. Every command in this file is already `-p`-scoped; keep it so. The
+  # `serat-app-release-guard` job below exercises the guard (task #54, NFR-MNT-01).
   CARGO_PROFILE: release
 
 jobs:
+  # The test-hooks guard, exercised: serat-app built alone in release must compile,
+  # i.e. nothing in ITS graph turns `test-hooks` on. If someone adds the feature to
+  # serat-app's own dependency edge, this fails here rather than at release time.
+  # Independent of `vault`, cheap, and runs on every PR and every push to main.
+  serat-app-release-guard:
+    name: "serat-app builds in release without test-hooks"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p serat-app --release
+      # The other direction: with test-hooks forced on, the same build MUST fail, and
+      # fail on the guard's own message (not on some unrelated error). If this step
+      # passes the assert is dead and the first step proves nothing.
+      - name: The guard fires when test-hooks is unified in
+        shell: bash
+        run: |
+          if out=$(cargo check -p serat-app --release --features serat-index/test-hooks 2>&1); then
+            echo "$out"
+            echo "::error::serat-app built in release with test-hooks on; the const assert is not firing"
+            exit 1
+          fi
+          echo "$out" | grep -q "test-hooks must not reach a release build" || {
+            echo "$out"
+            echo "::error::the build failed, but not on the test-hooks guard"
+            exit 1
+          }
+
   # NFR-MNT-02: the vault is generated from one command and is byte-identical.
   # Everything below is measured against it, so if this fails the other jobs
   # are measuring something unknown and are not worth running.
@@ -129,6 +165,30 @@ jobs:
         with:
           name: prf01-serat-term
           path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  # Report-only (task #47): architecture §4.5 states latency *expectations* for the
+  # P1 read paths, not budgets, so this job never fails on a slow number. It fails
+  # only if it cannot measure. It exists so the numbers are produced on every run and
+  # land in an artifact rather than in someone's terminal.
+  p1-read-paths:
+    name: "FR-NAV-02 / NFR-PRF-03 · P1 read paths and link-resolving saves (report only)"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure and print the report
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin p1-read-paths -- --vault 20k | tee bench/out/p1-read-paths.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-read-paths
+          path: bench/out/p1-read-paths.txt
           if-no-files-found: ignore
 
   # NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
