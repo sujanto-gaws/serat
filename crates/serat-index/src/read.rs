@@ -341,7 +341,7 @@ impl Reader {
     ///
     /// For `bench/budget`'s diagnoses only (task #53: reading pragmas back, counting
     /// statement runs). Not part of any caller's contract; the application never calls it.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         f(&self.conn)
     }
@@ -568,14 +568,14 @@ pub struct SearchConn {
     interrupt: InterruptHandle,
     conn: Mutex<Connection>,
     /// Test hook: called after the statement is prepared and bound, before its first step.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     after_prepare: Mutex<Option<TestHook>>,
     /// Test hook: how many times the progress handler has been called.
     #[cfg(test)]
     handler_calls: Arc<AtomicU64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 type TestHook = Box<dyn Fn() + Send>;
 
 impl std::fmt::Debug for SearchConn {
@@ -594,6 +594,28 @@ type Statement<'a> = dyn Fn(&Connection, &dyn Fn()) -> Result<Vec<SearchHit>, ru
 /// (architecture 4.5, task #51).
 const PROGRESS_OPS: i32 = 10_000;
 
+/// The supersession progress handler (a callback, not an SQL function: C-03): stops the
+/// running statement whenever `latest != running`. One construction for `open` and the
+/// bench toggle.
+fn install_handler(
+    conn: &Connection,
+    latest: &Arc<AtomicU64>,
+    running: &Arc<AtomicU64>,
+    #[cfg(test)] calls: &Arc<AtomicU64>,
+) -> Result<(), rusqlite::Error> {
+    let (l, r) = (Arc::clone(latest), Arc::clone(running));
+    #[cfg(test)]
+    let calls = Arc::clone(calls);
+    conn.progress_handler(
+        PROGRESS_OPS,
+        Some(move || {
+            #[cfg(test)]
+            calls.fetch_add(1, Ordering::SeqCst);
+            l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
+        }),
+    )
+}
+
 impl SearchConn {
     /// Open the vault's search connection, read-only, configured like a pool member.
     ///
@@ -601,6 +623,24 @@ impl SearchConn {
     ///
     /// [`IndexError::Sqlite`] if it cannot be opened.
     pub fn open(db_path: &Path) -> Result<Arc<Self>, IndexError> {
+        Self::open_with_generation(db_path, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// As [`SearchConn::open`], with the generation counter supplied by the caller.
+    ///
+    /// The counter is what makes "at most one full-text search in flight" (§4.5) true
+    /// *across* connections: an owner that reopens the connection (the index file was
+    /// replaced) passes the same counter to the new one, so a search on either
+    /// supersedes a search on the other. The owner may also bump it to supersede
+    /// whatever is in flight before it drops the connection.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if it cannot be opened.
+    pub fn open_with_generation(
+        db_path: &Path,
+        latest: Arc<AtomicU64>,
+    ) -> Result<Arc<Self>, IndexError> {
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -609,20 +649,15 @@ impl SearchConn {
         conn.set_prepared_statement_cache_capacity(16);
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
             .map_err(sqlite)?;
-        let latest = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicU64::new(0));
-        let (l, r) = (Arc::clone(&latest), Arc::clone(&running));
         #[cfg(test)]
         let handler_calls = Arc::new(AtomicU64::new(0));
-        #[cfg(test)]
-        let calls = Arc::clone(&handler_calls);
-        conn.progress_handler(
-            PROGRESS_OPS,
-            Some(move || {
-                #[cfg(test)]
-                calls.fetch_add(1, Ordering::SeqCst);
-                l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
-            }),
+        install_handler(
+            &conn,
+            &latest,
+            &running,
+            #[cfg(test)]
+            &handler_calls,
         )
         .map_err(sqlite)?;
         let interrupt = conn.get_interrupt_handle();
@@ -631,46 +666,52 @@ impl SearchConn {
             running,
             interrupt,
             conn: Mutex::new(conn),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             after_prepare: Mutex::new(None),
             #[cfg(test)]
             handler_calls,
         }))
     }
 
-    /// Run `f` on the search connection, under its lock.
-    ///
-    /// For `bench/budget`'s diagnoses only (task #53), like [`Self::set_progress_handler`].
-    #[doc(hidden)]
+    /// Run `f` on the search connection, under its lock. For `bench/budget`'s diagnoses
+    /// only (task #53), like [`Self::set_progress_handler`].
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         f(&conn)
+    }
+
+    /// Install a hook called once a statement is prepared and bound, before its first
+    /// step, so a test can hold a search mid-flight. Not for production use.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_after_prepare(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .after_prepare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// Install (`true`) or remove (`false`) the progress handler on this same connection.
     ///
     /// For `bench/budget`'s p1-read-paths only: it measures the handler's overhead on
     /// ONE connection, warmed the same way, because comparing two connections measured
-    /// page-cache warmth rather than the handler (task #51). Not part of any caller's
-    /// contract; the application never calls it.
+    /// page-cache warmth rather than the handler (task #51). Behind `test-hooks`
+    /// because `set_progress_handler(false)` silently disables supersession (§4.5);
+    /// the application never enables that feature.
     ///
     /// # Errors
     ///
     /// [`IndexError::Sqlite`].
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_progress_handler(&self, on: bool) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if on {
-            let (l, r) = (Arc::clone(&self.latest), Arc::clone(&self.running));
-            #[cfg(test)]
-            let calls = Arc::clone(&self.handler_calls);
-            conn.progress_handler(
-                PROGRESS_OPS,
-                Some(move || {
-                    #[cfg(test)]
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    l.load(Ordering::SeqCst) != r.load(Ordering::SeqCst)
-                }),
+            install_handler(
+                &conn,
+                &self.latest,
+                &self.running,
+                #[cfg(test)]
+                &self.handler_calls,
             )
         } else {
             conn.progress_handler(0, None::<fn() -> bool>)
@@ -690,7 +731,7 @@ impl SearchConn {
             }
             self.running.store(own, Ordering::SeqCst);
             let before_step = || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 if let Some(hook) = self
                     .after_prepare
                     .lock()

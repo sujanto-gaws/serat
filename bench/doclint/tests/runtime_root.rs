@@ -87,24 +87,71 @@ fn environment_variable_names_the_root() {
 
 #[test]
 fn resolution_precedence_and_fallback() {
-    use doclint::resolve_root;
+    use doclint::{Rule, resolve_root};
     let s = |x: &str| x.to_string();
     let env = PathBuf::from("/env");
-    assert_eq!(
-        resolve_root(
-            &[s("--root"), s("/flag")],
-            Some(&env),
-            Some(Path::new("/cwd"))
-        ),
-        PathBuf::from("/flag")
-    );
-    assert_eq!(resolve_root(&[], Some(&env), Some(Path::new("/cwd"))), env);
+    let r = resolve_root(
+        &[s("--root"), s("/flag")],
+        Some(&env),
+        Some(Path::new("/cwd")),
+    )
+    .unwrap();
+    assert_eq!((r.path, r.rule), (PathBuf::from("/flag"), Rule::Flag));
+    let r = resolve_root(&[], Some(&env), Some(Path::new("/cwd"))).unwrap();
+    assert_eq!((r.path, r.rule), (env, Rule::Env));
     // No flag, no env, and a cwd with no workspace above it: the compiled root.
     let t = tempfile::tempdir().unwrap();
-    let fallback = resolve_root(&[], None, Some(t.path()));
+    let r = resolve_root(&[], None, Some(t.path())).unwrap();
+    assert_eq!(r.rule, Rule::CompiledIn);
     assert!(
-        fallback.join("bench/doclint/Cargo.toml").exists(),
+        r.path.join("bench/doclint/Cargo.toml").exists(),
         "fallback should be the build-time checkout, got {}",
-        fallback.display()
+        r.path.display()
     );
+}
+
+/// The first line of every bin's report names the root and the rule (task #54).
+#[test]
+fn the_first_line_names_the_root_and_the_rule_that_chose_it() {
+    let t = temp_repo();
+    let (_, text) = run(t.path(), &[], None);
+    let first = text.lines().next().unwrap_or("");
+    assert!(
+        first.starts_with("root: ") && first.contains("[workspace] Cargo.toml above"),
+        "first line: {first:?}"
+    );
+    let root = t.path().display().to_string();
+    let (_, text) = run(t.path(), &["--root", &root], None);
+    assert!(text.lines().next().unwrap().ends_with("(from --root)"));
+    let (_, text) = run(t.path(), &[], Some(t.path()));
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .ends_with("(from SERAT_REPO_ROOT)")
+    );
+}
+
+/// With no `[workspace]` above the working directory the compiled-in checkout is
+/// used; that must be said on the first line, not discovered by reading the output.
+#[test]
+fn the_compiled_in_fallback_is_announced() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (_, text) = run(elsewhere.path(), &[], None);
+    let first = text.lines().next().unwrap_or("");
+    assert!(
+        first.starts_with("root: ") && first.contains("compiled-in fallback"),
+        "first line: {first:?}"
+    );
+}
+
+#[test]
+fn a_bare_root_flag_is_an_error_not_a_silent_fallback() {
+    let t = temp_repo();
+    for args in [&["--root"][..], &["--root="][..]] {
+        let (out, text) = run(t.path(), args, None);
+        assert!(!out.status.success(), "{args:?} must fail:\n{text}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--root needs a directory"), "{args:?}: {err}");
+    }
 }

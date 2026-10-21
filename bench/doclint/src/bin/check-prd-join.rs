@@ -9,7 +9,14 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let report = match doclint::prd_join::check_prd_join(&doclint::repo_root()) {
+    let root = match doclint::announce_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL  {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match doclint::prd_join::check_prd_join(&root) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("FAIL  could not run the PRD/architecture.md join check\n  {e}");

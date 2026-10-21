@@ -57,7 +57,14 @@ path = "src/bin/p1-save-tail.rs"
 name = "p1-search-gap"
 path = "src/bin/p1-search-gap.rs"
 
+# FR-VLT-01's tree path, Rust side (ADR-0015): warm and no-index arms, reported. The
+# binding tree_complete - T_open is task #9's.
+[[bin]]
+name = "p1-tree-path"
+path = "src/bin/p1-tree-path.rs"
+
 [dependencies]
+reporoot = { path = "../reporoot" }
 vaultgen = { path = "../vaultgen" }
 # Read sqlite_stat1 straight out of the index for F-47, rather than trusting a
 # number the code under test reports -- the same argument as recomputing the
@@ -65,7 +72,8 @@ vaultgen = { path = "../vaultgen" }
 # "trace": the save-tail and search-gap benches read statement profile events.
 rusqlite = { workspace = true, features = ["trace"] }
 serat-core = { path = "../../crates/serat-core" }
-serat-index = { path = "../../crates/serat-index" }
+# test-hooks: p1-read-paths toggles the progress handler on one connection (task #51).
+serat-index = { path = "../../crates/serat-index", features = ["test-hooks"] }
 serat-parse = { path = "../../crates/serat-parse" }
 serat-vault = { path = "../../crates/serat-vault" }
 

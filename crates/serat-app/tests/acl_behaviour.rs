@@ -114,6 +114,13 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
             commands::set_keybinding,
             commands::search,
             commands::backlinks,
+            commands::open_tree,
+            commands::mark_tree,
+            commands::note_opened,
+            commands::note_closed,
+            commands::save_patch,
+            commands::request_external_diff,
+            commands::rebase_buffer,
             commands::gitignore_offer_status,
             commands::append_gitignore_entry,
             commands::decline_gitignore_offer,
@@ -258,6 +265,91 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
             "set_keybinding",
             json!({ "args": { "command_id": "x.y", "change": { "kind": "reset" } } }),
         ),
+    ] {
+        let answer = invoke(&webview, cmd, body);
+        assert!(
+            !matches!(&answer, Err(e) if is_acl_rejection(e)),
+            "{cmd} was refused by the ACL layer: {answer:?}"
+        );
+    }
+
+    // Task #18c: the tree and editor-buffer grants. `open_tree` needs a webview-made
+    // channel the mock cannot supply, so it is only required to get past the ACL (its
+    // failure is the channel's); the rest are driven end to end.
+    let tree = invoke(
+        &webview,
+        "open_tree",
+        json!({ "onMessage": "__CHANNEL__:1" }),
+    );
+    assert!(
+        !matches!(&tree, Err(e) if is_acl_rejection(e)),
+        "open_tree was refused by the ACL layer: {tree:?}"
+    );
+    let marked = invoke(
+        &webview,
+        "mark_tree",
+        json!({ "args": { "mark": "first_screen", "entries_in_model": 0 } }),
+    );
+    assert!(
+        !matches!(&marked, Err(e) if is_acl_rejection(e)),
+        "mark_tree was refused by the ACL layer: {marked:?}"
+    );
+
+    let read = invoke(
+        &webview,
+        "read_file",
+        json!({ "args": { "path": "existing.md" } }),
+    )
+    .expect("read_file");
+    let hash = read.deserialize::<Value>().expect("FileContents")["hash"]
+        .as_str()
+        .expect("hash")
+        .to_owned();
+    let buffer = json!({ "args": { "path": "existing.md", "base_hash": hash } });
+    for (cmd, body) in [
+        ("note_opened", buffer.clone()),
+        ("request_external_diff", buffer.clone()),
+    ] {
+        let answer = invoke(&webview, cmd, body);
+        assert!(
+            !matches!(&answer, Err(e) if is_acl_rejection(e)),
+            "{cmd} was refused by the ACL layer: {answer:?}"
+        );
+        answer.unwrap_or_else(|e| panic!("{cmd} must succeed once past the ACL: {e}"));
+    }
+    let saved = invoke(
+        &webview,
+        "save_patch",
+        json!({ "args": {
+            "path": "existing.md",
+            "base_hash": hash,
+            "patches": [{
+                "from": { "line": 0, "col": 2 },
+                "to": { "line": 0, "col": 10 },
+                "insert": "Patched",
+            }],
+        } }),
+    );
+    assert!(
+        !matches!(&saved, Err(e) if is_acl_rejection(e)),
+        "save_patch was refused by the ACL layer: {saved:?}"
+    );
+    saved.expect("save_patch must succeed once past the ACL");
+    assert_eq!(
+        std::fs::read_to_string(vault.join("existing.md")).expect("read back"),
+        "# Patched\n",
+        "save_patch's grant let the call through, but the patch did not land"
+    );
+    for (cmd, body) in [
+        (
+            "rebase_buffer",
+            json!({ "args": {
+            "path": "existing.md",
+            "disk_hash": hash,
+            "buffer": "# Patched\n",
+        } }),
+        ),
+        ("note_closed", buffer),
     ] {
         let answer = invoke(&webview, cmd, body);
         assert!(

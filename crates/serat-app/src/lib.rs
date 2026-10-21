@@ -34,6 +34,13 @@
 //! types a second time, into `crates/serat-app/bindings/`. That directory is ignored
 //! and is not the committed copy.
 
+// Feature unification must not smuggle serat-index's test hooks into a release build
+// (task #52): `cargo build --workspace --release` unifies them in via bench/budget.
+const _: () = assert!(
+    !serat_index::TEST_HOOKS || cfg!(debug_assertions),
+    "test-hooks must not reach a release build"
+);
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -45,6 +52,7 @@ use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 mod acl_manifest;
 pub mod cli;
 pub mod commands;
+pub mod editor;
 pub mod error;
 pub mod folder;
 pub mod gitignore;
@@ -55,6 +63,7 @@ mod security_config;
 pub mod settings;
 pub mod startup;
 pub mod state;
+pub mod tree_stream;
 pub mod vault;
 
 /// The IPC contract, taken by path from `contracts/`.
@@ -275,6 +284,13 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::decline_gitignore_offer,
             commands::search,
             commands::backlinks,
+            commands::open_tree,
+            commands::mark_tree,
+            commands::note_opened,
+            commands::note_closed,
+            commands::save_patch,
+            commands::request_external_diff,
+            commands::rebase_buffer,
         ])
         .setup(move |app| {
             state.startup.mark_runtime_ready();
@@ -289,6 +305,29 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                     // event name Tauri will not accept, and a silently undelivered
                     // status is indistinguishable from an index that never changed.
                     eprintln!("serat: {INDEX_STATUS_EVENT} could not be emitted: {err}");
+                }
+            });
+
+            // 1b. And note://external-change: unthrottled, not ordered against command
+            //     responses (ADR-0016 §2), so the front end's rules decide when to apply it.
+            let external = handle.clone();
+            state.events.install_external(move |change| {
+                if let Err(err) = external.emit(ipc::EXTERNAL_CHANGE_EVENT, change) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::EXTERNAL_CHANGE_EVENT
+                    );
+                }
+            });
+
+            // 1c. And tree://status: the tree stream gave up (goal 5: say so).
+            let tree_status = handle.clone();
+            state.events.install_tree_status(move |status| {
+                if let Err(err) = tree_status.emit(ipc::TREE_STATUS_EVENT, status) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::TREE_STATUS_EVENT
+                    );
                 }
             });
 

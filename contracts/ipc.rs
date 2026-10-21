@@ -504,8 +504,8 @@ pub enum RebuildReason {
 /// | `MalformedPatch`    | `IpcError::InvalidPatch`                    |
 /// | `LineEndingsWouldFuse` | `IpcError::LineEndingsWouldFuse`         |
 ///
-/// The last two rows arrive with task #33's patch path in serat-vault (ADR-0016
-/// §2). Until it merges, no `VaultError` produces either `IpcError`.
+/// The last two rows are task #33's patch path in serat-vault (ADR-0016 §2,
+/// merged at `5be43ed`), mapped in `crates/serat-app/src/error.rs`.
 ///
 /// `serat_core::ParseError::NotUtf8` maps to `IpcError::NotUtf8`. The two
 /// variants with no counterpart in the core taxonomy — `IpcError::NotWritable`
@@ -887,6 +887,23 @@ pub enum TreeMark {
     /// `TreeMessage::Complete` applied and painted.
     Complete,
 }
+
+/// Event `tree://status`: the tree stream gave up. Emitted once when the session
+/// was replaced `MAX_RESTARTS` times and kept dying (a panic in the stream's
+/// sink), after which the tree no longer updates. The front end shows "file tree
+/// stopped updating; reopen the vault"; calling `open_tree` again starts afresh.
+/// Not a `TreeMessage`: the stream it would travel on is the thing that failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TreeStatus {
+    /// Session scope; discard if it is not the open vault.
+    pub vault_id: String,
+    /// `true` once the stream has stopped for good.
+    pub stopped: bool,
+}
+
+/// The tree-status event name.
+pub const TREE_STATUS_EVENT: &str = "tree://status";
 
 // ---------------------------------------------------------------------------
 // Editor buffers (ADR-0016, §3.3)

@@ -67,6 +67,9 @@ struct WalEv {
     /// Frames in the WAL, and frames checkpointed, as `wal_checkpoint_v2` reports.
     n_log: i32,
     n_ckpt: i32,
+    /// The checkpoint call failed (e.g. SQLITE_BUSY). Like sqlite3WalDefaultHook, the hook
+    /// ignores that and returns Ok; the failure is only counted.
+    ckpt_err: bool,
     /// The checkpoint's own duration.
     dur: Duration,
 }
@@ -149,11 +152,15 @@ fn on_wal(wal: &Wal, frames: i32) -> rusqlite::Result<()> {
     let threshold = AUTOCKPT.load(Ordering::Relaxed);
     if threshold > 0 && frames >= threshold {
         // sqlite3WalDefaultHook: sqlite3_wal_checkpoint(db, zDb), which is PASSIVE.
-        let (n_log, n_ckpt) = wal.checkpoint_v2(CheckpointMode::PASSIVE)?;
+        match wal.checkpoint_v2(CheckpointMode::PASSIVE) {
+            Ok((n_log, n_ckpt)) => {
+                ev.n_log = n_log;
+                ev.n_ckpt = n_ckpt;
+            }
+            Err(_) => ev.ckpt_err = true,
+        }
         ev.ran = true;
         ev.dur = entered.elapsed();
-        ev.n_log = n_log;
-        ev.n_ckpt = n_ckpt;
     }
     if let Some(last) = PROBE
         .lock()
@@ -294,6 +301,7 @@ struct Rec {
     ran: bool,
     n_log: i32,
     n_ckpt: i32,
+    ckpt_err: bool,
     segs_before: u32,
     segs_after: u32,
     levels_after: Vec<u32>,
@@ -500,6 +508,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         rec.ran = tx.wal.ran;
         rec.n_log = tx.wal.n_log;
         rec.n_ckpt = tx.wal.n_ckpt;
+        rec.ckpt_err = tx.wal.ckpt_err;
         if tx.analyze > 0 {
             return Err("an ANALYZE ran inside a save; the cause list does not cover it".into());
         }
@@ -787,6 +796,18 @@ fn report(
         ckpts.len(),
     );
     let ck: Vec<&Rec> = recs.iter().filter(|r| r.ran).collect();
+    let partial: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.ran && !r.ckpt_err && r.n_ckpt != r.n_log)
+        .map(|(i, _)| i)
+        .collect();
+    let failed = ck.iter().filter(|r| r.ckpt_err).count();
+    println!(
+        "  checkpoints with n_ckpt != n_log (a pinned reader held the WAL): {} {:?} · checkpoint calls that errored: {failed}",
+        partial.len(),
+        &partial[..partial.len().min(20)]
+    );
     if let (Some(first), Some(last)) = (ck.first(), ck.last()) {
         let mut d: Vec<f64> = ck.iter().map(|r| r.ckpt).collect();
         d.sort_by(f64::total_cmp);
