@@ -69,6 +69,7 @@ pub(crate) fn apply(
             // Without this the index differs from a rebuild's, which C-02 forbids.
             if gone && !bulk_load {
                 resolve_inbound(tx, path)?;
+                unpair_sidecar(tx, path)?;
             }
             Ok(Applied {
                 notes: 0,
@@ -192,8 +193,35 @@ fn upsert_note(
         // could not have done at insert time (a link's own rows do not yet have a
         // dst_note to compare against until they are in the table).
         resolve_outbound(tx, note_id)?;
+        // task #17. This note may be an asset's sidecar. The rebuild's one UPDATE
+        // (`writer::pair_sidecars`) covers a bulk load.
+        pair_note_as_sidecar(tx, &meta.path)?;
     }
 
+    Ok(())
+}
+
+/// If `note` is `<asset path>.md` for an asset that exists, record it as that asset's
+/// sidecar (FR-BIN-02; ADR-0005). By name alone and byte for byte: `X.PDF` and
+/// `x.pdf.md` are not a pair (ADR-0017). One lookup through `notes.path`'s unique index.
+fn pair_note_as_sidecar(tx: &Transaction<'_>, note: &VaultPath) -> Result<(), IndexError> {
+    let Some(asset) = note.as_str().strip_suffix(".md") else {
+        return Ok(());
+    };
+    tx.prepare_cached("UPDATE notes SET sidecar_path = ?2 WHERE path = ?1 AND kind = 'asset'")
+        .map_err(sqlite)?
+        .execute(params![asset, note.as_str()])
+        .map_err(sqlite)?;
+    Ok(())
+}
+
+/// The note at `note` is gone or no longer a sidecar: clear the pairing it held. Served
+/// by the partial `ix_notes_sidecar`, so it is a probe of at most ~200 entries.
+fn unpair_sidecar(tx: &Transaction<'_>, note: &VaultPath) -> Result<(), IndexError> {
+    tx.prepare_cached("UPDATE notes SET sidecar_path = NULL WHERE sidecar_path = ?1")
+        .map_err(sqlite)?
+        .execute(params![note.as_str()])
+        .map_err(sqlite)?;
     Ok(())
 }
 
@@ -288,8 +316,9 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     // silently drops every embed (F-313).
     tx.prepare_cached(
         "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash,
-                            path_fold, file_name_fold)
-         VALUES (?1, ?2, 'asset', ?1, ?3, ?4, ?5, ?6)",
+                            path_fold, file_name_fold, sidecar_path)
+         VALUES (?1, ?2, 'asset', ?1, ?3, ?4, ?5, ?6,
+                 (SELECT s.path FROM notes s WHERE s.path = ?1 || '.md' AND s.kind = 'note'))",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -302,6 +331,19 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     ])
     .map_err(sqlite)?;
     let asset_id = tx.last_insert_rowid();
+
+    // task #17 (FR-BIN-01): MIME from the extension, size from the walk's stat, in the
+    // same call on the rebuild and the incremental path. The sidecar subquery above
+    // finds a note already present; one that arrives later pairs in `upsert_note`, and
+    // a rebuild pairs both orders with one UPDATE after the load.
+    tx.prepare_cached("INSERT INTO assets (note_id, mime, bytes) VALUES (?1, ?2, ?3)")
+        .map_err(sqlite)?
+        .execute(params![
+            asset_id,
+            serat_core::mime_for_path(meta.path.as_str()),
+            meta.size as i64
+        ])
+        .map_err(sqlite)?;
 
     // task #13. The remove() above nulled every inbound link the cascade could see,
     // same as upsert_note -- and F-313 is exactly why an asset needs this call too:
@@ -373,9 +415,27 @@ fn rename(
         fold_case(to.file_name())
     ])
     .map_err(sqlite)?;
+    // task #17. An asset keeps `asset_path` equal to `path`, its MIME follows its new
+    // extension, and its sidecar is whatever `<to>.md` is now; a note that was some
+    // asset's sidecar stops being one, and may become another's. All no-ops (0 rows)
+    // for the common case.
+    tx.prepare_cached(
+        "UPDATE notes SET asset_path = ?2,
+                sidecar_path = (SELECT s.path FROM notes s WHERE s.path = ?2 || '.md' AND s.kind = 'note')
+          WHERE id = ?1 AND kind = 'asset'",
+    )
+    .map_err(sqlite)?
+    .execute(params![id, to.as_str()])
+    .map_err(sqlite)?;
+    tx.prepare_cached("UPDATE assets SET mime = ?2 WHERE note_id = ?1")
+        .map_err(sqlite)?
+        .execute(params![id, serat_core::mime_for_path(to.as_str())])
+        .map_err(sqlite)?;
     if bulk_load {
         return Ok(());
     }
+    unpair_sidecar(tx, from)?;
+    pair_note_as_sidecar(tx, to)?;
     tx.prepare_cached("UPDATE links SET dst_note = NULL WHERE dst_note = ?1 AND kind <> 'tag'")
         .map_err(sqlite)?
         .execute(params![id])

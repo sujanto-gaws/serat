@@ -523,6 +523,24 @@ fn every_statement_uses_the_index_it_was_designed_for() {
     assert!(plan_of("R3 field").contains("ix_notes_sidecar"));
     assert!(plan_of("R2").contains("ix_links_dst"), "{}", plan_of("R2"));
     assert!(plan_of("R1").contains("blocks_fts"), "{}", plan_of("R1"));
+
+    // R5 attachments (task #17; architecture §4.5): the plan scans `assets` (~200 rows) and reaches `notes`
+    // by rowid, and the resolver-choice subqueries use the folded path and file-name
+    // indexes. Aliases: a, n are `notes`, x is `assets`, c the derived candidate table.
+    let plan = plan_of("attachments");
+    for needle in [
+        "SCAN x",
+        "SEARCH a USING INTEGER PRIMARY KEY",
+        "ix_notes_path_fold",
+        "ix_notes_file_name",
+    ] {
+        assert!(plan.contains(needle), "{needle} missing from:\n{plan}");
+    }
+    assert!(
+        plan.lines()
+            .all(|line| !line.starts_with("SCAN a") && !line.starts_with("SCAN n")),
+        "attachments scans notes:\n{plan}"
+    );
 }
 
 #[test]
