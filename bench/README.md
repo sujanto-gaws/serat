@@ -5,7 +5,7 @@ The verification harness (architecture §10.3). Owned by test-engineer.
 ```
 vaultgen/        the deterministic benchmark vault generator — committed
 budget/          one asserting job per NFR-PRF budget — committed
-editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed, scaffolding only until P1 #5/#21 land
+editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed; rule E0, controls green, subject partial (3/8 scenarios), needs a `build:bench` build from `task/p1-21-editor`
 vaults/          generated vaults and their manifests — gitignored, never committed
 out/             budget results — gitignored
 ```
@@ -42,7 +42,7 @@ npm install
 npm test
 ```
 
-Scaffolding only today — see `bench/editor-latency/README.md`. The p95 statistic is green; the subject (opening a real note in a real Serat window) is blocked on P1 tasks #5 and #21 and fails loudly rather than silently.
+`npm test` runs all three Playwright projects (unit, controls, subject) in dependency order; the gate is `npx playwright test --project=subject`. The subject needs `SERAT_BENCH_DIST` pointing at a `build:bench` output, which exists today only on `task/p1-21-editor`, and covers 3 of 8 §9.3 scenarios. See `bench/editor-latency/README.md`.
 
 ## Serves
 

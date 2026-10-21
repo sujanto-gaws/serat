@@ -17,6 +17,8 @@ export type ArmName = "positive" | "negative" | "render2" | "graded";
 export const POSITIVE_MIN_ON_TIME = 0.99;
 export const NEGATIVE_MIN_LATE = 0.95;
 export const SUBJECT_MIN_ON_TIME = 0.95;
+/** Keystrokes per cadence per subject position (architecture.md 9.3 requires >= 500). */
+export const SUBJECT_KEYS = 500;
 /** Reported, not gated. */
 export const GRADED_BAND: [number, number] = [0.85, 0.95];
 

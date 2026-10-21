@@ -144,6 +144,46 @@ for (const [label, ns] of impls) {
       const s = ns.scoreAll(frames, [], [R + 1, 3 * R + 1], R);
       expect(s.map((x) => x.tsJ)).toEqual([R, 3 * R]);
     });
+
+    test("checkKeyInvariants: a complete key (keydown + input within 8 ms) is ok and reports its spread", () => {
+      const e = [{ name: "keydown", startTime: 100, duration: 24 }, { name: "input", startTime: 101, duration: 27 }];
+      const r = ns.checkKeyInvariants(e, 100);
+      expect(r.ok).toBe(true);
+      expect(r.spreadMs).toBeCloseTo(4, 9);
+      expect(ns.checkKeyInvariants([], 100)).toEqual({ ok: true, reason: "", spreadMs: 0 });
+    });
+    test("checkKeyInvariants (a): an input entry without the keydown entry is rejected", () => {
+      const r = ns.checkKeyInvariants([{ name: "input", startTime: 101, duration: 40 }], 100);
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(/keydown entry is missing/);
+    });
+    test("checkKeyInvariants (b): entry ends more than 8 ms apart are rejected; exactly 8 is accepted", () => {
+      const wide = [{ name: "keydown", startTime: 100, duration: 20 }, { name: "input", startTime: 101, duration: 40 }];
+      const r = ns.checkKeyInvariants(wide, 100);
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(/apart/);
+      const edge = [{ name: "keydown", startTime: 100, duration: 20 }, { name: "input", startTime: 100, duration: 28 }];
+      expect(ns.checkKeyInvariants(edge, 100).ok).toBe(true);
+    });
+    test("scoreAll throws 'run rejected' with the key index on either invariant failure", () => {
+      const frames = [0, R, 2 * R, 3 * R, 4 * R, 5 * R, 6 * R];
+      const t0 = R + 1, t1 = 3 * R + 1;
+      const lost = [{ name: "input", startTime: t1 + 1, duration: 40 }];
+      expect(() => ns.scoreAll(frames, lost, [t0, t1], R)).toThrow(/run rejected: key index 1 /);
+      const wide = [{ name: "keydown", startTime: t0, duration: 20 }, { name: "input", startTime: t0 + 1, duration: 60 }];
+      expect(() => ns.scoreAll(frames, wide, [t0, t1], R)).toThrow(/run rejected: key index 0 .*apart/);
+    });
+    test("scoreAll records each key's spread and summarise reports the widest", () => {
+      const frames = [0, R, 2 * R, 3 * R, 4 * R, 5 * R, 6 * R];
+      const t0 = R + 1, t1 = 3 * R + 1;
+      const e = [
+        { name: "keydown", startTime: t0, duration: 20 }, { name: "input", startTime: t0 + 1, duration: 27 },
+        { name: "keydown", startTime: t1, duration: 16 },
+      ];
+      const sc = ns.scoreAll(frames, e, [t0, t1], R);
+      expect(sc[0].spreadMs).toBeCloseTo(8, 9); expect(sc[1].spreadMs).toBe(0);
+      expect(ns.summarise(sc, 0.5, R).widestSpreadMs).toBeCloseTo(8, 9);
+    });
   });
 }
 

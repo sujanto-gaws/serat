@@ -11,7 +11,14 @@ import { defineConfig, devices } from "@playwright/test";
 const chromiumPath =
   process.env.PW_CHROMIUM_PATH ?? "/opt/pw-browsers/chromium";
 
+const chromiumUse = {
+  ...devices["Desktop Chrome"],
+  launchOptions: { executablePath: chromiumPath },
+};
+
 export default defineConfig({
+  workers: 1, // timed specs must not share the machine with each other or with the unit spec
+  forbidOnly: !!process.env.CI,
   testDir: "./tests",
   timeout: 60_000,
   fullyParallel: false, // latency sampling shares one browser instance deliberately
@@ -21,14 +28,10 @@ export default defineConfig({
     trace: "off", // tracing screenshots load the page being timed
   },
   projects: [
-    {
-      name: "chromium",
-      use: {
-        ...devices["Desktop Chrome"],
-        launchOptions: {
-          executablePath: chromiumPath,
-        },
-      },
-    },
+    { name: "unit", testMatch: /measure\.unit\.spec\.ts/, use: chromiumUse },
+    { name: "controls", testMatch: /nfr-prf-02-controls\.spec\.ts/, dependencies: ["unit"], use: chromiumUse },
+    // The gate: `npx playwright test --project=subject` runs unit, then controls, then subject; a failing
+    // control skips the subject tests. Do not combine with a -g that excludes the controls.
+    { name: "subject", testMatch: /nfr-prf-02-subject\.spec\.ts/, dependencies: ["controls"], use: chromiumUse },
   ],
 });

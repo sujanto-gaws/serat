@@ -58,6 +58,8 @@ export interface KeystrokeScore {
   etEnd: number | null;
   late: boolean;
   framesToPaint: number;
+  /** Spread (max - min) of this key's Event Timing entry ends, ms; 0 with fewer than two entries. */
+  spreadMs?: number;
 }
 
 export interface RunSummary {
@@ -69,8 +71,10 @@ export interface RunSummary {
   staleAnchors: number;
   /** Smallest `D - t - 16` over the keys scored on time by absence: the headroom the
    * absence argument guarantees (an absent entry means presented < 16 ms after `t`).
-   * `null` when no key was scored that way. Always > 0 when R >= 16. */
+   * `null` when no key was scored that way. Positive for every key whose anchor is not stale (t - ts_j < R, R >= 16); a stale anchor can make it smaller or negative. */
   worstAbsentMarginMs: number | null;
+  /** Widest spread of one key's Event Timing entry ends over the run (invariant b: <= 8 ms). */
+  widestSpreadMs: number;
   verdict: "PASS" | "FAIL" | "INDETERMINATE";
 }
 
@@ -126,6 +130,37 @@ export function keystrokeEventEnd(entries: EtEntry[], t: number): number | null 
   return end;
 }
 
+/** Per-key invariants of 9.3, asserted on every run so a lost entry cannot score a key on time:
+ * (a) if ANY keydown/keypress/beforeinput/input entry of this key is present (window [t-0.01, t+4]),
+ *     the keydown entry must be present too (keydown starts first, so its duration is the longest;
+ *     rounding is monotonic, so it can never be the one below the 16 ms threshold);
+ * (b) the ends (startTime + duration) of the key's entries lie within 8 ms of each other (they are
+ *     presented in one frame; Event Timing rounds duration to 8 ms).
+ * Returns { ok, reason, spreadMs }; `reason` is empty when ok. */
+export function checkKeyInvariants(entries: EtEntry[], t: number): { ok: boolean; reason: string; spreadMs: number } {
+  let any = false;
+  let hasKeydown = false;
+  let lo = 0;
+  let hi = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.name === "keyup") continue;
+    if (e.startTime < t - 0.01 || e.startTime > t + 4) continue;
+    const v = e.startTime + e.duration;
+    if (!any) { lo = v; hi = v; } else { if (v < lo) lo = v; if (v > hi) hi = v; }
+    any = true;
+    if (e.name === "keydown") hasKeydown = true;
+  }
+  const spreadMs = any ? hi - lo : 0;
+  if (any && !hasKeydown) {
+    return { ok: false, reason: "an Event Timing entry for this key is present but its keydown entry is missing (a lost entry would score the key on time)", spreadMs };
+  }
+  if (spreadMs > 8) {
+    return { ok: false, reason: "the key's Event Timing entries end " + spreadMs.toFixed(1) + " ms apart (> 8 ms): they are not one presentation", spreadMs };
+  }
+  return { ok: true, reason: "", spreadMs };
+}
+
 /** E0's verdict. `etEnd === null` (no entry, duration < 16 ms) is on time. */
 export function isLate(etEnd: number | null, deadlineMs: number): boolean {
   if (etEnd === null) return false;
@@ -163,7 +198,15 @@ export function scoreAll(
   keydownTimes: number[],
   refreshIntervalMs: number,
 ): KeystrokeScore[] {
-  return keydownTimes.map((t) => scoreKeystroke(frameStarts, entries, t, refreshIntervalMs));
+  const out: KeystrokeScore[] = [];
+  for (let i = 0; i < keydownTimes.length; i++) {
+    const inv = checkKeyInvariants(entries, keydownTimes[i]);
+    if (!inv.ok) throw new Error("run rejected: key index " + i + " (t=" + keydownTimes[i] + "): " + inv.reason);
+    const sc = scoreKeystroke(frameStarts, entries, keydownTimes[i], refreshIntervalMs);
+    sc.spreadMs = inv.spreadMs;
+    out.push(sc);
+  }
+  return out;
 }
 
 /** On-time share when the lateness threshold is moved by `thetaMs` (late iff ETend > D + theta).
@@ -193,6 +236,7 @@ export function summarise(
   let absent = 0;
   let stale = 0;
   let worstAbsent: number | null = null;
+  let widest = 0;
   for (let i = 0; i < scores.length; i++) {
     if (scores[i].etEnd === null && !scores[i].late) {
       absent++;
@@ -200,9 +244,10 @@ export function summarise(
       if (worstAbsent === null || margin < worstAbsent) worstAbsent = margin;
     }
     if (scores[i].t - scores[i].tsJ >= refreshIntervalMs) stale++;
+    if ((scores[i].spreadMs || 0) > widest) widest = scores[i].spreadMs as number;
   }
   const verdict = strict >= bar ? "PASS" : lenient < bar ? "FAIL" : "INDETERMINATE";
-  return { n: scores.length, onTimeAtMinus4: strict, onTimeAtZero: nominal, onTimeAtPlus4: lenient, scoredOnTimeByAbsence: absent, staleAnchors: stale, worstAbsentMarginMs: worstAbsent, verdict };
+  return { n: scores.length, onTimeAtMinus4: strict, onTimeAtZero: nominal, onTimeAtPlus4: lenient, scoredOnTimeByAbsence: absent, staleAnchors: stale, worstAbsentMarginMs: worstAbsent, widestSpreadMs: widest, verdict };
 }
 
 /** Smallest refresh interval at which "no Event Timing entry means presented in time" holds. */
@@ -227,6 +272,7 @@ export const SeratLatencyFns = {
   lastFrameAtOrBefore,
   deadline,
   keystrokeEventEnd,
+  checkKeyInvariants,
   isLate,
   framesToPaint,
   scoreKeystroke,
