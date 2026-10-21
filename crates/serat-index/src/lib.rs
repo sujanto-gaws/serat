@@ -17,6 +17,7 @@ mod apply;
 /// which can disable supersession (§4.5).
 pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
 
+pub mod history;
 pub mod identity;
 pub mod incremental;
 pub mod open;
@@ -24,6 +25,7 @@ pub mod read;
 pub mod rebuild;
 mod resolve;
 pub mod schema;
+pub mod switcher;
 pub mod tree;
 pub mod writer;
 
