@@ -71,12 +71,29 @@ impl RefusalLog {
         inner.by_path.insert(refusal.path, refusal.reason);
     }
 
-    /// Forget everything. A walk calls this first, because it is about to
-    /// re-discover every refusal that still applies.
-    pub(crate) fn clear(&self) {
+    /// Replace every entry at or below `scope` (`""`: the whole vault) with `found`,
+    /// the refusals a walk of that subtree has just made. This is how entries leave:
+    /// at the next walk that covers them, whichever walk it is (`walk`, `walk_tree`,
+    /// `walk_dir`), so a renamed or deleted file stops being reported and the log is
+    /// never empty while a walk is still running (#13 N1; task #14).
+    ///
+    /// `overflowed` counts refusals past the capacity since the last whole-vault
+    /// walk; a walk of the whole vault resets it, a partial one leaves it.
+    pub(crate) fn replace_scope(&self, scope: &str, found: Vec<Refusal>) {
         let mut inner = self.lock();
-        inner.by_path.clear();
-        inner.overflowed = 0;
+        if scope.is_empty() {
+            inner.by_path.clear();
+            inner.overflowed = 0;
+        } else {
+            let below = format!("{scope}/");
+            inner
+                .by_path
+                .retain(|path, _| path != scope && !path.starts_with(&below));
+        }
+        drop(inner);
+        for refusal in found {
+            self.record(refusal);
+        }
     }
 
     /// Every refused path, in path order.
@@ -151,12 +168,27 @@ mod tests {
     }
 
     #[test]
-    fn clear_forgets_everything() {
+    fn a_whole_vault_replacement_forgets_what_the_walk_no_longer_finds() {
         let log = RefusalLog::new();
         log.record(refusal("x.md", "r"));
-        log.clear();
+        log.replace_scope("", vec![refusal("y.md", "r")]);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.snapshot()[0].path, "y.md");
+        log.replace_scope("", Vec::new());
         assert!(log.is_empty());
         assert_eq!(log.overflowed(), 0);
+    }
+
+    #[test]
+    fn a_subtree_replacement_leaves_the_rest_alone_and_matches_whole_segments() {
+        let log = RefusalLog::new();
+        log.record(refusal("a/x.md", "r"));
+        log.record(refusal("a/b/y.md", "r"));
+        log.record(refusal("ab/z.md", "r"));
+        log.record(refusal("c.md", "r"));
+        log.replace_scope("a", vec![refusal("a/new.md", "r")]);
+        let kept: Vec<String> = log.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(kept, ["a/new.md", "ab/z.md", "c.md"]);
     }
 
     #[test]

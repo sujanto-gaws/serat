@@ -75,7 +75,7 @@ fn an_unreadable_file_is_skipped_rather_than_fatal() {
 }
 
 #[test]
-fn a_file_the_parser_refuses_is_skipped_rather_than_fatal() {
+fn a_file_the_parser_refuses_is_a_bare_row_rather_than_absent_or_fatal() {
     let dir = tempfile::tempdir().expect("temp");
     let parser = LineParser::default();
     parser
@@ -91,8 +91,11 @@ fn a_file_the_parser_refuses_is_skipped_rather_than_fatal() {
         dir.path(),
     )
     .expect("rebuild");
-    assert_eq!(report.skipped, 1);
-    assert_eq!(report.notes, 2);
+    assert_eq!(
+        report.skipped, 0,
+        "a refused note is indexed, not skipped (task #58)"
+    );
+    assert_eq!(report.notes, 3);
 }
 
 #[test]

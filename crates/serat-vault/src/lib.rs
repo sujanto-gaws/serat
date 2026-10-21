@@ -31,6 +31,8 @@ pub mod echo;
 mod gitignore;
 pub mod hash;
 pub mod ignore;
+#[cfg(test)]
+mod ignore_file_tests;
 pub mod patch;
 #[cfg(test)]
 mod patch_props;
@@ -56,7 +58,7 @@ use serat_core::{
 pub use echo::EchoSuppressor;
 pub use gitignore::{GitignoreAppended, gitignore_ignores_serat};
 pub use hash::hash_bytes;
-pub use ignore::{IgnoreRules, is_note_file};
+pub use ignore::{IGNORE_FILE, IgnoreRules, Patterns, is_note_file};
 pub use patch::Edit;
 pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
@@ -126,13 +128,43 @@ impl Vault {
                 reason: "is not a directory".to_owned(),
             });
         }
-        Ok(Self {
+        let vault = Self {
             root: strip_verbatim(&canonical),
             ignore,
             echo: Arc::new(EchoSuppressor::new()),
             refusals: RefusalLog::new(),
             locks: Arc::default(),
-        })
+        };
+        vault.reload_ignore_file();
+        Ok(vault)
+    }
+
+    /// Re-read the ignore file ([`IGNORE_FILE`], at the root) into the rules in
+    /// force. Returns whether the effective patterns changed, in which case what the
+    /// vault contains has changed too and the caller must walk it again (the watcher
+    /// raises [`VaultEvent::RescanRequired`] for exactly that).
+    ///
+    /// A missing, unreadable, symlinked or oversized file means no patterns. It is
+    /// never an error: the file is the user's and Serat only reads it (FR-VLT-07).
+    pub fn reload_ignore_file(&self) -> bool {
+        let path = self.root.join(IGNORE_FILE);
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(stat) if stat.is_file() => fs::read(&path).ok(),
+            _ => None,
+        };
+        self.ignore.set_ignore_file(bytes.as_deref())
+    }
+
+    /// Every indexable file at or below the vault-relative directory `dir`, sorted,
+    /// under the same rules as [`Vault::walk`]. A directory that is gone, is a
+    /// symlink or is itself ignored lists nothing. For reconciling one directory after
+    /// a [`VaultEvent::DirChanged`] without walking the vault.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] only if the vault root cannot be read.
+    pub fn walk_dir(&self, dir: &VaultPath) -> Result<Vec<serat_core::SourceEntry>, VaultError> {
+        walk::walk_dir(self, dir)
     }
 
     pub(crate) fn path_locks(&self) -> &atomic::PathLocks {
@@ -154,7 +186,7 @@ impl Vault {
     /// The echo suppressor the watcher consults.
     ///
     /// The watcher asks it whether an event carries bytes we just indexed:
-    /// `if vault.echo().take_echo(loaded.meta.hash) { skip }` after the hash gate.
+    /// `if vault.echo().take_echo(&path, loaded.meta.hash) { skip }` after the hash gate.
     /// Recording an entry is [`EchoGuard::record_echo`], which `Vault` implements
     /// below — callers that write through the index's save path use that trait object
     /// rather than reaching in here directly.
@@ -676,8 +708,8 @@ impl Vault {
 impl EchoGuard for Vault {
     /// Delegates to the shared [`EchoSuppressor`], so the save path and the watcher
     /// consult the same set regardless of which clone of `Vault` each holds.
-    fn record_echo(&self, hash: ContentHash) {
-        self.echo.record(hash);
+    fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
+        self.echo.record(path, hash);
     }
 }
 
@@ -1151,7 +1183,7 @@ mod tests {
             .expect("write");
 
         assert!(
-            !vault.echo().take_echo(hash),
+            !vault.echo().take_echo(&path, hash),
             "write_atomic recorded an echo entry; it must be a plain write (F-224)"
         );
     }
@@ -1170,14 +1202,14 @@ mod tests {
             )
             .expect("write");
 
-        vault.record_echo(hash);
+        vault.record_echo(&path, hash);
 
         assert!(
-            vault.echo().take_echo(hash),
+            vault.echo().take_echo(&path, hash),
             "record_echo did not register the hash for suppression"
         );
         assert!(
-            !vault.echo().take_echo(hash),
+            !vault.echo().take_echo(&path, hash),
             "one recorded echo suppressed two events"
         );
     }
@@ -1196,7 +1228,7 @@ mod tests {
             .expect("read");
 
         assert!(
-            !vault.echo().take_echo(theirs.meta.hash),
+            !vault.echo().take_echo(&theirs.meta.path, theirs.meta.hash),
             "an external edit was mistaken for our own echo"
         );
     }
@@ -1397,6 +1429,15 @@ impl serat_core::NoteSource for Vault {
     }
 
     fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+        // The index never holds what the ignore file hides. A change accepted under the
+        // old rules during the watcher's window, or a path from a stale queue, is
+        // answered as gone, so the consumer removes the row rather than re-adding it.
+        // `read` itself is not restricted: the editor may open an ignored note.
+        if self.ignore.user_ignores_path(path.as_str()) {
+            return Err(VaultError::NotFound {
+                path: path.as_str().to_owned(),
+            });
+        }
         self.read(path)
     }
 }

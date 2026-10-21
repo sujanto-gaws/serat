@@ -97,7 +97,9 @@ PRAGMA synchronous = NORMAL;
 
 -- user_version 9 (task #57): no DDL change; serat-parse now reads block-style frontmatter
 -- lists, so every `aliases:`/`tags:` item the old derivation skipped is a fields row.
-PRAGMA user_version = 9;
+-- user_version 10 (task #14): index_meta.clean_close, the unclean-shutdown marker; and a note
+-- the parser refuses is indexed as a bare row (task #58) rather than skipped.
+PRAGMA user_version = 10;
 
 -- ============================================================================
 -- Tables
@@ -129,7 +131,17 @@ CREATE TABLE index_meta (
     built_at        INTEGER,               -- unix seconds, last completed full rebuild
     note_count      INTEGER NOT NULL DEFAULT 0,  -- must equal (SELECT count(*) FROM notes)
     state           TEXT NOT NULL DEFAULT 'building'
-                    CHECK (state IN ('building', 'ready'))
+                    CHECK (state IN ('building', 'ready')),
+    -- 1 only while no session holds the index open, and only once everything the
+    -- session committed has reached the database file. It is cleared, durably
+    -- (synchronous = FULL for that one commit), when a session opens the index, and
+    -- set again when the session closes after a TRUNCATE checkpoint; a full rebuild
+    -- leaves it 1. A 0 found at open therefore means the last session did not close
+    -- cleanly, and since the index side of a save does no fsync (architecture
+    -- 3.1.1 item 6) a commit may have been lost: the catch-up walk then compares
+    -- each file's mtime with notes.mtime as well as the paths (task #14). Nothing
+    -- else reads it. It is the index's own state, re-derived by a rebuild (C-02).
+    clean_close     INTEGER NOT NULL DEFAULT 0 CHECK (clean_close IN (0, 1))
 );
 
 -- ----------------------------------------------------------------------------
