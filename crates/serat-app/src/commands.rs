@@ -20,7 +20,7 @@ use crate::ipc::{
     GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError, MarkTreeArgs,
     NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadFileArgs, RebaseBufferArgs,
     RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
-    TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
+    SwitcherQueryArgs, SwitcherResults, TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -161,6 +161,27 @@ pub async fn search(
             path: String::new(),
             message: format!("the search thread failed: {err}"),
         })?
+}
+
+/// `switcher_query(args) -> SwitcherResults`
+///
+/// Never fails and never waits for the index (before `Ready` it answers from the tree's
+/// paths). The match runs in `spawn_blocking`, off the webview thread and off a Tauri
+/// async worker: a query serialises behind the one before it, and that wait must not
+/// hold either.
+#[tauri::command]
+pub async fn switcher_query(
+    state: State<'_, Arc<AppState>>,
+    args: SwitcherQueryArgs,
+) -> Result<SwitcherResults, IpcError> {
+    let seq = args.seq;
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || state.switcher_query(&args))
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: format!("the switcher thread failed (query {seq}): {err}"),
+        })
 }
 
 /// `backlinks(args) -> Result<IndexRead<Vec<Backlink>>, IpcError>`

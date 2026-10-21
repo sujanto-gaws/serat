@@ -43,6 +43,7 @@ fn main() {
             "append_gitignore_entry",
             "decline_gitignore_offer",
             "search",
+            "switcher_query",
             "backlinks",
             "open_tree",
             "mark_tree",

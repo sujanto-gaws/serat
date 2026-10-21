@@ -180,6 +180,7 @@ mod tests {
             "allow-request-external-diff",
             "allow-save-patch",
             "allow-search",
+            "allow-switcher-query",
             "allow-write-file",
             "core:default",
             "opener:allow-open-url",

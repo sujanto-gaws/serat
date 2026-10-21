@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use serat_core::{TreeEntry, TreeKind, TreeOp, VaultPath};
+use serat_core::{SourceEntry, TreeEntry, TreeKind, TreeOp, VaultPath, source_entries};
 use serat_vault::{TreeOut, TreeProgress, TreeSession, TreeSource, Vault, is_note_file};
 
 use crate::ipc::{self, TreeEntryKind, TreeMessage};
@@ -338,6 +338,21 @@ pub struct FeedConfig {
     /// Blocks until the walk may start: the first paint, in the application
     /// (ADR-0015 §2: "the walk always runs, after the first paint").
     pub gate: Arc<dyn Fn() + Send + Sync>,
+    /// Called on the warm path just before the authoritative walk starts, so the
+    /// application can journal what the watcher reports until the catch-up is done.
+    pub on_walk_start: Box<dyn Fn() + Send + Sync>,
+    /// Called on the warm path (index `Ready` at the start of the stream) with every
+    /// file the authoritative walk found, sorted by path, once the walk has completed
+    /// (ADR-0015 section 2, *One walk at open*). The application hands it to the open's
+    /// catch-up on a thread of its own. Never called on the no-index path, where the
+    /// rebuild is the reconciliation, nor when the walk failed.
+    pub on_walked: Box<dyn Fn(Vec<SourceEntry>) + Send + Sync>,
+    /// Fed every message of the stream, for the switcher's corpus before the index is
+    /// `Ready` (architecture 9.2).
+    pub paths: Arc<crate::switcher::TreePaths>,
+    /// Called with the number of files the authoritative walk admitted, on either path,
+    /// when it completes (the cold-start trace's walk mark; the refusal count is final).
+    pub on_walk_complete: Box<dyn Fn(u32) + Send + Sync>,
     /// Called once when the stream has exhausted [`MAX_RESTARTS`] and will not update
     /// again (the application emits `tree://status`). Must not call back into the feed.
     pub on_stopped: Box<dyn Fn() + Send + Sync>,
@@ -413,7 +428,11 @@ impl TreeFeed {
     fn start(self: &Arc<Self>, send: TreeSender, restarts: u32) -> std::io::Result<()> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let sink = CoalescingSink::new(Arc::clone(&send), Arc::clone(&cancelled));
-        let session = Arc::new(TreeSession::new(move |out| sink.push(out)));
+        let paths = Arc::clone(&self.config.paths);
+        let session = Arc::new(TreeSession::new(move |out| {
+            paths.apply(&out);
+            sink.push(out);
+        }));
         {
             let mut state = self.state();
             if let Some(old) = state.active.take() {
@@ -444,9 +463,8 @@ impl TreeFeed {
 
     /// The warm path if the index is `Ready`, then the authoritative walk.
     fn populate(&self, session: &TreeSession, generation: u32) {
-        if (self.config.index_ready)()
-            && let Some(snapshot) = session.begin_index_read()
-        {
+        let warm = (self.config.index_ready)();
+        if warm && let Some(snapshot) = session.begin_index_read() {
             match serat_index::tree::read_tree_rows(&self.config.index_db) {
                 Ok(rows) => {
                     let _ = session.populate_from_index(
@@ -458,7 +476,27 @@ impl TreeFeed {
             }
         }
         (self.config.gate)();
-        if let Ok(summary) = session.populate_from_walk(&self.config.vault)
+        // One walk at open (ADR-0015 section 2): on the warm path it carries size and
+        // mtime and feeds the catch-up; on the no-index path it stays name-and-kind.
+        let walked = if warm {
+            (self.config.on_walk_start)();
+            let mut acc: Vec<SourceEntry> = Vec::new();
+            let result = session
+                .populate_from_walk_with_metadata(&self.config.vault, &mut |dir, entries| {
+                    acc.extend(source_entries(dir, entries))
+                });
+            if result.is_ok() {
+                acc.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+                (self.config.on_walked)(acc);
+            }
+            result
+        } else {
+            session.populate_from_walk(&self.config.vault)
+        };
+        if let Ok(summary) = walked {
+            (self.config.on_walk_complete)(summary.files);
+        }
+        if let Ok(summary) = walked
             && self.populating.load(Ordering::SeqCst) == generation
         {
             self.marks_lock().empty_folders = Some(summary.empty_folders);
@@ -548,6 +586,20 @@ impl TreeFeed {
         }
     }
 
+    /// A directory appeared, moved or was renamed (`VaultEvent::DirChanged`): re-list
+    /// that subtree, sending only listings that differ.
+    pub fn dir_changed(self: &Arc<Self>, dir: &VaultPath) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _ = session.rescan(&self.config.vault, dir.as_str());
+        }));
+        if outcome.is_err() || session.is_poisoned() {
+            self.restart_if_poisoned();
+        }
+    }
+
     /// The watcher lost events (or a directory moved): re-list everything, sending
     /// only listings that differ (ADR-0011, ADR-0015 §1).
     pub fn rescan_all(self: &Arc<Self>) {
@@ -628,6 +680,10 @@ mod tests {
             index_db: dir.join(".serat/none.db"),
             index_ready: Box::new(move || ready),
             gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            on_walk_start: Box::new(|| {}),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
             on_stopped: Box::new(|| {}),
         })
     }
@@ -693,6 +749,69 @@ mod tests {
         ));
         assert!(listing(&log, "sub").is_some());
         assert!(listing(&log, "empty").is_some_and(Vec::is_empty));
+    }
+
+    type Walked = Arc<Mutex<Vec<Vec<SourceEntry>>>>;
+
+    fn feed_with_walk_hooks(dir: &Path, ready: bool) -> (Arc<TreeFeed>, Walked, Arc<AtomicU32>) {
+        let walked: Walked = Arc::default();
+        let sink = Arc::clone(&walked);
+        let starts = Arc::new(AtomicU32::new(0));
+        let started = Arc::clone(&starts);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir).expect("open")),
+            index_db: dir.join(".serat/none.db"),
+            index_ready: Box::new(move || ready),
+            gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            on_walk_start: Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+            }),
+            on_walked: Box::new(move |entries| sink.lock().expect("walked").push(entries)),
+            on_walk_complete: Box::new(|_| {}),
+            on_stopped: Box::new(|| {}),
+        });
+        (feed, walked, starts)
+    }
+
+    #[test]
+    fn the_warm_walk_carries_metadata_and_feeds_catch_up_once_sorted() {
+        // ADR-0015 section 2, One walk at open: the tree walk is the catch-up's input.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "b.md");
+        write(dir.path(), "a/z.md");
+        write(dir.path(), "a/img.png");
+        let (feed, walked, starts) = feed_with_walk_hooks(dir.path(), true);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        wait_for("the hand-off", || {
+            !walked.lock().expect("walked").is_empty()
+        });
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let walked = walked.lock().expect("walked");
+        assert_eq!(walked.len(), 1, "catch-up is fed once");
+        let paths: Vec<&str> = walked[0].iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a/img.png", "a/z.md", "b.md"]);
+        assert!(
+            walked[0].iter().all(|e| e.mtime_ms > 0 && e.size == 1),
+            "the warm walk carries size and mtime: {:?}",
+            walked[0]
+        );
+    }
+
+    #[test]
+    fn the_no_index_walk_stays_name_and_kind_and_feeds_no_catch_up() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let (feed, walked, starts) = feed_with_walk_hooks(dir.path(), false);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(walked.lock().expect("walked").is_empty());
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -805,6 +924,10 @@ mod tests {
             index_db: dir.path().join(".serat/none.db"),
             index_ready: Box::new(|| false),
             gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            on_walk_start: Box::new(|| {}),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
             on_stopped: Box::new(move || {
                 stopped.fetch_add(1, Ordering::SeqCst);
             }),

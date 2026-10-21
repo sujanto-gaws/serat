@@ -67,12 +67,15 @@ fn open_reader(root: &Path, search: Option<&SearchSlot>) -> Result<Reader, Index
 /// SQLite on Windows opens without delete sharing, so a held-open `index.db` makes the
 /// rebuild's `remove_file` fail (reported as `Corrupt`). Any code that deletes or
 /// replaces the index file while the vault is open **must** call `close()` first.
-/// Nothing does yet (rebuilds happen only in `open_or_rebuild`, before `Ready`); task
-/// #14 adds the first runtime rebuild.
+/// The one runtime rebuild, `AppState::rebuild_index`, calls [`SearchSlot::suspend`]
+/// (which closes and then refuses to reopen) and [`SearchSlot::resume`] after it.
 pub struct SearchSlot {
     pub(crate) epoch: HandleEpoch,
     pub(crate) generation: Arc<AtomicU64>,
     conn: Mutex<Option<(u64, Arc<SearchConn>)>>,
+    /// Set while a runtime rebuild owns the file: [`SearchSlot::get`] refuses instead
+    /// of reopening it. Read and written only under `conn`'s lock.
+    suspended: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for SearchSlot {
@@ -89,6 +92,7 @@ impl SearchSlot {
             epoch,
             generation: Arc::new(AtomicU64::new(0)),
             conn: Mutex::new(None),
+            suspended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -96,6 +100,11 @@ impl SearchSlot {
     /// only to clone or replace the `Arc`, never while a search runs.
     pub(crate) fn get(&self, path: &Path) -> Result<Arc<SearchConn>, serat_core::IndexError> {
         let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.suspended.load(Ordering::SeqCst) {
+            return Err(serat_core::IndexError::Corrupt {
+                message: "the index is being rebuilt".to_owned(),
+            });
+        }
         let epoch = self.epoch.load(Ordering::SeqCst);
         if let Some((have, conn)) = slot.as_ref()
             && *have == epoch
@@ -112,6 +121,27 @@ impl SearchSlot {
     /// **Required before any runtime rebuild deletes `index.db`** (Windows; see the
     /// type's documentation). A search still running returns `Superseded` at its next
     /// progress-handler call and then releases its `Arc`; the next search reopens.
+    /// [`SearchSlot::close`], and keep it closed: until [`SearchSlot::resume`], a search
+    /// is refused rather than reopening `index.db` (a runtime rebuild is about to delete
+    /// it, and on Windows an open connection makes the delete fail). Serialised with
+    /// [`SearchSlot::get`] by the slot's lock, so nothing reopens after this returns.
+    pub fn suspend(&self) {
+        let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        self.suspended.store(true, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *slot = None;
+    }
+
+    /// Allow searches to open the (new) index again.
+    pub fn resume(&self) {
+        let _slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        self.suspended.store(false, Ordering::SeqCst);
+    }
+
+    /// Supersede any search in flight and drop the connection, releasing the file.
+    ///
+    /// Prefer [`SearchSlot::suspend`] around a rebuild; this alone lets a search
+    /// reopen the file straight away.
     pub fn close(&self) {
         let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         self.generation.fetch_add(1, Ordering::SeqCst);
