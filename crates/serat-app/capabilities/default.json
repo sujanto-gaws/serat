@@ -10,6 +10,11 @@
     "allow-index-status",
     "allow-mark-first-paint",
     "allow-mark-vault-usable",
+    "allow-asset-info",
+    "allow-read-asset-range",
+    "allow-gitignore-offer-status",
+    "allow-append-gitignore-entry",
+    "allow-decline-gitignore-offer",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

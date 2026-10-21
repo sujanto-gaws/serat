@@ -101,7 +101,9 @@ mod tests {
              going red"
         );
         assert!(
-            directives.contains(&"connect-src ipc: http://ipc.localhost"),
+            directives.contains(
+                &"connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost"
+            ),
             "tauri.conf.json's CSP no longer pins connect-src to the canonical narrow \
              value (was {csp:?}) — task #117 / F-423(c): with no connect-src directive \
              the value fell back to default-src 'self', which blocks the event|listen \
@@ -115,6 +117,19 @@ mod tests {
              enforcement silently; confirmed with vue-frontend-dev that nothing in \
              app/src makes any other network-shaped call (F-423(c), #117)."
         );
+        assert!(
+            directives.contains(&"img-src 'self' serat-asset: http://serat-asset.localhost"),
+            "tauri.conf.json's CSP img-src is not exactly 'self' plus the two serat-asset \
+             origins (was {csp:?}) -- ADR-0017: the only CSP widening task #19 makes. No \
+             remote origin, no data:, no blob: (section 9.3 drops data: URLs)"
+        );
+        for forbidden in ["data:", "blob:", "'unsafe-eval'", "'unsafe-inline'", "*"] {
+            assert!(
+                !csp.split_whitespace().any(|token| token == forbidden),
+                "tauri.conf.json's CSP contains {forbidden:?} (was {csp:?}) -- ADR-0017 \
+                 allows no data:, blob:, wildcard or unsafe-* source in the app CSP"
+            );
+        }
         assert!(
             directives.contains(&"frame-src 'none'"),
             "tauri.conf.json's CSP no longer pins frame-src to 'none' (was {csp:?}) — \
@@ -159,9 +174,14 @@ mod tests {
             .collect();
         permissions.sort();
         let mut expected: Vec<String> = vec![
+            "allow-append-gitignore-entry",
+            "allow-asset-info",
+            "allow-decline-gitignore-offer",
+            "allow-gitignore-offer-status",
             "allow-index-status",
             "allow-mark-first-paint",
             "allow-mark-vault-usable",
+            "allow-read-asset-range",
             "allow-read-file",
             "allow-write-file",
             "core:default",

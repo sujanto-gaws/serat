@@ -56,6 +56,19 @@ tauri-plugin-opener = "2.5.5"
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 webkit2gtk = "2.0.2"
 
+# ADR-0017 step 7: opening a vault file for the scheme needs O_NONBLOCK|O_NOFOLLOW
+# (constants only; the workspace forbids unsafe_code).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# macOS handle-to-path (fcntl F_GETPATH) through rustix's safe wrapper.
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+# Windows: handle identity for the step-7 check (no safe GetFinalPathNameByHandleW).
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 

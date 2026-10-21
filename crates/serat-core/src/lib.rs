@@ -25,6 +25,7 @@ pub mod field;
 pub mod hash;
 pub mod ids;
 pub mod link;
+pub mod mime;
 pub mod note;
 pub mod path;
 pub mod span;

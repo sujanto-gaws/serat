@@ -34,6 +34,11 @@ fn main() {
             "index_status",
             "mark_first_paint",
             "mark_vault_usable",
+            "asset_info",
+            "read_asset_range",
+            "gitignore_offer_status",
+            "append_gitignore_entry",
+            "decline_gitignore_offer",
         ]),
     ))
     .expect(

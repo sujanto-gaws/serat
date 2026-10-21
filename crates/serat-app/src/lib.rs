@@ -43,9 +43,11 @@ use serde::Serialize;
 use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 
 mod acl_manifest;
+mod asset;
 pub mod cli;
 pub mod commands;
 pub mod error;
+mod gitignore;
 pub mod index;
 mod nav_guard;
 mod security_config;
@@ -262,7 +264,26 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::asset_info,
+            commands::read_asset_range,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
         ])
+        // ADR-0017: the one read-only path vault bytes take into the webview.
+        // Runs on the blocking pool (never the main thread, design goal 2); the
+        // handler is asset::serve, which applies steps 1-10 in order.
+        .register_asynchronous_uri_scheme_protocol(
+            ipc::ASSET_SCHEME,
+            |context, request, responder| {
+                use tauri::Manager as _;
+                let state = Arc::clone(&*context.app_handle().state::<Arc<AppState>>());
+                tauri::async_runtime::spawn_blocking(move || {
+                    let reply = state.serve_asset(nav_guard::Platform::current(), &request);
+                    responder.respond(reply.into_http());
+                });
+            },
+        )
         .setup(move |app| {
             state.startup.mark_runtime_ready();
             let handle = app.handle().clone();

@@ -15,7 +15,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::ipc::{
-    FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, VaultOpened,
+    AssetArgs, AssetInfo, FileContents, FileWritten, GitignoreAppended, GitignoreOffer,
+    IndexStatus, IpcError, OpenVaultArgs, ReadAssetRangeArgs, ReadFileArgs, VaultOpened,
     WriteFileArgs,
 };
 use crate::startup;
@@ -138,4 +139,87 @@ pub fn mark_vault_usable(state: State<'_, Arc<AppState>>, note: Option<String>) 
         eprintln!("serat: settings not saved: {problem}");
     }
     state.startup.elapsed_ms()
+}
+
+/// Runs `work` on the blocking pool. A sync `#[tauri::command]` runs on the main
+/// thread, which is for UI and nothing else (design goal 2); these file reads and
+/// writes never belong there.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: err.to_string(),
+        })?
+}
+
+/// `asset_info(args) -> Result<AssetInfo, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::asset_info`].
+#[tauri::command]
+pub async fn asset_info(
+    state: State<'_, Arc<AppState>>,
+    args: AssetArgs,
+) -> Result<AssetInfo, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.asset_info(args)).await
+}
+
+/// `read_asset_range(args) -> Result<ArrayBuffer, IpcError>`: raw bytes, not JSON.
+///
+/// # Errors
+///
+/// As [`AppState::read_asset_range`].
+#[tauri::command]
+pub async fn read_asset_range(
+    state: State<'_, Arc<AppState>>,
+    args: ReadAssetRangeArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.read_asset_range(args))
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
+/// `gitignore_offer_status() -> GitignoreOffer`
+///
+/// # Errors
+///
+/// Only if the blocking pool itself fails.
+#[tauri::command]
+pub async fn gitignore_offer_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreOffer, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || Ok(state.gitignore_offer_status())).await
+}
+
+/// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`
+///
+/// Called only from the offer's explicit confirmation.
+///
+/// # Errors
+///
+/// As [`AppState::append_gitignore_entry`].
+#[tauri::command]
+pub async fn append_gitignore_entry(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreAppended, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.append_gitignore_entry()).await
+}
+
+/// `decline_gitignore_offer() -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::decline_gitignore_offer`].
+#[tauri::command]
+pub async fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<(), IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.decline_gitignore_offer()).await
 }
