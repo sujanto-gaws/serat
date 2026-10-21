@@ -57,6 +57,9 @@ pub struct NoteStats {
     pub frontmatter_keys: u32,
     /// `^blockid` anchors.
     pub block_ids: u32,
+    /// Block-style `aliases:` items written to frontmatter (one per row a
+    /// conforming parser must index under the `aliases` key; task #57).
+    pub aliases: u32,
     /// Whether the note opens with a YAML frontmatter block.
     pub has_frontmatter: bool,
     /// Whether the file uses CRLF line endings.
@@ -79,6 +82,7 @@ impl NoteStats {
         self.decoy_fields += other.decoy_fields;
         self.frontmatter_keys += other.frontmatter_keys;
         self.block_ids += other.block_ids;
+        self.aliases += other.aliases;
     }
 }
 
@@ -220,6 +224,7 @@ fn frontmatter(
         s.push_str(&alias_for(&note.title, r));
         s.push_str("\"\n");
         keys += 1;
+        stats.aliases += 1;
     }
 
     match note.kind {

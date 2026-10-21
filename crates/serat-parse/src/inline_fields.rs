@@ -96,7 +96,7 @@ pub(crate) fn infer_value(raw: &str) -> FieldValue {
     infer_scalar(raw)
 }
 
-fn infer_scalar(raw: &str) -> FieldValue {
+pub(crate) fn infer_scalar(raw: &str) -> FieldValue {
     if raw.eq_ignore_ascii_case("true") {
         return FieldValue::Bool(true);
     }

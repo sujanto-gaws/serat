@@ -93,7 +93,9 @@ PRAGMA synchronous = NORMAL;
 -- number look insufficient was its name, and a name is cheaper to fix than a
 -- mechanism is to add.
 
-PRAGMA user_version = 7;
+-- user_version 8 (task #57): no DDL change; serat-parse now reads block-style frontmatter
+-- lists, so every `aliases:`/`tags:` item the old derivation skipped is a fields row.
+PRAGMA user_version = 8;
 
 -- ============================================================================
 -- Tables
