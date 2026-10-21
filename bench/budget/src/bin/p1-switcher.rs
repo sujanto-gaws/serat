@@ -376,8 +376,8 @@ fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
         set.len()
     );
     println!(
-        "alias-prefix queries: 0 generated, 0 excluded (the index holds {} alias rows: \
-         block-style aliases are not indexed until #57)",
+        "alias-prefix queries: up to 20 generated, drawn from the {} alias rows in the index \
+         (block-style lists indexed since #57; each is checked non-empty like any 3-character prefix)",
         corpus.alias_count()
     );
     println!(
