@@ -18,6 +18,7 @@ mod apply;
 pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
 
 pub mod history;
+pub mod external;
 pub mod identity;
 pub mod incremental;
 pub mod open;

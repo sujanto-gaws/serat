@@ -39,6 +39,8 @@ pub mod queue;
 pub mod refusal;
 pub mod tree;
 pub mod walk;
+#[cfg(test)]
+mod ignore_file_tests;
 #[cfg(all(test, unix))]
 mod walk_refusal_tests;
 pub mod watch;
@@ -56,7 +58,7 @@ use serat_core::{
 pub use echo::EchoSuppressor;
 pub use gitignore::{GitignoreAppended, gitignore_ignores_serat};
 pub use hash::hash_bytes;
-pub use ignore::{IgnoreRules, is_note_file};
+pub use ignore::{IGNORE_FILE, IgnoreRules, Patterns, is_note_file};
 pub use patch::Edit;
 pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
@@ -126,13 +128,43 @@ impl Vault {
                 reason: "is not a directory".to_owned(),
             });
         }
-        Ok(Self {
+        let vault = Self {
             root: strip_verbatim(&canonical),
             ignore,
             echo: Arc::new(EchoSuppressor::new()),
             refusals: RefusalLog::new(),
             locks: Arc::default(),
-        })
+        };
+        vault.reload_ignore_file();
+        Ok(vault)
+    }
+
+    /// Re-read the ignore file ([`IGNORE_FILE`], at the root) into the rules in
+    /// force. Returns whether the effective patterns changed, in which case what the
+    /// vault contains has changed too and the caller must walk it again (the watcher
+    /// raises [`VaultEvent::RescanRequired`] for exactly that).
+    ///
+    /// A missing, unreadable, symlinked or oversized file means no patterns. It is
+    /// never an error: the file is the user's and Serat only reads it (FR-VLT-07).
+    pub fn reload_ignore_file(&self) -> bool {
+        let path = self.root.join(IGNORE_FILE);
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(stat) if stat.is_file() => fs::read(&path).ok(),
+            _ => None,
+        };
+        self.ignore.set_ignore_file(bytes.as_deref())
+    }
+
+    /// Every indexable file at or below the vault-relative directory `dir`, sorted,
+    /// under the same rules as [`Vault::walk`]. A directory that is gone, is a
+    /// symlink or is itself ignored lists nothing. For reconciling one directory after
+    /// a [`VaultEvent::DirChanged`] without walking the vault.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] only if the vault root cannot be read.
+    pub fn walk_dir(&self, dir: &VaultPath) -> Result<Vec<serat_core::SourceEntry>, VaultError> {
+        walk::walk_dir(self, dir)
     }
 
     pub(crate) fn path_locks(&self) -> &atomic::PathLocks {

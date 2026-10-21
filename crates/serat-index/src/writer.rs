@@ -69,6 +69,8 @@ enum Command {
     EndBulkLoad(Vec<String>, SyncSender<Result<(), IndexError>>),
     /// Resolve every link whose target is now present.
     ResolveLinks(SyncSender<Result<usize, IndexError>>),
+    /// Commit anything in hand, checkpoint, and mark the index as cleanly closed.
+    CloseClean(SyncSender<Result<bool, IndexError>>),
     /// Apply anything in hand and end the loop.
     ///
     /// An explicit message rather than relying on every sender being dropped: handles
@@ -186,6 +188,24 @@ impl WriterHandle {
         let (reply, answer) = sync_channel(1);
         self.tx
             .send(Command::ResolveLinks(reply))
+            .map_err(|_| IndexError::WriterStopped)?;
+        answer.recv().map_err(|_| IndexError::WriterStopped)?
+    }
+
+    /// End the session: apply everything queued, checkpoint the WAL into the database
+    /// file and, only if that completed, durably set `index_meta.clean_close`. Returns
+    /// whether it was set; `false` (a reader pinned the WAL) means the next open will
+    /// treat this shutdown as unclean, which costs a little work and loses nothing.
+    ///
+    /// A barrier, called once per session at close, never on the save path.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::WriterStopped`], or whatever SQLite says.
+    pub fn close_clean(&self) -> Result<bool, IndexError> {
+        let (reply, answer) = sync_channel(1);
+        self.tx
+            .send(Command::CloseClean(reply))
             .map_err(|_| IndexError::WriterStopped)?;
         answer.recv().map_err(|_| IndexError::WriterStopped)?
     }
@@ -418,6 +438,12 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 // its triggers and the caller must not mark it ready, but the writer
                 // is no longer bulk loading and must not keep suppressing ANALYZE.
                 bulk_load = false;
+                let _ = reply.send(result);
+                continue;
+            }
+            Command::CloseClean(reply) => {
+                let result = commit(&conn, &mut pending, &mut since_analyze, bulk_load, fault)
+                    .and_then(|()| schema::end_session(&conn));
                 let _ = reply.send(result);
                 continue;
             }

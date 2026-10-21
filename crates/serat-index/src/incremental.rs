@@ -58,6 +58,7 @@ pub fn parse_pool_threads() -> usize {
 pub struct IndexHandle {
     actor: IndexActor,
     index_dir: PathBuf,
+    after_unclean_shutdown: bool,
 }
 
 impl IndexHandle {
@@ -84,10 +85,25 @@ impl IndexHandle {
         }
         let conn = schema::open(&path)?;
         schema::bootstrap_if_empty(&conn)?;
+        let after_unclean_shutdown = !schema::begin_session(&conn)?;
         Ok(Self {
             actor: IndexActor::with_capacity(conn, queue_depth),
             index_dir: index_dir.to_path_buf(),
+            after_unclean_shutdown,
         })
+    }
+
+    /// Whether the previous session did not close the index cleanly (task #14).
+    ///
+    /// True means a commit may have been lost to a power cut, because the index side of
+    /// a save does no fsync (architecture §3.1.1 item 6), so the catch-up walk must
+    /// compare mtimes as well as paths: pass this to [`crate::external::CatchUp`].
+    /// True for a freshly created index too, which is harmless: it holds nothing to
+    /// be stale. Fixed at open; the marker itself is cleared as this handle opens and
+    /// set again by [`IndexHandle::close`].
+    #[must_use]
+    pub fn opened_after_unclean_shutdown(&self) -> bool {
+        self.after_unclean_shutdown
     }
 
     /// A writer handle, for callers that want to submit without waiting.
@@ -223,12 +239,55 @@ impl IndexHandle {
         apply(&self.actor.handle(), source, parser, echo, path)
     }
 
-    /// Stop the writer, applying anything queued.
+    /// Replace the index while the vault stays open: stop this handle's writer, call
+    /// `release`, delete the index and rebuild it from `source`, and open a new handle.
+    ///
+    /// **`release` is where every other holder of `index.db` lets go**, and it runs after
+    /// the writer has stopped and immediately before the file is deleted. serat-app
+    /// passes `|| search_slot.close()` (`SearchSlot::close`, task #52): SQLite on
+    /// Windows opens without delete sharing, so a search connection still open makes
+    /// the rebuild's `remove_file` fail, reported as `Corrupt`. Per-call readers are
+    /// already gone by construction; the search connection is the one that lives long
+    /// enough to matter. Any other runtime rebuild path must go through here, or call
+    /// `SearchSlot::close()` itself before deleting the file.
+    ///
+    /// The old handle is consumed and does not mark a clean close: the index it
+    /// described is being discarded. The caller bumps its handle epoch for the new one.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::rebuild`], and as [`IndexHandle::open`] for the new handle.
+    pub fn rebuild_in_place(
+        self,
+        release: &dyn Fn(),
+        source: &dyn NoteSource,
+        parser: &dyn NoteParser,
+        vault_root: &Path,
+    ) -> Result<(Self, crate::RebuildReport), IndexError> {
+        let Self {
+            actor, index_dir, ..
+        } = self;
+        actor.shutdown()?;
+        release();
+        let report = crate::rebuild(source, parser, vault_root, &index_dir)?;
+        Ok((Self::open(&index_dir)?, report))
+    }
+
+    /// Close the index cleanly: apply anything queued, checkpoint, and set the
+    /// clean-close marker, so the next open can skip the content comparison.
+    ///
+    /// **Call this** (serat-app: on vault close and at exit). Dropping the handle
+    /// stops the writer and loses nothing, but leaves the marker cleared, so the next
+    /// session treats the shutdown as unclean. That costs one stat per file and a hash
+    /// of the files whose mtime moved; it is the safe direction.
     ///
     /// # Errors
     ///
     /// [`IndexError::WriterStopped`] if it had already died.
     pub fn close(self) -> Result<(), IndexError> {
+        // The marker not being set (a pinned reader) is not an error; see
+        // `WriterHandle::close_clean`.
+        let _marked = self.actor.handle().close_clean()?;
         self.actor.shutdown()
     }
 }
@@ -306,7 +365,7 @@ pub fn apply(
 /// rather than appearing without blocks. Indexing it as a bare row instead would keep
 /// it listable and linkable and lose only its text. That is a change to what the index
 /// contains, so it belongs to architect and not to a timing task.
-fn build_op(
+pub(crate) fn build_op(
     parser: &dyn NoteParser,
     path: &VaultPath,
     loaded: LoadedNote,

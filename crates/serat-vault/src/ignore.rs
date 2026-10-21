@@ -1,4 +1,12 @@
 //! What the walk and the watcher refuse to look at.
+//!
+//! Two layers (FR-VLT-07). The built-in rules below are fixed: `.serat/`, `.git/`,
+//! `.obsidian/` and every other dotted directory. On top of them sits the **ignore
+//! file**, [`IGNORE_FILE`] (`.seratignore`) at the vault root, in gitignore syntax. It
+//! is the user's, plain text that Serat only ever reads, and a vault without one
+//! behaves exactly as before.
+
+use std::sync::{Arc, PoisonError, RwLock};
 
 /// Directory names that are never descended into.
 ///
@@ -24,15 +32,32 @@ const IGNORED_DIRS: &[&str] = &[
 /// row, still linkable, still queryable.
 const NOTE_EXTENSIONS: &[&str] = &["md", "markdown"];
 
+/// The user's ignore file, at the vault root.
+///
+/// Its own name rather than `.gitignore`: a `.gitignore` says what *git* should not
+/// track (a vault under git commonly lists notes it keeps off the remote but still
+/// wants searched), so reading it would hide notes from the index for a reason the
+/// user never gave us. `.gitignore` is touched by exactly one thing here, the
+/// `/.serat/` offer (NFR-CMP-04), and is never read for indexing.
+pub const IGNORE_FILE: &str = ".seratignore";
+
+/// The most bytes of the ignore file that are read. Past it the file is treated as
+/// absent: matching cost is linear in its lines for every entry of every walk.
+const MAX_IGNORE_FILE_BYTES: usize = 256 * 1024;
+
 /// The rules the walk and the watcher share.
 ///
 /// One type, used by both, because a file the walk skips and the watcher accepts
 /// would be indexed on edit and vanish on rebuild — a difference that only shows up
 /// as "my vault has different contents after a rebuild", which is the one thing
 /// C-02 promises cannot happen.
+///
+/// Clones share the ignore file's patterns, so reloading them through one (the
+/// watcher does, when `.seratignore` changes) is seen by the walk holding another.
 #[derive(Debug, Clone, Default)]
 pub struct IgnoreRules {
     extra_dirs: Vec<String>,
+    user: Arc<RwLock<Arc<Patterns>>>,
 }
 
 impl IgnoreRules {
@@ -77,6 +102,268 @@ impl IgnoreRules {
     }
 }
 
+impl IgnoreRules {
+    /// Replace the ignore file's patterns with those in `bytes` (`None`: no file).
+    /// Returns whether the effective patterns changed, which is what tells the caller
+    /// the vault must be walked again.
+    ///
+    /// Bytes that are not UTF-8 are read lossily and an oversized file is treated as
+    /// absent; neither is an error, because an unreadable ignore file must not stop a
+    /// vault opening (design goal 5).
+    pub fn set_ignore_file(&self, bytes: Option<&[u8]>) -> bool {
+        let patterns = match bytes {
+            Some(bytes) if bytes.len() <= MAX_IGNORE_FILE_BYTES => {
+                Patterns::parse(&String::from_utf8_lossy(bytes))
+            }
+            _ => Patterns::default(),
+        };
+        let mut current = self.user.write().unwrap_or_else(PoisonError::into_inner);
+        if **current == patterns {
+            return false;
+        }
+        *current = Arc::new(patterns);
+        true
+    }
+
+    /// The ignore file's patterns as a snapshot a walk can hold for its whole length
+    /// without taking the lock per entry.
+    #[must_use]
+    pub fn user_patterns(&self) -> Arc<Patterns> {
+        Arc::clone(&self.user.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Whether the directory `relative`, or any directory above it, is excluded: a
+    /// directory under an ignored one is not reachable by a walk from the root.
+    #[must_use]
+    pub fn is_ignored_dir_chain(&self, relative: &str) -> bool {
+        let mut end = 0;
+        for segment in relative.split('/') {
+            end += segment.len();
+            if self.is_ignored_at(&relative[..end], true) {
+                return true;
+            }
+            end += 1;
+        }
+        false
+    }
+
+    /// Whether the entry at vault-relative path `relative` is excluded: by the
+    /// built-in rules on its name, or by the ignore file on its path.
+    #[must_use]
+    pub fn is_ignored_at(&self, relative: &str, is_dir: bool) -> bool {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        let built_in = if is_dir {
+            self.is_ignored_dir(name)
+        } else {
+            self.is_ignored_file(name)
+        };
+        built_in || self.user_patterns().is_ignored(relative, is_dir)
+    }
+}
+
+/// One parsed line of the ignore file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pattern {
+    /// `!pattern`: a match re-includes.
+    negated: bool,
+    /// A trailing `/`: matches directories only.
+    dir_only: bool,
+    /// The glob, split on `/`.
+    segments: Vec<String>,
+    /// Contained a `/` other than a trailing one: matches from the vault root only.
+    /// Otherwise it matches an entry's own name at any depth.
+    anchored: bool,
+}
+
+/// The ignore file, parsed. Gitignore syntax: blank lines and `#` comments, `!`
+/// negation, an inner or leading `/` anchoring to the vault root, a trailing `/` for
+/// directories only, `*` `?` `[a-z]` within a name and `**` across directories. The
+/// last matching line wins. As in git, a file under an ignored directory cannot be
+/// re-included, because the directory is never entered.
+///
+/// Matching folds ASCII case on every platform, as the built-in directory names do
+/// (task #34): the same vault must index the same notes on every machine (C-02).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Patterns {
+    list: Vec<Pattern>,
+}
+
+impl Patterns {
+    /// Parse the text of an ignore file.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        Self {
+            list: text.lines().filter_map(parse_line).collect(),
+        }
+    }
+
+    /// Whether there is nothing to match, so a walk can skip building paths.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Whether `relative` (vault-relative, `/`-separated) is ignored.
+    #[must_use]
+    pub fn is_ignored(&self, relative: &str, is_dir: bool) -> bool {
+        if self.list.is_empty() {
+            return false;
+        }
+        let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+        let mut ignored = false;
+        for pattern in &self.list {
+            if (pattern.dir_only && !is_dir) || ignored != pattern.negated {
+                // Wrong kind of entry, or it cannot change the verdict: an ignoring
+                // line after an ignore, or a negation after an include.
+                continue;
+            }
+            if pattern.matches(&parts) {
+                ignored = !pattern.negated;
+            }
+        }
+        ignored
+    }
+}
+
+fn parse_line(line: &str) -> Option<Pattern> {
+    let line = line.trim_end_matches(['\r', ' ', '\t']);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (negated, line) = match line.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    // `\#` and `\!` are a literal first character.
+    let line = match line.strip_prefix('\\') {
+        Some(rest) if rest.starts_with(['#', '!']) => rest,
+        _ => line,
+    };
+    let (line, dir_only) = match line.strip_suffix('/') {
+        Some(rest) => (rest, true),
+        None => (line, false),
+    };
+    let anchored = line.contains('/');
+    let mut segments: Vec<String> = line
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    // `a/**` is what is inside `a`, not `a`: one segment, then any number more.
+    if anchored && segments.len() > 1 && segments.last().is_some_and(|s| s == "**") {
+        let last = segments.len() - 1;
+        segments.insert(last, "*".to_owned());
+    }
+    Some(Pattern {
+        negated,
+        dir_only,
+        segments,
+        anchored,
+    })
+}
+
+impl Pattern {
+    fn matches(&self, path: &[&str]) -> bool {
+        let Some(name) = path.last() else {
+            return false;
+        };
+        if !self.anchored {
+            return glob_segment(&self.segments[0], name);
+        }
+        // Reachability over (pattern segment, path segment): linear in the product,
+        // so a pattern full of `**` cannot make a walk exponential.
+        let (p, t) = (self.segments.len(), path.len());
+        let mut reach = vec![vec![false; t + 1]; p + 1];
+        reach[0][0] = true;
+        for i in 0..p {
+            for j in 0..=t {
+                if !reach[i][j] {
+                    continue;
+                }
+                if self.segments[i] == "**" {
+                    reach[i + 1][j] = true;
+                    if j < t {
+                        reach[i][j + 1] = true;
+                    }
+                } else if j < t && glob_segment(&self.segments[i], path[j]) {
+                    reach[i + 1][j + 1] = true;
+                }
+            }
+        }
+        reach[p][t]
+    }
+}
+
+/// Match one name against one glob segment (`*`, `?`, `[...]`, `\x`). The pattern
+/// side is already lower-case.
+fn glob_segment(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut p, mut n) = (0, 0);
+    // Where the last `*` was, and how much of the name it has taken so far.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        let advance = match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+                continue;
+            }
+            Some('?') => Some((p + 1, n + 1)),
+            Some('[') => match class(&pattern, p, name[n]) {
+                Some((true, next)) => Some((next, n + 1)),
+                Some((false, _)) => None,
+                // Never closed: a literal `[`.
+                None => (name[n] == '[').then_some((p + 1, n + 1)),
+            },
+            Some('\\') if pattern.get(p + 1) == Some(&name[n]) => Some((p + 2, n + 1)),
+            Some(&c) if c != '\\' && c == name[n] => Some((p + 1, n + 1)),
+            _ => None,
+        };
+        match (advance, star) {
+            (Some((next_p, next_n)), _) => (p, n) = (next_p, next_n),
+            (None, Some((star_p, star_n))) => {
+                p = star_p + 1;
+                n = star_n + 1;
+                star = Some((star_p, star_n + 1));
+            }
+            (None, None) => return false,
+        }
+    }
+    while pattern.get(p) == Some(&'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// A `[...]` class starting at `pattern[start]`: whether `c` is in it, and where the
+/// pattern continues. `None` when the bracket is never closed.
+fn class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+    let mut i = start + 1;
+    let negate = matches!(pattern.get(i), Some('!' | '^'));
+    if negate {
+        i += 1;
+    }
+    let first = i;
+    let mut hit = false;
+    while let Some(&current) = pattern.get(i) {
+        if current == ']' && i > first {
+            return Some((hit != negate, i + 1));
+        }
+        if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&end| end != ']') {
+            hit |= (current..=pattern[i + 2]).contains(&c);
+            i += 3;
+        } else {
+            hit |= current == c;
+            i += 1;
+        }
+    }
+    None
+}
+
 /// The prefix of the temporary files [`crate::Vault::write_atomic`] creates.
 ///
 /// Recognisable on sight and skipped by the walk, so a crash mid-write leaves
@@ -113,6 +400,88 @@ mod tests {
         for kept in ["10-projects", "20-systems", "attachments", "Daily Notes"] {
             assert!(!rules.is_ignored_dir(kept), "{kept} was ignored");
         }
+    }
+
+    fn ignored(file: &str, path: &str, is_dir: bool) -> bool {
+        Patterns::parse(file).is_ignored(path, is_dir)
+    }
+
+    #[test]
+    fn an_anchored_directory_entry_ignores_that_directory_only() {
+        // FR-VLT-07's acceptance example: an entry for /archive.
+        assert!(ignored("/archive\n", "archive", true));
+        assert!(!ignored("/archive\n", "notes/archive", true));
+        assert!(ignored("archive/\n", "notes/archive", true));
+        assert!(!ignored("archive/\n", "archive", false), "dir_only");
+    }
+
+    #[test]
+    fn wildcards_stay_inside_a_name_and_double_star_crosses_directories() {
+        assert!(ignored("*.pdf\n", "a/b/c.pdf", false));
+        assert!(!ignored("*.pdf\n", "a/b/c.md", false));
+        assert!(ignored("drafts/*.md\n", "drafts/x.md", false));
+        assert!(!ignored("drafts/*.md\n", "drafts/deep/x.md", false));
+        assert!(ignored("drafts/**/x.md\n", "drafts/a/b/x.md", false));
+        assert!(ignored("drafts/**/x.md\n", "drafts/x.md", false));
+        assert!(ignored("**/tmp\n", "a/b/tmp", true));
+        assert!(ignored("a/**\n", "a/b/c.md", false));
+        assert!(!ignored("a/**\n", "a", true), "a/** is inside a, not a");
+        assert!(ignored("note-?.md\n", "note-1.md", false));
+        assert!(!ignored("note-?.md\n", "note-12.md", false));
+        assert!(ignored("v[0-9].md\n", "v3.md", false));
+        assert!(!ignored("v[!0-9].md\n", "v3.md", false));
+    }
+
+    #[test]
+    fn the_last_matching_line_wins_and_comments_and_blanks_are_skipped() {
+        let file = "# private\n\n*.md\n!keep.md\n";
+        assert!(ignored(file, "a.md", false));
+        assert!(!ignored(file, "keep.md", false));
+        assert!(!ignored(file, "# private", false));
+        assert!(ignored("\\#odd.md\n", "#odd.md", false));
+    }
+
+    #[test]
+    fn matching_folds_case_and_tolerates_crlf_and_trailing_spaces() {
+        assert!(ignored("Archive/  \r\n", "ARCHIVE", true));
+        assert!(ignored("*.PDF\n", "x.pdf", false));
+    }
+
+    #[test]
+    fn a_pathological_pattern_is_linear_not_exponential() {
+        let pattern = format!("{}x\n", "**/".repeat(40));
+        let path = "a/".repeat(60);
+        let started = std::time::Instant::now();
+        assert!(!ignored(&pattern, &format!("{path}y"), false));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let stars = format!("{}b\n", "*a".repeat(30));
+        assert!(!ignored(&stars, &"a".repeat(200), false));
+    }
+
+    #[test]
+    fn the_rules_see_the_ignore_file_and_a_reload_is_visible_to_clones() {
+        let rules = IgnoreRules::new();
+        let clone = rules.clone();
+        assert!(!rules.is_ignored_at("archive/x.md", false));
+        assert!(rules.set_ignore_file(Some(b"/archive\n")));
+        assert!(clone.is_ignored_at("archive", true));
+        assert!(!clone.is_ignored_at("notes/archive", true));
+        assert!(
+            !rules.set_ignore_file(Some(b"/archive\n")),
+            "same file, no change"
+        );
+        assert!(rules.set_ignore_file(None));
+        assert!(!clone.is_ignored_at("archive", true));
+        // The built-in layer still applies on top.
+        assert!(clone.is_ignored_at(".obsidian", true));
+    }
+
+    #[test]
+    fn an_oversized_ignore_file_is_treated_as_absent() {
+        let rules = IgnoreRules::new();
+        let big = "x\n".repeat(MAX_IGNORE_FILE_BYTES);
+        assert!(!rules.set_ignore_file(Some(big.as_bytes())));
+        assert!(rules.user_patterns().is_empty());
     }
 
     #[test]

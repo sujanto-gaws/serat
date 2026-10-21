@@ -86,11 +86,11 @@ impl Vault {
     /// in turn. `start` is a vault-relative directory, or `""` for the whole vault.
     ///
     /// Entries are unordered; ordering is [`TreeModel`]'s. A name this platform cannot
-    /// represent as a [`VaultPath`] is recorded in [`Vault::refusals`] (without
-    /// clearing it: only [`Vault::walk`] does that) and left out. That includes a
-    /// **directory** name, which makes an entry for the directory's path in a log
-    /// whose contract is one entry per refused file; [`Vault::walk`] would instead
-    /// report each file beneath it. A subdirectory that
+    /// represent as a [`VaultPath`] is recorded in [`Vault::refusals`] and left out. That
+    /// includes a **directory** name, which is one entry for the directory and is not
+    /// entered; [`Vault::walk`] does the same (#13 N1). When the walk finishes, the
+    /// log is replaced for the subtree walked (all of it when `start` is the root), so
+    /// entries leave at the next walk that covers them. A subdirectory that
     /// cannot be read is listed empty rather than left pending for ever (design goal
     /// 5).
     ///
@@ -109,6 +109,10 @@ impl Vault {
         } else {
             self.resolve(&VaultPath::new(start)?)?
         };
+        if !start.is_empty() && self.ignore_rules().is_ignored_dir_chain(start) {
+            self.refusals().replace_scope(start, Vec::new());
+            return Ok(WalkSummary::default());
+        }
 
         // (parent index, whether a file sits at or below this directory), in the
         // order directories were read, so a reverse pass settles every ancestor.
@@ -116,6 +120,8 @@ impl Vault {
         let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
         queue.push_back((start_path, start.to_owned(), usize::MAX));
         let mut summary = WalkSummary::default();
+        let user = self.ignore_rules().user_patterns();
+        let mut refused: Vec<Refusal> = Vec::new();
 
         while let Some((directory, relative, parent)) = queue.pop_front() {
             let listing: Vec<fs::DirEntry> = match fs::read_dir(&directory) {
@@ -124,6 +130,7 @@ impl Vault {
                     if start.is_empty() {
                         return Err(VaultError::io(crate::display(&directory), &err));
                     }
+                    self.refusals().replace_scope(start, Vec::new());
                     return Ok(summary);
                 }
                 Err(_) => Vec::new(),
@@ -150,11 +157,21 @@ impl Vault {
                 if !is_dir && self.ignore_rules().is_ignored_file(&name) {
                     continue;
                 }
+                if !user.is_empty() {
+                    let candidate = if relative.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{relative}/{name}")
+                    };
+                    if user.is_ignored(&candidate, is_dir) {
+                        continue;
+                    }
+                }
                 let path = entry.path();
                 let child = match relativise_walked(self, &path) {
                     Ok(child) => child,
                     Err(VaultError::InvalidPath { path, reason }) => {
-                        self.refusals().record(Refusal { path, reason });
+                        refused.push(Refusal { path, reason });
                         continue;
                     }
                     Err(_) => continue,
@@ -177,6 +194,7 @@ impl Vault {
             summary.dirs += 1;
             on_dir(&relative, entries);
         }
+        self.refusals().replace_scope(start, refused);
 
         for index in (1..nodes.len()).rev() {
             let (parent, has_file) = nodes[index];

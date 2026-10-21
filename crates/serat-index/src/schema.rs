@@ -33,7 +33,7 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 /// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
 /// [`DDL`], which is asserted by a test rather than remembered by two people — under
 /// ADR-0002 a silent drift costs every user a full reindex.
-pub const INDEX_VERSION: i64 = 8;
+pub const INDEX_VERSION: i64 = 10;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +267,80 @@ pub fn inspect_for(path: &Path, vault_root: Option<&str>) -> Result<IndexState, 
         Ok(_) => unusable(UnusableReason::CountMismatch),
         Err(_) => unusable(UnusableReason::Corrupt),
     }
+}
+
+/// Run one write with `synchronous = FULL`, so its commit has reached stable storage
+/// when this returns, then put the connection back to the ordinary `NORMAL`.
+fn durably<T>(
+    conn: &Connection,
+    write: impl FnOnce() -> rusqlite::Result<T>,
+) -> Result<T, IndexError> {
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(sqlite)?;
+    let result = write();
+    let restored = conn.pragma_update(None, "synchronous", "NORMAL");
+    let value = result.map_err(sqlite)?;
+    restored.map_err(sqlite)?;
+    Ok(value)
+}
+
+/// A session opens the index (task #14, architecture §3.1.1 item 6). Returns whether
+/// the previous session closed cleanly, and clears `index_meta.clean_close`.
+///
+/// **The clear is durable before this returns.** That is the whole of why the marker
+/// works: commits are not fsynced (`synchronous = NORMAL`), and SQLite's WAL loses a
+/// *suffix* of commits on power loss, never a middle. If the clear could be lost, so
+/// could every commit after it, and the next open would find `clean_close = 1` over
+/// an index that is behind the disk, with nothing to say the catch-up must look at
+/// content. Forcing this one commit to `FULL` fsyncs the WAL up to and including it,
+/// so a lost commit can only be one made after the marker said "unclean".
+///
+/// Runs on the connection before the writer actor owns it, like `open_or_rebuild`'s
+/// adoption of a changed vault root: ADR-0001's single writer is about the actor
+/// being the only writer while it runs.
+pub(crate) fn begin_session(conn: &Connection) -> Result<bool, IndexError> {
+    let clean: i64 = conn
+        .query_row("SELECT clean_close FROM index_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(sqlite)?;
+    if clean != 0 {
+        durably(conn, || {
+            conn.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
+        })?;
+    }
+    Ok(clean != 0)
+}
+
+/// A session closes the index: checkpoint everything into the database file, and only
+/// if that completed, durably set `clean_close`. Returns whether the marker was set.
+///
+/// `false` is not an error. A reader pinning the WAL makes the `TRUNCATE` checkpoint
+/// report busy, and then the honest answer is "unclean": the next open does the extra
+/// work and nothing is lost. The order matters the other way round too: the marker is
+/// set only after the checkpoint has moved every earlier commit into the file.
+pub(crate) fn end_session(conn: &Connection) -> Result<bool, IndexError> {
+    // A reader pinning the WAL makes the checkpoint wait; closing must not hang for the
+    // connection's usual five seconds on a reader that is not going to leave.
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(sqlite)?;
+    let checkpoint = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })
+        .map_err(sqlite);
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(sqlite)?;
+    let (busy, log, moved) = checkpoint?;
+    if busy != 0 || log != moved {
+        return Ok(false);
+    }
+    durably(conn, || {
+        conn.execute("UPDATE index_meta SET clean_close = 1 WHERE id = 1", [])
+    })?;
+    // Best effort: leave no -wal behind. The marker is already durable.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    Ok(true)
 }
 
 pub(crate) fn sqlite(error: rusqlite::Error) -> IndexError {
