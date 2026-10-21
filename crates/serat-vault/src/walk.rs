@@ -1,7 +1,7 @@
 //! Walking the vault.
 
 use std::fs::{self, Metadata};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serat_core::{NoteKind, Platform, SourceEntry, VaultError, VaultPath};
@@ -23,12 +23,41 @@ use crate::{Vault, ignore::is_note_file};
 /// same rule [`Vault::resolve`] enforces for a path that arrives without going through
 /// this walk at all (T-07).
 pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
-    // The refusal log describes the vault as this walk finds it (one entry per file).
-    vault.refusals().clear();
-    let mut entries = Vec::new();
-    let mut pending = vec![vault.root().to_path_buf()];
+    scan(vault, vault.root().to_path_buf(), "")
+}
 
-    while let Some(directory) = pending.pop() {
+/// [`walk`], from one directory: the entries at or below `dir`.
+///
+/// The refusal log is replaced for that subtree only, so a directory rescan does not
+/// forget refusals elsewhere in the vault.
+pub(crate) fn walk_dir(vault: &Vault, dir: &VaultPath) -> Result<Vec<SourceEntry>, VaultError> {
+    if vault.ignore_rules().is_ignored_dir_chain(dir.as_str()) {
+        vault.refusals().replace_scope(dir.as_str(), Vec::new());
+        return Ok(Vec::new());
+    }
+    match vault.resolve(dir) {
+        Ok(absolute) if absolute.is_dir() => scan(vault, absolute, dir.as_str()),
+        // Gone, a file, or a symlink: nothing is listed there any more.
+        _ => {
+            vault.refusals().replace_scope(dir.as_str(), Vec::new());
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The walk proper, from `start` (whose vault-relative path is `start_rel`, empty for
+/// the root).
+fn scan(vault: &Vault, start: PathBuf, start_rel: &str) -> Result<Vec<SourceEntry>, VaultError> {
+    let user = vault.ignore_rules().user_patterns();
+    let match_user = !user.is_empty();
+    // Refusals are collected and swapped in at the end, so the log describes the
+    // vault as this walk found it without ever being empty mid-walk, and a walk of
+    // one directory cannot disturb the rest (#13 N1; task #14).
+    let mut refused: Vec<Refusal> = Vec::new();
+    let mut entries = Vec::new();
+    let mut pending = vec![(start, start_rel.to_owned())];
+
+    while let Some((directory, rel)) = pending.pop() {
         let listing = match fs::read_dir(&directory) {
             Ok(listing) => listing,
             // One unreadable directory must not stop the vault indexing (design goal
@@ -51,14 +80,15 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
                 continue;
             }
 
-            if stat.is_dir() {
-                if !vault.ignore_rules().is_ignored_dir(&name) {
-                    pending.push(entry.path());
+            let is_dir = stat.is_dir();
+            if is_dir {
+                if vault.ignore_rules().is_ignored_dir(&name) {
+                    continue;
                 }
+            } else if vault.ignore_rules().is_ignored_file(&name) {
                 continue;
             }
-
-            if vault.ignore_rules().is_ignored_file(&name) {
+            if match_user && user.is_ignored(&join(&rel, &name), is_dir) {
                 continue;
             }
 
@@ -83,8 +113,13 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
                 // (FR-VLT-01, design goal 5). Skipping the entry is still
                 // correct: there is no row to create for a name the current
                 // platform's filesystem could not itself hold.
+                //
+                // A refused **directory** is one entry and is not entered, exactly as
+                // `walk_tree` does it (#13 N1): the two walks used to disagree, this
+                // one reporting every file beneath and that one the directory, so the
+                // count of refusals depended on which walk ran last.
                 Err(VaultError::InvalidPath { path, reason }) => {
-                    vault.refusals().record(Refusal { path, reason });
+                    refused.push(Refusal { path, reason });
                     continue;
                 }
                 // Anything else (the entry vanished mid-walk, or lies outside a
@@ -92,6 +127,10 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
                 // not a name refusal, so it is not reported as one.
                 Err(_) => continue,
             };
+            if is_dir {
+                pending.push((entry.path(), path.as_str().to_owned()));
+                continue;
+            }
             entries.push(SourceEntry {
                 kind: if is_note_file(&name) {
                     NoteKind::Note
@@ -105,8 +144,18 @@ pub(crate) fn walk(vault: &Vault) -> Result<Vec<SourceEntry>, VaultError> {
         }
     }
 
+    vault.refusals().replace_scope(start_rel, refused);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// `rel/name`, or `name` at the root.
+fn join(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{rel}/{name}")
+    }
 }
 
 /// Strip the vault root lexically from a path this walk built.

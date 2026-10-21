@@ -158,5 +158,5 @@ pub trait EchoGuard: Send + Sync {
     /// with nothing to redo, since a later index write is idempotent by path — and a
     /// watcher event that wins a race against this call merely indexes the same note a
     /// moment early, for the same reason.
-    fn record_echo(&self, hash: ContentHash);
+    fn record_echo(&self, path: &VaultPath, hash: ContentHash);
 }

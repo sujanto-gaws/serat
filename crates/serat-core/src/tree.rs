@@ -32,6 +32,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::fold::fold_case;
+use crate::note::{NoteKind, SourceEntry};
+use crate::path::VaultPath;
 
 /// What a tree entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,17 +53,66 @@ pub struct RawEntry {
     pub name: String,
     /// What it is.
     pub kind: TreeKind,
+    /// Size in bytes, for a file whose walk was asked for metadata; 0 otherwise.
+    pub size: u64,
+    /// Modification time, milliseconds since the Unix epoch, under the same condition;
+    /// 0 otherwise.
+    pub mtime_ms: i64,
 }
 
 impl RawEntry {
-    /// An entry.
+    /// An entry with a name and a kind only: the no-index walk, which FR-VLT-01 times.
     #[must_use]
     pub fn new(name: impl Into<String>, kind: TreeKind) -> Self {
         Self {
             name: name.into(),
             kind,
+            size: 0,
+            mtime_ms: 0,
         }
     }
+
+    /// The same entry carrying the metadata the open's catch-up compares.
+    #[must_use]
+    pub fn with_metadata(mut self, size: u64, mtime_ms: i64) -> Self {
+        self.size = size;
+        self.mtime_ms = mtime_ms;
+        self
+    }
+}
+
+/// Turn the listing of one directory into the `SourceEntry`s of its files.
+///
+/// Pure (ADR-0015 section 2, *One walk at open*): the consumer of the tree walk
+/// accumulates these as the listings stream and calls `Reconciler::catch_up` once the
+/// walk completes, because removal needs the complete set. `dir` is the vault-relative
+/// directory (`""` for the root); a note becomes `NoteKind::Note`, any other file
+/// `NoteKind::Asset`, and directories are dropped. Size and mtime are whatever the
+/// entries carry: real only from a walk that was asked for metadata. A name that does
+/// not form a valid `VaultPath` is skipped, as the walks do (it is in the refusal log).
+#[must_use]
+pub fn source_entries(dir: &str, entries: &[RawEntry]) -> Vec<SourceEntry> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let kind = match entry.kind {
+                TreeKind::Note => NoteKind::Note,
+                TreeKind::Asset => NoteKind::Asset,
+                TreeKind::Dir => return None,
+            };
+            let joined = if dir.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            Some(SourceEntry {
+                path: VaultPath::new(joined).ok()?,
+                kind,
+                size: entry.size,
+                mtime_ms: entry.mtime_ms,
+            })
+        })
+        .collect()
 }
 
 /// An entry as the tree displays it.
@@ -346,7 +397,7 @@ impl TreeModel {
     /// directory's listing will carry the entry.
     pub fn upsert(&mut self, dir: &str, entry: RawEntry) -> Vec<TreeOp> {
         self.record(dir, &entry.name, Some(entry.kind));
-        let RawEntry { name, kind } = entry;
+        let RawEntry { name, kind, .. } = entry;
         let Some(previous) = self.dirs.get(dir).map(|s| s.names.get(&name).copied()) else {
             return Vec::new();
         };

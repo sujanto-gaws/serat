@@ -153,7 +153,7 @@ fn run(args: &[String]) -> Result<(), String> {
 struct NoEcho;
 
 impl serat_core::EchoGuard for NoEcho {
-    fn record_echo(&self, _hash: serat_core::ContentHash) {}
+    fn record_echo(&self, _path: &serat_core::VaultPath, _hash: serat_core::ContentHash) {}
 }
 
 /// Time one content save of `path` through the incremental path (parse, submit, commit),

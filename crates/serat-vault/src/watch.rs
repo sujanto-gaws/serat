@@ -59,15 +59,26 @@ impl Default for WatcherConfig {
 }
 
 /// Something the watcher noticed that is not a single changed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultEvent {
     /// The watcher lost events and the vault must be walked and reconciled.
     ///
     /// Emitted when the platform says it dropped notifications, or when the work
     /// queue overflowed. Both mean the same thing to the consumer, so they are one
     /// signal: the index may now disagree with the disk, and only a walk can settle
-    /// it.
+    /// it. Also raised when the ignore file ([`crate::IGNORE_FILE`]) changed and the
+    /// vault's contents changed with it; the rules are already reloaded by then.
     RescanRequired,
+    /// A directory appeared, moved or was renamed, so an unknown number of files under
+    /// it changed and the platform will not list them. Only that subtree needs
+    /// reconciling: walk it with [`Vault::walk_dir`] and the tree's own directory
+    /// listing, not the whole vault. Ancestors subsume descendants: one is reported
+    /// per subtree, the topmost.
+    ///
+    /// A directory that has since gone arrives as a changed *path* instead (the
+    /// consumer's read fails, which is how a delete is recognised), and the consumer
+    /// removes what the index holds beneath it.
+    DirChanged(VaultPath),
 }
 
 /// A running watcher.
@@ -148,7 +159,7 @@ impl Watcher {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *events)
+        collapse(std::mem::take(&mut *events))
     }
 
     /// The queue this watcher feeds.
@@ -192,6 +203,9 @@ fn coalesce(
     window: Duration,
 ) {
     let mut pending: HashMap<VaultPath, Instant> = HashMap::new();
+    let mut pending_dirs: HashMap<VaultPath, Instant> = HashMap::new();
+    // When the ignore file changed, and so when to reload it.
+    let mut ignore_file_due: Option<Instant> = None;
 
     loop {
         if stop.lock().is_ok_and(|stop| *stop) {
@@ -206,18 +220,22 @@ fn coalesce(
                 if is_interesting(&event.kind) {
                     let deadline = Instant::now() + window;
                     for path in &event.paths {
-                        match accept(vault, path) {
+                        match accept(vault, path, &event.kind) {
                             Accepted::File(path) => {
                                 pending.entry(path).or_insert(deadline);
                             }
                             // A directory event describes a subtree, and no platform
                             // emits per-child events for a folder rename. Queueing the
                             // directory itself would hand the consumer a path it cannot
-                            // read, while the notes that actually moved reach nothing —
-                            // the index keeps rows for files that no longer exist and
-                            // never learns the new ones. A rescan is the honest answer
-                            // and it is the mechanism that already exists.
-                            Accepted::Subtree => raise(events, VaultEvent::RescanRequired),
+                            // read, while the notes that actually moved reach nothing.
+                            // The honest answer is to say which directory, so the
+                            // consumer reconciles that subtree and not the vault.
+                            Accepted::Subtree(dir) => {
+                                pending_dirs.entry(dir).or_insert(deadline);
+                            }
+                            Accepted::IgnoreFile => {
+                                ignore_file_due.get_or_insert(deadline);
+                            }
                             // Task #34's amendment: reported, not dropped
                             // (FR-VLT-01, design goal 5). No further action —
                             // there is still no row to create for a name this
@@ -237,12 +255,27 @@ fn coalesce(
         }
 
         flush(&mut pending, queue, events);
+        flush_dirs(&mut pending_dirs, events);
+        if ignore_file_due.is_some_and(|due| due <= Instant::now()) {
+            ignore_file_due = None;
+            // The rules change what the vault contains, so a changed file is a
+            // rescan; an edit that left the effective patterns alone is not.
+            if vault.reload_ignore_file() {
+                raise(events, VaultEvent::RescanRequired);
+            }
+        }
     }
 
     // Anything still pending at shutdown is flushed: a change we noticed and then
     // dropped on the floor is an index that disagrees with the disk.
     for (path, _) in pending.drain() {
         queue.push(path);
+    }
+    if ignore_file_due.is_some() && vault.reload_ignore_file() {
+        raise(events, VaultEvent::RescanRequired);
+    }
+    for (dir, _) in pending_dirs.drain() {
+        raise(events, VaultEvent::DirChanged(dir));
     }
 }
 
@@ -272,6 +305,51 @@ fn flush(
     }
 }
 
+/// Report every directory whose window has closed.
+fn flush_dirs(pending: &mut HashMap<VaultPath, Instant>, events: &Mutex<Vec<VaultEvent>>) {
+    let now = Instant::now();
+    pending.retain(|dir, deadline| {
+        if *deadline > now {
+            return true;
+        }
+        raise(events, VaultEvent::DirChanged(dir.clone()));
+        false
+    });
+}
+
+/// What a consumer should see: a rescan of the vault subsumes every directory event,
+/// and a directory event subsumes those for directories beneath it. A rename of `a/`
+/// with a hundred subdirectories is one event, not a hundred and one.
+fn collapse(events: Vec<VaultEvent>) -> Vec<VaultEvent> {
+    if events.contains(&VaultEvent::RescanRequired) {
+        return vec![VaultEvent::RescanRequired];
+    }
+    let dirs: Vec<&VaultPath> = events
+        .iter()
+        .filter_map(|event| match event {
+            VaultEvent::DirChanged(dir) => Some(dir),
+            VaultEvent::RescanRequired => None,
+        })
+        .collect();
+    let covered = |dir: &VaultPath| {
+        dirs.iter().any(|ancestor| {
+            *ancestor != dir
+                && dir
+                    .as_str()
+                    .strip_prefix(ancestor.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    events
+        .iter()
+        .filter(|event| match event {
+            VaultEvent::DirChanged(dir) => !covered(dir),
+            VaultEvent::RescanRequired => true,
+        })
+        .cloned()
+        .collect()
+}
+
 fn raise(events: &Mutex<Vec<VaultEvent>>, event: VaultEvent) {
     let mut events = events
         .lock()
@@ -297,8 +375,11 @@ fn is_interesting(kind: &EventKind) -> bool {
 enum Accepted {
     /// A file to index.
     File(VaultPath),
-    /// A directory, so an unknown number of files under it changed.
-    Subtree,
+    /// A directory that appeared, moved or was renamed, so an unknown number of files
+    /// under it changed.
+    Subtree(VaultPath),
+    /// The ignore file itself.
+    IgnoreFile,
     /// A name this platform cannot represent as a `VaultPath` at all — reported
     /// rather than silently ignored (task #34's amendment).
     Refused(crate::refusal::Refusal),
@@ -310,7 +391,7 @@ enum Accepted {
 ///
 /// Everything the walk skips, the watcher skips, using the same rules — a file the
 /// walk ignores and the watcher accepts would appear on edit and vanish on rebuild.
-fn accept(vault: &Vault, path: &Path) -> Accepted {
+fn accept(vault: &Vault, path: &Path, kind: &EventKind) -> Accepted {
     let relative = match vault.relativise(path) {
         Ok(relative) => relative,
         // A name refusal (task #34's amendment) is reported; anything else —
@@ -324,6 +405,12 @@ fn accept(vault: &Vault, path: &Path) -> Accepted {
             };
         }
     };
+
+    // The ignore file is a dotfile, so the rules below would drop it; it is the one
+    // dotfile the watcher must hear about (FR-VLT-07).
+    if relative.as_str() == crate::IGNORE_FILE {
+        return Accepted::IgnoreFile;
+    }
 
     // Any ignored directory anywhere in the path: .serat/index.db must not enqueue
     // itself, which would be an index that reindexes because it indexed. Checked
@@ -348,8 +435,36 @@ fn accept(vault: &Vault, path: &Path) -> Accepted {
     let Ok(resolved) = vault.resolve(&relative) else {
         return Accepted::Ignored;
     };
-    if resolved.is_dir() {
-        return Accepted::Subtree;
+    let is_dir = resolved.is_dir();
+
+    // The ignore file's patterns, on the path. A directory above an ignored one is
+    // checked too: nothing under `/archive` is a vault file whatever its own name.
+    let user = vault.ignore_rules().user_patterns();
+    if !user.is_empty() {
+        let parent = relative.as_str().rsplit_once('/').map(|(parent, _)| parent);
+        if parent.is_some_and(|parent| vault.ignore_rules().is_ignored_dir_chain(parent))
+            || user.is_ignored(relative.as_str(), is_dir)
+        {
+            return Accepted::Ignored;
+        }
+    }
+
+    if is_dir {
+        // A directory whose own content or metadata changed says nothing new about
+        // its children, which report for themselves. Only a directory that came,
+        // went or moved is a subtree event; without this every save on a platform
+        // that reports the parent (Windows, macOS) would rescan the parent.
+        //
+        // A whitelist, not a blacklist: on Windows notify reports a directory's
+        // MODIFIED (raised on every child create, delete and rename) as
+        // `Modify(Any)`, which a blacklist of Data and Metadata lets through.
+        return match kind {
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+            | EventKind::Modify(notify::event::ModifyKind::Name(_)) => Accepted::Subtree(relative),
+            _ => Accepted::Ignored,
+        };
     }
 
     if vault.ignore_rules().is_ignored_file(relative.file_name()) {
@@ -568,10 +683,22 @@ mod tests {
         )
         .expect("rename the folder");
 
-        let saw_rescan = eventually(|| {
-            watcher.take_events().contains(&VaultEvent::RescanRequired) || queue.depth() > 0
+        // Which directory, not the whole vault: task #14's path-aware event.
+        let mut seen = Vec::new();
+        let named = eventually(|| {
+            seen.extend(watcher.take_events());
+            seen.contains(&VaultEvent::DirChanged(
+                VaultPath::new("20-archive").expect("path"),
+            ))
         });
-        assert!(saw_rescan, "a folder rename produced no signal at all");
+        assert!(
+            named,
+            "a folder rename did not name the new directory: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&VaultEvent::RescanRequired),
+            "a single directory change asked for a rescan of the vault: {seen:?}"
+        );
 
         std::thread::sleep(COALESCE_WINDOW * 2);
         for queued in queue.drain() {
@@ -581,6 +708,70 @@ mod tests {
             );
         }
         watcher.stop();
+    }
+
+    #[test]
+    fn saving_a_file_in_a_folder_does_not_report_the_folder() {
+        // Task #14. On platforms that report the parent of a written file, treating
+        // that as a directory change would rescan the folder on every save.
+        let (dir, vault, queue) = fixture();
+        fs::create_dir_all(dir.path().join("notes")).expect("mkdir");
+        fs::write(dir.path().join("notes/a.md"), b"# A\n").expect("write");
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+        std::thread::sleep(COALESCE_WINDOW * 2);
+        queue.drain();
+        let _ = watcher.take_events();
+
+        fs::write(dir.path().join("notes/a.md"), b"# A, edited\n").expect("write");
+        assert!(eventually(|| queue.depth() > 0), "the edit was not seen");
+        std::thread::sleep(COALESCE_WINDOW * 2);
+        assert_eq!(watcher.take_events(), Vec::<VaultEvent>::new());
+        watcher.stop();
+    }
+
+    #[test]
+    fn an_ignore_file_hides_a_folder_from_the_watcher_and_its_change_asks_for_a_rescan() {
+        // FR-VLT-07: the walk and the watcher apply one rule.
+        let (dir, vault, queue) = fixture();
+        fs::create_dir_all(dir.path().join("archive")).expect("mkdir");
+        fs::write(dir.path().join(crate::IGNORE_FILE), b"/archive\n").expect("write");
+        assert!(vault.reload_ignore_file(), "the file was not picked up");
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::write(dir.path().join("archive/old.md"), b"# Old\n").expect("write");
+        fs::write(dir.path().join("kept.md"), b"# Kept\n").expect("write");
+        assert!(eventually(|| queue.depth() > 0));
+        std::thread::sleep(COALESCE_WINDOW * 2);
+        assert_eq!(
+            queue.drain(),
+            vec![VaultPath::new("kept.md").expect("path")]
+        );
+        let _ = watcher.take_events();
+
+        // Un-ignoring it: the rules reload, and the vault must be walked again.
+        fs::write(dir.path().join(crate::IGNORE_FILE), b"# nothing now\n").expect("write");
+        assert!(
+            eventually(|| watcher.take_events().contains(&VaultEvent::RescanRequired)),
+            "changing the ignore file did not ask for a rescan"
+        );
+        assert!(!vault.ignore_rules().is_ignored_at("archive", true));
+        watcher.stop();
+    }
+
+    #[test]
+    fn a_directory_event_covers_the_directories_beneath_it_and_a_rescan_covers_all() {
+        let dir = |text: &str| VaultEvent::DirChanged(VaultPath::new(text).expect("path"));
+        assert_eq!(
+            collapse(vec![dir("a/b"), dir("a"), dir("ab"), dir("a/b/c")]),
+            vec![dir("a"), dir("ab")],
+            "a/b and a/b/c are under a; ab is a sibling and not"
+        );
+        assert_eq!(
+            collapse(vec![dir("a"), VaultEvent::RescanRequired]),
+            vec![VaultEvent::RescanRequired]
+        );
     }
 
     #[test]
