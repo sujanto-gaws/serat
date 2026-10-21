@@ -48,3 +48,9 @@ Task #31 (NFR-PRF-01 benches requiring `tree_first_screen` in place of `buffer_r
 ## Serves
 
 NFR-PRF-02 · NFR-PRF-08 (once wired) · US-35 · C-06.
+
+## Current state (task #11 final, 2026-10-21)
+
+The harness implements rule E0 (see `tests/measure.ts` header and the `RULE_STATEMENT` printed at the start of every run: R, R >= 16 validity rule, absent-key handling, verdict rule). The README sections above describing the older rule (frame-start recording, `selectFk`) are historical. Run: `SERAT_BENCH_DIST=<app>/dist-bench SERAT_SUBJECT_LABEL=<name> [SERAT_DUMP_DIR=<dir>] npx playwright test tests/nfr-prf-02.spec.ts` (build the subject with `npm run build:bench` in `app/`). The controls block (positive strict + swept, negative, render2, mutation) must be green in the same run for the subject figures to count; the three subject positions (start, middle, end) are independent tests. `record/subject-report.mjs` summarises SERAT_DUMP_DIR files per key.
+
+Numbers on task/p1-21-editor build, headless Chromium, R=16.70 ms (not gate-eligible): positive controls 100% on time (strict and swept); negative and render2 100% late; mutation red; subject start 99.3% / 99.0% on time (PASS), middle 3.3% / 4.7% and end 3.3% / 7.0% (FAIL; mean Event Timing 7.8 s, i.e. the editor stalls on keystrokes away from document start; task #42).
