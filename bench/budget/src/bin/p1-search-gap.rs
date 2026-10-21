@@ -422,7 +422,13 @@ fn measure(
             let _ = p.backlinks(&hub).map_err(|e| e.to_string())?;
             mixed.push(timed(&s, term));
         }
-        line("I  S alone | S between pool R2 reads", &alone, &mixed, "S", "S+R2");
+        line(
+            "I  S alone | S between pool R2 reads",
+            &alone,
+            &mixed,
+            "S",
+            "S+R2",
+        );
     }
     Ok(())
 }

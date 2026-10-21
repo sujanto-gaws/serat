@@ -8,9 +8,8 @@
 //! read type that exists here, on the paths that leave a statement mid-flight: a search
 //! that returns `Superseded`, an interrupted statement, and a read that returned an error.
 //!
-//! R5 (`Reader::attachments`, task #17) is not in this branch's base. When #17's
-//! integration lands, `every_read_type_leaves_no_transaction_open` gains its call; the
-//! list of reads there is the one place to extend.
+//! R5 (`Reader::attachments`) is in the list in `every_read_type_leaves_no_transaction_open`,
+//! which is the one place to extend when a read is added.
 
 use std::sync::atomic::Ordering;
 
@@ -107,6 +106,12 @@ fn every_read_type_leaves_no_transaction_open() {
                     r.search("[type:note]", 0, 50),
                     Ok(SearchOutcome::Hits(h)) if h.len() == 2
                 ));
+            }),
+        ),
+        (
+            "R5",
+            Box::new(|r| {
+                r.attachments().expect("R5");
             }),
         ),
         (
