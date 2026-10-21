@@ -1163,6 +1163,21 @@ A different control from §9's lens switcher: it changes note, not role. Designe
 3. The scorer's score, descending (an fzf-v2-style scorer; `nucleo-matcher` is the candidate, subject to the licence check — tests assert this ordering, not a crate).
 4. Shorter candidate, then path in byte order.
 
+**The scorer is bounded, and where it gives up exactness is stated** (task #16).
+
+- **The exact pass.** Candidates are capped at 256 characters. For a query of *m* characters, the matcher runs the exact dynamic program only over the window of the candidate from the first occurrence of the query's first character to the last occurrence of its last character.
+- **When the exact pass is skipped.** The matcher falls back in two cases:
+  - **the window is too large**: *m* × window exceeds 2,048 cells. Given the 256-character cap, that happens only for queries of 9 characters or more;
+  - **the query's budget is spent**: a per-query budget of cells, value in the code, has been used up across the candidates already scored.
+
+  Then the score and the word-start class come from the **leftmost greedy alignment**.
+- **What the fallback costs, and in which direction.**
+  - Greedy scores sit on a lower scale than exact ones. That biases long candidates downward, which is the same direction as the shorter-candidate tie-break (rank 4), so it never promotes a long candidate over a short one.
+  - The greedy alignment can miss a word-start alignment that exists, so a candidate can drop from the word-start tier ("all query characters at word starts") to the scattered-subsequence tier.
+  - **The substring class is still exact**, because it is decided by a substring search, not by the alignment. Exact, prefix and contiguous-substring matches never move class.
+- **Results stay deterministic.** Candidates are consumed in a fixed order (corpus order, which is note path order), so the budget runs out at the same candidate for the same query and corpus on every run, and two runs return the same 50 results in the same order (goal 3).
+- **The adversarial worst case is reported, not gated.** That is 50k notes with 100–200-character titles dense in `e`, queried with `e`-heavy queries. It is reported beside the NFR-PRF-06 bench and the `Switcher::query` allocation, and labelled as adversarial. The benchmark vault's titles are not like that, and a cap that made the adversarial case gate would be tuning the switcher to a vault nobody has.
+
 At most 50 results, by partial selection rather than a full sort. Each result carries its note path, the candidate that matched (`title` | `alias` | `path` | `heading`), the heading's text and byte offset when it is one, and the matched character ranges for highlighting. **An empty query returns 20 notes: the most frecent first, then, to fill the 20, the most recently modified (`notes.mtime` descending, then path in byte order), with no note listed twice.** As #16 first built it, an empty query returned only notes with history. On a fresh vault, or after `.serat/` is deleted, that left the switcher blank until a note had been opened, which is a control that shows nothing where US-04 promises any note within reach, and against goal 5.
 - Modification time is derived from the vault, so the fallback depends on nothing that lives only in `.serat/` (C-02).
 - It is a good proxy for the notes the user has been working on. A sync tool that touches mtimes can reorder it, and that is accepted for a list whose only job is to be a useful start.
