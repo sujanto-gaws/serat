@@ -242,6 +242,7 @@ impl WriterHandle {
     /// # Errors
     ///
     /// As [`WriterHandle::analyze`].
+    #[doc(hidden)]
     pub fn set_caught_up_from(&self, started_at_ms: i64) -> Result<(), IndexError> {
         self.round_trip(|reply| Command::CaughtUp(started_at_ms, reply))
     }
