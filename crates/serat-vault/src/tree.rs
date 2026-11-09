@@ -69,6 +69,9 @@ pub enum TreeOut {
     },
 }
 
+/// A callback handed each directory's raw entries as the walk streams them.
+pub type ListingTap<'a> = dyn FnMut(&str, &[RawEntry]) + 'a;
+
 /// What a walk found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalkSummary {
@@ -515,7 +518,36 @@ impl TreeSession {
     /// As [`Vault::walk_tree`], and an I/O error if the session is poisoned. On error
     /// no `Complete` is sent.
     pub fn populate_from_walk(&self, vault: &Vault) -> Result<WalkSummary, VaultError> {
-        let summary = self.rescan_dir(vault, "", true)?;
+        self.populate_walk(vault, None)
+    }
+
+    /// [`Self::populate_from_walk`] for the warm path's open (ADR-0015 section 2, *One
+    /// walk at open*): the walk is [`Vault::walk_tree_with_metadata`], and each
+    /// directory's raw entries (with `size` and `mtime_ms`) are handed to `on_listing`
+    /// as they are streamed, so the caller can accumulate
+    /// `serat_core::source_entries(dir, entries)` for `Reconciler::catch_up`. The
+    /// stream the front end sees is identical to [`Self::populate_from_walk`]'s.
+    ///
+    /// `on_listing` runs under the session's lock, in stream order; it must not call
+    /// back into the session.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::populate_from_walk`].
+    pub fn populate_from_walk_with_metadata(
+        &self,
+        vault: &Vault,
+        on_listing: &mut ListingTap<'_>,
+    ) -> Result<WalkSummary, VaultError> {
+        self.populate_walk(vault, Some(on_listing))
+    }
+
+    fn populate_walk(
+        &self,
+        vault: &Vault,
+        tap: Option<&mut ListingTap<'_>>,
+    ) -> Result<WalkSummary, VaultError> {
+        let summary = self.rescan_dir(vault, "", true, tap)?;
         self.with(|inner| {
             if inner.progress.complete().is_none() {
                 let entries = inner.files();
@@ -542,7 +574,7 @@ impl TreeSession {
     ///
     /// As [`Vault::walk_tree`], and an I/O error if the session is poisoned.
     pub fn rescan(&self, vault: &Vault, dir: &str) -> Result<WalkSummary, VaultError> {
-        self.rescan_dir(vault, dir, false)
+        self.rescan_dir(vault, dir, false, None)
     }
 
     fn rescan_dir(
@@ -550,19 +582,29 @@ impl TreeSession {
         vault: &Vault,
         dir: &str,
         initial: bool,
+        mut tap: Option<&mut ListingTap<'_>>,
     ) -> Result<WalkSummary, VaultError> {
         let snapshot: Snapshot = self
             .with(|inner| inner.model.begin_snapshot())
             .ok_or_else(Self::poisoned)?;
-        let result = vault.walk_tree(dir, |listed, raw| {
+        let metadata = tap.is_some();
+        let mut on_dir = |listed: &str, raw: Vec<RawEntry>| {
             self.with(|inner| {
                 if initial {
                     inner.walk_sent = true;
                 }
+                if let Some(tap) = tap.as_mut() {
+                    tap(listed, &raw);
+                }
                 let ops = inner.model.list(snapshot, listed, raw);
                 inner.emit_all(ops);
             });
-        });
+        };
+        let result = if metadata {
+            vault.walk_tree_with_metadata(dir, &mut on_dir)
+        } else {
+            vault.walk_tree(dir, &mut on_dir)
+        };
         self.with(|inner| inner.model.end_snapshot(snapshot))
             .ok_or_else(Self::poisoned)?;
         result

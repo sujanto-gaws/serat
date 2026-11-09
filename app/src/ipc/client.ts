@@ -12,11 +12,14 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { Backlink } from "./generated/Backlink";
 import type { ExternalChange } from "./generated/ExternalChange";
+import type { IndexChanged } from "./generated/IndexChanged";
 import type { MarkTreeArgs } from "./generated/MarkTreeArgs";
 import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
 import type { Patch } from "./generated/Patch";
 import type { RebaseBufferArgs } from "./generated/RebaseBufferArgs";
 import type { SavePatchArgs } from "./generated/SavePatchArgs";
+import type { SwitcherQueryArgs } from "./generated/SwitcherQueryArgs";
+import type { SwitcherResults } from "./generated/SwitcherResults";
 import type { TreeMessage } from "./generated/TreeMessage";
 import type { CreateFolderArgs } from "./generated/CreateFolderArgs";
 import type { FolderCreated } from "./generated/FolderCreated";
@@ -41,6 +44,9 @@ export type { IpcError };
 
 /** `contracts/ipc.rs::INDEX_STATUS_EVENT`. See that file for why it is not "/". */
 export const INDEX_STATUS_EVENT = "index://status";
+
+/** `contracts/ipc.rs::INDEX_CHANGED_EVENT`. */
+export const INDEX_CHANGED_EVENT = "index://changed";
 
 /** `contracts/ipc.rs::EXTERNAL_CHANGE_EVENT`. */
 export const EXTERNAL_CHANGE_EVENT = "note://external-change";
@@ -261,4 +267,27 @@ export function rebaseBuffer(args: RebaseBufferArgs): Promise<Patch[]> {
 /** Subscribes to `note://external-change` (unthrottled, not ordered against responses). */
 export function onExternalChange(handler: (change: ExternalChange) => void): Promise<UnlistenFn> {
   return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
+}
+
+// ---- P1 (task #18c): the quick switcher and index invalidation (architecture 9.2, 3.1).
+
+/**
+ * `switcher_query`: one call per keystroke (FR-NAV-01, NFR-PRF-06). Never rejects for
+ * a reason of its own and never waits for the index: before it is `Ready` the answer
+ * is built from the tree's paths (`corpus: "tree"`). A `#` switches to heading mode.
+ * Drop any response whose `seq` is not the latest sent, and any with `discarded: true`
+ * (the query was superseded while it waited and was not computed: its empty `items`
+ * is not "no matches").
+ */
+export function switcherQuery(args: SwitcherQueryArgs): Promise<SwitcherResults> {
+  return invoke("switcher_query", { args });
+}
+
+/**
+ * Subscribes to `index://changed`: throttled to ten per second, invalidation only.
+ * Re-query what is open; never treat it as proof that a particular write was indexed.
+ * Discard an event whose `vault_id` is not the current vault's.
+ */
+export function onIndexChanged(handler: (changed: IndexChanged) => void): Promise<UnlistenFn> {
+  return listen<IndexChanged>(INDEX_CHANGED_EVENT, (event) => handler(event.payload));
 }

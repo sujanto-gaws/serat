@@ -26,8 +26,8 @@
  *
  * The handler is a callback, not an SQL function, so C-03 holds. Every older
  * call returns `SearchOutcome::Superseded` rather than an error. serat-app
- * waits for the lock inside `spawn_blocking`, off the async executor. So a superseded 230-560 ms
- * search never holds a pooled connection that backlinks or a property lookup
+ * waits for the lock inside `spawn_blocking`, off the async executor. So a
+ * superseded 230-560 ms search never holds a pooled connection that backlinks or a property lookup
  * is waiting for. A property-only query (R3) runs on the pool and is never
  * interrupted, and neither are `backlinks` or any other read. The front end
  * also drops any response that is not for its latest request.

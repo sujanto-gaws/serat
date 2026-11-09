@@ -52,6 +52,7 @@ use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 mod acl_manifest;
 pub mod cli;
 pub mod commands;
+pub mod consumer;
 pub mod editor;
 pub mod error;
 pub mod folder;
@@ -63,6 +64,7 @@ mod security_config;
 pub mod settings;
 pub mod startup;
 pub mod state;
+pub mod switcher;
 pub mod tree_stream;
 pub mod vault;
 
@@ -258,6 +260,8 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
     // benchmark thread wants is recorded here and returned below.
     let exit_code = Arc::new(AtomicI32::new(0));
     let setup_exit_code = Arc::clone(&exit_code);
+    let window_state = Arc::clone(&state);
+    let exit_state = Arc::clone(&state);
 
     tauri::Builder::default()
         // §9.3: opening an external link goes through the system opener, and
@@ -267,6 +271,36 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         // #37 -- rather than the plugin's own wider `tel:`-including default.
         .plugin(tauri_plugin_opener::init())
         .manage(Arc::clone(&state))
+        // The index is closed cleanly before the window is destroyed (architecture
+        // 3.1.1 item 6): without it every session reads as unclean. The close checkpoints
+        // the WAL, so it runs on a thread of its own and the window is destroyed when it
+        // is done; the webview thread waits for nothing. A second close request while it
+        // runs destroys the window mid-close: safe, because the clean-close marker is
+        // set only at the end of a clean close, so the next open reads it as unclean.
+        .on_window_event(move |window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window_state.vault_root().is_some()
+            {
+                let state = Arc::clone(&window_state);
+                let window = window.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("serat-close".to_owned())
+                    .spawn(move || {
+                        state.close_vault();
+                        if let Err(err) = window.destroy() {
+                            eprintln!("serat: the window could not be destroyed: {err}");
+                        }
+                    });
+                // If no thread can be had the close proceeds and `RunEvent::Exit`
+                // below closes the index instead.
+                if spawned.is_ok() {
+                    api.prevent_close();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::open_vault,
             commands::read_file,
@@ -283,6 +317,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::append_gitignore_entry,
             commands::decline_gitignore_offer,
             commands::search,
+            commands::switcher_query,
             commands::backlinks,
             commands::open_tree,
             commands::mark_tree,
@@ -327,6 +362,18 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                     eprintln!(
                         "serat: {} could not be emitted: {err}",
                         ipc::TREE_STATUS_EVENT
+                    );
+                }
+            });
+
+            // 1d. And index://changed: invalidation only, throttled to ten per second by
+            //     the notifier before it reaches this sink.
+            let changed = handle.clone();
+            state.events.install_changed(move |event| {
+                if let Err(err) = changed.emit(ipc::INDEX_CHANGED_EVENT, event) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::INDEX_CHANGED_EVENT
                     );
                 }
             });
@@ -460,12 +507,45 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             Ok(())
         })
-        .run(tauri::generate_context!())?;
+        .build(tauri::generate_context!())?
+        .run(move |_app, event| {
+            // Whatever ended the event loop, the index is closed (idempotent).
+            if matches!(event, tauri::RunEvent::Exit) {
+                close_with_deadline(&exit_state, EXIT_CLOSE_DEADLINE);
+            }
+        });
 
     Ok(match exit_code.load(Ordering::SeqCst) {
         0 => ExitCode::SUCCESS,
         code => ExitCode::from(u8::try_from(code).unwrap_or(1)),
     })
+}
+
+/// The longest `RunEvent::Exit` (on the main thread) waits for the vault to close. Past
+/// it the process exits with the vault unclosed: the clean-close marker is then unset
+/// and the next open compares mtimes, which it does anyway.
+const EXIT_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Close the open vault on a thread of its own and wait for it, but not for ever: the
+/// close joins the vault thread and drains the index writer, either of which could be
+/// slow behind a very large catch-up, and the main thread must not hang at exit.
+fn close_with_deadline(state: &Arc<AppState>, deadline: std::time::Duration) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let closing = Arc::clone(state);
+    let spawned = std::thread::Builder::new()
+        .name("serat-exit-close".to_owned())
+        .spawn(move || {
+            closing.close_vault();
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => {
+            if finished.recv_timeout(deadline).is_err() {
+                eprintln!("serat: the vault did not close within {deadline:?}; exiting anyway");
+            }
+        }
+        Err(_) => state.close_vault(),
+    }
 }
 
 /// Window size, from the settings file's defaults.
@@ -505,6 +585,10 @@ fn spawn_benchmark_exit(
         .spawn(move || {
             let arrived = startup.wait_for_usable(timeout);
             if wait_for_walk && arrived {
+                // The one walk at open (ADR-0015 section 2) is started by the
+                // application itself after the first paint and the watcher, and stands
+                // in for the tree's when nobody has opened one; the benchmark no longer
+                // opens a stream, so it measures the product's own trigger.
                 // FR-VLT-01's quantity, not NFR-PRF-01's: with no index the file tree
                 // comes from the walk, so walk completion is when a tree could first
                 // render (F-151). Only reached under --exit-after-walk; the ordinary
@@ -562,6 +646,9 @@ fn spawn_benchmark_exit(
                     }
                 },
             };
+            // The index is closed after the last save this run submitted and before the
+            // process ends; `exit_now` bypasses `RunEvent::Exit`.
+            state.close_vault();
             exit_code.store(code, Ordering::SeqCst);
             if code == 0 {
                 handle.exit(0);

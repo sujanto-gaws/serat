@@ -429,3 +429,41 @@ fn a_created_directory_that_arrives_with_contents_is_listed_by_the_rescan_it_owe
 
     assert!(session.created("a2.md", TreeKind::Note).dir().is_none());
 }
+
+#[test]
+fn the_metadata_walk_streams_the_same_messages_and_taps_each_listing_with_metadata() {
+    // ADR-0015 section 2, One walk at open: the stream is unchanged, and the caller
+    // gets each directory's entries carrying size and mtime for catch-up.
+    let dir = tempfile::tempdir().expect("dir");
+    write(dir.path(), "a.md");
+    write(dir.path(), "sub/b.md");
+
+    let vault = Vault::open(dir.path()).expect("open");
+    let (plain, plain_log) = session();
+    plain.populate_from_walk(&vault).expect("walk");
+
+    let (tapped, tapped_log) = session();
+    let mut seen: Vec<(String, usize, bool)> = Vec::new();
+    tapped
+        .populate_from_walk_with_metadata(&vault, &mut |dir, entries| {
+            seen.push((
+                dir.to_owned(),
+                entries.len(),
+                entries
+                    .iter()
+                    .filter(|e| e.kind != TreeKind::Dir)
+                    .all(|e| e.size == 1 && e.mtime_ms > 0),
+            ));
+        })
+        .expect("walk");
+
+    assert_eq!(
+        *plain_log.lock().expect("log"),
+        *tapped_log.lock().expect("log")
+    );
+    seen.sort();
+    assert_eq!(
+        seen,
+        [(String::new(), 2, true), ("sub".to_owned(), 1, true)]
+    );
+}

@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use serat_core::{TreeEntry, TreeKind, TreeOp, VaultPath};
+use serat_core::{SourceEntry, TreeEntry, TreeKind, TreeOp, VaultPath, source_entries};
 use serat_vault::{TreeOut, TreeProgress, TreeSession, TreeSource, Vault, is_note_file};
 
 use crate::ipc::{self, TreeEntryKind, TreeMessage};
@@ -295,6 +295,67 @@ fn flusher(weak: &Weak<Shared>) {
     }
 }
 
+/// Calls its callback on drop unless disarmed.
+struct FailureGuard<'a> {
+    on_failure: &'a (dyn Fn() + Send + Sync),
+    armed: bool,
+}
+
+impl<'a> FailureGuard<'a> {
+    fn armed(on_failure: &'a (dyn Fn() + Send + Sync)) -> Self {
+        Self {
+            on_failure,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            (self.on_failure)();
+        }
+    }
+}
+
+/// The open's one authoritative walk, for a vault whose tree nobody has opened: the
+/// same metadata walk the tree would have made, into a sink that discards listings.
+/// Returns the files admitted and the sorted entries for the catch-up, or `None` if the
+/// walk failed (`on_failed` has then been called). Run on a thread of its own after the
+/// gate and the claim.
+pub fn standalone_walk(
+    vault: &Vault,
+    on_start: &dyn Fn(),
+    on_failed: &(dyn Fn() + Send + Sync),
+) -> Option<(u32, Vec<SourceEntry>)> {
+    let session = TreeSession::new(|_| {});
+    let mut failure = FailureGuard::armed(on_failed);
+    on_start();
+    let mut acc: Vec<SourceEntry> = Vec::new();
+    let result = session.populate_from_walk_with_metadata(vault, &mut |dir, entries| {
+        acc.extend(source_entries(dir, entries));
+    });
+    let summary = result.ok()?;
+    acc.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    failure.disarm();
+    Some((summary.files, acc))
+}
+
+/// A name-and-kind walk with no catch-up and no journal, for the benchmark's
+/// `--exit-after-walk` when the open's walk was not claimed (a rebuild is the
+/// reconciliation) and nobody opened a tree. Returns the files admitted.
+pub fn standalone_name_walk(vault: &Vault) -> Option<u32> {
+    let session = TreeSession::new(|_| {});
+    session
+        .populate_from_walk(vault)
+        .ok()
+        .map(|summary| summary.files)
+}
+
 /// What the front end's two marks were, as `mark_tree` recorded them (ADR-0015 §3).
 /// Milliseconds on the process's monotonic clock (`t0`), like every other mark.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -333,11 +394,42 @@ pub struct FeedConfig {
     pub vault: Arc<Vault>,
     /// The index database file, for the warm path.
     pub index_db: PathBuf,
-    /// Whether the index is `Ready` now. Read once per stream start.
+    /// Whether the index is `Ready` now. Read once per stream start, and only to decide
+    /// whether the index may paint the first listings; whether the walk feeds a
+    /// catch-up is [`FeedConfig::claim`]'s decision, taken after the gate.
     pub index_ready: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called by every `open`, before anything else: this vault now has a tree stream,
+    /// so the application's own open-time trigger leaves the walk to it.
+    pub attach: Box<dyn Fn() + Send + Sync>,
+    /// Called if the stream's thread could not be started after `attach`: the
+    /// application's own trigger may walk after all.
+    pub detach: Box<dyn Fn() + Send + Sync>,
+    /// Called after the gate: waits (bounded) for the index to settle and says whether
+    /// *this* walk is the open's one authoritative walk, the one that feeds the
+    /// catch-up (ADR-0015 section 2). True at most once per open vault; a second
+    /// `open_tree`, or a restarted session, gets false and walks name-and-kind only.
+    pub claim: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called if a walk that [`FeedConfig::claim`] granted did not complete (an error or
+    /// a panic), so the journal opened by `on_walk_start` is closed and a rescan owed.
+    pub on_walk_failed: Box<dyn Fn() + Send + Sync>,
     /// Blocks until the walk may start: the first paint, in the application
     /// (ADR-0015 §2: "the walk always runs, after the first paint").
     pub gate: Arc<dyn Fn() + Send + Sync>,
+    /// Called when `claim` was granted, just before the authoritative walk starts, so the
+    /// application can journal what the watcher reports until the catch-up is done.
+    pub on_walk_start: Box<dyn Fn() + Send + Sync>,
+    /// Called when `claim` was granted with every
+    /// file the authoritative walk found, sorted by path, once the walk has completed
+    /// (ADR-0015 section 2, *One walk at open*). The application hands it to the open's
+    /// catch-up on a thread of its own. Never called on the no-index path, where the
+    /// rebuild is the reconciliation, nor when the walk failed.
+    pub on_walked: Box<dyn Fn(Vec<SourceEntry>) + Send + Sync>,
+    /// Fed every message of the stream, for the switcher's corpus before the index is
+    /// `Ready` (architecture 9.2).
+    pub paths: Arc<crate::switcher::TreePaths>,
+    /// Called with the number of files the authoritative walk admitted, on either path,
+    /// when it completes (the cold-start trace's walk mark; the refusal count is final).
+    pub on_walk_complete: Box<dyn Fn(u32) + Send + Sync>,
     /// Called once when the stream has exhausted [`MAX_RESTARTS`] and will not update
     /// again (the application emits `tree://status`). Must not call back into the feed.
     pub on_stopped: Box<dyn Fn() + Send + Sync>,
@@ -405,15 +497,26 @@ impl TreeFeed {
     ///
     /// Only if the operating system refuses to create the populate thread.
     pub fn open(self: &Arc<Self>, send: TreeSender) -> std::io::Result<()> {
+        // Before the thread exists, so the application's trigger cannot claim between
+        // the two; undone if the thread cannot be had.
+        (self.config.attach)();
         *self.marks_lock() = TreeMarks::default();
         self.stopped.store(false, Ordering::SeqCst);
-        self.start(send, 0)
+        let started = self.start(send, 0);
+        if started.is_err() {
+            (self.config.detach)();
+        }
+        started
     }
 
     fn start(self: &Arc<Self>, send: TreeSender, restarts: u32) -> std::io::Result<()> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let sink = CoalescingSink::new(Arc::clone(&send), Arc::clone(&cancelled));
-        let session = Arc::new(TreeSession::new(move |out| sink.push(out)));
+        let paths = Arc::clone(&self.config.paths);
+        let session = Arc::new(TreeSession::new(move |out| {
+            paths.apply(&out);
+            sink.push(out);
+        }));
         {
             let mut state = self.state();
             if let Some(old) = state.active.take() {
@@ -444,9 +547,8 @@ impl TreeFeed {
 
     /// The warm path if the index is `Ready`, then the authoritative walk.
     fn populate(&self, session: &TreeSession, generation: u32) {
-        if (self.config.index_ready)()
-            && let Some(snapshot) = session.begin_index_read()
-        {
+        let warm = (self.config.index_ready)();
+        if warm && let Some(snapshot) = session.begin_index_read() {
             match serat_index::tree::read_tree_rows(&self.config.index_db) {
                 Ok(rows) => {
                     let _ = session.populate_from_index(
@@ -458,7 +560,33 @@ impl TreeFeed {
             }
         }
         (self.config.gate)();
-        if let Ok(summary) = session.populate_from_walk(&self.config.vault)
+        // One walk at open (ADR-0015 section 2): the claimed walk carries size and
+        // mtime and feeds the catch-up; any other stays name-and-kind. The claim is
+        // taken here, after the gate and the index's settling, so an `open_tree` that
+        // arrived while the index was `Opening` still gets the catch-up.
+        let walked = if (self.config.claim)() {
+            // Armed until the catch-up has its entries: an error or a panic closes the
+            // journal and owes a rescan instead of leaving the window open forever.
+            let mut failure = FailureGuard::armed(&*self.config.on_walk_failed);
+            (self.config.on_walk_start)();
+            let mut acc: Vec<SourceEntry> = Vec::new();
+            let result = session
+                .populate_from_walk_with_metadata(&self.config.vault, &mut |dir, entries| {
+                    acc.extend(source_entries(dir, entries))
+                });
+            if result.is_ok() {
+                acc.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+                failure.disarm();
+                (self.config.on_walked)(acc);
+            }
+            result
+        } else {
+            session.populate_from_walk(&self.config.vault)
+        };
+        if let Ok(summary) = walked {
+            (self.config.on_walk_complete)(summary.files);
+        }
+        if let Ok(summary) = walked
             && self.populating.load(Ordering::SeqCst) == generation
         {
             self.marks_lock().empty_folders = Some(summary.empty_folders);
@@ -548,6 +676,20 @@ impl TreeFeed {
         }
     }
 
+    /// A directory appeared, moved or was renamed (`VaultEvent::DirChanged`): re-list
+    /// that subtree, sending only listings that differ.
+    pub fn dir_changed(self: &Arc<Self>, dir: &VaultPath) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _ = session.rescan(&self.config.vault, dir.as_str());
+        }));
+        if outcome.is_err() || session.is_poisoned() {
+            self.restart_if_poisoned();
+        }
+    }
+
     /// The watcher lost events (or a directory moved): re-list everything, sending
     /// only listings that differ (ADR-0011, ADR-0015 §1).
     pub fn rescan_all(self: &Arc<Self>) {
@@ -628,6 +770,14 @@ mod tests {
             index_db: dir.join(".serat/none.db"),
             index_ready: Box::new(move || ready),
             gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(move || ready),
+            on_walk_failed: Box::new(|| {}),
+            on_walk_start: Box::new(|| {}),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
             on_stopped: Box::new(|| {}),
         })
     }
@@ -693,6 +843,121 @@ mod tests {
         ));
         assert!(listing(&log, "sub").is_some());
         assert!(listing(&log, "empty").is_some_and(Vec::is_empty));
+    }
+
+    type Walked = Arc<Mutex<Vec<Vec<SourceEntry>>>>;
+
+    fn feed_with_walk_hooks(dir: &Path, ready: bool) -> (Arc<TreeFeed>, Walked, Arc<AtomicU32>) {
+        let walked: Walked = Arc::default();
+        let sink = Arc::clone(&walked);
+        let starts = Arc::new(AtomicU32::new(0));
+        let started = Arc::clone(&starts);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir).expect("open")),
+            index_db: dir.join(".serat/none.db"),
+            index_ready: Box::new(move || ready),
+            gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(move || ready),
+            on_walk_failed: Box::new(|| {}),
+            on_walk_start: Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+            }),
+            on_walked: Box::new(move |entries| sink.lock().expect("walked").push(entries)),
+            on_walk_complete: Box::new(|_| {}),
+            on_stopped: Box::new(|| {}),
+        });
+        (feed, walked, starts)
+    }
+
+    #[test]
+    fn the_warm_walk_carries_metadata_and_feeds_catch_up_once_sorted() {
+        // ADR-0015 section 2, One walk at open: the tree walk is the catch-up's input.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "b.md");
+        write(dir.path(), "a/z.md");
+        write(dir.path(), "a/img.png");
+        let (feed, walked, starts) = feed_with_walk_hooks(dir.path(), true);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        wait_for("the hand-off", || {
+            !walked.lock().expect("walked").is_empty()
+        });
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let walked = walked.lock().expect("walked");
+        assert_eq!(walked.len(), 1, "catch-up is fed once");
+        let paths: Vec<&str> = walked[0].iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a/img.png", "a/z.md", "b.md"]);
+        assert!(
+            walked[0].iter().all(|e| e.mtime_ms > 0 && e.size == 1),
+            "the warm walk carries size and mtime: {:?}",
+            walked[0]
+        );
+    }
+
+    #[test]
+    fn the_no_index_walk_stays_name_and_kind_and_feeds_no_catch_up() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let (feed, walked, starts) = feed_with_walk_hooks(dir.path(), false);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(walked.lock().expect("walked").is_empty());
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_walk_that_fails_or_panics_reports_failure_through_the_guard() {
+        // A failing walk: the root is gone by the time the walk runs.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let vault = Vault::open(dir.path()).expect("open");
+        let failures = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&failures);
+        let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        fs::remove_dir_all(dir.path()).ok();
+        let walked = standalone_walk(&vault, &|| {}, &*on_failed);
+        if walked.is_none() {
+            assert_eq!(failures.load(Ordering::SeqCst), 1);
+        } else {
+            // The platform reported an empty root rather than an error; the guard is
+            // then not owed, and the panic arm below is what this test pins.
+            assert_eq!(failures.load(Ordering::SeqCst), 0);
+        }
+
+        // A panic in the claimed walk's start: the guard fires on unwind.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let panicked = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&panicked);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir.path()).expect("open")),
+            index_db: dir.path().join(".serat/none.db"),
+            index_ready: Box::new(|| false),
+            gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(|| true),
+            on_walk_failed: Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+            on_walk_start: Box::new(|| panic!("walk start (test)")),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
+            on_stopped: Box::new(|| {}),
+        });
+        let (send, _log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("the guard", || panicked.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
@@ -805,6 +1070,14 @@ mod tests {
             index_db: dir.path().join(".serat/none.db"),
             index_ready: Box::new(|| false),
             gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(|| false),
+            on_walk_failed: Box::new(|| {}),
+            on_walk_start: Box::new(|| {}),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
             on_stopped: Box::new(move || {
                 stopped.fetch_add(1, Ordering::SeqCst);
             }),
