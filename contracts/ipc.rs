@@ -474,11 +474,26 @@ pub struct BootInfo {
 /// before three steps that can still fail and return through `?`: building the
 /// switcher, spawning the index actor and spawning the vault thread. If one
 /// fails, `choose_vault` answers `Err`. The front end then treats the window
-/// as having **no vault open**. No event will ever carry the id `vault://opened`
-/// announced, so the front end keeps that id only to drop anything that does
-/// not match. It never re-adopts the previous vault's id, because that vault
-/// was closed before the emit. tauri-app-dev's follow-up tests this case
-/// ("emit, then a spawn fails") beside the ordering test.
+/// as having **no vault open**. Three rules then hold (task #103, on #90's
+/// implementation):
+///
+/// 1. **An `index://status` for the announced id may be emitted before the
+///    `Err`, and may be delivered after it.** The index actor exists from
+///    `IndexActor::spawn`, so a later step's failure can follow a status the
+///    actor already published. Commands and events are not ordered against
+///    each other.
+/// 2. **After the `Err`, the front end drops every event that carries the
+///    announced id.** No vault is open, so no id is current. It keeps the id
+///    only to recognise those events and drop them, and it never re-adopts the
+///    previous vault's id, because that vault was closed before the emit.
+/// 3. **Nothing that carries the announced id is emitted after the `Err`
+///    returns.** On the failure path serat-app retires the publisher and joins
+///    the actor with a bound before it answers. If the join passes its
+///    deadline, the rebuild thread may still write `index.db`, but it emits
+///    nothing.
+///
+/// tauri-app-dev's #90 tests this case ("emit, then a spawn fails") beside the
+/// ordering test.
 ///
 /// Not emitted for the vault opened at launch: the window does not exist yet,
 /// and `BootInfo::vault_id` covers that case. Webview-safe: it carries the root
