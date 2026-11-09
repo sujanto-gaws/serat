@@ -72,6 +72,7 @@ As an engineer, I want Claude Code and git to edit my files while I work, so tha
 **Acceptance criteria**
 
 - Given an open note, when an external process edits an earlier line, then my cursor and undo history survive.
+- Given a file is modified by git or another editor, when 500ms have elapsed at p95 over 100 single-note external changes on the 20,000-note vault, then the index and any open view reflect the change.
 
 ### US-07 — Never lose work  (serves FR-VLT-03, FR-PLT-04, NFR-REL-01, NFR-REL-02)
 **Phase:** P1 → P5 · **Size:** M
