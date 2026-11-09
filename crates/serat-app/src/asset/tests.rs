@@ -113,11 +113,11 @@ impl<'a> Spec<'a> {
     }
 }
 
-fn uri(platform: Platform, encoded_path: &str) -> String {
-    match platform {
-        Platform::Windows => format!("http://serat-asset.localhost/{encoded_path}"),
-        Platform::Other => format!("serat-asset://localhost/{encoded_path}"),
-    }
+/// The form the handler is actually given on every platform: wry reverts
+/// Windows' `http://serat-asset.localhost/...` to this before calling it
+/// (`revert_uri_work_around`), so the platform does not change the URI.
+fn uri(_platform: Platform, encoded_path: &str) -> String {
+    format!("serat-asset://localhost/{encoded_path}")
 }
 
 fn body_text(reply: &Reply) -> String {
@@ -352,7 +352,7 @@ fn any_host_but_the_platforms_own_is_a_404() {
         (Platform::Other, "serat-asset://user@localhost/a.png"),
         (Platform::Other, "serat-asset://localhost.evil/a.png"),
         (Platform::Other, "http://serat-asset.localhost/a.png"), // the Windows spelling elsewhere
-        (Platform::Windows, "serat-asset://localhost/a.png"),
+        (Platform::Windows, "http://serat-asset.localhost/a.png"), // wry never delivers this form
         (Platform::Windows, "http://serat-asset.localhost:8080/a.png"),
         (Platform::Windows, "http://evil.localhost/a.png"),
         (Platform::Windows, "http://serat-asset.localhost.evil/a.png"),
@@ -548,13 +548,10 @@ fn a_trailing_dot_name_is_refused_by_step_5_not_by_step_4_elsewhere() {
     }
 }
 
-/// The Windows half of the split. `VaultPath::new` on this tree does not yet
-/// apply #34's Windows-only rules, so this cannot pass until #34 merges; it is
-/// written now so the expectation is on record and the day #34 lands it is a
-/// one-line un-ignore.
+/// The Windows half of the split: #34's Windows-only `VaultPath` rules (`:` in a
+/// segment, device names, trailing dot/space), reached through the scheme.
 #[cfg(windows)]
 #[test]
-#[ignore = "needs task #34's Windows-only VaultPath rules (':' in a segment, device names, trailing dot/space)"]
 fn windows_name_rules_are_enforced_on_windows() {
     let fx = Fx::new("winnames-windows");
     for path in [
@@ -699,7 +696,7 @@ mod unix_only {
         let root = fx.vault.root().to_path_buf();
         let honest = root.join("dir/a.png");
         assert!(
-            open_verified(&honest, &root).is_some(),
+            open_verified(&honest, &fx.vault).is_some(),
             "control: an honest path opens"
         );
 
@@ -708,11 +705,29 @@ mod unix_only {
         fs::write(fx.outside().join("a.png"), b"OUTSIDE").unwrap();
         symlink(fx.outside(), root.join("dir")).unwrap();
         assert!(
-            open_verified(&honest, &root).is_none(),
+            open_verified(&honest, &fx.vault).is_none(),
             "the handle now lives outside the root; step 7 must refuse it"
         );
         // And the full pipeline refuses too (step 6 sees the link).
         assert_refused(&fx.get(Platform::Other, "dir/a.png"), "swapped component");
+    }
+
+    /// Step 7 re-runs the ignored-directory rule on the handle's real path: a
+    /// directory swapped for a link into `.serat/` after step 5 is refused.
+    #[test]
+    fn a_directory_swapped_for_a_link_into_serat_is_refused_by_step_7() {
+        let fx = Fx::new("toctou-serat");
+        fx.put("dir/x.png", b"INSIDE");
+        fx.put(".serat/x.png", b"INDEX");
+        let root = fx.vault.root().to_path_buf();
+        let honest = root.join("dir/x.png");
+        assert!(open_verified(&honest, &fx.vault).is_some(), "control");
+        fs::rename(root.join("dir"), root.join("dir.moved")).unwrap();
+        symlink(root.join(".serat"), root.join("dir")).unwrap();
+        assert!(
+            open_verified(&honest, &fx.vault).is_none(),
+            "the handle lives in .serat/, an ignored directory"
+        );
     }
 
     #[test]
@@ -720,14 +735,13 @@ mod unix_only {
         let fx = Fx::new("toctou-final");
         let root = fx.vault.root().to_path_buf();
         symlink(fx.outside().join("secret.png"), root.join("a.png")).unwrap();
-        assert!(open_verified(&root.join("a.png"), &root).is_none());
+        assert!(open_verified(&root.join("a.png"), &fx.vault).is_none());
     }
 
     #[test]
     fn a_handle_outside_the_root_is_refused_even_by_an_honest_path() {
         let fx = Fx::new("outside-handle");
-        let root = fx.vault.root().to_path_buf();
-        assert!(open_verified(&fx.outside().join("secret.png"), &root).is_none());
+        assert!(open_verified(&fx.outside().join("secret.png"), &fx.vault).is_none());
     }
 
     #[test]

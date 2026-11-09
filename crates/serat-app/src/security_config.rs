@@ -259,6 +259,23 @@ mod tests {
     }
 
     #[test]
+    fn the_main_window_pins_the_http_custom_protocol_scheme() {
+        // ADR-0017: `app_origin()` and the asset CSP hard-code `http://tauri.localhost`
+        // and `http://serat-asset.localhost`. A builder that left the Windows scheme
+        // at Tauri's default (or chose https) would make every CORS origin check
+        // compare against the wrong string, so the choice is explicit and pinned.
+        const LIB_RS: &str = include_str!("lib.rs");
+        assert!(
+            LIB_RS.contains(".use_https_scheme(false)"),
+            "lib.rs must call .use_https_scheme(false) on the main WebviewWindowBuilder"
+        );
+        assert!(
+            !LIB_RS.contains("use_https_scheme(true)"),
+            "use_https_scheme(true) would move the Windows origin to https://"
+        );
+    }
+
+    #[test]
     fn the_granted_window_label_matches_the_one_the_builder_creates() {
         // Task #18 finding 3: WebviewWindowBuilder::new(app, ..., ...) in lib.rs and
         // capabilities/default.json's `windows` array were two independent spellings of

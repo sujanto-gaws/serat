@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn the_granted_set_is_exactly_the_five_commands_boot_js_calls() {
+    fn the_granted_set_is_exactly_the_pinned_commands() {
         // ADR-0012, option 3: grant the five commands the webview actually invokes,
         // not all six. open_vault is called only from Rust (state.open_vault(...)
         // inside setup, crates/serat-app/src/lib.rs) and granting it here would

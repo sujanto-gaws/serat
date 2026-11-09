@@ -25,33 +25,30 @@
 //!
 //! # Platform notes for step 7
 //!
-//! The workspace forbids `unsafe_code`, so every handle query here goes through a
-//! safe API: Linux reads `/proc/self/fd/N`; macOS uses `rustix::fs::getpath`
-//! (`fcntl(F_GETPATH)`); Windows and the other Unixes cannot ask a handle for its
-//! path without FFI, so they compare the canonical path of what was opened and
-//! then prove the handle *is* that file by identity (`same-file`, device and inode
-//! respectively). That is one syscall pair weaker than `GetFinalPathNameByHandleW`
-//! on Windows: a component swapped between the canonicalisation and the identity
-//! comparison is not caught. It is recorded in the task report as an open decision
-//! (a tiny audited `unsafe` crate versus this) rather than silently accepted.
+//! The workspace forbids `unsafe_code`, so the handle-to-path query goes through
+//! the `filepath` crate's `File::path()`: `GetFinalPathNameByHandleW` on Windows,
+//! `fcntl(F_GETPATH)` on macOS, `/proc/self/fd/N` on Linux. That is ADR-0017 step
+//! 7 literally on every platform: the open handle is asked where it really is, and
+//! the answer must be under the vault root.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use serat_core::VaultPath;
 use serat_core::mime::{OCTET_STREAM, VIEWABLE, is_viewable, mime_for_extension};
 
-/// A viewable image type (served whole: an `<img>` cannot ask for spans).
-fn is_image(mime: &str) -> bool {
-    mime != "application/pdf" && VIEWABLE.contains(&mime)
-}
 use serat_vault::Vault;
 
 use crate::ipc::{AssetInfo, IpcError};
 use crate::nav_guard::Platform;
+
+/// A viewable image type (served whole: an `<img>` cannot ask for spans).
+fn is_image(mime: &str) -> bool {
+    mime != "application/pdf" && VIEWABLE.contains(&mime)
+}
 
 /// Tauri's own span figure, ADR-0017 step 9: 1,000 KiB.
 pub(crate) const SPAN_CAP: u64 = 1000 * 1024;
@@ -163,20 +160,17 @@ impl Drop for Permit<'_> {
 /// ignored directory. The directory check folds case (#34's fourth rule), so
 /// `Node_Modules/` on a case-insensitive filesystem is the directory it names.
 fn viewable_mime(vault: &Vault, path: &VaultPath) -> Option<&'static str> {
-    if !under_no_ignored_dir(vault, path) {
+    if !under_no_ignored_dir(vault, path.parent()) {
         return None;
     }
     let mime = mime_for_extension(&path.extension()?).unwrap_or(OCTET_STREAM);
     is_viewable(mime).then_some(mime)
 }
 
-fn under_no_ignored_dir(vault: &Vault, path: &VaultPath) -> bool {
-    let mut segments: Vec<&str> = path.as_str().split('/').collect();
-    segments.pop(); // the file name is not a directory
-    !segments.iter().any(|segment| {
-        vault.ignore_rules().is_ignored_dir(segment)
-            || vault.ignore_rules().is_ignored_dir(&segment.to_lowercase())
-    })
+/// The same rule the walk applies (`IgnoreRules::is_ignored_dir_chain`: built-ins,
+/// case-folded, and the user's `.seratignore` patterns), on the file's parent.
+fn under_no_ignored_dir(vault: &Vault, parent: Option<&str>) -> bool {
+    parent.is_none_or(|parent| !vault.ignore_rules().is_ignored_dir_chain(parent))
 }
 
 /// An opened, verified vault file.
@@ -193,7 +187,7 @@ fn locate(vault: &Vault, path: &VaultPath) -> Option<Opened> {
     if !absolute.starts_with(vault.root()) {
         return None;
     }
-    let file = open_verified(&absolute, vault.root())?;
+    let file = open_verified(&absolute, vault)?;
     let meta = file.metadata().ok()?;
     let mtime_ns = meta
         .modified()
@@ -213,7 +207,11 @@ fn locate(vault: &Vault, path: &VaultPath) -> Option<Opened> {
 /// instead of waiting for a writer; `O_NOFOLLOW` so a final component swapped for a
 /// symlink after step 6 is refused by the kernel; the `is_file` check after the
 /// open so a FIFO or device is never read (it would block forever).
-pub(crate) fn open_verified(absolute: &Path, root: &Path) -> Option<File> {
+///
+/// After the handle's own path is read back and found under the root, the
+/// ignored-directory rule is re-run on that *real* relative path: a directory
+/// swapped for a link into `.serat/` after step 5 is caught here.
+pub(crate) fn open_verified(absolute: &Path, vault: &Vault) -> Option<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -221,85 +219,39 @@ pub(crate) fn open_verified(absolute: &Path, root: &Path) -> Option<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT: open a final-component link itself, so the
-        // attribute check below can see it, instead of silently following it.
-        options.custom_flags(0x0020_0000);
-    }
+    // Windows: no reparse flag. A final-component link is followed by the open and
+    // the handle's final path below says where it really landed; refusing every
+    // reparse point would also refuse OneDrive Files-On-Demand placeholders.
     let file = options.open(absolute).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() {
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 {
-            return None; // FILE_ATTRIBUTE_REPARSE_POINT
-        }
-    }
-    handle_is_inside(&file, absolute, root).then_some(file)
+    let real = filepath::FilePath::path(&file).ok()?;
+    let relative = relative_to_root(&real, vault.root())?;
+    let parent = relative
+        .parent()
+        .and_then(Path::to_str)
+        .map(|text| text.replace('\\', "/"))
+        .filter(|text| !text.is_empty());
+    under_no_ignored_dir(vault, parent.as_deref()).then_some(file)
 }
 
-#[cfg(target_os = "linux")]
-fn handle_is_inside(file: &File, _opened_as: &Path, root: &Path) -> bool {
-    use std::os::fd::AsRawFd;
-    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-        .is_ok_and(|real| real.starts_with(root))
+/// `real` relative to `root`, or `None` when it is not under it. Windows reports
+/// handle paths in `\\?\` form; both sides are normalised before comparing.
+fn relative_to_root(real: &Path, root: &Path) -> Option<PathBuf> {
+    let real = strip_verbatim(real);
+    let root = strip_verbatim(root);
+    real.strip_prefix(&root).ok().map(Path::to_path_buf)
 }
 
-#[cfg(target_os = "macos")]
-fn handle_is_inside(file: &File, _opened_as: &Path, root: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    rustix::fs::getpath(file)
-        .is_ok_and(|real| Path::new(std::ffi::OsStr::from_bytes(real.to_bytes())).starts_with(root))
-}
-
-/// Windows and the other Unixes: no safe handle-to-path query exists, so prove the
-/// handle is the file the canonical path names, and that path is inside the root.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn handle_is_inside(file: &File, opened_as: &Path, root: &Path) -> bool {
-    let Ok(real) = fs::canonicalize(opened_as) else {
-        return false;
-    };
-    let real = strip_verbatim(&real);
-    if !real.starts_with(root) {
-        return false;
-    }
-    same_file_identity(file, &real)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn strip_verbatim(path: &Path) -> std::path::PathBuf {
+fn strip_verbatim(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        std::path::PathBuf::from(format!(r"\\{rest}"))
+        PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        std::path::PathBuf::from(rest)
+        PathBuf::from(rest)
     } else {
         path.to_path_buf()
-    }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn same_file_identity(file: &File, real: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), fs::metadata(real)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(windows)]
-fn same_file_identity(file: &File, real: &Path) -> bool {
-    match (
-        file.try_clone().and_then(same_file::Handle::from_file),
-        same_file::Handle::from_path(real),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
     }
 }
 
@@ -399,18 +351,21 @@ fn not_found(platform: Platform) -> Reply {
 /// The raw, still percent-encoded path of a request for this platform's spelling,
 /// or `None` when scheme or host is not exactly ours (step 2). Parsed by hand: a
 /// URL parser would collapse `%2e%2e` and `..` before step 3 sees them.
-fn request_path(platform: Platform, uri: &str) -> Option<&str> {
+///
+/// Every platform delivers `serat-asset://localhost/...` to the handler: the page
+/// uses `http://serat-asset.localhost/...` on Windows, but wry reverts that URI
+/// before calling the handler (wry 0.55.1 `webview2/mod.rs`
+/// `revert_uri_work_around`), as Tauri's own scheme relies on
+/// (`tauri-2.11.5/src/protocol/tauri.rs`). `Platform` matters only for the CORS
+/// origin in the response.
+fn request_path(uri: &str) -> Option<&str> {
     let (scheme, rest) = uri.split_once("://")?;
-    let (want_scheme, want_host) = match platform {
-        Platform::Windows => ("http", "serat-asset.localhost"),
-        Platform::Other => ("serat-asset", "localhost"),
-    };
-    if !scheme.eq_ignore_ascii_case(want_scheme) {
+    if !scheme.eq_ignore_ascii_case("serat-asset") {
         return None;
     }
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    if !authority.eq_ignore_ascii_case(want_host) {
+    if !authority.eq_ignore_ascii_case("localhost") {
         return None;
     }
     let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
@@ -559,6 +514,11 @@ pub(crate) fn serve(
     limits: Limits,
     request: &Request<'_>,
 ) -> Reply {
+    // Steps 2-3. The host check comes before OPTIONS so a foreign host gets 404
+    // whatever the method.
+    let Some(raw) = request_path(request.uri) else {
+        return not_found(platform);
+    };
     // Step 1 / step 8: OPTIONS is answered, from the app origin only.
     if request.method.eq_ignore_ascii_case("OPTIONS") {
         if request.origin != Some(platform.app_origin()) {
@@ -578,10 +538,6 @@ pub(crate) fn serve(
         return bare(platform, 405);
     }
 
-    // Steps 2-3.
-    let Some(raw) = request_path(platform, request.uri) else {
-        return not_found(platform);
-    };
     let Some(decoded) = decode_once(raw) else {
         return not_found(platform);
     };
@@ -687,7 +643,7 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
     let missing = || IpcError::NotFound {
         path: path.to_string(),
     };
-    if !under_no_ignored_dir(vault, path) {
+    if !under_no_ignored_dir(vault, path.parent()) {
         return Err(missing());
     }
     let opened = locate(vault, path).ok_or_else(missing)?;
@@ -707,7 +663,7 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
 fn sidecar_of(vault: &Vault, path: &VaultPath) -> Option<String> {
     let wanted = format!("{}.md", path.file_name());
     let directory = match path.parent() {
-        Some(parent) => vault.root().join(parent),
+        Some(parent) => vault.resolve(&VaultPath::new(parent).ok()?).ok()?,
         None => vault.root().to_path_buf(),
     };
     let found = fs::read_dir(directory)

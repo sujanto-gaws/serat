@@ -410,6 +410,11 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 WebviewUrl::App("index.html".into()),
             )
             .title("Serat")
+            // ADR-0017: pinned, not defaulted. On Windows the app origin is
+            // `http://tauri.localhost` and the asset page URL is
+            // `http://serat-asset.localhost`; `app_origin()` and the CSP hard-code
+            // `http://`, so the `https` form must never be selected.
+            .use_https_scheme(false)
             .inner_size(geometry.0, geometry.1)
             .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
             // T-09, ADR-0017's correction (task #36): the only control

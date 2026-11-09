@@ -143,9 +143,21 @@ export function readAssetRange(args: ReadAssetRangeArgs): Promise<ArrayBuffer> {
   return invoke("read_asset_range", { args });
 }
 
-/** URL of the `serat-asset` scheme for a vault path; the bytes path is not a command. */
+/**
+ * URL of the `serat-asset` scheme for a vault path; the bytes path is not a command.
+ *
+ * `.`, `..` and empty segments are refused rather than encoded: `encodeURIComponent`
+ * leaves dots alone, and a URL parser collapses `a/../b` (and `%2e%2e`) before the
+ * handler ever sees the request, so such a path could never name the file asked for.
+ * The native handler decodes exactly once and re-validates (ADR-0017 steps 3-4);
+ * this is the front end refusing to build a URL it knows will be rewritten.
+ */
 export function assetUrl(path: string, windows: boolean): string {
-  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`not a vault-relative asset path: ${JSON.stringify(path)}`);
+  }
+  const encoded = segments.map(encodeURIComponent).join("/");
   return windows
     ? `http://serat-asset.localhost/${encoded}`
     : `serat-asset://localhost/${encoded}`;
