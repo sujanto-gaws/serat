@@ -1,0 +1,15 @@
+{
+  "name": "editor-latency",
+  "private": true,
+  "version": "0.0.0",
+  "description": "NFR-PRF-02 budget harness — keystroke-to-paint p95 in a 5,000-line note. Task #11 (P1/test). See README.md; not wired into CI until it can pass.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^26.6.5"
+  }
+}
