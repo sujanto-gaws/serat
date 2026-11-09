@@ -8,7 +8,7 @@
   `CodeMirrorEditor.vue` rather than driven from here.
 -->
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, provide, ref } from "vue";
 
 import BacklinksPane from "@/panes/BacklinksPane.vue";
 import SearchPanel from "@/panes/SearchPanel.vue";
@@ -24,6 +24,12 @@ import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
 import { indexStatus, isIpcError, onIndexStatus } from "@/ipc/client";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
+import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
+import { detectPlatform } from "@/editor/codemirrorSetup";
+import { headingDocOffset } from "@/overlays/headingTarget";
+import CommandPalette from "@/overlays/CommandPalette.vue";
+import QuickSwitcher from "@/overlays/QuickSwitcher.vue";
+import { getUiSettings, setLivePreview } from "@/ipc/client";
 
 const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
@@ -111,15 +117,15 @@ function closeSearch(): void {
  * search jump-to-block). The previous note's unsaved edits are flushed first by
  * `loadNote`; if they cannot be saved the note is not replaced.
  */
-async function openNote(path: string, block: BlockLocation | null = null): Promise<void> {
+async function openNote(path: string, block: BlockLocation | null = null): Promise<string | null> {
   const editor = editorRef.value;
-  if (!editor) return;
+  if (!editor) return null;
   try {
     const file = await readFile({ path });
     const loaded = await editor.loadNote(file.text, file.path, file.hash);
     if (!loaded) {
       store.setMark("not opened: the current note has changes that could not be saved yet");
-      return;
+      return null;
     }
     store.setOpenBuffer(file.path, file.hash);
     missingNote.value = null;
@@ -130,40 +136,111 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
       editor.revealOffset(position.offset);
       if (position.approximate) store.setMark("approximate location \u2014 this note has changed since it was indexed");
     }
+    return file.text;
   } catch (error) {
     store.setMark(`could not open ${path}: ${JSON.stringify(error)}`);
+    return null;
   }
 }
+
+/*
+ * Quick switcher (⌘O, FR-NAV-01) and command palette (⌘K, FR-NAV-06). The two
+ * overlays are mutually exclusive. Every user-invocable action lives in ONE
+ * registry (architecture.md §9.3, editor/commands.ts): the editor adds its own
+ * commands to it, this file adds the global ones, the palette lists it, and the
+ * global chords below are matched against its effective bindings.
+ */
+const commands = new CommandRegistry();
+commands.onOverrideRefused((ids) =>
+  store.setMark(`keybinding ignored (already used by another command): ${ids.join(", ")}`),
+);
+provide(COMMANDS_KEY, commands);
+const mac = detectPlatform() === "mac";
+const switcherOpen = ref(false);
+const paletteOpen = ref(false);
+const livePreview = ref(true);
+
+function openSwitcher(): void {
+  paletteOpen.value = false;
+  switcherOpen.value = true;
+}
+
+function openPalette(): void {
+  switcherOpen.value = false;
+  paletteOpen.value = true;
+}
+
+async function onSwitcherOpen(payload: {
+  path: string;
+  newTab: boolean;
+  heading: { text: string; byteStart: number } | null;
+}): Promise<void> {
+  switcherOpen.value = false; // `newTab` is ignored: there are no tabs in P1
+  const text = await openNote(payload.path);
+  const editor = editorRef.value;
+  if (editor && text !== null && payload.heading && store.openNote === payload.path) {
+    editor.revealOffset(headingDocOffset(text, payload.heading.byteStart, payload.heading.text));
+  }
+  await nextTick();
+  editor?.focus();
+}
+
+async function onPaletteRun(id: string): Promise<void> {
+  paletteOpen.value = false;
+  await nextTick(); // focus returns to the opener first; the command may then move it
+  const reason = await commands.execute(id, editorRef.value?.getView() ?? null);
+  if (reason !== null) store.setMark(reason);
+}
+
+/** A toggle made before `get_ui_settings` answers wins over the stored value. */
+let toggledByUser = false;
+function toggleLivePreview(): void {
+  toggledByUser = true;
+  livePreview.value = !livePreview.value;
+  void setLivePreview({ enabled: livePreview.value }).catch(() => undefined);
+}
+
+/** Global, view-less commands (`when` unset), in CodeMirror key notation. */
+function registerCommands(): Array<() => void> {
+  return [
+    commands.register({ id: "switcher.open", name: "Open quick switcher", defaultBinding: "Mod-o", exec: openSwitcher }),
+    commands.register({ id: "palette.open", name: "Open command palette", defaultBinding: "Mod-k", exec: openPalette }),
+    commands.register({ id: "search.open", name: "Search vault", defaultBinding: "Mod-Shift-f", exec: openSearch }),
+    commands.register({
+      id: "tree.focus",
+      name: "Focus file tree",
+      defaultBinding: "Mod-1",
+      exec: () => {
+        // The flyover only exists below 720 px (file-tree.md); docked, this just focuses.
+        if (window.matchMedia?.("(max-width: 719px)").matches) treeFlyover.value = true;
+        void nextTick(() => treeRef.value?.focusTree());
+      },
+    }),
+    commands.register({ id: "backlinks.focus", name: "Focus backlinks", defaultBinding: "Mod-3", exec: () => backlinksRef.value?.focus() }),
+  ];
+}
+const disposeCommands = registerCommands();
 
 function onInsertLink(payload: { path: string; text: string }): void {
   if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
 }
 
 /**
- * Global chords (components.md §7): ⌘⇧F open/focus search, ⌘1 tree, ⌘3 backlinks,
- * ⌘N new note, ⌘⇧N new folder. Regardless of which pane has focus.
+ * Global chords (components.md §7), matched against the registry's effective
+ * bindings so a rebinding changes behaviour, not just the palette's chip.
+ * ⌘N / ⌘⇧N (new note / folder) are task #43's and stay no-ops until then.
  */
 function onGlobalKeydown(event: KeyboardEvent): void {
-  if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
-  const key = event.key.toLowerCase();
-  if (event.shiftKey && key === "f") {
+  if (event.defaultPrevented) return; // the editor's keymap already took it (mac emacs Ctrl-k/o/n)
+  const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (!mod || event.altKey) return;
+  const command = commands.matchGlobal(event, mac);
+  if (command) {
     event.preventDefault();
-    openSearch();
-  } else if (event.shiftKey && key === "n") {
-    event.preventDefault(); // ⌘⇧N: new folder is task #43; a no-op until then
-
-  } else if (!event.shiftKey && key === "n") {
-    event.preventDefault(); // ⌘N: new note is task #43; a no-op until then
-
-  } else if (!event.shiftKey && key === "1") {
-    event.preventDefault();
-    // The flyover only exists below 720 px (file-tree.md); docked, ⌘1 just focuses.
-    if (window.matchMedia?.("(max-width: 719px)").matches) treeFlyover.value = true;
-    void nextTick(() => treeRef.value?.focusTree());
-  } else if (!event.shiftKey && key === "3") {
-    event.preventDefault();
-    backlinksRef.value?.focus();
+    void commands.execute(command.id, null);
+    return;
   }
+  if (event.key.toLowerCase() === "n") event.preventDefault(); // ⌘N / ⌘⇧N: #43
 }
 
 onMounted(async () => {
@@ -205,6 +282,21 @@ onMounted(async () => {
   // mark that was already scheduled on the line above.
   window.addEventListener("keydown", onGlobalKeydown);
 
+  // `editor.live_preview` and the user's `[keybindings]` (FR-PLT-05, NFR-USE-01). Until the
+  // answer arrives the defaults hold (live preview on, default bindings), so nothing here
+  // sits on the first-paint path. Rebinding UI + `set_keybinding`: task #93.
+  getUiSettings()
+    .then((settings) => {
+      if (!settings) return; // the bench stub answers null
+      if (!toggledByUser) livePreview.value = settings.live_preview;
+      const refused = commands.setOverrides(settings.keybindings ?? []);
+      if (refused.length > 0) {
+        store.setMark(`keybinding ignored (already used by another command): ${refused.join(", ")}`);
+      }
+    })
+    .catch(() => undefined);
+
+
   unlistenIndexStatus = await onIndexStatus((status) => {
     store.setVaultId(status.vault_id);
     store.setIndexState(status.state);
@@ -215,6 +307,7 @@ onMounted(async () => {
   });
 
   store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
+
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
@@ -234,6 +327,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
+  for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();
   if (updatedTimer) clearTimeout(updatedTimer);
 });
@@ -311,7 +405,10 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       <CodeMirrorEditor
         ref="editorRef"
         :vault-id="store.vaultId"
+        :live-preview="livePreview"
+        :commands="commands"
         placeholder="No note open."
+        @toggle-live-preview="toggleLivePreview"
         @save-outcome="onSaveOutcome"
         @follow-link="onFollowLink"
         @dirty-changed="(d: boolean) => (editorDirty = d)"
@@ -330,6 +427,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </aside>
   </main>
+
+  <QuickSwitcher v-if="switcherOpen" @open="onSwitcherOpen" @close="switcherOpen = false" />
+  <CommandPalette v-if="paletteOpen" :registry="commands" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
     <span class="index">{{ store.indexStatusText }}</span>

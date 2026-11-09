@@ -32,6 +32,7 @@ import { isolateHistory, redo, undo } from "@codemirror/commands";
 import { ChangeSet, Compartment, EditorState, type Extension, Transaction } from "@codemirror/state";
 import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
 
+import type { CommandRegistry } from "@/editor/commands";
 import { buildEditorExtensions, createEditorCommandRegistry, editorScrollExtensions } from "@/editor/codemirrorSetup";
 import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
 import { seratMarkdown } from "@/editor/markdownLanguage";
@@ -73,6 +74,9 @@ const props = withDefaults(
      * compared. Captured per buffer at `loadNote`, so an `app://closing` for the OLD
      * vault of a switch still reaches the buffer that belongs to it (architecture 3.1.1 item 6.7). */
     vaultId?: string | null;
+    /** The app-wide command registry (architecture.md §9.3). The editor adds its commands to
+     * it for as long as it is mounted, so the palette lists them; a private one when absent. */
+    commands?: CommandRegistry;
   }>(),
   { livePreview: true, vaultId: null, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
@@ -602,7 +606,9 @@ function followLinkUnderCursor(v: EditorView): boolean {
   return false;
 }
 
-const registry = createEditorCommandRegistry({
+const idsBefore = new Set(props.commands?.list().map((c) => c.id) ?? []);
+const registry = createEditorCommandRegistry(
+  {
   save: () => {
     void performSave(true); // an explicit command may retry a refused save
     return true;
@@ -612,6 +618,19 @@ const registry = createEditorCommandRegistry({
     return true;
   },
   followLink: (v) => followLinkUnderCursor(v),
+  },
+  undefined,
+  props.commands,
+);
+const ownCommandIds = registry.list().map((c) => c.id).filter((id) => !idsBefore.has(id));
+const keymapCompartment = new Compartment();
+/** Rebindings arrive after mount (settings are read asynchronously): rebuild the one keymap. */
+const unsubscribeRegistry = registry.subscribe(() => {
+  try {
+    view?.dispatch({ effects: keymapCompartment.reconfigure(buildEditorExtensions(registry)) });
+  } catch {
+    // An override that collides is refused by the registry; keep the keymap in force.
+  }
 });
 
 function buildExtensions(livePreview: boolean): Extension[] {
@@ -624,7 +643,7 @@ function buildExtensions(livePreview: boolean): Extension[] {
     seratMarkdown(),
     revealCompartment.of(livePreview ? liveExtensions : []),
     ...linkExtensions({ ipc: props.linkIpc, resolver, getSourcePath: () => buffer?.path ?? null }),
-    ...buildEditorExtensions(registry),
+    keymapCompartment.of(buildEditorExtensions(registry)),
     EditorView.lineWrapping,
     ...editorScrollExtensions(), // NFR-PRF-02: CM owns the scroll; see codemirrorSetup.ts
     EditorView.contentAttributes.of({ spellcheck: "false", "aria-label": "editor" }),
@@ -696,6 +715,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  unsubscribeRegistry();
+  if (props.commands) for (const id of ownCommandIds) registry.unregister(id);
   unlistenIndexChanged?.();
   unlistenIndexChanged = null;
   unlistenExternal?.();
@@ -835,6 +856,8 @@ defineExpose({
   compareWithDisk,
   isDirty,
   conflict,
+  /** The live `EditorView`, for running registry commands from the palette. */
+  getView: () => view,
   undo: () => view && undo(view),
   redo: () => view && redo(view),
 });
