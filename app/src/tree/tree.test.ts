@@ -407,6 +407,7 @@ describe("FileTree component", () => {
     const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(0);
     const dirs = Array.from({ length: 200 }, (_, i) => ({ name: `d${i}`, kind: "dir" as const, sidecar: false }));
+    vi.useRealTimers();
     const t0 = Number(process.hrtime.bigint()) / 1e6;
     push(listing("", dirs));
     for (let i = 0; i < 200; i++) {
