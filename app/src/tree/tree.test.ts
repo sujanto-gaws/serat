@@ -408,6 +408,7 @@ describe("FileTree component", () => {
     await vi.advanceTimersByTimeAsync(0);
     const dirs = Array.from({ length: 200 }, (_, i) => ({ name: `d${i}`, kind: "dir" as const, sidecar: false }));
     vi.useRealTimers();
+    vi.stubGlobal("requestAnimationFrame", () => 0);
     const t0 = Number(process.hrtime.bigint()) / 1e6;
     push(listing("", dirs));
     for (let i = 0; i < 200; i++) {
