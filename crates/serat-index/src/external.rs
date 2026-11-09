@@ -115,8 +115,9 @@ impl Outcome {
 /// exFAT, 2 s), ADR-0015 section 2 as amended.
 const WINDOW_MS: i64 = 2000;
 
-/// `index_meta.caught_up_from_ms`: the window start of the last completed catch-up (or rebuild), taken
-/// immediately before the watcher was armed (ADR-0015 section 2).
+/// `index_meta.caught_up_from_ms`: the window start of the last completed catch-up
+/// (taken immediately before the watcher was armed) or of the rebuild that built the
+/// index (taken before its walk); ADR-0015 section 2.
 fn caught_up_from_ms(conn: &Connection) -> Result<i64, IndexError> {
     conn.query_row(
         "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
