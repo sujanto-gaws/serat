@@ -427,6 +427,58 @@ fn r2_collapses_two_links_in_one_block_and_a_frontmatter_link_is_one_blockless_e
 }
 
 #[test]
+fn r2_aggregates_distinct_frontmatter_keys_ordered_and_none_when_all_null() {
+    // Task #86: links.field_key -> Backlink::frontmatter_keys.
+    let f = fixture(&[
+        ("Target.md", "# T\n"),
+        ("a.md", "# A\n"),
+        ("b.md", "# B\n"),
+        ("c.md", "# C\n"),
+    ]);
+    {
+        let conn = schema::open(&f.db).expect("writer");
+        conn.execute_batch(
+            "INSERT INTO blocks (note_id, ord, kind, text, byte_start, byte_end)
+               VALUES ((SELECT id FROM notes WHERE path='a.md'), 9, 'para', 'body', 0, 4);
+             INSERT INTO links (src_note, src_block, dst_path, dst_note, kind, field_key)
+               SELECT s.id, NULL, 'Target', t.id, 'wiki', k.key
+                 FROM notes s, notes t,
+                      (SELECT 'b' AS key UNION ALL SELECT 'a' UNION ALL SELECT 'a') k
+                WHERE s.path='a.md' AND t.path='Target.md'
+               UNION ALL
+               SELECT s.id, b.id, 'Target', t.id, 'wiki', NULL
+                 FROM notes s, notes t, blocks b
+                WHERE s.path='a.md' AND t.path='Target.md' AND b.ord = 9
+               UNION ALL
+               SELECT s.id, NULL, 'Target', t.id, 'wiki', NULL
+                 FROM notes s, notes t WHERE s.path='b.md' AND t.path='Target.md';",
+        )
+        .expect("seed links");
+    }
+    let links = f.reader.backlinks("Target.md").expect("backlinks");
+    assert_eq!(links.len(), 3, "{links:#?}");
+    // a.md: body block (ord 9) sorts after the NULL-block group? order is path, b.ord.
+    let keyed = links
+        .iter()
+        .find(|l| l.source_path == "a.md" && l.block.is_none())
+        .expect("a frontmatter group");
+    assert_eq!(
+        keyed.frontmatter_keys,
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+    let body = links
+        .iter()
+        .find(|l| l.source_path == "a.md" && l.block.is_some())
+        .expect("a body group");
+    assert_eq!(body.frontmatter_keys, None);
+    let all_null = links
+        .iter()
+        .find(|l| l.source_path == "b.md")
+        .expect("b group");
+    assert_eq!(all_null.frontmatter_keys, None);
+}
+
+#[test]
 fn r2_omits_unresolved_links_and_follows_the_resolvers_choice_for_ambiguous_names() {
     let f = fixture(&[
         ("x/Meeting.md", "# long\n"),

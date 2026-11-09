@@ -1512,11 +1512,8 @@ pub struct Backlink {
     /// word `frontmatter`, which is the degraded state, never an error (design
     /// goal 5). Never `Some` of an empty list.
     ///
-    /// **Contract ahead of implementation.** Filled by #79's follow-ups
-    /// `[P1/impl] Record frontmatter link keys in serat-index (links.field_key,
-    /// INDEX_VERSION 12)` (rust-core-dev), which adds the column and the R2
-    /// aggregate, then `[P1/impl] Map Backlink::frontmatter_keys in serat-app`
-    /// (tauri-app-dev). Until both land, serat-app sends `None`.
+    /// Filled since #86 (INDEX_VERSION 12): serat-index records `links.field_key`
+    /// and R2 aggregates it; serat-app maps it through unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub frontmatter_keys: Option<Vec<String>>,
