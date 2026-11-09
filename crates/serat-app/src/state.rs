@@ -267,6 +267,14 @@ struct OpenVault {
 /// reconciliation, which refuses further reads once the close has begun).
 const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A test hook called with the new vault id.
+#[cfg(test)]
+pub(crate) type SpawnHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Where a test finds the open's publisher after a failed open.
+#[cfg(test)]
+pub(crate) type PublisherProbe = Arc<Mutex<Option<Arc<Publisher>>>>;
+
 /// The fallible steps of `open_vault_with` after `vault://opened`, one per `?`.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,14 +327,14 @@ pub(crate) struct OpenHooks {
     pub(crate) fail_at: Option<FailAt>,
     /// Called with the new vault id right after `IndexActor::spawn` returned.
     #[cfg(test)]
-    pub(crate) after_index_spawn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub(crate) after_index_spawn: Option<SpawnHook>,
     /// Called with the new vault id right after `VaultThread::spawn_with` returned.
     #[cfg(test)]
-    pub(crate) after_vault_spawn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub(crate) after_vault_spawn: Option<SpawnHook>,
     /// Receives the open's publisher as soon as it exists, so a test can inspect it
     /// after the open has failed and dropped everything else.
     #[cfg(test)]
-    pub(crate) publisher_probe: Option<Arc<Mutex<Option<Arc<Publisher>>>>>,
+    pub(crate) publisher_probe: Option<PublisherProbe>,
 }
 
 impl OpenVault {
@@ -4924,7 +4932,7 @@ mod tests {
     /// race the ordering test needs is not a race: an emit placed after that spawn
     /// loses every time, because the status is already logged when the emit comes.
     fn hold_until_first_status(log: &EventLog) -> OpenHooks {
-        let hold = |log: &EventLog| -> Arc<dyn Fn(&str) + Send + Sync> {
+        let hold = |log: &EventLog| -> SpawnHook {
             let log = Arc::clone(log);
             Arc::new(move |id: &str| {
                 if id == "v2" {
@@ -5014,7 +5022,7 @@ mod tests {
     fn a_failed_open_after_vault_opened_retires_everything_that_could_carry_the_id() {
         // One run per `?` after the announcement (task #90, review B1).
         for at in [FailAt::Switcher, FailAt::IndexActor, FailAt::VaultThread] {
-            let probe: Arc<Mutex<Option<Arc<Publisher>>>> = Arc::default();
+            let probe: PublisherProbe = Arc::default();
             let hooked = Arc::clone(&probe);
             let (state, log, a, _b) = switch_state(
                 &format!("opened-fails-{at:?}"),
