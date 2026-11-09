@@ -14,7 +14,7 @@ import {
 } from "@codemirror/commands";
 import { acceptCompletion, closeCompletion, moveCompletionSelection, startCompletion } from "@codemirror/autocomplete";
 import type { Extension } from "@codemirror/state";
-import { keymap, type EditorView, type KeyBinding } from "@codemirror/view";
+import { EditorView, keymap, scrollPastEnd, type KeyBinding } from "@codemirror/view";
 
 import { CommandRegistry, type CommandId } from "@/editor/commands";
 import { deleteMarkupBackward, insertNewlineContinueMarkup } from "@/editor/markdownLanguage";
@@ -247,4 +247,19 @@ export function buildEditorExtensions(
   overrides: ReadonlyMap<CommandId, string | null> = new Map(),
 ): Extension[] {
   return [history(), keymap.of(registry.buildKeymap(overrides))];
+}
+
+/** NFR-PRF-02 / FR-EDT-01: CodeMirror must own the scroll. The editor fills its (bounded) column,
+ * `.cm-scroller` scrolls, the document can scroll past its end, and the caret keeps a margin from
+ * the scroller's edges. Margins exist because of the end/strict stall: with the caret flush against
+ * the bottom edge Chromium reported 2-9 s presentation delays with an idle main thread. The height
+ * bound alone fixes the ~124k px page (unscrollable editor); see style.css (.editor-column). */
+export const EDITOR_SCROLL_MARGINS = { top: 24, bottom: 48 } as const;
+
+export function editorScrollExtensions(): Extension[] {
+  return [
+    scrollPastEnd(),
+    EditorView.scrollMargins.of(() => ({ ...EDITOR_SCROLL_MARGINS })),
+    EditorView.theme({ "&": { height: "100%" }, ".cm-scroller": { overflow: "auto" } }),
+  ];
 }
