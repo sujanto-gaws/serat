@@ -10,6 +10,7 @@
 import { defineStore } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
+import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
 /** §3.4: a rebuild is a status line, never a modal, never a blocking spinner. */
@@ -45,15 +46,45 @@ export const useVaultStore = defineStore("vault", {
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
     baseHash: null as string | null,
-    /** The open vault's opaque `vault_id` (from `index_status`); compared for equality only. */
+    /** The open vault's opaque `vault_id`; compared for equality only, never parsed. Set ONLY by
+     * `adoptBoot`, `vaultOpened` and (restricted) `adoptFromIndexStatus`; `null` = no vault known. */
     vaultId: null as string | null,
+    /** `BootInfo.vault_id` was present at launch: the poll fallback is closed for good. */
+    vaultIdFromBoot: false,
+    /** `vault://opened` has been seen: the id is event-sourced and the poll can never change it. */
+    announced: false,
     /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
     refusedNames: null as number | null,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
   actions: {
-    setVaultId(id: string | null) {
+    /** Launch vault: `window.__SERAT_BOOT__.vault_id` (architecture 3.4). Absent/empty adopts nothing. */
+    adoptBoot(id: string | undefined | null) {
+      if (!id) return;
+      this.vaultId = id;
+      this.vaultIdFromBoot = true;
+    },
+    /** `vault://opened`: the authoritative id of every later open. Replaces whatever was there. */
+    vaultOpened(opened: VaultOpened) {
+      this.announced = true; // from now on, no poll may set the id, even after a failed open
+      if (!opened.vault_id) return; // never adopt an empty id
+      this.vaultId = opened.vault_id;
+      this.vaultRoot = opened.root;
+    },
+    /** `choose_vault` answered `Err` after `vault://opened`: the window has no vault open and no later
+     * event carries the announced id. `announced` stays set so a stale poll cannot bring it back. */
+    openFailed() {
+      this.vaultId = null;
+      this.vaultRoot = null;
+      this.openNote = null;
+      this.baseHash = null;
+    },
+    /** The `index_status` fallback (poll and event, one guarded entry): only at launch, only while
+     * `BootInfo.vault_id` is absent, never once `vault://opened` has been seen, never an empty id. The
+     * poll is not ordered against events: it can carry the OLD id or `""` after a switch began. */
+    adoptFromIndexStatus(id: string) {
+      if (!id || this.vaultIdFromBoot || this.announced || this.vaultId !== null) return;
       this.vaultId = id;
     },
     setVaultRoot(root: string | null) {

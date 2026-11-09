@@ -90,3 +90,33 @@ describe("App status strip: external changes", () => {
     wrapper.unmount();
   });
 });
+
+describe("App wiring of the vault id sources (#91)", () => {
+  it("reads BootInfo.vault_id at launch, then follows vault://opened; index_status cannot override either", async () => {
+    window.__SERAT_BOOT__ = { vault: "/vault", vault_id: "A", open: null, exit_after_ready: false };
+    const { listen } = await import("@tauri-apps/api/event");
+    const { invoke } = await import("@tauri-apps/api/core");
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((name: string, h: (e: { payload: unknown }) => void) => {
+      handlers.set(name, h);
+      return Promise.resolve(() => undefined);
+    }) as never);
+    vi.mocked(invoke).mockImplementation(((cmd: string) =>
+      cmd === "index_status"
+        ? Promise.resolve({ vault_id: "OTHER", state: { kind: "opening" } })
+        : new Promise(() => {})) as never);
+    const pinia = createPinia();
+    const wrapper = mount(App, { global: { plugins: [pinia] } });
+    const { useVaultStore } = await import("@/stores/vault");
+    const store = useVaultStore(pinia);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.vaultId).toBe("A");
+    handlers.get("vault://opened")!({ payload: { root: "/b", vault_id: "B", index: { kind: "opening" } } });
+    expect(store.vaultId).toBe("B");
+    handlers.get("index://status")!({ payload: { vault_id: "A", state: { kind: "opening" } } });
+    expect(store.vaultId).toBe("B");
+    wrapper.unmount();
+    vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(invoke).mockImplementation(() => new Promise(() => {}));
+  });
+});

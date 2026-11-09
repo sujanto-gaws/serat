@@ -18,6 +18,7 @@ import type { ExternalChange } from "./generated/ExternalChange";
 import type { AppClosing } from "./generated/AppClosing";
 import type { FlushAckArgs } from "./generated/FlushAckArgs";
 import type { IndexChanged } from "./generated/IndexChanged";
+import type { VaultOpened } from "./generated/VaultOpened";
 import type { MarkTreeArgs } from "./generated/MarkTreeArgs";
 import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
 import type { Patch } from "./generated/Patch";
@@ -254,6 +255,18 @@ export function markVaultUsable(note: string | null): Promise<number> {
  */
 export function onIndexStatus(handler: (status: IndexStatus) => void): Promise<UnlistenFn> {
   return listen<IndexStatus>(INDEX_STATUS_EVENT, (event) => handler(event.payload));
+}
+
+/** `contracts/ipc.rs::VAULT_OPENED_EVENT`. */
+export const VAULT_OPENED_EVENT = "vault://opened";
+
+/**
+ * Subscribes to `vault://opened` (architecture 3.4, "Which vault an event belongs to"): every
+ * open AFTER the launch vault announces its new `vault_id` here, before any event carrying it.
+ * The emit can precede a failed open (`choose_vault` then answers `Err`).
+ */
+export function onVaultOpened(handler: (opened: VaultOpened) => void): Promise<UnlistenFn> {
+  return listen<VaultOpened>(VAULT_OPENED_EVENT, (event) => handler(event.payload));
 }
 
 /** True when `err` is the shape `IpcError` promises — Tauri rejects with `unknown`. */
