@@ -131,6 +131,28 @@ describe("BacklinksPane", () => {
     expect(wrapper.text()).toContain("<img src=x onerror=alert(1)>");
   });
 
+  it("frontmatter entries show their keys in the order given; absent or empty is the bare word (FR-NAV-02)", async () => {
+    const backlinks = vi.fn().mockResolvedValue({
+      kind: "ready",
+      value: [
+        { ...link("A.md", null, ""), frontmatter_keys: ["related", "author"] },
+        { ...link("B.md", null, ""), frontmatter_keys: ["owner"] },
+        link("C.md", null, ""), // absent
+        { ...link("D.md", null, ""), frontmatter_keys: [] }, // never produced; treated as absent
+      ],
+    });
+    const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc } });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(wrapper.findAll(".serat-backlink-frontmatter").map((e) => e.text())).toEqual([
+      "frontmatter: related, author",
+      "frontmatter: owner",
+      "frontmatter",
+      "frontmatter",
+    ]);
+    const labels = wrapper.findAll(".serat-backlink").map((e) => e.attributes("aria-label"));
+    expect(labels).toEqual(["A: frontmatter: related, author", "B: frontmatter: owner", "C: frontmatter", "D: frontmatter"]);
+  });
+
   it("holds the skeleton for the minimum time, then shows the answer", async () => {
     const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x")] });
     const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc } });
@@ -407,6 +429,29 @@ describe("SearchPanel", () => {
     expect(wrapper.text()).toContain("<script>alert(1)</script>");
     await wrapper.get('[data-testid="search-results"]').trigger("keydown", { key: "Enter" });
     expect(wrapper.emitted("open")?.[0][0]).toMatchObject({ path: "A.md", block: { block_id: 1 }, newTab: false });
+  });
+
+  it("marks a hit 'approximate' in text only when changed_since_indexed is true; the click still opens it at its block (FR-NAV-04)", async () => {
+    const search = vi.fn().mockResolvedValue(
+      hits([
+        { ...hit("A.md", "alpha", 1), changed_since_indexed: true },
+        { ...hit("B.md", "beta", 2), changed_since_indexed: false },
+        hit("C.md", "gamma", 3), // undefined: no hint
+      ]),
+    );
+    const wrapper = mount(SearchPanel, { props: { ipc: ipcWith({ search }).ipc } });
+    await wrapper.get('[data-testid="search-input"]').setValue("x");
+    await vi.advanceTimersByTimeAsync(300);
+    const rows = wrapper.findAll('[role="listitem"]');
+    expect(rows[0].find('[data-testid="hit-approximate"]').text()).toContain("approximate");
+    expect(rows[0].attributes("aria-label")).toContain("approximate location");
+    expect(rows[1].find('[data-testid="hit-approximate"]').exists()).toBe(false);
+    expect(rows[2].find('[data-testid="hit-approximate"]').exists()).toBe(false);
+    expect(rows[1].attributes("aria-label")).not.toContain("approximate");
+    await rows[0].trigger("click");
+    // The click path is unchanged: the open event carries the block, so the host's click-time
+    // locateBlock (exact vs by-ord, tested above) still decides and still posts its status message.
+    expect(wrapper.emitted("open")?.[0][0]).toMatchObject({ path: "A.md", block: { block_id: 1 } });
   });
 
   it("a newer query wins over a slower earlier one", async () => {
