@@ -122,10 +122,9 @@ describe("blockWidgetsField", () => {
       for (let j = 0; j < 90; j += 1) parts.push(`paragraph ${i}.${j}`, "");
     }
     const doc = parts.join("\n");
-    // Cursor in the last paragraph: no table is revealed, so all 50 start as widgets.
-    const s0 = makeState(doc, doc.length);
+    const s0 = makeState(doc, doc.indexOf("paragraph 0.45"));
     const before = widgets(s0);
-    expect(before).toHaveLength(50);
+    expect(before.length).toBe(50);
     const s1 = s0.update({
       changes: { from: doc.length - 1, insert: "x" },
       selection: { anchor: doc.length },
@@ -134,7 +133,7 @@ describe("blockWidgetsField", () => {
     expect(after.length).toBe(before.length);
     // Every pre-existing widget (those not near the edit/selection) is the same object.
     const reused = after.filter((w, i) => w.widget === before[i].widget).length;
-    expect(reused).toBeGreaterThanOrEqual(before.length - 2);
+    expect(reused).toBe(before.length);
     // NFR-PRF-02: the property is REUSE, asserted above by object identity, not wall time (a 100 ms
     // single-sample bound failed 1/389 under load, #99). A whole-document rebuild replaces every
     // widget, so identity catches it deterministically.
@@ -161,6 +160,33 @@ describe("blockWidgetsField", () => {
     // And entering from elsewhere onto a first character reveals it.
     const s2 = s1.update({ selection: { anchor: first } }).state;
     expect(widgets(s2)).toHaveLength(1);
+  });
+
+  it("a table's LAST character: leaving it brings the widget back, same as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid paragraph\n\nend`;
+    const last = TABLE.length; // offset just past the final character, the block's end
+    for (const at of [last - 1, last]) {
+      const s0 = makeState(doc, at);
+      expect(widgets(s0)).toHaveLength(0);
+      const away = doc.indexOf("mid");
+      const s1 = s0.update({ selection: { anchor: away } }).state;
+      expect(widgets(s1)).toHaveLength(1);
+      expect(widgets(s1).map((w) => [w.from, w.to])).toEqual(widgets(makeState(doc, away)).map((w) => [w.from, w.to]));
+    }
+  });
+
+  it("property: from every cursor position, moving to 0, a middle paragraph or the end equals a fresh build (FR-EDT-02)", () => {
+    const t = (n: string) => TABLE.replace("1", n);
+    const doc = `${t("a")}\n\nfirst paragraph\n\n${t("b")}\n\n> [!note] Title\n> body line\n\nmiddle paragraph\n\n${t("c")}\n\nlast paragraph`;
+    const shape = (st: EditorState) => widgets(st).map((w) => [w.from, w.to]);
+    const targets = [0, doc.indexOf("middle paragraph") + 3, doc.length];
+    for (let from = 0; from <= doc.length; from += 1) {
+      const s0 = makeState(doc, from);
+      for (const to of targets) {
+        const s1 = s0.update({ selection: { anchor: to } }).state;
+        expect(shape(s1), `from ${from} to ${to}`).toEqual(shape(makeState(doc, to)));
+      }
+    }
   });
 
   it("the examined watermark maps through edits and never moves back", () => {
