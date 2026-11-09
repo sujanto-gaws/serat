@@ -15,6 +15,8 @@ import type { AssetInfo } from "./generated/AssetInfo";
 import type { ReadAssetRangeArgs } from "./generated/ReadAssetRangeArgs";
 import type { Backlink } from "./generated/Backlink";
 import type { ExternalChange } from "./generated/ExternalChange";
+import type { AppClosing } from "./generated/AppClosing";
+import type { FlushAckArgs } from "./generated/FlushAckArgs";
 import type { IndexChanged } from "./generated/IndexChanged";
 import type { MarkTreeArgs } from "./generated/MarkTreeArgs";
 import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
@@ -53,6 +55,8 @@ export const INDEX_CHANGED_EVENT = "index://changed";
 
 /** `contracts/ipc.rs::EXTERNAL_CHANGE_EVENT`. */
 export const EXTERNAL_CHANGE_EVENT = "note://external-change";
+/** `contracts/ipc.rs::APP_CLOSING_EVENT`. */
+export const APP_CLOSING_EVENT = "app://closing";
 
 // There is deliberately no `openVault` wrapper, and its absence is the point rather
 // than an omission. `open_vault` exists as a command, but
@@ -298,6 +302,22 @@ export function requestExternalDiff(args: NoteBufferArgs): Promise<ExternalChang
 /** `rebase_buffer`: *Keep mine* — patches from the disk text to the buffer, in disk coordinates. */
 export function rebaseBuffer(args: RebaseBufferArgs): Promise<Patch[]> {
   return invoke("rebase_buffer", { args });
+}
+
+/**
+ * `flush_ack`: tell the shell everything pending has been submitted (or nothing was),
+ * ending its bounded wait before the vault closes. Echo the `vault_id` of `app://closing`.
+ */
+export function flushAck(args: FlushAckArgs): Promise<void> {
+  return invoke("flush_ack", { args });
+}
+
+/**
+ * Subscribes to `app://closing` (NFR-REL-01): the window or vault is closing. Flush the
+ * pending patch set with `savePatch` (still accepted until `deadline_ms`), then `flushAck`.
+ */
+export function onClosing(handler: (closing: AppClosing) => void): Promise<UnlistenFn> {
+  return listen<AppClosing>(APP_CLOSING_EVENT, (event) => handler(event.payload));
 }
 
 /** Subscribes to `note://external-change` (unthrottled, not ordered against responses). */

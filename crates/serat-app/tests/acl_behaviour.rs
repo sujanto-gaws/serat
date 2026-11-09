@@ -121,6 +121,7 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
             commands::save_patch,
             commands::request_external_diff,
             commands::rebase_buffer,
+            commands::flush_ack,
             commands::gitignore_offer_status,
             commands::append_gitignore_entry,
             commands::decline_gitignore_offer,
@@ -350,6 +351,7 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
         } }),
         ),
         ("note_closed", buffer),
+        ("flush_ack", json!({ "args": { "vault_id": "v1" } })),
     ] {
         let answer = invoke(&webview, cmd, body);
         assert!(
