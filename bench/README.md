@@ -48,7 +48,7 @@ cargo run --release -p budget --bin p1-search-gap -- --vault 20k --iterations 60
 cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert
 ```
 
-`p1-catch-up` (task #14 review) reports what the ignore file and the open-time catch-up cost on the 20k vault: `Vault::walk` and `walk_tree_with_metadata` with no ignore file, a 50-line one and the 1,000-line cap (patterns applied in memory; the pinned vault is never written), and `Reconciler::catch_up` on an unchanged index in `PathsOnly` and `PathsAndMtime` modes. Reports only; it rejects a run in which an ignore file changed the file count or a catch-up changed the index.
+`p1-catch-up` (task #14 review) reports what the ignore file and the open-time catch-up cost on the 20k vault: `Vault::walk` and `walk_tree_with_metadata` with no ignore file, a 50-line one and the 1,000-line cap (patterns applied in memory; the pinned vault is never written), and `Reconciler::catch_up` on an unchanged index (the one mode, `PathsAndMtime`) and on the sync-tool worst case (every mtime moved, no byte changed: every file hashed and touched). Reports only; it rejects a run in which an ignore file changed the file count or a catch-up changed the index.
 
 ```
 cargo run --release -p budget --bin p1-catch-up -- --vault 20k --passes 5

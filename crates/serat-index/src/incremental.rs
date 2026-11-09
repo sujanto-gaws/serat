@@ -96,8 +96,8 @@ impl IndexHandle {
     /// Whether the previous session did not close the index cleanly (task #14).
     ///
     /// True means a commit may have been lost to a power cut, because the index side of
-    /// a save does no fsync (architecture §3.1.1 item 6). The catch-up always compares mtimes whatever this says
-    /// ([`crate::external::CatchUp`]); this is kept as a diagnostic.
+    /// a save does no fsync (architecture §3.1.1 item 6). The catch-up always compares mtimes whatever this
+    /// says ([`crate::external::CatchUp`]); this is kept as a diagnostic.
     /// True for a freshly created index too, which is harmless: it holds nothing to
     /// be stale. Fixed at open; the marker itself is cleared as this handle opens and
     /// set again by [`IndexHandle::close`].

@@ -267,7 +267,9 @@ impl Reconciler {
 
     fn finish(&self, outcome: Outcome) -> Result<Outcome, IndexError> {
         // One barrier per batch, not per file: the caller learns "committed" once.
-        if outcome.changed() {
+        // Touches are not a change to announce, but they are queued work: the
+        // contract is that everything submitted is committed on return.
+        if outcome.changed() || outcome.touched > 0 {
             self.writer.flush()?;
         }
         Ok(outcome)
@@ -305,6 +307,8 @@ impl Reconciler {
                             path: entry.path.clone(),
                         })?;
                         outcome.removed += 1;
+                    } else if !not_found {
+                        outcome.unreadable += 1;
                     }
                 }
                 Step::Done(step) => outcome.absorb(step),
@@ -354,6 +358,7 @@ impl Reconciler {
             if row.mtime != loaded.meta.mtime_ms {
                 self.writer.submit_blocking(IndexOp::TouchMtime {
                     path: path.clone(),
+                    hash,
                     mtime_ms: loaded.meta.mtime_ms,
                 })?;
                 outcome.touched = 1;

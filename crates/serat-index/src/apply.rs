@@ -80,10 +80,14 @@ pub(crate) fn apply(
             rename(tx, from, to, bulk_load)?;
             Ok(Applied::default())
         }
-        IndexOp::TouchMtime { path, mtime_ms } => {
-            tx.prepare_cached("UPDATE notes SET mtime = ?2 WHERE path = ?1")
+        IndexOp::TouchMtime {
+            path,
+            hash,
+            mtime_ms,
+        } => {
+            tx.prepare_cached("UPDATE notes SET mtime = ?2 WHERE path = ?1 AND hash = ?3")
                 .map_err(sqlite)?
-                .execute(params![path.as_str(), mtime_ms])
+                .execute(params![path.as_str(), mtime_ms, hash.to_hex()])
                 .map_err(sqlite)?;
             Ok(Applied::default())
         }

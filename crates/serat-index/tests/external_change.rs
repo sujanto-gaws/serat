@@ -389,7 +389,6 @@ fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed
     let outcome = reconciler
         .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
         .expect("catch up");
-    handle.writer().flush().expect("flush");
 
     assert_eq!(
         (outcome.upserted, outcome.unchanged, outcome.touched),
@@ -407,8 +406,67 @@ fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed
 }
 
 #[test]
-fn a_write_between_stat_and_read_leaves_an_old_mtime_that_the_next_catch_up_catches() {
-    // Vault::read stats the open handle before reading it. A write that lands after
+fn a_touch_applies_only_to_a_row_still_holding_the_verified_hash() {
+    // Row (H0, t0) landed first; a touch verified against H1 must not move it to t1.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let t0 = mtime_of(&f.index, "a.md");
+    let other = serat_core::ContentHash::from_bytes([9u8; 32]);
+    handle
+        .writer()
+        .submit_blocking(serat_core::IndexOp::TouchMtime {
+            path: path("a.md"),
+            hash: other,
+            mtime_ms: t0 + 5_000,
+        })
+        .expect("touch");
+    handle.writer().flush().expect("flush");
+    assert_eq!(
+        mtime_of(&f.index, "a.md"),
+        t0,
+        "touch ignored the hash guard"
+    );
+    handle.close().expect("close");
+}
+
+#[test]
+fn touched_mtimes_leave_the_index_equal_to_a_fresh_rebuild() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    for name in ["a.md", "b.md", "folder/c.md"] {
+        nudge(&f.root, name, 200);
+    }
+    let outcome = Reconciler::new(&handle)
+        .catch_up(
+            &DiskVault::new(&f.root),
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+        )
+        .expect("catch up");
+    assert_eq!((outcome.upserted, outcome.touched), (0, 3));
+    handle.close().expect("close");
+
+    let fresh = f._dir.path().join("fresh");
+    rebuild(&DiskVault::new(&f.root), &f.parser, &f.root, &fresh).expect("rebuild");
+    let snapshot = |index: &Path| -> Vec<(String, String, i64)> {
+        let conn = schema::open(&serat_index::index_path(index)).expect("open");
+        let mut statement = conn
+            .prepare("SELECT path, hash, mtime FROM notes ORDER BY path")
+            .expect("prepare");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .map(|row| row.expect("row"))
+            .collect()
+    };
+    assert_eq!(snapshot(&f.index), snapshot(&fresh));
+}
+
+#[test]
+fn a_row_holding_an_old_mtime_beside_the_new_hash_is_caught_by_the_next_catch_up() {
+    // The comparison half of the stat/read race (the read half is a serat-vault test,
+    // `a_write_between_the_stat_and_the_read...`). Vault::read stats the open handle before reading it. A write that lands after
     // the stat is then recorded as (old mtime, new hash), and the old mtime differs
     // from the file's new one, so the next comparison re-reads. The other order would
     // record (new mtime, old hash) and every later comparison would pass.
@@ -440,7 +498,6 @@ fn a_write_between_stat_and_read_leaves_an_old_mtime_that_the_next_catch_up_catc
     let outcome = reconciler
         .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
         .expect("catch up");
-    handle.writer().flush().expect("flush");
     // Same content, so no parse; the row's mtime is brought up to the file's.
     assert_eq!((outcome.upserted, outcome.touched), (0, 1));
     assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed_before);
@@ -999,4 +1056,45 @@ fn the_change_signal_emits_at_once_then_at_most_ten_a_second_and_never_loses_the
     // go up.
     assert_eq!(signal.changed(t0 + Duration::from_secs(5)), Some(4));
     assert_eq!(signal.generation(), 4);
+}
+
+#[test]
+fn a_catch_up_counts_a_file_that_exists_but_cannot_be_read() {
+    // The read fails with something other than NotFound: the row stays and the file
+    // is counted, as index_paths counts it.
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let entries = vec![SourceEntry {
+        path: path("a.md"),
+        kind: serat_core::NoteKind::Note,
+        size: 0,
+        mtime_ms: mtime_of(&f.index, "a.md") + 1,
+    }];
+    let outcome = Reconciler::new(&handle)
+        .catch_up(
+            &DeniedSource(DiskVault::new(&f.root)),
+            &f.parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+        )
+        .expect("catch up");
+    assert_eq!(outcome.unreadable, 1);
+    assert!(paths_in(&f.index).contains(&"a.md".to_owned()));
+    handle.close().expect("close");
+}
+
+/// A source whose every `load` fails with a permission error.
+struct DeniedSource(DiskVault);
+
+impl serat_core::NoteSource for DeniedSource {
+    fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+        self.0.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        Err(serat_core::VaultError::Io {
+            path: path.as_str().to_owned(),
+            message: "permission denied".to_owned(),
+        })
+    }
 }

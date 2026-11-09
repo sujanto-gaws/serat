@@ -348,6 +348,16 @@ impl Vault {
     /// [`VaultError::NotFound`] if it is gone, [`VaultError::PathEscapesVault`] if it
     /// resolves through a symlink (T-07), [`VaultError::Io`] otherwise.
     pub fn read(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+        self.read_hooked(path, || {})
+    }
+
+    /// [`Vault::read`] with a seam between the stat and the read, so a test can land a
+    /// write exactly there (as `write_atomic_hooked` does for the rename).
+    fn read_hooked(
+        &self,
+        path: &VaultPath,
+        after_stat: impl FnOnce(),
+    ) -> Result<LoadedNote, VaultError> {
         let absolute = self.resolve(path)?;
         // One open, stat the handle, then read from it. The mtime must be taken
         // *before* the bytes: a write landing between the two then leaves an old
@@ -356,6 +366,7 @@ impl Vault {
         let io = |err: std::io::Error| VaultError::io(path.as_str(), &err);
         let mut file = fs::File::open(&absolute).map_err(io)?;
         let stat = file.metadata().map_err(io)?;
+        after_stat();
         let mut bytes = Vec::with_capacity(usize::try_from(stat.len()).unwrap_or(0));
         std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
 
@@ -811,6 +822,34 @@ mod tests {
         assert_eq!(loaded.meta.kind, NoteKind::Note);
         assert_eq!(loaded.meta.size, 25);
         assert_eq!(loaded.meta.path, path);
+    }
+
+    #[test]
+    fn a_write_between_the_stat_and_the_read_leaves_the_old_mtime_beside_the_new_bytes() {
+        let (dir, vault) = vault();
+        let path = VaultPath::new("note.md").expect("path");
+        vault.write_atomic(&path, b"old\n").expect("seed");
+        let before = vault.read(&path).expect("read").meta.mtime_ms;
+        let file = dir.path().join("note.md");
+
+        let loaded = vault
+            .read_hooked(&path, || {
+                // In place, so the open handle sees it; mtime moved well forward.
+                fs::write(&file, b"new bytes\n").expect("rewrite");
+                let handle = fs::File::options().write(true).open(&file).expect("open");
+                handle
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                    .expect("mtime");
+            })
+            .expect("read");
+
+        assert_eq!(loaded.bytes, b"new bytes\n");
+        assert_eq!(
+            loaded.meta.mtime_ms, before,
+            "the mtime was taken after the bytes"
+        );
+        let now = vault.read(&path).expect("read").meta.mtime_ms;
+        assert_ne!(now, before, "the file's own mtime did move");
     }
 
     #[test]
