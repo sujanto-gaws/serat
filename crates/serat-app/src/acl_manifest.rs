@@ -221,6 +221,7 @@ mod tests {
             "save_patch",
             "request_external_diff",
             "rebase_buffer",
+            "flush_ack",
             "asset_info",
             "read_asset_range",
         ]

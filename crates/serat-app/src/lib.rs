@@ -285,12 +285,19 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             if let tauri::WindowEvent::CloseRequested { api, .. } = event
                 && window_state.vault_root().is_some()
             {
+                // NFR-REL-01: the editor gets a bounded chance to flush (`app://closing`,
+                // then `flush_ack`) while the vault still accepts saves. A second request
+                // during the wait is held off too and does not restart it.
                 let state = Arc::clone(&window_state);
                 let window = window.clone();
                 let spawned = std::thread::Builder::new()
                     .name("serat-close".to_owned())
                     .spawn(move || {
-                        state.close_vault();
+                        if state.close_after_flush(state::CLOSING_FLUSH_DEADLINE)
+                            == state::FlushOutcome::AlreadyWaiting
+                        {
+                            return; // the first request's thread destroys the window
+                        }
                         if let Err(err) = window.destroy() {
                             eprintln!("serat: the window could not be destroyed: {err}");
                         }
@@ -327,6 +334,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::save_patch,
             commands::request_external_diff,
             commands::rebase_buffer,
+            commands::flush_ack,
             commands::asset_info,
             commands::read_asset_range,
         ])
@@ -391,6 +399,17 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                     eprintln!(
                         "serat: {} could not be emitted: {err}",
                         ipc::INDEX_CHANGED_EVENT
+                    );
+                }
+            });
+
+            // 1e. And app://closing: the bounded flush before the vault closes.
+            let closing = handle.clone();
+            state.events.install_closing(move |event| {
+                if let Err(err) = closing.emit(ipc::APP_CLOSING_EVENT, event) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::APP_CLOSING_EVENT
                     );
                 }
             });

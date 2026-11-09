@@ -17,8 +17,8 @@ use tauri::ipc::Channel;
 
 use crate::ipc::{
     AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
-    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError,
-    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
+    FlushAckArgs, FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus,
+    IpcError, MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
     ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome,
     SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage,
     UiSettings, VaultOpened, WriteFileArgs,
@@ -265,6 +265,13 @@ pub fn save_patch(
     args: SavePatchArgs,
 ) -> Result<FileWritten, IpcError> {
     state.save_patch(&args)
+}
+
+/// `flush_ack(args)`: the editor has submitted what it had pending; ends the bounded
+/// wait before the vault closes (NFR-REL-01). Never fails.
+#[tauri::command]
+pub fn flush_ack(state: State<'_, Arc<AppState>>, args: FlushAckArgs) {
+    state.flush_ack(&args);
 }
 
 /// `request_external_diff(args) -> Result<Option<ExternalChange>, IpcError>`

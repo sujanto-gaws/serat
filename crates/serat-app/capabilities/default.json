@@ -28,6 +28,7 @@
     "allow-save-patch",
     "allow-request-external-diff",
     "allow-rebase-buffer",
+    "allow-flush-ack",
     "allow-asset-info",
     "allow-read-asset-range",
     {

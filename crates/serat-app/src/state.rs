@@ -35,13 +35,13 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
-    FolderCreated, GitignoreAppended, GitignoreOffer, IndexChanged, IndexRead, IndexState,
-    IndexStatus, IpcError, KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs,
-    NotePathArgs, OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadAssetRangeArgs, ReadFileArgs,
-    RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs,
-    SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeStatus, UiSettings, VaultOpened,
-    WriteFileArgs,
+    AppClosing, AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents,
+    FileWritten, FlushAckArgs, FolderCreated, GitignoreAppended, GitignoreOffer, IndexChanged,
+    IndexRead, IndexState, IndexStatus, IpcError, KeybindingChange, KeybindingOverride,
+    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, REFUSED_NAMES_CAP,
+    ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs,
+    SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults,
+    TreeStatus, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -64,7 +64,11 @@ pub struct Events {
     external: RwLock<Option<ExternalFn>>,
     tree_status: RwLock<Option<TreeStatusFn>>,
     changed: RwLock<Option<ChangedFn>>,
+    closing: RwLock<Option<ClosingFn>>,
 }
+
+/// The installed `app://closing` sink.
+type ClosingFn = Box<dyn Fn(&AppClosing) + Send + Sync>;
 
 /// The installed `index://changed` sink.
 type ChangedFn = Box<dyn Fn(&IndexChanged) + Send + Sync>;
@@ -134,6 +138,30 @@ impl Events {
             .as_ref()
         {
             sink(changed);
+        }
+    }
+
+    /// Direct every future `app://closing` at `sink`.
+    pub fn install_closing(&self, sink: impl Fn(&AppClosing) + Send + Sync + 'static) {
+        *self
+            .closing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+
+    /// Announce that the vault is about to close. Returns whether a sink took it: with
+    /// none installed nobody can ack, so the caller must not wait.
+    pub fn emit_closing(&self, closing: &AppClosing) -> bool {
+        if let Some(sink) = self
+            .closing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sink(closing);
+            true
+        } else {
+            false
         }
     }
 
@@ -358,6 +386,33 @@ pub struct AppState {
     /// ADR-0017: bytes the `serat-asset` handler and `read_asset_range` may hold in
     /// flight at once, across every concurrent request.
     asset_budget: crate::asset::ByteBudget,
+    /// The bounded flush before close (NFR-REL-01): the vault id being waited on, and
+    /// whether the editor has acked.
+    flush: Mutex<Option<FlushWait>>,
+    flush_cv: std::sync::Condvar,
+}
+
+/// The bound on the wait for `flush_ack` (`contracts/ipc.rs::CLOSING_FLUSH_DEADLINE_MS`).
+pub const CLOSING_FLUSH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(crate::ipc::CLOSING_FLUSH_DEADLINE_MS);
+
+/// One bounded wait for `flush_ack`.
+struct FlushWait {
+    vault_id: String,
+    acked: bool,
+}
+
+/// How a [`AppState::close_after_flush`] call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// No vault was open, or nobody can ack (no sink): closed at once.
+    Immediate,
+    /// The editor acked; the vault was closed.
+    Acked,
+    /// No ack inside the deadline; the vault was closed anyway.
+    TimedOut,
+    /// Another close is already waiting; this call did nothing and did not restart it.
+    AlreadyWaiting,
 }
 
 impl std::fmt::Debug for AppState {
@@ -380,6 +435,8 @@ impl AppState {
         let state = Self {
             startup,
             events: Arc::new(Events::default()),
+            flush: Mutex::new(None),
+            flush_cv: std::sync::Condvar::new(),
             boot,
             settings: Mutex::new(loaded.settings),
             settings_path: loaded.path,
@@ -402,6 +459,8 @@ impl AppState {
         Self {
             startup,
             events: Arc::new(Events::default()),
+            flush: Mutex::new(None),
+            flush_cv: std::sync::Condvar::new(),
             boot,
             settings: Mutex::new(settings),
             settings_path: None,
@@ -476,8 +535,9 @@ impl AppState {
         // The new root is valid; only now is the old vault closed, and *before* the new
         // one's actor, watcher and consumer exist. Two writers on one `index.db` (the
         // same root reopened), or the old close setting `clean_close` after the new
-        // open cleared it, are the failures this order rules out.
-        self.close_vault();
+        // open cleared it, are the failures this order rules out. The editor gets its
+        // bounded flush first (NFR-REL-01): this runs off the webview's thread.
+        self.close_after_flush(CLOSING_FLUSH_DEADLINE);
 
         let vault_id = format!(
             "v{}",
@@ -1584,6 +1644,94 @@ impl AppState {
     /// this from a thread of its own, never the webview's, and before the window is
     /// destroyed.
     pub fn close_vault(&self) {
+        self.close_vault_now();
+    }
+
+    /// The id of the open vault, if any.
+    #[must_use]
+    pub fn vault_id(&self) -> Option<String> {
+        self.open_lock()
+            .as_ref()
+            .map(|open| open.publisher.status().vault_id)
+    }
+
+    /// `flush_ack`: the editor has submitted what it had pending. Ends the wait of
+    /// [`AppState::close_after_flush`] early. An ack for any other vault, or with no
+    /// wait in progress, is ignored.
+    pub fn flush_ack(&self, args: &FlushAckArgs) {
+        let mut wait = self
+            .flush
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(wait) = wait.as_mut()
+            && wait.vault_id == args.vault_id
+        {
+            wait.acked = true;
+            self.flush_cv.notify_all();
+        }
+    }
+
+    /// Give the editor a bounded chance to flush, then close the vault (NFR-REL-01).
+    ///
+    /// Emits `app://closing`, then waits for `flush_ack` or `deadline`, whichever is
+    /// first. Throughout, `save_patch` and `write_file` are accepted because the vault is
+    /// still open; only then is it closed. Blocks the caller: run it on a thread of its
+    /// own, never the webview's. A call while another is waiting returns
+    /// [`FlushOutcome::AlreadyWaiting`] at once and does not restart the wait.
+    pub fn close_after_flush(&self, deadline: std::time::Duration) -> FlushOutcome {
+        let Some(vault_id) = self.vault_id() else {
+            self.close_vault_now();
+            return FlushOutcome::Immediate;
+        };
+        {
+            let mut wait = self
+                .flush
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if wait.is_some() {
+                return FlushOutcome::AlreadyWaiting;
+            }
+            *wait = Some(FlushWait {
+                vault_id: vault_id.clone(),
+                acked: false,
+            });
+        }
+        // Emitted outside the lock: the sink is `AppHandle::emit`, which queues.
+        let announced = self.events.emit_closing(&AppClosing {
+            vault_id,
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        });
+        let outcome = if announced {
+            let wait = self
+                .flush
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mut wait, result) = self
+                .flush_cv
+                .wait_timeout_while(wait, deadline, |w| w.as_ref().is_some_and(|w| !w.acked))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *wait = None;
+            if result.timed_out() {
+                eprintln!(
+                    "serat: the editor did not acknowledge the flush within {deadline:?}; \
+                     closing the vault anyway"
+                );
+                FlushOutcome::TimedOut
+            } else {
+                FlushOutcome::Acked
+            }
+        } else {
+            *self
+                .flush
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            FlushOutcome::Immediate
+        };
+        self.close_vault_now();
+        outcome
+    }
+
+    fn close_vault_now(&self) {
         let open = self.open_lock_mut().take();
         if let Some(open) = open {
             self.startup.set_vault(None);
@@ -4080,6 +4228,131 @@ mod tests {
         });
         assert_eq!(switch(&state, 301, "").items[0].path, "notes.md");
         state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- the bounded flush before close (NFR-REL-01, #63) ---------------------------
+
+    /// A settled state on `dir` whose `app://closing` events are collected.
+    fn closing_state(dir: &Path) -> (Arc<AppState>, Arc<Mutex<Vec<AppClosing>>>) {
+        let state = Arc::new(settled_state(dir));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        state
+            .events
+            .install_closing(move |event| sink.lock().expect("seen").push(event.clone()));
+        (state, seen)
+    }
+
+    fn patch_args(state: &AppState, text: &str) -> SavePatchArgs {
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        SavePatchArgs {
+            path: "10-projects/serat.md".into(),
+            base_hash: read.hash,
+            patches: vec![Patch {
+                from: crate::ipc::Pos { line: 0, col: 0 },
+                to: crate::ipc::Pos { line: 0, col: 0 },
+                insert: text.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_save_after_the_closing_event_and_before_the_ack_lands_on_disk() {
+        let dir = fixture("flush-save");
+        let (state, seen) = closing_state(&dir);
+        let args = patch_args(&state, "LAST-SECOND ");
+        let closer = Arc::clone(&state);
+        let closing = std::thread::spawn(move || closer.close_after_flush(Duration::from_secs(10)));
+        wait_until("the closing event", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        let event = seen.lock().expect("seen")[0].clone();
+        assert_eq!(event.deadline_ms, 10_000);
+        // The window has been asked to close; the debounced save still gets in.
+        state.save_patch(&args).expect("accepted during the wait");
+        state.flush_ack(&FlushAckArgs {
+            vault_id: event.vault_id,
+        });
+        assert_eq!(closing.join().expect("close"), FlushOutcome::Acked);
+        let text = std::fs::read_to_string(dir.join("10-projects/serat.md")).expect("read");
+        assert!(text.starts_with("LAST-SECOND "), "{text}");
+        // After the close the same save is refused, as before.
+        assert!(matches!(
+            state.save_patch(&args),
+            Err(IpcError::VaultNotFound { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ack_ends_the_wait_early_and_a_stale_ack_does_not() {
+        let dir = fixture("flush-ack");
+        let (state, seen) = closing_state(&dir);
+        let closer = Arc::clone(&state);
+        let started = Instant::now();
+        let closing = std::thread::spawn(move || closer.close_after_flush(Duration::from_secs(30)));
+        wait_until("the closing event", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        state.flush_ack(&FlushAckArgs {
+            vault_id: "not-this-vault".into(),
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !closing.is_finished(),
+            "an ack for another vault ended the wait"
+        );
+        let id = seen.lock().expect("seen")[0].vault_id.clone();
+        state.flush_ack(&FlushAckArgs { vault_id: id });
+        assert_eq!(closing.join().expect("close"), FlushOutcome::Acked);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(state.vault_root().is_none(), "closed after the ack");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_ack_closes_at_the_deadline_and_a_second_request_does_not_restart_it() {
+        let dir = fixture("flush-timeout");
+        let (state, seen) = closing_state(&dir);
+        let closer = Arc::clone(&state);
+        let started = Instant::now();
+        let closing =
+            std::thread::spawn(move || closer.close_after_flush(Duration::from_millis(600)));
+        wait_until("the closing event", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        assert_eq!(
+            state.close_after_flush(Duration::from_secs(30)),
+            FlushOutcome::AlreadyWaiting
+        );
+        assert_eq!(closing.join().expect("close"), FlushOutcome::TimedOut);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(600), "{waited:?}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+        assert_eq!(seen.lock().expect("seen").len(), 1, "one event per close");
+        assert!(state.vault_root().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_listener_or_no_vault_the_close_does_not_wait() {
+        let dir = fixture("flush-none");
+        let state = settled_state(&dir);
+        let started = Instant::now();
+        assert_eq!(
+            state.close_after_flush(Duration::from_secs(30)),
+            FlushOutcome::Immediate
+        );
+        assert_eq!(
+            state.close_after_flush(Duration::from_secs(30)),
+            FlushOutcome::Immediate
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
