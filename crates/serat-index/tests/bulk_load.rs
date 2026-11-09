@@ -81,7 +81,7 @@ fn load_in_bulk(conn: &Connection) -> Vec<String> {
 
 fn insert_rows(conn: &Connection) {
     conn.execute(
-        "INSERT INTO notes (id, path, kind, mtime, hash) VALUES (1, 'a.md', 'note', 0, 'h')",
+        "INSERT INTO notes (id, path, kind, mtime, size, hash) VALUES (1, 'a.md', 'note', 0, 0, 'h')",
         [],
     )
     .expect("note");

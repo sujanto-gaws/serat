@@ -236,7 +236,7 @@ mod tests {
         crate::schema::bootstrap(&conn).expect("bootstrap");
         for (n, path) in paths.iter().enumerate() {
             conn.execute(
-                "INSERT INTO notes (id, path, kind, mtime, hash) VALUES (?1, ?2, 'note', 0, 'h')",
+                "INSERT INTO notes (id, path, kind, mtime, size, hash) VALUES (?1, ?2, 'note', 0, 0, 'h')",
                 rusqlite::params![n as i64 + 1, path],
             )
             .expect("insert");

@@ -33,7 +33,7 @@ pub const DDL: &str = include_str!("../../../schema/001_init.sql");
 /// other value is deleted and rebuilt. It must equal the `PRAGMA user_version` in
 /// [`DDL`], which is asserted by a test rather than remembered by two people — under
 /// ADR-0002 a silent drift costs every user a full reindex.
-pub const INDEX_VERSION: i64 = 10;
+pub const INDEX_VERSION: i64 = 11;
 
 /// What an existing database turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,8 +465,8 @@ mod tests {
         bootstrap(&conn).expect("bootstrap");
 
         conn.execute(
-            "INSERT INTO notes (id, path, kind, mtime, hash) \
-             VALUES (1, '10-projects/a.md', 'note', 0, 'h')",
+            "INSERT INTO notes (id, path, kind, mtime, size, hash) \
+             VALUES (1, '10-projects/a.md', 'note', 0, 0, 'h')",
             [],
         )
         .expect("insert note");
@@ -507,7 +507,7 @@ mod tests {
         let conn = open_in_memory().expect("open");
         bootstrap(&conn).expect("bootstrap");
         conn.execute(
-            "INSERT INTO notes (id, path, kind, mtime, hash) VALUES (1, 'a.md', 'note', 0, 'h')",
+            "INSERT INTO notes (id, path, kind, mtime, size, hash) VALUES (1, 'a.md', 'note', 0, 0, 'h')",
             [],
         )
         .expect("note");
@@ -581,8 +581,8 @@ mod tests {
             let conn = open(&path).expect("open");
             bootstrap(&conn).expect("bootstrap");
             conn.execute_batch(
-                "INSERT INTO notes (id, path, kind, mtime, hash) \
-                     VALUES (1, 'a.md', 'note', 0, 'h');
+                "INSERT INTO notes (id, path, kind, mtime, size, hash) \
+                     VALUES (1, 'a.md', 'note', 0, 0, 'h');
                  UPDATE index_meta SET state = 'ready', note_count = 7;",
             )
             .expect("meddle");

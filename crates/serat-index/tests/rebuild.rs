@@ -674,8 +674,8 @@ fn the_rebuild_leaves_the_fts_triggers_in_place() {
     assert_eq!(triggers, 3, "the rebuild did not restore the FTS triggers");
 
     conn.execute(
-        "INSERT INTO notes (id, path, kind, mtime, hash) \
-         VALUES (99, 'later.md', 'note', 0, 'h')",
+        "INSERT INTO notes (id, path, kind, mtime, size, hash) \
+         VALUES (99, 'later.md', 'note', 0, 0, 'h')",
         [],
     )
     .expect("note");

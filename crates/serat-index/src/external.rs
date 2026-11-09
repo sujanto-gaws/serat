@@ -56,7 +56,9 @@ type EchoTest<'a> = &'a dyn Fn(&VaultPath, ContentHash) -> bool;
 /// What a comparison of the vault with the index looks at.
 ///
 /// One mode. Every open-time catch-up compares paths and, for a path in both, `mtime`
-/// against `notes.mtime` (ADR-0015 §2 as amended): the clean-close marker was a
+/// against `notes.mtime`, `size` against `notes.size`, and re-hashes any file whose
+/// disk mtime is within 2 s of `index_meta.caught_up_from_ms` (ADR-0015 §2 as amended;
+/// the residual is a same-size rewrite outside that window that kept its mtime): the clean-close marker was a
 /// heuristic for "the index committed everything", and it cannot see a file edited
 /// while Serat was closed. The enum stays, with its one variant, so the call shape
 /// `catch_up(.., CatchUp::PathsAndMtime)` that callers already use is unchanged.
@@ -108,11 +110,27 @@ impl Outcome {
     }
 }
 
+/// How far before the start of the last completed catch-up a file's disk mtime may be
+/// and still make it a candidate: the coarsest mtime granularity in the field (FAT and
+/// exFAT, 2 s), ADR-0015 section 2 as amended.
+const WINDOW_MS: i64 = 2000;
+
+/// `index_meta.caught_up_from_ms`: when the last completed catch-up (or rebuild) began.
+fn caught_up_from_ms(conn: &Connection) -> Result<i64, IndexError> {
+    conn.query_row(
+        "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sqlite)
+}
+
 /// One row of `notes`, as far as a comparison needs it.
 #[derive(Debug, Clone)]
 struct Row {
     hash: String,
     mtime: i64,
+    size: i64,
     kind: NoteKind,
 }
 
@@ -221,7 +239,15 @@ impl Reconciler {
     ) -> Result<Outcome, IndexError> {
         let reader = self.reader()?;
         let rows = rows_under(&reader, Some(dir.as_str()))?;
-        let outcome = self.compare(source, parser, entries, rows, CatchUp::PathsAndMtime)?;
+        let mut scan = Scan::default();
+        let outcome = self.compare(
+            source,
+            parser,
+            entries,
+            rows,
+            CatchUp::PathsAndMtime,
+            &mut scan,
+        )?;
         self.finish(outcome)
     }
 
@@ -242,11 +268,36 @@ impl Reconciler {
         parser: &dyn NoteParser,
         entries: &[SourceEntry],
         mode: CatchUp,
+        started_at_ms: Option<i64>,
     ) -> Result<Outcome, IndexError> {
         let reader = self.reader()?;
         let rows = rows_under(&reader, None)?;
-        let outcome = self.compare(source, parser, entries, rows, mode)?;
-        self.finish(outcome)
+        let stored = caught_up_from_ms(&reader)?;
+        // A stored value ahead of the clock (the clock stepped back) would shrink the
+        // window to nothing: treat it as unset, which makes every file a candidate.
+        let stored = if stored > crate::rebuild::now_ms() {
+            0
+        } else {
+            stored
+        };
+        let window = stored.saturating_sub(WINDOW_MS);
+        let mut scan = Scan {
+            window: Some(window),
+            unread_from: None,
+        };
+        let outcome = self.compare(source, parser, entries, rows, mode, &mut scan)?;
+        let outcome = self.finish(outcome)?;
+        // Only here, when every step above succeeded: a catch-up that died part way
+        // leaves the window where it was, so the next one looks at the same files again.
+        // `None` is a comparison that is not the open's (a rescan): it never writes.
+        // A file that was a candidate and could not be read holds the window back to its
+        // own mtime, so the next catch-up compares it again; it is the minimum, not a
+        // refusal to write, so one permanently unreadable file does not freeze the window.
+        if let Some(started) = started_at_ms {
+            self.writer
+                .set_caught_up_from(scan.unread_from.map_or(started, |m| m.min(started).max(0)))?;
+        }
+        Ok(outcome)
     }
 
     /// Keep at most one batch of this caller's work outstanding in the writer's channel.
@@ -282,6 +333,7 @@ impl Reconciler {
         entries: &[SourceEntry],
         mut rows: HashMap<String, Row>,
         mode: CatchUp,
+        scan: &mut Scan,
     ) -> Result<Outcome, IndexError> {
         let mut outcome = Outcome::default();
         let mut flushed = 0;
@@ -291,7 +343,12 @@ impl Reconciler {
             let CatchUp::PathsAndMtime = mode;
             let candidate = match &known {
                 None => true,
-                Some(row) => row.mtime != entry.mtime_ms || row.kind != entry.kind,
+                Some(row) => {
+                    row.mtime != entry.mtime_ms
+                        || row.size != i64::try_from(entry.size).unwrap_or(i64::MAX)
+                        || row.kind != entry.kind
+                        || scan.window.is_some_and(|from| entry.mtime_ms >= from)
+                }
             };
             if !candidate {
                 continue;
@@ -309,6 +366,10 @@ impl Reconciler {
                         outcome.removed += 1;
                     } else if !not_found {
                         outcome.unreadable += 1;
+                        scan.unread_from = Some(
+                            scan.unread_from
+                                .map_or(entry.mtime_ms, |m| m.min(entry.mtime_ms)),
+                        );
                     }
                 }
                 Step::Done(step) => outcome.absorb(step),
@@ -373,6 +434,15 @@ impl Reconciler {
     }
 }
 
+/// What one comparison is told and what it reports back besides the [`Outcome`].
+#[derive(Default)]
+struct Scan {
+    /// Disk mtimes at or after this make a path a candidate (`None`: no window).
+    window: Option<i64>,
+    /// The smallest disk mtime of a candidate that exists and could not be read.
+    unread_from: Option<i64>,
+}
+
 enum Step {
     /// The file could not be read. `not_found` distinguishes a vanished file from one
     /// that exists and cannot be read (permissions, a symlink, a directory).
@@ -392,7 +462,7 @@ fn kind_of(text: &str) -> NoteKind {
 
 fn row(conn: &Connection, path: &VaultPath) -> Result<Option<Row>, IndexError> {
     let mut statement = conn
-        .prepare_cached("SELECT hash, mtime, kind FROM notes WHERE path = ?1")
+        .prepare_cached("SELECT hash, mtime, kind, size FROM notes WHERE path = ?1")
         .map_err(sqlite)?;
     let mut rows = statement.query(params![path.as_str()]).map_err(sqlite)?;
     match rows.next().map_err(sqlite)? {
@@ -400,6 +470,7 @@ fn row(conn: &Connection, path: &VaultPath) -> Result<Option<Row>, IndexError> {
             hash: found.get(0).map_err(sqlite)?,
             mtime: found.get(1).map_err(sqlite)?,
             kind: kind_of(&found.get::<_, String>(2).map_err(sqlite)?),
+            size: found.get(3).map_err(sqlite)?,
         })),
         None => Ok(None),
     }
@@ -418,13 +489,14 @@ fn rows_under(conn: &Connection, dir: Option<&str>) -> Result<HashMap<String, Ro
                 hash: found.get(1)?,
                 mtime: found.get(2)?,
                 kind: kind_of(&found.get::<_, String>(3)?),
+                size: found.get(4)?,
             },
         ))
     };
     let collected = match dir {
         Some(dir) => {
             let mut statement = conn
-                .prepare("SELECT path, hash, mtime, kind FROM notes WHERE path >= ?1 AND path < ?2")
+                .prepare("SELECT path, hash, mtime, kind, size FROM notes WHERE path >= ?1 AND path < ?2")
                 .map_err(sqlite)?;
             statement
                 .query_map(params![format!("{dir}/"), format!("{dir}0")], map)
@@ -433,7 +505,7 @@ fn rows_under(conn: &Connection, dir: Option<&str>) -> Result<HashMap<String, Ro
         }
         None => {
             let mut statement = conn
-                .prepare("SELECT path, hash, mtime, kind FROM notes")
+                .prepare("SELECT path, hash, mtime, kind, size FROM notes")
                 .map_err(sqlite)?;
             statement
                 .query_map([], map)
@@ -540,5 +612,48 @@ impl ChangeSignal {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+}
+
+/// The integration tests' stubs, shared (they use `serat_core` and `std::fs` only).
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+mod tests {
+    use super::support::{DiskVault, LineParser};
+    use super::*;
+
+    /// Task #66: a catch-up whose final flush fails writes nothing, so the window the
+    /// next one uses is the one the last completed catch-up left.
+    #[test]
+    fn a_catch_up_whose_flush_fails_leaves_the_window_where_it_was() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = dir.path().join("vault");
+        let index = dir.path().join("index");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.md"), "# A\n").expect("write");
+        let source = DiskVault::new(&root);
+        let parser = LineParser::default();
+        crate::rebuild::rebuild(&source, &parser, &root, &index).expect("rebuild");
+        let handle = IndexHandle::open(&index).expect("open");
+        let before = handle.caught_up_from_ms().expect("value");
+        assert!(before > 0);
+
+        std::fs::write(root.join("a.md"), "# A, edited, longer\n").expect("edit");
+        let entries = source.entries().expect("walk");
+        handle.fault_injector().fail_every_commit();
+        let failed = Reconciler::new(&handle).catch_up(
+            &source,
+            &parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            Some(before + 60_000),
+        );
+        assert!(failed.is_err(), "the injected commit failure must surface");
+        assert_eq!(handle.caught_up_from_ms().expect("value"), before);
+        // The writer still holds the batch it could not commit; closing says so.
+        let _ = handle.close();
     }
 }
