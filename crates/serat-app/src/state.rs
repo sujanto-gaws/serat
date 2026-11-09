@@ -65,7 +65,11 @@ pub struct Events {
     tree_status: RwLock<Option<TreeStatusFn>>,
     changed: RwLock<Option<ChangedFn>>,
     closing: RwLock<Option<ClosingFn>>,
+    opened: RwLock<Option<OpenedFn>>,
 }
+
+/// The installed `vault://opened` sink.
+type OpenedFn = Box<dyn Fn(&VaultOpened) + Send + Sync>;
 
 /// The installed `app://closing` sink.
 type ClosingFn = Box<dyn Fn(&AppClosing) + Send + Sync>;
@@ -86,6 +90,29 @@ type ExternalFn = Box<dyn Fn(&ExternalChange) + Send + Sync>;
 impl std::fmt::Debug for Events {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Events").finish_non_exhaustive()
+    }
+}
+
+impl Events {
+    /// Direct every future `vault://opened` at `sink`.
+    pub fn install_opened(&self, sink: impl Fn(&VaultOpened) + Send + Sync + 'static) {
+        *self
+            .opened
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+    }
+
+    /// Emit `vault://opened` (task #90, architecture §3.4 "Which vault an event belongs
+    /// to"). A no-op with no sink installed, which is the launch vault's case.
+    pub fn emit_opened(&self, opened: &VaultOpened) {
+        if let Some(sink) = self
+            .opened
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sink(opened);
+        }
     }
 }
 
@@ -248,6 +275,10 @@ pub(crate) struct OpenHooks {
     /// Called when the open's authoritative walk is about to start, with who runs it:
     /// `"tree"` (the stream's walk) or `"standalone"` (the application's trigger).
     pub(crate) on_walk_start: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+    /// Fail the open at the point the switcher is built, i.e. after `vault://opened`
+    /// has been emitted (task #90's "emit, then a spawn fails").
+    #[cfg(test)]
+    pub(crate) fail_after_announce: bool,
 }
 
 impl OpenVault {
@@ -564,6 +595,22 @@ impl AppState {
             "v{}",
             self.vaults_opened.fetch_add(1, Ordering::Relaxed) + 1
         );
+        // The ruled point (architecture §3.4 "Which vault an event belongs to"): after the
+        // old vault is closed and the new id is minted, before anything that can carry
+        // that id exists. The three steps below can still fail through `?`; the front end
+        // then treats the window as having no vault open (see `VAULT_OPENED_EVENT`).
+        self.events.emit_opened(&VaultOpened {
+            root: root.display().to_string(),
+            vault_id: vault_id.clone(),
+            index: IndexState::Opening,
+        });
+        #[cfg(test)]
+        if self.hooks.fail_after_announce {
+            return Err(IpcError::Io {
+                path: root.display().to_string(),
+                message: "injected failure after vault://opened".into(),
+            });
+        }
         let publisher = Arc::new(
             Publisher::new(
                 vault_id.clone(),
@@ -3958,6 +4005,7 @@ mod tests {
             on_walk_start: Some(Arc::new(move |who| {
                 recorded.lock().expect("starts").push(who)
             })),
+            ..OpenHooks::default()
         });
         // Both streams are opened while the index is still Opening, so the tree is
         // attached before the application's own trigger can claim: the claimed walk
@@ -4032,6 +4080,7 @@ mod tests {
                 }
             })),
             on_walk_start: None,
+            ..OpenHooks::default()
         });
         state.open_vault(open_args(&dir)).expect("open");
         wait_until("the catch-up to record its window", || {
@@ -4077,6 +4126,7 @@ mod tests {
             on_walk_start: Some(Arc::new(move |_| {
                 started.lock().expect("log").push("walk");
             })),
+            ..OpenHooks::default()
         });
         state.open_vault(open_args(&dir)).expect("open");
         wait_until("the walk to start", || {
@@ -4674,5 +4724,209 @@ mod tests {
         assert_eq!(seen.lock().expect("seen").len(), 1);
         assert!(state.vault_root().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- task #90: `vault://opened` and the order it is emitted in (FR-VLT-01, FR-VLT-04) --
+    //
+    // These prove the order at the sink: one Vec records every event in the order the
+    // Rust side handed it to its emitter. Whether the webview *receives* them in that
+    // order across event names is Tauri's, and is the open question in architecture
+    // "Open design questions"; nothing here claims it.
+
+    type EventLog = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+    /// Every event kind with the vault id it carries, in emission order. `app://closing`
+    /// is acked from inside the sink so a switch with an open note does not wait.
+    fn log_all_events(state: &Arc<AppState>, with_opened: bool) -> EventLog {
+        let log: EventLog = Arc::default();
+        let l = Arc::clone(&log);
+        state.events.install(move |s| {
+            l.lock()
+                .expect("log")
+                .push(("index://status", s.vault_id.clone()));
+        });
+        let l = Arc::clone(&log);
+        state.events.install_tree_status(move |s| {
+            l.lock()
+                .expect("log")
+                .push(("tree://status", s.vault_id.clone()));
+        });
+        let l = Arc::clone(&log);
+        state.events.install_changed(move |e| {
+            l.lock()
+                .expect("log")
+                .push(("index://changed", e.vault_id.clone()));
+        });
+        let l = Arc::clone(&log);
+        state.events.install_external(move |e| {
+            let id = match e {
+                crate::ipc::ExternalChange::Changed { vault_id, .. }
+                | crate::ipc::ExternalChange::Deleted { vault_id, .. } => vault_id.clone(),
+            };
+            l.lock().expect("log").push(("note://external-change", id));
+        });
+        if with_opened {
+            let l = Arc::clone(&log);
+            state.events.install_opened(move |o| {
+                l.lock()
+                    .expect("log")
+                    .push(("vault://opened", o.vault_id.clone()));
+            });
+        }
+        let l = Arc::clone(&log);
+        let acker = Arc::clone(state);
+        state.events.install_closing(move |c| {
+            l.lock()
+                .expect("log")
+                .push(("app://closing", c.vault_id.clone()));
+            acker.flush_ack(&FlushAckArgs {
+                vault_id: c.vault_id.clone(),
+            });
+        });
+        log
+    }
+
+    fn switch_state(
+        name: &str,
+        hooks: OpenHooks,
+        with_opened: bool,
+    ) -> (Arc<AppState>, EventLog, PathBuf, PathBuf) {
+        let (a, b) = (fixture(&format!("{name}-a")), fixture(&format!("{name}-b")));
+        let state = Arc::new(
+            AppState::with_settings(
+                Arc::new(Startup::begin()),
+                Boot::default(),
+                Settings::default(),
+            )
+            .with_walk_gate(Duration::ZERO)
+            .with_open_hooks(hooks),
+        );
+        let log = log_all_events(&state, with_opened);
+        (state, log, a, b)
+    }
+
+    fn open_dir(state: &AppState, dir: &Path) -> Result<VaultOpened, IpcError> {
+        state.open_vault(OpenVaultArgs {
+            root: dir.display().to_string(),
+        })
+    }
+
+    #[test]
+    fn vault_opened_precedes_every_event_carrying_the_new_id_and_the_old_id_never_follows_it() {
+        let (state, log, a, b) = switch_state("opened-order", OpenHooks::default(), true);
+        let first = open_dir(&state, &a).expect("open A");
+        wait_ready(&state);
+        open_note(&state);
+        let a_id = first.vault_id;
+        // Switch with a note open so A's app://closing is emitted too.
+        let second = open_dir(&state, &b).expect("open B");
+        let b_id = second.vault_id;
+        assert_ne!(a_id, b_id);
+        wait_ready(&state);
+        let (send, tree) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&tree));
+        std::fs::write(b.join("external.md"), "# other tool\n").expect("write");
+        wait_for_row(&b, "external.md");
+        open_note(&state);
+        close_flush(&state, Duration::from_secs(10));
+
+        let log = log.lock().expect("log").clone();
+        let opened_b = log
+            .iter()
+            .position(|e| *e == ("vault://opened", b_id.clone()))
+            .expect("vault://opened for B");
+        for (i, (kind, id)) in log.iter().enumerate() {
+            // (a) nothing carrying B's id precedes its announcement.
+            if *id == b_id && *kind != "vault://opened" {
+                assert!(
+                    i > opened_b,
+                    "{kind} for B at {i} precedes opened at {opened_b}: {log:?}"
+                );
+            }
+            // (d) the old id is dead once the new vault has been announced.
+            if i > opened_b {
+                assert_ne!(*id, a_id, "{kind} carries the old id after opened: {log:?}");
+            }
+        }
+        assert!(
+            log.iter()
+                .any(|(k, id)| *k == "index://status" && *id == b_id),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|(k, id)| *k == "app://closing" && *id == a_id),
+            "A's closing event is part of the run: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|(k, id)| *k == "app://closing" && *id == b_id),
+            "B's closing event follows its announcement: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|(k, _)| *k == "vault://opened").count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_failed_open_after_vault_opened_leaves_no_vault_and_no_event_with_the_announced_id() {
+        let hooks = OpenHooks {
+            fail_after_announce: true,
+            ..OpenHooks::default()
+        };
+        let (state, log, a, _b) = switch_state("opened-fails", hooks, true);
+        let err = open_dir(&state, &a).expect_err("the open fails after the emit");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        assert!(state.vault_root().is_none(), "no vault is open");
+        let announced = log
+            .lock()
+            .expect("log")
+            .iter()
+            .find(|(k, _)| *k == "vault://opened")
+            .map(|(_, id)| id.clone())
+            .expect("the announcement was made");
+        std::thread::sleep(Duration::from_millis(300));
+        let seen = log.lock().expect("log").clone();
+        assert!(
+            seen.iter()
+                .all(|(k, id)| *k == "vault://opened" || *id != announced),
+            "something carried the announced id: {seen:?}"
+        );
+        assert_eq!(state.index_status().vault_id, "", "no vault is reporting");
+        let _ = std::fs::remove_dir_all(&a);
+    }
+
+    #[test]
+    fn the_boot_info_carries_the_id_the_first_index_status_reports() {
+        // `setup` builds `BootInfo` from the boot open's `VaultOpened` and installs the
+        // `vault://opened` sink only afterwards; this builds it the same way (no opened
+        // sink) and checks the id is the one the index reports (FR-VLT-04).
+        let (state, log, a, _b) = switch_state("opened-boot", OpenHooks::default(), false);
+        let opened = open_dir(&state, &a).expect("boot open");
+        let boot = crate::ipc::BootInfo {
+            vault: Some(opened.root),
+            vault_id: Some(opened.vault_id),
+            open: None,
+            exit_after_ready: false,
+        };
+        wait_ready(&state);
+        assert_eq!(
+            boot.vault_id.as_deref(),
+            Some(state.index_status().vault_id.as_str())
+        );
+        let log = log.lock().expect("log");
+        let first = log
+            .iter()
+            .find(|(k, _)| *k == "index://status")
+            .expect("a status event");
+        assert_eq!(Some(first.1.as_str()), boot.vault_id.as_deref());
+        assert!(log.iter().all(|(k, _)| *k != "vault://opened"));
+        drop(log);
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&a);
     }
 }
