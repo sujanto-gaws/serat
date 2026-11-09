@@ -61,6 +61,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Task #41: licences, advisories, duplicate versions, wildcards and sources, per deny.toml.
+  # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It gates: continue-on-error is false. The action is
+  # pinned to the v2 major tag (its own line of releases; the exact patch tag could not be
+  # verified from the authoring sandbox, so tighten it to a patch tag when runners schedule).
+  deny:
+    name: cargo deny check (licences, advisories, bans, sources)
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
   clippy:
     name: cargo clippy --workspace --all-targets -- -D warnings
     runs-on: ubuntu-latest

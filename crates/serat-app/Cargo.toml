@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 default-run = "serat"
 
 # The binary the cold-start budget spawns (NFR-PRF-01). Named `serat` rather than
