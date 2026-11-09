@@ -13,7 +13,7 @@ import { defineConfig, devices } from "@playwright/test";
 const chromiumPath =
   process.env.PW_CHROMIUM_PATH ?? (existsSync("/opt/pw-browsers/chromium") ? "/opt/pw-browsers/chromium" : undefined);
 
-// Inherited by the worker processes, which is where the specs print.
+// SERAT_BROWSER is derived here, never set by hand. Inherited by the worker processes, which is where the specs print.
 process.env.SERAT_BROWSER = chromiumPath ? `executablePath ${chromiumPath}` : "channel chromium (Playwright install, new headless)";
 
 const chromiumUse = {
