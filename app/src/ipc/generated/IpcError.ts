@@ -87,4 +87,13 @@ path: string,
 /**
  * The operating system's message, for the user.
  */
-message: string, };
+message: string, } | { "kind": "asset_changed", 
+/**
+ * Vault-relative path.
+ */
+path: string, 
+/**
+ * The asset's current validator, in `AssetInfo::etag`'s form. Opaque,
+ * compared for equality only.
+ */
+validator: string, };

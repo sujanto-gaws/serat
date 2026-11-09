@@ -709,6 +709,28 @@ pub enum IpcError {
         /// The operating system's message, for the user.
         message: String,
     },
+
+    /// `read_asset_range` only: the asset changed since the load began.
+    /// `ReadAssetRangeArgs::if_match` no longer equals the opened handle's
+    /// validator, and no bytes were served. The PDF transport reloads from
+    /// `asset_info` and shows the 4 s "changed on disk" notice (ADR-0017
+    /// Amendment 1, task #94).
+    ///
+    /// A separate variant rather than `StaleHash`, deliberately: `StaleHash`
+    /// carries a BLAKE3 content hash that note code adopts as a base, and an
+    /// asset validator is not one. A handler written for notes must never see
+    /// this value in a field it treats as a hash.
+    ///
+    /// **Contract ahead of implementation**, filled by the follow-up
+    /// `[P1/impl] Validator check on read_asset_range` (tauri-app-dev). No
+    /// command returns it until then.
+    AssetChanged {
+        /// Vault-relative path.
+        path: String,
+        /// The asset's current validator, in `AssetInfo::etag`'s form. Opaque,
+        /// compared for equality only.
+        validator: String,
+    },
 }
 
 // ============================================================================
@@ -1490,11 +1512,8 @@ pub struct Backlink {
     /// word `frontmatter`, which is the degraded state, never an error (design
     /// goal 5). Never `Some` of an empty list.
     ///
-    /// **Contract ahead of implementation.** Filled by #79's follow-ups
-    /// `[P1/impl] Record frontmatter link keys in serat-index (links.field_key,
-    /// INDEX_VERSION 12)` (rust-core-dev), which adds the column and the R2
-    /// aggregate, then `[P1/impl] Map Backlink::frontmatter_keys in serat-app`
-    /// (tauri-app-dev). Until both land, serat-app sends `None`.
+    /// Filled since #86 (INDEX_VERSION 12): serat-index records `links.field_key`
+    /// and R2 aggregates it; serat-app maps it through unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub frontmatter_keys: Option<Vec<String>>,
@@ -1585,16 +1604,29 @@ pub struct AssetInfo {
     pub viewable: bool,
     /// Its sidecar note, if one exists (ADR-0005, byte-exact name).
     pub sidecar_path: Option<String>,
+    /// The asset's validator: the same value as the scheme's `ETag` (size and
+    /// mtime of the opened handle, ADR-0017 step 10). Opaque, compared for
+    /// equality only. The PDF transport passes it back as
+    /// `ReadAssetRangeArgs::if_match` on every span (ADR-0017 Amendment 1).
+    /// `None` (absent) when not computed.
+    ///
+    /// **Contract ahead of implementation** (task #94). It is filled by the
+    /// follow-up `[P1/impl] Validator check on read_asset_range` (tauri-app-dev),
+    /// which reuses `asset.rs`'s existing `etag`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub etag: Option<String>,
 }
 
-/// Arguments to `read_asset_range`, ADR-0017 §Fallback only.
+/// Arguments to `read_asset_range`: the PDF transport on every platform
+/// (ADR-0017 Amendment 1, task #94), and the image fallback where a webview
+/// will not deliver a custom-scheme 206 (ADR-0017 §Fallback).
 ///
 /// `read_asset_range(args: ReadAssetRangeArgs) -> Result<ArrayBuffer, IpcError>`
 ///
 /// Returns **raw bytes** (`tauri::ipc::Response`), which arrive in JavaScript
-/// as an `ArrayBuffer`, not JSON. Granted only on a platform whose webview will
-/// not deliver a custom-scheme 206; applies the scheme's steps 2–7 and its span
-/// cap.
+/// as an `ArrayBuffer`, not JSON. Granted to `main` on every platform
+/// (ADR-0012). It applies the scheme's steps 2–7 and its span cap.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ReadAssetRangeArgs {
@@ -1605,6 +1637,18 @@ pub struct ReadAssetRangeArgs {
     pub start: u64,
     /// Bytes wanted; served up to 1,000 KiB.
     pub len: u32,
+    /// The `AssetInfo::etag` the load started with. When it is present and the
+    /// opened handle's current validator differs, no bytes are served and the
+    /// answer is `IpcError::AssetChanged`, carrying the new validator. The transport then
+    /// reloads from `asset_info` and shows the 4 s "changed on disk" notice
+    /// (ADR-0017 Amendment 1, the scheme's `If-Range` moved into the transport).
+    ///
+    /// **Contract ahead of implementation**, filled by the same follow-up as
+    /// `AssetInfo::etag`. Until then it is ignored, and a file changed
+    /// mid-load is not detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub if_match: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
