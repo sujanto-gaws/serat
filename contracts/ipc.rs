@@ -1074,9 +1074,10 @@ pub const INDEX_CHANGED_EVENT: &str = "index://changed";
 /// to close, or another vault is being opened). The editor flushes its pending patch
 /// set with `save_patch` and then calls `flush_ack`. `save_patch` and `write_file`
 /// are still accepted until the ack arrives or `deadline_ms` has passed; after that
-/// the vault is closed and they answer `VaultNotFound`. Emitted once per close.
+/// the vault is closed and they answer `VaultNotFound`. Emitted once per close, and only
+/// when a note is open in the editor (otherwise there is nothing to flush).
 ///
-/// Serves NFR-REL-01, FR-EDT-01, US-05.
+/// Serves NFR-REL-01, FR-EDT-01, US-35.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct AppClosing {
@@ -1092,7 +1093,7 @@ pub struct AppClosing {
 /// `flush_ack(args: FlushAckArgs) -> ()`
 ///
 /// "Everything I had pending is submitted (or I had nothing)." Ends the wait early.
-/// An ack for a vault that is not closing is ignored. Never fails.
+/// An ack for a vault that is not closing is ignored. Never fails. Serves NFR-SEC-06.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct FlushAckArgs {

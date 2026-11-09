@@ -6,7 +6,7 @@
  * `flush_ack(args: FlushAckArgs) -> ()`
  *
  * "Everything I had pending is submitted (or I had nothing)." Ends the wait early.
- * An ack for a vault that is not closing is ignored. Never fails.
+ * An ack for a vault that is not closing is ignored. Never fails. Serves NFR-SEC-06.
  */
 export type FlushAckArgs = { 
 /**

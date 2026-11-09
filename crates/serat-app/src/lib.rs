@@ -273,38 +273,24 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         .plugin(tauri_plugin_opener::init())
         .manage(Arc::clone(&state))
         // The index is closed cleanly before the window is destroyed (architecture
-        // 3.1.1 item 6): without it every session reads as unclean. The close checkpoints
-        // the WAL, so it runs on a thread of its own and the window is destroyed when it
-        // is done; the webview thread waits for nothing. A second close request while it
-        // runs destroys the window mid-close: safe, because the clean-close marker is
-        // set only at the end of a clean close, so the next open reads it as unclean.
+        // 3.1.1 item 6): without it every session reads as unclean. The editor first
+        // gets a bounded flush (`app://closing`, NFR-REL-01); the close checkpoints the
+        // WAL; both run on a thread of its own and the window is destroyed when it is
+        // done, so the webview thread waits for nothing. A second request while that
+        // runs, or a vault switch racing it, waits for the same close and the window is
+        // destroyed once (`on_close_requested`).
         .on_window_event(move |window, event| {
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event
-                && window_state.vault_root().is_some()
-            {
-                // NFR-REL-01: the editor gets a bounded chance to flush (`app://closing`,
-                // then `flush_ack`) while the vault still accepts saves. A second request
-                // during the wait is held off too and does not restart it.
-                let state = Arc::clone(&window_state);
-                let window = window.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("serat-close".to_owned())
-                    .spawn(move || {
-                        if state.close_after_flush(state::CLOSING_FLUSH_DEADLINE)
-                            == state::FlushOutcome::AlreadyWaiting
-                        {
-                            return; // the first request's thread destroys the window
-                        }
-                        if let Err(err) = window.destroy() {
-                            eprintln!("serat: the window could not be destroyed: {err}");
-                        }
-                    });
-                // If no thread can be had the close proceeds and `RunEvent::Exit`
-                // below closes the index instead.
-                if spawned.is_ok() {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let target = window.clone();
+                let prevent = on_close_requested(&window_state, move || {
+                    if let Err(err) = target.destroy() {
+                        eprintln!("serat: the window could not be destroyed: {err}");
+                    }
+                });
+                if prevent {
                     api.prevent_close();
                 }
             }
@@ -560,6 +546,35 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         0 => ExitCode::SUCCESS,
         code => ExitCode::from(u8::try_from(code).unwrap_or(1)),
     })
+}
+
+/// A window close was requested: run the bounded flush and the vault close on a thread
+/// of its own, then `destroy` the window, exactly once however many requests (or racing
+/// vault switches) there were. Returns whether the caller must `prevent_close` (the
+/// thread will close the window itself); `false` leaves the close to proceed, with
+/// `RunEvent::Exit` closing the index.
+pub(crate) fn on_close_requested(
+    state: &Arc<AppState>,
+    destroy: impl FnOnce() + Send + 'static,
+) -> bool {
+    if state.vault_root().is_none() {
+        return false;
+    }
+    let state = Arc::clone(state);
+    std::thread::Builder::new()
+        .name("serat-close".to_owned())
+        .spawn(move || {
+            {
+                // Whoever holds `opening` runs the whole flush and close; a vault switch
+                // in progress finishes first (lock order: `opening`, then the close wait).
+                let _opening = state.lock_opening();
+                state.close_after_flush(state::CLOSING_FLUSH_DEADLINE);
+            }
+            if state.claim_window_destroy() {
+                destroy();
+            }
+        })
+        .is_ok()
 }
 
 /// The longest `RunEvent::Exit` (on the main thread) waits for the vault to close. Past
