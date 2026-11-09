@@ -28,9 +28,11 @@
 //!
 //! # Unclean shutdown
 //!
-//! [`CatchUp::after_unclean_shutdown`] turns on the mtime comparison. The reason, and
-//! how the marker works, is on [`IndexHandle::opened_after_unclean_shutdown`] and in
-//! `schema::begin_session`; this module only does the comparing.
+//! The catch-up always compares mtimes ([`CatchUp`]); the clean-close marker
+//! ([`IndexHandle::opened_after_unclean_shutdown`]) no longer selects a cheaper mode.
+//! A file whose mtime moved but whose bytes did not has the new mtime written back to
+//! its row (`IndexOp::TouchMtime`, bulk side, through the one writer), so it is hashed
+//! once, not at every open.
 //!
 //! [`index_paths`]: Reconciler::index_paths
 
@@ -51,33 +53,20 @@ use crate::writer::WriterHandle;
 /// Whether a (path, hash) is the echo of our own save; see `EchoSuppressor::take_echo`.
 type EchoTest<'a> = &'a dyn Fn(&VaultPath, ContentHash) -> bool;
 
-/// What a comparison of the vault with the index may look at.
+/// What a comparison of the vault with the index looks at.
+///
+/// One mode. Every open-time catch-up compares paths and, for a path in both, `mtime`
+/// against `notes.mtime` (ADR-0015 §2 as amended): the clean-close marker was a
+/// heuristic for "the index committed everything", and it cannot see a file edited
+/// while Serat was closed. The enum stays, with its one variant, so the call shape
+/// `catch_up(.., CatchUp::PathsAndMtime)` that callers already use is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchUp {
-    /// Paths only: a path on disk that the index lacks is indexed, a path the index
-    /// holds that the disk lacks is removed. Enough after a clean shutdown, when the
-    /// watcher was the only thing that could have missed a change and a path it saw
-    /// is a path the walk sees.
-    PathsOnly,
     /// Paths, and for a path in both, `mtime` against `notes.mtime`; a path whose
     /// mtime differs goes through the hash gate and is re-indexed if its content
-    /// differs. One stat per file the walk already made, and a hash only where the
-    /// mtime moved. Required after an unclean shutdown (a lost index commit for a
-    /// path the index already holds) and after any dropped watcher event (the drop
-    /// may have been a modification).
+    /// differs, or has its mtime refreshed if it does not. One stat per file the walk
+    /// already made, and a hash only where the mtime moved.
     PathsAndMtime,
-}
-
-impl CatchUp {
-    /// The mode for an open: [`IndexHandle::opened_after_unclean_shutdown`].
-    #[must_use]
-    pub fn after_unclean_shutdown(unclean: bool) -> Self {
-        if unclean {
-            Self::PathsAndMtime
-        } else {
-            Self::PathsOnly
-        }
-    }
 }
 
 /// What one reconciliation did. Counted from what was submitted, so it says what the
@@ -91,6 +80,9 @@ pub struct Outcome {
     pub removed: usize,
     /// Files read and hashed whose content the index already held.
     pub unchanged: usize,
+    /// Of those unchanged, how many had a moved mtime that was written back to the row
+    /// (`IndexOp::TouchMtime`) so the next comparison does not hash them again.
+    pub touched: usize,
     /// Of those upserted, how many the parser refused and are now bare rows (`build_op`).
     pub unparsed: usize,
     /// Files that exist and could not be read (permissions, a sharing violation); their
@@ -110,6 +102,7 @@ impl Outcome {
         self.upserted += other.upserted;
         self.removed += other.removed;
         self.unchanged += other.unchanged;
+        self.touched += other.touched;
         self.unparsed += other.unparsed;
         self.unreadable += other.unreadable;
     }
@@ -264,7 +257,7 @@ impl Reconciler {
     /// per `BATCH_SIZE` submits leaves the rest of the depth to saves, at the cost of
     /// a round trip per batch.
     fn pace(&self, outcome: &Outcome, flushed: &mut usize) -> Result<(), IndexError> {
-        let submitted = outcome.upserted + outcome.removed;
+        let submitted = outcome.upserted + outcome.removed + outcome.touched;
         if submitted >= *flushed + crate::writer::BATCH_SIZE {
             self.writer.flush()?;
             *flushed = submitted;
@@ -274,7 +267,9 @@ impl Reconciler {
 
     fn finish(&self, outcome: Outcome) -> Result<Outcome, IndexError> {
         // One barrier per batch, not per file: the caller learns "committed" once.
-        if outcome.changed() {
+        // Touches are not a change to announce, but they are queued work: the
+        // contract is that everything submitted is committed on return.
+        if outcome.changed() || outcome.touched > 0 {
             self.writer.flush()?;
         }
         Ok(outcome)
@@ -293,12 +288,10 @@ impl Reconciler {
         for entry in entries {
             self.pace(&outcome, &mut flushed)?;
             let known = rows.remove(entry.path.as_str());
-            let candidate = match (&known, mode) {
-                (None, _) => true,
-                (Some(row), CatchUp::PathsAndMtime) => {
-                    row.mtime != entry.mtime_ms || row.kind != entry.kind
-                }
-                (Some(_), CatchUp::PathsOnly) => false,
+            let CatchUp::PathsAndMtime = mode;
+            let candidate = match &known {
+                None => true,
+                Some(row) => row.mtime != entry.mtime_ms || row.kind != entry.kind,
             };
             if !candidate {
                 continue;
@@ -314,6 +307,8 @@ impl Reconciler {
                             path: entry.path.clone(),
                         })?;
                         outcome.removed += 1;
+                    } else if !not_found {
+                        outcome.unreadable += 1;
                     }
                 }
                 Step::Done(step) => outcome.absorb(step),
@@ -352,10 +347,22 @@ impl Reconciler {
         let mut outcome = Outcome::default();
         // The echo is keyed by (path, hash): a copy of a just-saved note at another
         // path carries the same hash and does not match.
-        if is_echo.is_some_and(|is_echo| is_echo(path, hash))
-            || known.is_some_and(|row| row.hash == hash.to_hex() && row.kind == loaded.meta.kind)
+        if is_echo.is_some_and(|is_echo| is_echo(path, hash)) {
+            outcome.unchanged = 1;
+            return Ok(Step::Done(outcome));
+        }
+        if let Some(row) =
+            known.filter(|row| row.hash == hash.to_hex() && row.kind == loaded.meta.kind)
         {
             outcome.unchanged = 1;
+            if row.mtime != loaded.meta.mtime_ms {
+                self.writer.submit_blocking(IndexOp::TouchMtime {
+                    path: path.clone(),
+                    hash,
+                    mtime_ms: loaded.meta.mtime_ms,
+                })?;
+                outcome.touched = 1;
+            }
             return Ok(Step::Done(outcome));
         }
         let (op, _, refused) = build_op(parser, path, loaded);

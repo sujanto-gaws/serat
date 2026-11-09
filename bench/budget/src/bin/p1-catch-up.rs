@@ -10,9 +10,9 @@
 //!   `IgnoreRules::set_ignore_file`, so the pinned vault is never written to. None of
 //!   the patterns matches a note, so every run walks the same 20,000 files: what moves
 //!   is the matching cost per entry.
-//! * **The catch-up on an unchanged vault**, `CatchUp::PathsOnly` (a clean shutdown)
-//!   and `CatchUp::PathsAndMtime` (an unclean one): one read of `notes`, one pass over
-//!   the walk's entries, nothing to submit. The index is built into a temporary
+//! * **The catch-up on an unchanged vault**, `CatchUp::PathsAndMtime` (the only mode,
+//!   ADR-0015 §2 as amended): one read of `notes`, one pass over the walk's entries,
+//!   one mtime compare each, nothing to submit. The index is built into a temporary
 //!   directory from the pinned vault (read only).
 //!
 //! ```text
@@ -123,13 +123,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let handle = IndexHandle::open(&work).map_err(|e| e.to_string())?;
     let reconciler = Reconciler::new(&handle);
     let entries = vault.walk().map_err(|e| e.to_string())?;
-    for (label, mode) in [
-        ("catch_up PathsOnly (clean shutdown)", CatchUp::PathsOnly),
-        (
-            "catch_up PathsAndMtime (unclean shutdown)",
-            CatchUp::PathsAndMtime,
-        ),
-    ] {
+    for (label, mode) in [(
+        "catch_up PathsAndMtime (every open)",
+        CatchUp::PathsAndMtime,
+    )] {
         let mut samples = Samples::new();
         for _ in 0..passes {
             let started = Instant::now();
@@ -143,6 +140,33 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         line(label, &samples);
     }
+    // The sync-tool worst case: every mtime moved, no byte changed. Every file is read,
+    // hashed and touched; none is parsed. Only the temporary index is written.
+    {
+        let conn = serat_index::schema::open(&serat_index::index_path(&work))
+            .map_err(|e| e.to_string())?;
+        conn.execute("UPDATE notes SET mtime = mtime - 1", [])
+            .map_err(|e| e.to_string())?;
+    }
+    let started = Instant::now();
+    let outcome = reconciler
+        .catch_up(&vault, &parser, &entries, CatchUp::PathsAndMtime)
+        .map_err(|e| e.to_string())?;
+    let elapsed = started.elapsed();
+    if outcome.upserted != 0 || outcome.touched != entries.len() {
+        return Err(format!(
+            "REJECTED: worst case upserted {} and touched {} of {}",
+            outcome.upserted,
+            outcome.touched,
+            entries.len()
+        ));
+    }
+    println!(
+        "catch_up, every mtime moved, no byte changed: {:.1} ms, {} hashed, {} touched",
+        elapsed.as_secs_f64() * 1000.0,
+        outcome.unchanged,
+        outcome.touched
+    );
     let _ = handle.close();
     let _ = std::fs::remove_dir_all(&work);
     Ok(())
