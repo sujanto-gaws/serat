@@ -12,6 +12,7 @@
 //! in I6.
 
 mod apply;
+pub mod checkpoint;
 /// Whether the `test-hooks` feature is compiled in. serat-app asserts it is not in a
 /// release build, because the feature exposes `SearchConn::set_progress_handler`,
 /// which can disable supersession (§4.5).
@@ -30,13 +31,14 @@ pub mod switcher;
 pub mod tree;
 pub mod writer;
 
+pub use checkpoint::{Bounds, CheckpointStats, WalHealth};
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild};
 pub use read::{Attachment, Backlink, Reader, SearchConn, SearchHit, SearchOutcome};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
 pub use schema::{DDL, INDEX_VERSION, IndexState, UnusableReason, bootstrap, inspect, open};
-pub use writer::{BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
+pub use writer::{ActorOptions, BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
 /// The version of SQLite compiled into this binary.
 ///
