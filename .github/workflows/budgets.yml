@@ -242,11 +242,10 @@ jobs:
           if-no-files-found: ignore
 
   # FR-VLT-04 (architecture 3.1.2): an external change visible in the index within
-  # 500 ms. --assert gates p95 of the single-note shape only (max is printed, not gated;
-  # the PRD names no percentile, #81); the 100-note batch is printed as
-  # "reported, not gated".
+  # 500 ms at p95 over 100 single-note changes (PRD v1.9, #81). --assert gates that only;
+  # the max and the 100-note batch are printed as "reported, not gated".
   p1-external-change:
-    name: "FR-VLT-04 · external change visible < 500 ms, single note, gated on p95 (PRD criterion carries no percentile, see #81)"
+    name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes (PRD v1.9; max and 100-file batch reported)"
     needs: vault
     runs-on: windows-latest
     steps:

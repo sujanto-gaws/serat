@@ -1,6 +1,5 @@
 //! FR-VLT-04 · an external change is visible in the index within 500 ms · reported,
-//! with `--assert` as the gate (on p95 of the single-note shape; the PRD criterion names
-//! no percentile, task #81; `--assert` refuses any vault but 20k).
+//! with --assert as the gate (p95 over the single-note changes, PRD v1.9 FR-VLT-04; --assert refuses any vault but 20k).
 //!
 //! Serves **FR-VLT-04**, **NFR-REL-01**, **US-35**; architecture §3.1.2 (the watcher
 //! path), not §3.1.1 (the save path, NFR-PRF-03's 50 ms, which has no watcher and no
@@ -367,7 +366,7 @@ fn run(args: &[String]) -> Result<bool, String> {
             total.max(),
             if within { "within" } else { "OVER" },
             if label == "single" {
-                " (gated on p95; the PRD criterion carries no percentile, see #81; max is not gated)"
+                " (gated on p95, PRD v1.9 FR-VLT-04; max reported, not gated)"
             } else {
                 " (reported, not gated)"
             }
@@ -377,6 +376,11 @@ fn run(args: &[String]) -> Result<bool, String> {
         }
     }
     let breaches = budget::gate::breaches(BUDGET_MS, &rows);
+    if assert {
+        for b in &breaches {
+            eprintln!("FR-VLT-04: over budget (--assert): {b}");
+        }
+    }
     Ok(budget::gate::passes(assert, &breaches))
 }
 

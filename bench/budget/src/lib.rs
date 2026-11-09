@@ -5259,39 +5259,74 @@ mod tests {
         ("p1-switcher", "p1-switcher", "NFR-PRF-06"),
     ];
 
+    /// Whether workflow `text` has a job `job` that really gates on `bin`: a run line
+    /// invoking `--bin <bin> ` with `--assert` before any `#`, no `||` on that line (it
+    /// would swallow the exit code), and no `continue-on-error:` anywhere in the job.
+    fn job_asserts(text: &str, job: &str, bin: &str) -> bool {
+        let head = format!("\n  {job}:");
+        let Some(start) = text.find(&head) else {
+            return false;
+        };
+        // The job ends at the next key indented exactly two spaces.
+        let mut body: Vec<&str> = Vec::new();
+        for l in text[start + head.len()..].lines() {
+            let key = l.starts_with("  ")
+                && !l.starts_with("   ")
+                && !l.trim().is_empty()
+                && !l.trim_start().starts_with('#');
+            if key {
+                break;
+            }
+            body.push(l);
+        }
+        let code = |l: &str| l.split('#').next().unwrap_or("").to_owned();
+        if body.iter().any(|l| code(l).contains("continue-on-error:")) {
+            return false;
+        }
+        body.iter().any(|l| {
+            let c = code(l);
+            c.contains(&format!("--bin {bin} ")) && c.contains("--assert") && !c.contains("||")
+        })
+    }
+
     #[test]
     fn every_p1_gated_budget_has_a_job_whose_run_line_asserts() {
         let workflow = repo_root().join(".github/workflows/budgets.yml");
         let text = std::fs::read_to_string(&workflow)
             .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
         for (job, bin, requirement) in P1_GATED {
-            let head = format!("\n  {job}:");
-            let start = text
-                .find(&head)
-                .unwrap_or_else(|| panic!("{requirement}: no job {job} in budgets.yml"));
-            // The job ends at the next key indented exactly two spaces.
-            let mut body = String::new();
-            for l in text[start + head.len()..].lines() {
-                let key = l.starts_with("  ")
-                    && !l.starts_with("   ")
-                    && !l.trim().is_empty()
-                    && !l.trim_start().starts_with('#');
-                if key {
-                    break;
-                }
-                body.push_str(l);
-                body.push('\n');
-            }
-            let asserting = body.lines().any(|l| {
-                !l.trim_start().starts_with('#')
-                    && l.contains(&format!("--bin {bin} "))
-                    && l.contains("--assert")
-            });
             assert!(
-                asserting,
-                "{requirement}: job {job} has no run line invoking `--bin {bin}` with --assert (NFR-PRF-08)"
+                job_asserts(&text, job, bin),
+                "{requirement}: job {job} has no un-swallowed run line invoking `--bin {bin}` with --assert (NFR-PRF-08)"
             );
         }
+    }
+
+    #[test]
+    fn job_asserts_accepts_the_good_job_and_rejects_each_sabotage() {
+        let wrap = |run: &str, extra: &str| {
+            format!(
+                "jobs:\n  p1-x:\n    steps:\n      - name: m\n{extra}        run: {run}\n  next:\n    steps: []\n"
+            )
+        };
+        let good = "cargo run --release -p budget --bin p1-x -- --vault 20k --assert";
+        assert!(job_asserts(&wrap(good, ""), "p1-x", "p1-x"));
+        // --assert hidden behind a comment.
+        let commented = "cargo run -p budget --bin p1-x -- --vault 20k # --assert";
+        assert!(!job_asserts(&wrap(commented, ""), "p1-x", "p1-x"));
+        // The step may not fail open.
+        assert!(!job_asserts(
+            &wrap(good, "        continue-on-error: true\n"),
+            "p1-x",
+            "p1-x"
+        ));
+        // The exit code swallowed on the run line.
+        let swallowed = format!("{good} || true");
+        assert!(!job_asserts(&wrap(&swallowed, ""), "p1-x", "p1-x"));
+        // A continue-on-error in a different job is not this job's problem.
+        let other = format!("{}  other:\n    continue-on-error: true\n", wrap(good, ""));
+        assert!(job_asserts(&other, "p1-x", "p1-x"));
+        assert!(!job_asserts(&wrap(good, ""), "missing", "p1-x"));
     }
 
     #[test]
