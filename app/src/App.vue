@@ -111,6 +111,7 @@ onMounted(async () => {
   window.addEventListener("keydown", onGlobalKeydown);
 
   unlistenIndexStatus = await onIndexStatus((status) => {
+    store.setVaultId(status.vault_id);
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -122,7 +123,10 @@ onMounted(async () => {
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
-  indexStatus().then((status) => store.setIndexState(status.state));
+  indexStatus().then((status) => {
+    store.setVaultId(status.vault_id);
+    store.setIndexState(status.state);
+  });
 
   if (editorRef.value) {
     // `hydrateBuffer` reads the note and installs it with `loadNote` in one
@@ -202,6 +206,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <div class="editor-column">
       <CodeMirrorEditor
         ref="editorRef"
+        :vault-id="store.vaultId"
         placeholder="No note open."
         @save-outcome="onSaveOutcome"
         @follow-link="onFollowLink"

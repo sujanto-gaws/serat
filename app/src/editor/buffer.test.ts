@@ -29,6 +29,8 @@ function mockIpc(overrides: Partial<EditorIpcAdapter> = {}): EditorIpcAdapter {
     readFile: vi.fn(),
     writeFile: vi.fn(),
     onExternalChange: vi.fn().mockResolvedValue(() => undefined),
+    onClosing: vi.fn().mockResolvedValue(() => undefined),
+    flushAck: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }

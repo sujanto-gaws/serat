@@ -17,7 +17,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { AppClosing } from "./generated/AppClosing";
 import type { ExternalChange } from "./generated/ExternalChange";
+import type { FlushAckArgs } from "./generated/FlushAckArgs";
 import type { FileContents } from "./generated/FileContents";
 import type { FileWritten } from "./generated/FileWritten";
 import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
@@ -29,6 +31,8 @@ import type { WriteFileArgs } from "./generated/WriteFileArgs";
 
 /** Event `note://external-change` (contracts/ipc.rs). Not throttled, not ordered against responses. */
 export const EXTERNAL_CHANGE_EVENT = "note://external-change";
+/** Event `app://closing` (contracts/ipc.rs `APP_CLOSING_EVENT`). */
+export const APP_CLOSING_EVENT = "app://closing";
 
 export interface EditorIpcAdapter {
   /** `note_opened(args) -> Result<(), IpcError>` (ADR-0016 §3). */
@@ -47,6 +51,10 @@ export interface EditorIpcAdapter {
   writeFile(args: WriteFileArgs): Promise<FileWritten>;
   /** Subscribes to `note://external-change`. */
   onExternalChange(handler: (change: ExternalChange) => void): Promise<UnlistenFn>;
+  /** Subscribes to `app://closing` (NFR-REL-01): flush, then `flushAck`. */
+  onClosing(handler: (closing: AppClosing) => void): Promise<UnlistenFn>;
+  /** `flush_ack(args) -> ()`: "everything I had pending is submitted (or I had nothing)". Never fails. */
+  flushAck(args: FlushAckArgs): Promise<void>;
 }
 
 /** The real adapter: one `invoke` per method, command names matching
@@ -76,5 +84,11 @@ export const defaultEditorIpc: EditorIpcAdapter = {
   },
   onExternalChange(handler) {
     return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
+  },
+  onClosing(handler) {
+    return listen<AppClosing>(APP_CLOSING_EVENT, (event) => handler(event.payload));
+  },
+  flushAck(args) {
+    return invoke("flush_ack", { args });
   },
 };

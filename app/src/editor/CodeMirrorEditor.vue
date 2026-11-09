@@ -39,6 +39,7 @@ import Preview from "@/editor/Preview.vue";
 import { blockWidgetsExtension } from "@/editor/blockWidgets";
 import { minimalReplacement, patchesToChangeSet, planExternal, externalChangeSet } from "@/editor/reconcile";
 import { textFromString } from "@/editor/patches";
+import type { AppClosing } from "@/ipc/generated/AppClosing";
 import type { ExternalChange } from "@/ipc/generated/ExternalChange";
 import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
@@ -53,6 +54,10 @@ import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
  * the save command." */
 const AUTOSAVE_IDLE_MS = 1000;
 
+/** How long before `AppClosing.deadline_ms` the editor stops waiting for its
+ * flush and acks anyway (the core's bound is the backstop, not the plan). */
+const CLOSE_ACK_MARGIN_MS = 100;
+
 const props = withDefaults(
   defineProps<{
     placeholder?: string;
@@ -63,8 +68,13 @@ const props = withDefaults(
     ipc?: EditorIpcAdapter;
     /** `resolve_links` / `note_anchors` / `switcher_query` / `index://changed`. */
     linkIpc?: LinkIpcAdapter;
+    /** The open vault's `vault_id` (from `index_status`; opaque, compared for equality only).
+     * `null`/absent until known: events are then not filtered, since nothing can be
+     * compared. Captured per buffer at `loadNote`, so an `app://closing` for the OLD
+     * vault of a switch still reaches the buffer that belongs to it (architecture 3.1.1 item 6.7). */
+    vaultId?: string | null;
   }>(),
-  { livePreview: true, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
+  { livePreview: true, vaultId: null, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
 
 const emit = defineEmits<{
@@ -77,6 +87,9 @@ const emit = defineEmits<{
   "follow-link": [target: FollowLinkTarget];
   /** *Compare* on an external-change conflict: the host opens a diff of the two texts. */
   "compare-external": [payload: { path: string; mine: string; disk: string }];
+  /** A disjoint external edit was merged into unsaved work: the host may show "Updated externally" for 3 s
+   * (external-change-notice.md). A clean-buffer reload is silent by spec and emits nothing. */
+  "external-merged": [payload: { path: string }];
 }>();
 
 const host = ref<HTMLDivElement | null>(null);
@@ -160,6 +173,8 @@ function dispatchExternal(changes: ChangeSet): void {
 async function onExternalChange(change: ExternalChange): Promise<void> {
   const b = buffer;
   if (!b || change.path !== b.path) return;
+  // "Session scope; discard if it is not the open vault" (contracts/ipc.rs).
+  if (!isOurVault(change.vault_id)) return;
   if (change.kind === "deleted") {
     deleted.value = true;
     notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
@@ -251,6 +266,7 @@ function applyChange(b: EditorBuffer, change: Extract<ExternalChange, { kind: "c
     case "apply-rebased":
       dispatchExternal(plan.externalOnDoc);
       b.adoptExternal(plan.external, change.new_hash, plan.localRebased);
+      emit("external-merged", { path: b.path });
       break;
     case "conflict":
       conflict.value = { change, newHash: change.new_hash };
@@ -329,11 +345,44 @@ async function takeTheirs(): Promise<void> {
   markDirty();
 }
 
+/** Asks serat-app for the diff against the current base right now (ADR-0016 section 2, rule 3):
+ * the disk may have moved since the notice went up. Returns the conflict to compare against,
+ * or null when there is nothing to compare any more (the disk equals the base again, the note
+ * was deleted, or the buffer changed). A failed request keeps the conflict we already have. */
+async function refreshConflict(b: EditorBuffer, c: ExternalConflict): Promise<ExternalConflict | null> {
+  let answer: ExternalChange | null;
+  try {
+    answer = await props.ipc.requestExternalDiff({ path: b.path, base_hash: b.baseHash });
+  } catch (error) {
+    if (errorKind(error) === "stale_hash") {
+      return { change: null, newHash: (error as { current_hash: string }).current_hash };
+    }
+    return c;
+  }
+  if (b !== buffer) return null;
+  if (answer === null) {
+    b.clearStale();
+    conflict.value = null; // disk equals the base: nothing diverged after all
+    return null;
+  }
+  if (answer.kind === "deleted") {
+    conflict.value = null;
+    deleted.value = true;
+    notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
+    return null;
+  }
+  if (answer.base_hash !== b.baseHash) return { change: null, newHash: answer.new_hash };
+  return { change: answer, newHash: answer.new_hash };
+}
+
 /** *Compare*: hands both texts to the host; nothing is changed or discarded. */
 async function compareExternal(): Promise<void> {
   const b = buffer;
-  const c = conflict.value;
-  if (!b || !c || !view) return;
+  const c0 = conflict.value;
+  if (!b || !c0 || !view) return;
+  const c = await refreshConflict(b, c0);
+  if (!c || b !== buffer || !view) return;
+  conflict.value = c;
   const disk = await diskTextFor(b, c);
   if (!disk) return;
   emit("compare-external", { path: b.path, mine: view.state.doc.toString(), disk: disk.text });
@@ -361,6 +410,70 @@ async function recreateDeletedNote(): Promise<SaveOutcome | null> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Clean close (NFR-REL-01, FR-EDT-01; architecture.md 3.1.1 item 6)
+// ---------------------------------------------------------------------------
+
+/** The vault the current buffer was loaded from; `null` when not known then. */
+let bufferVaultId: string | null = null;
+
+/** True unless both sides know their vault id and they differ. */
+function isOurVault(id: string): boolean {
+  const mine = bufferVaultId ?? props.vaultId;
+  return mine === null || mine === undefined || mine === id;
+}
+
+watch(
+  () => props.vaultId,
+  (id) => {
+    // A buffer opened before the id was known belongs to the first vault we learn of.
+    if (id && buffer && bufferVaultId === null) bufferVaultId = id;
+  },
+);
+
+/** `vault_id`s whose close flush has started: `app://closing` is emitted once per close, but
+ * the ack must be sent exactly once whatever the transport does. */
+const closingSeen = new Set<string>();
+
+async function onClosing(closing: AppClosing): Promise<void> {
+  if (!isOurVault(closing.vault_id)) return; // another vault's close: not ours to ack
+  if (closingSeen.has(closing.vault_id)) return;
+  closingSeen.add(closing.vault_id);
+
+  let acked = false;
+  const ack = async (): Promise<void> => {
+    if (acked) return;
+    acked = true;
+    try {
+      await props.ipc.flushAck({ vault_id: closing.vault_id });
+    } catch {
+      /* never fails by contract; if the transport does, the core's bound is the backstop */
+    }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.max(0, closing.deadline_ms - CLOSE_ACK_MARGIN_MS));
+  });
+  try {
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    const b = buffer;
+    if (b && !deleted.value) {
+      // Awaits an in-flight save, then issues the coalesced remainder. A StaleHash, a refusal or an
+      // error leaves the buffer dirty and untouched (C-04: never re-serialised); we ack anyway,
+      // because the conflict path needs a user and the close does not wait for one.
+      await Promise.race([b.flush(props.ipc).catch(() => false), deadline]);
+      markDirty();
+    }
+  } finally {
+    clearTimeout(timer);
+    await ack();
+    closingSeen.delete(closing.vault_id);
+  }
+}
+
 function scheduleAutosave(): void {
   if (autosaveTimer) clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => {
@@ -371,6 +484,7 @@ function scheduleAutosave(): void {
 const resolver = new LinkResolver(props.linkIpc);
 let unlistenIndexChanged: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
+let unlistenClosing: (() => void) | null = null;
 
 export interface FollowLinkTarget {
   /** As written, minus brackets and `|display`. */
@@ -490,6 +604,15 @@ onMounted(() => {
     .catch(() => {
       /* no event channel (tests, early boot): StaleHash still requests the diff */
     });
+  props.ipc
+    .onClosing((closing) => void onClosing(closing))
+    .then((unlisten) => {
+      if (view) unlistenClosing = unlisten;
+      else unlisten();
+    })
+    .catch(() => {
+      /* no event channel (tests, early boot) */
+    });
   view = new EditorView({
     parent: shadowRoot,
     state: EditorState.create({
@@ -504,6 +627,8 @@ onBeforeUnmount(() => {
   unlistenIndexChanged = null;
   unlistenExternal?.();
   unlistenExternal = null;
+  unlistenClosing?.();
+  unlistenClosing = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
   view?.destroy();
@@ -565,6 +690,7 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
     void props.ipc.noteClosed({ path: old.path, base_hash: old.baseHash }).catch(() => undefined);
   }
   buffer = new EditorBuffer(path, text, baseHash);
+  bufferVaultId = props.vaultId ?? null;
   held = [];
   conflict.value = null;
   deleted.value = false;

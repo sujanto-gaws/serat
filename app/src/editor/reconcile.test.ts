@@ -80,7 +80,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function harness(overrides: Partial<EditorIpcAdapter> = {}) {
+function harness(overrides: Partial<EditorIpcAdapter> = {}, extraProps: { vaultId?: string | null } = {}) {
   let emit: (change: ExternalChange) => void = () => undefined;
   const ipc: EditorIpcAdapter = {
     noteOpened: vi.fn().mockResolvedValue(undefined),
@@ -90,6 +90,8 @@ function harness(overrides: Partial<EditorIpcAdapter> = {}) {
     rebaseBuffer: vi.fn().mockResolvedValue([]),
     readFile: vi.fn(),
     writeFile: vi.fn(),
+    onClosing: vi.fn().mockResolvedValue(() => undefined),
+    flushAck: vi.fn().mockResolvedValue(undefined),
     onExternalChange: vi.fn(async (handler: (c: ExternalChange) => void) => {
       emit = handler;
       return () => undefined;
@@ -102,7 +104,7 @@ function harness(overrides: Partial<EditorIpcAdapter> = {}) {
     switcherQuery: vi.fn(),
     onIndexChanged: vi.fn().mockResolvedValue(() => undefined),
   };
-  const wrapper = mount(CodeMirrorEditor, { props: { ipc, linkIpc }, attachTo: document.body });
+  const wrapper = mount(CodeMirrorEditor, { props: { ipc, linkIpc, ...extraProps }, attachTo: document.body });
   const host = wrapper.find(".cm-editor-host").element as HTMLElement;
   const view = EditorView.findFromDOM(host.shadowRoot!.querySelector(".cm-content") as HTMLElement)!;
   const api = wrapper.vm as unknown as {
@@ -257,7 +259,9 @@ describe("reconciliation in the editor", () => {
     });
 
     it("Compare hands both texts to the host and changes nothing", async () => {
-      const { api, wrapper } = await conflicted();
+      const { api, wrapper } = await conflicted({
+        requestExternalDiff: vi.fn().mockResolvedValue(changed("h0", "h2", [patch(0, 0, 0, 3, "THEIRS")])),
+      });
       await wrapper.find('[data-testid="compare"]').trigger("click");
       await flush();
       expect(wrapper.emitted("compare-external")?.[0][0]).toEqual({
@@ -389,5 +393,118 @@ describe("reconciliation in the editor", () => {
     await flush();
     expect(api.getText()).toBe("one");
     wrapper.unmount();
+  });
+});
+
+// Task #23 audit: base-hash handling, Compare, vault scoping, the quiet merge signal.
+describe("external-change audit (FR-VLT-05, NFR-REL-01, C-04)", () => {
+  it("clean buffer: reloads silently and the next save's base hash is the new on-disk hash", async () => {
+    const savePatch = vi.fn().mockResolvedValue(written("h3"));
+    const { api, view, send, wrapper } = harness({ savePatch });
+    await api.loadNote("one\ntwo", "a.md", "h0");
+    send(changed("h0", "h2", [patch(0, 0, 0, 3, "ONE")]));
+    await flush();
+    expect(api.getText()).toBe("ONE\ntwo");
+    expect(api.isDirty).toBe(false);
+    expect(wrapper.find('[data-testid="external-conflict"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="external-notice"]').exists()).toBe(false);
+    expect(wrapper.emitted("external-merged")).toBeUndefined(); // a clean reload is not announced
+    view.dispatch({ changes: { from: 7, insert: "!" } });
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(savePatch.mock.calls[0][0].base_hash).toBe("h2");
+    wrapper.unmount();
+  });
+
+  it("a FileWritten with mtime_ms 0 (unknown) is never taken as 'unchanged': hashes alone decide, so the next external change still applies", async () => {
+    const savePatch = vi.fn().mockResolvedValue({ path: "a.md", hash: "h1", mtime_ms: 0, bytes: 3 });
+    const { api, view, send, wrapper } = harness({ savePatch });
+    await api.loadNote("one\ntwo", "a.md", "h0");
+    view.dispatch({ changes: { from: 7, insert: "!" } });
+    await api.triggerSave();
+    expect(api.isDirty).toBe(false);
+    send(changed("h1", "h2", [patch(0, 0, 0, 3, "ONE")])); // against the write's own hash
+    await flush();
+    expect(api.getText()).toBe("ONE\ntwo!");
+    wrapper.unmount();
+  });
+
+  it("dirty and disjoint: merges and tells the host once (the 'Updated externally' strip), no conflict notice", async () => {
+    const { api, view, send, wrapper } = harness();
+    await api.loadNote("one\ntwo\nthree", "a.md", "h0");
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "!" } });
+    send(changed("h0", "h2", [patch(0, 0, 0, 3, "ONE")]));
+    await flush();
+    expect(api.getText()).toBe("ONE\ntwo\nthree!");
+    expect(wrapper.emitted("external-merged")).toEqual([[{ path: "a.md" }]]);
+    expect(wrapper.find('[data-testid="external-conflict"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("an external change or deletion scoped to another vault is discarded", async () => {
+    const { api, send, wrapper } = harness({}, { vaultId: "vA" });
+    await api.loadNote("one", "a.md", "h0");
+    send({ ...(changed("h0", "h1", [patch(0, 0, 0, 3, "X")]) as object), vault_id: "vB" } as ExternalChange);
+    send({ kind: "deleted", vault_id: "vB", path: "a.md" });
+    await flush();
+    expect(api.getText()).toBe("one");
+    expect(wrapper.find('[data-testid="external-notice"]').exists()).toBe(false);
+    send({ ...(changed("h0", "h1", [patch(0, 0, 0, 3, "X")]) as object), vault_id: "vA" } as ExternalChange);
+    await flush();
+    expect(api.getText()).toBe("X");
+    wrapper.unmount();
+  });
+
+  describe("Compare asks serat-app for the current diff (requestExternalDiff)", () => {
+    async function conflicted(overrides: Partial<EditorIpcAdapter>) {
+      const h = harness(overrides);
+      await h.api.loadNote("one\ntwo\nthree", "a.md", "h0");
+      h.view.dispatch({ changes: { from: 0, to: 3, insert: "MINE" } });
+      h.send(changed("h0", "h2", [patch(0, 0, 0, 3, "THEIRS")]));
+      await flush();
+      return h;
+    }
+
+    it("calls requestExternalDiff with the current base and compares against the FRESH disk text", async () => {
+      const requestExternalDiff = vi.fn().mockResolvedValue(changed("h0", "h5", [patch(0, 0, 0, 3, "NEWER")]));
+      const { wrapper, api } = await conflicted({ requestExternalDiff });
+      await wrapper.find('[data-testid="compare"]').trigger("click");
+      await flush();
+      expect(requestExternalDiff).toHaveBeenCalledWith({ path: "a.md", base_hash: "h0" });
+      expect(wrapper.emitted("compare-external")?.[0][0]).toEqual({ path: "a.md", mine: "MINE\ntwo\nthree", disk: "NEWER\ntwo\nthree" });
+      expect(api.getText()).toBe("MINE\ntwo\nthree");
+      wrapper.unmount();
+    });
+
+    it("a stale_hash answer (no base bytes held) falls back to reading the file; nothing is applied", async () => {
+      const requestExternalDiff = vi.fn().mockRejectedValue({ kind: "stale_hash", path: "a.md", current_hash: "h7" });
+      const readFile = vi.fn().mockResolvedValue({ path: "a.md", text: "DISK", hash: "h7", mtime_ms: 0, bytes: 4 });
+      const { wrapper, api } = await conflicted({ requestExternalDiff, readFile });
+      await wrapper.find('[data-testid="compare"]').trigger("click");
+      await flush();
+      expect(wrapper.emitted("compare-external")?.[0][0]).toEqual({ path: "a.md", mine: "MINE\ntwo\nthree", disk: "DISK" });
+      expect(api.getText()).toBe("MINE\ntwo\nthree");
+      wrapper.unmount();
+    });
+
+    it("a failed request keeps the conflict we have and still compares", async () => {
+      const requestExternalDiff = vi.fn().mockRejectedValue({ kind: "io", message: "x" });
+      const { wrapper } = await conflicted({ requestExternalDiff });
+      await wrapper.find('[data-testid="compare"]').trigger("click");
+      await flush();
+      expect(wrapper.emitted("compare-external")?.[0][0]).toMatchObject({ disk: "THEIRS\ntwo\nthree" });
+      wrapper.unmount();
+    });
+
+    it("if the disk equals the base again there is nothing to compare: the conflict resolves, the buffer is untouched", async () => {
+      const requestExternalDiff = vi.fn().mockResolvedValue(null);
+      const { wrapper, api } = await conflicted({ requestExternalDiff });
+      await wrapper.find('[data-testid="compare"]').trigger("click");
+      await flush();
+      expect(wrapper.emitted("compare-external")).toBeUndefined();
+      expect(wrapper.find('[data-testid="external-conflict"]').exists()).toBe(false);
+      expect(api.getText()).toBe("MINE\ntwo\nthree");
+      expect(api.isDirty).toBe(true);
+      wrapper.unmount();
+    });
   });
 });
