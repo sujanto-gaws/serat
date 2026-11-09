@@ -8,13 +8,13 @@
 //   2. negative control   2.2R busy-wait in the input handler, 100 keys, BOTH cadences: >= 95% late
 //   3. negative control 2 2.2R busy-wait in a rAF queued by the input handler, 100 keys, BOTH cadences: >= 95% late
 //   4. mutation           verdict forced "on time" must turn BOTH negative arms red
-// Reported, never gated: graded 1.5R (expected band 85-95% late).
+// Reported, never gated: graded 1.5R (band recorded per Chromium version).
 //
 // Engine label: headless Chromium. Presentation timing there is a proxy for a real compositor, so a
 // result is NOT gate-eligible for NFR-PRF-02 until reproduced on a reference machine (WebView2).
 import { test, expect } from "@playwright/test";
 import { namespaceSource, percentLate, percentOnTime, p95FramesToPaint, type Cadence } from "./measure";
-import { measureArm, POSITIVE_MIN_ON_TIME, NEGATIVE_MIN_LATE, GRADED_BAND, type ArmName } from "./arms";
+import { measureArm, POSITIVE_MIN_ON_TIME, NEGATIVE_MIN_LATE, gradedBandNote, type ArmName } from "./arms";
 import { ENGINE, RULE_STATEMENT, fmt, pct } from "./report";
 
 test.beforeAll(async ({ browser }) => { console.log(RULE_STATEMENT(browser.version())); });
@@ -54,19 +54,19 @@ test("mutation: forcing the verdict on time turns BOTH negative arms red", async
   const mutant = namespaceSource({ isLate: "function isLate(etEnd, deadlineMs) { return false; }" });
   for (const arm of ["negative", "render2"] as ArmName[]) {
     const fresh = await context.newPage(); // one document per capture install
-    const { scores } = await measureArm(fresh, arm, 40, { kind: "strict" }, mutant);
+    const { scores, summary, refreshIntervalMs } = await measureArm(fresh, arm, 40, { kind: "strict" }, mutant);
     await fresh.close();
     const late = percentLate(scores);
-    console.log(`mutant (isLate -> false) on ${arm}: ${pct(late)} late (gate needs >= ${pct(NEGATIVE_MIN_LATE)}, so it is red); ${ENGINE(context.browser()?.version())}`);
+    console.log(`mutant (isLate -> false) on ${arm}: ${pct(late)} late (gate needs >= ${pct(NEGATIVE_MIN_LATE)}, so it is red); n=40 R=${refreshIntervalMs.toFixed(2)} ${fmt(summary).split(";")[0]}; ${ENGINE(context.browser()?.version())}`);
     expect(late, `the mutant must fail the ${arm} gate`).toBeLessThan(NEGATIVE_MIN_LATE);
   }
 });
 
-test("graded 1.5R (reported, not gated; expected band 85-95% late)", async ({ page }) => {
+test("graded 1.5R (reported, not gated; band recorded per Chromium version)", async ({ page }) => {
   test.setTimeout(90_000);
   const { scores, summary, refreshIntervalMs } = await measureArm(page, "graded", 200);
   const late = percentLate(scores);
-  const inBand = late >= GRADED_BAND[0] && late <= GRADED_BAND[1];
-  console.log(`graded: n=200 R=${refreshIntervalMs.toFixed(2)} ${pct(late)} late; ${fmt(summary)}; ${ENGINE(page.context().browser()?.version())}; band ${pct(GRADED_BAND[0])}-${pct(GRADED_BAND[1])}: ${inBand ? "in band" : "OUT OF BAND (informational)"}`);
+  const version = page.context().browser()?.version();
+  console.log(`graded: n=200 R=${refreshIntervalMs.toFixed(2)} ${pct(late)} late; ${fmt(summary)}; ${ENGINE(version)}; ${gradedBandNote(version, late)}`);
   test.info().annotations.push({ type: "graded-late", description: pct(late) });
 });

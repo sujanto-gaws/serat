@@ -8,7 +8,7 @@
 //   render2  : 2.2R busy-wait in a rAF callback QUEUED by the input handler (where
 //              CodeMirror's requestMeasure/DOM update runs; after the recorder's callback, so
 //              frame timing alone cannot see it). REQUIRED second negative control, >= 95% late.
-//   graded   : 1.5R in the input handler. Reported only; the expected band is 85-95% late.
+//   graded   : 1.5R in the input handler. Reported only; its band is recorded per Chromium version (GRADED_BANDS).
 import type { Page } from "@playwright/test";
 import { installCapture, namespaceSource, runKeystrokes, type Cadence, type KeystrokeScore, type RunSummary } from "./measure";
 
@@ -20,7 +20,17 @@ export const SUBJECT_MIN_ON_TIME = 0.95;
 /** Keystrokes per cadence per subject position (architecture.md 9.3 requires >= 500). */
 export const SUBJECT_KEYS = 500;
 /** Reported, not gated. */
-export const GRADED_BAND: [number, number] = [0.85, 0.95];
+/** Graded-arm late-share band, keyed by Chromium version prefix (architecture 9.3: the band is a property of the
+ * engine version). 141 recorded 85-95%; 153 is unstable (50.5, 73.0, 49.5, 80.0% across runs) so it has no entry. */
+export const GRADED_BANDS: Record<string, [number, number]> = { "141.": [0.85, 0.95] };
+
+/** The band text for a version: the recorded band and in/out of it, or the no-band statement. */
+export function gradedBandNote(version: string | undefined, late: number): string {
+  const key = Object.keys(GRADED_BANDS).find((k) => (version ?? "").startsWith(k));
+  if (!key) return `no recorded band for ${version ?? "unknown version"} (unstable on this version, 9.3)`;
+  const [lo, hi] = GRADED_BANDS[key];
+  return `band for ${key}x ${(lo * 100).toFixed(1)}%-${(hi * 100).toFixed(1)}%: ${late >= lo && late <= hi ? "in band" : "OUT OF BAND (informational)"}`;
+}
 
 const FIXTURE_HTML =
   "<!doctype html><html><body>" +
