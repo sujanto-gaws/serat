@@ -209,6 +209,9 @@ fn map_hit(hit: read::SearchHit) -> SearchHit {
         sidecar_path: hit.sidecar_path,
         block: hit.block.map(map_block),
         snippet: hit.snippet,
+        // Contract ahead of implementation (task #79): filled by the follow-up that
+        // stats each hit against notes.mtime/size. None = "not computed".
+        changed_since_indexed: None,
     }
 }
 
@@ -238,6 +241,9 @@ pub fn map_backlink(link: read::Backlink) -> Backlink {
         source_title: link.source_title,
         block: link.block.map(map_block),
         excerpt: link.excerpt,
+        // Contract ahead of implementation (task #79): filled once serat-index
+        // records links.field_key (INDEX_VERSION 12). None = "not known".
+        frontmatter_keys: None,
     }
 }
 
