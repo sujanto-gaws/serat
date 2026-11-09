@@ -68,8 +68,8 @@ fn hostile_a_symlink_planted_at_a_temp_name_is_not_written_through() {
 #[test]
 fn temp_names_are_not_a_function_of_pid_or_a_counter() {
     let dir = tempfile::tempdir().unwrap();
-    let a = crate::atomic::write_temp(dir.path(), "n.md", b"a", None).unwrap();
-    let b = crate::atomic::write_temp(dir.path(), "n.md", b"b", None).unwrap();
+    let (a, _) = crate::atomic::write_temp(dir.path(), "n.md", b"a", None).unwrap();
+    let (b, _) = crate::atomic::write_temp(dir.path(), "n.md", b"b", None).unwrap();
     assert_ne!(a, b);
     let name = a.file_name().unwrap().to_string_lossy().into_owned();
     assert!(!name.contains(&std::process::id().to_string()), "{name}");
@@ -342,9 +342,9 @@ fn set_mtime(path: &std::path::Path, secs: u64) {
 }
 
 #[test]
-fn write_atomic_returns_the_mtime_of_the_renamed_file_not_of_a_later_rewrite() {
-    // ADR-0015 section 2: the mtime beside the hash is from the rename, so an external
-    // rewrite landing after it cannot make the pair claim newer bytes than it hashes.
+fn write_atomic_returns_the_mtime_the_bytes_had_at_the_rename_not_a_later_rewrite() {
+    // ADR-0015 section 2: an external rewrite landing right after the rename (before
+    // any stat of the target could happen) must not give the pair a newer mtime.
     let (dir, vault) = vault();
     let path = VaultPath::new("note.md").unwrap();
     let target = dir.path().join("note.md");
@@ -366,7 +366,7 @@ fn write_atomic_returns_the_mtime_of_the_renamed_file_not_of_a_later_rewrite() {
 }
 
 #[test]
-fn write_patch_returns_the_mtime_of_the_renamed_file_not_of_a_later_rewrite() {
+fn write_patch_returns_the_mtime_the_bytes_had_at_the_rename_not_a_later_rewrite() {
     let (dir, vault) = vault();
     let path = VaultPath::new("note.md").unwrap();
     let target = dir.path().join("note.md");

@@ -279,8 +279,9 @@ pub struct FileWritten {
     /// BLAKE3 of what is now on disk, lowercase hex. The caller keeps it as the
     /// next `base_hash`.
     pub hash: String,
-    /// Filesystem mtime after the write, unix milliseconds. See
-    /// `FileContents::mtime_ms`.
+    /// Filesystem mtime of the written bytes, unix milliseconds, taken before the
+    /// rename and so never newer than `hash` describes (ADR-0015 section 2). See
+    /// `FileContents::mtime_ms`. `0` means unknown: treat the file as changed.
     #[ts(type = "number")]
     pub mtime_ms: i64,
     /// Byte length after the write.

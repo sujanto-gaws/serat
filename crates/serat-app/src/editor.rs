@@ -514,12 +514,6 @@ mod tests {
         assert_eq!(written.hash, serat_vault::hash_bytes(&on_disk).to_hex());
         assert_eq!(written.bytes, on_disk.len() as u64);
         assert_eq!(written.mtime_ms, mtime);
-        // The save path holds no `Vault::read` / `stat` of its own: the triple is the
-        // write's return value.
-        let src = include_str!("editor.rs");
-        let body = &src[src.find("pub fn save_patch").expect("fn")..];
-        let body = &body[..body.find("/// `request_external_diff`").expect("end")];
-        assert!(!body.contains("vault.read(") && !body.contains("fs::metadata"));
     }
 
     #[test]

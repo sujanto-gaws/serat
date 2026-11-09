@@ -78,13 +78,14 @@ pub enum Expect {
 }
 
 /// What a write returns: the hash of the bytes written and the mtime the file had
-/// right after the rename (ADR-0015 §2: a recorded mtime must not be newer than the
+/// when it was renamed in (ADR-0015 §2: a recorded mtime must not be newer than the
 /// bytes its hash describes, so the two come from the same moment, not a later read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Written {
     /// BLAKE3 of the bytes written.
     pub hash: ContentHash,
-    /// Unix milliseconds, statted once after the rename under the per-path lock.
+    /// Unix milliseconds, from the temp file's handle before the rename (which preserves
+    /// it), so it never postdates our bytes.
     pub mtime_ms: i64,
     /// Length of the bytes written.
     pub size: u64,
@@ -486,16 +487,16 @@ impl Vault {
         self.write_atomic_seams(path, bytes, expect, before_rename, || {})
     }
 
-    /// [`Vault::write_atomic_hooked`] plus `after_stat`, which runs after the post-rename
-    /// stat and before the return: where a test lands an external write to prove the
-    /// returned mtime is the one taken at the rename.
+    /// [`Vault::write_atomic_hooked`] plus `after_commit`, which runs right after the rename:
+    /// where a test lands an external write to prove the returned mtime is the one
+    /// the bytes carried into place.
     fn write_atomic_seams(
         &self,
         path: &VaultPath,
         bytes: &[u8],
         expect: Option<Expect>,
         before_rename: impl FnOnce(),
-        after_stat: impl FnOnce(),
+        after_commit: impl FnOnce(),
     ) -> Result<Written, VaultError> {
         // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
         // rewritten. The threat model's stated mechanism is that no write path accepts
@@ -574,13 +575,15 @@ impl Vault {
         // mode; on Windows only the read-only flag exists to carry.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
-            .map_err(|err| failed(err.to_string()))?;
+        let (temp, mtime_ms) =
+            atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
+                .map_err(|err| failed(err.to_string()))?;
         before_rename();
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        let mtime_ms = self.mtime_after_commit(&target);
-        after_stat();
+        // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
+        // no stat of the target here, so an external write cannot be paired with our hash.
+        after_commit();
         Ok(Written {
             hash,
             mtime_ms,
@@ -646,7 +649,7 @@ impl Vault {
         self.write_patch_seams(path, base_hash, edits, before_rehash, before_rename, || {})
     }
 
-    /// [`Vault::write_patch_hooked`] plus `after_stat` (see `write_atomic_seams`).
+    /// [`Vault::write_patch_hooked`] plus `after_commit` (see `write_atomic_seams`).
     fn write_patch_seams(
         &self,
         path: &VaultPath,
@@ -654,7 +657,7 @@ impl Vault {
         edits: &[patch::Edit],
         before_rehash: impl FnOnce(),
         before_rename: impl FnOnce(),
-        after_stat: impl FnOnce(),
+        after_commit: impl FnOnce(),
     ) -> Result<Written, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
@@ -709,8 +712,9 @@ impl Vault {
         // permissions.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
-            .map_err(|err| failed(err.to_string()))?;
+        let (temp, mtime_ms) =
+            atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
+                .map_err(|err| failed(err.to_string()))?;
 
         before_rehash();
 
@@ -734,22 +738,14 @@ impl Vault {
 
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        let mtime_ms = self.mtime_after_commit(&target);
-        after_stat();
+        // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
+        // no stat of the target here, so an external write cannot be paired with our hash.
+        after_commit();
         Ok(Written {
             hash: new_hash,
             mtime_ms,
             size: new_bytes.len() as u64,
         })
-    }
-
-    /// The mtime of the file just renamed into place, for [`Written`]. Called inside
-    /// the per-path lock straight after the rename, so no in-process writer can
-    /// interleave. If the stat fails (an external delete in that instant) the answer
-    /// is `0`: older than any real mtime, so the next comparison sees a change
-    /// rather than a stale agreement (ADR-0015 §2: never newer than the bytes).
-    fn mtime_after_commit(&self, target: &Path) -> i64 {
-        fs::metadata(target).map_or(0, |stat| walk::mtime_ms(&stat))
     }
 
     /// The edit script from `base` to the file as it is on disk now, in `base`'s
