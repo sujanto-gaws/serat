@@ -1,89 +1,102 @@
 ---
 project: Serat
-artifact: P1 status — paused for resume
+artifact: P1 status
 phase: 01-planning
 owner: lead
-status: paused by owner, 2026-09-24 — gate NOT reached, P1 in progress
+status: in progress — 2026-11-09 — gate NOT reached; core and app plumbing on main, frontend and gate work open
 ---
 
-# P1 — An editor you could live in — Status (paused)
+# P1 — An editor you could live in — Status
 
 **Gate (charter §Milestones):** owner opens their own vault in Serat for a week without needing Obsidian. Protocol: `docs/05-testing/p1-gate-protocol.md` (merged).
 
-**Where P1 stands:** design is complete and merged. Implementation has started on task branches, and none of it is merged. Every teammate was stopped at the owner's request. Nothing is running, and the PR watch on sujanto-gaws/serat#10 and its scheduled check-in are cancelled.
+**Where P1 stands.** The Rust core and the serat-app plumbing for P1 are on `main`: tree, search, backlinks, saves as patch sets, assets and sidecars, the quick-switcher index, external-change indexing with an always-mtime catch-up, the WAL checkpointer off the save path, the asset scheme, and the app's open/close/switch sequence. The editor's keystroke stall is fixed and the NFR-PRF-02 harness exists and passes 3 of 8 scenarios on headless Chromium. Not yet on main: the editor's own UI wiring (tree, panels, switcher UI, viewers), the remaining latency scenarios, CI wiring for the latency gate, and the week-in-vault report.
 
-Integration branch: `claude/great-mccarthy-jywddn` (PR sujanto-gaws/serat#10), tip at the time of pausing = the commit that adds this file. The last code-bearing merge is `e179b2c`. The full Rust workspace and `app/` `npm test` (31/31) were green there, and doclint was 50/50.
+`main` == integration branch `claude/great-mccarthy-jywddn` == **217b75e**. Every merge goes through the full gate first: `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --check`, `cargo check -p serat-app --release`, doclint, `npm test` and `vue-tsc` in `app/`. Index schema version on main: **10** (11 arrives with #66). Toolchain: pinned Rust 1.92; Chromium 153 for the latency harness.
 
-## Owner decisions recorded during P1 (2026-09-24)
+## Owner decisions recorded during P1
 
-1. Enter P1 with P0's gate not formally closed. F-384 (no CI jobs) and #123 (a scanner-on re-run) are carried as RISK-013 and an open item.
-2. The flat table view stays in P2 (FR-VIW-01). FR-NAV-02 is split: note bodies in P1, and extracted/PDF content becomes new **FR-NAV-08** (P2).
-3. Gate rule: reaching for Obsidian for **any post-P1 capability** is logged and counted, not gate-failing. A missing-P1-feature, defect or "defect (trust)" reach is NO-GO and restarts the 7 days.
-4. FR-VLT-01 is re-defined (PRD v1.6, ADR-0015): the complete tree within 2 s p95, timed from the window's first paint; empty folders are reported, not gated.
-5. NFR-PRF-02 is re-defined (PRD v1.6): ≥95% of keystrokes painted in the first frame after the keystroke. The old "p95 < 16 ms" is unmeetable at 60 Hz.
-6. Lead default (owner told, not objected to): a gate reach that maps to **no PRD ID** counts as missing P1 unless product-analyst records an ID or exclusion first.
+1. Enter P1 with P0's gate not formally closed; F-384 (no CI jobs) and #123 (scanner-on re-run) carried as risks.
+2. Flat table view stays P2 (FR-VIW-01). FR-NAV-02 split: note bodies in P1, extracted/PDF content becomes FR-NAV-08 (P2).
+3. Gate rule: reaching for Obsidian for any post-P1 capability is logged and counted, not gate-failing. A missing-P1-feature, defect or trust reach is NO-GO and restarts the 7 days.
+4. FR-VLT-01 re-defined (PRD v1.6, ADR-0015): complete tree within 2 s p95 from the window's first paint; empty folders reported, not gated.
+5. NFR-PRF-02 re-defined (PRD v1.6, §9.3): ≥95% of keystrokes painted on time under the E0 rule; measured per engine version; gate-eligible only on the reference machine.
+6. Lead default (told, not objected to): a gate reach mapping to no PRD ID counts as missing P1 unless product-analyst records an ID or exclusion first.
+7. Finished branches push to `main` as well as the integration branch (owner, 2026-10-21).
 
-## Merged on the integration branch
+## Design rulings made during implementation (all merged)
 
-| # | What | Merge |
+- **ADR-0015 §2:** the open-time catch-up always compares mtimes (a `git pull` while Serat is closed must be seen); `clean_close` only schedules the background `quick_check`. Coarse-mtime gap closed by `notes.size` plus a racy window `caught_up_from_ms` (#66, in review). `Vault::read` stats the open handle before reading; `TouchMtime` is hash-guarded.
+- **§3.1.1 hub-note save (#53 → #56):** the WAL auto-checkpoint landed on every second hub save; it now runs on its own thread with a 250 ms idle gate, 2 s idle spacing and a 4,000-frame bound; search connection cache 64 MiB. Attested quiet run: **p95 23.3 ms vs 50 ms**.
+- **§9.2 quick switcher:** 20k gates, 50k reported; empty query falls back to most-recent-by-mtime; per-query DP cell budget; history written by `Vault::update_history`.
+- **§9.3 NFR-PRF-02:** E0 rule, two per-run invariants (keydown present; entry-end spread ≤8 ms, derived), engine version on every figure, graded arm informational and per-version, key window [t−0.01, t+4]. Headless end-of-document stall recorded; scroll margins are load-bearing for the measurement until the reference-machine run tests both builds.
+- **ADR-0017:** handler accepts `serat-asset://localhost/…` on every platform (wry reverts its Windows rewrite); step 7 reads the handle's real path via `filepath`; `use_https_scheme(false)` pinned on the window builder.
+- **#63 clean close:** `app://closing` → editor flush → `flush_ack`, bounded 2 s, only when a note is open; close and switch serialised on `opening`.
+- **#58:** a parser-refused note is a bare row on every path (C-02). **#57:** block-style frontmatter lists are indexed (aliases were 0 rows before). **#59:** no unsafe carve-out for cache diagnostics.
+
+## Merged on main (this run)
+
+| # | What | Review |
 |---|---|---|
-| 1 | FR-NAV-02 split, FR-NAV-08 (PRD v1.5) | 5485c2e |
-| 2 | ADR-0015 file tree (accepted) | e624c20 |
-| 3 | Quick switcher, architecture §9.2 | 487abc3 |
-| 4 | P1 read paths, §4.5 | b2d2f1c |
-| 5 | ADR-0016 editor saves are patches (accepted); §3.3, §9.3 | d0d5300 |
-| 6 | ADR-0017 serat-asset scheme; §7.4 | 1e74f07 |
-| 7 | contracts/ipc.rs P1 subset + generated TS (50 types) | be8baa7 |
-| 8 | UI screen specs, tokens, components (docs/03-design/ui) | 8fe20a3 |
-| 28a | Gate protocol | d118997 |
-| 30 | FR-NAV-08 accounted for in architecture.md | db1d967 |
-| 32 | PRD v1.6 (FR-VLT-01, NFR-PRF-02 re-definitions) | 857af57 |
-| 36 | ADR-0017 correction: real controls (a) top-level nav guard, (b) sandbox CSP, (c) frame-src/object-src 'none' + sanitiser | e274d75 |
+| 14 | `.seratignore`, watcher-driven indexing, DirChanged rescan, clean-close marker, (path,hash) echo, one walk at open; INDEX_VERSION 10 | approved after 3 rounds |
+| 16 | quick-switcher index + bench | approved |
+| 17 | assets and sidecars, schema v8 | approved |
+| 18 (round 3) | index://changed consumer, app-owned open-time catch-up, close_vault, switcher_query | approved after 3 rounds |
+| 19 | serat-asset scheme, asset_info/read_asset_range, handle-path containment | approved (Windows by reading only) |
+| 56 | WAL checkpointer, page-cache sizes, 2 s idle spacing | approved |
+| 57 | block-style frontmatter lists; INDEX_VERSION 9 | approved |
+| 58 | bare rows for parser-refused notes | approved (with #14) |
+| 65 | always-mtime catch-up, stat-before-read, hash-guarded TouchMtime | approved |
+| 11 | NFR-PRF-02 harness (unit → controls → subject projects, 500 keys) | approved after 3 rounds |
+| 42 | editor keystroke stall: #app bounded to the window, CodeMirror owns the scroll | approved; **3/8 scenarios PASS, NFR-PRF-02 stays open** |
+| docs | ADR-0015 §2 amendment, §9.3 rewrite, ADR-0017 wording, editor.md scrolling, #63 clean-close design, #59 ruling | doclint green |
 
-## Unmerged branches: exact state at pause
+## Open branches
 
-Review state: **APPROVED** = can merge. **CR** = changes required, not yet fixed. **FIXED-UNREVIEWED** = the author committed fixes that no one has re-reviewed. **WIP** = incomplete. Where a branch lives only in a local worktree, that is stated.
+| # | Branch @ head | State | Next |
+|---|---|---|---|
+| 63 | `task/p1-63-flush-before-close` @ a80365e | round 2 in re-review | merge; editor half in #22/#23 |
+| 66 | `task/p1-66-size-and-window` @ bedd1e3 | NOT APPROVED (window advances past skipped files; rescan must not write); round 2 in progress | fix, re-review, merge (INDEX_VERSION 11) |
+| 67 | `task/p1-67-watcher-test-flake` | in progress: three load-sensitive tests made deterministic | review, merge |
+| 71 | `task/p1-71-filewritten-mtime` @ a9e4f18 | in review | merge |
+| 72 | `task/p1-72-unc-root` | in review (Windows unexercised) | merge; Windows CI run owed |
+| 9, 10 | `task/p1-09-tree-budget` @ 1098c60, `task/p1-10-switcher-budget` @ e54986a | pre-reset, fixed-unreviewed; #14 and #16 shipped their own benches since | reconcile with `p1-external-change` / `p1-switcher`, review, merge |
+| 12 | `task/p1-12-compat-corpus` @ 1a081c7 | pre-reset WIP | resume |
+| 28b | `task/p1-28b-no-id-reach` @ e9564c4 | pre-reset, unreviewed | review |
+| 31 | `task/p1-31-tree-first-screen-mark` @ d8e2547 | pre-reset CR + lead WIP; `startup::TREE_DELIVERED` can flip now | finish, re-review |
+| 40 | `task/p1-40-block-widgets` @ b5d3424 | pre-reset WIP, was paused for #21 (now merged) | resume |
+| — | `task/p1-design-merge-preview` @ 87e6ace | unknown | inspect, delete if stale |
 
-| # | Branch @ hash | Owner | State | Next step |
-|---|---|---|---|---|
-| 9 | `task/p1-09-tree-budget` @ 1098c60 | test-engineer | FIXED-UNREVIEWED (code-reviewer-2's B1 job_exit / B2 P1_BUDGETS) | code-reviewer-2 re-review |
-| 10 | `task/p1-10-switcher-budget` @ e54986a | test-engineer | FIXED-UNREVIEWED; should sit on top of #9 (Cargo.toml `[[bin]]` keep-both) | re-review after #9 |
-| 11 | `task/p1-11-editor-latency` @ aedb9e1 | test-engineer | CR. The §9.3 rule is unsettled: three definitions failed on recorded frames | **empirical step first**: record candidate rules (positive n=300 ≥99% on time; negative 2.2R ≥95% late; graded 1.5R stable band). Candidate: late iff frame k's rAF `run_k > D` (D = ts_j+2R), render cost from LoAF / Event Timing. If nothing clears 99% headless, escalate to the owner (a WebView2 reference-machine gate?) |
-| 12 | `task/p1-12-compat-corpus` @ 1a081c7 | test-engineer | WIP (fixtures) | continue |
-| 16b | `task/p1-16b-adr0016-separator-note` @ 72a50f9 | architect | in review queue (code-reviewer-2); watch F-239, since it cites a path on unmerged #21 | review |
-| 21 | `task/p1-21-editor` @ b87755d | vue-frontend-dev | **CR, BLOCKING data loss**: two undos after load empty the note and autosave writes it. Also: markdown() adds its own Enter/Backspace keymap; the bench seam ships in release; boot chunk +78% gzip (lang-html pulls JS/CSS grammars). Plus NITs: StaleHash blind retry, offsetAt validation, sanitiser class/data-*, auxclick | fix (the author had just started); merge blocked on #11 and #31 |
-| 28b | `task/p1-28b-no-id-reach` @ e9564c4 | test-engineer | unreviewed | review |
-| 31 | `task/p1-31-tree-first-screen-mark` @ d8e2547 | test-engineer | CR + a lead-committed WIP on top (unverified) | finish the `tree:false` declaration approach (ADR-0013), then re-review |
-| 33 | `task/p1-33-patch-apply` @ 3ddad26 | rust-core-dev | WIP, lead-committed; tests not yet run | finish; add the lone-`\r` table case matching app/src/editor/patches.test.ts |
-| 34 | `task/p1-34-path-escape` @ 10603a1 | rust-core-dev | FIXED-UNREVIEWED (platform-conditional name rules, refused names reported per #35, device-name list, `\` on Unix, resolve_segments seam) | code-reviewer-2 re-review. **Live security defect on the integration branch until merged** (Windows drive-relative escape in read_file) |
-| 37 | `task/p1-37-nav-guard` @ 4f3766f | tauri-app-dev | in security review (code-reviewer-2, interrupted) | re-run the review |
-| 38 | `task/p1-38-prf02-vsync-count` @ 13c5486 | architect | CR, **on hold** until #11's data | rewrite §9.3 from the measured winner |
-| 40 | `task/p1-40-block-widgets` @ b5d3424 | vue-frontend-dev | WIP, paused for the #21 fixes | resume after #21 |
+## Not started (P1 scope)
 
-Not started: #13, #14, #15, #16, #17 (rust-core-dev, each after its bench or design); #18, #19, #20 (tauri-app-dev); #22–#26 (vue-frontend-dev); #27 (test-engineer); #31's re-measure; #39 (context menu on Windows/macOS, needs platform access). Task definitions are in `tasks-p1-editor.md` and on the session task list.
+#20 no-network test · #22 wikilink completion (partly on the merged #21/#42 lineage; must honour `SwitcherResults.discarded` and the `app://closing` flush) · #23 reconcile external edits (`note://external-change`, `request_external_diff` exist) · #24 tree/backlinks/search panels (`open_tree`, `tree://status`, search, backlinks exist) · #25 switcher + palette UI · #26 PDF/image viewers (`assetInfo`/`readAssetRange`/`assetUrl` exist) · #27 test cases per P1 ID + hostile suite · #35 refused names · #39 context menu Win/mac · #41 cargo-deny · #43 tree ops UI · #49 read/write off main thread.
 
-## Budget numbers measured in P1
+## Follow-ups filed this run
 
-None of the P1 budgets has been measured: no subject code exists yet. Carried from P0: NFR-PRF-04 27.7 s / 30 s PASS; NFR-PRF-03 4.3 ms p95 PASS; NFR-PRF-01 Serat term 233.8 ms (a *buffer-rendered* figure, pre-tree) against 350 ms. All are `gate_eligible: false` (scanner off, RISK-012). FR-VLT-01's pre-design walk figure was 4.2 s median / 8.1 s p95 (F-193).
+#60 latency job in CI · #61 remaining 5 PRF-02 scenarios + CRLF/BOM + real IPC · #62 attested post-spacing hub-save run · #68 TreeSession replay on reload · #69 background quick_check · #73 (done) · #75 48 px scroll-margin token · #18c follow-up: capture the window timestamp before arming the watcher.
 
-## Open risks at pause
+## Budget numbers (20k vault unless stated)
 
-- **RISK-013 / F-384: CI still produces no jobs.** All 19 checks on PR #10 fail in 2–4 s with 404 logs, and `main` behaves the same. This is an owner action (Actions billing/limits or enablement). A comment on PR #10 says so.
-- **The #34 security defect is live** on the integration branch until #34 merges.
-- **NFR-PRF-02 has no validated measurement rule.** Three §9.3 definitions failed against recorded frames. It may not be gateable in headless Chromium.
-- **NFR-PRF-01 at risk:** the editor's boot chunk grew +78% gzip; it must be re-measured (#31) before #21 merges.
-- **RISK-003 (CM6 live preview):** block widgets (#40) are needed for the gate, not just split preview.
-- **Disk:** the container reached 96% twice from parallel build dirs. On resume, build targets go on `/dev/shm` or a single shared dir, deleted after use.
+| Budget | Figure | Status |
+|---|---|---|
+| NFR-PRF-03 hub-note save | p95 23.3 ms (attested quiet, pre-spacing); 32.6 ms loaded post-spacing | PASS; #62 re-attests |
+| NFR-PRF-06 switcher keystroke 3 | p95 16–18 ms of 20 ms; heading mode up to 97% | PASS, thin |
+| FR-VLT-04 external change visible | single note p95 192 ms of 500 ms (unattested) | PASS |
+| NFR-PRF-04 full rebuild | 7.9–10.8 s of 30 s | PASS |
+| NFR-PRF-02 keystrokes | 3/8 scenarios ≥95% on headless 153; lowest cell 95.0% | OPEN (reference machine) |
+| catch-up on unchanged index | 16–22 ms; sync-tool worst case 294 ms | reported |
+| R5 attachments read | p95 2.3 ms of 20 ms | PASS |
 
-## Process lessons for resume
+## Open risks
 
-- Teammates cannot message each other or update the task list; the lead relays everything. product-analyst has no shell, so the lead commits its edits (commit messages say so).
-- Run `cargo test -p doclint` on **every** docs change, the lead's own planning edits included (the lead broke the tip twice this way).
-- A measurement definition must be checked against recorded data **before** it goes into the design text.
-- All 26 `task/p1-*` branches, merged and unmerged, **are pushed to origin** (owner approved, 2026-09-24). None is merged into `main` or PR #10 by that push.
+- **No Windows or macOS build in this environment.** #19's Windows paths, #72's UNC handling and #34/#35's name rules are verified by reading only. A Windows CI run is owed before any release claim.
+- **NFR-PRF-02 is not gateable headless.** The reference-machine run (WebView2) must test the editor with and without scroll margins.
+- **RISK-013 / F-384:** CI still produces no jobs; #60 cannot gate until it does.
+- **Load-sensitive tests** (#67): three tests flake under concurrent builds; the lead's gate treats a frontend test failure as blocking from now on.
+- **Disk:** the session allowance overflowed once with three concurrent Rust builds; `~/.cargo/config.toml` sets incremental=false and debug=0, and each agent uses a uniquely named target dir.
 
-## To resume
+## Process notes
 
-1. Fetch the task branches: `git fetch origin 'refs/heads/task/p1-*:refs/heads/task/p1-*'`.
-2. Re-spawn the roles from `.claude/agents/`, each with its own worktree, and hand each the row above.
-3. Order: #34 re-review → merge (security); #21 data-loss fix; #9/#10 re-review → merge; #11 empirical rule selection → #38 → #11 → #31 → #21 merge; then #33/#15/#17 → #18/#19 → #22–#26 → #27 → #28 report.
+- Teammates cannot message each other or edit the task list; the lead relays and records. Agents read their spec from the brief.
+- A container reset wipes worktrees, the session task list and the cargo config; branches on origin are the record. Never remove a worktree whose agent may still be resumed.
+- 63 merged `task/p1-*` branches remain on origin because branch deletion is denied to the lead; the owner may delete them (`git push --delete origin <branch>`); all are contained in `main`.
