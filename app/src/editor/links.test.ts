@@ -84,7 +84,7 @@ function fakeLinks(corpus: SwitcherCorpus = "index"): LinkIpcAdapter & { resolve
         }
       }
       items.sort((a, b) => Number(lower(b.candidate).startsWith(q)) - Number(lower(a.candidate).startsWith(q)));
-      return { seq, corpus, items };
+      return { seq, corpus, items, discarded: false };
     }),
     onIndexChanged: vi.fn(async () => () => undefined),
   };
@@ -327,6 +327,14 @@ describe("[[ completion", () => {
     release();
     expect(await slow).toBeNull();
     expect(await fast).not.toBeNull();
+  });
+
+  it("ignores a response the core marked discarded", async () => {
+    const ipc = fakeLinks();
+    ipc.switcherQuery.mockImplementationOnce(async ({ seq }: { seq: number }) => ({ seq, corpus: "index", items: [], discarded: true }));
+    const { view, resolver } = makeView("[[Al", ipc);
+    const source = makeLinkCompletionSource({ ipc, resolver, getSourcePath: () => "src.md" });
+    expect(await source(new CompletionContext(view.state, 4, false))).toBeNull();
   });
 });
 
