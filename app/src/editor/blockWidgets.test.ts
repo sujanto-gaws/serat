@@ -347,4 +347,61 @@ describe("blockWidgetsField", () => {
     console.log(`select-all extend by one char on ${doc.split("\n").length} lines: ${ms.toFixed(1)} ms`);
     expect(shapeOf(next)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
   });
+
+  // ---- document changes (task #104): both ends, both sides, and the inserted span ----
+
+  /** Applies `spec` to `state` incrementally and compares with a fresh build of the result. */
+  function expectChangeMatchesFresh(state: EditorState, spec: { from: number; to?: number; insert?: string }, label: string): EditorState {
+    const next = state.update({ changes: spec }).state;
+    const sel = next.selection.main;
+    const fresh = makeRange(next.doc.toString(), sel.anchor, sel.head);
+    expect(shapeOf(next), label).toEqual(shapeOf(fresh));
+    return next;
+  }
+
+  it("deleting the text before a table brings it back to a widget/raw state equal to a fresh build", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, doc.length);
+    expect(widgets(s0)).toHaveLength(1);
+    const s1 = expectChangeMatchesFresh(s0, { from: 0, to: "intro\n".length }, "delete `intro\\n`");
+    expect(widgets(s1)).toHaveLength(1);
+    expectChangeMatchesFresh(s0, { from: 0, to: "intro\n\n".length }, "delete the whole line + blank");
+  });
+
+  it("pasting a table over a selection equals a fresh build", () => {
+    const doc = `one\n\ntwo\n\nthree`;
+    const s0 = makeRange(doc, 0, doc.indexOf("two") + 3);
+    const s1 = expectChangeMatchesFresh(s0, { from: 0, to: doc.indexOf("two") + 3, insert: TABLE }, "paste over selection");
+    expect(widgets(s1)).toHaveLength(0); // the cursor sits at the end of the pasted table: revealed
+    const s2 = s1.update({ selection: { anchor: s1.doc.length } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+  });
+
+  it("single-character typing in a paragraph reuses every widget object (no range walk)", () => {
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 50 }, (_, i) => `${t(i)}\n\np${i}`).join("\n\n");
+    const at = doc.indexOf("p25") + 1;
+    const s0 = makeState(doc, at);
+    const before = widgets(s0);
+    const s1 = s0.update({ changes: { from: at, insert: "x" }, selection: { anchor: at + 1 } }).state;
+    const after = widgets(s1);
+    expect(after.length).toBe(before.length);
+    expect(after.every((w) => before.some((b) => b.widget === w.widget))).toBe(true);
+  });
+
+  it("property: deleting [min, max] of each sampled pair equals a fresh build of the result", () => {
+    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+    const mid = doc.indexOf("p two") + 2;
+    const startStates = [0, mid, doc.length].map((c) => makeState(doc, c));
+    const positions = new Set<number>([0, 1, doc.length - 1, doc.length]);
+    for (let i = 0; i <= doc.length; i += 4) positions.add(i);
+    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) [i, i + 1, i + 2].forEach((p) => p <= doc.length && positions.add(p));
+    const list = [...positions];
+    for (const a of list) {
+      for (const b of list) {
+        if (b <= a) continue;
+        startStates.forEach((st, i) => expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b} from start ${i}`));
+      }
+    }
+  });
 });
