@@ -11,7 +11,10 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { CommandRegistry, EDITOR_PRIMARY_ACTION_IDS } from "@/editor/commands";
-import { createEditorCommandRegistry } from "@/editor/codemirrorSetup";
+import { createEditorCommandRegistry, passthroughName } from "@/editor/codemirrorSetup";
+import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
+import { mount } from "@vue/test-utils";
+import { EditorView } from "@codemirror/view";
 
 function noopHandler() {
   return true;
@@ -207,5 +210,92 @@ describe("view-less (global) commands in the one registry (architecture.md 9.3, 
 
   it("refuses a command with neither run nor exec", () => {
     expect(() => new CommandRegistry().register({ id: "n", name: "N" })).toThrow(/neither/);
+  });
+});
+
+describe("rebinding editor commands (NFR-USE-01)", () => {
+  it("an editor-id override changes the key in the built keymap", () => {
+    const registry = buildDefaultRegistry();
+    expect(registry.setOverrides([{ command_id: "editor.save", key: "Mod-q" }])).toEqual([]);
+    const keys = registry.buildKeymap().map((b) => b.key);
+    expect(keys).toContain("Mod-q");
+    expect(keys).not.toContain("Mod-s");
+  });
+
+  it("a colliding override is refused (never reaches buildKeymap, which would throw)", () => {
+    const registry = buildDefaultRegistry();
+    const refused = registry.setOverrides([
+      { command_id: "editor.save", key: "Mod-z" },
+      { command_id: "editor.follow-link", key: "Mod-a" },
+      { command_id: "editor.redo", key: "Mod-Shift-y" },
+    ]);
+    expect(refused).toEqual(["editor.save", "editor.follow-link"]);
+    expect(() => registry.buildKeymap()).not.toThrow();
+    expect(registry.effectiveBinding("editor.save")).toBe("Mod-s");
+    expect(registry.effectiveBinding("editor.redo")).toBe("Mod-Shift-y");
+    expect(registry.setOverride("editor.save", "Mod-z")).toBe(false);
+  });
+
+  it("two globals on one chord: the second is refused", () => {
+    const registry = new CommandRegistry();
+    registry.register({ id: "a", name: "A", defaultBinding: "Mod-o", exec: () => {} });
+    registry.register({ id: "b", name: "B", exec: () => {} });
+    expect(registry.setOverrides([{ command_id: "b", key: "Mod-o" }])).toEqual(["b"]);
+  });
+
+  it("with a colliding override in force, a mounted editor still loads a note (no strand)", async () => {
+    if (!Range.prototype.getClientRects) {
+      Range.prototype.getClientRects = () =>
+        ({ length: 0, item: () => null, [Symbol.iterator]: [][Symbol.iterator] }) as unknown as DOMRectList;
+      Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);
+    }
+    const registry = new CommandRegistry();
+    const ipc = {
+      noteOpened: vi.fn().mockResolvedValue(undefined),
+      noteClosed: vi.fn().mockResolvedValue(undefined),
+      savePatch: vi.fn(),
+      requestExternalDiff: vi.fn().mockResolvedValue(null),
+      rebaseBuffer: vi.fn().mockResolvedValue([]),
+      readFile: vi.fn(),
+      writeFile: vi.fn(),
+      onExternalChange: vi.fn().mockResolvedValue(() => undefined),
+      onClosing: vi.fn().mockResolvedValue(() => undefined),
+      flushAck: vi.fn().mockResolvedValue(undefined),
+    };
+    const wrapper = mount(CodeMirrorEditor, { props: { ipc, commands: registry }, attachTo: document.body });
+    registry.setOverrides([{ command_id: "editor.save", key: "Mod-z" }, { command_id: "editor.undo", key: "Mod-q" }]);
+    const api = wrapper.vm as unknown as { loadNote(t: string, p: string, h: string): Promise<boolean>; getText(): string };
+    expect(await api.loadNote("hello", "a.md", "h1")).toBe(true);
+    expect(api.getText()).toBe("hello");
+    expect(registry.effectiveBinding("editor.undo")).toBe("Mod-q");
+    wrapper.unmount();
+    expect(registry.has("editor.save")).toBe(false); // an unmounted editor takes its commands with it
+    void EditorView;
+  });
+
+  it("toggle live preview is global: it has an exec, so it runs without editor focus and from the palette", async () => {
+    const toggled = vi.fn(() => true);
+    const registry = createEditorCommandRegistry({ save: noopHandler, toggleLivePreview: toggled, followLink: noopHandler });
+    expect(await registry.execute("editor.toggle-live-preview", null)).toBeNull();
+    expect(toggled).toHaveBeenCalledTimes(1);
+    expect(registry.matchGlobal(new KeyboardEvent("keydown", { key: "M", ctrlKey: true, shiftKey: true }), false)?.id).toBe(
+      "editor.toggle-live-preview",
+    );
+  });
+});
+
+describe("readable names for CodeMirror's own commands", () => {
+  for (const platform of ["mac", "win", "linux"] as const) {
+    it(`no passthrough command is named after its key (${platform})`, () => {
+      const registry = createEditorCommandRegistry({ save: noopHandler, toggleLivePreview: noopHandler, followLink: noopHandler }, platform);
+      const generic = registry.list().filter((c) => /^Editor command \(|^Editor: /.test(c.name));
+      expect(generic.map((c) => c.defaultBinding)).toEqual([]);
+    });
+  }
+  it("names read as actions", () => {
+    expect(passthroughName("Mod-Alt-ArrowUp", "linux", false)).toBe("Add cursor above");
+    expect(passthroughName("ArrowLeft", "linux", true)).toBe("Extend selection left");
+    expect(passthroughName("Mod-Backspace", "mac", false)).toBe("Delete to line start");
+    expect(passthroughName("Mod-Backspace", "win", false)).toBe("Delete word backward");
   });
 });

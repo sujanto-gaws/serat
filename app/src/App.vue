@@ -189,7 +189,10 @@ async function onPaletteRun(id: string): Promise<void> {
   if (reason !== null) store.setMark(reason);
 }
 
+/** A toggle made before `get_ui_settings` answers wins over the stored value. */
+let toggledByUser = false;
 function toggleLivePreview(): void {
+  toggledByUser = true;
   livePreview.value = !livePreview.value;
   void setLivePreview({ enabled: livePreview.value }).catch(() => undefined);
 }
@@ -281,8 +284,12 @@ onMounted(async () => {
   // sits on the first-paint path. Rebinding UI + `set_keybinding`: task #93.
   getUiSettings()
     .then((settings) => {
-      livePreview.value = settings.live_preview;
-      commands.setOverrides(settings.keybindings);
+      if (!settings) return; // the bench stub answers null
+      if (!toggledByUser) livePreview.value = settings.live_preview;
+      const refused = commands.setOverrides(settings.keybindings ?? []);
+      if (refused.length > 0) {
+        store.setMark(`keybinding ignored (already used by another command): ${refused.join(", ")}`);
+      }
     })
     .catch(() => undefined);
 

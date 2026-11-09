@@ -101,17 +101,43 @@ export class CommandRegistry {
    * `null` unbinds; `undefined` restores the default. Rebind UI, conflict
    * handling and `set_keybinding` are task #93; this is the read side.
    */
-  setOverride(id: CommandId, key: string | null | undefined): void {
+  setOverride(id: CommandId, key: string | null | undefined): boolean {
     if (key === undefined) this.overrides.delete(id);
-    else this.overrides.set(id, key);
+    else if (this.collidesWith(id, key) === null) this.overrides.set(id, key);
+    else return false; // refused: it would share a chord in the same `when` context
     this.changed();
+    return true;
   }
 
-  /** Replaces all overrides at once (`UiSettings.keybindings` at startup). */
-  setOverrides(overrides: ReadonlyArray<{ command_id: string; key: string | null }>): void {
+  /**
+   * Replaces all overrides at once (`UiSettings.keybindings` at startup).
+   * An override that would share a chord with another command in the same
+   * `when` context is dropped (not applied) and its command id returned, so
+   * `buildKeymap` can never throw on user data: a throw inside the editor's
+   * state replacement would strand the old text against a new note's base.
+   * Overrides naming no registered command are kept (the command may register later).
+   */
+  setOverrides(overrides: ReadonlyArray<{ command_id: string; key: string | null }>): CommandId[] {
     this.overrides.clear();
-    for (const o of overrides) this.overrides.set(o.command_id, o.key);
+    const refused: CommandId[] = [];
+    for (const o of overrides) {
+      if (o.key !== null && this.collidesWith(o.command_id, o.key) !== null) refused.push(o.command_id);
+      else this.overrides.set(o.command_id, o.key);
+    }
     this.changed();
+    return refused;
+  }
+
+  /** The other command that already holds `key` in `id`'s `when` context, if any. */
+  private collidesWith(id: CommandId, key: string | null): CommandId | null {
+    if (key === null) return null;
+    const mine = this.commands.get(id);
+    const bucket = mine?.when ?? "*";
+    for (const other of this.commands.values()) {
+      if (other.id === id || (other.when ?? "*") !== bucket) continue;
+      if (this.effectiveBinding(other.id) === key) return other.id;
+    }
+    return null;
   }
 
   /** The binding in force: the override (`null` = unbound) else the default. */

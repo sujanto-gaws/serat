@@ -21,8 +21,97 @@ import { deleteMarkupBackward, insertNewlineContinueMarkup } from "@/editor/mark
 
 export interface EditorCommandHandlers {
   save: (view: EditorView) => boolean;
-  toggleLivePreview: (view: EditorView) => boolean;
+  toggleLivePreview: () => boolean;
   followLink: (view: EditorView) => boolean;
+}
+
+/** Readable names for CodeMirror's own commands, keyed by the key they resolve to on a platform.
+ * Static on purpose: the commands' function names are minified in a production build. */
+const PASSTHROUGH_NAMES: Record<string, string> = {
+  "Mod-z": "Undo",
+  "Mod-y": "Redo",
+  "Mod-Shift-z": "Redo",
+  "Ctrl-Shift-z": "Redo",
+  "Mod-u": "Undo selection",
+  "Alt-u": "Redo selection",
+  "Mod-Shift-u": "Redo selection",
+  "Alt-ArrowLeft": "Move by syntax left",
+  "Ctrl-ArrowLeft": "Move by syntax left",
+  "Alt-ArrowRight": "Move by syntax right",
+  "Ctrl-ArrowRight": "Move by syntax right",
+  "Alt-ArrowUp": "Move line up",
+  "Shift-Alt-ArrowUp": "Copy line up",
+  "Alt-ArrowDown": "Move line down",
+  "Shift-Alt-ArrowDown": "Copy line down",
+  "Mod-Alt-ArrowUp": "Add cursor above",
+  "Mod-Alt-ArrowDown": "Add cursor below",
+  "Alt-l": "Select line",
+  "Ctrl-l": "Select line",
+  "Mod-i": "Select parent syntax",
+  "Mod-[": "Outdent line",
+  "Mod-]": "Indent line",
+  "Mod-Alt-\\": "Indent selection",
+  "Shift-Mod-k": "Delete line",
+  "Shift-Mod-\\": "Go to matching bracket",
+  "Mod-/": "Toggle line comment",
+  "Alt-A": "Toggle block comment",
+  "Ctrl-A": "Toggle block comment",
+  "Ctrl-m": "Toggle tab focus mode",
+  "Shift-Alt-m": "Toggle tab focus mode",
+  ArrowLeft: "Move cursor left",
+  ArrowRight: "Move cursor right",
+  ArrowUp: "Move cursor up",
+  ArrowDown: "Move cursor down",
+  "Mod-ArrowLeft": "Move by word left",
+  "Mod-ArrowRight": "Move by word right",
+  "Cmd-ArrowLeft": "Move to line start",
+  "Cmd-ArrowRight": "Move to line end",
+  "Cmd-ArrowUp": "Move to document start",
+  "Cmd-ArrowDown": "Move to document end",
+  "Ctrl-ArrowUp": "Move page up",
+  "Ctrl-ArrowDown": "Move page down",
+  PageUp: "Move page up",
+  PageDown: "Move page down",
+  Home: "Move to line start",
+  End: "Move to line end",
+  "Mod-Home": "Move to document start",
+  "Mod-End": "Move to document end",
+  Enter: "Insert newline",
+  "Mod-a": "Select all",
+  Backspace: "Delete character backward",
+  Delete: "Delete character forward",
+  "Mod-Backspace": "Delete word backward",
+  "Mod-Delete": "Delete word forward",
+  "Alt-Backspace": "Delete word backward",
+  "Alt-Delete": "Delete word forward",
+  "Ctrl-b": "Move cursor left",
+  "Ctrl-f": "Move cursor right",
+  "Ctrl-p": "Move cursor up",
+  "Ctrl-n": "Move cursor down",
+  "Ctrl-a": "Move to line start",
+  "Ctrl-e": "Move to line end",
+  "Ctrl-d": "Delete character forward",
+  "Ctrl-h": "Delete character backward",
+  "Ctrl-k": "Delete to line end",
+  "Ctrl-Alt-h": "Delete word backward",
+  "Ctrl-o": "Split line",
+  "Ctrl-t": "Transpose characters",
+  "Ctrl-v": "Move page down",
+};
+
+/** The palette name of a passthrough binding; `shift` names its Shift (extend-selection) variant. */
+export function passthroughName(key: string, platform: EditorPlatform, shift: boolean): string {
+  // On macOS Mod-Backspace/Delete are the line-boundary deletes; elsewhere they delete by word.
+  let name = PASSTHROUGH_NAMES[key];
+  if (platform === "mac" && key === "Mod-Backspace") name = "Delete to line start";
+  if (platform === "mac" && key === "Mod-Delete") name = "Delete to line end";
+  if (!name) return `Editor command (${key})`;
+  if (!shift) return name;
+  if (name.startsWith("Move cursor ")) return `Extend selection ${name.slice("Move cursor ".length)}`;
+  if (name.startsWith("Move to ")) return `Extend selection to ${name.slice("Move to ".length)}`;
+  if (name.startsWith("Move by ")) return `Extend selection by ${name.slice("Move by ".length)}`;
+  if (name.startsWith("Move page ")) return `Extend selection ${name.slice("Move ".length)}`;
+  return `${name} (extending selection)`;
 }
 
 function slugForKey(key: string): string {
@@ -68,7 +157,7 @@ function registerPassthrough(
       const { run } = binding;
       registry.register({
         id: base,
-        name: `Editor: ${key}`,
+        name: passthroughName(key, platform, false),
         defaultBinding: key,
         when: "editor",
         // CodeMirror's own default (false): a key the command declines
@@ -86,7 +175,7 @@ function registerPassthrough(
         const shiftRun = binding.shift;
         registry.register({
           id: `${base}-shift`,
-          name: `Editor: ${shiftKey}`,
+          name: passthroughName(key, platform, true),
           defaultBinding: shiftKey,
           when: "editor",
           preventDefault: binding.preventDefault ?? false,
@@ -132,7 +221,9 @@ export function createEditorCommandRegistry(
     id: "editor.toggle-live-preview",
     name: "Toggle live preview / split",
     defaultBinding: "Mod-Shift-m",
-    run: handlers.toggleLivePreview,
+    run: () => handlers.toggleLivePreview(),
+    // Global per components.md §7: works without editor focus and from the palette.
+    exec: () => void handlers.toggleLivePreview(),
   });
   registry.register({
     id: "editor.follow-link",
@@ -245,8 +336,9 @@ export function createEditorCommandRegistry(
  */
 export function buildEditorExtensions(
   registry: CommandRegistry,
-  overrides: ReadonlyMap<CommandId, string | null> = new Map(),
+  overrides?: ReadonlyMap<CommandId, string | null>,
 ): Extension[] {
+  // No argument: the registry's own (validated) overrides, so a TOML rebinding reaches the keymap.
   return [history(), keymap.of(registry.buildKeymap(overrides))];
 }
 

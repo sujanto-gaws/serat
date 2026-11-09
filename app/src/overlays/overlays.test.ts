@@ -321,9 +321,23 @@ describe("heading target (CRLF-safe)", () => {
     const offset = headingDocOffset(crlf, byteOf(crlf, "## Open"), "Open risks");
     expect(offset).toBe(doc.indexOf("## Open"));
   });
-  it("a stale byte_start falls back to searching for the heading, then to the note start", () => {
-    expect(headingDocOffset(lf, 2, "Open risks")).toBe(lf.indexOf("## Open"));
-    expect(headingDocOffset(lf, 2, "Gone")).toBe(0);
+  it("a byte_start on a non-heading line falls back to searching for the heading, then to the note start", () => {
+    const stale = byteOf(lf, "body");
+    expect(headingDocOffset(lf, stale, "Open risks")).toBe(lf.indexOf("## Open"));
+    expect(headingDocOffset(lf, stale, "Gone")).toBe(0);
+  });
+  it("any heading at the offset is trusted; inline markup is plain text in the index", () => {
+    const raw = "intro\n\n## **Open** [risks](x) and `code`\n";
+    const at = byteOf(raw, "## **");
+    expect(headingDocOffset(raw, at, "Open risks and code")).toBe(raw.indexOf("## **"));
+    // moved: found by its plain text even though the source has markup
+    expect(headingDocOffset(raw, 0, "Open risks and code")).toBe(raw.indexOf("## **"));
+  });
+  it("setext headings match, at the offset and by search", () => {
+    const raw = "intro\n\nOpen risks\n===========\nbody\n";
+    const at = byteOf(raw, "Open risks");
+    expect(headingDocOffset(raw, at, "Open risks")).toBe(raw.indexOf("Open risks"));
+    expect(headingDocOffset(raw, 0, "Open risks")).toBe(raw.indexOf("Open risks"));
   });
 });
 
