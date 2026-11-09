@@ -542,15 +542,19 @@ impl AppState {
         // The gate: the first paint, then the watcher (section 3.4's order). A false
         // wait on the watcher is recorded, not swallowed: the walk then starts without
         // the watcher's guarantee.
-        let gate: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            tree_gate.wait_for_first_paint(gate_timeout);
+        // Returns whether the first paint arrived: the trigger's grace for a tree is
+        // pointless when it did not (a headless run, a window that never painted).
+        let gate: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            let painted = tree_gate.wait_for_first_paint(gate_timeout);
             if !gate_latch.wait(WALK_GATE_TIMEOUT) {
                 eprintln!(
                     "serat: the watcher was not registered after {WALK_GATE_TIMEOUT:?}; \
                      the walk starts without it"
                 );
             }
+            painted
         });
+        let tree_gate_fn = Arc::clone(&gate);
 
         let notifier = Arc::new(ChangeNotifier::new(
             vault_id.clone(),
@@ -609,7 +613,9 @@ impl AppState {
             index_db: serat_index::index_path(&index_dir_for(&root)),
             index_ready: Box::new(move || matches!(ready.status().state, IndexState::Ready { .. })),
             paths: tree_paths,
-            gate: Arc::clone(&gate),
+            gate: Arc::new(move || {
+                tree_gate_fn();
+            }),
             attach: Box::new(move || tree_attach.attach_tree()),
             detach: Box::new(move || tree_detach.detach_tree()),
             claim: Box::new(move || tree_claim.claim(true)),
@@ -693,8 +699,8 @@ impl AppState {
             let spawned = std::thread::Builder::new()
                 .name("serat-open-catch-up".to_owned())
                 .spawn(move || {
-                    gate();
-                    if !claim.claim(false) {
+                    let painted = gate();
+                    if !claim.claim_standalone(painted, bench_walk) {
                         // Refused. If that is because the index was rebuilt, nothing
                         // else walks; the benchmark's `--exit-after-walk` still needs
                         // the walk mark (FR-VLT-01's baseline), so it gets a
@@ -1159,6 +1165,7 @@ impl AppState {
                 seq: args.seq,
                 corpus: crate::ipc::SwitcherCorpus::Tree,
                 items: Vec::new(),
+                discarded: false,
             },
         }
     }
@@ -3710,12 +3717,23 @@ mod tests {
             Settings::default(),
         )
         .with_walk_gate(Duration::ZERO);
+        let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&rebuilt);
+        state.events.install(move |status| {
+            if matches!(status.state, IndexState::Rebuilding { .. }) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
         state.open_vault(open_args(&dir)).expect("open");
         assert!(
             state
                 .startup
                 .wait_for_walk_complete(Duration::from_secs(20)),
             "no walk mark"
+        );
+        assert!(
+            rebuilt.load(Ordering::SeqCst),
+            "this test is about the rebuilt-index case, so a Rebuilding must have been seen"
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);

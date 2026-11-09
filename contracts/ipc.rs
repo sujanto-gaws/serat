@@ -1078,7 +1078,9 @@ pub const INDEX_CHANGED_EVENT: &str = "index://changed";
 /// before the index is `Ready` it answers from the tree's paths
 /// (`corpus: Tree`). The newest `seq` wins; `serat-app` discards an older query
 /// still waiting, and the front end drops any response whose `seq` is not its
-/// latest.
+/// latest. **An empty answer is never authoritative for a superseded `seq`:** a query
+/// discarded while it waited is answered with `discarded: true`, and the front end
+/// ignores such a response rather than painting it as "no matches".
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SwitcherQueryArgs {
@@ -1101,6 +1103,10 @@ pub struct SwitcherResults {
     pub corpus: SwitcherCorpus,
     /// Ranked, best first, one per note.
     pub items: Vec<SwitcherItem>,
+    /// The query was superseded by a newer one while it waited, and was not computed:
+    /// `items` is empty because nothing was asked, not because nothing matched. Ignore
+    /// the response.
+    pub discarded: bool,
 }
 
 /// The corpus an answer came from (goal 5).

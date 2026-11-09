@@ -275,7 +275,9 @@ export function onExternalChange(handler: (change: ExternalChange) => void): Pro
  * `switcher_query`: one call per keystroke (FR-NAV-01, NFR-PRF-06). Never rejects for
  * a reason of its own and never waits for the index: before it is `Ready` the answer
  * is built from the tree's paths (`corpus: "tree"`). A `#` switches to heading mode.
- * Drop any response whose `seq` is not the latest sent.
+ * Drop any response whose `seq` is not the latest sent, and any with `discarded: true`
+ * (the query was superseded while it waited and was not computed: its empty `items`
+ * is not "no matches").
  */
 export function switcherQuery(args: SwitcherQueryArgs): Promise<SwitcherResults> {
   return invoke("switcher_query", { args });

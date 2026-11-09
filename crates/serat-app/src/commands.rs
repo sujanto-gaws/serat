@@ -31,6 +31,8 @@ use crate::tree_stream::TreeSender;
 /// # Errors
 ///
 /// As [`AppState::open_vault`].
+// Not a granted command (the ACL test pins that); `async` because opening closes the
+// previous vault, which must never block the webview's thread.
 #[tauri::command(async)]
 pub fn open_vault(
     state: State<'_, Arc<AppState>>,

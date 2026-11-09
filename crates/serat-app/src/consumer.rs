@@ -262,6 +262,8 @@ struct Claim {
     claimed: bool,
     tree_attached: bool,
     cancelled: bool,
+    /// The trigger refused itself because a tree was attached.
+    stood_aside: bool,
 }
 
 /// How long a claimant waits for the index to settle.
@@ -270,7 +272,9 @@ pub const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// How long the application's own trigger waits, after the gate and the index have
 /// settled, for the front end's `open_tree` to arrive before walking on its own: the
 /// window is visible at about the moment the gate opens, and a front end that mounts a
-/// few hundred milliseconds later would otherwise cause a second enumeration.
+/// few hundred milliseconds later would otherwise cause a second enumeration. **When no
+/// tree mounts it adds up to this long to `t0_to_walk_complete_ms`**; it is skipped when
+/// the first paint never arrived, and when the index was rebuilt (nothing to claim).
 pub const TREE_GRACE: Duration = Duration::from_millis(750);
 
 impl OpenCatchUp {
@@ -325,7 +329,14 @@ impl OpenCatchUp {
     /// `open_tree` failed to start its thread after [`OpenCatchUp::attach_tree`]: the
     /// trigger may walk after all (if it has not already stood aside, see `claim`).
     pub fn detach_tree(&self) {
-        self.lock().tree_attached = false;
+        let mut claim = self.lock();
+        claim.tree_attached = false;
+        if claim.stood_aside && !claim.claimed {
+            eprintln!(
+                "serat: the tree's thread could not start after the open's trigger stood \
+                 aside; the open's catch-up is owed to the next open"
+            );
+        }
     }
 
     /// Whether a tree stream is attached.
@@ -339,6 +350,20 @@ impl OpenCatchUp {
     /// stands aside for a tree.
     #[must_use]
     pub fn claim(&self, from_tree: bool) -> bool {
+        self.claim_inner(from_tree, false, false)
+    }
+
+    /// The application's own trigger's claim. `painted` is whether the first paint
+    /// arrived (no paint, no tree to wait for); `bench_walk` is the benchmark's need for
+    /// a walk even when the index was rebuilt. The grace for a tree is spent only when
+    /// there is something to claim (or the benchmark needs the walk), and only after a
+    /// paint.
+    #[must_use]
+    pub fn claim_standalone(&self, painted: bool, bench_walk: bool) -> bool {
+        self.claim_inner(false, painted, bench_walk)
+    }
+
+    fn claim_inner(&self, from_tree: bool, wait_for_tree: bool, bench_walk: bool) -> bool {
         if !self.settled.wait(self.bound) {
             eprintln!(
                 "serat: the index had not settled after {:?}; no catch-up this session",
@@ -347,13 +372,21 @@ impl OpenCatchUp {
             return false;
         }
         let mut claim = self.lock();
-        if !from_tree && !claim.tree_attached && !claim.cancelled {
+        if !from_tree
+            && wait_for_tree
+            && !claim.tree_attached
+            && !claim.cancelled
+            && ((claim.ready && !claim.rebuilt) || bench_walk)
+        {
             // The grace window: the front end's tree, if it is coming, is coming now.
             claim = self
                 .attached
                 .wait_timeout_while(claim, self.grace, |c| !c.tree_attached && !c.cancelled)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+        }
+        if !from_tree && claim.tree_attached {
+            claim.stood_aside = true;
         }
         if claim.cancelled
             || claim.claimed
@@ -1060,7 +1093,17 @@ mod tests {
         // The trigger waits its grace for a tree, and walks if none comes.
         let c = OpenCatchUp::new(Duration::from_secs(5), Duration::from_millis(40));
         c.index_published(&ready);
-        assert!(c.claim(false));
+        assert!(c.claim_standalone(true, false));
+
+        // No first paint, no grace: a headless run must not pay it.
+        let c = OpenCatchUp::new(Duration::from_secs(5), Duration::from_secs(30));
+        c.index_published(&ready);
+        let started = Instant::now();
+        assert!(c.claim_standalone(false, false));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited the grace"
+        );
 
         // ...and stands aside for one that arrives within it.
         let c = Arc::new(OpenCatchUp::new(
@@ -1073,7 +1116,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(40));
             attaching.attach_tree();
         });
-        assert!(!c.claim(false));
+        assert!(!c.claim_standalone(true, false));
         late.join().expect("attach");
 
         let c = OpenCatchUp::new(Duration::from_millis(30), Duration::ZERO);

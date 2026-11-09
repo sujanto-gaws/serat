@@ -17,7 +17,11 @@
 //!   when a later arrival with a higher `seq` comes in is discarded (empty answer
 //!   carrying its own `seq`, which the front end drops anyway). Neither arrival order
 //!   alone (the commands run on a thread pool, so the newest keystroke can arrive
-//!   first) nor `seq` alone (it restarts on a webview reload) would be safe.
+//!   first) nor `seq` alone (it restarts on a webview reload) would be safe. The
+//!   answer says `discarded: true`, so the front end ignores it instead of painting
+//!   "no matches". One edge remains across a reload: a straggler from before it, still
+//!   in flight with a higher `seq`, supersedes a new low-`seq` query, which is then
+//!   answered `discarded` and repainted by the user's next keystroke.
 //! * **The frecency record** (`.serat/history.json`): read once at open, updated in
 //!   memory at once when a note is reported opened, and written [`HISTORY_DELAY`] after
 //!   the last open (and when the vault closes) through `Vault::update_history`. Losing
@@ -337,6 +341,7 @@ impl Switcher {
                 seq: args.seq,
                 corpus: source,
                 items: Vec::new(),
+                discarded: true,
             };
         }
         let history = shared
@@ -349,6 +354,7 @@ impl Switcher {
             seq: args.seq,
             corpus: source,
             items: hits.into_iter().map(item).collect(),
+            discarded: false,
         }
     }
 
@@ -599,7 +605,11 @@ mod tests {
         drop(turn);
         threads
             .into_iter()
-            .map(|t| !t.join().expect("query").items.is_empty())
+            .map(|t| {
+                let answer = t.join().expect("query");
+                assert_eq!(answer.discarded, answer.items.is_empty());
+                !answer.discarded
+            })
             .collect()
     }
 

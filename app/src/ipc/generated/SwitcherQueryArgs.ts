@@ -9,7 +9,9 @@
  * before the index is `Ready` it answers from the tree's paths
  * (`corpus: Tree`). The newest `seq` wins; `serat-app` discards an older query
  * still waiting, and the front end drops any response whose `seq` is not its
- * latest.
+ * latest. **An empty answer is never authoritative for a superseded `seq`:** a query
+ * discarded while it waited is answered with `discarded: true`, and the front end
+ * ignores such a response rather than painting it as "no matches".
  */
 export type SwitcherQueryArgs = { 
 /**
