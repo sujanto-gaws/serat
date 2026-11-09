@@ -45,6 +45,8 @@ const model = new TreeModel();
 const version = ref(0);
 const scrollTop = ref(0);
 const viewportHeight = ref(props.fallbackViewportHeight);
+const stopped = ref(false);
+let unlistenStatus: (() => void) | null = null;
 const focusedPath = ref<string | null>(null);
 const container = ref<HTMLDivElement | null>(null);
 let resizeObserver: ResizeObserver | null = null;
@@ -100,6 +102,14 @@ onMounted(() => {
     resizeObserver.observe(container.value);
   }
   void props.ipc
+    .onTreeStatus?.((status) => {
+      if (status.stopped) stopped.value = true;
+    })
+    .then((un) => {
+      unlistenStatus = un;
+    })
+    .catch(() => undefined);
+  void props.ipc
     .openTree((message) => {
       model.apply(message); // strictly in arrival order, never dropped
       bump();
@@ -107,7 +117,10 @@ onMounted(() => {
     .catch(() => undefined);
 });
 
-onBeforeUnmount(() => resizeObserver?.disconnect());
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  unlistenStatus?.();
+});
 
 function measure(): void {
   const height = container.value?.clientHeight ?? 0;
@@ -230,6 +243,9 @@ defineExpose({ model, focusTree, version });
     @scroll="onScroll"
     @keydown="onKeydown"
   >
+    <p v-if="stopped" class="serat-tree-stopped" role="status" data-testid="tree-stopped">
+      File tree stopped updating; reopen the vault.
+    </p>
     <p v-if="rootEmpty" class="serat-tree-empty">Nothing here yet — press ⌘N to start a note.</p>
     <div v-else class="serat-tree-spacer" :style="{ height: windowed.totalHeight + 'px' }">
       <div class="serat-tree-window" :style="{ transform: `translateY(${windowed.offsetTop}px)` }">
@@ -304,6 +320,11 @@ defineExpose({ model, focusTree, version });
 .serat-tree-dot {
   color: var(--brass, #c08a47);
   font-size: 0.7em;
+}
+.serat-tree-stopped {
+  padding: 0.5rem 0.75rem;
+  color: var(--serat-text-secondary, #6b7075);
+  border-bottom: 1px solid var(--serat-border-hairline, #bbb);
 }
 .serat-tree-empty {
   padding: 0.75rem;

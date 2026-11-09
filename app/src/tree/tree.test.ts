@@ -383,4 +383,41 @@ describe("FileTree component", () => {
     expect(model.listing("")?.map((e) => e.name)).toEqual(Array.from({ length: 1000 }, (_, i) => `n${String(i).padStart(4, "0")}.md`));
     wrapper.unmount();
   });
+
+  it("tree://status stopped shows the stopped notice; a live status does not (ADR-0015)", async () => {
+    const { ipc } = fakeIpc();
+    let fire: (s: { vault_id: string; stopped: boolean }) => void = () => undefined;
+    ipc.onTreeStatus = vi.fn(async (h) => {
+      fire = h;
+      return () => undefined;
+    });
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    fire({ vault_id: "v", stopped: false });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-testid="tree-stopped"]').exists()).toBe(false);
+    fire({ vault_id: "v", stopped: true });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get('[data-testid="tree-stopped"]').text()).toContain("stopped updating");
+    wrapper.unmount();
+  });
+
+  it("20k-note tree: apply + first render timing is reported and bounded", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const dirs = Array.from({ length: 200 }, (_, i) => ({ name: `d${i}`, kind: "dir" as const, sidecar: false }));
+    const t0 = Number(process.hrtime.bigint()) / 1e6;
+    push(listing("", dirs));
+    for (let i = 0; i < 200; i++) {
+      push(listing(`d${i}`, Array.from({ length: 100 }, (_, j) => note(`n${j}.md`))));
+    }
+    push({ kind: "complete", entries: 20_000, source: "walk" } as TreeMessage);
+    await wrapper.vm.$nextTick();
+    const ms = Number(process.hrtime.bigint()) / 1e6 - t0;
+    console.log(`20k-note tree applied and rendered in ${ms.toFixed(1)} ms`);
+    expect(ms).toBeLessThan(2000);
+    expect(wrapper.findAll('[role="treeitem"]').length).toBeLessThan(80);
+    wrapper.unmount();
+  });
 });

@@ -6,7 +6,7 @@
 // changes `defaultPaneIpc` alone.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { defaultLinkIpc } from "./linkAdapter";
 import type { Backlink } from "./generated/Backlink";
@@ -16,6 +16,9 @@ import type { NotePathArgs } from "./generated/NotePathArgs";
 import type { SearchArgs } from "./generated/SearchArgs";
 import type { SearchOutcome } from "./generated/SearchOutcome";
 import type { TreeMessage } from "./generated/TreeMessage";
+import type { TreeStatus } from "./generated/TreeStatus";
+
+export const TREE_STATUS_EVENT = "tree://status";
 
 export interface PaneIpcAdapter {
   /**
@@ -31,6 +34,8 @@ export interface PaneIpcAdapter {
   backlinks(args: NotePathArgs): Promise<IndexRead<Backlink[]>>;
   /** `index://changed`: invalidation only. */
   onIndexChanged(handler: () => void): Promise<UnlistenFn>;
+  /** `tree://status`: the stream gave up (ADR-0015). Optional so existing fakes stay valid. */
+  onTreeStatus?(handler: (status: TreeStatus) => void): Promise<UnlistenFn>;
 }
 
 export const defaultPaneIpc: PaneIpcAdapter = {
@@ -50,5 +55,8 @@ export const defaultPaneIpc: PaneIpcAdapter = {
   },
   onIndexChanged(handler) {
     return defaultLinkIpc.onIndexChanged(() => handler());
+  },
+  onTreeStatus(handler) {
+    return listen<TreeStatus>(TREE_STATUS_EVENT, (event) => handler(event.payload));
   },
 };
