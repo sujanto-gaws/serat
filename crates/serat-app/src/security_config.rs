@@ -193,6 +193,7 @@ mod tests {
             "allow-read-asset-range",
             "allow-read-file",
             "allow-rebase-buffer",
+            "allow-flush-ack",
             "allow-refused-names",
             "allow-request-external-diff",
             "allow-save-patch",

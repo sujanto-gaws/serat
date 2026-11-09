@@ -65,7 +65,7 @@
 //! | File tree | `open_tree` + `Channel<TreeMessage>` (streaming), `mark_tree` | ADR-0015, §3.5 |
 //! | Creating notes and folders | `write_file` with `base_hash: None` (a note), `create_folder` (a folder) | FR-VLT-11, ADR-0016, T-07 |
 //! | Choosing a vault | `choose_vault` (native dialog, no path parameter) | T-08 |
-//! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change` | ADR-0016, §3.3 |
+//! | Editor buffers | `note_opened`, `note_closed`, `save_patch`, `request_external_diff`, `rebase_buffer`, event `note://external-change`, `flush_ack` + event `app://closing` (bounded flush before close) | ADR-0016, §3.3 |
 //! | Invalidation | event `index://changed` (throttled, invalidation only) | §3.1 step 6 |
 //! | Switcher + link completion | `switcher_query` | §9.2 |
 //! | Search, property lookup | `search` | §4.5 R1/R3 |
@@ -279,8 +279,9 @@ pub struct FileWritten {
     /// BLAKE3 of what is now on disk, lowercase hex. The caller keeps it as the
     /// next `base_hash`.
     pub hash: String,
-    /// Filesystem mtime after the write, unix milliseconds. See
-    /// `FileContents::mtime_ms`.
+    /// Filesystem mtime of the written bytes, unix milliseconds, taken before the
+    /// rename and so never newer than `hash` describes (ADR-0015 section 2). See
+    /// `FileContents::mtime_ms`. `0` means unknown: treat the file as changed.
     #[ts(type = "number")]
     pub mtime_ms: i64,
     /// Byte length after the write.
@@ -1065,6 +1066,47 @@ pub struct IndexChanged {
 
 /// The invalidation event name.
 pub const INDEX_CHANGED_EVENT: &str = "index://changed";
+
+// ---------------------------------------------------------------------------
+// Bounded flush before close (NFR-REL-01, ADR-0016 §2)
+// ---------------------------------------------------------------------------
+
+/// Event `app://closing`: the open vault is about to be closed (the window was asked
+/// to close, or another vault is being opened). The editor flushes its pending patch
+/// set with `save_patch` and then calls `flush_ack`. `save_patch` and `write_file`
+/// are still accepted until the ack arrives or `deadline_ms` has passed; after that
+/// the vault is closed and they answer `VaultNotFound`. Emitted once per close, and only
+/// when a note is open in the editor (otherwise there is nothing to flush).
+///
+/// Serves NFR-REL-01, FR-EDT-01, US-35.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AppClosing {
+    /// The vault being closed; echo it in `flush_ack`.
+    pub vault_id: String,
+    /// How long `serat-app` waits for the ack before closing anyway.
+    #[ts(type = "number")]
+    pub deadline_ms: u64,
+}
+
+/// Arguments to `flush_ack`.
+///
+/// `flush_ack(args: FlushAckArgs) -> ()`
+///
+/// "Everything I had pending is submitted (or I had nothing)." Ends the wait early.
+/// An ack for a vault that is not closing is ignored. Never fails. Serves NFR-SEC-06.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FlushAckArgs {
+    /// The `vault_id` from `app://closing`.
+    pub vault_id: String,
+}
+
+/// The closing event name.
+pub const APP_CLOSING_EVENT: &str = "app://closing";
+
+/// The bound on the wait for `flush_ack`, in milliseconds.
+pub const CLOSING_FLUSH_DEADLINE_MS: u64 = 2000;
 
 // ---------------------------------------------------------------------------
 // Quick switcher and link completion (§9.2, §9.3)

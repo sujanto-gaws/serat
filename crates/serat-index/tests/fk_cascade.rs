@@ -23,8 +23,8 @@ fn fixture() -> Connection {
     schema::bootstrap(&conn).expect("bootstrap");
     conn.execute_batch(
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
-         INSERT INTO notes(id, path, kind, mtime, hash)
-           SELECT i, 'n' || i || '.md', 'note', 0, 'h' FROM n;
+         INSERT INTO notes(id, path, kind, mtime, size, hash)
+           SELECT i, 'n' || i || '.md', 'note', 0, 0, 'h' FROM n;
          WITH RECURSIVE b(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM b WHERE i < 780)
          INSERT INTO blocks(id, note_id, ord, kind, text)
            SELECT i, (i - 1) / 13 + 1, (i - 1) % 13, 'para', 't' FROM b;

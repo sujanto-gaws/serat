@@ -51,6 +51,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use serat_core::verbatim::strip_verbatim;
 use serat_core::{
     ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, Platform, VaultError, VaultPath,
 };
@@ -75,6 +76,20 @@ pub enum Expect {
     Absent,
     /// The file must exist with this content hash (an overwrite of a known base).
     Hash(ContentHash),
+}
+
+/// What a write returns: the hash of the bytes written and the mtime the file had
+/// when it was renamed in (ADR-0015 §2: a recorded mtime must not be newer than the
+/// bytes its hash describes, so the two come from the same moment, not a later read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Written {
+    /// BLAKE3 of the bytes written.
+    pub hash: ContentHash,
+    /// Unix milliseconds, from the temp file's handle before the rename (which preserves
+    /// it), so it never postdates our bytes.
+    pub mtime_ms: i64,
+    /// Length of the bytes written.
+    pub size: u64,
 }
 
 /// An open vault: a root directory, and the rules for what inside it counts.
@@ -437,6 +452,7 @@ impl Vault {
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
         self.write_atomic_hooked(path, bytes, None, || {})
+            .map(|written| written.hash)
     }
 
     /// [`Vault::write_atomic`] guarded by what the caller believes is on disk, checked
@@ -456,7 +472,7 @@ impl Vault {
         path: &VaultPath,
         expect: Expect,
         bytes: &[u8],
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
         self.write_atomic_hooked(path, bytes, Some(expect), || {})
     }
 
@@ -468,7 +484,21 @@ impl Vault {
         bytes: &[u8],
         expect: Option<Expect>,
         before_rename: impl FnOnce(),
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
+        self.write_atomic_seams(path, bytes, expect, before_rename, || {})
+    }
+
+    /// [`Vault::write_atomic_hooked`] plus `after_commit`, which runs right after the rename:
+    /// where a test lands an external write to prove the returned mtime is the one
+    /// the bytes carried into place.
+    fn write_atomic_seams(
+        &self,
+        path: &VaultPath,
+        bytes: &[u8],
+        expect: Option<Expect>,
+        before_rename: impl FnOnce(),
+        after_commit: impl FnOnce(),
+    ) -> Result<Written, VaultError> {
         // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
         // rewritten. The threat model's stated mechanism is that no write path accepts
         // a non-Markdown target, so the refusal belongs here — in the one function that
@@ -546,12 +576,20 @@ impl Vault {
         // mode; on Windows only the read-only flag exists to carry.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
-            .map_err(|err| failed(err.to_string()))?;
+        let (temp, mtime_ms) =
+            atomic::write_temp(parent, path.file_name(), bytes, existing_permissions)
+                .map_err(|err| failed(err.to_string()))?;
         before_rename();
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        Ok(hash)
+        // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
+        // no stat of the target here, so an external write cannot be paired with our hash.
+        after_commit();
+        Ok(Written {
+            hash,
+            mtime_ms,
+            size: bytes.len() as u64,
+        })
     }
 
     /// Apply a patch set against `base_hash` and write the result, atomically
@@ -594,7 +632,7 @@ impl Vault {
         path: &VaultPath,
         base_hash: ContentHash,
         edits: &[patch::Edit],
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
         self.write_patch_hooked(path, base_hash, edits, || {}, || {})
     }
 
@@ -608,7 +646,20 @@ impl Vault {
         edits: &[patch::Edit],
         before_rehash: impl FnOnce(),
         before_rename: impl FnOnce(),
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
+        self.write_patch_seams(path, base_hash, edits, before_rehash, before_rename, || {})
+    }
+
+    /// [`Vault::write_patch_hooked`] plus `after_commit` (see `write_atomic_seams`).
+    fn write_patch_seams(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        before_rehash: impl FnOnce(),
+        before_rename: impl FnOnce(),
+        after_commit: impl FnOnce(),
+    ) -> Result<Written, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
                 path: path.as_str().to_owned(),
@@ -662,8 +713,9 @@ impl Vault {
         // permissions.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
-        let temp = atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
-            .map_err(|err| failed(err.to_string()))?;
+        let (temp, mtime_ms) =
+            atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
+                .map_err(|err| failed(err.to_string()))?;
 
         before_rehash();
 
@@ -687,7 +739,14 @@ impl Vault {
 
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        Ok(new_hash)
+        // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
+        // no stat of the target here, so an external write cannot be paired with our hash.
+        after_commit();
+        Ok(Written {
+            hash: new_hash,
+            mtime_ms,
+            size: new_bytes.len() as u64,
+        })
     }
 
     /// The edit script from `base` to the file as it is on disk now, in `base`'s
@@ -730,14 +789,6 @@ impl EchoGuard for Vault {
     fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
         self.echo.record(path, hash);
     }
-}
-
-/// Windows canonicalisation returns `\\?\D:\...`; every path we compare against and
-/// every path we show a user is the plain form.
-fn strip_verbatim(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    text.strip_prefix(r"\\?\")
-        .map_or_else(|| path.to_path_buf(), PathBuf::from)
 }
 
 /// A path for an error message. Lossy on purpose: a path we cannot render is
@@ -1169,7 +1220,7 @@ mod tests {
                 position::Position::new(0, 4 * 1024 * 1024),
                 replacement.to_string().repeat(4 * 1024 * 1024),
             )];
-            hash = vault.write_patch(&path, hash, &edits).expect("patch");
+            hash = vault.write_patch(&path, hash, &edits).expect("patch").hash;
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().expect("reader");

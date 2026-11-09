@@ -37,6 +37,20 @@ fn nudge(root: &Path, relative: &str, seconds: u64) {
         .expect("set mtime");
 }
 
+fn now() -> i64 {
+    serat_index::rebuild::now_ms()
+}
+
+/// Put a file's mtime an hour in the past: outside any catch-up window.
+fn backdate(root: &Path, relative: &str) {
+    let file = fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .expect("open");
+    file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .expect("set mtime");
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -52,6 +66,9 @@ fn fixture() -> Fixture {
     write(&root, "a.md", "# A\nalpha\n");
     write(&root, "b.md", "# B\nbeta\n");
     write(&root, "folder/c.md", "# C\ngamma\n");
+    for name in ["a.md", "b.md", "folder/c.md"] {
+        backdate(&root, name);
+    }
     let parser = LineParser::default();
     rebuild(&DiskVault::new(&root), &parser, &root, &index).expect("rebuild");
     Fixture {
@@ -234,6 +251,7 @@ fn a_deleted_directory_takes_what_the_index_held_beneath_it() {
             &f.parser,
             &walk(&f.root),
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
     assert!(paths_in(&f.index).contains(&"folder/deep/d.md".to_owned()));
@@ -303,7 +321,13 @@ fn reconciling_a_directory_does_not_touch_a_sibling_with_a_similar_name() {
     let reconciler = Reconciler::new(&handle);
     let source = DiskVault::new(&f.root);
     reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
 
     // folder/ is now empty on disk; folder-2/x.md must survive reconciling it.
@@ -333,6 +357,7 @@ fn catch_up_submits_what_the_index_lacks_and_removes_what_the_disk_lacks() {
             &f.parser,
             &walk(&f.root),
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
 
@@ -364,6 +389,7 @@ fn a_clean_close_followed_by_an_external_edit_is_reindexed_at_the_next_open() {
             &f.parser,
             &walk(&f.root),
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
     assert_eq!(outcome.upserted, 1);
@@ -377,7 +403,7 @@ fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed
     let handle = IndexHandle::open(&f.index).expect("open");
     let reconciler = Reconciler::new(&handle);
     let source = DiskVault::new(&f.root);
-    nudge(&f.root, "a.md", 300); // touched, same bytes
+    backdate_by(&f.root, "a.md", 1800); // touched, same bytes, an old mtime outside any window
     let moved = walk(&f.root)
         .into_iter()
         .find(|entry| entry.path.as_str() == "a.md")
@@ -387,7 +413,13 @@ fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed
     let parsed_before = f.parser.calls.load(Ordering::Relaxed);
 
     let outcome = reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
 
     assert_eq!(
@@ -399,7 +431,13 @@ fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed
 
     // The next comparison does not read the file again.
     let again = reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
     assert_eq!(again, Outcome::default());
     handle.close().expect("close");
@@ -442,6 +480,7 @@ fn touched_mtimes_leave_the_index_equal_to_a_fresh_rebuild() {
             &f.parser,
             &walk(&f.root),
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
     assert_eq!((outcome.upserted, outcome.touched), (0, 3));
@@ -449,13 +488,15 @@ fn touched_mtimes_leave_the_index_equal_to_a_fresh_rebuild() {
 
     let fresh = f._dir.path().join("fresh");
     rebuild(&DiskVault::new(&f.root), &f.parser, &f.root, &fresh).expect("rebuild");
-    let snapshot = |index: &Path| -> Vec<(String, String, i64)> {
+    let snapshot = |index: &Path| -> Vec<(String, String, i64, i64)> {
         let conn = schema::open(&serat_index::index_path(index)).expect("open");
         let mut statement = conn
-            .prepare("SELECT path, hash, mtime FROM notes ORDER BY path")
+            .prepare("SELECT path, hash, mtime, size FROM notes ORDER BY path")
             .expect("prepare");
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .expect("query")
             .map(|row| row.expect("row"))
             .collect()
@@ -496,7 +537,13 @@ fn a_row_holding_an_old_mtime_beside_the_new_hash_is_caught_by_the_next_catch_up
 
     let parsed_before = f.parser.calls.load(Ordering::Relaxed);
     let outcome = reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
     // Same content, so no parse; the row's mtime is brought up to the file's.
     assert_eq!((outcome.upserted, outcome.touched), (0, 1));
@@ -521,6 +568,7 @@ fn only_files_whose_mtime_moved_are_hashed_and_only_changed_content_is_parsed() 
             &f.parser,
             &walk(&f.root),
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
 
@@ -664,7 +712,13 @@ fn a_commit_lost_after_the_marker_cleared_is_recovered_by_the_mtime_catch_up() {
 
     // The mtime comparison finds the stale row and fixes it:
     let outcome = reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
     assert_eq!(outcome.upserted, 1);
     assert_eq!(hash_of(&f.index, "a.md").expect("row"), committed);
@@ -1003,7 +1057,13 @@ fn a_save_during_a_large_catch_up_is_accepted_not_refused() {
     let entries = walk(&f.root);
 
     reconciler
-        .catch_up(&source, &f.parser, &entries, CatchUp::PathsAndMtime)
+        .catch_up(
+            &source,
+            &f.parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
         .expect("catch up");
 
     let saves = source.saves.load(Ordering::Relaxed);
@@ -1121,6 +1181,7 @@ fn a_catch_up_counts_a_file_that_exists_but_cannot_be_read() {
             &f.parser,
             &entries,
             CatchUp::PathsAndMtime,
+            Some(now()),
         )
         .expect("catch up");
     assert_eq!(outcome.unreadable, 1);
@@ -1142,4 +1203,302 @@ impl serat_core::NoteSource for DeniedSource {
             message: "permission denied".to_owned(),
         })
     }
+}
+
+// ---- task #66: size and the catch-up window (ADR-0015 section 2 as amended) ----------
+
+fn disk_mtime(root: &Path, relative: &str) -> SystemTime {
+    fs::metadata(root.join(relative))
+        .expect("stat")
+        .modified()
+        .expect("mtime")
+}
+
+/// Rewrite a file and put its mtime back to `mtime`, as a coarse-mtime filesystem would.
+fn rewrite_keeping_mtime(root: &Path, relative: &str, body: &str, mtime: SystemTime) {
+    write(root, relative, body);
+    fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .expect("open")
+        .set_modified(mtime)
+        .expect("set mtime");
+}
+
+fn size_of(index: &Path, relative: &str) -> i64 {
+    let conn = schema::open(&serat_index::index_path(index)).expect("open");
+    conn.query_row(
+        "SELECT size FROM notes WHERE path = ?1",
+        [relative],
+        |row| row.get(0),
+    )
+    .expect("row")
+}
+
+fn run_catch_up(f: &Fixture, handle: &IndexHandle, started_at_ms: i64) -> Outcome {
+    Reconciler::new(handle)
+        .catch_up(
+            &DiskVault::new(&f.root),
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(started_at_ms),
+        )
+        .expect("catch up")
+}
+
+#[test]
+fn rows_carry_the_size_of_the_file_they_were_built_from() {
+    let f = fixture();
+    assert_eq!(size_of(&f.index, "a.md"), "# A\nalpha\n".len() as i64);
+}
+
+#[test]
+fn a_same_mtime_rewrite_of_a_different_size_is_reindexed() {
+    let f = fixture();
+    let old = disk_mtime(&f.root, "a.md");
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let before = hash_of(&f.index, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nalpha, and then some\n", old);
+
+    let outcome = run_catch_up(&f, &handle, now());
+
+    assert_eq!(outcome.upserted, 1, "{outcome:?}");
+    assert_ne!(hash_of(&f.index, "a.md"), before);
+    assert_eq!(
+        size_of(&f.index, "a.md"),
+        "# A\nalpha, and then some\n".len() as i64
+    );
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_same_mtime_same_size_rewrite_inside_the_window_is_reindexed() {
+    // Files stamped now, then indexed: the rebuild's window starts at its walk, so the
+    // stamp is inside it. A rewrite of the same length that keeps the stamp is the case
+    // a 2 s mtime tick produces.
+    let dir = tempfile::tempdir().expect("temp");
+    let root = dir.path().join("vault");
+    let index = dir.path().join("index");
+    write(&root, "a.md", "# A\nalpha\n");
+    let stamp = SystemTime::now();
+    fs::File::options()
+        .write(true)
+        .open(root.join("a.md"))
+        .expect("open")
+        .set_modified(stamp)
+        .expect("set mtime");
+    let parser = LineParser::default();
+    rebuild(&DiskVault::new(&root), &parser, &root, &index).expect("rebuild");
+    let handle = IndexHandle::open(&index).expect("open");
+    let before = hash_of(&index, "a.md");
+    rewrite_keeping_mtime(&root, "a.md", "# A\nalphb\n", stamp);
+    let entries = walk(&root);
+    assert_eq!(
+        entries[0].size,
+        u64::try_from(size_of(&index, "a.md")).expect("size")
+    );
+
+    let outcome = Reconciler::new(&handle)
+        .catch_up(
+            &DiskVault::new(&root),
+            &parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
+        .expect("catch up");
+
+    assert_eq!(outcome.upserted, 1, "{outcome:?}");
+    assert_ne!(hash_of(&index, "a.md"), before);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_same_mtime_same_size_rewrite_outside_the_window_is_not_seen() {
+    // The documented residual (ADR-0015 section 2 as amended, A-03): nothing but the
+    // watcher could have told us.
+    let f = fixture();
+    let old = disk_mtime(&f.root, "a.md");
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let before = hash_of(&f.index, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nalphb\n", old);
+
+    let outcome = run_catch_up(&f, &handle, now());
+
+    assert_eq!(outcome, Outcome::default());
+    assert_eq!(hash_of(&f.index, "a.md"), before);
+    handle.close().expect("close");
+}
+
+#[test]
+fn the_window_advances_when_a_catch_up_completes_and_not_for_a_compare_only_run() {
+    // That an unfinished catch-up leaves it alone is the unit test in external.rs
+    // (it needs the writer's fault injector).
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let from_rebuild = handle.caught_up_from_ms().expect("value");
+    assert!(from_rebuild > 0, "a finished rebuild writes it");
+
+    // `None` is a rescan: compare, never write.
+    Reconciler::new(&handle)
+        .catch_up(
+            &DiskVault::new(&f.root),
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            None,
+        )
+        .expect("catch up");
+    assert_eq!(handle.caught_up_from_ms().expect("value"), from_rebuild);
+
+    let started = from_rebuild + 10_000;
+    run_catch_up(&f, &handle, started);
+    assert_eq!(handle.caught_up_from_ms().expect("value"), started);
+    handle.close().expect("close");
+}
+
+/// A source whose `load` fails (not NotFound) for the named paths.
+struct FlakySource {
+    inner: DiskVault,
+    failing: Vec<&'static str>,
+}
+
+impl serat_core::NoteSource for FlakySource {
+    fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+        self.inner.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        if self.failing.contains(&path.as_str()) {
+            return Err(serat_core::VaultError::Io {
+                path: path.as_str().to_owned(),
+                message: "sharing violation".to_owned(),
+            });
+        }
+        self.inner.load(path)
+    }
+}
+
+#[test]
+fn a_catch_up_that_could_not_read_a_file_does_not_move_the_window_past_it() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    // A same-size rewrite that kept its mtime: only the window can make it a candidate.
+    let kept = disk_mtime(&f.root, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nomega\n", kept);
+    assert_eq!(size_of(&f.index, "a.md"), 10);
+    let m = mtime_of(&f.index, "a.md");
+    handle.writer().set_caught_up_from(m).expect("window");
+
+    let flaky = FlakySource {
+        inner: DiskVault::new(&f.root),
+        failing: vec!["a.md"],
+    };
+    let reconciler = Reconciler::new(&handle);
+    let outcome = reconciler
+        .catch_up(
+            &flaky,
+            &f.parser,
+            &walk(&f.root),
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
+        .expect("catch up");
+    assert_eq!(outcome.unreadable, 1);
+    let window = handle.caught_up_from_ms().expect("value");
+    assert!(
+        window <= m,
+        "the window {window} moved past the unread file at {m}"
+    );
+
+    // The next catch-up, with the file readable, re-hashes it.
+    let outcome = run_catch_up(&f, &handle, now());
+    assert_eq!(outcome.upserted, 1, "the missed rewrite is found");
+    assert!(handle.caught_up_from_ms().expect("value") > m);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_rebuild_records_the_time_its_walk_began() {
+    let dir = tempfile::tempdir().expect("temp");
+    let root = dir.path().join("vault");
+    let index = dir.path().join("index");
+    write(&root, "a.md", "# A\n");
+    let before = now();
+    rebuild(
+        &DiskVault::new(&root),
+        &LineParser::default(),
+        &root,
+        &index,
+    )
+    .expect("rebuild");
+    let after = now();
+    let handle = IndexHandle::open(&index).expect("open");
+    let value = handle.caught_up_from_ms().expect("value");
+    assert!(
+        (before..=after).contains(&value),
+        "{before} {value} {after}"
+    );
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_fresh_index_has_no_window_so_everything_is_a_candidate() {
+    let dir = tempfile::tempdir().expect("temp");
+    let handle = IndexHandle::open(&dir.path().join("index")).expect("open");
+    assert_eq!(handle.caught_up_from_ms().expect("value"), 0);
+    handle.close().expect("close");
+}
+
+#[test]
+fn window_zero_makes_a_same_mtime_same_size_rewrite_a_candidate() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    handle.writer().set_caught_up_from(0).expect("window");
+    let kept = disk_mtime(&f.root, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nomega\n", kept);
+    let outcome = run_catch_up(&f, &handle, now());
+    assert_eq!(outcome.upserted, 1);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_window_ahead_of_the_clock_is_ignored() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    handle
+        .writer()
+        .set_caught_up_from(now() + 3_600_000)
+        .expect("window");
+    let kept = disk_mtime(&f.root, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nomega\n", kept);
+    let outcome = run_catch_up(&f, &handle, now());
+    assert_eq!(outcome.upserted, 1);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_future_mtime_with_unchanged_bytes_is_read_and_not_parsed_every_catch_up() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    nudge(&f.root, "a.md", 3600);
+    run_catch_up(&f, &handle, now());
+    let parsed = f.parser.calls.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        let outcome = run_catch_up(&f, &handle, now());
+        assert_eq!((outcome.unchanged, outcome.upserted), (1, 0));
+    }
+    assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed, "no parse");
+    handle.close().expect("close");
+}
+
+/// Set a file's mtime `seconds` in the past (a sync tool restoring an old stamp).
+fn backdate_by(root: &Path, relative: &str, seconds: u64) {
+    fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .expect("open")
+        .set_modified(SystemTime::now() - Duration::from_secs(seconds))
+        .expect("set mtime");
 }

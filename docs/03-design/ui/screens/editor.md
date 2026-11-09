@@ -1,6 +1,6 @@
 # Screen: Editor — hybrid live preview and split-preview fallback
 
-Serves: FR-EDT-01, FR-EDT-02, FR-EDT-03, FR-EDT-10, FR-NAV-06, NFR-PRF-02, NFR-CMP-01 · US-02, US-03, US-08
+Serves: FR-EDT-01, FR-EDT-02, FR-EDT-03, FR-EDT-10, FR-NAV-06, NFR-PRF-02, NFR-CMP-01 · US-02, US-03, US-08, US-35
 Design basis: architecture.md §9.3, ADR-0006 (CodeMirror 6 decorations), ADR-0016 (patch saves, coordinates), §3.3 (reconciliation)
 
 ## Layout
@@ -75,6 +75,17 @@ No state in this sequence is a spinner or a toast that disappears before it's re
 | Normal | As above, both panes live. |
 | Preview render fails (malformed sanitiser input, degenerate document) | Preview pane shows a plain-language message ("This note couldn't be rendered — the source is unaffected") in place of the broken render; source pane is completely unaffected and remains fully editable, which is the whole reason FR-EDT-10 exists. |
 | Very large note (5,000+ lines) | Preview chunks its render (§9.3); a thin brass progress rule at the top of the preview pane only, never blocking the source pane. |
+
+## Scrolling (both modes)
+
+Ratified by architect from #42 (`task/p1-42-prf02-stalls` @ `be0724a`), which introduced both behaviours without a spec. Serves FR-EDT-01, NFR-PRF-02 · US-35. Design basis: architecture.md §9.3, *Headless observation: the end-of-document stall*.
+
+- **The editor column owns the scroll. The page never scrolls.** `#app` is bounded to the window, so the title bar, the tab strip and the status strip stay in place at any note length. The editor scrolls inside CodeMirror's own scroller, and the tree and context panes each scroll themselves. A 5,000-line note never makes the window taller than the window. This is the fix for a real defect: the page used to grow to the note's height, the title bar and status strip scrolled away, and the file tree's virtual window rendered thousands of rows (architecture.md §9.3).
+- **Scroll past end.** The last line can be scrolled up to the top of the editor, with empty space below it. Writing at the end of a note then happens at a comfortable eye height instead of against the bottom edge of the window. The empty space is not part of the document, and it is never saved.
+- **Scroll margins around the caret: 24 px above, 48 px below.** When the caret moves or text is typed, the editor scrolls just enough to keep the caret line at least 24 px from the top edge and 48 px from the bottom edge. The caret line is therefore never flush with an edge, and the next line is always partly in view while writing. The bottom margin is the larger one because writing moves downward.
+- **Why, in two parts.** The first is reading comfort, as above. The second is measured. On headless Chromium 153, typing with the caret line flush against the scroller's bottom edge stalled presentation for seconds, and these two behaviours together clear it. So they are **load-bearing for NFR-PRF-02's headless measurement, and not only a UX choice**. Removing either one, or changing a margin value, is a change to that measurement as well as to this screen. It needs the end-of-document scenario re-run and architecture.md §9.3 updated in the same change.
+- **Open for frontend-designer.** 24 px is `space.7`. **48 px is not on the `space` scale**, which has 40 px (`space.9`) and 56 px (`space.10`). If frontend-designer wants a token value instead, either is acceptable on design grounds. The figure that was measured is 48 px, though, so the change must come with a re-run of the end/strict scenario per the bullet above. Until then 48 px stands.
+- Scroll is never animated by these rules. They adjust the scroll position in the same frame as the edit that moved the caret (§9.3's frame budget), so a keystroke never waits on a scroll transition.
 
 ## Keyboard map (both modes)
 

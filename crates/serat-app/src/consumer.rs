@@ -36,7 +36,7 @@
 //! a file that was created is re-added and a file that was deleted is removed again.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -427,6 +427,10 @@ pub struct Indexer {
     journal: Mutex<Option<Journal>>,
     /// The vault is closing: reconciliation reads are refused ([`Stoppable`]).
     stop: AtomicBool,
+    /// Wall-clock ms taken as the open's walk began (task #66); the catch-up records it
+    /// as `caught_up_from_ms` when it completes. 0 until a walk has started, which makes
+    /// the next catch-up hash every file: conservative, never wrong.
+    walk_started_ms: AtomicI64,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -446,6 +450,7 @@ impl Indexer {
             deferred: Mutex::new(Deferred::default()),
             journal: Mutex::new(None),
             stop: AtomicBool::new(false),
+            walk_started_ms: AtomicI64::new(0),
         }
     }
 
@@ -588,6 +593,9 @@ impl Indexer {
                     &parser,
                     &entries,
                     CatchUp::PathsAndMtime,
+                    // Compare only: ADR-0015 section 2 lets the open-time catch-up and a
+                    // finished rebuild move the window, nothing else.
+                    None,
                 ));
             }
             Err(_) => self.deferred().rescan = true,
@@ -636,7 +644,16 @@ impl Indexer {
 
     /// The open's authoritative walk is about to start: journal what the consumer
     /// handles until the catch-up has finished.
+    ///
+    /// The interim timestamp (task #66) is taken here, after the watcher was armed and
+    /// not before the walk's first stat. That is still sound: a write between arming
+    /// and this stamp is seen by the watcher and enumerated by the walk that follows; a
+    /// file whose mtime equals the stamp was indexed inside the old window. The #18c
+    /// follow-up captures `now_ms()` immediately before `VaultThread::spawn_with`
+    /// (state.rs), which closes the remaining gap.
     pub fn walk_started(&self) {
+        self.walk_started_ms
+            .store(serat_index::rebuild::now_ms(), Ordering::SeqCst);
         *self.journal() = Some(Journal::default());
     }
 
@@ -674,7 +691,13 @@ impl Indexer {
         if self.unclean() {
             eprintln!("serat: the previous session did not close cleanly; comparing mtimes");
         }
-        self.settle(reconciler.catch_up(&self.source(), &parser, entries, CatchUp::PathsAndMtime));
+        self.settle(reconciler.catch_up(
+            &self.source(),
+            &parser,
+            entries,
+            CatchUp::PathsAndMtime,
+            Some(self.walk_started_ms.load(Ordering::SeqCst)),
+        ));
         self.replay_journal(&reconciler);
     }
 
@@ -1029,14 +1052,31 @@ mod tests {
         indexer.stop();
         let reconciler = indexer.reconciler().expect("handle");
         let parser = CommonMarkParser::new();
+        let entries = walk(&indexer);
+        let oldest = entries.iter().map(|e| e.mtime_ms).min().expect("files");
         let outcome = reconciler
             .catch_up(
                 &indexer.source(),
                 &parser,
-                &walk(&indexer),
+                &entries,
                 CatchUp::PathsAndMtime,
+                Some(serat_index::rebuild::now_ms()),
             )
             .expect("catch-up");
+        // Every load failed, so the window may not move past any file's mtime: a file
+        // the catch-up never read must stay a candidate for the next one (task #66).
+        let window = indexer
+            .slot
+            .lock()
+            .expect("slot")
+            .as_ref()
+            .expect("handle")
+            .caught_up_from_ms()
+            .expect("window");
+        assert!(
+            window <= oldest,
+            "window {window} passed an unread file at {oldest}"
+        );
         assert_eq!(outcome.removed, 0, "nothing removed");
         assert_eq!(outcome.upserted, 0, "nothing read, so nothing submitted");
         let by_path = reconciler

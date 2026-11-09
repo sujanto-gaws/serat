@@ -78,7 +78,7 @@ impl Snapshot {
         Self {
             notes: rows(
                 &conn,
-                "SELECT path, file_name, title, type, kind, hash
+                "SELECT path, file_name, title, type, kind, hash, size, mtime
                    FROM notes
                   ORDER BY path",
             ),

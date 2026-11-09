@@ -31,7 +31,9 @@ fn temp_name(parent: &Path, file_name: &str) -> PathBuf {
 
 /// Create `temp` exclusively (`O_EXCL`, which does not follow a symlink) and write it
 /// durably. Fails with `AlreadyExists` if anything, a symlink included, is at that name.
-pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Returns the mtime (unix ms) of the open handle after the final sync: the mtime these
+/// bytes carry, which a rename preserves (ADR-0015 section 2).
+pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<i64> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -39,10 +41,15 @@ pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<()> 
     file.write_all(bytes)?;
     // Flush before the rename. Without this the rename can be durable while the
     // contents are not, which turns a power cut into a note full of zeroes.
-    file.sync_all()
+    file.sync_all()?;
+    Ok(crate::walk::mtime_ms(&file.metadata()?))
 }
 
-/// Write `bytes` to a new temp file in `parent` and return its path.
+/// Write `bytes` to a new temp file in `parent` and return its path and the mtime (unix
+/// ms) of the bytes, taken from the open handle before any rename. Rename preserves
+/// mtime (POSIX `rename`, Windows `MoveFileEx`), so this mtime always predates the
+/// moment our bytes became visible under the target name: a later external write can
+/// only carry a later-or-equal mtime, never be mistaken for ours (ADR-0015 section 2).
 ///
 /// When `permissions` is given the temp file gets them (F-33): a temp-and-rename write
 /// creates a new file, and a new file would otherwise publish a note the user made
@@ -53,19 +60,19 @@ pub(crate) fn write_temp(
     file_name: &str,
     bytes: &[u8],
     permissions: Option<fs::Permissions>,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, i64)> {
     let mut last = None;
     for _ in 0..NAME_ATTEMPTS {
         let temp = temp_name(parent, file_name);
         match write_exclusive(&temp, bytes) {
-            Ok(()) => {
+            Ok(mtime_ms) => {
                 if let Some(permissions) = permissions
                     && let Err(err) = fs::set_permissions(&temp, permissions)
                 {
                     let _ = fs::remove_file(&temp);
                     return Err(err);
                 }
-                return Ok(temp);
+                return Ok((temp, mtime_ms));
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
             Err(err) => {

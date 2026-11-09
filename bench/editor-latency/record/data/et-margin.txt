@@ -1,0 +1,12 @@
+pos.json     keys 297  noEntry(on time by absence) 190  withEntry 107  ETend-D over entry-bearing keys: min -16.2 p10 -15.1 p50 -11.7 p90 -10.1 p99  -6.3 max  -5.3
+posj.json    keys 297  noEntry(on time by absence) 185  withEntry 112  ETend-D over entry-bearing keys: min -16.0 p10 -15.2 p50 -12.7 p90 -10.2 p99  -7.9 max  -7.0
+neg.json     keys  97  noEntry(on time by absence)   0  withEntry  97  ETend-D over entry-bearing keys: min   7.9 p10   9.7 p50  16.0 p90  23.9 p99  31.9 max  31.9
+negj.json    keys  97  noEntry(on time by absence)   0  withEntry  97  ETend-D over entry-bearing keys: min   8.1 p10   8.8 p50  16.6 p90  23.0 p99  24.7 max  24.7
+gr1.json     keys 197  noEntry(on time by absence)   0  withEntry 197  ETend-D over entry-bearing keys: min  -7.9 p10   0.3 p50   8.7 p90  15.1 p99  19.8 max  26.2
+gr2.json     keys 197  noEntry(on time by absence)   0  withEntry 197  ETend-D over entry-bearing keys: min  -8.1 p10   0.8 p50   7.9 p90  14.2 p99  17.0 max  42.7
+gr3.json     keys 197  noEntry(on time by absence)   0  withEntry 197  ETend-D over entry-bearing keys: min  -7.4 p10  -0.5 p50   6.7 p90  14.1 p99  16.1 max  41.9
+grj.json     keys 197  noEntry(on time by absence)   0  withEntry 197  ETend-D over entry-bearing keys: min  -8.2 p10  -0.1 p50   6.7 p90  13.5 p99  16.3 max  16.7
+render2.json keys  97  noEntry(on time by absence)   0  withEntry  97  ETend-D over entry-bearing keys: min   7.9 p10  19.1 p50  24.2 p90  27.6 p99  38.7 max  38.7
+render1.json keys  97  noEntry(on time by absence)   0  withEntry  97  ETend-D over entry-bearing keys: min  -7.6 p10   0.9 p50   4.7 p90   7.9 p99  14.0 max  14.0
+render05.json keys  97  noEntry(on time by absence)  10  withEntry  87  ETend-D over entry-bearing keys: min -17.2 p10  -8.2 p50  -4.0 p90  -0.8 p99  16.4 max  16.4
+paint.json   keys  97  noEntry(on time by absence)   0  withEntry  97  ETend-D over entry-bearing keys: min  56.2 p10  83.7 p50 165.7 p90 313.5 p99 545.3 max 545.3

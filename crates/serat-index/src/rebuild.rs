@@ -160,6 +160,10 @@ pub fn rebuild_with_queue_depth(
     // the_bulk_load_and_the_trigger_path_produce_the_same_search_index asserts.
     let triggers = writer.begin_bulk_load()?;
 
+    // ADR-0015 section 2 (task #66): the catch-up window starts where this walk starts.
+    // Taken before the walk so a file rewritten while it runs is inside the next
+    // catch-up's window.
+    let caught_up_from_ms = now_ms();
     let started = Instant::now();
     let entries = source.entries().map_err(|err| IndexError::Corrupt {
         message: format!("could not enumerate the vault: {err}"),
@@ -218,7 +222,10 @@ pub fn rebuild_with_queue_depth(
     // documents this column as "canonical vault path this index was built from" and the
     // code recorded whatever spelling the caller held, so the same vault reached twice
     // by two names was two vaults and the second paid for a rebuild (F-458, F-459).
-    writer.mark_ready(&crate::identity::canonical_root(vault_root))?;
+    writer.mark_ready(
+        &crate::identity::canonical_root(vault_root),
+        caught_up_from_ms,
+    )?;
     actor.shutdown()?;
     truncate_wal(&path);
 
@@ -229,6 +236,15 @@ pub fn rebuild_with_queue_depth(
     report.producer_wait = producer_wait;
     report.write_fts = write_fts;
     Ok(report)
+}
+
+/// Wall-clock milliseconds since the epoch; the unit of `notes.mtime`.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// A file that could not be read or parsed. Counted, not propagated.

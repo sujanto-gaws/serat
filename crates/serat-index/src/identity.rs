@@ -73,11 +73,17 @@ pub(crate) enum Verdict {
 /// — and strips Windows' verbatim `\\?\` prefix so the recorded value matches
 /// `serat_vault::Vault::root()`, which strips it for the same reason. The two agreeing
 /// **by construction rather than by coincidence** is the whole of F-458's lesson.
+///
+/// Both call `serat_core::verbatim::strip_verbatim_str`, which also maps
+/// `\\?\UNC\srv\share` to `\\srv\share`. An index recorded before task #72 for a UNC
+/// vault holds the mangled `UNC\srv\share\v`, so it sees one `RootChanged` and is
+/// adopted once; that is accepted.
 #[must_use]
 pub fn canonical_root(vault_root: &Path) -> String {
     let resolved = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     let text = resolved.to_string_lossy();
-    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let plain = serat_core::verbatim::strip_verbatim_str(&text);
+    let plain = plain.as_str();
 
     // Only for the fallback above: `canonicalize` never returns a trailing separator,
     // but a raw path may, and `C:\vault\` and `C:\vault` are one directory. Guarded so
@@ -230,7 +236,7 @@ mod tests {
         crate::schema::bootstrap(&conn).expect("bootstrap");
         for (n, path) in paths.iter().enumerate() {
             conn.execute(
-                "INSERT INTO notes (id, path, kind, mtime, hash) VALUES (?1, ?2, 'note', 0, 'h')",
+                "INSERT INTO notes (id, path, kind, mtime, size, hash) VALUES (?1, ?2, 'note', 0, 0, 'h')",
                 rusqlite::params![n as i64 + 1, path],
             )
             .expect("insert");

@@ -94,6 +94,12 @@ pub(crate) fn apply(
     }
 }
 
+/// `notes.size` from the walk's size; saturating, since a file past `i64::MAX` bytes is
+/// not a case to represent, only to survive.
+fn size_column(meta: &NoteMeta) -> i64 {
+    i64::try_from(meta.size).unwrap_or(i64::MAX)
+}
+
 /// Replace every row for a note.
 ///
 /// Delete-then-insert rather than a diff. Blocks are identified by position, so a
@@ -134,8 +140,8 @@ fn upsert_note(
 
     tx.prepare_cached(
         "INSERT INTO notes (path, file_name, path_fold, file_name_fold,
-                            title, type, kind, mtime, hash, word_count)
-         VALUES (?1, ?2, ?8, ?9, ?3, ?4, 'note', ?5, ?6, ?7)",
+                            title, type, kind, mtime, size, hash, word_count)
+         VALUES (?1, ?2, ?8, ?9, ?3, ?4, 'note', ?5, ?10, ?6, ?7)",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -152,6 +158,7 @@ fn upsert_note(
         // The folded keys link resolution compares by (architecture §4.5).
         fold_case(meta.path.as_str()),
         fold_case(meta.path.file_name()),
+        size_column(meta),
     ])
     .map_err(sqlite)?;
     let note_id = tx.last_insert_rowid();
@@ -327,8 +334,8 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
     // silently drops every embed (F-313).
     tx.prepare_cached(
         "INSERT INTO notes (path, file_name, kind, asset_path, mtime, hash,
-                            path_fold, file_name_fold, sidecar_path)
-         VALUES (?1, ?2, 'asset', ?1, ?3, ?4, ?5, ?6,
+                            path_fold, file_name_fold, size, sidecar_path)
+         VALUES (?1, ?2, 'asset', ?1, ?3, ?4, ?5, ?6, ?7,
                  (SELECT s.path FROM notes s WHERE s.path = ?1 || '.md' AND s.kind = 'note'))",
     )
     .map_err(sqlite)?
@@ -339,6 +346,7 @@ fn upsert_asset(tx: &Transaction<'_>, meta: &NoteMeta, bulk_load: bool) -> Resul
         meta.hash.to_hex(),
         fold_case(meta.path.as_str()),
         fold_case(meta.path.file_name()),
+        size_column(meta),
     ])
     .map_err(sqlite)?;
     let asset_id = tx.last_insert_rowid();
@@ -722,13 +730,23 @@ pub(crate) fn sync_note_count(tx: &Transaction<'_>) -> Result<(), IndexError> {
 ///
 /// Raised as a design question rather than fixed here, because `CARGO_PKG_VERSION` is
 /// the wrong granularity for it — see the note in `crate::open`.
-pub(crate) fn mark_ready(tx: &Transaction<'_>, vault_root: &str) -> Result<(), IndexError> {
+pub(crate) fn mark_ready(
+    tx: &Transaction<'_>,
+    vault_root: &str,
+    caught_up_from_ms: i64,
+) -> Result<(), IndexError> {
     tx.execute(
         "UPDATE index_meta
             SET state = 'ready', vault_root = ?1, built_at = unixepoch(),
-                indexer_version = ?2, schema_version = ?3, clean_close = 1
+                indexer_version = ?2, schema_version = ?3, clean_close = 1,
+                caught_up_from_ms = ?4
           WHERE id = 1",
-        params![vault_root, env!("CARGO_PKG_VERSION"), crate::INDEX_VERSION],
+        params![
+            vault_root,
+            env!("CARGO_PKG_VERSION"),
+            crate::INDEX_VERSION,
+            caught_up_from_ms
+        ],
     )
     .map_err(sqlite)?;
     Ok(())
