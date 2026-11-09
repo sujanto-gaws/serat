@@ -122,9 +122,10 @@ describe("blockWidgetsField", () => {
       for (let j = 0; j < 90; j += 1) parts.push(`paragraph ${i}.${j}`, "");
     }
     const doc = parts.join("\n");
-    const s0 = makeState(doc, 0);
+    // Cursor in the last paragraph: no table is revealed, so all 50 start as widgets.
+    const s0 = makeState(doc, doc.length);
     const before = widgets(s0);
-    expect(before.length).toBeGreaterThanOrEqual(49);
+    expect(before).toHaveLength(50);
     const s1 = s0.update({
       changes: { from: doc.length - 1, insert: "x" },
       selection: { anchor: doc.length },
@@ -137,6 +138,29 @@ describe("blockWidgetsField", () => {
     // NFR-PRF-02: the property is REUSE, asserted above by object identity, not wall time (a 100 ms
     // single-sample bound failed 1/389 under load, #99). A whole-document rebuild replaces every
     // widget, so identity catches it deterministically.
+  });
+
+  it("a table's FIRST character (offset 0): leaving it brings the widget back, same count as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}`;
+    const s0 = makeState(doc, 0); // cursor on the first character: table 1 is revealed
+    expect(widgets(s0)).toHaveLength(1);
+    const away = doc.indexOf("mid");
+    const s1 = s0.update({ selection: { anchor: away } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, away)).length);
+    expect(widgets(s1)).toHaveLength(2);
+  });
+
+  it("the first character of a block in the middle of the note behaves the same", () => {
+    const doc = `intro\n\n${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}\n\nend`;
+    const first = doc.indexOf("| a |");
+    const s0 = makeState(doc, first);
+    expect(widgets(s0)).toHaveLength(1);
+    const s1 = s0.update({ selection: { anchor: doc.length } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, doc.length)).length);
+    expect(widgets(s1)).toHaveLength(2);
+    // And entering from elsewhere onto a first character reveals it.
+    const s2 = s1.update({ selection: { anchor: first } }).state;
+    expect(widgets(s2)).toHaveLength(1);
   });
 
   it("the examined watermark maps through edits and never moves back", () => {
