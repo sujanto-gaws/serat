@@ -24,6 +24,11 @@ import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
 import { indexStatus, isIpcError, onIndexStatus } from "@/ipc/client";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
+import { commandRegistry } from "@/commands/registry";
+import CommandPalette from "@/overlays/CommandPalette.vue";
+import QuickSwitcher from "@/overlays/QuickSwitcher.vue";
+import { byteToUtf16Index } from "@/panes/locate";
+import { setLivePreview } from "@/ipc/client";
 
 const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
@@ -135,6 +140,77 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
   }
 }
 
+/*
+ * Quick switcher (⌘O, FR-NAV-01) and command palette (⌘K, FR-NAV-05). The two
+ * overlays are mutually exclusive; each restores focus to where it was opened
+ * unless the choice moves focus itself.
+ */
+const switcherOpen = ref(false);
+const paletteOpen = ref(false);
+const livePreview = ref(true);
+
+function openSwitcher(): void {
+  paletteOpen.value = false;
+  switcherOpen.value = true;
+}
+
+function openPalette(): void {
+  switcherOpen.value = false;
+  paletteOpen.value = true;
+}
+
+async function onSwitcherOpen(payload: {
+  path: string;
+  newTab: boolean;
+  heading: { text: string; byteStart: number } | null;
+}): Promise<void> {
+  switcherOpen.value = false; // `newTab` is ignored: there are no tabs in P1
+  await openNote(payload.path);
+  const editor = editorRef.value;
+  if (editor && payload.heading && store.openNote === payload.path) {
+    editor.revealOffset(byteToUtf16Index(editor.getText(), payload.heading.byteStart));
+  }
+  await nextTick();
+  editor?.focus();
+}
+
+function onSwitcherCreate(_payload: { name: string }): void {
+  // Creating a note is task #43's naming flow and create command; nothing to call yet.
+  switcherOpen.value = false;
+  store.setMark("Creating notes arrives with tree operations.");
+}
+
+async function onPaletteRun(id: string): Promise<void> {
+  paletteOpen.value = false;
+  await nextTick(); // focus returns to the opener first; the command may then move it
+  await commandRegistry.run(id);
+}
+
+function toggleLivePreview(): void {
+  livePreview.value = !livePreview.value;
+  void setLivePreview({ enabled: livePreview.value }).catch(() => undefined);
+}
+
+const disposeCommands: Array<() => void> = [];
+function registerCommands(): void {
+  const noNote = (): string | null => (store.openNote === null ? "Open a note first" : null);
+  disposeCommands.push(
+    commandRegistry.register({ id: "switcher.open", name: "Open quick switcher", binding: "Mod+O", run: openSwitcher }),
+    commandRegistry.register({ id: "editor.togglePreview", name: "Toggle live preview", binding: "Mod+Shift+M", unavailable: noNote, run: toggleLivePreview }),
+    commandRegistry.register({ id: "search.open", name: "Search vault", binding: "Mod+Shift+F", run: openSearch }),
+    commandRegistry.register({
+      id: "tree.focus",
+      name: "Focus file tree",
+      binding: "Mod+1",
+      run: () => {
+        if (window.matchMedia?.("(max-width: 719px)").matches) treeFlyover.value = true;
+        void nextTick(() => treeRef.value?.focusTree());
+      },
+    }),
+    commandRegistry.register({ id: "backlinks.focus", name: "Focus backlinks", binding: "Mod+3", run: () => backlinksRef.value?.focus() }),
+  );
+}
+
 function onInsertLink(payload: { path: string; text: string }): void {
   if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
 }
@@ -146,7 +222,13 @@ function onInsertLink(payload: { path: string; text: string }): void {
 function onGlobalKeydown(event: KeyboardEvent): void {
   if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
   const key = event.key.toLowerCase();
-  if (event.shiftKey && key === "f") {
+  if (!event.shiftKey && key === "o") {
+    event.preventDefault();
+    openSwitcher();
+  } else if (!event.shiftKey && key === "k") {
+    event.preventDefault();
+    openPalette();
+  } else if (event.shiftKey && key === "f") {
     event.preventDefault();
     openSearch();
   } else if (event.shiftKey && key === "n") {
@@ -204,6 +286,7 @@ onMounted(async () => {
   // concurrently with the rAF pair above, not before it: nothing here can delay a
   // mark that was already scheduled on the line above.
   window.addEventListener("keydown", onGlobalKeydown);
+  registerCommands();
 
   unlistenIndexStatus = await onIndexStatus((status) => {
     store.setVaultId(status.vault_id);
@@ -234,6 +317,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
+  for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();
   if (updatedTimer) clearTimeout(updatedTimer);
 });
@@ -311,7 +395,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       <CodeMirrorEditor
         ref="editorRef"
         :vault-id="store.vaultId"
+        :live-preview="livePreview"
         placeholder="No note open."
+        @toggle-live-preview="toggleLivePreview"
         @save-outcome="onSaveOutcome"
         @follow-link="onFollowLink"
         @dirty-changed="(d: boolean) => (editorDirty = d)"
@@ -330,6 +416,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </aside>
   </main>
+
+  <QuickSwitcher v-if="switcherOpen" @open="onSwitcherOpen" @create="onSwitcherCreate" @close="switcherOpen = false" />
+  <CommandPalette v-if="paletteOpen" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
     <span class="index">{{ store.indexStatusText }}</span>

@@ -1,0 +1,107 @@
+/* Shared overlay chrome (components.md §5): quick switcher and command palette. */
+.overlay-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 15vh;
+}
+.overlay-card {
+  width: min(560px, 90vw);
+  background: #fff;
+  border: 1px solid rgba(22, 25, 27, 0.15);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(22, 25, 27, 0.22);
+  overflow: hidden;
+}
+.overlay-input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid rgba(22, 25, 27, 0.15);
+  padding: 12px 14px;
+  font: inherit;
+  font-size: 16px;
+  background: transparent;
+  color: var(--ink);
+  outline: none;
+}
+.overlay-input:focus-visible {
+  box-shadow: inset 0 -2px 0 var(--indigo);
+}
+.overlay-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  max-height: 288px;
+  overflow-y: auto;
+}
+.overlay-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.overlay-row[aria-selected="true"] {
+  background: rgba(36, 69, 126, 0.1);
+}
+.overlay-row .glyph {
+  color: rgba(22, 25, 27, 0.5);
+  width: 1em;
+  flex: none;
+}
+.overlay-row .main {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-row .meta {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: rgba(22, 25, 27, 0.55);
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-row .hit {
+  color: var(--indigo);
+  font-weight: 600;
+}
+.overlay-row.unavailable .main {
+  color: rgba(22, 25, 27, 0.5);
+}
+.overlay-empty {
+  padding: 10px 14px;
+  color: rgba(22, 25, 27, 0.7);
+}
+.overlay-footer {
+  display: flex;
+  gap: 16px;
+  padding: 6px 14px;
+  font-size: 11px;
+  color: rgba(22, 25, 27, 0.55);
+  border-top: 1px solid rgba(22, 25, 27, 0.15);
+}
+.chip {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  background: rgba(22, 25, 27, 0.06);
+  border: 1px solid rgba(22, 25, 27, 0.15);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 2px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
