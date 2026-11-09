@@ -17,6 +17,13 @@ root: string,
  * Opaque, unique per open, and never parsed: the front end only ever
  * compares it for equality. Its format is `serat-app`'s business and may
  * change without this being a contract change.
+ *
+ * **How the webview learns it before any event carrying it can arrive**
+ * (task #79's ruling, architecture §3.4 "Which vault an event belongs to"):
+ * for the vault opened at launch, from [`BootInfo::vault_id`]; for every
+ * later open in the same window, from [`VAULT_OPENED_EVENT`], whose payload
+ * is this type and which is emitted before anything else that carries the
+ * new id. `index_status` is a poll for status, not the way the id is learnt.
  */
 vault_id: string, 
 /**

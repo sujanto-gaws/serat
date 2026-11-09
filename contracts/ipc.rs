@@ -75,6 +75,7 @@
 //! | Settings, command registry | `get_ui_settings`, `set_live_preview`, `set_keybinding` | §9.3, FR-PLT-05 |
 //! | Names the vault cannot show | `refused_names`; the count rides on `IndexStatus::refused_names` | FR-VLT-01, task #34 |
 //! | `.serat/` ignore offer | `gitignore_offer_status`, `append_gitignore_entry`, `decline_gitignore_offer` | NFR-CMP-04, T-06 |
+//! | Which vault is open | `BootInfo` (`window.__SERAT_BOOT__`, launch), event `vault://opened` (every later open) | §3.4, task #79 |
 //!
 //! `write_file` stays, and in P1 its **only** job is creating a note: the editor
 //! saves through `save_patch` (ADR-0016). Extraction state (`ExtractionState`) is
@@ -189,6 +190,13 @@ pub struct VaultOpened {
     /// Opaque, unique per open, and never parsed: the front end only ever
     /// compares it for equality. Its format is `serat-app`'s business and may
     /// change without this being a contract change.
+    ///
+    /// **How the webview learns it before any event carrying it can arrive**
+    /// (task #79's ruling, architecture §3.4 "Which vault an event belongs to"):
+    /// for the vault opened at launch, from [`BootInfo::vault_id`]; for every
+    /// later open in the same window, from [`VAULT_OPENED_EVENT`], whose payload
+    /// is this type and which is emitted before anything else that carries the
+    /// new id. `index_status` is a poll for status, not the way the id is learnt.
     pub vault_id: String,
     /// What the index was found to be by the open check (§3.4), before any
     /// rebuild has made progress. `IndexState::Rebuilding` here is a normal
@@ -402,6 +410,87 @@ pub const REFUSED_NAMES_COMMAND: &str = "refused_names";
 /// architect if `://` is not usable, in which case this constant changes and
 /// nothing else does.
 pub const INDEX_STATUS_EVENT: &str = "index://status";
+
+/// What `window.__SERAT_BOOT__` holds: the webview's facts before its first line
+/// of script runs, set by an initialization script on the main window (§3.4).
+/// Not a command and not an event, so it adds nothing to the ACL (ADR-0012): it is
+/// the process's own arguments and the vault the process opened at launch, all
+/// known before the window exists. Serves FR-VLT-01, FR-VLT-04, NFR-PRF-01.
+///
+/// Generated into TypeScript like every other type here (ADR-0007), so `app/`
+/// reads the generated `BootInfo` rather than a hand-written mirror.
+///
+/// **Contract ahead of implementation.** serat-app today serialises a private
+/// struct with `vault`, `open` and `exit_after_ready` and no `vault_id`. #79's
+/// follow-up `[P1/impl] Boot the webview with vault_id and emit vault://opened`
+/// (tauri-app-dev) replaces it with this type, and
+/// `[P1/impl] Adopt BootInfo and vault://opened as the vault-id source`
+/// (vue-frontend-dev) switches `app/src/env.d.ts` to the generated type. The
+/// field #79 adds is optional on the wire, so neither side breaks first.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BootInfo {
+    /// Canonical vault root, if one was opened at launch. Display only.
+    pub vault: Option<String>,
+    /// That vault's `VaultOpened::vault_id`; `Some` exactly when `vault` is
+    /// `Some`. `None` (absent) until serat-app fills it. The front end then
+    /// adopts the id from an `index_status` poll, under four restrictions:
+    /// only at launch, only while this field is absent, never once
+    /// `vault://opened` has been seen, and never an empty id. The poll is not
+    /// ordered against events: an answer computed before a switch's close
+    /// carries the OLD id, and one computed between the old vault's close and
+    /// the new one's install carries `vault_id: ""`. Either can arrive after
+    /// `vault://opened`, so an unrestricted fallback would adopt a dead id.
+    /// The fallback is today's behaviour, and it is why this field can land
+    /// in the contract first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub vault_id: Option<String>,
+    /// Vault-relative note to render, if any.
+    pub open: Option<String>,
+    /// Whether this process is a benchmark run (`--exit-after-ready`).
+    pub exit_after_ready: bool,
+}
+
+/// Event `vault://opened`: a vault was opened in this window after launch
+/// (`choose_vault`, or task #80's in-window switch). Payload: [`VaultOpened`],
+/// the same value the command returns. Serves FR-VLT-01, FR-VLT-04; task #79.
+///
+/// **Ordering guarantee.** serat-app emits it from `open_vault_with` after the
+/// new `vault_id` is minted and the old vault is closed (its `app://closing`
+/// already emitted and its flush awaited), and **before** the new vault's index
+/// actor, watcher, consumer and tree session exist. Those are the only emitters
+/// of an event carrying the new id, so this emit is enqueued before any of
+/// theirs, and Tauri delivers one window's events in the order they were
+/// enqueued (tauri-app-dev's follow-up pins that with a test, since it is
+/// Tauri's property and not ours). The front end therefore knows the id before
+/// the first `index://status`, `index://changed`, `note://external-change`,
+/// `tree://status` or `app://closing` for that vault can arrive. The
+/// `choose_vault` response carries the same id but is **not** ordered against
+/// events (the streaming rule in this file's header), which is why it cannot be
+/// the source.
+///
+/// **It can precede a failed open.** The emit comes after the id is minted and
+/// before three steps that can still fail and return through `?`: building the
+/// switcher, spawning the index actor and spawning the vault thread. If one
+/// fails, `choose_vault` answers `Err`. The front end then treats the window
+/// as having **no vault open**. No event will ever carry the id `vault://opened`
+/// announced, so the front end keeps that id only to drop anything that does
+/// not match. It never re-adopts the previous vault's id, because that vault
+/// was closed before the emit. tauri-app-dev's follow-up tests this case
+/// ("emit, then a spawn fails") beside the ordering test.
+///
+/// Not emitted for the vault opened at launch: the window does not exist yet,
+/// and `BootInfo::vault_id` covers that case. Webview-safe: it carries the root
+/// the user just chose, which `BootInfo::vault` already discloses for the
+/// launch vault, and it grants nothing. `open_vault` itself stays withheld
+/// (ADR-0012). **No ACL change:** listening comes from `core:default`, and
+/// ADR-0012's pin covers commands only, so `capabilities/default.json` does not
+/// name this event and the follow-up does not widen it.
+///
+/// **Contract ahead of implementation**, filled by the same follow-up as
+/// [`BootInfo::vault_id`].
+pub const VAULT_OPENED_EVENT: &str = "vault://opened";
 
 // ============================================================================
 // Index state
@@ -1301,6 +1390,38 @@ pub struct SearchHit {
     /// Snippet with matches delimited by U+0002 … U+0003. Build text nodes only
     /// (T-09); the delimiters can also occur in note text, harmlessly.
     pub snippet: Option<String>,
+    /// Whether the file on disk has visibly changed since this hit's block was
+    /// indexed, so the result row can say "approximate" **before** the click
+    /// (search-panel.md; architecture §4.5 "Location", task #79's ruling).
+    /// Serves FR-NAV-02, US-05.
+    ///
+    /// Computed by serat-app after the statement returns, for hits with a
+    /// `block` only (at most 50 per page, R1's ceiling), as one `stat` per hit
+    /// compared with the `notes.mtime` and `notes.size` the row was indexed
+    /// with. `Some(true)` when either differs or the stat fails; `Some(false)`
+    /// when both match. It never reads or hashes the file.
+    ///
+    /// **A hint, not the authority.** The authority stays the hash compare at
+    /// open (`BlockLocation::note_hash` against the bytes just read). A
+    /// `Some(false)` hit whose hash nevertheless differs (an edit inside the
+    /// mtime granularity that kept the size) is still located by `ord` and
+    /// marked approximate after the click, as today. A `Some(true)` hit whose
+    /// hash matches (a `touch`, a checkout of identical bytes) jumps exactly,
+    /// and the row's marker was merely cautious. Neither case presents a wrong
+    /// line as exact.
+    ///
+    /// `None` (absent on the wire) for a property-only hit (it has no block to
+    /// be approximate about) and whenever it was not computed. The front end
+    /// shows no marker for `None` and relies on the click-time check.
+    ///
+    /// **Contract ahead of implementation.** Filled by #79's follow-up
+    /// `[P1/impl] Flag search hits changed since indexed` (rust-core-dev returns
+    /// `notes.mtime`/`notes.size` from R1 and R1 + R3, no schema change), then
+    /// `[P1/impl] Stat search hits and map changed_since_indexed in serat-app`
+    /// (tauri-app-dev). Until both land, serat-app sends `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub changed_since_indexed: Option<bool>,
 }
 
 /// Where a block is, as indexed.
@@ -1352,6 +1473,31 @@ pub struct Backlink {
     pub block: Option<BlockLocation>,
     /// Block text, cut to 300 characters in Rust; empty for frontmatter.
     pub excerpt: String,
+    /// For a frontmatter-origin entry (`block: None`), the frontmatter keys the
+    /// links to this note were written under (`owner: "[[Person]]"` gives
+    /// `["owner"]`), distinct, in byte order. The pane renders them in place of
+    /// the excerpt as `frontmatter: owner` (backlinks-pane.md). Serves FR-NAV-04,
+    /// US-03; architecture §4.5 R2 (task #79's ruling).
+    ///
+    /// **The entry shape does not change:** frontmatter is still one entry per
+    /// source note, because R2 groups by (source note, source block) and every
+    /// frontmatter link has the same NULL block. Two keys naming this note give
+    /// one entry with two keys, not two entries.
+    ///
+    /// `None` (absent on the wire) for a body link, and also whenever the key is
+    /// not known: a link the index could not attribute to a key, or an index
+    /// written before the column existed. The front end then renders the bare
+    /// word `frontmatter`, which is the degraded state, never an error (design
+    /// goal 5). Never `Some` of an empty list.
+    ///
+    /// **Contract ahead of implementation.** Filled by #79's follow-ups
+    /// `[P1/impl] Record frontmatter link keys in serat-index (links.field_key,
+    /// INDEX_VERSION 12)` (rust-core-dev), which adds the column and the R2
+    /// aggregate, then `[P1/impl] Map Backlink::frontmatter_keys in serat-app`
+    /// (tauri-app-dev). Until both land, serat-app sends `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub frontmatter_keys: Option<Vec<String>>,
 }
 
 /// What `[[note#` and `[[note^` complete against (§9.3).
