@@ -3985,7 +3985,9 @@ mod tests {
 
     #[test]
     fn the_catch_up_window_starts_no_later_than_the_watcher_registering() {
-        // Task #78: the stamp the open's catch-up records predates `WatcherRegistered`.
+        // Task #78: the stamp the open's catch-up records predates `WatcherRegistered`. This
+        // guards against stamping at the walk's start (#66's interim); the exact "just
+        // before arming" position is the code's, not pinned by this test.
         let dir = fixture("window-before-watcher");
         open_and_close_cleanly(&dir);
         let old = window_of(&dir);

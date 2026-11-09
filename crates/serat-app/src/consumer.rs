@@ -432,7 +432,7 @@ pub struct Indexer {
     /// `caught_up_from_ms` when it completes. 0 until [`Indexer::window_opened`] has
     /// been called, which makes the next catch-up hash every file: conservative, never
     /// wrong.
-    walk_started_ms: AtomicI64,
+    window_start_ms: AtomicI64,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -452,7 +452,7 @@ impl Indexer {
             deferred: Mutex::new(Deferred::default()),
             journal: Mutex::new(None),
             stop: AtomicBool::new(false),
-            walk_started_ms: AtomicI64::new(0),
+            window_start_ms: AtomicI64::new(0),
         }
     }
 
@@ -648,7 +648,7 @@ impl Indexer {
     /// watcher is armed, which the open's catch-up hands to the reconciler (task #78).
     /// Call before any walk.
     pub fn window_opened(&self, ms: i64) {
-        self.walk_started_ms.store(ms, Ordering::SeqCst);
+        self.window_start_ms.store(ms, Ordering::SeqCst);
     }
 
     /// The open's authoritative walk is about to start: journal what the consumer
@@ -697,7 +697,7 @@ impl Indexer {
             &parser,
             entries,
             CatchUp::PathsAndMtime,
-            Some(self.walk_started_ms.load(Ordering::SeqCst)),
+            Some(self.window_start_ms.load(Ordering::SeqCst)),
         ));
         self.replay_journal(&reconciler);
     }
@@ -911,42 +911,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_same_size_same_mtime_edit_after_the_window_start_is_a_candidate() {
-        // Task #78: a write after the watcher was armed can carry the mtime and size
-        // the index already holds; the window start, taken before arming, still makes
-        // it a candidate.
-        let dir = vault_dir("window-equal-mtime");
-        let (indexer, _) = indexer(&dir, slot_with(&dir));
-        indexer.catch_up(&walk(&indexer));
-        let before = hash_of(&dir, "a.md").expect("indexed");
+    /// Session one stores `stored_window`; session two edits `a.md` (same size, mtime
+    /// reset to `T`) and catches up. Returns whether the edit was picked up.
+    fn edit_at_equal_mtime_is_picked_up(name: &str, stored_offset_ms: i64) -> bool {
+        let dir = vault_dir(name);
         let path = dir.join("a.md");
-        let mtime = std::fs::metadata(&path)
-            .expect("meta")
-            .modified()
-            .expect("mtime");
-        let size = std::fs::metadata(&path).expect("meta").len();
-        let mut bytes = std::fs::read(&path).expect("read");
-        bytes[size as usize - 2] = b'Z';
-        std::fs::write(&path, &bytes).expect("rewrite");
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .expect("open")
-            .set_modified(mtime)
-            .expect("set_modified");
-        let ms = i64::try_from(
-            mtime
-                .duration_since(std::time::UNIX_EPOCH)
+        let set_mtime = |t: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(t)
+                .expect("set_modified");
+        };
+        let t = std::time::SystemTime::now() - Duration::from_secs(60);
+        let t_ms = i64::try_from(
+            t.duration_since(std::time::UNIX_EPOCH)
                 .expect("epoch")
                 .as_millis(),
         )
         .expect("ms");
-        indexer.window_opened(ms);
+        set_mtime(t);
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.window_opened(t_ms + stored_offset_ms);
         indexer.walk_started();
         indexer.catch_up(&walk(&indexer));
-        assert_ne!(hash_of(&dir, "a.md").expect("indexed"), before);
+        let before = hash_of(&dir, "a.md").expect("indexed");
+
+        let mut bytes = std::fs::read(&path).expect("read");
+        let at = bytes.len() - 2;
+        bytes[at] = b'Z';
+        std::fs::write(&path, &bytes).expect("rewrite");
+        set_mtime(t);
+        indexer.window_opened(serat_index::rebuild::now_ms());
+        indexer.walk_started();
+        indexer.catch_up(&walk(&indexer));
+        let changed = hash_of(&dir, "a.md").expect("indexed") != before;
         let _ = std::fs::remove_dir_all(&dir);
+        changed
+    }
+
+    #[test]
+    fn a_same_size_same_mtime_edit_after_the_window_start_is_a_candidate() {
+        // Task #78: the stored window decides. A window at the file's mtime keeps the
+        // equal-mtime edit a candidate; the negative control, a window 5 s later, does
+        // not (so the test fails if the stored value is wrong in either direction).
+        assert!(edit_at_equal_mtime_is_picked_up("window-equal-mtime", 0));
+        assert!(!edit_at_equal_mtime_is_picked_up(
+            "window-equal-mtime-control",
+            5_000
+        ));
     }
 
     #[test]

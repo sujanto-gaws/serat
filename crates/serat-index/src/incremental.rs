@@ -107,7 +107,8 @@ impl IndexHandle {
     }
 
     /// `index_meta.caught_up_from_ms`: the wall-clock time (ms) at which the last
-    /// completed catch-up, or the rebuild that built this index, began its walk. 0 for
+    /// completed catch-up, or the rebuild that built this index, took as its window start
+    /// (immediately before the watcher was armed; ADR-0015 section 2). 0 for
     /// an index no catch-up has finished on. Diagnostic; the catch-up reads it itself.
     ///
     /// # Errors
