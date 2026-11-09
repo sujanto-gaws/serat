@@ -507,6 +507,9 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
+                    // Nobody is waiting on this commit, whatever the last turn's
+                    // `continue` arm left `answering` as.
+                    fault.set_answering(false);
                     let _ = commit(
                         &conn,
                         &mut pending,

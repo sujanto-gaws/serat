@@ -762,6 +762,13 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
 
+            // A paced catch-up parks in its first flush at exactly one batch of loads,
+            // so a single load more is a broken pacer, whatever the machine's speed.
+            assert_eq!(
+                source.loads.load(SeqCst),
+                crate::writer::BATCH_SIZE,
+                "the catch-up loaded past one batch with the writer held: not paced"
+            );
             // The assertion: saves are accepted while the writer is held.
             let (accepted, refused) = save_a(&writer, &inner, &parser, 50);
             drop(held);
