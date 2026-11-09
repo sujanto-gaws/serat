@@ -98,4 +98,30 @@ describe("App", () => {
     mount(App, { global: { plugins: [createPinia()] } });
     expect(schedulePaintMark).toHaveBeenCalledTimes(1);
   });
+
+  it("Mod-Shift-F opens and focuses search and never toggles it closed; Esc closes it and returns focus", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    const press = (init: KeyboardEventInit) =>
+      window.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(false);
+    press({ key: "F", ctrlKey: true, shiftKey: true });
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(true));
+    await wrapper.vm.$nextTick();
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="search-input"]').element);
+    press({ key: "F", ctrlKey: true, shiftKey: true });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(true); // second press focuses, does not close
+    await wrapper.get('[data-testid="search-input"]').trigger("keydown", { key: "Escape" });
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("Mod-1 focuses the tree; Mod-N asks the tree for a new note (handled by the host as a stub for task #43)", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", ctrlKey: true, bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(wrapper.get('[role="tree"]').element));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", ctrlKey: true, bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(wrapper.text()).toContain("new note"));
+    wrapper.unmount();
+  });
 });

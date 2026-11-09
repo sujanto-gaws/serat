@@ -18,6 +18,12 @@ import { folderOf, plainSnippet, splitSnippet, titleOf } from "@/panes/text";
 
 const PAGE = 50;
 
+/** The `[key:value]` filter in a query, for labelling results of a continued page. */
+function filterOf(query: string): string | null {
+  const c = checkQuery(query);
+  return c.kind === "ok" ? c.filter : null;
+}
+
 const props = withDefaults(
   defineProps<{
     ipc?: PaneIpcAdapter;
@@ -30,6 +36,7 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
+  // `newTab` is carried for the contract's sake; there are no tabs in P1, so hosts ignore it.
   open: [payload: { path: string; block: BlockLocation | null; newTab: boolean }];
   close: [];
 }>();
@@ -54,6 +61,8 @@ let settleTimer: ReturnType<typeof setTimeout> | null = null;
 let skeletonTimer: ReturnType<typeof setTimeout> | null = null;
 let seq = 0;
 let unlisten: (() => void) | null = null;
+let disposed = false;
+const inputEl = ref<HTMLInputElement | null>(null);
 
 const check = computed(() => checkQuery(input.value));
 const filterChip = computed(() => (check.value.kind === "ok" ? check.value.filter : null));
@@ -86,7 +95,10 @@ async function run(more: boolean): Promise<void> {
     clearTimeout(settleTimer);
     settleTimer = null;
   }
-  const c = check.value;
+  // "Load more" continues the query that produced the shown results (`lastQuery`), never
+  // whatever has since been typed into the box.
+  if (more && lastQuery === null) return;
+  const c = more ? ({ kind: "ok", filter: filterOf(lastQuery as string) } as const) : check.value;
   if (c.kind === "empty") {
     seq += 1;
     view.value = { kind: "idle" };
@@ -95,7 +107,7 @@ async function run(more: boolean): Promise<void> {
     return;
   }
   if (c.kind !== "ok") return; // refused before sending; the message is already showing
-  const query = input.value.trim();
+  const query = more ? (lastQuery as string) : input.value.trim();
   if (!more) lastQuery = query;
   const mine = ++seq;
   const offset = more ? hits.value.length : 0;
@@ -158,11 +170,13 @@ onMounted(() => {
       if (pendingQuery !== null) void run(false);
     })
     .then((off) => {
-      unlisten = off;
+      if (disposed) off(); // resolved after unmount: do not leak the listener
+      else unlisten = off;
     })
     .catch(() => undefined);
 });
 onBeforeUnmount(() => {
+  disposed = true;
   clearTimers();
   seq += 1;
   unlisten?.();
@@ -190,12 +204,25 @@ function onInputKeydown(event: KeyboardEvent): void {
   if (event.key === "Enter") {
     event.preventDefault();
     void run(false);
-  } else if (event.key === "Escape") {
-    emit("close");
   } else if (event.key === "Backspace" && filterChip.value && input.value.trimEnd().endsWith(filterChip.value)) {
     event.preventDefault();
     removeFilter();
   }
+}
+
+/** Esc from anywhere in the panel (input or results) closes it; the host returns focus. */
+function onPanelKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    emit("close");
+  }
+}
+
+const activeDescendant = computed(() => (hits.value.length > 0 ? `serat-hit-${focusedIndex.value}` : undefined));
+
+function focus(): void {
+  inputEl.value?.focus();
+  inputEl.value?.select();
 }
 
 function useRecent(query: string): void {
@@ -211,13 +238,14 @@ const noResultsMessage = computed(() => {
     : `No matches for “${v.query}”`;
 });
 
-defineExpose({ input, run });
+defineExpose({ input, run, focus });
 </script>
 
 <template>
-  <section class="serat-search" aria-label="Search" data-testid="search-panel">
+  <section class="serat-search" aria-label="Search" data-testid="search-panel" @keydown="onPanelKeydown">
     <div class="serat-search-bar">
       <input
+        ref="inputEl"
         v-model="input"
         type="search"
         class="serat-search-input"
@@ -267,15 +295,22 @@ defineExpose({ input, run });
       </p>
       <template v-else>
         <p class="serat-search-count">{{ hits.length }}{{ hasMore ? "+" : "" }} result{{ hits.length === 1 ? "" : "s" }}</p>
-        <div role="list" tabindex="0" data-testid="search-results" @keydown="onResultsKeydown">
+        <div
+          role="list"
+          tabindex="0"
+          data-testid="search-results"
+          :aria-activedescendant="activeDescendant"
+          @keydown="onResultsKeydown"
+        >
           <div
             v-for="(hit, i) in hits"
             :key="hit.path + ':' + (hit.block ? hit.block.block_id : i)"
+            :id="`serat-hit-${i}`"
             role="listitem"
             class="serat-hit"
             :class="{ 'serat-hit-focused': i === focusedIndex }"
             :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '')"
-            @click="openHit(hit, false)"
+            @click="focusedIndex = i; openHit(hit, false)"
           >
             <div class="serat-hit-head">
               <span class="serat-hit-title">{{ titleOf(hit.path, hit.title) }}</span>

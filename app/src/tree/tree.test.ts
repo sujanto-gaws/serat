@@ -384,7 +384,7 @@ describe("FileTree component", () => {
     wrapper.unmount();
   });
 
-  it("tree://status stopped shows the stopped notice; a live status does not (ADR-0015)", async () => {
+  it("tree://status stopped fills a persistent live region outside the tree (ADR-0015)", async () => {
     const { ipc } = fakeIpc();
     let fire: (s: { vault_id: string; stopped: boolean }) => void = () => undefined;
     ipc.onTreeStatus = vi.fn(async (h) => {
@@ -393,33 +393,169 @@ describe("FileTree component", () => {
     });
     const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(0);
+    const live = wrapper.get('[data-testid="tree-status"]');
+    expect(live.attributes("role")).toBe("status");
+    expect(live.text()).toBe(""); // present before it has anything to say
+    expect(wrapper.get('[role="tree"]').element.contains(live.element)).toBe(false);
     fire({ vault_id: "v", stopped: false });
     await wrapper.vm.$nextTick();
-    expect(wrapper.find('[data-testid="tree-stopped"]').exists()).toBe(false);
+    expect(live.text()).toBe("");
     fire({ vault_id: "v", stopped: true });
     await wrapper.vm.$nextTick();
-    expect(wrapper.get('[data-testid="tree-stopped"]').text()).toContain("stopped updating");
+    expect(live.text()).toBe("file tree stopped updating; reopen the vault");
     wrapper.unmount();
   });
 
-  it("20k-note tree: apply + first render timing is reported and bounded", async () => {
+  it("tree://status for another vault is discarded once the vault id is known; any is accepted before", async () => {
+    const { ipc } = fakeIpc();
+    let fire: (s: { vault_id: string; stopped: boolean }) => void = () => undefined;
+    ipc.onTreeStatus = vi.fn(async (h) => {
+      fire = h;
+      return () => undefined;
+    });
+    const known = mount(FileTree, { props: { ipc, vaultId: "mine" }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    fire({ vault_id: "other", stopped: true });
+    await known.vm.$nextTick();
+    expect(known.get('[data-testid="tree-status"]').text()).toBe("");
+    fire({ vault_id: "mine", stopped: true });
+    await known.vm.$nextTick();
+    expect(known.get('[data-testid="tree-status"]').text()).toContain("stopped updating");
+    known.unmount();
+
+    const unknown = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    fire({ vault_id: "anything", stopped: true });
+    await unknown.vm.$nextTick();
+    expect(unknown.get('[data-testid="tree-status"]').text()).toContain("stopped updating");
+    unknown.unmount();
+  });
+
+  it("open_tree is on the wire before the status listener is registered; a late listener resolving after unmount is unlistened", async () => {
+    const { ipc } = fakeIpc();
+    const order: string[] = [];
+    ipc.openTree = vi.fn(async () => void order.push("open_tree"));
+    const off = vi.fn();
+    let resolve!: (f: () => void) => void;
+    ipc.onTreeStatus = vi.fn(() => {
+      order.push("listen");
+      return new Promise<() => void>((r) => (resolve = r));
+    });
+    const wrapper = mount(FileTree, { props: { ipc } });
+    expect(order).toEqual(["open_tree", "listen"]);
+    wrapper.unmount();
+    resolve(off);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(off).toHaveBeenCalledTimes(1);
+  });
+
+  it("20,000 notes in one expanded listing: bounded DOM rows and the apply+render time (jsdom, real clock)", async () => {
     const { ipc, push } = fakeIpc();
     const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(0);
-    const dirs = Array.from({ length: 200 }, (_, i) => ({ name: `d${i}`, kind: "dir" as const, sidecar: false }));
     vi.useRealTimers();
     vi.stubGlobal("requestAnimationFrame", () => 0);
-    const t0 = Number(process.hrtime.bigint()) / 1e6;
-    push(listing("", dirs));
-    for (let i = 0; i < 200; i++) {
-      push(listing(`d${i}`, Array.from({ length: 100 }, (_, j) => note(`n${j}.md`))));
-    }
+    const t0 = performance.now();
+    push(listing("", [{ name: "big", kind: "dir", sidecar: false }, ...Array.from({ length: 9_999 }, (_, i) => note(`r${i}.md`))]));
+    push(listing("big", Array.from({ length: 10_001 }, (_, j) => note(`n${j}.md`))));
+    (wrapper.vm as unknown as { model: { expand(p: string): void } }).model.expand("big");
     push({ kind: "complete", entries: 20_000, source: "walk" } as TreeMessage);
     await wrapper.vm.$nextTick();
-    const ms = Number(process.hrtime.bigint()) / 1e6 - t0;
-    console.log(`20k-note tree applied and rendered in ${ms.toFixed(1)} ms`);
-    expect(ms).toBeLessThan(2000);
+    const ms = performance.now() - t0;
+    console.log(`20k-note tree (all expanded) applied and rendered in ${ms.toFixed(1)} ms`);
+    expect((wrapper.vm as unknown as { model: { rows(): unknown[] } }).model.rows().length).toBe(20_001);
     expect(wrapper.findAll('[role="treeitem"]').length).toBeLessThan(80);
+    expect(ms).toBeLessThan(2000);
+    wrapper.unmount();
+  });
+
+  it("filter: hides non-matches, keeps ancestors expanded, bolds the match; Esc clears and returns focus to the tree", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    push(listing("", [{ name: "Projects", kind: "dir", sidecar: false }, note("Alpha.md")]));
+    push(listing("Projects", [note("Roadmap.md"), note("Budget.md")]));
+    await wrapper.vm.$nextTick();
+    const input = wrapper.get('[data-testid="tree-filter"]');
+    await input.setValue("road");
+    const paths = wrapper.findAll('[role="treeitem"]').map((r) => r.attributes("data-path"));
+    expect(paths).toEqual(["Projects", "Projects/Roadmap.md"]);
+    expect(wrapper.get(".serat-tree-match").text()).toBe("Road");
+    await input.setValue("zzz");
+    expect(wrapper.get('[data-testid="tree-no-matches"]').text()).toContain("zzz");
+    await input.trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect((input.element as HTMLInputElement).value).toBe("");
+    expect(document.activeElement).toBe(wrapper.get('[role="tree"]').element);
+    wrapper.unmount();
+  });
+
+  it("Mod-F in the tree pane focuses the filter; Mod-Shift-F is left alone for global search", async () => {
+    const { ipc } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const tree = wrapper.get('[role="tree"]');
+    await tree.trigger("keydown", { key: "F", ctrlKey: true, shiftKey: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).not.toBe(wrapper.get('[data-testid="tree-filter"]').element);
+    await tree.trigger("keydown", { key: "f", ctrlKey: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="tree-filter"]').element);
+    wrapper.unmount();
+  });
+
+  it("toolbar and requestNew* emit new-note / new-folder with the focused folder", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    push(listing("", [{ name: "Projects", kind: "dir", sidecar: false }]));
+    push(listing("Projects", [note("A.md")]));
+    await wrapper.vm.$nextTick();
+    await wrapper.get('[data-testid="tree-new-note"]').trigger("click");
+    expect(wrapper.emitted("new-note")?.[0][0]).toEqual({ dir: "" });
+    await wrapper.get('[data-path="Projects"]').trigger("click"); // selects + expands
+    await wrapper.get('[data-testid="tree-new-folder"]').trigger("click");
+    expect(wrapper.emitted("new-folder")?.[0][0]).toEqual({ dir: "Projects" });
+    wrapper.unmount();
+  });
+
+  it("format glyphs, ids and aria-activedescendant; a clicked pending folder emits pending-listing, cleared when it lists", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    push(
+      listing("", [
+        { name: "Later", kind: "dir", sidecar: false },
+        { name: "doc.pdf", kind: "asset", sidecar: false },
+        { name: "pic.png", kind: "asset", sidecar: false },
+        { name: "x.bin", kind: "asset", sidecar: false },
+        note("n.md"),
+      ]),
+    );
+    await wrapper.vm.$nextTick();
+    const glyphs = wrapper.findAll(".serat-tree-glyph").map((g) => g.classes().find((c) => c.startsWith("serat-glyph-")));
+    expect(glyphs).toEqual(["serat-glyph-folder", "serat-glyph-pdf", "serat-glyph-image", "serat-glyph-file", "serat-glyph-note"]);
+    const tree = wrapper.get('[role="tree"]');
+    await tree.trigger("keydown", { key: "ArrowDown" });
+    const id = tree.attributes("aria-activedescendant");
+    expect(document.getElementById(id as string)?.getAttribute("data-path")).toBe("Later");
+    await wrapper.get('[data-path="Later"]').trigger("click");
+    expect(wrapper.emitted("pending-listing")?.at(-1)).toEqual(["Later"]);
+    push(listing("Later", [note("a.md")]));
+    await wrapper.vm.$nextTick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wrapper.emitted("pending-listing")?.at(-1)).toEqual([null]);
+    wrapper.unmount();
+  });
+
+  it("a remove message emits removed with the full path", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc } });
+    await vi.advanceTimersByTimeAsync(0);
+    push(listing("", [{ name: "d", kind: "dir", sidecar: false }]));
+    push(listing("d", [note("a.md")]));
+    push({ kind: "remove", dir: "d", name: "a.md" } as TreeMessage);
+    expect(wrapper.emitted("removed")?.[0]).toEqual(["d/a.md"]);
     wrapper.unmount();
   });
 });

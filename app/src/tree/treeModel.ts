@@ -38,6 +38,7 @@ export class TreeModel {
   private readonly dirs = new Map<string, TreeEntry[]>();
   private readonly expandedDirs = new Set<string>();
   private rowsCache: TreeRow[] | null = null;
+  private rowsCacheFilter = "";
   /** Count of non-directory entries in the model (what `TreeComplete.entries` counts). */
   fileCount = 0;
   complete: { entries: number; source: TreeSource } | null = null;
@@ -183,9 +184,17 @@ export class TreeModel {
     else this.expand(path);
   }
 
-  /** The visible rows, depth-first through expanded directories. Cached until the next change. */
-  rows(): readonly TreeRow[] {
-    if (this.rowsCache) return this.rowsCache;
+  /**
+   * The visible rows, depth-first through expanded directories. Cached until the
+   * next change. With a non-empty `filter` (the tree's own filter box,
+   * file-tree.md) only entries whose display name contains it (case-insensitive)
+   * and the folders on the way to them are kept; those ancestor folders show
+   * expanded. Only directories already listed can be searched.
+   */
+  rows(filter = ""): readonly TreeRow[] {
+    const needle = filter.trim().toLowerCase();
+    if (this.rowsCache && this.rowsCacheFilter === needle) return this.rowsCache;
+    const keep = needle ? this.filterKeepSet(needle) : null;
     const rows: TreeRow[] = [];
     const root = this.dirs.get("");
     if (root) {
@@ -202,12 +211,14 @@ export class TreeModel {
         const entry = frame.entries[frame.index];
         frame.index += 1;
         const path = childPath(frame.dir, entry.name);
+        if (keep && !keep.has(path)) continue;
         let state: RowState = "leaf";
         let children: readonly TreeEntry[] | undefined;
         if (entry.kind === "dir") {
           children = this.dirs.get(path);
           if (!children) state = "pending";
           else if (children.length === 0) state = "empty";
+          else if (keep) state = keep.get(path) === "ancestor" ? "expanded" : "collapsed";
           else state = this.expandedDirs.has(path) ? "expanded" : "collapsed";
         }
         rows.push({
@@ -225,8 +236,43 @@ export class TreeModel {
       }
     }
     this.rowsCache = rows;
+    this.rowsCacheFilter = needle;
     return rows;
   }
+
+  /** Paths to keep under a filter: matches, and the ancestors of matches (marked "ancestor"). */
+  private filterKeepSet(needle: string): Map<string, "match" | "ancestor"> {
+    const keep = new Map<string, "match" | "ancestor">();
+    for (const [dir, entries] of this.dirs) {
+      for (const entry of entries) {
+        if (!displayName(entry.name, entry.kind).toLowerCase().includes(needle)) continue;
+        const path = childPath(dir, entry.name);
+        if (!keep.has(path)) keep.set(path, "match");
+        // Walk up the path; stop at the first ancestor already recorded.
+        let at = dir;
+        while (at !== "") {
+          if (keep.get(at) === "ancestor") break;
+          keep.set(at, "ancestor");
+          const slash = at.lastIndexOf("/");
+          at = slash < 0 ? "" : at.slice(0, slash);
+        }
+      }
+    }
+    return keep;
+  }
+}
+
+/** What a row shows: a note without its `.md`. */
+export function displayName(name: string, kind: TreeEntryKind): string {
+  return kind === "note" ? name.replace(/\.md$/i, "") : name;
+}
+
+/** The first case-insensitive occurrence of `needle` in `text`, for bolding; null when absent. */
+export function matchRange(text: string, needle: string): [number, number] | null {
+  const n = needle.trim().toLowerCase();
+  if (!n) return null;
+  const at = text.toLowerCase().indexOf(n);
+  return at < 0 ? null : [at, at + n.length];
 }
 
 function countFiles(entries: readonly TreeEntry[]): number {

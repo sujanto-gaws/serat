@@ -7,7 +7,7 @@
   papered over.
 -->
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import type { Backlink } from "@/ipc/generated/Backlink";
@@ -29,6 +29,7 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
+  // `newTab` is carried for the contract's sake; there are no tabs in P1, so hosts ignore it.
   open: [payload: { path: string; block: BlockLocation | null; newTab: boolean }];
 }>();
 
@@ -43,7 +44,14 @@ type PaneState =
 const state = ref<PaneState>({ kind: "idle" });
 const focusedIndex = ref(0);
 let token = 0;
+let disposed = false;
 let unlisten: (() => void) | null = null;
+/** The path the shown state belongs to; a re-read of the same path swaps in place (no skeleton). */
+let shownPath: string | null = null;
+const root = ref<HTMLElement | null>(null);
+/** The entry just activated: it holds a 400 ms confirmation highlight (backlinks-pane.md, Interaction). */
+const confirmed = ref<Backlink | null>(null);
+let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
 function group(items: Backlink[]): Array<{ source: string; title: string; entries: Backlink[] }> {
   const order: string[] = [];
@@ -60,20 +68,28 @@ function group(items: Backlink[]): Array<{ source: string; title: string; entrie
   return order.map((k) => bySource.get(k) as { source: string; title: string; entries: Backlink[] });
 }
 
-async function load(): Promise<void> {
+/**
+ * `background`: an `index://changed` re-read of the note already shown. The old
+ * answer stays on screen and is swapped atomically when the new one lands; the
+ * skeleton is for a path change only.
+ */
+async function load(background = false): Promise<void> {
   const mine = ++token;
   const path = props.path;
   if (!path || props.missing) {
+    shownPath = null;
     state.value = { kind: "idle" };
     return;
   }
-  state.value = { kind: "loading" };
-  const floor = new Promise<void>((resolve) => setTimeout(resolve, props.minLoadingMs));
+  const keep = background && shownPath === path && (state.value.kind === "ready" || state.value.kind === "empty");
+  if (!keep) state.value = { kind: "loading" };
+  shownPath = path;
+  const floor = keep ? Promise.resolve() : new Promise<void>((resolve) => setTimeout(resolve, props.minLoadingMs));
   let result;
   try {
     [result] = await Promise.all([props.ipc.backlinks({ path }), floor]);
   } catch {
-    if (mine === token) state.value = { kind: "error" };
+    if (mine === token && !keep) state.value = { kind: "error" };
     return;
   }
   if (mine !== token) return; // a newer load superseded this one
@@ -84,7 +100,7 @@ async function load(): Promise<void> {
   } else {
     state.value = { kind: "ready", groups: group(result.value), count: result.value.length };
   }
-  focusedIndex.value = 0;
+  focusedIndex.value = keep ? Math.min(focusedIndex.value, Math.max(0, flatEntries().length - 1)) : 0;
 }
 
 watch(() => [props.path, props.missing], () => void load());
@@ -92,14 +108,17 @@ watch(() => [props.path, props.missing], () => void load());
 onMounted(() => {
   void load();
   props.ipc
-    .onIndexChanged(() => void load())
+    .onIndexChanged(() => void load(true))
     .then((off) => {
-      unlisten = off;
+      if (disposed) off(); // resolved after unmount: do not leak the listener
+      else unlisten = off;
     })
     .catch(() => undefined);
 });
 onBeforeUnmount(() => {
+  disposed = true;
   token += 1;
+  if (confirmTimer) clearTimeout(confirmTimer);
   unlisten?.();
 });
 
@@ -108,6 +127,11 @@ function flatEntries(): Backlink[] {
 }
 
 function openEntry(entry: Backlink, newTab: boolean): void {
+  confirmed.value = entry;
+  if (confirmTimer) clearTimeout(confirmTimer);
+  confirmTimer = setTimeout(() => {
+    confirmed.value = null;
+  }, 400);
   emit("open", { path: entry.source_path, block: entry.block, newTab });
 }
 
@@ -130,11 +154,37 @@ function indexOfEntry(entry: Backlink): number {
   return flatEntries().indexOf(entry);
 }
 
+function entryId(entry: Backlink): string {
+  return `serat-backlink-${indexOfEntry(entry)}`;
+}
+const activeDescendant = computed(() => {
+  const entries = flatEntries();
+  return entries.length > 0 ? `serat-backlink-${focusedIndex.value}` : undefined;
+});
+
+function onEntryClick(entry: Backlink): void {
+  focusedIndex.value = indexOfEntry(entry);
+  openEntry(entry, false);
+}
+
+function focus(): void {
+  root.value?.focus();
+}
+defineExpose({ focus });
+
 const total = (): number => (state.value.kind === "ready" ? state.value.count : 0);
 </script>
 
 <template>
-  <section class="serat-backlinks" aria-label="Backlinks" data-testid="backlinks" tabindex="0" @keydown="onKeydown">
+  <section
+    ref="root"
+    class="serat-backlinks"
+    aria-label="Backlinks"
+    data-testid="backlinks"
+    tabindex="0"
+    :aria-activedescendant="activeDescendant"
+    @keydown="onKeydown"
+  >
     <h3>Backlinks<span v-if="state.kind === 'ready'"> ({{ total() }})</span></h3>
     <p v-if="missing" class="serat-backlinks-note">This note no longer exists</p>
     <div v-else-if="state.kind === 'loading'" class="serat-backlinks-skeleton" data-testid="backlinks-loading" aria-hidden="true">
@@ -146,24 +196,32 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
       Building the index — backlinks available shortly.
     </p>
     <p v-else-if="state.kind === 'error'" class="serat-backlinks-note">Backlinks could not be read.</p>
+    <!-- One group per source note; the title labels the group and is never a bare child of a list. -->
     <div v-else-if="state.kind === 'ready'" role="list">
-      <template v-for="g in state.groups" :key="g.source">
-        <h4 class="serat-backlinks-source">{{ g.title }}</h4>
-        <div
-          v-for="(entry, i) in g.entries"
-          :key="g.source + ':' + (entry.block ? entry.block.block_id : 'fm') + ':' + i"
-          role="listitem"
-          class="serat-backlink"
-          :class="{ 'serat-backlink-focused': indexOfEntry(entry) === focusedIndex }"
-          :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
-          @click="openEntry(entry, false)"
-        >
-          <span v-if="!entry.block" class="serat-backlink-frontmatter">frontmatter</span>
-          <span v-else class="serat-backlink-excerpt"
-            ><template v-for="(seg, k) in splitSnippet(entry.excerpt)" :key="k">{{ seg.text }}</template></span
+      <div v-for="g in state.groups" :key="g.source" role="listitem" class="serat-backlinks-group">
+        <div class="serat-backlinks-source" role="presentation">{{ g.title }}</div>
+        <div role="list" :aria-label="g.title">
+          <div
+            v-for="(entry, i) in g.entries"
+            :id="entryId(entry)"
+            :key="g.source + ':' + (entry.block ? entry.block.block_id : 'fm') + ':' + i"
+            role="listitem"
+            class="serat-backlink"
+            :class="{
+              'serat-backlink-focused': indexOfEntry(entry) === focusedIndex,
+              'serat-backlink-confirmed': confirmed === entry,
+            }"
+            :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
+            @click="onEntryClick(entry)"
           >
+            <!-- TODO(#79): the contract's Backlink carries no frontmatter field key yet; shows "frontmatter" only. -->
+            <span v-if="!entry.block" class="serat-backlink-frontmatter">frontmatter</span>
+            <span v-else class="serat-backlink-excerpt"
+              ><template v-for="(seg, k) in splitSnippet(entry.excerpt)" :key="k">{{ seg.text }}</template></span
+            >
+          </div>
         </div>
-      </template>
+      </div>
     </div>
   </section>
 </template>
@@ -178,6 +236,18 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
   padding: 4px 6px;
   font-family: Georgia, serif;
   font-size: 13px;
+}
+.serat-backlink {
+  transition: background-color 200ms ease-out;
+}
+.serat-backlink-confirmed {
+  background: var(--serat-bg-selected-weak, rgba(36, 69, 126, 0.2));
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Same 400 ms hold, no fade. */
+  .serat-backlink {
+    transition: none;
+  }
 }
 .serat-backlink-focused {
   background: rgba(36, 69, 126, 0.12);

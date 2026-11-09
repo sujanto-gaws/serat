@@ -8,7 +8,7 @@
   `CodeMirrorEditor.vue` rather than driven from here.
 -->
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 
 import BacklinksPane from "@/panes/BacklinksPane.vue";
 import SearchPanel from "@/panes/SearchPanel.vue";
@@ -30,6 +30,64 @@ const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 const searchOpen = ref(false);
 const editorDirty = ref(false);
+const treeRef = ref<InstanceType<typeof FileTree> | null>(null);
+const backlinksRef = ref<InstanceType<typeof BacklinksPane> | null>(null);
+const searchRef = ref<InstanceType<typeof SearchPanel> | null>(null);
+/** Below 720 px the tree is a flyover (file-tree.md, Responsive); this is its open state. */
+const treeFlyover = ref(false);
+/** A selected folder whose listing has not arrived yet: the context pane says "Listing…". */
+const pendingListing = ref<string | null>(null);
+/** Set when the tree reports the open note was deleted (backlinks-pane.md: "This note no longer exists"). */
+const missingNote = ref<string | null>(null);
+const openNoteMissing = computed(() => missingNote.value !== null && missingNote.value === store.openNote);
+let focusBeforeSearch: HTMLElement | null = null;
+
+function onTreeRemoved(path: string): void {
+  const open = store.openNote;
+  if (open !== null && (open === path || open.startsWith(`${path}/`))) missingNote.value = open;
+}
+
+/**
+ * The tree's open event. `newTab` is ignored: there are no tabs in P1. On a narrow
+ * window the flyover closes after a selection and focus returns to the editor.
+ */
+async function onTreeOpen(payload: { path: string; newTab: boolean; keepFocus: boolean }): Promise<void> {
+  await openNote(payload.path);
+  if (treeFlyover.value && !payload.keepFocus) {
+    treeFlyover.value = false;
+    await nextTick();
+    editorRef.value?.focus();
+  }
+}
+
+/*
+ * Rename (F2) and the context menu are task #43 (tree operations). Until it
+ * lands the events are received here and do nothing, so the tree's keys have a
+ * handler to bind to; #43 replaces these two bodies. New note / new folder are the
+ * same: #43 owns the naming flow and the create commands.
+ */
+function onTreeRename(_payload: { path: string }): void {}
+function onTreeContextMenu(_payload: { path: string }): void {}
+function onTreeNewNote(_payload: { dir: string }): void {
+  store.setMark("new note: arrives with the tree operations");
+}
+function onTreeNewFolder(_payload: { dir: string }): void {
+  store.setMark("new folder: arrives with the tree operations");
+}
+
+function openSearch(): void {
+  // Open or focus; never toggles closed (search-panel.md). Esc closes.
+  if (!searchOpen.value) focusBeforeSearch = document.activeElement as HTMLElement | null;
+  searchOpen.value = true;
+  void nextTick(() => searchRef.value?.focus());
+}
+
+function closeSearch(): void {
+  searchOpen.value = false;
+  const back = focusBeforeSearch;
+  focusBeforeSearch = null;
+  void nextTick(() => (back && back.isConnected ? back.focus() : editorRef.value?.focus()));
+}
 
 /**
  * Opens `path` in the editor, optionally at a located block (backlinks and
@@ -63,11 +121,29 @@ function onInsertLink(payload: { path: string; text: string }): void {
   if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
 }
 
-/** ⌘⇧F: global, regardless of which pane has focus (search-panel.md). */
+/**
+ * Global chords (components.md §7): ⌘⇧F open/focus search, ⌘1 tree, ⌘3 backlinks,
+ * ⌘N new note, ⌘⇧N new folder. Regardless of which pane has focus.
+ */
 function onGlobalKeydown(event: KeyboardEvent): void {
-  if ((event.metaKey || event.ctrlKey) && event.shiftKey && (event.key === "F" || event.key === "f")) {
+  if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (event.shiftKey && key === "f") {
     event.preventDefault();
-    searchOpen.value = !searchOpen.value;
+    openSearch();
+  } else if (event.shiftKey && key === "n") {
+    event.preventDefault();
+    treeRef.value?.requestNewFolder();
+  } else if (!event.shiftKey && key === "n") {
+    event.preventDefault();
+    treeRef.value?.requestNewNote();
+  } else if (!event.shiftKey && key === "1") {
+    event.preventDefault();
+    treeFlyover.value = true;
+    void nextTick(() => treeRef.value?.focusTree());
+  } else if (!event.shiftKey && key === "3") {
+    event.preventDefault();
+    backlinksRef.value?.focus();
   }
 }
 
@@ -111,6 +187,7 @@ onMounted(async () => {
   window.addEventListener("keydown", onGlobalKeydown);
 
   unlistenIndexStatus = await onIndexStatus((status) => {
+    store.setVaultId(status.vault_id);
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -122,7 +199,10 @@ onMounted(async () => {
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
-  indexStatus().then((status) => store.setIndexState(status.state));
+  indexStatus().then((status) => {
+    store.setVaultId(status.vault_id);
+    store.setIndexState(status.state);
+  });
 
   if (editorRef.value) {
     // `hydrateBuffer` reads the note and installs it with `loadNote` in one
@@ -188,15 +268,24 @@ function onSaveOutcome(outcome: SaveOutcome): void {
   <header class="titlebar">
     <span class="wordmark">Serat</span>
     <span class="vault">{{ store.vaultRoot ?? "no vault" }}</span>
+    <button type="button" class="tree-toggle" aria-label="Toggle file tree" @click="treeFlyover = !treeFlyover">Files</button>
   </header>
 
-  <main class="workspace">
+  <main class="workspace" :class="{ 'tree-open': treeFlyover }">
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
+        ref="treeRef"
         :open-path="store.openNote"
         :open-dirty="editorDirty"
-        @open="(p) => openNote(p.path)"
+        :vault-id="store.vaultId"
+        @open="onTreeOpen"
         @insert-link="onInsertLink"
+        @rename="onTreeRename"
+        @context-menu="onTreeContextMenu"
+        @new-note="onTreeNewNote"
+        @new-folder="onTreeNewFolder"
+        @pending-listing="(p) => (pendingListing = p)"
+        @removed="onTreeRemoved"
       />
     </aside>
     <div class="editor-column">
@@ -209,8 +298,14 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </div>
     <aside class="pane pane-context" aria-label="Context">
-      <SearchPanel v-if="searchOpen" @open="(p) => openNote(p.path, p.block)" @close="searchOpen = false" />
-      <BacklinksPane :path="store.openNote" @open="(p) => openNote(p.path, p.block)" />
+      <p v-if="pendingListing !== null" class="listing-note" role="status" data-testid="listing-note">Listing…</p>
+      <SearchPanel ref="searchRef" v-if="searchOpen" @open="(p) => openNote(p.path, p.block)" @close="closeSearch" />
+      <BacklinksPane
+        ref="backlinksRef"
+        :path="store.openNote"
+        :missing="openNoteMissing"
+        @open="(p) => openNote(p.path, p.block)"
+      />
     </aside>
   </main>
 
