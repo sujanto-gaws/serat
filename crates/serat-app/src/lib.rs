@@ -551,15 +551,14 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 /// A window close was requested: run the bounded flush and the vault close on a thread
 /// of its own, then `destroy` the window, exactly once however many requests (or racing
 /// vault switches) there were. Returns whether the caller must `prevent_close` (the
-/// thread will close the window itself); `false` leaves the close to proceed, with
-/// `RunEvent::Exit` closing the index.
+/// thread will close the window itself); `false` (no thread could be had) leaves the
+/// close to proceed, with `RunEvent::Exit` closing the index. Whether there is a vault
+/// to close is decided on the thread, under `opening`: a request during a switch, or a
+/// second one, blocks there and then finds nothing left to do (an immediate close).
 pub(crate) fn on_close_requested(
     state: &Arc<AppState>,
     destroy: impl FnOnce() + Send + 'static,
 ) -> bool {
-    if state.vault_root().is_none() {
-        return false;
-    }
     let state = Arc::clone(state);
     std::thread::Builder::new()
         .name("serat-close".to_owned())
@@ -568,7 +567,7 @@ pub(crate) fn on_close_requested(
                 // Whoever holds `opening` runs the whole flush and close; a vault switch
                 // in progress finishes first (lock order: `opening`, then the close wait).
                 let _opening = state.lock_opening();
-                state.close_after_flush(state::CLOSING_FLUSH_DEADLINE);
+                state.close_after_flush(&_opening, state::CLOSING_FLUSH_DEADLINE);
             }
             if state.claim_window_destroy() {
                 destroy();
@@ -591,6 +590,9 @@ fn close_with_deadline(state: &Arc<AppState>, deadline: std::time::Duration) {
     let spawned = std::thread::Builder::new()
         .name("serat-exit-close".to_owned())
         .spawn(move || {
+            // Under `opening`: an exit during a vault switch waits for the switch, so the
+            // vault it installs is the one closed (architecture 3.1.1 item 8).
+            let _opening = closing.lock_opening();
             closing.close_vault();
             let _ = done.send(());
         });
