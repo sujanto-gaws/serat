@@ -99,7 +99,13 @@ PRAGMA synchronous = NORMAL;
 -- lists, so every `aliases:`/`tags:` item the old derivation skipped is a fields row.
 -- user_version 10 (task #14): index_meta.clean_close, the unclean-shutdown marker; and a note
 -- the parser refuses is indexed as a bare row (task #58) rather than skipped.
-PRAGMA user_version = 10;
+-- user_version 11 (task #66, ADR-0015 section 2 as amended): notes.size, and
+-- index_meta.caught_up_from_ms. A coarse-mtime filesystem (FAT/exFAT 2 s, some network and
+-- sync mounts) can leave a rewrite's mtime equal to the one recorded; the catch-up now also
+-- compares size, and re-hashes any file whose disk mtime is within 2 s of the start of the
+-- last completed catch-up. Residual: a same-size rewrite outside that window that keeps its
+-- mtime is not seen (A-03).
+PRAGMA user_version = 11;
 
 -- ============================================================================
 -- Tables
@@ -143,7 +149,14 @@ CREATE TABLE index_meta (
     -- mode: since task #64 every open compares each file's mtime with notes.mtime
     -- as well as the paths (ADR-0015 section 2, FR-VLT-04, A-03). It is the
     -- index's own state, re-derived by a rebuild (C-02).
-    clean_close     INTEGER NOT NULL DEFAULT 0 CHECK (clean_close IN (0, 1))
+    clean_close     INTEGER NOT NULL DEFAULT 0 CHECK (clean_close IN (0, 1)),
+    -- Unix ms, wall clock, taken before the walk of the last catch-up that COMPLETED (or of
+    -- the rebuild that built this index). The next catch-up re-hashes every file whose disk
+    -- mtime is >= this minus 2000 ms, whatever notes.mtime says: a rewrite landing in the
+    -- same coarse-mtime tick as the last indexing is otherwise invisible. Written only on
+    -- completion, so a crash mid catch-up does not advance it. 0 (a fresh index) makes
+    -- every file a candidate. The index's own state, re-derived by a rebuild (C-02).
+    caught_up_from_ms INTEGER NOT NULL DEFAULT 0
 );
 
 -- ----------------------------------------------------------------------------
@@ -195,6 +208,8 @@ CREATE TABLE notes (
     asset_path   TEXT,                     -- kind='asset': the binary this row stands for
     sidecar_path TEXT,                     -- kind='asset': the .md carrying its frontmatter
     mtime        INTEGER NOT NULL,         -- filesystem mtime at last index
+    size         INTEGER NOT NULL,         -- file size in bytes at last index; the catch-up
+                                           -- compares it with mtime (user_version 11)
     hash         TEXT    NOT NULL,         -- blake3 of file bytes; the hash gate (§3.1)
                                            -- and the stale guard (§6.1) read this
     word_count   INTEGER,

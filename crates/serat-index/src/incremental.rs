@@ -106,6 +106,23 @@ impl IndexHandle {
         self.after_unclean_shutdown
     }
 
+    /// `index_meta.caught_up_from_ms`: the wall-clock time (ms) at which the last
+    /// completed catch-up, or the rebuild that built this index, began its walk. 0 for
+    /// an index no catch-up has finished on. Diagnostic; the catch-up reads it itself.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if the database cannot be opened or the row is missing.
+    pub fn caught_up_from_ms(&self) -> Result<i64, IndexError> {
+        let conn = schema::open(&crate::index_path(&self.index_dir))?;
+        conn.query_row(
+            "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(schema::sqlite)
+    }
+
     /// A writer handle, for callers that want to submit without waiting.
     ///
     /// F-40's guard — that `submit_blocking` cannot be reached because it is off

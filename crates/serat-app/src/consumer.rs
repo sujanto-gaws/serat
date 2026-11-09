@@ -36,7 +36,7 @@
 //! a file that was created is re-added and a file that was deleted is removed again.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -427,6 +427,10 @@ pub struct Indexer {
     journal: Mutex<Option<Journal>>,
     /// The vault is closing: reconciliation reads are refused ([`Stoppable`]).
     stop: AtomicBool,
+    /// Wall-clock ms taken as the open's walk began (task #66); the catch-up records it
+    /// as `caught_up_from_ms` when it completes. 0 until a walk has started, which makes
+    /// the next catch-up hash every file: conservative, never wrong.
+    walk_started_ms: AtomicI64,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -446,6 +450,7 @@ impl Indexer {
             deferred: Mutex::new(Deferred::default()),
             journal: Mutex::new(None),
             stop: AtomicBool::new(false),
+            walk_started_ms: AtomicI64::new(0),
         }
     }
 
@@ -580,6 +585,7 @@ impl Indexer {
     }
 
     fn rescan_with(&self, reconciler: &Reconciler) {
+        let started_at_ms = serat_index::rebuild::now_ms();
         match self.vault.walk() {
             Ok(entries) => {
                 let parser = CommonMarkParser::new();
@@ -588,6 +594,7 @@ impl Indexer {
                     &parser,
                     &entries,
                     CatchUp::PathsAndMtime,
+                    started_at_ms,
                 ));
             }
             Err(_) => self.deferred().rescan = true,
@@ -637,6 +644,8 @@ impl Indexer {
     /// The open's authoritative walk is about to start: journal what the consumer
     /// handles until the catch-up has finished.
     pub fn walk_started(&self) {
+        self.walk_started_ms
+            .store(serat_index::rebuild::now_ms(), Ordering::SeqCst);
         *self.journal() = Some(Journal::default());
     }
 
@@ -674,7 +683,13 @@ impl Indexer {
         if self.unclean() {
             eprintln!("serat: the previous session did not close cleanly; comparing mtimes");
         }
-        self.settle(reconciler.catch_up(&self.source(), &parser, entries, CatchUp::PathsAndMtime));
+        self.settle(reconciler.catch_up(
+            &self.source(),
+            &parser,
+            entries,
+            CatchUp::PathsAndMtime,
+            self.walk_started_ms.load(Ordering::SeqCst),
+        ));
         self.replay_journal(&reconciler);
     }
 
@@ -1035,6 +1050,7 @@ mod tests {
                 &parser,
                 &walk(&indexer),
                 CatchUp::PathsAndMtime,
+                0,
             )
             .expect("catch-up");
         assert_eq!(outcome.removed, 0, "nothing removed");

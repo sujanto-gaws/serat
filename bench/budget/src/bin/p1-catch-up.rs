@@ -122,6 +122,7 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!("rebuilt in {:.1} s", started.elapsed().as_secs_f64());
     let handle = IndexHandle::open(&work).map_err(|e| e.to_string())?;
     let reconciler = Reconciler::new(&handle);
+    let started_at_ms = serat_index::rebuild::now_ms();
     let entries = vault.walk().map_err(|e| e.to_string())?;
     for (label, mode) in [(
         "catch_up PathsAndMtime (every open)",
@@ -131,7 +132,7 @@ fn run(args: &[String]) -> Result<(), String> {
         for _ in 0..passes {
             let started = Instant::now();
             let outcome = reconciler
-                .catch_up(&vault, &parser, &entries, mode)
+                .catch_up(&vault, &parser, &entries, mode, started_at_ms)
                 .map_err(|e| e.to_string())?;
             samples.push(started.elapsed());
             if outcome.changed() {
@@ -150,7 +151,13 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let started = Instant::now();
     let outcome = reconciler
-        .catch_up(&vault, &parser, &entries, CatchUp::PathsAndMtime)
+        .catch_up(
+            &vault,
+            &parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            started_at_ms,
+        )
         .map_err(|e| e.to_string())?;
     let elapsed = started.elapsed();
     if outcome.upserted != 0 || outcome.touched != entries.len() {

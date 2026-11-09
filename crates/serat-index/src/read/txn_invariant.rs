@@ -38,9 +38,9 @@ fn db() -> (tempfile::TempDir, std::path::PathBuf) {
     let conn = schema::open(&path).expect("open");
     schema::bootstrap(&conn).expect("bootstrap");
     conn.execute_batch(
-        "INSERT INTO notes (path, file_name, path_fold, file_name_fold, title, kind, type, mtime, hash)
-         VALUES ('a.md', 'a.md', 'a.md', 'a.md', 'A', 'note', 'note', 0, 'h'),
-                ('b.md', 'b.md', 'b.md', 'b.md', 'B', 'note', 'note', 0, 'h2');
+        "INSERT INTO notes (path, file_name, path_fold, file_name_fold, title, kind, type, mtime, size, hash)
+         VALUES ('a.md', 'a.md', 'a.md', 'a.md', 'A', 'note', 'note', 0, 0, 'h'),
+                ('b.md', 'b.md', 'b.md', 'b.md', 'B', 'note', 'note', 0, 0, 'h2');
          INSERT INTO blocks (note_id, ord, kind, text, byte_start, byte_end)
          SELECT 1, i, 'para', 'commonword filler ' || i, 0, 1
            FROM (WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)

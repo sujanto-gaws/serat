@@ -63,7 +63,9 @@ enum Command {
     /// Run ANALYZE now, regardless of what the batch counter says.
     Analyze(SyncSender<Result<(), IndexError>>),
     /// Mark the index ready and record the vault it was built from.
-    MarkReady(String, SyncSender<Result<(), IndexError>>),
+    MarkReady(String, i64, SyncSender<Result<(), IndexError>>),
+    /// Record that a catch-up that began at this wall-clock time (ms) has completed.
+    CaughtUp(i64, SyncSender<Result<(), IndexError>>),
     /// Capture and drop the blocks_fts triggers and ix_links_unresolved before a bulk
     /// load (F-373).
     BeginBulkLoad(SyncSender<Result<Vec<String>, IndexError>>),
@@ -229,8 +231,19 @@ impl WriterHandle {
     /// # Errors
     ///
     /// As [`WriterHandle::analyze`].
-    pub fn mark_ready(&self, vault_root: &str) -> Result<(), IndexError> {
-        self.round_trip(|reply| Command::MarkReady(vault_root.to_owned(), reply))
+    pub fn mark_ready(&self, vault_root: &str, caught_up_from_ms: i64) -> Result<(), IndexError> {
+        self.round_trip(|reply| Command::MarkReady(vault_root.to_owned(), caught_up_from_ms, reply))
+    }
+
+    /// Commit everything queued, then record `index_meta.caught_up_from_ms`: the one
+    /// UPDATE that ends a catch-up that ran to completion (task #66). Call it only
+    /// then; a catch-up that did not finish must not advance the window.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriterHandle::analyze`].
+    pub fn set_caught_up_from(&self, started_at_ms: i64) -> Result<(), IndexError> {
+        self.round_trip(|reply| Command::CaughtUp(started_at_ms, reply))
     }
 }
 
@@ -510,7 +523,10 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             Command::Apply(op) => pending.push(*op),
             Command::Flush(reply) => barrier = Some((reply, Barrier::None)),
             Command::Analyze(reply) => barrier = Some((reply, Barrier::Analyze)),
-            Command::MarkReady(root, reply) => barrier = Some((reply, Barrier::MarkReady(root))),
+            Command::MarkReady(root, from, reply) => {
+                barrier = Some((reply, Barrier::MarkReady(root, from)));
+            }
+            Command::CaughtUp(from, reply) => barrier = Some((reply, Barrier::CaughtUp(from))),
             // These three answer with something other than `()`, so they are handled
             // here and not through the Barrier path. Each drains the batch first, and
             // only one of the three drains is load-bearing — which is worth naming,
@@ -625,8 +641,11 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 Ok(Command::Apply(op)) => pending.push(*op),
                 Ok(Command::Flush(reply)) => barrier = Some((reply, Barrier::None)),
                 Ok(Command::Analyze(reply)) => barrier = Some((reply, Barrier::Analyze)),
-                Ok(Command::MarkReady(root, reply)) => {
-                    barrier = Some((reply, Barrier::MarkReady(root)));
+                Ok(Command::MarkReady(root, from, reply)) => {
+                    barrier = Some((reply, Barrier::MarkReady(root, from)));
+                }
+                Ok(Command::CaughtUp(from, reply)) => {
+                    barrier = Some((reply, Barrier::CaughtUp(from)));
                 }
                 Ok(Command::Stop) => {
                     let _ = commit(
@@ -661,7 +680,14 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 result = match &extra {
                     Barrier::None => Ok(()),
                     Barrier::Analyze => analyze(&conn, &mut since_analyze),
-                    Barrier::MarkReady(root) => mark_ready(&conn, root),
+                    Barrier::MarkReady(root, from) => mark_ready(&conn, root, *from),
+                    Barrier::CaughtUp(from) => conn
+                        .execute(
+                            "UPDATE index_meta SET caught_up_from_ms = ?1 WHERE id = 1",
+                            [from],
+                        )
+                        .map(|_| ())
+                        .map_err(sqlite),
                 };
             }
             // A receiver that has gone away means the caller stopped waiting; that is
@@ -808,7 +834,8 @@ fn pair_sidecars(conn: &Connection) -> Result<(), IndexError> {
 enum Barrier {
     None,
     Analyze,
-    MarkReady(String),
+    MarkReady(String, i64),
+    CaughtUp(i64),
 }
 
 /// Makes an actor's next commit fail once, so a test can reach the code that runs
@@ -926,10 +953,14 @@ fn analyze(conn: &Connection, since_analyze: &mut usize) -> Result<(), IndexErro
     Ok(())
 }
 
-fn mark_ready(conn: &Connection, vault_root: &str) -> Result<(), IndexError> {
+fn mark_ready(
+    conn: &Connection,
+    vault_root: &str,
+    caught_up_from_ms: i64,
+) -> Result<(), IndexError> {
     let tx = conn.unchecked_transaction().map_err(sqlite)?;
     apply::sync_note_count(&tx)?;
-    apply::mark_ready(&tx, vault_root)?;
+    apply::mark_ready(&tx, vault_root, caught_up_from_ms)?;
     tx.commit().map_err(sqlite)
 }
 

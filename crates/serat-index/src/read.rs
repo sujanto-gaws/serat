@@ -953,8 +953,8 @@ mod tests {
         let conn = schema::open(&path).expect("open");
         schema::bootstrap(&conn).expect("bootstrap");
         conn.execute(
-            "INSERT INTO notes (path, file_name, path_fold, file_name_fold, title, kind, mtime, hash)
-             VALUES ('a.md', 'a.md', 'a.md', 'a.md', 'A', 'note', 0, 'h')",
+            "INSERT INTO notes (path, file_name, path_fold, file_name_fold, title, kind, mtime, size, hash)
+             VALUES ('a.md', 'a.md', 'a.md', 'a.md', 'A', 'note', 0, 0, 'h')",
             [],
         )
         .expect("note");

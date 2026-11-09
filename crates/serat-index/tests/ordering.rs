@@ -263,7 +263,7 @@ fn the_index_is_not_marked_ready_while_its_triggers_are_off() {
     );
 
     writer.end_bulk_load(triggers).expect("end");
-    writer.mark_ready("vault").expect("ready");
+    writer.mark_ready("vault", 0).expect("ready");
     actor.shutdown().expect("shutdown");
 
     assert_eq!(

@@ -12,11 +12,11 @@ fn fixture() -> Connection {
     let conn = schema::open_in_memory().expect("open");
     schema::bootstrap(&conn).expect("bootstrap");
     conn.execute_batch(
-        "INSERT INTO notes(id, path, title, kind, mtime, hash) VALUES
-           (1, 'projects/Roadmap.md', 'Product roadmap', 'note', 0, 'h'),
-           (2, 'daily/2026-08-12.md', '2026-08-12', 'note', 0, 'h'),
-           (3, 'refs/report.pdf', 'report.pdf', 'asset', 0, 'h'),
-           (4, 'archive/Roadmap.md', NULL, 'note', 0, 'h');
+        "INSERT INTO notes(id, path, title, kind, mtime, size, hash) VALUES
+           (1, 'projects/Roadmap.md', 'Product roadmap', 'note', 0, 0, 'h'),
+           (2, 'daily/2026-08-12.md', '2026-08-12', 'note', 0, 0, 'h'),
+           (3, 'refs/report.pdf', 'report.pdf', 'asset', 0, 0, 'h'),
+           (4, 'archive/Roadmap.md', NULL, 'note', 0, 0, 'h');
          INSERT INTO blocks(id, note_id, ord, kind, text, byte_start, byte_end) VALUES
            (10, 1, 0, 'heading', 'Q3 goals', 40, 50),
            (11, 1, 1, 'para', 'not a heading', 51, 70),
