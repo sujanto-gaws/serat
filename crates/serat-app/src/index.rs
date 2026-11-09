@@ -76,6 +76,9 @@ pub struct StatusPublisher<S> {
     /// The checkpointer's facts, once the vault's `IndexHandle` exists (task #56). Set
     /// by [`IndexActor::spawn`]'s thread; read, as atomics, whenever a status is built.
     wal: Mutex<Option<Arc<serat_index::WalHealth>>>,
+    /// Set when the open that created this publisher failed after `vault://opened` had
+    /// announced its id (task #90): nothing may carry that id afterwards.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -141,6 +144,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             observer: Mutex::new(None),
             refusals: None,
             wal: Mutex::new(None),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -232,11 +236,28 @@ impl<S: StatusSink> StatusPublisher<S> {
         &self.vault_id
     }
 
+    /// Stop emitting for good: the open this belongs to failed (task #90). Statuses
+    /// already in flight on another thread are not recalled; the caller joins the actor
+    /// after retiring, so none can start afterwards.
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`StatusPublisher::retire`] has been called.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Emit the current state again, unthrottled, so a fact that is not part of the
     /// state -- the refused-name count, which the walk changes while the state stays
     /// `Ready` -- reaches a front end that only listens (invalidation, not proof:
     /// `index_status()` is still what establishes it).
     pub fn re_emit(&self) {
+        if self.is_retired() {
+            return;
+        }
         let status = self.status();
         self.lock().last_emit = Some(Instant::now());
         self.sink.emit(&status);
@@ -252,6 +273,9 @@ impl<S: StatusSink> StatusPublisher<S> {
     ///
     /// Returns whether an event was emitted, which is what the throttle test asserts.
     pub fn publish(&self, state: IndexState) -> bool {
+        if self.is_retired() {
+            return false;
+        }
         let now_ms = self.startup.elapsed_ms() as u64;
 
         // Before the throttle, and outside the state lock: the observer records facts
@@ -291,6 +315,9 @@ impl<S: StatusSink> StatusPublisher<S> {
         // Emitted outside the lock. Holding it across the IPC bridge would let a slow
         // front end block `index_status()`, which is the one thing this type promises
         // it cannot do.
+        if self.is_retired() {
+            return false;
+        }
         self.sink.emit(&status);
         true
     }

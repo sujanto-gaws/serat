@@ -267,6 +267,44 @@ struct OpenVault {
 /// reconciliation, which refuses further reads once the close has begun).
 const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The fallible steps of `open_vault_with` after `vault://opened`, one per `?`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailAt {
+    Switcher,
+    IndexActor,
+    VaultThread,
+}
+
+/// What a failed open owes (task #90): once `vault://opened` has announced the id, an
+/// open that returns `Err` must leave nothing that can carry it. Armed from the
+/// publisher's creation, disarmed only by [`OpenAttempt::commit`] at the `replace`.
+/// Retire first, then join the actor: after the join no status can be mid-emit and the
+/// actor has closed its handle, so a re-open never meets a second writer on `index.db`.
+struct OpenAttempt {
+    publisher: Arc<Publisher>,
+    actor: Option<IndexActor>,
+    armed: bool,
+}
+
+impl OpenAttempt {
+    fn commit(mut self) -> Option<IndexActor> {
+        self.armed = false;
+        self.actor.take()
+    }
+}
+
+impl Drop for OpenAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.publisher.retire();
+            if let Some(actor) = self.actor.as_mut() {
+                actor.join();
+            }
+        }
+    }
+}
+
 /// Test seams on the open path, so the orderings §3.4 states can be forced.
 #[derive(Default, Clone)]
 pub(crate) struct OpenHooks {
@@ -275,10 +313,20 @@ pub(crate) struct OpenHooks {
     /// Called when the open's authoritative walk is about to start, with who runs it:
     /// `"tree"` (the stream's walk) or `"standalone"` (the application's trigger).
     pub(crate) on_walk_start: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
-    /// Fail the open at the point the switcher is built, i.e. after `vault://opened`
-    /// has been emitted (task #90's "emit, then a spawn fails").
+    /// Fail the open at one of the three fallible steps after `vault://opened`
+    /// (task #90's "emit, then a spawn fails"): the seam sits at that step's own `?`.
     #[cfg(test)]
-    pub(crate) fail_after_announce: bool,
+    pub(crate) fail_at: Option<FailAt>,
+    /// Called with the new vault id right after `IndexActor::spawn` returned.
+    #[cfg(test)]
+    pub(crate) after_index_spawn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Called with the new vault id right after `VaultThread::spawn_with` returned.
+    #[cfg(test)]
+    pub(crate) after_vault_spawn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Receives the open's publisher as soon as it exists, so a test can inspect it
+    /// after the open has failed and dropped everything else.
+    #[cfg(test)]
+    pub(crate) publisher_probe: Option<Arc<Mutex<Option<Arc<Publisher>>>>>,
 }
 
 impl OpenVault {
@@ -549,6 +597,18 @@ impl AppState {
 
     // -- commands -----------------------------------------------------------
 
+    /// The test seam for one fallible step of the open.
+    #[cfg(test)]
+    fn inject(&self, at: FailAt, root: &std::path::Path) -> Result<(), IpcError> {
+        if self.hooks.fail_at == Some(at) {
+            return Err(IpcError::Io {
+                path: root.display().to_string(),
+                message: format!("injected failure at {at:?} after vault://opened"),
+            });
+        }
+        Ok(())
+    }
+
     /// `open_vault`. FR-VLT-01, FR-VLT-02, NFR-PRF-01.
     ///
     /// Returns as soon as the root is canonicalised and readable. It does not wait for
@@ -604,13 +664,6 @@ impl AppState {
             vault_id: vault_id.clone(),
             index: IndexState::Opening,
         });
-        #[cfg(test)]
-        if self.hooks.fail_after_announce {
-            return Err(IpcError::Io {
-                path: root.display().to_string(),
-                message: "injected failure after vault://opened".into(),
-            });
-        }
         let publisher = Arc::new(
             Publisher::new(
                 vault_id.clone(),
@@ -621,6 +674,15 @@ impl AppState {
             // status, so "N names not shown" is a fact of the status, not a second poll.
             .with_refusals(vault.refusals().clone()),
         );
+        #[cfg(test)]
+        if let Some(probe) = &self.hooks.publisher_probe {
+            *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
+        }
+        let mut attempt = OpenAttempt {
+            publisher: Arc::clone(&publisher),
+            actor: None,
+            armed: true,
+        };
 
         // §3.4's first `t_usable` precondition: the vault is not usable until the open
         // check has finished and the index state is *known*. The actor tells us by
@@ -630,6 +692,8 @@ impl AppState {
         let catch_up_gate = Arc::new(OpenCatchUp::new(SETTLE_BOUND, TREE_GRACE));
         let publishing = Arc::clone(&catch_up_gate);
         let tree_paths = Arc::new(TreePaths::default());
+        #[cfg(test)]
+        self.inject(FailAt::Switcher, &root)?;
         let switcher = Switcher::new(
             Arc::clone(&vault),
             serat_index::index_path(&index_dir_for(&root)),
@@ -649,17 +713,26 @@ impl AppState {
         });
 
         let epoch = crate::index::HandleEpoch::default();
-        let (index, index_handle) = IndexActor::spawn(
+        #[cfg(test)]
+        self.inject(FailAt::IndexActor, &root)?;
+        let spawned = IndexActor::spawn(
             Arc::clone(&publisher),
             opener,
             root.clone(),
             index_dir_for(&root),
             Arc::clone(&epoch),
-        )
-        .map_err(|err| IpcError::Io {
+        );
+        // Immediately after the spawn, before its `?`, so no later statement can sit
+        // between the thread starting and this point (the ordering test's hold).
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.after_index_spawn {
+            hook(&vault_id);
+        }
+        let (index, index_handle) = spawned.map_err(|err| IpcError::Io {
             path: root.display().to_string(),
             message: format!("could not start the index thread: {err}"),
         })?;
+        attempt.actor = Some(index);
 
         // §3.4 puts the walk off the critical path; measured, being on another thread
         // is not enough to achieve that (see `crate::vault`). The tree's gate holds the
@@ -789,7 +862,9 @@ impl AppState {
         // ADR-0015 section 2 as amended (task #78): the catch-up window starts at the
         // wall-clock time taken immediately before the watcher is armed.
         indexer.window_opened(serat_index::rebuild::now_ms());
-        let walk = VaultThread::spawn_with(
+        #[cfg(test)]
+        self.inject(FailAt::VaultThread, &root)?;
+        let spawned = VaultThread::spawn_with(
             Arc::clone(&vault),
             move |stage| {
                 if let Some(hook) = &stage_hook {
@@ -810,8 +885,12 @@ impl AppState {
                 }
             },
             Some(live),
-        )
-        .map_err(|err| IpcError::Io {
+        );
+        #[cfg(test)]
+        if let Some(hook) = &self.hooks.after_vault_spawn {
+            hook(&vault_id);
+        }
+        let walk = spawned.map_err(|err| IpcError::Io {
             path: root.display().to_string(),
             message: format!("could not start the vault thread: {err}"),
         })?;
@@ -878,7 +957,7 @@ impl AppState {
         let previous = self.open_lock_mut().replace(OpenVault {
             vault,
             publisher,
-            _index: index,
+            _index: attempt.commit().expect("the actor was spawned"),
             indexer,
             switcher,
             index_handle,
@@ -4735,29 +4814,55 @@ mod tests {
 
     type EventLog = Arc<Mutex<Vec<(&'static str, String)>>>;
 
+    fn logged(log: &EventLog, kind: &str, id: &str) -> bool {
+        log.lock()
+            .expect("log")
+            .iter()
+            .any(|(k, i)| *k == kind && i == id)
+    }
+
+    /// An opener whose first act is to publish `Rebuilding`, so the actor's first
+    /// status is on its way the moment its thread starts; then the real open.
+    struct Announcing(SeratIndexOpen);
+
+    impl IndexOpen for Announcing {
+        fn open(&mut self, root: &Path, dir: &Path, publish: &dyn Fn(IndexState)) {
+            publish(IndexState::Rebuilding {
+                reason: RebuildReason::NoIndex,
+                done: 0,
+                total: 1,
+                walk_complete: false,
+            });
+            self.0.open(root, dir, publish);
+        }
+
+        fn into_handle(self) -> Option<serat_index::IndexHandle> {
+            self.0.into_handle()
+        }
+    }
+
     /// Every event kind with the vault id it carries, in emission order. `app://closing`
     /// is acked from inside the sink so a switch with an open note does not wait.
-    fn log_all_events(state: &Arc<AppState>, with_opened: bool) -> EventLog {
-        let log: EventLog = Arc::default();
-        let l = Arc::clone(&log);
+    fn log_all_events(state: &Arc<AppState>, log: &EventLog, with_opened: bool) {
+        let l = Arc::clone(log);
         state.events.install(move |s| {
             l.lock()
                 .expect("log")
                 .push(("index://status", s.vault_id.clone()));
         });
-        let l = Arc::clone(&log);
+        let l = Arc::clone(log);
         state.events.install_tree_status(move |s| {
             l.lock()
                 .expect("log")
                 .push(("tree://status", s.vault_id.clone()));
         });
-        let l = Arc::clone(&log);
+        let l = Arc::clone(log);
         state.events.install_changed(move |e| {
             l.lock()
                 .expect("log")
                 .push(("index://changed", e.vault_id.clone()));
         });
-        let l = Arc::clone(&log);
+        let l = Arc::clone(log);
         state.events.install_external(move |e| {
             let id = match e {
                 crate::ipc::ExternalChange::Changed { vault_id, .. }
@@ -4766,14 +4871,14 @@ mod tests {
             l.lock().expect("log").push(("note://external-change", id));
         });
         if with_opened {
-            let l = Arc::clone(&log);
+            let l = Arc::clone(log);
             state.events.install_opened(move |o| {
                 l.lock()
                     .expect("log")
                     .push(("vault://opened", o.vault_id.clone()));
             });
         }
-        let l = Arc::clone(&log);
+        let l = Arc::clone(log);
         let acker = Arc::clone(state);
         state.events.install_closing(move |c| {
             l.lock()
@@ -4783,15 +4888,15 @@ mod tests {
                 vault_id: c.vault_id.clone(),
             });
         });
-        log
     }
 
     fn switch_state(
         name: &str,
-        hooks: OpenHooks,
+        hooks: impl FnOnce(&EventLog) -> OpenHooks,
         with_opened: bool,
     ) -> (Arc<AppState>, EventLog, PathBuf, PathBuf) {
         let (a, b) = (fixture(&format!("{name}-a")), fixture(&format!("{name}-b")));
+        let log: EventLog = Arc::default();
         let state = Arc::new(
             AppState::with_settings(
                 Arc::new(Startup::begin()),
@@ -4799,21 +4904,58 @@ mod tests {
                 Settings::default(),
             )
             .with_walk_gate(Duration::ZERO)
-            .with_open_hooks(hooks),
+            .with_open_hooks(hooks(&log)),
         );
-        let log = log_all_events(&state, with_opened);
+        log_all_events(&state, &log, with_opened);
         (state, log, a, b)
     }
 
     fn open_dir(state: &AppState, dir: &Path) -> Result<VaultOpened, IpcError> {
-        state.open_vault(OpenVaultArgs {
-            root: dir.display().to_string(),
-        })
+        state.open_vault_with(
+            OpenVaultArgs {
+                root: dir.display().to_string(),
+            },
+            Announcing(SeratIndexOpen::default()),
+        )
     }
 
+    /// Hooks that, for the vault "v2" only, hold the open thread right after the given
+    /// spawn until the actor's first `index://status` for "v2" is in the log. Then the
+    /// race the ordering test needs is not a race: an emit placed after that spawn
+    /// loses every time, because the status is already logged when the emit comes.
+    fn hold_until_first_status(log: &EventLog) -> OpenHooks {
+        let hold = |log: &EventLog| -> Arc<dyn Fn(&str) + Send + Sync> {
+            let log = Arc::clone(log);
+            Arc::new(move |id: &str| {
+                if id == "v2" {
+                    wait_until("the actor's first status for v2", || {
+                        logged(&log, "index://status", "v2")
+                    });
+                }
+            })
+        };
+        OpenHooks {
+            after_index_spawn: Some(hold(log)),
+            after_vault_spawn: Some(hold(log)),
+            ..OpenHooks::default()
+        }
+    }
+
+    // Mutation check, run by hand on this commit (each moves the one `emit_opened`
+    // call in `open_vault_with`):
+    //   after Publisher::new ........... passes: equivalent, nothing can carry the id yet
+    //   after Switcher::new ............ passes: equivalent, same reason
+    //   after IndexActor::spawn ........ FAILS every time (hold hook: the actor's first
+    //                                    status is logged before the emit comes)
+    //   after VaultThread::spawn_with .. FAILS every time (same)
+    //   after the `replace` ............ FAILS
+    // `tree://status` is deliberately absent from the required kinds: it is emitted only
+    // when the tree stream gives up after MAX_RESTARTS poisoned sessions, which no seam
+    // reaches here. Its id comes from the same mint and its closure is built after the
+    // emit, so the emit-point argument covers it; it is not proven by this test.
     #[test]
     fn vault_opened_precedes_every_event_carrying_the_new_id_and_the_old_id_never_follows_it() {
-        let (state, log, a, b) = switch_state("opened-order", OpenHooks::default(), true);
+        let (state, log, a, b) = switch_state("opened-order", hold_until_first_status, true);
         let first = open_dir(&state, &a).expect("open A");
         wait_ready(&state);
         open_note(&state);
@@ -4849,20 +4991,16 @@ mod tests {
                 assert_ne!(*id, a_id, "{kind} carries the old id after opened: {log:?}");
             }
         }
-        assert!(
-            log.iter()
-                .any(|(k, id)| *k == "index://status" && *id == b_id),
-            "{log:?}"
-        );
+        for kind in ["index://status", "index://changed", "app://closing"] {
+            assert!(
+                log.iter().any(|(k, id)| *k == kind && *id == b_id),
+                "no {kind} for B in the run, so the ordering of it was not tested: {log:?}"
+            );
+        }
         assert!(
             log.iter()
                 .any(|(k, id)| *k == "app://closing" && *id == a_id),
             "A's closing event is part of the run: {log:?}"
-        );
-        assert!(
-            log.iter()
-                .any(|(k, id)| *k == "app://closing" && *id == b_id),
-            "B's closing event follows its announcement: {log:?}"
         );
         assert_eq!(
             log.iter().filter(|(k, _)| *k == "vault://opened").count(),
@@ -4873,39 +5011,80 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_open_after_vault_opened_leaves_no_vault_and_no_event_with_the_announced_id() {
-        let hooks = OpenHooks {
-            fail_after_announce: true,
-            ..OpenHooks::default()
-        };
-        let (state, log, a, _b) = switch_state("opened-fails", hooks, true);
-        let err = open_dir(&state, &a).expect_err("the open fails after the emit");
-        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
-        assert!(state.vault_root().is_none(), "no vault is open");
-        let announced = log
-            .lock()
-            .expect("log")
-            .iter()
-            .find(|(k, _)| *k == "vault://opened")
-            .map(|(_, id)| id.clone())
-            .expect("the announcement was made");
-        std::thread::sleep(Duration::from_millis(300));
-        let seen = log.lock().expect("log").clone();
-        assert!(
-            seen.iter()
-                .all(|(k, id)| *k == "vault://opened" || *id != announced),
-            "something carried the announced id: {seen:?}"
-        );
-        assert_eq!(state.index_status().vault_id, "", "no vault is reporting");
-        let _ = std::fs::remove_dir_all(&a);
+    fn a_failed_open_after_vault_opened_retires_everything_that_could_carry_the_id() {
+        // One run per `?` after the announcement (task #90, review B1).
+        for at in [FailAt::Switcher, FailAt::IndexActor, FailAt::VaultThread] {
+            let probe: Arc<Mutex<Option<Arc<Publisher>>>> = Arc::default();
+            let hooked = Arc::clone(&probe);
+            let (state, log, a, _b) = switch_state(
+                &format!("opened-fails-{at:?}"),
+                move |_| OpenHooks {
+                    fail_at: Some(at),
+                    publisher_probe: Some(hooked),
+                    ..OpenHooks::default()
+                },
+                true,
+            );
+            let err = open_dir(&state, &a).expect_err("the open fails after the emit");
+            assert!(matches!(err, IpcError::Io { .. }), "{at:?}: {err:?}");
+            assert!(state.vault_root().is_none(), "{at:?}: no vault is open");
+            assert_eq!(
+                state.index_status().vault_id,
+                "",
+                "{at:?}: no vault reports"
+            );
+            let announced = log
+                .lock()
+                .expect("log")
+                .iter()
+                .find(|(k, _)| *k == "vault://opened")
+                .map(|(_, id)| id.clone())
+                .expect("the announcement was made");
+
+            // Positive, not timing: the publisher is retired, and a publish on it now
+            // reaches nobody. The actor was joined before `open_vault_with` returned, so
+            // nothing is mid-emit either.
+            let publisher = probe.lock().expect("probe").clone();
+            let publisher = publisher.unwrap_or_else(|| panic!("{at:?}: a publisher existed"));
+            assert!(publisher.is_retired(), "{at:?}");
+            let before = log.lock().expect("log").len();
+            assert!(!publisher.publish(IndexState::Ready { note_count: 1 }));
+            publisher.re_emit();
+            assert_eq!(log.lock().expect("log").len(), before, "{at:?}");
+            assert!(
+                log.lock()
+                    .expect("log")
+                    .iter()
+                    .skip_while(|(k, _)| *k != "vault://opened")
+                    .skip(1)
+                    .all(|(k, id)| *id != announced || *k == "index://status"),
+                "{at:?}: only the actor's own status may fall in the window before Err"
+            );
+
+            // Nothing holds `index.db`: the same root opens again with a fresh id.
+            // `FailAt` is cleared by building the retry on a new state, so this is the
+            // same-root reopen on a process that still has the failed attempt's files.
+            let retry = AppState::with_settings(
+                Arc::new(Startup::begin()),
+                Boot::default(),
+                Settings::default(),
+            )
+            .with_walk_gate(Duration::ZERO);
+            let ok = open_dir(&retry, &a).expect("a re-open works");
+            wait_ready(&retry);
+            assert_eq!(retry.index_status().vault_id, ok.vault_id);
+            retry.close_vault();
+            let _ = std::fs::remove_dir_all(&a);
+        }
     }
 
     #[test]
     fn the_boot_info_carries_the_id_the_first_index_status_reports() {
-        // `setup` builds `BootInfo` from the boot open's `VaultOpened` and installs the
-        // `vault://opened` sink only afterwards; this builds it the same way (no opened
-        // sink) and checks the id is the one the index reports (FR-VLT-04).
-        let (state, log, a, _b) = switch_state("opened-boot", OpenHooks::default(), false);
+        // Mirrors lib.rs `setup`: step 2 (`state.open_vault(..)`, keeping `opened.root`
+        // and `opened.vault_id`) and the `BootInfo { vault, vault_id, open, .. }` it
+        // serialises. `setup` installs the `vault://opened` sink after the boot open, so
+        // here none is installed either (FR-VLT-04).
+        let (state, log, a, _b) = switch_state("opened-boot", |_| OpenHooks::default(), false);
         let opened = open_dir(&state, &a).expect("boot open");
         let boot = crate::ipc::BootInfo {
             vault: Some(opened.root),
