@@ -16,11 +16,11 @@ use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::ipc::{
-    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
-    GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError, MarkTreeArgs,
-    NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadFileArgs, RebaseBufferArgs,
-    RefusedName, ReadAssetRangeArgs, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
-    TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError,
+    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
+    ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome,
+    SetKeybindingArgs, SetLivePreviewArgs, TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;

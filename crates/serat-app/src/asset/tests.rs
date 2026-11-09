@@ -1152,7 +1152,7 @@ fn asset_info_reports_mime_size_viewability_and_the_byte_exact_sidecar() {
 
     let zip = super::info(&fx.vault, &vp("docs/z.zip")).unwrap();
     assert!(!zip.viewable);
-    assert_eq!(zip.mime, "application/octet-stream");
+    assert_eq!(zip.mime, "application/zip");
 }
 
 #[test]

@@ -100,4 +100,9 @@ describe("the IPC client stays inside ADR-0012's grant", () => {
     // wrapper: the note above the wrappers may discuss it, an invoke may not.
     expect(clientSource).not.toMatch(/invoke\(\s*"open_vault"/);
   });
+
+  it("wraps both asset commands (FR-BIN-01, ADR-0017) and both are granted", () => {
+    expect(invokedCommands()).toEqual(expect.arrayContaining(["asset_info", "read_asset_range"]));
+    expect(grantedCommands()).toEqual(expect.arrayContaining(["asset_info", "read_asset_range"]));
+  });
 });

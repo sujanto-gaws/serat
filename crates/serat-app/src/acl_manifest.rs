@@ -220,6 +220,8 @@ mod tests {
             "save_patch",
             "request_external_diff",
             "rebase_buffer",
+            "asset_info",
+            "read_asset_range",
         ]
         .into_iter()
         .map(str::to_owned)

@@ -34,12 +34,12 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
-    GitignoreAppended, GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexState, IndexStatus, IpcError,
     KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs, NotePathArgs,
-    OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadFileArgs, RebaseBufferArgs, RefusedName,
-    ReadAssetRangeArgs, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, TreeStatus,
-    UiSettings, VaultOpened, WriteFileArgs,
+    OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs,
+    RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
+    TreeStatus, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
