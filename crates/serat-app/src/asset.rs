@@ -644,6 +644,9 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
         bytes: opened.size,
         viewable: is_viewable(mime),
         sidecar_path: sidecar_of(vault, path),
+        // Contract ahead of implementation (task #94, ADR-0017 Amendment 1): the
+        // follow-up sets Some(opened.etag) and checks ReadAssetRangeArgs::if_match.
+        etag: None,
     })
 }
 
