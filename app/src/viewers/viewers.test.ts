@@ -156,6 +156,21 @@ describe("ViewerHost states (binary-viewers.md)", () => {
     vi.useRealTimers();
   });
 
+  it("a restart whose asset_info shows the same size is the error state, not another load", async () => {
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000 }));
+    const loads: Array<() => void> = [];
+    const loader = vi.fn(async (_p: string, _l: number, hooks: { onChanged: () => void }) => {
+      loads.push(hooks.onChanged);
+      return new Promise<PdfDocumentHandle>(() => {});
+    });
+    const w = mount(ViewerHost, { props: { path: "d/x.pdf", pdfLoader: loader } });
+    await flushPromises();
+    loads[0]();
+    await flushPromises();
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(w.find('[data-testid="viewer-error"]').exists()).toBe(true);
+  });
+
   it("a path the URL builder refuses never reaches an <img>", async () => {
     assetInfo.mockResolvedValue(info({ path: ".serat/x.png" }));
     const w = mount(ViewerHost, { props: { path: ".serat/x.png" } });

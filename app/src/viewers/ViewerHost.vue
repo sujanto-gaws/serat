@@ -43,6 +43,7 @@ function formatBytes(n: number): string {
 
 async function load(path: string, restart = false): Promise<void> {
   if (!restart) resumePage.value = 1;
+  const openedBytes = restart ? (info.value?.bytes ?? null) : null;
   state.value = "loading";
   info.value = null;
   url.value = null;
@@ -59,6 +60,11 @@ async function load(path: string, restart = false): Promise<void> {
   }
   if (props.path !== path) return; // a later open superseded this one
   info.value = result;
+  if (openedBytes !== null && result.bytes === openedBytes) {
+    // A restart with nothing different on disk would just fail again: say so instead of looping.
+    state.value = "error";
+    return;
+  }
   if (!result.viewable || (kind.value !== "pdf" && kind.value !== "image")) {
     state.value = "unsupported";
     return;

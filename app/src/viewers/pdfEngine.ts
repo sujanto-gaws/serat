@@ -51,6 +51,9 @@ export const loadPdf: PdfLoader = async (path, length, hooks, signal) => {
   await lastDestroy;
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   const pdfjs = await import("pdfjs-dist");
+  // An abort during the (first-ever) import must stop here: past this point a task would be
+  // created whose abort listener is attached too late, and its destroy would race the next load.
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   if (!pdfjs.GlobalWorkerOptions.workerPort) {
     if (typeof Worker === "undefined") throw new Error("no Worker: refusing pdf.js's main-thread fake worker");
     pdfjs.GlobalWorkerOptions.workerPort = new Worker(new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url), {

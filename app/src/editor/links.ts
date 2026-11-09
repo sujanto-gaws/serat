@@ -31,6 +31,7 @@ import {
   type ParsedLink,
 } from "@/editor/linkState";
 import type { LinkIpcAdapter } from "@/ipc/linkAdapter";
+import { createSwitcherQuerier } from "@/ipc/switcherQuery";
 
 /** Idle time after the last doc/viewport change before the scan runs. */
 export const LINK_SCAN_DEBOUNCE_MS = 200;
@@ -224,7 +225,7 @@ export function rankAnchors(candidates: readonly string[], query: string): strin
 }
 
 export function makeLinkCompletionSource(deps: LinkExtensionDeps): CompletionSource {
-  let seq = 0;
+  const querier = createSwitcherQuerier((args) => deps.ipc.switcherQuery(args));
   return async (context: CompletionContext) => {
     const before = context.matchBefore(/\[\[[^\]\n]*/);
     if (!before) return null;
@@ -235,14 +236,13 @@ export function makeLinkCompletionSource(deps: LinkExtensionDeps): CompletionSou
     const source = deps.getSourcePath();
 
     if (mode.kind === "name") {
-      const mySeq = ++seq;
       let results;
       try {
-        results = await deps.ipc.switcherQuery({ seq: mySeq, query: mode.query, limit: 50 });
+        results = await querier.run(mode.query, 50);
       } catch {
         return null; // transport failure: no completions, nothing thrown into typing
       }
-      if (context.aborted || results.discarded || results.seq !== seq) return null; // a newer keystroke wins; discarded = superseded, ignore
+      if (context.aborted || results === null) return null; // a newer keystroke wins; discarded = superseded, ignore
       const names = results.corpus === "tree" ? " · file names only" : "";
       const total = results.items.length;
       const options: Completion[] = results.items.map((item, index) => {

@@ -207,4 +207,16 @@ describe("loadPdf (pdf.js arguments)", () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     vi.unstubAllGlobals();
   });
+
+  it("an abort that lands during the pdf.js import never reaches getDocument", async () => {
+    vi.stubGlobal("Worker", class {});
+    const { loadPdf } = await import("./pdfEngine");
+    pdfjs.getDocument.mockClear();
+    let reads = 0;
+    // `aborted` is false for the first check (before the import) and true afterwards.
+    const signal = { get aborted() { return reads++ >= 1; }, addEventListener() {}, removeEventListener() {} } as unknown as AbortSignal;
+    await expect(loadPdf("d/a.pdf", 10, HOOKS, signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(pdfjs.getDocument).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
 });

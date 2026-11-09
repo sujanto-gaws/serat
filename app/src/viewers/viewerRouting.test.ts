@@ -37,6 +37,8 @@ vi.mock("@/startup", () => ({
 vi.mock("@/viewers/pdfEngine", () => ({ loadPdf: () => new Promise(() => {}) }));
 
 const { default: App } = await import("@/App.vue");
+const { default: CodeMirrorEditor } = await import("@/editor/CodeMirrorEditor.vue");
+const { default: BacklinksPane } = await import("@/panes/BacklinksPane.vue");
 
 const treePush = (m: unknown) => channels[channels.length - 1].onmessage?.(m);
 
@@ -100,6 +102,43 @@ describe("App routing to the viewers (FR-BIN-11, FR-BIN-12)", () => {
     await wrapper.get('[data-path="a.md"]').trigger("click");
     await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(false));
     expect(reads()).toBe(1);
+    wrapper.unmount();
+  });
+
+  it("a block target for the note open behind a viewer reveals on the existing buffer: no second read, 'approximate' only when dirty", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    treePush({
+      kind: "listing",
+      dir: "",
+      entries: [
+        { name: "pic.png", kind: "asset", sidecar: false },
+        { name: "a.md", kind: "note", sidecar: false },
+      ],
+    });
+    await wrapper.vm.$nextTick();
+    const reads = () => calls.filter((c) => c.cmd === "read_file").length;
+    await wrapper.get('[data-path="a.md"]').trigger("click");
+    await vi.waitFor(() => expect(reads()).toBe(1));
+    await new Promise((r) => setTimeout(r, 30));
+    const editor = wrapper.findComponent(CodeMirrorEditor);
+    const exposed = (editor.vm.$ as unknown as { exposed: { revealOffset(o: number): void } }).exposed; // what App.vue calls through its ref
+    const reveal = vi.spyOn(exposed, "revealOffset");
+    const block = { block_id: 1, ord: 0, heading_path: null, byte_start: 2, byte_end: 4, note_hash: "h1" };
+    const back = wrapper.findComponent(BacklinksPane);
+
+    for (const dirty of [false, true]) {
+      await wrapper.get('[data-path="pic.png"]').trigger("click");
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(true));
+      editor.vm.$emit("dirty-changed", dirty);
+      reveal.mockClear();
+      back.vm.$emit("open", { path: "a.md", block, newTab: false });
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(false));
+      await vi.waitFor(() => expect(reveal).toHaveBeenCalledWith(dirty ? 0 : 2)); // dirty: by ord, not by byte offset
+      expect(reads()).toBe(1);
+      const marks = wrapper.get(".marks").text();
+      if (dirty) expect(marks).toContain("approximate");
+      else expect(marks).not.toContain("approximate");
+    }
     wrapper.unmount();
   });
 
