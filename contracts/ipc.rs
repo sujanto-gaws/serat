@@ -1414,11 +1414,9 @@ pub struct SearchHit {
     /// be approximate about) and whenever it was not computed. The front end
     /// shows no marker for `None` and relies on the click-time check.
     ///
-    /// **Contract ahead of implementation.** Filled by #79's follow-up
-    /// `[P1/impl] Flag search hits changed since indexed` (rust-core-dev returns
-    /// `notes.mtime`/`notes.size` from R1 and R1 + R3, no schema change), then
-    /// `[P1/impl] Stat search hits and map changed_since_indexed in serat-app`
-    /// (tauri-app-dev). Until both land, serat-app sends `None`.
+    /// Filled by serat-app (task #88): `None` = property-only hit, or beyond
+    /// `STAT_HITS_PER_PAGE` (50), or the stat phase ran out of time or was
+    /// superseded. A stat that fails (the file is gone) is `Some(true)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub changed_since_indexed: Option<bool>,

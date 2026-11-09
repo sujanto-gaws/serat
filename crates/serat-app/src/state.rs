@@ -1142,12 +1142,15 @@ impl AppState {
     ///
     /// [`IpcError::VaultNotFound`] with no vault open.
     pub fn search(&self, args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError> {
-        let (root, state, search) = self.read_context()?;
-        let vault = self.vault()?;
+        let (root, state, search, vault) = self.read_context()?;
         // After the statement and outside SQLite; `Vault::stat` keeps containment.
-        let stat = |path: &str| {
-            let path = Self::vault_path(path).ok()?;
-            vault.stat(&path).ok()
+        // Bounded by a deadline, and abandoned if a newer search has begun.
+        let raw = |path: &str| match Self::vault_path(path)
+            .ok()
+            .and_then(|path| vault.stat(&path).ok())
+        {
+            Some((mtime, size)) => crate::reads::StatResult::Got(mtime, size),
+            None => crate::reads::StatResult::Failed,
         };
         Ok(crate::reads::read_when_ready(
             state,
@@ -1156,7 +1159,18 @@ impl AppState {
             |reader| {
                 reader
                     .search(&args.query, args.offset, args.limit)
-                    .map(|outcome| crate::reads::map_outcome(outcome, &stat))
+                    .map(|outcome| {
+                        let before = search.generation.load(std::sync::atomic::Ordering::SeqCst);
+                        let stat = crate::reads::budgeted_stat(
+                            crate::reads::STAT_DEADLINE,
+                            || {
+                                search.generation.load(std::sync::atomic::Ordering::SeqCst)
+                                    != before
+                            },
+                            raw,
+                        );
+                        crate::reads::map_outcome(outcome, &stat)
+                    })
             },
         ))
     }
@@ -1169,7 +1183,7 @@ impl AppState {
     /// no vault open.
     pub fn backlinks(&self, args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
         let path = Self::vault_path(&args.path)?;
-        let (root, state, _) = self.read_context()?;
+        let (root, state, _, _) = self.read_context()?;
         Ok(crate::reads::read_when_ready(
             state,
             &root,
@@ -1185,7 +1199,15 @@ impl AppState {
     /// The root, the last published index state and the search slot, read without blocking.
     fn read_context(
         &self,
-    ) -> Result<(PathBuf, IndexState, Arc<crate::reads::SearchSlot>), IpcError> {
+    ) -> Result<
+        (
+            PathBuf,
+            IndexState,
+            Arc<crate::reads::SearchSlot>,
+            Arc<Vault>,
+        ),
+        IpcError,
+    > {
         let guard = self.open_lock();
         let open = guard.as_ref().ok_or_else(|| IpcError::VaultNotFound {
             path: String::new(),
@@ -1194,6 +1216,7 @@ impl AppState {
             open.vault.root().to_path_buf(),
             open.publisher.status().state,
             Arc::clone(&open.search),
+            Arc::clone(&open.vault),
         ))
     }
 
@@ -3052,7 +3075,7 @@ mod tests {
         std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
         let state = Arc::new(state(&dir));
         wait_ready(&state);
-        let (root, _, slot) = state.read_context().expect("context");
+        let (root, _, slot, _) = state.read_context().expect("context");
         let path = serat_index::index_path(&crate::index::index_dir_for(&root));
         let (parked, release) = park_first_search(&slot, &path);
 
@@ -3095,7 +3118,7 @@ mod tests {
         std::fs::write(dir.join("beta.md"), "# Beta\n\nzebra stripes\n").expect("fixture");
         let state = Arc::new(state(&dir));
         wait_ready(&state);
-        let (root, _, slot) = state.read_context().expect("context");
+        let (root, _, slot, _) = state.read_context().expect("context");
         let path = serat_index::index_path(&crate::index::index_dir_for(&root));
         let (parked, release) = park_first_search(&slot, &path);
 

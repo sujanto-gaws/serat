@@ -189,12 +189,11 @@ pub fn read_when_ready<T>(
 /// The core's outcome in the contract's terms.
 #[must_use]
 ///
-/// `stat` answers `(mtime_ms, size)` for a vault-relative path, or `None` when it cannot
-/// (the file is gone, the path escapes the vault). It is called for at most
+/// `stat` answers for a vault-relative path (see [`StatResult`]). It is called for at most
 /// [`STAT_HITS_PER_PAGE`] hits; see [`changed_since_indexed`].
 pub fn map_outcome(
     outcome: read::SearchOutcome,
-    stat: &dyn Fn(&str) -> Option<(i64, u64)>,
+    stat: &dyn Fn(&str) -> StatResult,
 ) -> SearchOutcome {
     match outcome {
         read::SearchOutcome::Hits(hits) => SearchOutcome::Hits {
@@ -218,6 +217,42 @@ pub fn map_outcome(
     }
 }
 
+/// What one stat of a hit's file came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatResult {
+    /// `(mtime_ms, size)`.
+    Got(i64, u64),
+    /// The stat failed (gone, unreadable, escapes the vault): not what was indexed.
+    Failed,
+    /// Not attempted: the deadline passed or the search was superseded.
+    Skipped,
+}
+
+/// The whole stat phase's budget (task #88): on a cold network share each stat can
+/// cost ~10 ms, and the phase runs on the blocking thread after R1 has returned.
+pub const STAT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Wrap `stat` so that it stops at `deadline` from now, or once `superseded()` is true;
+/// every hit after that is [`StatResult::Skipped`] and stays `None`.
+pub fn budgeted_stat<'a>(
+    deadline: std::time::Duration,
+    superseded: impl Fn() -> bool + 'a,
+    stat: impl Fn(&str) -> StatResult + 'a,
+) -> impl Fn(&str) -> StatResult + 'a {
+    let cutoff = std::time::Instant::now() + deadline;
+    let stopped = std::cell::Cell::new(false);
+    move |path| {
+        if !stopped.get() && (std::time::Instant::now() >= cutoff || superseded()) {
+            stopped.set(true);
+        }
+        if stopped.get() {
+            StatResult::Skipped
+        } else {
+            stat(path)
+        }
+    }
+}
+
 /// The most hits per page that are stat-ed: R1's ceiling (architecture §4.5).
 pub const STAT_HITS_PER_PAGE: usize = 50;
 
@@ -237,14 +272,13 @@ pub const STAT_HITS_PER_PAGE: usize = 50;
 /// tick) reads `Some(false)`. Neither presents a wrong line as exact, because the
 /// authority is the hash check at open, which compares `BlockLocation::note_hash` with
 /// the bytes it reads.
-fn changed_since_indexed(
-    hit: &read::SearchHit,
-    stat: &dyn Fn(&str) -> Option<(i64, u64)>,
-) -> Option<bool> {
+fn changed_since_indexed(hit: &read::SearchHit, stat: &dyn Fn(&str) -> StatResult) -> Option<bool> {
     hit.block.as_ref()?;
     let indexed = hit.indexed?;
-    let Some((mtime_ms, size)) = stat(&hit.path) else {
-        return Some(true);
+    let (mtime_ms, size) = match stat(&hit.path) {
+        StatResult::Got(mtime_ms, size) => (mtime_ms, size),
+        StatResult::Failed => return Some(true),
+        StatResult::Skipped => return None,
     };
     Some(mtime_ms != indexed.mtime_ms || i64::try_from(size).unwrap_or(i64::MAX) != indexed.size)
 }
@@ -301,7 +335,7 @@ mod tests {
     #[test]
     fn superseded_maps_through_unchanged() {
         assert!(matches!(
-            map_outcome(read::SearchOutcome::Superseded, &|_| None),
+            map_outcome(read::SearchOutcome::Superseded, &|_| StatResult::Skipped),
             SearchOutcome::Superseded
         ));
     }
@@ -339,8 +373,42 @@ mod tests {
         }
     }
 
+    fn vault_stat(vault: &Vault, p: &str) -> StatResult {
+        match VaultPath::new(p).ok().and_then(|p| vault.stat(&p).ok()) {
+            Some((m, s)) => StatResult::Got(m, s),
+            None => StatResult::Failed,
+        }
+    }
+
+    #[test]
+    fn hits_after_the_deadline_or_a_supersession_are_not_stat_ed() {
+        let slow = |_: &str| {
+            std::thread::sleep(Duration::from_millis(30));
+            StatResult::Got(0, 0)
+        };
+        let budgeted = budgeted_stat(Duration::from_millis(50), || false, slow);
+        let got: Vec<_> = (0..10).map(|_| budgeted("a.md")).collect();
+        assert!(got[0] == StatResult::Got(0, 0), "the first runs");
+        assert!(
+            got[3..].iter().all(|r| *r == StatResult::Skipped),
+            "after the cutoff nothing is stat-ed: {got:?}"
+        );
+
+        let flag = std::cell::Cell::new(false);
+        let budgeted = budgeted_stat(
+            Duration::from_secs(60),
+            || flag.get(),
+            |_| StatResult::Failed,
+        );
+        assert_eq!(budgeted("a.md"), StatResult::Failed);
+        flag.set(true);
+        assert_eq!(budgeted("a.md"), StatResult::Skipped);
+        flag.set(false);
+        assert_eq!(budgeted("a.md"), StatResult::Skipped, "stays stopped");
+    }
+
     fn flags(vault: &Vault, hits: Vec<read::SearchHit>) -> Vec<Option<bool>> {
-        let stat = |p: &str| vault.stat(&VaultPath::new(p).ok()?).ok();
+        let stat = |p: &str| vault_stat(vault, p);
         match map_outcome(read::SearchOutcome::Hits(hits), &stat) {
             SearchOutcome::Hits { items } => {
                 items.into_iter().map(|h| h.changed_since_indexed).collect()
