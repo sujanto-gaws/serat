@@ -239,7 +239,15 @@ impl Reconciler {
     ) -> Result<Outcome, IndexError> {
         let reader = self.reader()?;
         let rows = rows_under(&reader, Some(dir.as_str()))?;
-        let outcome = self.compare(source, parser, entries, rows, CatchUp::PathsAndMtime, None)?;
+        let mut scan = Scan::default();
+        let outcome = self.compare(
+            source,
+            parser,
+            entries,
+            rows,
+            CatchUp::PathsAndMtime,
+            &mut scan,
+        )?;
         self.finish(outcome)
     }
 
@@ -260,16 +268,35 @@ impl Reconciler {
         parser: &dyn NoteParser,
         entries: &[SourceEntry],
         mode: CatchUp,
-        started_at_ms: i64,
+        started_at_ms: Option<i64>,
     ) -> Result<Outcome, IndexError> {
         let reader = self.reader()?;
         let rows = rows_under(&reader, None)?;
-        let window = caught_up_from_ms(&reader)?.saturating_sub(WINDOW_MS);
-        let outcome = self.compare(source, parser, entries, rows, mode, Some(window))?;
+        let stored = caught_up_from_ms(&reader)?;
+        // A stored value ahead of the clock (the clock stepped back) would shrink the
+        // window to nothing: treat it as unset, which makes every file a candidate.
+        let stored = if stored > crate::rebuild::now_ms() {
+            0
+        } else {
+            stored
+        };
+        let window = stored.saturating_sub(WINDOW_MS);
+        let mut scan = Scan {
+            window: Some(window),
+            unread_from: None,
+        };
+        let outcome = self.compare(source, parser, entries, rows, mode, &mut scan)?;
         let outcome = self.finish(outcome)?;
         // Only here, when every step above succeeded: a catch-up that died part way
         // leaves the window where it was, so the next one looks at the same files again.
-        self.writer.set_caught_up_from(started_at_ms)?;
+        // `None` is a comparison that is not the open's (a rescan): it never writes.
+        // A file that was a candidate and could not be read holds the window back to its
+        // own mtime, so the next catch-up compares it again; it is the minimum, not a
+        // refusal to write, so one permanently unreadable file does not freeze the window.
+        if let Some(started) = started_at_ms {
+            self.writer
+                .set_caught_up_from(scan.unread_from.map_or(started, |m| m.min(started).max(0)))?;
+        }
         Ok(outcome)
     }
 
@@ -306,7 +333,7 @@ impl Reconciler {
         entries: &[SourceEntry],
         mut rows: HashMap<String, Row>,
         mode: CatchUp,
-        window: Option<i64>,
+        scan: &mut Scan,
     ) -> Result<Outcome, IndexError> {
         let mut outcome = Outcome::default();
         let mut flushed = 0;
@@ -320,7 +347,7 @@ impl Reconciler {
                     row.mtime != entry.mtime_ms
                         || row.size != i64::try_from(entry.size).unwrap_or(i64::MAX)
                         || row.kind != entry.kind
-                        || window.is_some_and(|from| entry.mtime_ms >= from)
+                        || scan.window.is_some_and(|from| entry.mtime_ms >= from)
                 }
             };
             if !candidate {
@@ -339,6 +366,10 @@ impl Reconciler {
                         outcome.removed += 1;
                     } else if !not_found {
                         outcome.unreadable += 1;
+                        scan.unread_from = Some(
+                            scan.unread_from
+                                .map_or(entry.mtime_ms, |m| m.min(entry.mtime_ms)),
+                        );
                     }
                 }
                 Step::Done(step) => outcome.absorb(step),
@@ -401,6 +432,15 @@ impl Reconciler {
         outcome.unparsed = usize::from(refused);
         Ok(Step::Done(outcome))
     }
+}
+
+/// What one comparison is told and what it reports back besides the [`Outcome`].
+#[derive(Default)]
+struct Scan {
+    /// Disk mtimes at or after this make a path a candidate (`None`: no window).
+    window: Option<i64>,
+    /// The smallest disk mtime of a candidate that exists and could not be read.
+    unread_from: Option<i64>,
 }
 
 enum Step {
@@ -572,5 +612,48 @@ impl ChangeSignal {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+}
+
+/// The integration tests' stubs, shared (they use `serat_core` and `std::fs` only).
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+mod tests {
+    use super::support::{DiskVault, LineParser};
+    use super::*;
+
+    /// Task #66: a catch-up whose final flush fails writes nothing, so the window the
+    /// next one uses is the one the last completed catch-up left.
+    #[test]
+    fn a_catch_up_whose_flush_fails_leaves_the_window_where_it_was() {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = dir.path().join("vault");
+        let index = dir.path().join("index");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.md"), "# A\n").expect("write");
+        let source = DiskVault::new(&root);
+        let parser = LineParser::default();
+        crate::rebuild::rebuild(&source, &parser, &root, &index).expect("rebuild");
+        let handle = IndexHandle::open(&index).expect("open");
+        let before = handle.caught_up_from_ms().expect("value");
+        assert!(before > 0);
+
+        std::fs::write(root.join("a.md"), "# A, edited, longer\n").expect("edit");
+        let entries = source.entries().expect("walk");
+        handle.fault_injector().fail_every_commit();
+        let failed = Reconciler::new(&handle).catch_up(
+            &source,
+            &parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            Some(before + 60_000),
+        );
+        assert!(failed.is_err(), "the injected commit failure must surface");
+        assert_eq!(handle.caught_up_from_ms().expect("value"), before);
+        // The writer still holds the batch it could not commit; closing says so.
+        let _ = handle.close();
     }
 }

@@ -153,6 +153,12 @@ impl IndexHandle {
         self.actor.wal_health()
     }
 
+    /// The writer's fault injector, for in-crate tests of a flush that fails.
+    #[cfg(test)]
+    pub(crate) fn fault_injector(&self) -> crate::writer::FaultInjector {
+        self.actor.fault_injector()
+    }
+
     /// Where the index lives.
     #[must_use]
     pub fn index_dir(&self) -> &Path {

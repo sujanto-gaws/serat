@@ -854,7 +854,10 @@ enum Barrier {
 /// this shares the same underlying flag with the writer thread it was made for and no
 /// other.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FaultInjector(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub(crate) struct FaultInjector(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 
 impl FaultInjector {
     /// Make the next commit through this handle's actor fail once.
@@ -863,11 +866,21 @@ impl FaultInjector {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Make every commit through this handle's actor fail until the actor is dropped.
+    /// For a test whose failing commit must be the one a barrier waits on: the writer
+    /// may commit a lone `Apply` before the barrier arrives, and a one-shot fault is
+    /// then spent on a commit nobody is waiting for.
+    #[cfg(test)]
+    pub(crate) fn fail_every_commit(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Consume the injected failure, if one is armed. Always false in production: the
     /// only way to arm it is [`FaultInjector::fail_next_commit`], which does not exist
     /// outside `#[cfg(test)]`.
     fn take(&self) -> bool {
-        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
+            || self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 

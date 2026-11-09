@@ -585,7 +585,6 @@ impl Indexer {
     }
 
     fn rescan_with(&self, reconciler: &Reconciler) {
-        let started_at_ms = serat_index::rebuild::now_ms();
         match self.vault.walk() {
             Ok(entries) => {
                 let parser = CommonMarkParser::new();
@@ -594,7 +593,9 @@ impl Indexer {
                     &parser,
                     &entries,
                     CatchUp::PathsAndMtime,
-                    started_at_ms,
+                    // Compare only: ADR-0015 section 2 lets the open-time catch-up and a
+                    // finished rebuild move the window, nothing else.
+                    None,
                 ));
             }
             Err(_) => self.deferred().rescan = true,
@@ -643,6 +644,13 @@ impl Indexer {
 
     /// The open's authoritative walk is about to start: journal what the consumer
     /// handles until the catch-up has finished.
+    ///
+    /// The interim timestamp (task #66) is taken here, after the watcher was armed and
+    /// not before the walk's first stat. That is still sound: a write between arming
+    /// and this stamp is seen by the watcher and enumerated by the walk that follows; a
+    /// file whose mtime equals the stamp was indexed inside the old window. The #18c
+    /// follow-up captures `now_ms()` immediately before `VaultThread::spawn_with`
+    /// (state.rs), which closes the remaining gap.
     pub fn walk_started(&self) {
         self.walk_started_ms
             .store(serat_index::rebuild::now_ms(), Ordering::SeqCst);
@@ -688,7 +696,7 @@ impl Indexer {
             &parser,
             entries,
             CatchUp::PathsAndMtime,
-            self.walk_started_ms.load(Ordering::SeqCst),
+            Some(self.walk_started_ms.load(Ordering::SeqCst)),
         ));
         self.replay_journal(&reconciler);
     }
@@ -1044,15 +1052,31 @@ mod tests {
         indexer.stop();
         let reconciler = indexer.reconciler().expect("handle");
         let parser = CommonMarkParser::new();
+        let entries = walk(&indexer);
+        let oldest = entries.iter().map(|e| e.mtime_ms).min().expect("files");
         let outcome = reconciler
             .catch_up(
                 &indexer.source(),
                 &parser,
-                &walk(&indexer),
+                &entries,
                 CatchUp::PathsAndMtime,
-                0,
+                Some(serat_index::rebuild::now_ms()),
             )
             .expect("catch-up");
+        // Every load failed, so the window may not move past any file's mtime: a file
+        // the catch-up never read must stay a candidate for the next one (task #66).
+        let window = indexer
+            .slot
+            .lock()
+            .expect("slot")
+            .as_ref()
+            .expect("handle")
+            .caught_up_from_ms()
+            .expect("window");
+        assert!(
+            window <= oldest,
+            "window {window} passed an unread file at {oldest}"
+        );
         assert_eq!(outcome.removed, 0, "nothing removed");
         assert_eq!(outcome.upserted, 0, "nothing read, so nothing submitted");
         let by_path = reconciler

@@ -156,7 +156,7 @@ CREATE TABLE index_meta (
     -- same coarse-mtime tick as the last indexing is otherwise invisible. Written only on
     -- completion, so a crash mid catch-up does not advance it. 0 (a fresh index) makes
     -- every file a candidate. The index's own state, re-derived by a rebuild (C-02).
-    caught_up_from_ms INTEGER NOT NULL DEFAULT 0
+    caught_up_from_ms INTEGER NOT NULL DEFAULT 0 CHECK (caught_up_from_ms >= 0)
 );
 
 -- ----------------------------------------------------------------------------
