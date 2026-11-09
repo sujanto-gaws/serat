@@ -73,9 +73,14 @@ export const useVaultStore = defineStore("vault", {
       this.vaultRoot = opened.root;
     },
     /** `choose_vault` answered `Err` after `vault://opened`: the window has no vault open and no later
-     * event carries the announced id. `announced` stays set so a stale poll cannot bring it back. */
+     * event carries the announced id. `vaultId` is KEPT at the announced id, "only to drop anything that
+     * does not match" (VAULT_OPENED_EVENT): nulling it would switch every consumer's filter off and let the
+     * old vault's late events through. "No vault open" is `vaultRoot === null`. `announced` stays set so a
+     * stale poll cannot change the id either.
+     *
+     * This resets only the store. It cannot reset the file tree (stopped state, rows, no `open_tree`) or
+     * the editor buffer: #80, the only caller, must do that on `choose_vault` Err BEFORE calling this. */
     openFailed() {
-      this.vaultId = null;
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -83,6 +88,11 @@ export const useVaultStore = defineStore("vault", {
     /** The `index_status` fallback (poll and event, one guarded entry): only at launch, only while
      * `BootInfo.vault_id` is absent, never once `vault://opened` has been seen, never an empty id. The
      * poll is not ordered against events: it can carry the OLD id or `""` after a switch began. */
+    /** True when an `index_status` answer/event belongs to the current vault: never an empty id (a poll
+     * computed between a close and the next install), never one that differs from a known current id. */
+    statusBelongsHere(id: string): boolean {
+      return id !== "" && (this.vaultId === null || id === this.vaultId);
+    },
     adoptFromIndexStatus(id: string) {
       if (!id || this.vaultIdFromBoot || this.announced || this.vaultId !== null) return;
       this.vaultId = id;

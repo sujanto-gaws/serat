@@ -277,6 +277,7 @@ onMounted(async () => {
   // *waiting* on the promise it returns happens later, in `hydrateBuffer` below.
   const paintMark = schedulePaintMark(store);
   store.adoptBoot(window.__SERAT_BOOT__?.vault_id);
+  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
 
   // Installed next so the first transition the actor publishes is not lost — mirrors
   // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
@@ -307,6 +308,7 @@ onMounted(async () => {
 
   unlistenIndexStatus = await onIndexStatus((status) => {
     store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -314,13 +316,12 @@ onMounted(async () => {
     if (typeof refused === "number") store.setRefusedNames(refused);
   });
 
-  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
-
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
   indexStatus().then((status) => {
     store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return;
     store.setIndexState(status.state);
   });
 

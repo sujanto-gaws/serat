@@ -120,3 +120,34 @@ describe("App wiring of the vault id sources (#91)", () => {
     vi.mocked(invoke).mockImplementation(() => new Promise(() => {}));
   });
 });
+
+describe("App drops index status from another vault (#91, IndexStatus.vault_id)", () => {
+  it("applies a status for the current vault; drops another vault's and the empty id; stays dropped after a failed open", async () => {
+    window.__SERAT_BOOT__ = { vault: "/vault", vault_id: "A", open: null, exit_after_ready: false };
+    const { listen } = await import("@tauri-apps/api/event");
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((name: string, h: (e: { payload: unknown }) => void) => {
+      handlers.set(name, h);
+      return Promise.resolve(() => undefined);
+    }) as never);
+    const pinia = createPinia();
+    const wrapper = mount(App, { global: { plugins: [pinia] } });
+    const { useVaultStore } = await import("@/stores/vault");
+    const store = useVaultStore(pinia);
+    await vi.advanceTimersByTimeAsync(0);
+    const send = (vault_id: string, note_count: number) =>
+      handlers.get("index://status")!({ payload: { vault_id, state: { kind: "ready", note_count } } });
+    send("A", 1);
+    expect(store.indexStatusText).toContain("1 notes");
+    send("OTHER", 2);
+    send("", 3);
+    expect(store.indexStatusText).toContain("1 notes");
+    handlers.get("vault://opened")!({ payload: { root: "/b", vault_id: "B", index: { kind: "opening" } } });
+    store.openFailed();
+    send("A", 4); // the old vault's late status after the failed open
+    expect(store.indexStatusText).toContain("1 notes");
+    expect(store.vaultRoot).toBeNull();
+    wrapper.unmount();
+    vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
+  });
+});
