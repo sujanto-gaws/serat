@@ -40,7 +40,7 @@ npm test                                  # bare: runs all three projects in the
 SERAT_BENCH_DIST=<checkout>/app/dist-bench SERAT_SUBJECT_LABEL=<name> [SERAT_DUMP_DIR=<dir>] npx playwright test --project=subject
 ```
 
-`npm run build:bench` (in `app/`) is on the branch carrying it, **`task/p1-42-prf02-stalls`** (`app/package.json`); not yet on integration; without a build the subject fails loudly with the build command. `SERAT_DUMP_DIR` receives per-key JSON; `node record/subject-report.mjs <files>` summarises it. A subject run takes about 20 minutes (3 positions x 2 cadences x 500 keys at 100 ms).
+`npm run build:bench` (in `app/`) is on main (`app/package.json`). CI runs this exact sequence in the report-only `editor-latency` job (task #60; headless Chromium is not gate-eligible, so it never gates); without a build the subject fails loudly with the build command. `SERAT_DUMP_DIR` receives per-key JSON; `node record/subject-report.mjs <files>` summarises it. A subject run takes about 20 minutes (3 positions x 2 cadences x 500 keys at 100 ms).
 
 Do not read a red subject test as "the editor is over budget" unless the controls passed in the same run on the same machine.
 

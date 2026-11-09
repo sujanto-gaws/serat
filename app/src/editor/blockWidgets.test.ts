@@ -122,22 +122,71 @@ describe("blockWidgetsField", () => {
       for (let j = 0; j < 90; j += 1) parts.push(`paragraph ${i}.${j}`, "");
     }
     const doc = parts.join("\n");
-    const s0 = makeState(doc, 0);
+    const s0 = makeState(doc, doc.indexOf("paragraph 0.45"));
     const before = widgets(s0);
-    expect(before.length).toBeGreaterThanOrEqual(49);
-    const t0 = performance.now();
+    expect(before.length).toBe(50);
     const s1 = s0.update({
       changes: { from: doc.length - 1, insert: "x" },
       selection: { anchor: doc.length },
     }).state;
-    const elapsed = performance.now() - t0;
     const after = widgets(s1);
     expect(after.length).toBe(before.length);
     // Every pre-existing widget (those not near the edit/selection) is the same object.
     const reused = after.filter((w, i) => w.widget === before[i].widget).length;
-    expect(reused).toBeGreaterThanOrEqual(before.length - 2);
-    // Loose guard against an accidental whole-document walk (jsdom/CI noise tolerated).
-    expect(elapsed).toBeLessThan(100);
+    expect(reused).toBe(before.length);
+    // NFR-PRF-02: the property is REUSE, asserted above by object identity, not wall time (a 100 ms
+    // single-sample bound failed 1/389 under load, #99). A whole-document rebuild replaces every
+    // widget, so identity catches it deterministically.
+  });
+
+  it("a table's FIRST character (offset 0): leaving it brings the widget back, same count as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}`;
+    const s0 = makeState(doc, 0); // cursor on the first character: table 1 is revealed
+    expect(widgets(s0)).toHaveLength(1);
+    const away = doc.indexOf("mid");
+    const s1 = s0.update({ selection: { anchor: away } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, away)).length);
+    expect(widgets(s1)).toHaveLength(2);
+  });
+
+  it("the first character of a block in the middle of the note behaves the same", () => {
+    const doc = `intro\n\n${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}\n\nend`;
+    const first = doc.indexOf("| a |");
+    const s0 = makeState(doc, first);
+    expect(widgets(s0)).toHaveLength(1);
+    const s1 = s0.update({ selection: { anchor: doc.length } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, doc.length)).length);
+    expect(widgets(s1)).toHaveLength(2);
+    // And entering from elsewhere onto a first character reveals it.
+    const s2 = s1.update({ selection: { anchor: first } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+  });
+
+  it("a table's LAST character: leaving it brings the widget back, same as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid paragraph\n\nend`;
+    const last = TABLE.length; // offset just past the final character, the block's end
+    for (const at of [last - 1, last]) {
+      const s0 = makeState(doc, at);
+      expect(widgets(s0)).toHaveLength(0);
+      const away = doc.indexOf("mid");
+      const s1 = s0.update({ selection: { anchor: away } }).state;
+      expect(widgets(s1)).toHaveLength(1);
+      expect(widgets(s1).map((w) => [w.from, w.to])).toEqual(widgets(makeState(doc, away)).map((w) => [w.from, w.to]));
+    }
+  });
+
+  it("property: from every cursor position, moving to 0, a middle paragraph or the end equals a fresh build (FR-EDT-02)", () => {
+    const t = (n: string) => TABLE.replace("1", n);
+    const doc = `${t("a")}\n\nfirst paragraph\n\n${t("b")}\n\n> [!note] Title\n> body line\n\nmiddle paragraph\n\n${t("c")}\n\nlast paragraph`;
+    const shape = (st: EditorState) => widgets(st).map((w) => [w.from, w.to]);
+    const targets = [0, doc.indexOf("middle paragraph") + 3, doc.length];
+    for (let from = 0; from <= doc.length; from += 1) {
+      const s0 = makeState(doc, from);
+      for (const to of targets) {
+        const s1 = s0.update({ selection: { anchor: to } }).state;
+        expect(shape(s1), `from ${from} to ${to}`).toEqual(shape(makeState(doc, to)));
+      }
+    }
   });
 
   it("the examined watermark maps through edits and never moves back", () => {

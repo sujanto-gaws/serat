@@ -1,19 +1,24 @@
 // NFR-PRF-02 budget harness config. Task #11 (P1/test).
 //
-// Chromium is not downloaded through Playwright's own installer here — this
-// environment provisions it once at a fixed path, and `executablePath`
-// points straight at it so the harness never triggers a network fetch (that
-// would itself be an NFR-SEC-01/02 violation in spirit: a test harness has
-// no business phoning out). Override with PW_CHROMIUM_PATH if this ever
-// needs to run somewhere the browser lives elsewhere.
+// The harness itself fetches nothing (a test harness has no business phoning out). In the development
+// container the browser is provisioned once at a fixed path and `executablePath` points at it. In CI the
+// `editor-latency` job runs `npx playwright install chromium` as a step OUTSIDE the harness, and the
+// fallback below selects that install's FULL Chromium (channel "chromium", new headless), never the old
+// `chromium-headless-shell` Playwright would otherwise pick: both report the same version string, so the
+// browser mode is put on every result line (SERAT_BROWSER, read by tests/report.ts). Override with
+// PW_CHROMIUM_PATH to run anywhere else.
+import { existsSync } from "node:fs";
 import { defineConfig, devices } from "@playwright/test";
 
 const chromiumPath =
-  process.env.PW_CHROMIUM_PATH ?? "/opt/pw-browsers/chromium";
+  process.env.PW_CHROMIUM_PATH ?? (existsSync("/opt/pw-browsers/chromium") ? "/opt/pw-browsers/chromium" : undefined);
+
+// SERAT_BROWSER is derived here, never set by hand. Inherited by the worker processes, which is where the specs print.
+process.env.SERAT_BROWSER = chromiumPath ? `executablePath ${chromiumPath}` : "channel chromium (Playwright install, new headless)";
 
 const chromiumUse = {
   ...devices["Desktop Chrome"],
-  launchOptions: { executablePath: chromiumPath },
+  launchOptions: chromiumPath ? { executablePath: chromiumPath } : { channel: "chromium" as const },
 };
 
 export default defineConfig({

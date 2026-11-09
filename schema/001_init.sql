@@ -105,7 +105,9 @@ PRAGMA synchronous = NORMAL;
 -- compares size, and re-hashes any file whose disk mtime is within 2 s of the start of the
 -- last completed catch-up. Residual: a same-size rewrite outside that window that keeps its
 -- mtime is not seen (A-03).
-PRAGMA user_version = 11;
+-- user_version 12 (task #86, FR-NAV-04, US-03): links.field_key, the frontmatter key whose
+-- byte range contains the link (NULL for a body link). Derived from file bytes only (C-02).
+PRAGMA user_version = 12;
 
 -- ============================================================================
 -- Tables
@@ -312,6 +314,7 @@ CREATE TABLE links (
     dst_block_ref TEXT,                    -- targeted ^id
     kind          TEXT NOT NULL CHECK (kind IN ('wiki','embed','md','tag','unresolved')),
     alias         TEXT,
+    field_key     TEXT,                    -- frontmatter key containing the link; NULL in the body
     -- A tag names no note and never will, so it can never carry a dst_note.
     -- Structural rather than remembered: see the note below.
     CHECK (kind <> 'tag' OR dst_note IS NULL)

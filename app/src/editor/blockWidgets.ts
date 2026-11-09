@@ -190,7 +190,11 @@ class ImageEmbedWidget extends WidgetType {
     // <object>/<iframe>/inline SVG/v-html.
     if (this.resolvedPath === null) return this.placeholder();
     const img = document.createElement("img");
-    img.src = assetUrl(this.resolvedPath);
+    try {
+      img.src = assetUrl(this.resolvedPath);
+    } catch {
+      return this.placeholder(); // a path the builder refuses is never requested
+    }
     img.alt = this.label;
     img.className = "serat-embed-widget";
     if (this.widthAttr && /^\d+$/.test(this.widthAttr)) {
@@ -376,8 +380,8 @@ function buildAll(state: EditorState): BlockWidgetState {
  * or `null` if `pos` sits directly under `Document` with no such ancestor
  * (e.g. a boundary position). Bounds every recompute to "one block", which
  * is what keeps this field's per-keystroke cost independent of note size. */
-function enclosingTopLevelBlock(state: EditorState, pos: number): Span | null {
-  let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, -1);
+function enclosingTopLevelBlock(state: EditorState, pos: number, side: -1 | 1 = -1): Span | null {
+  let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, side);
   while (node && node.parent && node.parent.type.name !== "Document") {
     node = node.parent;
   }
@@ -385,6 +389,17 @@ function enclosingTopLevelBlock(state: EditorState, pos: number): Span | null {
     return null;
   }
   return { from: node.from, to: node.to };
+}
+
+/** The block(s) a position touches: `resolveInner(pos, -1)` alone resolves a block's
+ * FIRST character to the previous node (or to `Document`, so `null`, at offset 0), which
+ * left that block unexamined when the cursor left it and a table stayed raw (FR-EDT-02).
+ * Both sides, deduplicated; two O(depth) lookups, no walk. */
+function touchedTopLevelBlocks(state: EditorState, pos: number): Span[] {
+  const before = enclosingTopLevelBlock(state, pos, -1);
+  const after = enclosingTopLevelBlock(state, pos, 1);
+  if (before && after && before.from === after.from && before.to === after.to) return [before];
+  return [before, after].filter((x): x is Span => x !== null);
 }
 
 function mergeSpans(spans: Span[]): Span[] {
@@ -442,12 +457,10 @@ function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
   if (!tr.startState.selection.eq(tr.state.selection)) {
     for (const range of tr.startState.selection.ranges) {
       const mapped = tr.changes.mapPos(range.head);
-      const region = enclosingTopLevelBlock(tr.state, mapped);
-      if (region) regions.push(region);
+      regions.push(...touchedTopLevelBlocks(tr.state, mapped));
     }
     for (const range of tr.state.selection.ranges) {
-      const region = enclosingTopLevelBlock(tr.state, range.head);
-      if (region) regions.push(region);
+      regions.push(...touchedTopLevelBlocks(tr.state, range.head));
     }
   }
   return mergeSpans(regions);

@@ -103,7 +103,7 @@ impl Snapshot {
             // <> 'tag').
             links: rows(
                 &conn,
-                "SELECT src.path, l.kind, l.dst_path, dst.path, l.alias
+                "SELECT src.path, l.kind, l.dst_path, dst.path, l.alias, l.field_key
                    FROM links l
                    JOIN notes src ON src.id = l.src_note
                    LEFT JOIN notes dst ON dst.id = l.dst_note

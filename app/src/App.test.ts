@@ -1,4 +1,4 @@
-import { mount } from "@vue/test-utils";
+import { enableAutoUnmount, mount } from "@vue/test-utils";
 import { createPinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -44,6 +44,10 @@ vi.mock("@/startup", () => ({
 }));
 
 const { default: App } = await import("./App.vue");
+
+// A leaked mount keeps its window keydown listener, and a handler that already preventDefault()ed
+// the chord makes the next one stand down (as it must for the editor keymap).
+enableAutoUnmount(afterEach);
 
 beforeEach(() => {
   window.__SERAT_BOOT__ = { vault: "/vault", open: "a.md", exit_after_ready: false };
@@ -193,5 +197,69 @@ describe("App", () => {
     treePush({ kind: "listing", dir: "Later", entries: [ent("x.md", "note")] });
     await vi.waitFor(() => expect(wrapper.find('[data-testid="listing-note"]').exists()).toBe(false));
     wrapper.unmount();
+  });
+
+  describe("quick switcher and command palette (FR-NAV-01, FR-NAV-06)", () => {
+    const press = (init: KeyboardEventInit) => {
+      const ev = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+      window.dispatchEvent(ev);
+      return ev;
+    };
+
+    it("Mod-O opens the switcher and Mod-K the palette (mutually exclusive)", async () => {
+      const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+      expect(press({ key: "o", ctrlKey: true }).defaultPrevented).toBe(true);
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="quick-switcher"]').exists()).toBe(true));
+      press({ key: "k", ctrlKey: true });
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(true));
+      expect(wrapper.find('[data-testid="quick-switcher"]').exists()).toBe(false);
+    });
+
+    it("the palette lists the global commands AND the editor's (Save now, Undo, Redo, Follow link)", async () => {
+      const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+      press({ key: "k", ctrlKey: true });
+      await vi.waitFor(() => expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(true));
+      const names = wrapper.findAll('[role="option"]').map((r) => r.attributes("aria-label") ?? "");
+      for (const wanted of ["Open quick switcher", "Search vault", "Focus file tree", "Focus backlinks", "Save now", "Undo", "Redo", "Follow link/URL under cursor"]) {
+        expect(names.some((n) => n.startsWith(wanted)), wanted).toBe(true);
+      }
+    });
+
+    it("a chord the editor keymap already handled (defaultPrevented) is not handled again", async () => {
+      const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+      const first = (e: Event) => e.preventDefault();
+      window.addEventListener("keydown", first, true);
+      try {
+        press({ key: "o", ctrlKey: true });
+        await wrapper.vm.$nextTick();
+        expect(wrapper.find('[data-testid="quick-switcher"]').exists()).toBe(false);
+      } finally {
+        window.removeEventListener("keydown", first, true);
+      }
+    });
+
+    it("a rebinding from get_ui_settings changes behaviour, not only the chip", async () => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const impl = vi.mocked(invoke).getMockImplementation()!;
+      vi.mocked(invoke).mockImplementation(((cmd: string, args?: unknown) =>
+        cmd === "get_ui_settings"
+          ? Promise.resolve({ live_preview: true, keybindings: [{ command_id: "switcher.open", key: "Mod-p" }] })
+          : impl(cmd, args as never)) as typeof invoke);
+      try {
+        const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+        await vi.waitFor(() => {
+          press({ key: "p", ctrlKey: true });
+          expect(wrapper.find('[data-testid="quick-switcher"]').exists()).toBe(true);
+        });
+        wrapper.unmount();
+        const again = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+        await again.vm.$nextTick();
+        press({ key: "o", ctrlKey: true }); // the old default no longer opens it once rebound
+        await new Promise((r) => setTimeout(r, 20));
+        expect(again.find('[data-testid="quick-switcher"]').exists()).toBe(false);
+      } finally {
+        vi.mocked(invoke).mockImplementation(impl);
+      }
+    });
   });
 });
