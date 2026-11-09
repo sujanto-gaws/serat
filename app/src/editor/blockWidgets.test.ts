@@ -336,7 +336,8 @@ describe("blockWidgetsField", () => {
     }
   });
 
-  it("Shift-extending a select-all on a 5,000-line note equals a fresh build (re-measured: a few ms, was ~20 ms per-block)", () => {
+  it("Shift-extending a select-all on a 5,000-line note equals a fresh build", () => {
+    // Informational: re-measured at ~0.5 ms, was ~20 ms with one replaceRegion per block.
     const t = (n: number) => TABLE.replace("1", String(n));
     const doc = Array.from({ length: 700 }, (_, i) => `${t(i)}\n\npara ${i}\n\nmore text ${i}`).join("\n\n");
     const all = makeRange(doc, 0, doc.length - 1);
