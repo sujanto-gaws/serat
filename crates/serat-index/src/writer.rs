@@ -647,6 +647,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             }
         }
 
+        fault.set_answering(barrier.is_some());
         let mut result = commit(
             &conn,
             &mut pending,
@@ -655,6 +656,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             fault,
             &mut closed,
         );
+        fault.set_answering(false);
 
         if let Some((reply, extra)) = barrier {
             if result.is_ok() {
@@ -827,20 +829,57 @@ enum Barrier {
 /// this shares the same underlying flag with the writer thread it was made for and no
 /// other.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FaultInjector(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub(crate) struct FaultInjector(std::sync::Arc<FaultState>);
+
+#[derive(Debug, Default)]
+struct FaultState {
+    armed: std::sync::atomic::AtomicBool,
+    /// Set by the writer thread around the commit that ends a turn: true when that
+    /// turn carries a caller's barrier (a flush), so a failure has somebody to reach.
+    answering: std::sync::atomic::AtomicBool,
+}
 
 impl FaultInjector {
-    /// Make the next commit through this handle's actor fail once.
+    /// Fail every commit through this handle's actor from now until one that answers a
+    /// caller (a flush) has failed, then disarm.
+    ///
+    /// Not "the next commit", because that is racy by construction (task #67): a quiet
+    /// writer commits the moment an `Apply` arrives, and the test thread arms the fault
+    /// a few instructions after `submit`. Under load the writer wins, the batch commits
+    /// cleanly before the fault is armed, the flush finds nothing pending and returns
+    /// Ok, and the test fails for a reason that says nothing about the code. Armed
+    /// before the `submit`, an auto-commit that gets in first fails too and, as
+    /// documented on `commit`, leaves the batch in hand; the flush's commit then fails
+    /// and reports. A writer that folds the `Apply` and the flush into one turn fails
+    /// once, in the flush. Either interleaving ends with the batch in hand and the
+    /// error at the caller.
     #[cfg(test)]
-    pub(crate) fn fail_next_commit(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn fail_until_a_flush_fails(&self) {
+        self.0
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Consume the injected failure, if one is armed. Always false in production: the
-    /// only way to arm it is [`FaultInjector::fail_next_commit`], which does not exist
-    /// outside `#[cfg(test)]`.
+    /// Called by the writer thread: whether the commit it is about to make answers a
+    /// caller.
+    fn set_answering(&self, answering: bool) {
+        self.0
+            .answering
+            .store(answering, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this commit fails. Always false in production: the only way to arm it is
+    /// [`FaultInjector::fail_until_a_flush_fails`], which does not exist outside
+    /// `#[cfg(test)]`.
     fn take(&self) -> bool {
-        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.0.armed.load(SeqCst) {
+            return false;
+        }
+        if self.0.answering.load(SeqCst) {
+            self.0.armed.store(false, SeqCst);
+        }
+        true
     }
 }
 
@@ -981,8 +1020,13 @@ mod tests {
         let actor = IndexActor::with_connection(conn);
         let writer = actor.handle();
 
+        // Armed before the submit, not after (task #67): a quiet writer commits an
+        // `Apply` the moment it arrives, so arming after raced the writer thread and,
+        // under load, lost -- the batch committed cleanly and the flush had nothing to
+        // fail. See `FaultInjector::fail_until_a_flush_fails` for why this order holds
+        // under every interleaving.
+        actor.fault_injector().fail_until_a_flush_fails();
         writer.submit(asset("assets/a.pdf")).expect("submit");
-        actor.fault_injector().fail_next_commit();
 
         let failed = writer.flush();
         assert!(

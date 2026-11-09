@@ -3334,24 +3334,58 @@ mod tests {
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&tree));
 
-        // Not open: no event however the watcher sees it.
-        std::fs::write(dir.join("broken.md"), "now valid\n").expect("write");
-        std::fs::write(
-            dir.join("10-projects/serat.md"),
-            "---\ntype: project\n---\n\n# Serat, edited elsewhere\n",
-        )
-        .expect("external edit");
-        wait_until("note://external-change", || {
-            !seen.lock().expect("seen").is_empty()
+        // Not open: no event however the watcher sees it. Not "wait a while and see
+        // nothing": the index row for broken.md carries the final hash only once the
+        // batch that held it has been through every `Live::path_changed` (the editor's
+        // included) and `paths_changed`, on the one vault thread. So after this wait the
+        // editor has provably had its say about broken.md, and any event for it is in
+        // `seen` already.
+        wait_ready(&state);
+        let valid = "now valid\n";
+        std::fs::write(dir.join("broken.md"), valid).expect("write");
+        let valid_hash = serat_vault::hash_bytes(valid.as_bytes()).to_hex();
+        wait_until("the index to hold broken.md's final bytes", || {
+            index_hash(&dir, "broken.md").as_deref() == Some(valid_hash.as_str())
+        });
+
+        let edited = "---\ntype: project\n---\n\n# Serat, edited elsewhere\n";
+        let edited_hash = serat_vault::hash_bytes(edited.as_bytes()).to_hex();
+        std::fs::write(dir.join("10-projects/serat.md"), edited).expect("external edit");
+        // `fs::write` is a truncate and then a write. Starved between the two for longer
+        // than the 150 ms window, the watcher flushes the empty file as its own change
+        // and the final bytes follow as a second one (each correct, each from the
+        // registry's newest base). So the wait is for the event that carries the final
+        // hash, never for the first event, and the assertions hold for any such chain.
+        wait_until("note://external-change carrying the final hash", || {
+            seen.lock().expect("seen").iter().any(|change| {
+                matches!(change, crate::ipc::ExternalChange::Changed { new_hash, .. }
+                    if new_hash == &edited_hash)
+            })
         });
         let seen = seen.lock().expect("seen");
-        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen.iter().all(|change| matches!(
+                change,
+                crate::ipc::ExternalChange::Changed { path, .. } if path == "10-projects/serat.md"
+            )),
+            "only the open note is announced: {seen:?}"
+        );
         assert!(matches!(
             &seen[0],
-            crate::ipc::ExternalChange::Changed { path, base_hash, .. }
-                if path == "10-projects/serat.md" && base_hash == &read.hash
+            crate::ipc::ExternalChange::Changed { base_hash, .. } if base_hash == &read.hash
         ));
+        // Each change starts from where the last one ended: the registry advanced.
+        for pair in seen.windows(2) {
+            if let (
+                crate::ipc::ExternalChange::Changed { new_hash, .. },
+                crate::ipc::ExternalChange::Changed { base_hash, .. },
+            ) = (&pair[0], &pair[1])
+            {
+                assert_eq!(new_hash, base_hash, "{seen:?}");
+            }
+        }
         drop(seen);
+        state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
