@@ -26,7 +26,11 @@ fn rules(note: &ParsedNote) -> usize {
 fn a_blank_line_between_the_delimiters_is_an_empty_frontmatter_block() {
     let note = parse("---\n\n---\n");
     assert!(note.fields.is_empty());
-    assert_eq!(rules(&note), 0, "the delimiters are frontmatter, not breaks");
+    assert_eq!(
+        rules(&note),
+        0,
+        "the delimiters are frontmatter, not breaks"
+    );
 }
 
 #[test]
