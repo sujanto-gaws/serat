@@ -29,6 +29,7 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const textLayer = ref<HTMLElement | null>(null);
 const pageField$ = ref<HTMLInputElement | null>(null);
 let renderToken = 0;
+let loadAbort: AbortController | null = null;
 let alive = true;
 
 const numPages = computed(() => doc.value?.numPages ?? 0);
@@ -57,12 +58,26 @@ async function draw(): Promise<void> {
 }
 
 async function open(): Promise<void> {
+  loadAbort?.abort();
+  const controller = new AbortController();
+  loadAbort = controller;
   state.value = "loading";
   doc.value?.destroy();
   doc.value = null;
   try {
-    const handle = await (props.loader ?? loadPdf)(props.path, props.length, () => emit("changed", page.value));
-    if (!alive) {
+    const handle = await (props.loader ?? loadPdf)(
+      props.path,
+      props.length,
+      {
+        onChanged: () => emit("changed", page.value),
+        onFailed: () => {
+          if (alive && loadAbort === controller) state.value = "error";
+          controller.abort(); // releases a load still waiting on bytes
+        },
+      },
+      controller.signal,
+    );
+    if (!alive || loadAbort !== controller) {
       handle.destroy();
       return;
     }
@@ -72,7 +87,7 @@ async function open(): Promise<void> {
     await nextTick();
     await draw();
   } catch {
-    if (alive) state.value = "error";
+    if (alive && loadAbort === controller) state.value = "error";
   }
 }
 
@@ -131,6 +146,7 @@ function onKeydown(event: KeyboardEvent): void {
 onMounted(() => void open());
 onBeforeUnmount(() => {
   alive = false;
+  loadAbort?.abort(); // a load still pending is destroyed, not leaked
   doc.value?.destroy();
 });
 watch(() => props.path, () => void open());
@@ -195,7 +211,7 @@ defineExpose({ goTo });
 .stage { flex: 1; min-height: 0; overflow: auto; background: #0000000d; display: flex; justify-content: center; padding: 1rem; }
 .sheet { position: relative; margin: 0 auto; box-shadow: 0 0 0 1px #0002; background: #fff; align-self: flex-start; }
 .sheet canvas { display: block; }
-.textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; transform-origin: 0 0; }
+.textLayer { --scale-round-x: 1px; --scale-round-y: 1px; position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; transform-origin: 0 0; }
 /* Ported from pdfjs-dist/web/pdf_viewer.css: glyph size/shear come from per-span custom properties. */
 .textLayer :deep(span), .textLayer :deep(br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0 0; user-select: text; }
 .textLayer :deep(> :not(.markedContent)), .textLayer :deep(.markedContent span:not(.markedContent)) {

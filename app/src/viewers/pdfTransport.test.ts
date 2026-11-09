@@ -16,6 +16,7 @@ class FakeBase {
   requestDataRange(_b: number, _e: number): void {}
 }
 
+const HOOKS = { onChanged: () => {}, onFailed: () => {} };
 const FILE = 3 * SPAN + 123; // over the cap
 function deps(over: Partial<Parameters<typeof makeAssetTransport>[2]> = {}) {
   const reads: Array<[number, number]> = [];
@@ -28,6 +29,7 @@ function deps(over: Partial<Parameters<typeof makeAssetTransport>[2]> = {}) {
     }),
     statBytes: vi.fn(async () => FILE),
     onChanged: vi.fn(),
+    onFailed: vi.fn(),
     ...over,
   };
   return d;
@@ -93,11 +95,22 @@ describe("makeAssetTransport", () => {
     expect(d.reads).toHaveLength(2);
   });
 
-  it("an IPC failure (file gone, refused) takes the same restart path", async () => {
+  it("a file that is gone (not_found) is evidence of change: restart lands on the missing state", async () => {
     const d = deps({ readRange: vi.fn(async () => Promise.reject({ kind: "not_found" })) });
     make(d).requestDataRange(0, 10);
     await settle();
     expect(d.onChanged).toHaveBeenCalledTimes(1);
+    expect(d.onFailed).not.toHaveBeenCalled();
+  });
+
+  it("a read error with the size unchanged is a failure, never a restart (no EIO/offline loop)", async () => {
+    const d = deps({ readRange: vi.fn(async () => Promise.reject({ kind: "io", message: "EIO" })) });
+    const t = make(d);
+    t.requestDataRange(0, 10);
+    t.requestDataRange(0, 10);
+    await settle();
+    expect(d.onChanged).not.toHaveBeenCalled();
+    expect(d.onFailed).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -114,7 +127,7 @@ const pdfjs = vi.hoisted(() => {
   return {
     GlobalWorkerOptions: {} as { workerPort?: unknown; workerSrc?: string },
     PDFDataRangeTransport: Transport,
-    getDocument: vi.fn(() => ({ promise: Promise.resolve({ numPages: 3 }), destroy: vi.fn() })),
+    getDocument: vi.fn(() => ({ promise: Promise.resolve({ numPages: 3 }), destroy: vi.fn(async () => {}) })),
     TextLayer: class {},
   };
 });
@@ -137,11 +150,11 @@ describe("loadPdf (pdf.js arguments)", () => {
       },
     );
     const { loadPdf, RANGE_CHUNK_SIZE } = await import("./pdfEngine");
-    const handle = await loadPdf("d/x.pdf", FILE, () => {});
+    const handle = await loadPdf("d/x.pdf", FILE, HOOKS);
     expect(handle.numPages).toBe(3);
     expect(pdfjs.getDocument).toHaveBeenCalledTimes(1);
     const args = (pdfjs.getDocument.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
-    expect(Object.keys(args).sort()).toEqual(["disableAutoFetch", "range", "rangeChunkSize", "useWasm"]);
+    expect(Object.keys(args).sort()).toEqual(["disableAutoFetch", "disableStream", "range", "rangeChunkSize", "useWasm"]);
     expect(args.url).toBeUndefined();
     expect(args.useWasm).toBe(false);
     expect(args.disableAutoFetch).toBe(true);
@@ -158,8 +171,40 @@ describe("loadPdf (pdf.js arguments)", () => {
   it("refuses to run with the main-thread fake worker when no Worker exists", async () => {
     vi.stubGlobal("Worker", undefined);
     const { loadPdf } = await import("./pdfEngine");
-    await expect(loadPdf("d/x.pdf", 10, () => {})).rejects.toThrow(/fake worker/);
+    await expect(loadPdf("d/x.pdf", 10, HOOKS)).rejects.toThrow(/fake worker/);
     expect(pdfjs.getDocument).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("a new load waits for the previous document's destroy to finish (shared worker port)", async () => {
+    vi.stubGlobal("Worker", class {});
+    const { loadPdf } = await import("./pdfEngine");
+    let finishDestroy!: () => void;
+    const slow = new Promise<void>((r) => (finishDestroy = r));
+    pdfjs.getDocument.mockReturnValueOnce({ promise: Promise.resolve({ numPages: 1 }), destroy: vi.fn(() => slow) });
+    const first = await loadPdf("d/a.pdf", 10, HOOKS);
+    first.destroy();
+    pdfjs.getDocument.mockClear();
+    const second = loadPdf("d/b.pdf", 10, HOOKS);
+    await settle();
+    expect(pdfjs.getDocument).not.toHaveBeenCalled();
+    finishDestroy();
+    await second;
+    expect(pdfjs.getDocument).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+  });
+
+  it("aborting while getDocument is pending destroys that task and rejects; nothing leaks", async () => {
+    vi.stubGlobal("Worker", class {});
+    const { loadPdf } = await import("./pdfEngine");
+    const destroy = vi.fn(async () => {});
+    pdfjs.getDocument.mockReturnValueOnce({ promise: new Promise(() => {}), destroy });
+    const controller = new AbortController();
+    const pending = loadPdf("d/a.pdf", 10, HOOKS, controller.signal);
+    pending.catch(() => {});
+    await settle();
+    controller.abort();
+    expect(destroy).toHaveBeenCalledTimes(1);
     vi.unstubAllGlobals();
   });
 });

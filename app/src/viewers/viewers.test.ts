@@ -134,8 +134,8 @@ describe("ViewerHost states (binary-viewers.md)", () => {
     vi.useFakeTimers();
     assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000 }));
     const loads: Array<{ length: number; changed: () => void }> = [];
-    const loader = vi.fn(async (_p: string, length: number, changed: () => void) => {
-      loads.push({ length, changed });
+    const loader = vi.fn(async (_p: string, length: number, hooks: { onChanged: () => void }) => {
+      loads.push({ length, changed: hooks.onChanged });
       return { numPages: 9, pageSize: async () => ({ width: 1, height: 1 }), render: async () => {}, destroy: () => {} };
     });
     const w = mount(ViewerHost, { props: { path: "d/x.pdf", pdfLoader: loader } });
@@ -267,7 +267,7 @@ describe("PdfViewer", () => {
     const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 123456, name: "c.pdf", loader } });
     expect(w.find('[data-testid="pdf-loading"]').exists()).toBe(true);
     await flushPromises();
-    expect(loader).toHaveBeenCalledWith("d/c.pdf", 123456, expect.any(Function));
+    expect(loader).toHaveBeenCalledWith("d/c.pdf", 123456, expect.objectContaining({ onChanged: expect.any(Function), onFailed: expect.any(Function) }), expect.anything());
     expect(w.get('[data-testid="pdf-count"]').text()).toBe("of 18");
     const field = w.get('[data-testid="pdf-page"]');
     await field.setValue("4");
@@ -306,6 +306,32 @@ describe("PdfViewer", () => {
     await flushPromises();
     ok.unmount();
     expect(doc.destroyed).toBe(true);
+  });
+
+  it("a persistent read failure (size unchanged) is one load then the error state, no restart loop", async () => {
+    const loader = vi.fn(async (_p: string, _l: number, hooks: { onFailed: () => void }) => {
+      queueMicrotask(hooks.onFailed); // the transport's verdict
+      return new Promise<PdfDocumentHandle>(() => {}); // pdf.js never settles: it is waiting on bytes
+    });
+    const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 10, name: "c.pdf", loader } });
+    await flushPromises();
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(w.get('[data-testid="pdf-error"]').text()).toContain("couldn't be displayed");
+    expect(w.emitted("changed")).toBeUndefined();
+    expect((loader.mock.calls[0] as unknown[])[3]).toMatchObject({ aborted: true }); // the stuck load was released
+  });
+
+  it("unmounting while the load is still pending aborts it", async () => {
+    let signal!: AbortSignal;
+    const loader = vi.fn(async (_p: string, _l: number, _h: unknown, s?: AbortSignal) => {
+      signal = s as AbortSignal;
+      return new Promise<PdfDocumentHandle>(() => {});
+    });
+    const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 10, name: "c.pdf", loader } });
+    await flushPromises();
+    expect(signal.aborted).toBe(false);
+    w.unmount();
+    expect(signal.aborted).toBe(true);
   });
 
   it("arrow keys page when focus is not in the page field", async () => {

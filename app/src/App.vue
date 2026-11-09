@@ -125,7 +125,16 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
     // Returning from a viewer to the note still in the editor: its buffer (maybe dirty, with undo
     // history) is already current; re-reading would race the flush and replace it with stale text.
     viewing.value = null;
-    void nextTick(() => editorRef.value?.focus());
+    const open = editorRef.value;
+    if (block && open) {
+      // A block/heading target still reveals, on the existing buffer: exact only while the buffer
+      // is clean (its text is then the file at `baseHash`), by `ord` when it has unsaved edits.
+      const position = locateBlock(open.getText(), editorDirty.value ? null : store.baseHash, block);
+      void nextTick(() => open.revealOffset(position.offset));
+      if (position.approximate) store.setMark("approximate location — this note has changed since it was indexed");
+    } else {
+      void nextTick(() => editorRef.value?.focus());
+    }
     return;
   }
   const editor = editorRef.value;

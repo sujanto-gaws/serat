@@ -21,8 +21,10 @@ export interface RangeDeps {
   readRange(start: number, len: number): Promise<ArrayBuffer>;
   /** `asset_info(path).bytes`, a stat. */
   statBytes(): Promise<number>;
-  /** The file no longer matches the length the document was opened with. */
+  /** Evidence the file no longer matches what was opened: size differs, a short span, or gone. */
   onChanged(): void;
+  /** A read failed but nothing says the file changed (EIO, offline placeholder): do NOT restart. */
+  onFailed(): void;
 }
 
 type TransportClass = new (length: number, initialData: Uint8Array | null) => PDFDataRangeTransport;
@@ -37,6 +39,12 @@ export function makeAssetTransport(Base: TransportClass, length: number, deps: R
       if (this.stale) return;
       this.stale = true;
       deps.onChanged();
+    }
+
+    private markFailed(): void {
+      if (this.stale) return;
+      this.stale = true;
+      deps.onFailed();
     }
 
     override requestDataRange(begin: number, end: number): void {
@@ -54,10 +62,12 @@ export function makeAssetTransport(Base: TransportClass, length: number, deps: R
           if (got.byteLength !== want) return this.markChanged();
           this.onDataRange(pos, new Uint8Array(got));
         }
-      } catch {
-        // Missing, unreadable or refused: the same restart path; the host re-reads asset_info
-        // and shows the missing/error state.
-        this.markChanged();
+      } catch (error) {
+        // Only "the file is gone" is evidence of change (the restart then lands on the missing
+        // state). Any other failure with the size unchanged ends in the error state: restarting
+        // would loop on a persistent read error and leak a document per pass.
+        if ((error as { kind?: string } | null)?.kind === "not_found") this.markChanged();
+        else this.markFailed();
       }
     }
   }

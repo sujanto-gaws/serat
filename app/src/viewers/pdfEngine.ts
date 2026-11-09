@@ -29,14 +29,27 @@ export interface PdfDocumentHandle {
   destroy(): void;
 }
 
-/** Opens `path` (a resolved vault path) of `length` bytes. `onChanged` fires when the file no
- * longer matches what was opened. */
-export type PdfLoader = (path: string, length: number, onChanged: () => void) => Promise<PdfDocumentHandle>;
+export interface PdfHooks {
+  /** Evidence the file no longer matches what was opened (size differs, short span, gone). */
+  onChanged(): void;
+  /** A read failed with the file unchanged (I/O error, offline placeholder): show the error state. */
+  onFailed(): void;
+}
+
+/** Opens `path` (a resolved vault path) of `length` bytes. Aborting `signal` destroys the load
+ * (a pending `getDocument` is otherwise never released). */
+export type PdfLoader = (path: string, length: number, hooks: PdfHooks, signal?: AbortSignal) => Promise<PdfDocumentHandle>;
+
+/** The previous document's destroy: with one shared worker port a new `getDocument` must not start
+ * until it finishes ("the worker is being destroyed"). */
+let lastDestroy: Promise<unknown> = Promise.resolve();
 
 /** ADR-0017 §9: the handler's span cap, also pdf.js's chunk size. */
 export const RANGE_CHUNK_SIZE = 1000 * 1024;
 
-export const loadPdf: PdfLoader = async (path, length, onChanged) => {
+export const loadPdf: PdfLoader = async (path, length, hooks, signal) => {
+  await lastDestroy;
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   const pdfjs = await import("pdfjs-dist");
   if (!pdfjs.GlobalWorkerOptions.workerPort) {
     if (typeof Worker === "undefined") throw new Error("no Worker: refusing pdf.js's main-thread fake worker");
@@ -47,15 +60,33 @@ export const loadPdf: PdfLoader = async (path, length, onChanged) => {
   const transport = makeAssetTransport(pdfjs.PDFDataRangeTransport, length, {
     readRange: (start, len) => readAssetRange({ path, start, len }),
     statBytes: async () => (await assetInfo({ path })).bytes,
-    onChanged,
+    onChanged: hooks.onChanged,
+    onFailed: hooks.onFailed,
   });
   const task = pdfjs.getDocument({
     range: transport,
     rangeChunkSize: RANGE_CHUNK_SIZE,
+    disableStream: true, // no effect with a range transport; kept to match the ADR-0017 amendment
     disableAutoFetch: true,
     useWasm: false,
   });
-  const doc = await task.promise;
+  const destroyTask = (): void => {
+    lastDestroy = Promise.resolve(task.destroy()).catch(() => undefined);
+  };
+  const onAbort = (): void => destroyTask();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  let doc: Awaited<typeof task.promise>;
+  try {
+    doc = await task.promise;
+  } catch (error) {
+    signal?.removeEventListener("abort", onAbort);
+    throw error;
+  }
+  signal?.removeEventListener("abort", onAbort);
+  if (signal?.aborted) {
+    destroyTask();
+    throw new DOMException("aborted", "AbortError");
+  }
   return {
     numPages: doc.numPages,
     async pageSize(n) {
@@ -89,8 +120,6 @@ export const loadPdf: PdfLoader = async (path, length, onChanged) => {
         }).render();
       }
     },
-    destroy() {
-      void task.destroy();
-    },
+    destroy: destroyTask,
   };
 };
