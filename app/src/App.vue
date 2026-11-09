@@ -14,6 +14,8 @@ import BacklinksPane from "@/panes/BacklinksPane.vue";
 import SearchPanel from "@/panes/SearchPanel.vue";
 import { locateBlock } from "@/panes/locate";
 import FileTree from "@/tree/FileTree.vue";
+import ViewerHost from "@/viewers/ViewerHost.vue";
+import { isViewerPath } from "@/viewers/assetKind";
 import { readFile } from "@/ipc/client";
 import type { BlockLocation } from "@/ipc/generated/BlockLocation";
 
@@ -29,6 +31,8 @@ const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 const searchOpen = ref(false);
+/** The PDF/image open in place of the editor (binary-viewers.md); null = the editor shows. */
+const viewing = ref<string | null>(null);
 const editorDirty = ref(false);
 /** "Updated externally" in the status strip for 3 s after a disjoint external edit was merged
  * into unsaved work (external-change-notice.md, outcome table). */
@@ -112,6 +116,11 @@ function closeSearch(): void {
  * `loadNote`; if they cannot be saved the note is not replaced.
  */
 async function openNote(path: string, block: BlockLocation | null = null): Promise<void> {
+  if (isViewerPath(path)) {
+    // FR-BIN-01: a PDF or image opens in the viewer; the editor (and its buffer) stay mounted.
+    viewing.value = path;
+    return;
+  }
   const editor = editorRef.value;
   if (!editor) return;
   try {
@@ -122,6 +131,7 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
       return;
     }
     store.setOpenBuffer(file.path, file.hash);
+    viewing.value = null;
     missingNote.value = null;
     if (block) {
       // Exact while the file still has the hash the block was indexed at; by `ord`
@@ -255,6 +265,10 @@ function refusalMessage(error: unknown): string {
 /** Mod-Enter on a link. Opening notes needs the file tree and tabs (tasks #1-#4);
  * until then the host only reports what the link resolved to. */
 function onFollowLink(link: { target: string; path: string | null }): void {
+  if (link.path && isViewerPath(link.path)) {
+    viewing.value = link.path;
+    return;
+  }
   store.setMark(link.path ? `link: ${link.path}` : `no note named \u201C${link.target}\u201D`);
 }
 
@@ -295,7 +309,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
         ref="treeRef"
-        :open-path="store.openNote"
+        :open-path="viewing ?? store.openNote"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
         @open="onTreeOpen"
@@ -308,7 +322,14 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </aside>
     <div class="editor-column">
+      <ViewerHost
+        v-if="viewing !== null"
+        :path="viewing"
+        @open-note="(p: string) => openNote(p)"
+        @reveal="treeRef?.focusTree()"
+      />
       <CodeMirrorEditor
+        v-show="viewing === null"
         ref="editorRef"
         :vault-id="store.vaultId"
         placeholder="No note open."

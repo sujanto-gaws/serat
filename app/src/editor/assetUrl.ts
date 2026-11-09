@@ -26,11 +26,30 @@ export function detectAssetPlatform(): AssetPlatform {
   return /Win/.test(platform) ? "windows" : "other";
 }
 
+/** Directories the vault never serves (ADR-0017 step 5; case folded, like the Rust side). A
+ * defensive duplicate: the native handler is the authority, this just refuses to even ask. */
+const IGNORED_DIRS = new Set([".serat", ".git", ".obsidian", ".trash"]);
+
+export function isIgnoredAssetPath(vaultRelativePath: string): boolean {
+  return vaultRelativePath.split("/").some((segment) => IGNORED_DIRS.has(segment.toLowerCase()));
+}
+
+/**
+ * `.`, `..` and empty segments (an absolute path starts with an empty one) are refused rather
+ * than encoded: `encodeURIComponent` leaves dots alone and a URL parser collapses `a/../b`
+ * before the handler sees it, so such a URL could never name the file asked for. A backslash is
+ * not a separator here: it is encoded as `%5C` and decoded once natively, so it cannot smuggle
+ * a second path component.
+ */
 export function assetUrl(vaultRelativePath: string, platform: AssetPlatform = detectAssetPlatform()): string {
-  const encoded = vaultRelativePath
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
+  const segments = vaultRelativePath.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`not a vault-relative asset path: ${JSON.stringify(vaultRelativePath)}`);
+  }
+  if (isIgnoredAssetPath(vaultRelativePath)) {
+    throw new Error(`not a servable asset path: ${JSON.stringify(vaultRelativePath)}`);
+  }
+  const encoded = segments.map((segment) => encodeURIComponent(segment)).join("/");
   return platform === "windows"
     ? `http://serat-asset.localhost/${encoded}`
     : `serat-asset://localhost/${encoded}`;
