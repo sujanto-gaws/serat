@@ -43,7 +43,7 @@ function formatBytes(n: number): string {
 
 async function load(path: string, restart = false): Promise<void> {
   if (!restart) resumePage.value = 1;
-  const openedBytes = restart ? (info.value?.bytes ?? null) : null;
+  const opened = restart && info.value ? { bytes: info.value.bytes, etag: info.value.etag } : null;
   state.value = "loading";
   info.value = null;
   url.value = null;
@@ -60,8 +60,11 @@ async function load(path: string, restart = false): Promise<void> {
   }
   if (props.path !== path) return; // a later open superseded this one
   info.value = result;
-  if (openedBytes !== null && result.bytes === openedBytes) {
-    // A restart with nothing different on disk would just fail again: say so instead of looping.
+  // A restart with nothing different on disk would just fail again: say so instead of looping.
+  // With validators, "different" is the etag (a same-size rewrite after `asset_changed` has a new
+  // one and restarts); without them it can only be the size.
+  const unchanged = opened !== null && (opened.etag !== undefined ? result.etag === opened.etag : result.bytes === opened.bytes);
+  if (unchanged) {
     state.value = "error";
     return;
   }
@@ -177,6 +180,7 @@ async function editMetadata(): Promise<void> {
         :name="name"
         :loader="pdfLoader"
         :start-page="resumePage"
+        :etag="info.etag"
         @changed="onPdfChanged"
       />
     </div>

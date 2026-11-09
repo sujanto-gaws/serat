@@ -10,7 +10,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 
 import { loadPdf, type PdfDocumentHandle, type PdfLoader, type PdfPageSize } from "./pdfEngine";
 
-const props = defineProps<{ path: string; length: number; name: string; loader?: PdfLoader; startPage?: number }>();
+const props = defineProps<{ path: string; length: number; name: string; loader?: PdfLoader; startPage?: number; etag?: string }>();
 /** The file on disk no longer matches what was opened; carries the page being read. */
 const emit = defineEmits<{ (e: "changed", page: number): void }>();
 
@@ -76,6 +76,7 @@ async function open(): Promise<void> {
         },
       },
       controller.signal,
+      props.etag,
     );
     if (!alive || loadAbort !== controller) {
       handle.destroy();

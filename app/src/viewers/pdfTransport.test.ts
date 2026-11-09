@@ -112,6 +112,44 @@ describe("makeAssetTransport", () => {
     expect(d.onChanged).not.toHaveBeenCalled();
     expect(d.onFailed).toHaveBeenCalledTimes(1);
   });
+
+  it("asset_changed on a span (even at the same size) is one onChanged and no further spans", async () => {
+    const d = deps();
+    delete (d as { statBytes?: unknown }).statBytes; // the etag path has no per-request stat
+    (d.readRange as ReturnType<typeof vi.fn>).mockImplementation(async (start: number, len: number) => {
+      d.reads.push([start, len]);
+      if (start >= SPAN) throw { kind: "asset_changed", path: "d/x.pdf", validator: "E2" };
+      return new ArrayBuffer(len);
+    });
+    const t = make(d);
+    t.requestDataRange(0, 3 * SPAN);
+    await settle();
+    expect(d.reads).toEqual([
+      [0, SPAN],
+      [SPAN, SPAN],
+    ]);
+    expect(t.chunks).toHaveLength(1);
+    expect(d.onChanged).toHaveBeenCalledTimes(1);
+    expect(d.onFailed).not.toHaveBeenCalled();
+    t.requestDataRange(0, 10);
+    await settle();
+    expect(d.reads).toHaveLength(2);
+  });
+
+  it("without statBytes there is no per-request stat; with it (no etag) the old size check still works", async () => {
+    const withStat = deps({ statBytes: vi.fn(async () => FILE + 1) });
+    make(withStat).requestDataRange(0, 10);
+    await settle();
+    expect(withStat.onChanged).toHaveBeenCalledTimes(1);
+    expect(withStat.reads).toEqual([]);
+
+    const noStat = deps();
+    delete (noStat as { statBytes?: unknown }).statBytes;
+    make(noStat).requestDataRange(0, 10);
+    await settle();
+    expect(noStat.reads).toEqual([[0, 10]]);
+    expect(noStat.onChanged).not.toHaveBeenCalled();
+  });
 });
 
 // ---- loadPdf with pdfjs-dist mocked: the exact getDocument arguments and the worker.
@@ -132,6 +170,8 @@ const pdfjs = vi.hoisted(() => {
   };
 });
 vi.mock("pdfjs-dist", () => pdfjs);
+const ipc = vi.hoisted(() => ({ readAssetRange: vi.fn(), assetInfo: vi.fn() }));
+vi.mock("@/ipc/client", () => ipc);
 
 describe("loadPdf (pdf.js arguments)", () => {
   beforeEach(() => {
@@ -217,6 +257,37 @@ describe("loadPdf (pdf.js arguments)", () => {
     const signal = { get aborted() { return reads++ >= 1; }, addEventListener() {}, removeEventListener() {} } as unknown as AbortSignal;
     await expect(loadPdf("d/a.pdf", 10, HOOKS, signal)).rejects.toMatchObject({ name: "AbortError" });
     expect(pdfjs.getDocument).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends if_match = the etag on every span and does not stat; without an etag it omits if_match and stats", async () => {
+    vi.stubGlobal("Worker", class {});
+    const { loadPdf } = await import("./pdfEngine");
+    ipc.readAssetRange.mockImplementation(async (a: { start: number; len: number }) => new ArrayBuffer(Math.min(a.len, FILE - a.start)));
+    ipc.assetInfo.mockResolvedValue({ bytes: FILE });
+    const transportOf = () => {
+      const calls = pdfjs.getDocument.mock.calls as unknown as Array<[{ range: { requestDataRange(b: number, e: number): void } }]>;
+      return calls[calls.length - 1][0].range;
+    };
+
+    ipc.readAssetRange.mockClear();
+    await loadPdf("d/x.pdf", FILE, HOOKS, undefined, "E1");
+    transportOf().requestDataRange(0, 2 * SPAN + 5);
+    await settle();
+    expect(ipc.readAssetRange.mock.calls.map((c) => c[0])).toEqual([
+      { path: "d/x.pdf", start: 0, len: SPAN, if_match: "E1" },
+      { path: "d/x.pdf", start: SPAN, len: SPAN, if_match: "E1" },
+      { path: "d/x.pdf", start: 2 * SPAN, len: 5, if_match: "E1" },
+    ]);
+    expect(ipc.assetInfo).not.toHaveBeenCalled();
+
+    ipc.readAssetRange.mockClear();
+    await loadPdf("d/x.pdf", FILE, HOOKS);
+    transportOf().requestDataRange(0, 10);
+    await settle();
+    expect(ipc.readAssetRange.mock.calls[0][0]).toEqual({ path: "d/x.pdf", start: 0, len: 10 });
+    expect("if_match" in (ipc.readAssetRange.mock.calls[0][0] as object)).toBe(false);
+    expect(ipc.assetInfo).toHaveBeenCalledWith({ path: "d/x.pdf" });
     vi.unstubAllGlobals();
   });
 });
