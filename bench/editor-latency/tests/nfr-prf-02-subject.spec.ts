@@ -29,19 +29,39 @@ const COVERAGE = "partial: 3/8 scenarios (start/middle/end typing only)";
  * then step down to a "Paragraph n" line and require its source line index to be within 45-55% of the note. */
 async function placeCaret(page: Page, editor: Locator, where: Position): Promise<string> {
   const scroller = page.locator('[data-testid="serat-editor"] .cm-scroller');
-  const active = page.locator('[data-testid="serat-editor"] .cm-activeLine');
+  // The editor has no active-line decoration and lives in an open shadow root: read the caret's own
+  // line from the shadow root's selection (Chromium ShadowRoot.getSelection).
+  const activeLineText = () => editor.evaluate((el) => {
+    const sel = ((el.getRootNode() as unknown) as { getSelection?: () => Selection | null }).getSelection?.() ?? null;
+    const n = sel?.focusNode ?? null;
+    const e = n && (n.nodeType === 1 ? (n as Element) : n.parentElement);
+    return e?.closest(".cm-line")?.textContent ?? "";
+  });
   const lines = buildFixtureNote().split("\n");
   await editor.focus();
   await page.keyboard.press("Control+Home");
+  await expect.poll(() => scroller.evaluate((s) => s.scrollTop), { message: "Control+Home scrolled to the top" }).toBe(0);
   let desc = "";
   if (where === "start") {
-    await expect(active.first(), "caret at document start: active line is the first heading").toContainText("Section 0");
+    await expect.poll(activeLineText, { message: "caret at document start: caret line is the first heading" }).toContain("Section 0");
     desc = "line 0 (Section 0)";
   } else if (where === "end") {
     await page.keyboard.press("Control+End");
-    await new Promise((r) => setTimeout(r, 300));
-    const atBottom = await scroller.evaluate((s) => s.scrollTop + s.clientHeight >= s.scrollHeight - 2);
-    expect(atBottom, "caret at document end: the editor is scrolled to the bottom").toBe(true);
+    // Control+End scrolls the caret line into view but need not reach the maximum scrollTop (CodeMirror's
+    // height estimate), so assert the caret itself: it sits on the LAST rendered line (the viewport holds the
+    // document end) and that line is inside the scroller's visible rectangle.
+    await expect.poll(() => editor.evaluate((el) => {
+      const root = el.getRootNode() as ShadowRoot;
+      const sel = (root as unknown as { getSelection?: () => Selection | null }).getSelection?.() ?? null;
+      const n = sel?.focusNode ?? null;
+      const e = n && (n.nodeType === 1 ? (n as Element) : n.parentElement);
+      const line = e?.closest(".cm-line");
+      const all = root.querySelectorAll(".cm-line");
+      const sc = root.querySelector(".cm-scroller");
+      if (!line || !sc || all[all.length - 1] !== line) return false;
+      const a = line.getBoundingClientRect(), b = sc.getBoundingClientRect();
+      return a.top >= b.top - 1 && a.bottom <= b.bottom + 1;
+    }), { message: "caret at document end: caret is on the last line and that line is visible" }).toBe(true);
     desc = `end of note (line ${lines.length - 1})`;
   } else {
     await scroller.evaluate((s) => { s.scrollTop = (s.scrollHeight - s.clientHeight) / 2; });
@@ -53,7 +73,7 @@ async function placeCaret(page: Page, editor: Locator, where: Position): Promise
     lines.forEach((l, i) => { const m = /^Paragraph (\d+) /.exec(l); if (m) lineOf.set(Number(m[1]), i); });
     let idx = -1;
     for (let step = 0; step < 30 && idx < 0; step++) {
-      const text = (await active.first().textContent()) ?? "";
+      const text = await activeLineText();
       const m = /Paragraph (\d+) /.exec(text);
       if (m && lineOf.has(Number(m[1]))) idx = lineOf.get(Number(m[1])) as number;
       else await page.keyboard.press("ArrowDown");
