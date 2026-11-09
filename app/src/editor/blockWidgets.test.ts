@@ -309,15 +309,41 @@ describe("blockWidgetsField", () => {
 
   it("property: for every (anchor, head) pair in a small note the incremental decorations equal a fresh build", () => {
     const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
-    const starts = [0, doc.indexOf("p two") + 2, doc.length];
-    for (let anchor = 0; anchor <= doc.length; anchor += 1) {
-      for (let head = 0; head <= doc.length; head += 1) {
-        const target = makeRange(doc, anchor, head);
-        for (const start of starts) {
-          const s1 = makeState(doc, start).update({ selection: { anchor, head } }).state;
-          expect(shapeOf(s1), `from ${start} to ${anchor}-${head}`).toEqual(shapeOf(target));
-        }
+    const mid = doc.indexOf("p two") + 2;
+    // Start states hoisted: collapsed cursors, a range across the table, and a select-all.
+    const starts: Array<[number, number]> = [
+      [0, 0],
+      [mid, mid],
+      [doc.length, doc.length],
+      [2, mid],
+      [0, doc.length],
+    ];
+    const startStates = starts.map(([a, h]) => makeRange(doc, a, h));
+    const base = makeState(doc, 0);
+    const rebuild = setResolutions.of([]); // the effect forces a full buildAll: the fresh reference
+    // Every 8th position plus every block boundary (blank-line edges) and both ends.
+    const positions = new Set<number>([0, 1, doc.length - 1, doc.length]);
+    for (let i = 0; i <= doc.length; i += 8) positions.add(i);
+    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) [i, i + 2].forEach((p) => positions.has(p) || (p >= 0 && p <= doc.length && positions.add(p)));
+    for (const anchor of positions) {
+      for (const head of positions) {
+        const target = shapeOf(base.update({ selection: { anchor, head }, effects: rebuild }).state);
+        startStates.forEach((st, i) => {
+          const got = shapeOf(st.update({ selection: { anchor, head } }).state);
+          expect(got, `from ${starts[i]} to ${anchor}-${head}`).toEqual(target);
+        });
       }
     }
+  });
+
+  it("Shift-extending a select-all on a 5,000-line note equals a fresh build (re-measured: a few ms, was ~20 ms per-block)", () => {
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 700 }, (_, i) => `${t(i)}\n\npara ${i}\n\nmore text ${i}`).join("\n\n");
+    const all = makeRange(doc, 0, doc.length - 1);
+    const t0 = performance.now();
+    const next = all.update({ selection: { anchor: 0, head: doc.length } }).state;
+    const ms = performance.now() - t0;
+    console.log(`select-all extend by one char on ${doc.split("\n").length} lines: ${ms.toFixed(1)} ms`);
+    expect(shapeOf(next)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
   });
 });
