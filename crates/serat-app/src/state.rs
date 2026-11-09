@@ -961,7 +961,7 @@ impl AppState {
         // per-path lock so no other in-process writer can land between the check and
         // the rename (ADR-0016 §2). `None` asserts the file does not exist.
         let expect = base_hash.map_or(serat_vault::Expect::Absent, serat_vault::Expect::Hash);
-        vault
+        let wrote = vault
             .write_atomic_if(&path, expect, args.text.as_bytes())
             .map_err(from_vault_error)?;
 
@@ -974,18 +974,14 @@ impl AppState {
         // `index.changed` is how a caller learns the rest.
         self.submit_to_index(open, &path);
 
-        // Re-read for the mtime and size the contract returns. It costs a second read
-        // of a file we just wrote, and it buys a `hash` that is genuinely "BLAKE3 of
-        // what is now on disk" rather than of what we intended to put there. P0 writes
-        // whole documents from a text box; when the byte-range patcher arrives in P2
-        // this is a stat, not a read.
-        let written = vault.read(&path).map_err(from_vault_error)?;
-
+        // Hash, mtime and size come from the write itself (ADR-0015 §2): the mtime was
+        // statted right after the rename under the path lock, never from a later read
+        // that an external write could have moved past the hash.
         Ok(FileWritten {
             path: path.to_string(),
-            hash: written.meta.hash.to_hex(),
-            mtime_ms: written.meta.mtime_ms,
-            bytes: written.meta.size,
+            hash: wrote.hash.to_hex(),
+            mtime_ms: wrote.mtime_ms,
+            bytes: wrote.size,
         })
     }
 

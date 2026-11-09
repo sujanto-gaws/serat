@@ -386,7 +386,7 @@ fn a_crlf_and_bom_note_survives_many_sequential_saves_exactly_like_the_model() {
     for _ in 0..200 {
         let (edits, _) = random_edits(&mut rng, &model);
         let expected = apply_edits(&model, &edits, "note.md");
-        match vault.write_patch(&path, hash, &edits) {
+        match vault.write_patch(&path, hash, &edits).map(|w| w.hash) {
             Ok(new_hash) => {
                 let had_crlf = model.contains("\r\n");
                 model = expected.expect("same patch applies the same way");
@@ -514,7 +514,7 @@ fn a_crash_after_the_temp_file_is_written_leaves_the_old_note_and_the_next_save_
     assert!(crashed.is_err());
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), old);
     assert_eq!(stray_temps(dir.path()).len(), 1);
-    let new_hash = vault.write_patch(&path, base_hash, &edits).unwrap();
+    let new_hash = vault.write_patch(&path, base_hash, &edits).unwrap().hash;
     assert_eq!(
         fs::read(dir.path().join("note.md")).unwrap(),
         b"1\r\ntwo\r\n"
