@@ -13,8 +13,8 @@
 //! * **Freshness.** A snapshot is built when the index publishes `Ready`, and again
 //!   [`REFRESH_DELAY`] after the last `index://changed`-worthy change, on the worker
 //!   thread below, never on a query's.
-//! * **Stale queries.** Queries are serialised and each carries a sequence number; one
-//!   that reaches the front of the line after a newer one arrived is discarded (empty
+//! * **Stale queries.** Queries are serialised and each takes an arrival ticket in Rust (the front end's `seq` restarts on a
+//!   reload, so it cannot order anything across one); one that reaches the front of the line after a newer one arrived is discarded (empty
 //!   answer carrying its own `seq`, which the front end drops anyway).
 //! * **The frecency record** (`.serat/history.json`): read once at open, updated in
 //!   memory at once when a note is reported opened, and written [`HISTORY_DELAY`] after
@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -155,7 +155,10 @@ struct Shared {
     tree_corpus: Mutex<Option<(u64, Arc<Corpus>)>>,
     history: Mutex<History>,
     gate: Mutex<()>,
-    newest: AtomicU32,
+    /// Queries that have arrived, in Rust's order: the discard rule's clock. (The
+    /// front end's `seq` is a webview counter that restarts on reload, so it cannot be
+    /// compared across a reload; it is echoed back and nothing more.)
+    arrivals: AtomicU64,
     builds: AtomicU64,
 }
 
@@ -202,7 +205,7 @@ impl Switcher {
             tree_corpus: Mutex::new(None),
             history: Mutex::new(History::from_bytes(existing.as_deref())),
             gate: Mutex::new(()),
-            newest: AtomicU32::new(0),
+            arrivals: AtomicU64::new(0),
             builds: AtomicU64::new(0),
         });
         let thread = Arc::clone(&shared);
@@ -271,7 +274,7 @@ impl Switcher {
     #[must_use]
     pub fn query(&self, args: &SwitcherQueryArgs) -> SwitcherResults {
         let shared = &self.shared;
-        shared.newest.fetch_max(args.seq, Ordering::SeqCst);
+        let ticket = shared.arrivals.fetch_add(1, Ordering::SeqCst);
         // Serialised: an older query that reaches the front of the line after a newer
         // one has arrived is discarded instead of computed.
         let _turn = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
@@ -279,7 +282,7 @@ impl Switcher {
             Some(corpus) => (corpus, SwitcherCorpus::Index),
             None => (shared.tree_snapshot(), SwitcherCorpus::Tree),
         };
-        if args.seq < shared.newest.load(Ordering::SeqCst) {
+        if shared.arrivals.load(Ordering::SeqCst) > ticket + 1 {
             return SwitcherResults {
                 seq: args.seq,
                 corpus: source,
@@ -509,6 +512,47 @@ mod tests {
         }));
         assert!(paths.note_paths().is_empty());
         assert!(paths.generation() >= 5);
+    }
+
+    #[test]
+    fn an_older_arrival_behind_a_newer_one_is_discarded_whatever_the_seq() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("a.md"), "# a\n").expect("note");
+        let paths = Arc::new(TreePaths::default());
+        paths.apply(&listing("", vec![entry("a.md", TreeKind::Note)]));
+        let vault = Arc::new(Vault::open(dir.path()).expect("vault"));
+        let switcher = Switcher::new(vault, dir.path().join("none.db"), paths).expect("switcher");
+        let args = |seq| SwitcherQueryArgs {
+            seq,
+            query: "a".to_owned(),
+            limit: 5,
+        };
+        // Hold the line, let one query arrive, then another with a *lower* seq (as
+        // after a reload): the first is stale by arrival and is dropped.
+        let turn = switcher
+            .shared
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let first = {
+            let switcher = Arc::clone(&switcher);
+            let a = args(50);
+            std::thread::spawn(move || switcher.query(&a))
+        };
+        while switcher.shared.arrivals.load(Ordering::SeqCst) < 1 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let second = {
+            let switcher = Arc::clone(&switcher);
+            let a = args(1);
+            std::thread::spawn(move || switcher.query(&a))
+        };
+        while switcher.shared.arrivals.load(Ordering::SeqCst) < 2 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(turn);
+        assert!(first.join().expect("first").items.is_empty());
+        assert!(!second.join().expect("second").items.is_empty());
     }
 
     #[test]

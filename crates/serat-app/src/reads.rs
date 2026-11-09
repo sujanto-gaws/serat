@@ -116,15 +116,14 @@ impl SearchSlot {
         Ok(conn)
     }
 
-    /// Supersede any search in flight and drop the connection, releasing the file.
+    /// Supersede any search in flight, drop the connection releasing the file, and keep
+    /// it closed: until [`SearchSlot::resume`], a search is refused rather than
+    /// reopening `index.db` (a runtime rebuild is about to delete it, and on Windows an
+    /// open connection makes the delete fail). Serialised with [`SearchSlot::get`] by
+    /// the slot's lock, so nothing reopens after this returns.
     ///
     /// **Required before any runtime rebuild deletes `index.db`** (Windows; see the
-    /// type's documentation). A search still running returns `Superseded` at its next
-    /// progress-handler call and then releases its `Arc`; the next search reopens.
-    /// [`SearchSlot::close`], and keep it closed: until [`SearchSlot::resume`], a search
-    /// is refused rather than reopening `index.db` (a runtime rebuild is about to delete
-    /// it, and on Windows an open connection makes the delete fail). Serialised with
-    /// [`SearchSlot::get`] by the slot's lock, so nothing reopens after this returns.
+    /// type's documentation).
     pub fn suspend(&self) {
         let mut slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         self.suspended.store(true, Ordering::SeqCst);
@@ -138,7 +137,9 @@ impl SearchSlot {
         self.suspended.store(false, Ordering::SeqCst);
     }
 
-    /// Supersede any search in flight and drop the connection, releasing the file.
+    /// Supersede any search in flight and drop the connection, releasing the file. A
+    /// search still running returns `Superseded` at its next progress-handler call and
+    /// then releases its `Arc`; the next search reopens.
     ///
     /// Prefer [`SearchSlot::suspend`] around a rebuild; this alone lets a search
     /// reopen the file straight away.

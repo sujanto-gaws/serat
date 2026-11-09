@@ -295,6 +295,56 @@ fn flusher(weak: &Weak<Shared>) {
     }
 }
 
+/// Calls its callback on drop unless disarmed.
+struct FailureGuard<'a> {
+    on_failure: &'a (dyn Fn() + Send + Sync),
+    armed: bool,
+}
+
+impl<'a> FailureGuard<'a> {
+    fn armed(on_failure: &'a (dyn Fn() + Send + Sync)) -> Self {
+        Self {
+            on_failure,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            (self.on_failure)();
+        }
+    }
+}
+
+/// The open's one authoritative walk, for a vault whose tree nobody has opened: the
+/// same metadata walk the tree would have made, into a sink that discards listings.
+/// Returns the files admitted and the sorted entries for the catch-up, or `None` if the
+/// walk failed (`on_failed` has then been called). Run on a thread of its own after the
+/// gate and the claim.
+pub fn standalone_walk(
+    vault: &Vault,
+    on_start: &dyn Fn(),
+    on_failed: &(dyn Fn() + Send + Sync),
+) -> Option<(u32, Vec<SourceEntry>)> {
+    let session = TreeSession::new(|_| {});
+    let mut failure = FailureGuard::armed(on_failed);
+    on_start();
+    let mut acc: Vec<SourceEntry> = Vec::new();
+    let result = session.populate_from_walk_with_metadata(vault, &mut |dir, entries| {
+        acc.extend(source_entries(dir, entries));
+    });
+    let summary = result.ok()?;
+    acc.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    failure.disarm();
+    Some((summary.files, acc))
+}
+
 /// What the front end's two marks were, as `mark_tree` recorded them (ADR-0015 §3).
 /// Milliseconds on the process's monotonic clock (`t0`), like every other mark.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -333,15 +383,28 @@ pub struct FeedConfig {
     pub vault: Arc<Vault>,
     /// The index database file, for the warm path.
     pub index_db: PathBuf,
-    /// Whether the index is `Ready` now. Read once per stream start.
+    /// Whether the index is `Ready` now. Read once per stream start, and only to decide
+    /// whether the index may paint the first listings; whether the walk feeds a
+    /// catch-up is [`FeedConfig::claim`]'s decision, taken after the gate.
     pub index_ready: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called by every `open`, before anything else: this vault now has a tree stream,
+    /// so the application's own open-time trigger leaves the walk to it.
+    pub attach: Box<dyn Fn() + Send + Sync>,
+    /// Called after the gate: waits (bounded) for the index to settle and says whether
+    /// *this* walk is the open's one authoritative walk, the one that feeds the
+    /// catch-up (ADR-0015 section 2). True at most once per open vault; a second
+    /// `open_tree`, or a restarted session, gets false and walks name-and-kind only.
+    pub claim: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called if a walk that [`FeedConfig::claim`] granted did not complete (an error or
+    /// a panic), so the journal opened by `on_walk_start` is closed and a rescan owed.
+    pub on_walk_failed: Box<dyn Fn() + Send + Sync>,
     /// Blocks until the walk may start: the first paint, in the application
     /// (ADR-0015 §2: "the walk always runs, after the first paint").
     pub gate: Arc<dyn Fn() + Send + Sync>,
-    /// Called on the warm path just before the authoritative walk starts, so the
+    /// Called when `claim` was granted, just before the authoritative walk starts, so the
     /// application can journal what the watcher reports until the catch-up is done.
     pub on_walk_start: Box<dyn Fn() + Send + Sync>,
-    /// Called on the warm path (index `Ready` at the start of the stream) with every
+    /// Called when `claim` was granted with every
     /// file the authoritative walk found, sorted by path, once the walk has completed
     /// (ADR-0015 section 2, *One walk at open*). The application hands it to the open's
     /// catch-up on a thread of its own. Never called on the no-index path, where the
@@ -420,6 +483,7 @@ impl TreeFeed {
     ///
     /// Only if the operating system refuses to create the populate thread.
     pub fn open(self: &Arc<Self>, send: TreeSender) -> std::io::Result<()> {
+        (self.config.attach)();
         *self.marks_lock() = TreeMarks::default();
         self.stopped.store(false, Ordering::SeqCst);
         self.start(send, 0)
@@ -476,9 +540,14 @@ impl TreeFeed {
             }
         }
         (self.config.gate)();
-        // One walk at open (ADR-0015 section 2): on the warm path it carries size and
-        // mtime and feeds the catch-up; on the no-index path it stays name-and-kind.
-        let walked = if warm {
+        // One walk at open (ADR-0015 section 2): the claimed walk carries size and
+        // mtime and feeds the catch-up; any other stays name-and-kind. The claim is
+        // taken here, after the gate and the index's settling, so an `open_tree` that
+        // arrived while the index was `Opening` still gets the catch-up.
+        let walked = if (self.config.claim)() {
+            // Armed until the catch-up has its entries: an error or a panic closes the
+            // journal and owes a rescan instead of leaving the window open forever.
+            let mut failure = FailureGuard::armed(&*self.config.on_walk_failed);
             (self.config.on_walk_start)();
             let mut acc: Vec<SourceEntry> = Vec::new();
             let result = session
@@ -487,6 +556,7 @@ impl TreeFeed {
                 });
             if result.is_ok() {
                 acc.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+                failure.disarm();
                 (self.config.on_walked)(acc);
             }
             result
@@ -681,6 +751,9 @@ mod tests {
             index_ready: Box::new(move || ready),
             gate: Arc::new(|| {}),
             paths: Arc::default(),
+            attach: Box::new(|| {}),
+            claim: Box::new(move || ready),
+            on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(|| {}),
             on_walked: Box::new(|_| {}),
             on_walk_complete: Box::new(|_| {}),
@@ -764,6 +837,9 @@ mod tests {
             index_ready: Box::new(move || ready),
             gate: Arc::new(|| {}),
             paths: Arc::default(),
+            attach: Box::new(|| {}),
+            claim: Box::new(move || ready),
+            on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(move || {
                 started.fetch_add(1, Ordering::SeqCst);
             }),
@@ -925,6 +1001,9 @@ mod tests {
             index_ready: Box::new(|| false),
             gate: Arc::new(|| {}),
             paths: Arc::default(),
+            attach: Box::new(|| {}),
+            claim: Box::new(|| false),
+            on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(|| {}),
             on_walked: Box::new(|_| {}),
             on_walk_complete: Box::new(|_| {}),

@@ -13,7 +13,8 @@
 //! the tree's, and it feeds the catch-up), so the rule is kept by a latch:
 //! [`Stage::WatcherRegistered`] or [`Stage::WatcherFailed`] is reported first, and the
 //! application's tree walk waits on a [`Latch`] set by that stage
-//! (`the_tree_walk_waits_for_the_watcher` in `state.rs`).
+//! (`the_tree_walk_waits_for_the_watcher` in `state.rs`: a stage hook delays
+//! `WatcherRegistered`, and the walk's start must come after it).
 //!
 //! # The walk waits for the first paint, and that is a measurement
 //!
@@ -145,6 +146,27 @@ impl VaultThread {
             stop,
             handle: Some(handle),
         })
+    }
+
+    /// Ask the thread to stop and wait for it, for at most `deadline`. Returns whether it
+    /// stopped. A thread still inside a long reconciliation is detached rather than
+    /// waited for: it refuses further reads once the indexer's stop flag is set, so it
+    /// ends on its own, and a close that waited for it would be a hang at exit.
+    pub fn stop_within(&mut self, deadline: Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        let limit = Instant::now() + deadline;
+        while !handle.is_finished() {
+            if Instant::now() >= limit {
+                eprintln!("serat: the vault thread did not stop within {deadline:?}; detached");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = handle.join();
+        true
     }
 
     /// Ask the thread to stop and wait for it.

@@ -11,7 +11,7 @@
 //! | the coalesced paths, drained as one batch | `index_paths` |
 //! | `VaultEvent::DirChanged(d)` | `reconcile_dir` over `Vault::walk_dir(d)` |
 //! | `RescanRequired`, or an overflow ticket | `catch_up(.., PathsAndMtime)` over `Vault::walk()` |
-//! | open (warm path) | `catch_up(.., after_unclean_shutdown)` over the tree walk's entries |
+//! | open (index `Ready`, not rebuilt) | `catch_up(.., PathsAndMtime)` over the open's one walk |
 //!
 //! Every submit is on ADR-0011's bulk side (`submit_blocking`, inside the reconciler),
 //! and every call here runs on the vault thread or on the open's catch-up thread, never
@@ -36,17 +36,19 @@
 //! a file that was created is re-added and a file that was deleted is removed again.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use serat_core::{IndexError, SourceEntry, VaultPath};
+use serat_core::{IndexError, LoadedNote, NoteSource, SourceEntry, VaultError, VaultPath};
 use serat_index::external::{CatchUp, ChangeSignal, Outcome, Reconciler};
 use serat_parse::CommonMarkParser;
 use serat_vault::Vault;
 
 use crate::index::IndexHandleSlot;
-use crate::ipc::IndexChanged;
+use crate::ipc::{IndexChanged, IndexState};
 use crate::state::Events;
+use crate::vault::Latch;
 
 /// Paths held while the index has no handle, before the consumer gives up listing them
 /// and asks for a catch-up instead.
@@ -168,11 +170,173 @@ struct Deferred {
 struct Journal {
     paths: BTreeSet<VaultPath>,
     dirs: BTreeSet<VaultPath>,
+    /// A `RescanRequired` (or an overflow of this journal) arrived inside the window:
+    /// the replay re-runs the whole-vault rescan instead of listing anything.
+    rescan: bool,
 }
 
 impl Journal {
     fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.dirs.is_empty()
+        self.paths.is_empty() && self.dirs.is_empty() && !self.rescan
+    }
+
+    /// Cap like [`DEFERRED_CAP`]: a walk that never finishes cannot grow this without
+    /// bound, and an overflow is a full rescan in the replay.
+    fn add_paths(&mut self, paths: &[VaultPath]) {
+        if self.rescan {
+            return;
+        }
+        self.paths.extend(paths.iter().cloned());
+        self.enforce_cap();
+    }
+
+    fn add_dir(&mut self, dir: &VaultPath) {
+        if self.rescan {
+            return;
+        }
+        self.dirs.insert(dir.clone());
+        self.enforce_cap();
+    }
+
+    fn enforce_cap(&mut self) {
+        if self.paths.len() + self.dirs.len() > DEFERRED_CAP {
+            self.paths.clear();
+            self.dirs.clear();
+            self.rescan = true;
+        }
+    }
+}
+
+/// The vault as the reconciler's note source, refusing reads once the vault is closing:
+/// a catch-up over 50,000 files then finishes in the time it takes to skip them, rather
+/// than holding the close (a skipped file keeps its row; see `Reconciler`). The error is
+/// deliberately not `NotFound`, which would remove the row.
+struct Stoppable<'a> {
+    vault: &'a Vault,
+    stop: &'a AtomicBool,
+}
+
+impl NoteSource for Stoppable<'_> {
+    fn entries(&self) -> Result<Vec<SourceEntry>, VaultError> {
+        self.vault.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(VaultError::Io {
+                path: path.to_string(),
+                message: "the vault is closing".to_owned(),
+            });
+        }
+        self.vault.load(path)
+    }
+}
+
+/// Decides, once per open vault, whether the open's catch-up runs and which walk feeds
+/// it (ADR-0015 section 2, FR-VLT-04). Owned by the application, not by `open_tree`:
+/// a vault whose tree nobody has opened still reconciles what changed while it was
+/// closed, and a vault whose tree was opened while the index was still `Opening` does
+/// too.
+///
+/// Whoever wants the walk calls [`OpenCatchUp::claim`]: it waits, with a bound, for the
+/// index to settle, and grants the walk at most once, and only if the index is `Ready`
+/// and was not rebuilt this session (a rebuild is itself the reconciliation). A stream
+/// that has been opened ([`OpenCatchUp::attach_tree`]) takes precedence over the
+/// application's own trigger, so one walk serves both the tree and the catch-up; a
+/// later `open_tree` (a reload) or a restarted session is refused the claim and walks
+/// name-and-kind only, with no journal and no second catch-up.
+#[derive(Debug)]
+pub struct OpenCatchUp {
+    settled: Latch,
+    bound: Duration,
+    state: Mutex<Claim>,
+}
+
+#[derive(Debug, Default)]
+struct Claim {
+    ready: bool,
+    rebuilt: bool,
+    claimed: bool,
+    tree_attached: bool,
+    cancelled: bool,
+}
+
+/// How long a claimant waits for the index's open check to settle.
+pub const SETTLE_BOUND: Duration = Duration::from_secs(30);
+
+impl OpenCatchUp {
+    /// A coordinator that waits at most `bound` for the index to settle.
+    #[must_use]
+    pub fn new(bound: Duration) -> Self {
+        Self {
+            settled: Latch::default(),
+            bound,
+            state: Mutex::new(Claim::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Claim> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every state the publisher publishes.
+    pub fn index_published(&self, state: &IndexState) {
+        {
+            let mut claim = self.lock();
+            match state {
+                IndexState::Ready { .. } => claim.ready = true,
+                IndexState::Rebuilding { .. } => {
+                    claim.ready = false;
+                    claim.rebuilt = true;
+                }
+                _ => {}
+            }
+        }
+        if !matches!(state, IndexState::Opening) {
+            self.settled.set();
+        }
+    }
+
+    /// The vault is closing: wake every claimant and grant nothing further.
+    pub fn cancel(&self) {
+        self.lock().cancelled = true;
+        self.settled.set();
+    }
+
+    /// `open_tree` was called: the tree's walk will ask for the claim itself.
+    pub fn attach_tree(&self) {
+        self.lock().tree_attached = true;
+    }
+
+    /// Whether the caller's walk is the open's one authoritative walk. `from_tree` is
+    /// the tree's own request; the other caller is the application's trigger, which
+    /// stands aside for a tree.
+    #[must_use]
+    pub fn claim(&self, from_tree: bool) -> bool {
+        if !self.settled.wait(self.bound) {
+            eprintln!(
+                "serat: the index had not settled after {:?}; no catch-up this session",
+                self.bound
+            );
+            return false;
+        }
+        let mut claim = self.lock();
+        if claim.cancelled
+            || claim.claimed
+            || !claim.ready
+            || claim.rebuilt
+            || (!from_tree && claim.tree_attached)
+        {
+            return false;
+        }
+        claim.claimed = true;
+        true
+    }
+
+    /// Whether the claim has been granted.
+    #[must_use]
+    pub fn claimed(&self) -> bool {
+        self.lock().claimed
     }
 }
 
@@ -183,6 +347,8 @@ pub struct Indexer {
     notifier: Arc<ChangeNotifier>,
     deferred: Mutex<Deferred>,
     journal: Mutex<Option<Journal>>,
+    /// The vault is closing: reconciliation reads are refused ([`Stoppable`]).
+    stop: AtomicBool,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -201,6 +367,24 @@ impl Indexer {
             notifier,
             deferred: Mutex::new(Deferred::default()),
             journal: Mutex::new(None),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    /// The vault is closing: abandon work in progress, including the detached catch-up
+    /// thread, and start none.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn source(&self) -> Stoppable<'_> {
+        Stoppable {
+            vault: &self.vault,
+            stop: &self.stop,
         }
     }
 
@@ -248,11 +432,11 @@ impl Indexer {
 
     /// One drained batch of watcher paths (architecture 3.1.2 step 1).
     pub fn index_paths(&self, paths: &[VaultPath]) {
-        if paths.is_empty() {
+        if paths.is_empty() || self.stopped() {
             return;
         }
         if let Some(journal) = self.journal().as_mut() {
-            journal.paths.extend(paths.iter().cloned());
+            journal.add_paths(paths);
         }
         let Some(reconciler) = self.reconciler() else {
             self.defer(paths);
@@ -261,7 +445,7 @@ impl Indexer {
         let parser = CommonMarkParser::new();
         let vault = &*self.vault;
         self.settle(reconciler.index_paths(
-            vault,
+            &self.source(),
             &parser,
             &|path, hash| vault.echo().take_echo(path, hash),
             paths,
@@ -270,8 +454,11 @@ impl Indexer {
 
     /// `VaultEvent::DirChanged(dir)`: one subtree.
     pub fn dir_changed(&self, dir: &VaultPath) {
+        if self.stopped() {
+            return;
+        }
         if let Some(journal) = self.journal().as_mut() {
-            journal.dirs.insert(dir.clone());
+            journal.add_dir(dir);
         }
         let Some(reconciler) = self.reconciler() else {
             self.deferred().rescan = true;
@@ -289,20 +476,35 @@ impl Indexer {
             }
         };
         let parser = CommonMarkParser::new();
-        self.settle(reconciler.reconcile_dir(&*self.vault, &parser, dir, &entries));
+        self.settle(reconciler.reconcile_dir(&self.source(), &parser, dir, &entries));
     }
 
     /// `RescanRequired` or an overflow: the whole vault, mtimes included.
+    ///
+    /// Inside the open's journal window it is journaled instead, and the replay runs it
+    /// once the catch-up has finished: the catch-up's own comparison is what is in
+    /// progress, and a rescan racing it would compare against rows it is still writing.
     pub fn rescan(&self) {
+        if self.stopped() {
+            return;
+        }
+        if let Some(journal) = self.journal().as_mut() {
+            journal.rescan = true;
+            return;
+        }
         let Some(reconciler) = self.reconciler() else {
             self.deferred().rescan = true;
             return;
         };
+        self.rescan_with(&reconciler);
+    }
+
+    fn rescan_with(&self, reconciler: &Reconciler) {
         match self.vault.walk() {
             Ok(entries) => {
                 let parser = CommonMarkParser::new();
                 self.settle(reconciler.catch_up(
-                    &*self.vault,
+                    &self.source(),
                     &parser,
                     &entries,
                     CatchUp::PathsAndMtime,
@@ -352,25 +554,44 @@ impl Indexer {
         }
     }
 
-    /// The warm path's authoritative walk is about to start: journal what the consumer
+    /// The open's authoritative walk is about to start: journal what the consumer
     /// handles until the catch-up has finished.
     pub fn walk_started(&self) {
         *self.journal() = Some(Journal::default());
+    }
+
+    /// The walk that was to feed the catch-up failed or panicked: close the journal
+    /// (it would otherwise grow for the rest of the session) and owe a whole-vault
+    /// rescan, which is what the catch-up would have been.
+    pub fn walk_failed(&self) {
+        *self.journal() = None;
+        self.deferred().rescan = true;
     }
 
     /// The open's catch-up (ADR-0015 section 2): `entries` are the tree walk's, sorted.
     /// Runs on the caller's thread; the application gives it one of its own. Replays
     /// the journal when done (module note).
     pub fn catch_up(&self, entries: &[SourceEntry]) {
-        let Some(reconciler) = self.reconciler() else {
-            // No handle: the open produced none (Unavailable) or a rebuild is running,
-            // and the rebuild is the reconciliation.
+        if self.stopped() {
             *self.journal() = None;
+            return;
+        }
+        let Some(reconciler) = self.reconciler() else {
+            // `Ready` is published before the actor's handle reaches the slot, and a
+            // rebuild takes the handle out; either way the comparison is owed, and a
+            // rescan is it. (The open's own rebuild never gets here: it is not claimed.)
+            *self.journal() = None;
+            self.deferred().rescan = true;
             return;
         };
         let parser = CommonMarkParser::new();
-        let mode = CatchUp::after_unclean_shutdown(self.unclean());
-        self.settle(reconciler.catch_up(&*self.vault, &parser, entries, mode));
+        // The architect's ruling (ADR-0015 section 2): the open compares mtimes whatever
+        // the last shutdown was. The marker only schedules the background quick_check,
+        // which this crate does not run yet; it is reported so the fact is not lost.
+        if self.unclean() {
+            eprintln!("serat: the previous session did not close cleanly; comparing mtimes");
+        }
+        self.settle(reconciler.catch_up(&self.source(), &parser, entries, CatchUp::PathsAndMtime));
         self.replay_journal(&reconciler);
     }
 
@@ -379,20 +600,26 @@ impl Indexer {
             let batch = {
                 let mut guard = self.journal();
                 match guard.as_mut() {
-                    Some(journal) if !journal.is_empty() => std::mem::take(journal),
+                    Some(journal) if !journal.is_empty() && !self.stopped() => {
+                        std::mem::take(journal)
+                    }
                     _ => {
                         *guard = None;
                         return;
                     }
                 }
             };
+            if batch.rescan {
+                // Covers every path and directory in the batch.
+                self.rescan_with(reconciler);
+                continue;
+            }
             for dir in &batch.dirs {
                 self.reconcile_dir(reconciler, dir);
             }
             let paths: Vec<VaultPath> = batch.paths.into_iter().collect();
             let parser = CommonMarkParser::new();
-            let vault = &*self.vault;
-            self.settle(reconciler.index_paths(vault, &parser, &|_, _| false, &paths));
+            self.settle(reconciler.index_paths(&self.source(), &parser, &|_, _| false, &paths));
         }
     }
 
@@ -599,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_shutdown_compares_paths_and_an_unclean_one_compares_mtimes() {
+    fn the_open_compares_mtimes_after_a_clean_shutdown_and_after_an_unclean_one() {
         let dir = vault_dir("modes");
         let index_dir = dir.join(".serat");
         {
@@ -609,23 +836,128 @@ mod tests {
             handle.close().expect("clean close");
         }
         let before = hash_of(&dir, "a.md").expect("indexed");
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(dir.join("a.md"), "# a, edited while closed\n").expect("edit");
 
-        // Clean: the marker is set, so the content comparison is skipped.
+        // Clean: the marker is set, and the content comparison runs all the same.
         let (indexer, _) = indexer(&dir, slot_with(&dir));
         assert!(!indexer.unclean());
         indexer.catch_up(&walk(&indexer));
-        assert_eq!(hash_of(&dir, "a.md").expect("row"), before);
+        let after_clean = hash_of(&dir, "a.md").expect("row");
+        assert_ne!(after_clean, before, "a clean shutdown is not trusted");
 
         // Unclean: the handle was opened and dropped without close().
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("a.md"), "# a, edited again\n").expect("edit");
         drop(indexer.slot.lock().expect("slot").take());
         let handle = IndexHandle::open(&index_dir).expect("index");
         drop(handle);
         let (indexer, _) = indexer_for(&dir);
         assert!(indexer.unclean());
         indexer.catch_up(&walk(&indexer));
-        assert_ne!(hash_of(&dir, "a.md").expect("row"), before);
+        assert_ne!(hash_of(&dir, "a.md").expect("row"), after_clean);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rescan_inside_the_journal_window_is_replayed_after_the_catch_up() {
+        let dir = vault_dir("journal-rescan");
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.walk_started();
+        let stale_walk = walk(&indexer);
+        std::fs::write(dir.join("c.md"), "# c\n").expect("new");
+        indexer.rescan();
+        assert!(hash_of(&dir, "c.md").is_none(), "journaled, not run");
+        indexer.catch_up(&stale_walk);
+        assert!(
+            hash_of(&dir, "c.md").is_some(),
+            "the replay re-ran the rescan"
+        );
+        assert!(indexer.journal().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_journal_is_capped_and_a_failed_walk_closes_it_and_owes_a_rescan() {
+        let dir = vault_dir("journal-cap");
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.walk_started();
+        let many: Vec<VaultPath> = (0..DEFERRED_CAP + 1)
+            .map(|n| p(&format!("n{n}.md")))
+            .collect();
+        indexer.journal().as_mut().expect("window").add_paths(&many);
+        {
+            let guard = indexer.journal();
+            let journal = guard.as_ref().expect("window");
+            assert!(
+                journal.rescan && journal.paths.is_empty(),
+                "overflow is a rescan"
+            );
+        }
+        indexer.walk_failed();
+        assert!(indexer.journal().is_none());
+        assert!(indexer.deferred().rescan);
+        indexer.tick(Instant::now());
+        assert!(hash_of(&dir, "a.md").is_some(), "the owed rescan ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_catch_up_with_no_handle_owes_a_rescan_instead_of_vanishing() {
+        let dir = vault_dir("no-handle");
+        let slot: IndexHandleSlot = Arc::new(Mutex::new(None));
+        let (indexer, _) = indexer(&dir, Arc::clone(&slot));
+        indexer.walk_started();
+        indexer.catch_up(&walk(&indexer));
+        assert!(indexer.deferred().rescan);
+        *slot.lock().expect("slot") = Some(IndexHandle::open(&dir.join(".serat")).expect("index"));
+        indexer.tick(Instant::now());
+        assert!(hash_of(&dir, "a.md").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stopped_indexer_does_no_further_work() {
+        let dir = vault_dir("stopped");
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.stop();
+        indexer.catch_up(&walk(&indexer));
+        indexer.index_paths(&[p("a.md")]);
+        assert!(hash_of(&dir, "a.md").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_claim_is_granted_once_only_when_ready_and_never_after_a_rebuild() {
+        let ready = IndexState::Ready { note_count: 1 };
+        let rebuilding = IndexState::Rebuilding {
+            reason: crate::ipc::RebuildReason::NoIndex,
+            done: 0,
+            total: 0,
+            walk_complete: false,
+        };
+        let c = OpenCatchUp::new(Duration::from_secs(5));
+        c.index_published(&IndexState::Opening);
+        c.index_published(&ready);
+        assert!(c.claim(false));
+        assert!(!c.claim(true), "once per open vault");
+
+        let c = OpenCatchUp::new(Duration::from_secs(5));
+        c.index_published(&rebuilding);
+        c.index_published(&ready);
+        assert!(!c.claim(true), "a rebuild is the reconciliation");
+
+        let c = OpenCatchUp::new(Duration::from_secs(5));
+        c.attach_tree();
+        c.index_published(&ready);
+        assert!(!c.claim(false), "the trigger stands aside for a tree");
+        assert!(c.claim(true));
+
+        let c = OpenCatchUp::new(Duration::from_millis(30));
+        assert!(
+            !c.claim(true),
+            "a bounded wait for an index that never settles"
+        );
     }
 
     fn indexer_for(dir: &std::path::Path) -> (Indexer, Arc<Mutex<Vec<u64>>>) {
