@@ -671,9 +671,7 @@ pub enum IpcError {
     StaleHash {
         /// Vault-relative path.
         path: String,
-        /// The hash the file has now, lowercase hex. **Exception:** from
-        /// `read_asset_range` it is the asset's current validator in
-        /// `AssetInfo::etag`'s form, which is opaque (ADR-0017 Amendment 1).
+        /// The hash the file has now, lowercase hex.
         current_hash: String,
     },
 
@@ -710,6 +708,28 @@ pub enum IpcError {
         path: String,
         /// The operating system's message, for the user.
         message: String,
+    },
+
+    /// `read_asset_range` only: the asset changed since the load began.
+    /// `ReadAssetRangeArgs::if_match` no longer equals the opened handle's
+    /// validator, and no bytes were served. The PDF transport reloads from
+    /// `asset_info` and shows the 4 s "changed on disk" notice (ADR-0017
+    /// Amendment 1, task #94).
+    ///
+    /// A separate variant rather than `StaleHash`, deliberately: `StaleHash`
+    /// carries a BLAKE3 content hash that note code adopts as a base, and an
+    /// asset validator is not one. A handler written for notes must never see
+    /// this value in a field it treats as a hash.
+    ///
+    /// **Contract ahead of implementation**, filled by the follow-up
+    /// `[P1/impl] Validator check on read_asset_range` (tauri-app-dev). No
+    /// command returns it until then.
+    AssetChanged {
+        /// Vault-relative path.
+        path: String,
+        /// The asset's current validator, in `AssetInfo::etag`'s form. Opaque,
+        /// compared for equality only.
+        validator: String,
     },
 }
 
@@ -1622,8 +1642,7 @@ pub struct ReadAssetRangeArgs {
     pub len: u32,
     /// The `AssetInfo::etag` the load started with. When it is present and the
     /// opened handle's current validator differs, no bytes are served and the
-    /// answer is `IpcError::StaleHash`, whose `current_hash` carries the new
-    /// validator (not a BLAKE3 hash for this command). The transport then
+    /// answer is `IpcError::AssetChanged`, carrying the new validator. The transport then
     /// reloads from `asset_info` and shows the 4 s "changed on disk" notice
     /// (ADR-0017 Amendment 1, the scheme's `If-Range` moved into the transport).
     ///

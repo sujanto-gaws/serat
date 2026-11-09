@@ -27,8 +27,7 @@ len: number,
 /**
  * The `AssetInfo::etag` the load started with. When it is present and the
  * opened handle's current validator differs, no bytes are served and the
- * answer is `IpcError::StaleHash`, whose `current_hash` carries the new
- * validator (not a BLAKE3 hash for this command). The transport then
+ * answer is `IpcError::AssetChanged`, carrying the new validator. The transport then
  * reloads from `asset_info` and shows the 4 s "changed on disk" notice
  * (ADR-0017 Amendment 1, the scheme's `If-Range` moved into the transport).
  *

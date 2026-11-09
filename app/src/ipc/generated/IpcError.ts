@@ -61,9 +61,7 @@ value: string, } | { "kind": "stale_hash",
  */
 path: string, 
 /**
- * The hash the file has now, lowercase hex. **Exception:** from
- * `read_asset_range` it is the asset's current validator in
- * `AssetInfo::etag`'s form, which is opaque (ADR-0017 Amendment 1).
+ * The hash the file has now, lowercase hex.
  */
 current_hash: string, } | { "kind": "invalid_patch", 
 /**
@@ -89,4 +87,13 @@ path: string,
 /**
  * The operating system's message, for the user.
  */
-message: string, };
+message: string, } | { "kind": "asset_changed", 
+/**
+ * Vault-relative path.
+ */
+path: string, 
+/**
+ * The asset's current validator, in `AssetInfo::etag`'s form. Opaque,
+ * compared for equality only.
+ */
+validator: string, };
