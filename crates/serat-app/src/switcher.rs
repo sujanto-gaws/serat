@@ -13,9 +13,11 @@
 //! * **Freshness.** A snapshot is built when the index publishes `Ready`, and again
 //!   [`REFRESH_DELAY`] after the last `index://changed`-worthy change, on the worker
 //!   thread below, never on a query's.
-//! * **Stale queries.** Queries are serialised and each takes an arrival ticket in Rust (the front end's `seq` restarts on a
-//!   reload, so it cannot order anything across one); one that reaches the front of the line after a newer one arrived is discarded (empty
-//!   answer carrying its own `seq`, which the front end drops anyway).
+//! * **Stale queries.** Queries are serialised. One that is still waiting for the line
+//!   when a later arrival with a higher `seq` comes in is discarded (empty answer
+//!   carrying its own `seq`, which the front end drops anyway). Neither arrival order
+//!   alone (the commands run on a thread pool, so the newest keystroke can arrive
+//!   first) nor `seq` alone (it restarts on a webview reload) would be safe.
 //! * **The frecency record** (`.serat/history.json`): read once at open, updated in
 //!   memory at once when a note is reported opened, and written [`HISTORY_DELAY`] after
 //!   the last open (and when the vault closes) through `Vault::update_history`. Losing
@@ -155,11 +157,37 @@ struct Shared {
     tree_corpus: Mutex<Option<(u64, Arc<Corpus>)>>,
     history: Mutex<History>,
     gate: Mutex<()>,
-    /// Queries that have arrived, in Rust's order: the discard rule's clock. (The
-    /// front end's `seq` is a webview counter that restarts on reload, so it cannot be
-    /// compared across a reload; it is echoed back and nothing more.)
+    /// Identity for in-flight queries.
     arrivals: AtomicU64,
+    /// Queries that have arrived and not yet answered. A query is superseded only when a
+    /// *later arrival* carries a *higher* `seq`: queries reach `query()` in scheduler
+    /// order, so arrival order alone would discard the newest keystroke if it got
+    /// the earlier ticket, and `seq` alone breaks after a reload (it restarts at 1). A
+    /// lower `seq` arriving after a higher one supersedes nothing and is not superseded.
+    inflight: Mutex<Vec<Inflight>>,
     builds: AtomicU64,
+}
+
+struct Inflight {
+    ticket: u64,
+    seq: u32,
+    superseded: bool,
+}
+
+/// Removes a query's in-flight entry on every way out of `query`.
+struct Leave<'a> {
+    shared: &'a Shared,
+    ticket: u64,
+}
+
+impl Drop for Leave<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|q| q.ticket != self.ticket);
+    }
 }
 
 /// The switcher for one open vault.
@@ -206,6 +234,7 @@ impl Switcher {
             history: Mutex::new(History::from_bytes(existing.as_deref())),
             gate: Mutex::new(()),
             arrivals: AtomicU64::new(0),
+            inflight: Mutex::new(Vec::new()),
             builds: AtomicU64::new(0),
         });
         let thread = Arc::clone(&shared);
@@ -275,14 +304,35 @@ impl Switcher {
     pub fn query(&self, args: &SwitcherQueryArgs) -> SwitcherResults {
         let shared = &self.shared;
         let ticket = shared.arrivals.fetch_add(1, Ordering::SeqCst);
-        // Serialised: an older query that reaches the front of the line after a newer
-        // one has arrived is discarded instead of computed.
+        {
+            let mut inflight = shared
+                .inflight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for earlier in inflight.iter_mut().filter(|q| q.seq < args.seq) {
+                earlier.superseded = true;
+            }
+            inflight.push(Inflight {
+                ticket,
+                seq: args.seq,
+                superseded: false,
+            });
+        }
+        let _leave = Leave { shared, ticket };
+        // Serialised: a query superseded while it waited for the line is discarded
+        // instead of computed.
         let _turn = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
         let (corpus, source) = match shared.index_snapshot() {
             Some(corpus) => (corpus, SwitcherCorpus::Index),
             None => (shared.tree_snapshot(), SwitcherCorpus::Tree),
         };
-        if shared.arrivals.load(Ordering::SeqCst) > ticket + 1 {
+        let superseded = shared
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|q| q.ticket == ticket && q.superseded);
+        if superseded {
             return SwitcherResults {
                 seq: args.seq,
                 corpus: source,
@@ -514,45 +564,53 @@ mod tests {
         assert!(paths.generation() >= 5);
     }
 
-    #[test]
-    fn an_older_arrival_behind_a_newer_one_is_discarded_whatever_the_seq() {
+    /// Hold the line, let queries with the given seqs arrive in order, release, and
+    /// return whether each was answered with items.
+    fn arrive_in_order(seqs: &[u32]) -> Vec<bool> {
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(dir.path().join("a.md"), "# a\n").expect("note");
         let paths = Arc::new(TreePaths::default());
         paths.apply(&listing("", vec![entry("a.md", TreeKind::Note)]));
         let vault = Arc::new(Vault::open(dir.path()).expect("vault"));
         let switcher = Switcher::new(vault, dir.path().join("none.db"), paths).expect("switcher");
-        let args = |seq| SwitcherQueryArgs {
-            seq,
-            query: "a".to_owned(),
-            limit: 5,
-        };
-        // Hold the line, let one query arrive, then another with a *lower* seq (as
-        // after a reload): the first is stale by arrival and is dropped.
         let turn = switcher
             .shared
             .gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let first = {
-            let switcher = Arc::clone(&switcher);
-            let a = args(50);
-            std::thread::spawn(move || switcher.query(&a))
-        };
-        while switcher.shared.arrivals.load(Ordering::SeqCst) < 1 {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let second = {
-            let switcher = Arc::clone(&switcher);
-            let a = args(1);
-            std::thread::spawn(move || switcher.query(&a))
-        };
-        while switcher.shared.arrivals.load(Ordering::SeqCst) < 2 {
-            std::thread::sleep(Duration::from_millis(2));
+        let mut threads = Vec::new();
+        for (n, seq) in seqs.iter().copied().enumerate() {
+            let worker = Arc::clone(&switcher);
+            threads.push(std::thread::spawn(move || {
+                worker.query(&SwitcherQueryArgs {
+                    seq,
+                    query: "a".to_owned(),
+                    limit: 5,
+                })
+            }));
+            while switcher.shared.arrivals.load(Ordering::SeqCst) <= n as u64 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // The entry is registered just after the ticket is taken.
+            while switcher.shared.inflight.lock().expect("inflight").len() <= n {
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
         drop(turn);
-        assert!(first.join().expect("first").items.is_empty());
-        assert!(!second.join().expect("second").items.is_empty());
+        threads
+            .into_iter()
+            .map(|t| !t.join().expect("query").items.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn a_query_is_superseded_only_by_a_later_arrival_with_a_higher_seq() {
+        assert_eq!(arrive_in_order(&[1, 2]), [false, true], "the ordinary case");
+        // Scheduler order put keystroke 2 first: both are answered, and the newest is
+        // never the one discarded.
+        assert_eq!(arrive_in_order(&[2, 1]), [true, true]);
+        // After a reload the counter restarts: the low seq is not stale.
+        assert_eq!(arrive_in_order(&[50, 1]), [true, true]);
     }
 
     #[test]

@@ -345,6 +345,17 @@ pub fn standalone_walk(
     Some((summary.files, acc))
 }
 
+/// A name-and-kind walk with no catch-up and no journal, for the benchmark's
+/// `--exit-after-walk` when the open's walk was not claimed (a rebuild is the
+/// reconciliation) and nobody opened a tree. Returns the files admitted.
+pub fn standalone_name_walk(vault: &Vault) -> Option<u32> {
+    let session = TreeSession::new(|_| {});
+    session
+        .populate_from_walk(vault)
+        .ok()
+        .map(|summary| summary.files)
+}
+
 /// What the front end's two marks were, as `mark_tree` recorded them (ADR-0015 §3).
 /// Milliseconds on the process's monotonic clock (`t0`), like every other mark.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -390,6 +401,9 @@ pub struct FeedConfig {
     /// Called by every `open`, before anything else: this vault now has a tree stream,
     /// so the application's own open-time trigger leaves the walk to it.
     pub attach: Box<dyn Fn() + Send + Sync>,
+    /// Called if the stream's thread could not be started after `attach`: the
+    /// application's own trigger may walk after all.
+    pub detach: Box<dyn Fn() + Send + Sync>,
     /// Called after the gate: waits (bounded) for the index to settle and says whether
     /// *this* walk is the open's one authoritative walk, the one that feeds the
     /// catch-up (ADR-0015 section 2). True at most once per open vault; a second
@@ -483,10 +497,16 @@ impl TreeFeed {
     ///
     /// Only if the operating system refuses to create the populate thread.
     pub fn open(self: &Arc<Self>, send: TreeSender) -> std::io::Result<()> {
+        // Before the thread exists, so the application's trigger cannot claim between
+        // the two; undone if the thread cannot be had.
         (self.config.attach)();
         *self.marks_lock() = TreeMarks::default();
         self.stopped.store(false, Ordering::SeqCst);
-        self.start(send, 0)
+        let started = self.start(send, 0);
+        if started.is_err() {
+            (self.config.detach)();
+        }
+        started
     }
 
     fn start(self: &Arc<Self>, send: TreeSender, restarts: u32) -> std::io::Result<()> {
@@ -752,6 +772,7 @@ mod tests {
             gate: Arc::new(|| {}),
             paths: Arc::default(),
             attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
             claim: Box::new(move || ready),
             on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(|| {}),
@@ -838,6 +859,7 @@ mod tests {
             gate: Arc::new(|| {}),
             paths: Arc::default(),
             attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
             claim: Box::new(move || ready),
             on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(move || {
@@ -888,6 +910,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(walked.lock().expect("walked").is_empty());
         assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_walk_that_fails_or_panics_reports_failure_through_the_guard() {
+        // A failing walk: the root is gone by the time the walk runs.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let vault = Vault::open(dir.path()).expect("open");
+        let failures = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&failures);
+        let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        fs::remove_dir_all(dir.path()).ok();
+        let walked = standalone_walk(&vault, &|| {}, &*on_failed);
+        if walked.is_none() {
+            assert_eq!(failures.load(Ordering::SeqCst), 1);
+        } else {
+            // The platform reported an empty root rather than an error; the guard is
+            // then not owed, and the panic arm below is what this test pins.
+            assert_eq!(failures.load(Ordering::SeqCst), 0);
+        }
+
+        // A panic in the claimed walk's start: the guard fires on unwind.
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let panicked = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&panicked);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir.path()).expect("open")),
+            index_db: dir.path().join(".serat/none.db"),
+            index_ready: Box::new(|| false),
+            gate: Arc::new(|| {}),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(|| true),
+            on_walk_failed: Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+            on_walk_start: Box::new(|| panic!("walk start (test)")),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
+            on_stopped: Box::new(|| {}),
+        });
+        let (send, _log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("the guard", || panicked.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
@@ -1002,6 +1072,7 @@ mod tests {
             gate: Arc::new(|| {}),
             paths: Arc::default(),
             attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
             claim: Box::new(|| false),
             on_walk_failed: Box::new(|| {}),
             on_walk_start: Box::new(|| {}),

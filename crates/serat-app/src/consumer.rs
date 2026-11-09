@@ -249,7 +249,10 @@ impl NoteSource for Stoppable<'_> {
 pub struct OpenCatchUp {
     settled: Latch,
     bound: Duration,
+    grace: Duration,
     state: Mutex<Claim>,
+    /// Signalled when a tree attaches or the vault is cancelled.
+    attached: std::sync::Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -261,17 +264,26 @@ struct Claim {
     cancelled: bool,
 }
 
-/// How long a claimant waits for the index's open check to settle.
+/// How long a claimant waits for the index to settle.
 pub const SETTLE_BOUND: Duration = Duration::from_secs(30);
 
+/// How long the application's own trigger waits, after the gate and the index have
+/// settled, for the front end's `open_tree` to arrive before walking on its own: the
+/// window is visible at about the moment the gate opens, and a front end that mounts a
+/// few hundred milliseconds later would otherwise cause a second enumeration.
+pub const TREE_GRACE: Duration = Duration::from_millis(750);
+
 impl OpenCatchUp {
-    /// A coordinator that waits at most `bound` for the index to settle.
+    /// A coordinator that waits at most `bound` for the index to settle, and the
+    /// application's own trigger at most `grace` more for a tree to attach.
     #[must_use]
-    pub fn new(bound: Duration) -> Self {
+    pub fn new(bound: Duration, grace: Duration) -> Self {
         Self {
             settled: Latch::default(),
             bound,
+            grace,
             state: Mutex::new(Claim::default()),
+            attached: std::sync::Condvar::new(),
         }
     }
 
@@ -301,11 +313,25 @@ impl OpenCatchUp {
     pub fn cancel(&self) {
         self.lock().cancelled = true;
         self.settled.set();
+        self.attached.notify_all();
     }
 
     /// `open_tree` was called: the tree's walk will ask for the claim itself.
     pub fn attach_tree(&self) {
         self.lock().tree_attached = true;
+        self.attached.notify_all();
+    }
+
+    /// `open_tree` failed to start its thread after [`OpenCatchUp::attach_tree`]: the
+    /// trigger may walk after all (if it has not already stood aside, see `claim`).
+    pub fn detach_tree(&self) {
+        self.lock().tree_attached = false;
+    }
+
+    /// Whether a tree stream is attached.
+    #[must_use]
+    pub fn tree_attached(&self) -> bool {
+        self.lock().tree_attached
     }
 
     /// Whether the caller's walk is the open's one authoritative walk. `from_tree` is
@@ -321,6 +347,14 @@ impl OpenCatchUp {
             return false;
         }
         let mut claim = self.lock();
+        if !from_tree && !claim.tree_attached && !claim.cancelled {
+            // The grace window: the front end's tree, if it is coming, is coming now.
+            claim = self
+                .attached
+                .wait_timeout_while(claim, self.grace, |c| !c.tree_attached && !c.cancelled)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
         if claim.cancelled
             || claim.claimed
             || !claim.ready
@@ -337,6 +371,17 @@ impl OpenCatchUp {
     #[must_use]
     pub fn claimed(&self) -> bool {
         self.lock().claimed
+    }
+}
+
+/// On unwind out of the catch-up: close the journal and owe a rescan.
+struct UnwindGuard<'a>(&'a Indexer);
+
+impl Drop for UnwindGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.walk_failed();
+        }
     }
 }
 
@@ -377,7 +422,9 @@ impl Indexer {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    fn stopped(&self) -> bool {
+    /// Whether the vault is closing.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
@@ -584,6 +631,9 @@ impl Indexer {
             self.deferred().rescan = true;
             return;
         };
+        // A panic below (the reconciler, the replay) must not leave the journal open for
+        // the rest of the session, which would swallow every `RescanRequired`.
+        let _unwind = UnwindGuard(self);
         let parser = CommonMarkParser::new();
         // The architect's ruling (ADR-0015 section 2): the open compares mtimes whatever
         // the last shutdown was. The marker only schedules the background quick_check,
@@ -595,6 +645,10 @@ impl Indexer {
         self.replay_journal(&reconciler);
     }
 
+    /// Replays what the consumer journaled while the walk and catch-up ran. A catch-up
+    /// that was stopped mid-run (the vault is closing) skips the replay: whatever it
+    /// left is found by the next open's catch-up, which compares every mtime, so the
+    /// index self-heals (C-02).
     fn replay_journal(&self, reconciler: &Reconciler) {
         loop {
             let batch = {
@@ -928,6 +982,56 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_reconciliation_keeps_every_row_it_could_not_read() {
+        // `Stoppable::load` itself, which the Indexer's early returns never reach:
+        // a catch-up over paths that have rows, run with the stop flag set.
+        let dir = vault_dir("stoppable");
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.catch_up(&walk(&indexer));
+        let (a, b) = (hash_of(&dir, "a.md"), hash_of(&dir, "b.md"));
+        assert!(a.is_some() && b.is_some());
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("a.md"), "# a, edited\n").expect("edit");
+
+        indexer.stop();
+        let reconciler = indexer.reconciler().expect("handle");
+        let parser = CommonMarkParser::new();
+        let outcome = reconciler
+            .catch_up(
+                &indexer.source(),
+                &parser,
+                &walk(&indexer),
+                CatchUp::PathsAndMtime,
+            )
+            .expect("catch-up");
+        assert_eq!(outcome.removed, 0, "nothing removed");
+        assert_eq!(outcome.upserted, 0, "nothing read, so nothing submitted");
+        let by_path = reconciler
+            .index_paths(&indexer.source(), &parser, &|_, _| false, &[p("a.md")])
+            .expect("index_paths");
+        assert_eq!(by_path.unreadable, 1, "unreadable is counted: {by_path:?}");
+        assert_eq!(by_path.removed, 0);
+        assert_eq!(hash_of(&dir, "a.md"), a, "rows survive");
+        assert_eq!(hash_of(&dir, "b.md"), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panic_in_the_catch_up_closes_the_journal_and_owes_a_rescan() {
+        let dir = vault_dir("unwind");
+        let (indexer, _) = indexer(&dir, slot_with(&dir));
+        indexer.walk_started();
+        let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _unwind = UnwindGuard(&indexer);
+            panic!("catch-up failed (test)");
+        }));
+        assert!(guarded.is_err());
+        assert!(indexer.journal().is_none());
+        assert!(indexer.deferred().rescan);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_claim_is_granted_once_only_when_ready_and_never_after_a_rebuild() {
         let ready = IndexState::Ready { note_count: 1 };
         let rebuilding = IndexState::Rebuilding {
@@ -936,24 +1040,43 @@ mod tests {
             total: 0,
             walk_complete: false,
         };
-        let c = OpenCatchUp::new(Duration::from_secs(5));
+        let c = OpenCatchUp::new(Duration::from_secs(5), Duration::ZERO);
         c.index_published(&IndexState::Opening);
         c.index_published(&ready);
         assert!(c.claim(false));
         assert!(!c.claim(true), "once per open vault");
 
-        let c = OpenCatchUp::new(Duration::from_secs(5));
+        let c = OpenCatchUp::new(Duration::from_secs(5), Duration::ZERO);
         c.index_published(&rebuilding);
         c.index_published(&ready);
         assert!(!c.claim(true), "a rebuild is the reconciliation");
 
-        let c = OpenCatchUp::new(Duration::from_secs(5));
+        let c = OpenCatchUp::new(Duration::from_secs(5), Duration::ZERO);
         c.attach_tree();
         c.index_published(&ready);
         assert!(!c.claim(false), "the trigger stands aside for a tree");
         assert!(c.claim(true));
 
-        let c = OpenCatchUp::new(Duration::from_millis(30));
+        // The trigger waits its grace for a tree, and walks if none comes.
+        let c = OpenCatchUp::new(Duration::from_secs(5), Duration::from_millis(40));
+        c.index_published(&ready);
+        assert!(c.claim(false));
+
+        // ...and stands aside for one that arrives within it.
+        let c = Arc::new(OpenCatchUp::new(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ));
+        c.index_published(&ready);
+        let attaching = Arc::clone(&c);
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            attaching.attach_tree();
+        });
+        assert!(!c.claim(false));
+        late.join().expect("attach");
+
+        let c = OpenCatchUp::new(Duration::from_millis(30), Duration::ZERO);
         assert!(
             !c.claim(true),
             "a bounded wait for an index that never settles"

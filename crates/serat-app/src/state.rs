@@ -27,7 +27,7 @@ use serat_parse::CommonMarkParser;
 use serat_vault::Vault;
 
 use crate::cli::Boot;
-use crate::consumer::{ChangeNotifier, Indexer, OpenCatchUp, SETTLE_BOUND};
+use crate::consumer::{ChangeNotifier, Indexer, OpenCatchUp, SETTLE_BOUND, TREE_GRACE};
 use crate::editor::Editor;
 use crate::error::from_vault_error;
 use crate::index::{
@@ -45,7 +45,9 @@ use crate::ipc::{
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
 use crate::switcher::{Switcher, TreePaths};
-use crate::tree_stream::{FeedConfig, TreeFeed, TreeMarks, TreeSender, standalone_walk};
+use crate::tree_stream::{
+    FeedConfig, TreeFeed, TreeMarks, TreeSender, standalone_name_walk, standalone_walk,
+};
 use crate::vault::{Latch, Live, Stage, VaultThread};
 
 /// Where `index://status` goes.
@@ -214,8 +216,9 @@ const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) struct OpenHooks {
     /// Called on the vault thread first on every stage, before it is acted on.
     pub(crate) on_stage: Option<Arc<dyn Fn(Stage) + Send + Sync>>,
-    /// Called when the open's authoritative walk is about to start.
-    pub(crate) on_walk_start: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called when the open's authoritative walk is about to start, with who runs it:
+    /// `"tree"` (the stream's walk) or `"standalone"` (the application's trigger).
+    pub(crate) on_walk_start: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl OpenVault {
@@ -340,6 +343,9 @@ pub struct AppState {
     /// How long the tree walk and the vault thread wait for the first paint.
     walk_gate: std::time::Duration,
     hooks: OpenHooks,
+    /// Serialises opens: two concurrent `open_vault` calls must not both find nothing
+    /// to close.
+    opening: Mutex<()>,
     open: RwLock<Option<OpenVault>>,
     vaults_opened: AtomicU64,
     /// Backing counters for [`AppState::save_path_outcomes`] (F-382). Process
@@ -375,6 +381,7 @@ impl AppState {
             settings_path: loaded.path,
             walk_gate: WALK_GATE_TIMEOUT,
             hooks: OpenHooks::default(),
+            opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
             save_handle_missing: AtomicU64::new(0),
@@ -395,6 +402,7 @@ impl AppState {
             settings_path: None,
             walk_gate: WALK_GATE_TIMEOUT,
             hooks: OpenHooks::default(),
+            opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
             save_handle_missing: AtomicU64::new(0),
@@ -449,6 +457,10 @@ impl AppState {
         args: OpenVaultArgs,
         opener: O,
     ) -> Result<VaultOpened, IpcError> {
+        let _opening = self
+            .opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let requested = PathBuf::from(&args.root);
         let vault = Arc::new(
             Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?,
@@ -481,7 +493,7 @@ impl AppState {
         // publishing anything other than `Opening`; `Rebuilding` and `Unavailable`
         // settle it as much as `Ready` does.
         let settled = Arc::clone(&self.startup);
-        let catch_up_gate = Arc::new(OpenCatchUp::new(SETTLE_BOUND));
+        let catch_up_gate = Arc::new(OpenCatchUp::new(SETTLE_BOUND, TREE_GRACE));
         let publishing = Arc::clone(&catch_up_gate);
         let tree_paths = Arc::new(TreePaths::default());
         let switcher = Switcher::new(
@@ -554,19 +566,26 @@ impl AppState {
         let walk_start = Arc::clone(&indexer);
         let walk_failed = Arc::clone(&indexer);
         let catch_up = Arc::clone(&indexer);
+        let walk_failed_on_spawn = Arc::clone(&indexer);
         let walk_startup = Arc::clone(&self.startup);
         let walk_done = Arc::clone(&publisher);
         let walk_refusals = vault.refusals().clone();
         let start_hook = self.hooks.on_walk_start.clone();
         let stage_hook = self.hooks.on_stage.clone();
-        let on_start: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let on_start: Arc<dyn Fn(&'static str) + Send + Sync> = Arc::new(move |who| {
             if let Some(hook) = &start_hook {
-                hook();
+                hook(who);
             }
             walk_start.walk_started();
         });
         let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || walk_failed.walk_failed());
+        let stamp_guard = Arc::clone(&indexer);
         let on_complete: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |files| {
+            // A walk that outlives its vault (a switch, an exit) must not stamp the
+            // next vault's trace.
+            if stamp_guard.stopped() {
+                return;
+            }
             walk_startup.mark_walk_complete(files);
             // The walk clears the log and refills it, so the count is final here
             // and nothing else announces it. Only when there is something to say.
@@ -575,7 +594,11 @@ impl AppState {
             }
         });
 
-        let (tree_attach, tree_claim) = (Arc::clone(&catch_up_gate), Arc::clone(&catch_up_gate));
+        let (tree_attach, tree_detach, tree_claim) = (
+            Arc::clone(&catch_up_gate),
+            Arc::clone(&catch_up_gate),
+            Arc::clone(&catch_up_gate),
+        );
         let (tree_start, tree_failed, tree_complete) = (
             Arc::clone(&on_start),
             Arc::clone(&on_failed),
@@ -588,9 +611,10 @@ impl AppState {
             paths: tree_paths,
             gate: Arc::clone(&gate),
             attach: Box::new(move || tree_attach.attach_tree()),
+            detach: Box::new(move || tree_detach.detach_tree()),
             claim: Box::new(move || tree_claim.claim(true)),
             on_walk_failed: Box::new(move || tree_failed()),
-            on_walk_start: Box::new(move || tree_start()),
+            on_walk_start: Box::new(move || tree_start("tree")),
             on_walked: Box::new(move |entries| {
                 // ADR-0015 section 2: once, on a thread of its own, from the one walk.
                 let indexer = Arc::clone(&catch_up);
@@ -598,7 +622,10 @@ impl AppState {
                     .name("serat-catch-up".to_owned())
                     .spawn(move || indexer.catch_up(&entries));
                 if let Err(err) = spawned {
+                    // The journal opened for this walk must not stay open: close it
+                    // and owe a rescan, which is what the catch-up would have been.
                     eprintln!("serat: the open's catch-up could not start: {err}");
+                    walk_failed_on_spawn.walk_failed();
                 }
             }),
             on_walk_complete: Box::new(move |files| tree_complete(files)),
@@ -650,6 +677,7 @@ impl AppState {
         // changed while it was closed whether or not anything ever calls `open_tree`. It
         // stands aside for a tree stream, whose walk then serves both; the claim is
         // granted once.
+        let bench_walk = self.boot.exit_after_walk;
         {
             let (vault, gate, claim) = (
                 Arc::clone(&vault),
@@ -667,10 +695,21 @@ impl AppState {
                 .spawn(move || {
                     gate();
                     if !claim.claim(false) {
+                        // Refused. If that is because the index was rebuilt, nothing
+                        // else walks; the benchmark's `--exit-after-walk` still needs
+                        // the walk mark (FR-VLT-01's baseline), so it gets a
+                        // name-only walk, which feeds no catch-up.
+                        if bench_walk
+                            && !claim.claimed()
+                            && !claim.tree_attached()
+                            && let Some(files) = standalone_name_walk(&vault)
+                        {
+                            on_complete(files);
+                        }
                         return;
                     }
                     let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        standalone_walk(&vault, &*on_start, &*on_failed)
+                        standalone_walk(&vault, &|| on_start("standalone"), &*on_failed)
                     }));
                     match walked {
                         Ok(Some((files, entries))) => {
@@ -1407,8 +1446,6 @@ impl AppState {
     /// thread and the catch-up thread) are not. Before this is reachable from a command,
     /// `release` must quiesce both: park the switcher's build and make the consumer
     /// defer, then wait for in-flight reads to finish.
-    // TODO(S7): quiesce the switcher build and the reconciler's readers before the
-    // delete; until then this is for tests and the Linux/macOS unlink semantics.
     ///
     /// Publishes `Rebuilding`, then `Ready` (or `Unavailable`). Runs on the caller's
     /// thread, which must not be the webview's. The search connection is suspended first
@@ -1425,6 +1462,8 @@ impl AppState {
     /// the rebuild failed -- in which case the index is `Unavailable` for the rest of the
     /// session.
     pub fn rebuild_index(&self) -> Result<(), IpcError> {
+        // TODO(S7): quiesce the switcher build and the reconciler's readers before the
+        // delete; until then this is for tests and the Linux/macOS unlink semantics.
         let (vault, publisher, slot, search, indexer) = {
             let guard = self.open_lock();
             let open = guard.as_ref().ok_or_else(Self::not_open)?;
@@ -3525,6 +3564,18 @@ mod tests {
         std::fs::remove_file(dir.join("broken.md")).expect("remove");
     }
 
+    /// An opener whose open check takes `.1` ms, so the index is `Opening` meanwhile.
+    struct Slow(SeratIndexOpen, u64);
+    impl IndexOpen for Slow {
+        fn open(&mut self, root: &Path, dir: &Path, publish: &dyn Fn(IndexState)) {
+            std::thread::sleep(Duration::from_millis(self.1));
+            self.0.open(root, dir, publish);
+        }
+        fn into_handle(self) -> Option<serat_index::IndexHandle> {
+            self.0.into_handle()
+        }
+    }
+
     fn state_with(hooks: OpenHooks) -> AppState {
         AppState::with_settings(
             Arc::new(Startup::begin()),
@@ -3550,8 +3601,20 @@ mod tests {
         let before = index_hash(&dir, "10-projects/serat.md").expect("indexed");
         change_while_closed(&dir);
 
-        let state = gateless(&dir);
+        let state = state_with(OpenHooks::default());
+        let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&rebuilt);
+        state.events.install(move |status| {
+            if matches!(status.state, IndexState::Rebuilding { .. }) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        state.open_vault(open_args(&dir)).expect("open");
         wait_ready(&state);
+        assert!(
+            !rebuilt.load(Ordering::SeqCst),
+            "a rebuild would be the reconciliation, not the catch-up"
+        );
         let (send, log) = collecting_sender();
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -3584,22 +3647,12 @@ mod tests {
 
     #[test]
     fn an_open_tree_that_arrives_before_the_index_is_ready_still_catches_up() {
-        struct Slow(SeratIndexOpen);
-        impl IndexOpen for Slow {
-            fn open(&mut self, root: &Path, dir: &Path, publish: &dyn Fn(IndexState)) {
-                std::thread::sleep(Duration::from_millis(400));
-                self.0.open(root, dir, publish);
-            }
-            fn into_handle(self) -> Option<serat_index::IndexHandle> {
-                self.0.into_handle()
-            }
-        }
         let dir = fixture("open-catch-up-early-tree");
         open_and_close_cleanly(&dir);
         change_while_closed(&dir);
         let state = state_with(OpenHooks::default());
         state
-            .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default()))
+            .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default(), 400))
             .expect("open");
         assert!(matches!(state.index_status().state, IndexState::Opening));
         let (send, log) = collecting_sender();
@@ -3614,19 +3667,23 @@ mod tests {
     }
 
     #[test]
-    fn two_open_tree_calls_make_one_walk_with_one_catch_up() {
+    fn two_open_tree_calls_make_one_walk_with_one_catch_up_and_it_is_the_trees() {
         let dir = fixture("open-catch-up-once");
         open_and_close_cleanly(&dir);
-        let starts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counter = Arc::clone(&starts);
+        let starts: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let recorded = Arc::clone(&starts);
         let state = state_with(OpenHooks {
             on_stage: None,
-            on_walk_start: Some(Arc::new(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
+            on_walk_start: Some(Arc::new(move |who| {
+                recorded.lock().expect("starts").push(who)
             })),
         });
-        state.open_vault(open_args(&dir)).expect("open");
-        wait_ready(&state);
+        // Both streams are opened while the index is still Opening, so the tree is
+        // attached before the application's own trigger can claim: the claimed walk
+        // must be the tree's, and the second stream must not start another.
+        state
+            .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default(), 300))
+            .expect("open");
         let (first, log) = collecting_sender();
         state.open_tree(first).expect("open_tree");
         let (second, log2) = collecting_sender();
@@ -3634,10 +3691,31 @@ mod tests {
         wait_until("WalkSettled", || settled(&log) || settled(&log2));
         wait_until("the second stream", || settled(&log2));
         std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(
-            starts.load(Ordering::SeqCst),
-            1,
-            "one metadata walk, one catch-up"
+        assert_eq!(*starts.lock().expect("starts"), ["tree"]);
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_no_index_open_with_no_tree_still_marks_walk_complete_under_the_bench_flag() {
+        // --exit-after-walk on a vault whose index is rebuilt: the claim is refused (the
+        // rebuild is the reconciliation), and the walk mark must still arrive.
+        let dir = fixture("bench-walk-no-index");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot {
+                exit_after_walk: true,
+                ..Boot::default()
+            },
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO);
+        state.open_vault(open_args(&dir)).expect("open");
+        assert!(
+            state
+                .startup
+                .wait_for_walk_complete(Duration::from_secs(20)),
+            "no walk mark"
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3658,7 +3736,7 @@ mod tests {
                     staged.lock().expect("log").push("watcher");
                 }
             })),
-            on_walk_start: Some(Arc::new(move || {
+            on_walk_start: Some(Arc::new(move |_| {
                 started.lock().expect("log").push("walk");
             })),
         });
