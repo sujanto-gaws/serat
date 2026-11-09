@@ -90,7 +90,7 @@ status: in progress — 2026-11-09 (evening) — gate NOT reached; core, app plu
 
 | Budget | Figure | Status |
 |---|---|---|
-| NFR-PRF-03 hub-note save | p95 23.3 ms (attested quiet, pre-spacing); 42.0 / 44.5 ms loaded post-spacing, NOT attested (#62 open; 0 checkpoints on the save path) | PASS pre-spacing; post-spacing quiet run owed |
+| NFR-PRF-03 hub-note save | p95 23.3 ms (attested quiet, pre-spacing — **unsourced**: the run output was never committed, the figure first appears in e6f6738); 42.0 / 44.5 ms loaded post-spacing, NOT attested (#62 open; 0 checkpoints on the save path) | PASS claim rests on an unsourced figure; #62's quiet run replaces it |
 | NFR-PRF-06 switcher keystroke 3 (`Switcher::query`, 20 ms allocation of 50 ms) | 20k: default 12–13 ms, heading 16–18 ms (loaded); 50k: 46–48 ms (reported, not gated; PRD v1.9 finding) | CI gates 50 ms per mode; allocation findings printed |
 | FR-VLT-04 external change visible | single note p95 190 ms, max 454 ms of 500 ms (loaded); batch-of-100 p95 723 ms reported | PASS (gated in CI at p95, PRD v1.9) |
 | NFR-PRF-04 full rebuild | 7.9–10.8 s of 30 s | PASS |
