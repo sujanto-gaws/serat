@@ -280,7 +280,14 @@ impl Reconciler {
         } else {
             stored
         };
-        let window = stored.saturating_sub(WINDOW_MS);
+        // 0 is "no completed catch-up": no lower bound at all, so even a file stamped
+        // before 1970 is a candidate. (A floor of 0 on the written value below reads back
+        // as this same state, which is the conservative outcome.)
+        let window = if stored == 0 {
+            i64::MIN
+        } else {
+            stored.saturating_sub(WINDOW_MS)
+        };
         let mut scan = Scan {
             window: Some(window),
             unread_from: None,

@@ -1419,6 +1419,21 @@ fn window_zero_makes_a_same_mtime_same_size_rewrite_a_candidate() {
 }
 
 #[test]
+fn a_window_ahead_of_the_clock_is_ignored() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    handle
+        .writer()
+        .set_caught_up_from(now() + 3_600_000)
+        .expect("window");
+    let kept = disk_mtime(&f.root, "a.md");
+    rewrite_keeping_mtime(&f.root, "a.md", "# A\nomega\n", kept);
+    let outcome = run_catch_up(&f, &handle, now());
+    assert_eq!(outcome.upserted, 1);
+    handle.close().expect("close");
+}
+
+#[test]
 fn a_future_mtime_with_unchanged_bytes_is_read_and_not_parsed_every_catch_up() {
     let f = fixture();
     let handle = IndexHandle::open(&f.index).expect("open");
