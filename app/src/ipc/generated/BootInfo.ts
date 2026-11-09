@@ -25,9 +25,16 @@ export type BootInfo = {
 vault: string | null, 
 /**
  * That vault's `VaultOpened::vault_id`; `Some` exactly when `vault` is
- * `Some`. `None` (absent) until serat-app fills it: the front end then
- * adopts the id from its first `index_status` poll, which is today's
- * behaviour and the reason the field can land in the contract first.
+ * `Some`. `None` (absent) until serat-app fills it. The front end then
+ * adopts the id from an `index_status` poll, under four restrictions:
+ * only at launch, only while this field is absent, never once
+ * `vault://opened` has been seen, and never an empty id. The poll is not
+ * ordered against events: an answer computed before a switch's close
+ * carries the OLD id, and one computed between the old vault's close and
+ * the new one's install carries `vault_id: ""`. Either can arrive after
+ * `vault://opened`, so an unrestricted fallback would adopt a dead id.
+ * The fallback is today's behaviour, and it is why this field can land
+ * in the contract first.
  */
 vault_id?: string, 
 /**

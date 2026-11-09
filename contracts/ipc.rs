@@ -433,9 +433,16 @@ pub struct BootInfo {
     /// Canonical vault root, if one was opened at launch. Display only.
     pub vault: Option<String>,
     /// That vault's `VaultOpened::vault_id`; `Some` exactly when `vault` is
-    /// `Some`. `None` (absent) until serat-app fills it: the front end then
-    /// adopts the id from its first `index_status` poll, which is today's
-    /// behaviour and the reason the field can land in the contract first.
+    /// `Some`. `None` (absent) until serat-app fills it. The front end then
+    /// adopts the id from an `index_status` poll, under four restrictions:
+    /// only at launch, only while this field is absent, never once
+    /// `vault://opened` has been seen, and never an empty id. The poll is not
+    /// ordered against events: an answer computed before a switch's close
+    /// carries the OLD id, and one computed between the old vault's close and
+    /// the new one's install carries `vault_id: ""`. Either can arrive after
+    /// `vault://opened`, so an unrestricted fallback would adopt a dead id.
+    /// The fallback is today's behaviour, and it is why this field can land
+    /// in the contract first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub vault_id: Option<String>,
@@ -463,11 +470,23 @@ pub struct BootInfo {
 /// events (the streaming rule in this file's header), which is why it cannot be
 /// the source.
 ///
+/// **It can precede a failed open.** The emit comes after the id is minted and
+/// before three steps that can still fail and return through `?`: building the
+/// switcher, spawning the index actor and spawning the vault thread. If one
+/// fails, `choose_vault` answers `Err`. The front end then treats the window
+/// as having **no vault open**. No event will ever carry the id `vault://opened`
+/// announced, so the front end keeps that id only to drop anything that does
+/// not match. It never re-adopts the previous vault's id, because that vault
+/// was closed before the emit. tauri-app-dev's follow-up tests this case
+/// ("emit, then a spawn fails") beside the ordering test.
+///
 /// Not emitted for the vault opened at launch: the window does not exist yet,
 /// and `BootInfo::vault_id` covers that case. Webview-safe: it carries the root
 /// the user just chose, which `BootInfo::vault` already discloses for the
 /// launch vault, and it grants nothing. `open_vault` itself stays withheld
-/// (ADR-0012).
+/// (ADR-0012). **No ACL change:** listening comes from `core:default`, and
+/// ADR-0012's pin covers commands only, so `capabilities/default.json` does not
+/// name this event and the follow-up does not widen it.
 ///
 /// **Contract ahead of implementation**, filled by the same follow-up as
 /// [`BootInfo::vault_id`].
