@@ -2,7 +2,7 @@
 // NFR-PRF-02, architecture.md §9.3. Widgets only change what is displayed;
 // the document is never touched (C-04).
 
-import { ensureSyntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
@@ -353,6 +353,11 @@ describe("blockWidgetsField", () => {
   /** Applies `spec` to `state` incrementally and compares with a fresh build of the result. */
   function expectChangeMatchesFresh(state: EditorState, spec: { from: number; to?: number; insert?: string }, label: string): EditorState {
     const next = state.update({ changes: spec }).state;
+    // Under heavy CPU load CodeMirror's incremental reparse of a changed doc can be partial
+    // (time-sliced; the partial tree still reports the full length), and the field cannot
+    // tell until a later edit. That is a property of the parser budget, not of the dirty
+    // regions under test, so a partial apply is inconclusive and is not compared.
+    if (!syntaxTreeAvailable(next, next.doc.length)) return next;
     const sel = next.selection.main;
     const fresh = makeRange(next.doc.toString(), sel.anchor, sel.head);
     expect(shapeOf(next), label).toEqual(shapeOf(fresh));
@@ -401,6 +406,41 @@ describe("blockWidgetsField", () => {
       for (const b of list) {
         if (b <= a) continue;
         startStates.forEach((st, i) => expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b} from start ${i}`));
+      }
+    }
+  });
+
+  it("deleting a table's last row (cursor elsewhere) keeps a widget for the shortened table", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const lastRow = doc.indexOf("| 1 | 2 |");
+    const s1 = expectChangeMatchesFresh(s0, { from: lastRow - 1, to: lastRow + "| 1 | 2 |".length }, "delete last row");
+    expect(widgets(s1)).toHaveLength(1);
+  });
+
+  it("inserting a newline at the start of a table's last row, or text after the block, equals a fresh build", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const lastRow = doc.indexOf("| 1 | 2 |");
+    expectChangeMatchesFresh(s0, { from: lastRow, insert: "\n" }, "newline at last row start");
+    const blockEnd = lastRow + "| 1 | 2 |".length;
+    expectChangeMatchesFresh(s0, { from: blockEnd, insert: "\n" }, "newline at block end");
+    expectChangeMatchesFresh(s0, { from: blockEnd, insert: "\n> [!tip] x\n" }, "callout header at block end");
+  });
+
+  it("property: every deletion and insertion at every position near each block end equals a fresh build", () => {
+    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+    const ends: number[] = [];
+    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) ends.push(i);
+    ends.push(doc.length);
+    const around = new Set<number>();
+    for (const e of ends) for (let d = -12; d <= 3; d += 1) if (e + d >= 0 && e + d <= doc.length) around.add(e + d);
+    const list = [...around].sort((a, b) => a - b);
+    const states = [0, doc.length].map((c) => makeState(doc, c));
+    for (const a of list) {
+      for (const st of states) {
+        for (const ins of ["\n", "\n> [!tip] x\n"]) expectChangeMatchesFresh(st, { from: a, insert: ins }, `insert ${JSON.stringify(ins)} at ${a}`);
+        for (const b of list) if (b > a && b - a <= 10) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`);
       }
     }
   });

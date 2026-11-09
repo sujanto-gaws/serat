@@ -467,7 +467,16 @@ function mergeSpans(spans: Span[]): Span[] {
 
 /** Recomputes decorations only within `region`, splicing the result into
  * `deco` (which must already have nothing else inside `region`). */
-function replaceRegion(deco: DecorationSet, state: EditorState, region: Span, selectedLines: ReadonlySet<number>): DecorationSet {
+function replaceRegion(deco: DecorationSet, state: EditorState, region0: Span, selectedLines: ReadonlySet<number>): DecorationSet {
+  // Widen the region to every existing decoration it overlaps or touches before walking: a
+  // block cut short at its end (a table's last row deleted) leaves the change point in the
+  // blank line after it, so the walk over the bare region never reaches the shortened block
+  // while the filter below still drops its mapped widget.
+  const region = { ...region0 };
+  deco.between(region0.from, region0.to, (from, to) => {
+    if (from < region.from) region.from = from;
+    if (to > region.to) region.to = to;
+  });
   const fresh = decorationsInRange(state, region.from, region.to, selectedLines);
   // The tree walk also reports blocks that merely touch the region's edge. Such a block
   // may already be in `deco` (kept by the strict test below), so a fresh one at the same
