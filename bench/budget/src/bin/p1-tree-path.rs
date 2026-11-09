@@ -33,7 +33,10 @@
 //! ```
 //!
 //! Exits 0 whatever it measures; it fails only when it cannot measure or a run is
-//! invalid.
+//! invalid. With `--assert` (task #9, NFR-PRF-08) it also exits 1 if either arm's p95
+//! is over `BUDGET_MS`: the Rust side is a lower bound of the gated interval, so a
+//! breach here is a breach of the real figure, though a pass proves only that this part
+//! fits. Only meaningful on the 20k vault, so `--assert` refuses any other.
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -90,10 +93,11 @@ fn line(label: &str, s: &Samples) {
     );
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String]) -> Result<bool, String> {
     let mut vault_name = "20k".to_owned();
     let mut iterations = 10usize;
     let mut cold_iterations = 5usize;
+    let mut assert = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut number = |what: &str| -> Result<usize, String> {
@@ -106,10 +110,14 @@ fn run(args: &[String]) -> Result<(), String> {
             "--vault" => vault_name = it.next().ok_or("--vault needs a name")?.clone(),
             "--iterations" => iterations = number("--iterations")?,
             "--cold-iterations" => cold_iterations = number("--cold-iterations")?,
+            "--assert" => assert = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
 
+    if assert && vault_name != "20k" {
+        return Err("--assert gates FR-VLT-01 at 20,000 notes; use --vault 20k".to_owned());
+    }
     let under_test = ensure_vault(&vault_name)?;
     let expected =
         u32::try_from(under_test.notes + under_test.assets).map_err(|e| e.to_string())?;
@@ -229,8 +237,10 @@ fn run(args: &[String]) -> Result<(), String> {
     line("  Complete", &cold_complete);
 
     println!();
+    let mut within = true;
     for (arm, s) in [("warm", &complete), ("no-index", &cold_complete)] {
         let p95 = s.percentile(0.95);
+        within &= p95 <= BUDGET_MS;
         println!(
             "FR-VLT-01 Rust-side lower bound, {arm} arm: p95 {p95:.1} ms against {BUDGET_MS:.0} ms \
              ({:.1}% of budget). Excludes channel serialisation and the webview apply+paint; \
@@ -238,7 +248,10 @@ fn run(args: &[String]) -> Result<(), String> {
             100.0 * p95 / BUDGET_MS
         );
     }
-    Ok(())
+    if assert && !within {
+        eprintln!("FR-VLT-01: Rust-side lower bound over {BUDGET_MS:.0} ms (--assert)");
+    }
+    Ok(within || !assert)
 }
 
 fn check(
@@ -264,7 +277,8 @@ fn check(
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("p1-tree-path: {e}");
             ExitCode::FAILURE

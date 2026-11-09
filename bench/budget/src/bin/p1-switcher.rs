@@ -24,8 +24,12 @@
 //!
 //! ```text
 //! cargo run --release -p budget --bin p1-switcher
-//! cargo run --release -p budget --bin p1-switcher -- --vault 20k --passes 3
+//! cargo run --release -p budget --bin p1-switcher -- --vault 20k --passes 3 --assert
 //! ```
+//!
+//! `--assert` (task #9/#10, NFR-PRF-08) turns the allocation into the CI gate: exit 1 if
+//! keystroke-3 p95 at **20k**, default mode or heading mode, under any declared history, is
+//! over `ALLOCATION_MS`. 50k is never gated; the adversarial stress is never gated.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -229,13 +233,15 @@ fn line(label: &str, s: &Samples) {
     );
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String]) -> Result<bool, String> {
     let mut vault_names = "20k,50k".to_owned();
     let mut passes = 2usize;
+    let mut assert = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--vault" => vault_names = it.next().ok_or("--vault needs names")?.clone(),
+            "--assert" => assert = true,
             "--passes" => {
                 passes = it
                     .next()
@@ -247,11 +253,22 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    if assert && !vault_names.split(',').any(|n| n == "20k") {
+        return Err("--assert needs the 20k vault in --vault; nothing else gates".to_owned());
+    }
+    let mut breaches = Vec::new();
     for name in vault_names.split(',') {
-        measure(name, passes)?;
+        // Only the 20k vault gates (NFR-PRF-06's figure is "at 20,000 notes").
+        measure(name, passes, name == "20k", &mut breaches)?;
     }
     stress();
-    Ok(())
+    if assert && !breaches.is_empty() {
+        for b in &breaches {
+            eprintln!("NFR-PRF-06: over allocation (--assert): {b}");
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Adversarial candidates: long, dense in one letter, 50k of them (review S1). No vault
@@ -292,7 +309,12 @@ names under 80-120 character e-dense folders, history absent"
     }
 }
 
-fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
+fn measure(
+    vault_name: &str,
+    passes: usize,
+    gate: bool,
+    breaches: &mut Vec<String>,
+) -> Result<(), String> {
     let vault_name = vault_name.to_owned();
     println!("\n==================== vault {vault_name} ====================");
     let under_test = ensure_vault(&vault_name)?;
@@ -429,6 +451,11 @@ fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
         line("    heading mode", &gated_heading);
         line("  every keystroke (reported)", &all);
         let heading_p95 = gated_heading.percentile(0.95);
+        if gate && heading_p95 > ALLOCATION_MS {
+            breaches.push(format!(
+                "heading mode, history {label}: p95 {heading_p95:.2} ms"
+            ));
+        }
         println!(
             "  heading mode, own row, history {label}: p95 {heading_p95:.2} ms against \
              {ALLOCATION_MS:.0} ms ({:.0}% of allocation). {}",
@@ -440,6 +467,9 @@ fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
             }
         );
         let p95 = gated.percentile(0.95);
+        if gate && p95 > ALLOCATION_MS {
+            breaches.push(format!("keystroke 3, history {label}: p95 {p95:.2} ms"));
+        }
         println!(
             "  NFR-PRF-06 allocation, history {label}: Switcher::query p95 {p95:.2} ms against \
              {ALLOCATION_MS:.0} ms ({:.0}% of allocation). {}",
@@ -465,7 +495,8 @@ fn measure(vault_name: &str, passes: usize) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("p1-switcher: {e}");
             ExitCode::FAILURE

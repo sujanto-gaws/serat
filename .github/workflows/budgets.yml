@@ -191,6 +191,114 @@ jobs:
           path: bench/out/p1-read-paths.txt
           if-no-files-found: ignore
 
+  # ---------------------------------------------------------------------------
+  # P1 budgets (tasks #9 and #10; NFR-PRF-08, C-06). The bins already exist on main
+  # (#13 p1-tree-path, #14 p1-external-change, #16 p1-switcher); these jobs are what
+  # make a breach fail the PR. Three rules shared by the three jobs:
+  #
+  # * Toolchain: 1.92, spelled out, matching rust-toolchain.toml (NFR-PRF-08: a CI
+  #   number and a laptop number must be comparable). `stable` would drift.
+  # * Vault: the 20k preset is generated and its digest asserted before anything is
+  #   measured, so a drifted generator fails as "wrong vault", not as "slow".
+  # * `gate_eligible`: the `environment` step prints whether this runner's number could
+  #   be recorded as a gate figure, and the concurrent rustc/link count where the
+  #   platform reports it (Windows). It never fails the job and never excuses a breach:
+  #   a breach fails whatever the runner. It says how far to trust a *pass* and whether
+  #   the number may go in a gate report (docs/05-testing/reports/).
+  #
+  # Each asserts only its gated figure; what is reported is printed and uploaded.
+  # ---------------------------------------------------------------------------
+
+  # FR-VLT-01 (ADR-0015 §3): the complete tree within 2 s p95 at 20k, warm and no-index
+  # arms gated separately. This is the Rust side, a LOWER BOUND of the binding
+  # tree_complete - T_open: a breach here is a real breach, a pass proves only that this
+  # part fits. The in-app interval needs the running webview (task #24) and is not
+  # asserted by this job.
+  p1-tree-path:
+    name: "FR-VLT-01 · file tree complete < 2 s p95 at 20k, Rust-side lower bound (ADR-0015)"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the 20k vault and assert its digest
+        run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
+      - name: Measurement environment and gate_eligible
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin environment | tee bench/out/p1-tree-path.env.txt || true
+      - name: Measure and assert
+        shell: bash
+        run: cargo run --release -p budget --bin p1-tree-path -- --vault 20k --assert | tee bench/out/p1-tree-path.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-tree-path
+          path: bench/out/p1-tree-path*.txt
+          if-no-files-found: ignore
+
+  # FR-VLT-04 (architecture 3.1.2): an external change visible in the index within
+  # 500 ms. --assert gates the single-note shape only; the 100-note batch is printed as
+  # "reported, not gated".
+  p1-external-change:
+    name: "FR-VLT-04 · external change visible in the index < 500 ms p95, single note"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the 20k vault and assert its digest
+        run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
+      - name: Measurement environment and gate_eligible
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin environment | tee bench/out/p1-external-change.env.txt || true
+      - name: Measure and assert
+        shell: bash
+        run: cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert | tee bench/out/p1-external-change.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-external-change
+          path: bench/out/p1-external-change*.txt
+          if-no-files-found: ignore
+
+  # NFR-PRF-06 (architecture 9.2): 20 ms p95 allocated to Switcher::query at 20k, on
+  # keystroke 3 in default mode and in heading mode (its own row), with and without
+  # history. 50k and the adversarial stress are run and reported, never gated. In-process
+  # and a lower bound of the 50 ms keystroke-to-paint figure (task #10, in the real binary).
+  p1-switcher:
+    name: "NFR-PRF-06 · Switcher::query < 20 ms p95 at 20k (50k and stress reported)"
+    needs: vault
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the 20k vault and assert its digest
+        run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
+      - name: Measurement environment and gate_eligible
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin environment | tee bench/out/p1-switcher.env.txt || true
+      - name: Measure and assert (20k gates)
+        shell: bash
+        run: cargo run --release -p budget --bin p1-switcher -- --vault 20k --assert | tee bench/out/p1-switcher.txt
+      - name: Report 50k and the stress shapes (never gates)
+        shell: bash
+        run: cargo run --release -p budget --bin p1-switcher -- --vault 50k | tee bench/out/p1-switcher-50k.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-switcher
+          path: bench/out/p1-switcher*.txt
+          if-no-files-found: ignore
+
   # NFR-PRF-08's acceptance criterion is Inspect: "CI configuration review
   # confirms each budget has an asserting job". This job is that review, run
   # automatically, so a budget added to the PRD without a job fails the build
