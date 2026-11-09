@@ -398,6 +398,22 @@ function touchedTopLevelBlocks(state: EditorState, pos: number): Span[] {
   return [before, after].filter((x): x is Span => x !== null);
 }
 
+/** Every top-level block overlapping `[from, to]`: one tree walk bounded to the range
+ * (it does not descend into a block), so its cost is the selection's, not the note's. */
+function blocksIntersecting(state: EditorState, from: number, to: number): Span[] {
+  const out: Span[] = [];
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter(node) {
+      if (node.type.name === "Document") return true;
+      if (node.node.parent?.type.name === "Document") out.push({ from: node.from, to: node.to });
+      return false;
+    },
+  });
+  return out;
+}
+
 function mergeSpans(spans: Span[]): Span[] {
   if (spans.length === 0) return [];
   const sorted = [...spans].sort((a, b) => a.from - b.from);
@@ -451,12 +467,25 @@ function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
     regions.push({ from: start ? Math.min(start.from, growth.from) : growth.from, to: growth.to });
   }
   if (!tr.startState.selection.eq(tr.state.selection)) {
+    // Both ends of every range, old (mapped) and new, plus every top-level block a
+    // non-empty range spans: `selectedLines` (buildAll/update) comes from the full
+    // ranges, so the dirty regions must too (FR-EDT-02). A collapsed cursor takes the
+    // two O(depth) lookups only; cost grows with the selection, never the note.
     for (const range of tr.startState.selection.ranges) {
-      const mapped = tr.changes.mapPos(range.head);
-      regions.push(...touchedTopLevelBlocks(tr.state, mapped));
+      const from = tr.changes.mapPos(range.from);
+      const to = tr.changes.mapPos(range.to);
+      regions.push(...touchedTopLevelBlocks(tr.state, tr.changes.mapPos(range.head)));
+      if (range.anchor !== range.head) {
+        regions.push(...touchedTopLevelBlocks(tr.state, tr.changes.mapPos(range.anchor)));
+        regions.push(...blocksIntersecting(tr.state, from, to));
+      }
     }
     for (const range of tr.state.selection.ranges) {
       regions.push(...touchedTopLevelBlocks(tr.state, range.head));
+      if (range.anchor !== range.head) {
+        regions.push(...touchedTopLevelBlocks(tr.state, range.anchor));
+        regions.push(...blocksIntersecting(tr.state, range.from, range.to));
+      }
     }
   }
   return mergeSpans(regions);

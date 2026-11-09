@@ -249,4 +249,75 @@ describe("blockWidgetsField", () => {
     expect(dom.querySelector("img")).toBeNull();
     expect(dom.textContent).toContain("<img src=x onerror=alert(1)>");
   });
+
+  // ---- range selections (task #102): dirty regions cover the whole range, not just its head ----
+
+  function makeRange(doc: string, anchor: number, head: number): EditorState {
+    const state = EditorState.create({
+      doc,
+      selection: { anchor, head },
+      extensions: [seratMarkdown(), blockWidgetsExtension()],
+    });
+    ensureSyntaxTree(state, state.doc.length, 5000);
+    return state.update({ selection: { anchor, head }, effects: setResolutions.of([]) }).state;
+  }
+  const shapeOf = (st: EditorState) => widgets(st).map((w) => [w.from, w.to]);
+
+  it("dragging a selection from a paragraph across a table reveals the table raw, equal to a fresh build", () => {
+    const doc = `intro paragraph\n\n${TABLE}\n\nend paragraph`;
+    const s0 = makeState(doc, 2);
+    expect(widgets(s0)).toHaveLength(1);
+    const head = doc.indexOf("end") + 2;
+    const s1 = s0.update({ selection: { anchor: 2, head } }).state;
+    expect(widgets(s1)).toHaveLength(0);
+    expect(shapeOf(s1)).toEqual(shapeOf(makeRange(doc, 2, head)));
+  });
+
+  it("collapsing the selection away brings the widget back", () => {
+    const doc = `intro paragraph\n\n${TABLE}\n\nend paragraph`;
+    const head = doc.indexOf("end") + 2;
+    const s1 = makeState(doc, 2).update({ selection: { anchor: 2, head } }).state;
+    const s2 = s1.update({ selection: { anchor: 2 } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+    expect(shapeOf(s2)).toEqual(shapeOf(makeState(doc, 2)));
+  });
+
+  it("select-all on a three-table note: zero widgets; collapse: all three back", () => {
+    const t = (n: string) => TABLE.replace("1", n);
+    const doc = `${t("a")}\n\nmid\n\n${t("b")}\n\nmid2\n\n${t("c")}\n\nend`;
+    const s0 = makeState(doc, doc.length);
+    expect(widgets(s0)).toHaveLength(3);
+    const all = s0.update({ selection: { anchor: 0, head: doc.length } }).state;
+    expect(widgets(all)).toHaveLength(0);
+    expect(shapeOf(all)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
+    const back = all.update({ selection: { anchor: doc.length } }).state;
+    expect(widgets(back)).toHaveLength(3);
+  });
+
+  it("collapsed-cursor moves do not walk the tree over a range (only the selection-sized path walks)", () => {
+    // The collapsed path takes touchedTopLevelBlocks only; assert by behaviour: a cursor move
+    // across a 50-table note equals a fresh build and reuses untouched widget objects.
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 50 }, (_, i) => `${t(i)}\n\np${i}`).join("\n\n");
+    const s0 = makeState(doc, doc.indexOf("p0"));
+    const before = widgets(s0);
+    const s1 = s0.update({ selection: { anchor: doc.indexOf("p1") } }).state;
+    const after = widgets(s1);
+    expect(shapeOf(s1)).toEqual(shapeOf(makeState(doc, doc.indexOf("p1"))));
+    expect(after.filter((w) => before.some((b) => b.widget === w.widget)).length).toBeGreaterThanOrEqual(48);
+  });
+
+  it("property: for every (anchor, head) pair in a small note the incremental decorations equal a fresh build", () => {
+    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+    const starts = [0, doc.indexOf("p two") + 2, doc.length];
+    for (let anchor = 0; anchor <= doc.length; anchor += 1) {
+      for (let head = 0; head <= doc.length; head += 1) {
+        const target = makeRange(doc, anchor, head);
+        for (const start of starts) {
+          const s1 = makeState(doc, start).update({ selection: { anchor, head } }).state;
+          expect(shapeOf(s1), `from ${start} to ${anchor}-${head}`).toEqual(shapeOf(target));
+        }
+      }
+    }
+  });
 });
