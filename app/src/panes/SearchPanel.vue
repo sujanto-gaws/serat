@@ -331,7 +331,7 @@ defineExpose({ input, run, focus });
             role="listitem"
             class="serat-hit"
             :class="{ 'serat-hit-focused': i === focusedIndex }"
-            :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '')"
+            :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '') + (hit.changed_since_indexed === true ? ', approximate — this note has changed since it was indexed' : '')"
             @click="moveTo(i); openHit(hit, false)"
           >
             <div class="serat-hit-head">
@@ -346,6 +346,9 @@ defineExpose({ input, run, focus });
               >
             </div>
             <div v-else-if="view.filter" class="serat-hit-field">{{ view.filter.slice(1, -1).replace(':', ': ') }}</div>
+            <div v-if="hit.changed_since_indexed === true" class="serat-hit-approx" data-testid="hit-approximate">
+              approximate — this note has changed since it was indexed
+            </div>
           </div>
         </div>
         <button v-if="hasMore" type="button" class="serat-search-more" data-testid="search-more" @click="run(true)">
@@ -383,6 +386,10 @@ defineExpose({ input, run, focus });
   margin-left: 0.5em;
   font-size: 11px;
   color: var(--serat-text-tertiary, #8a8f94);
+}
+.serat-hit-approx {
+  font-size: 11px;
+  color: var(--serat-text-secondary, #6b7075);
 }
 .serat-hit-snippet {
   font-family: Georgia, serif;
