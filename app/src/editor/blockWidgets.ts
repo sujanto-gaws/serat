@@ -190,7 +190,11 @@ class ImageEmbedWidget extends WidgetType {
     // <object>/<iframe>/inline SVG/v-html.
     if (this.resolvedPath === null) return this.placeholder();
     const img = document.createElement("img");
-    img.src = assetUrl(this.resolvedPath);
+    try {
+      img.src = assetUrl(this.resolvedPath);
+    } catch {
+      return this.placeholder(); // a path the builder refuses is never requested
+    }
     img.alt = this.label;
     img.className = "serat-embed-widget";
     if (this.widthAttr && /^\d+$/.test(this.widthAttr)) {

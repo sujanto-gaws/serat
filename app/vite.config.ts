@@ -25,6 +25,11 @@ export default defineConfig(({ mode }) => ({
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
+  // The pdf.js worker (a `new Worker(new URL(...))` in viewers/pdfEngine.ts) keeps a fixed name
+  // like everything else here, not a content hash.
+  worker: {
+    rollupOptions: { output: { entryFileNames: "assets/[name].js" } },
+  },
   build: {
     // A bench build (NFR-PRF-02 harness only; installs `window.__seratBenchOpenNote`)
     // goes to app/dist-bench so it can never overwrite the shipped webview/.

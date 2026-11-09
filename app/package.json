@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "description": "Serat's Vue 3 frontend. Builds into crates/serat-app/webview, which tauri.conf.json's frontendDist points at. Task #98 (P0/impl): CodeMirror 6 mounted as a plain text box, no live preview. See app/README.md.",
   "type": "module",
+  "engines": { "node": ">=22.13.0" },
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
@@ -24,6 +25,7 @@
     "@tauri-apps/api": "^2.11.1",
     "codemirror": "^6.0.2",
     "markdown-it": "^15.0.2",
+    "pdfjs-dist": "^6.5.438",
     "pinia": "^3.0.3",
     "vue": "^3.5.42"
   },
