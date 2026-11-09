@@ -10,10 +10,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // DOM instead of the browser parsing it is the honest cost task #98 was asked to
 // report, and this test is what would catch that cost regressing further, e.g. an
 // `await` landing before the editor is created.
+// `read_file` answers (a tree click opens a note); every other command stays in flight.
+const channels = vi.hoisted(() => [] as Array<{ onmessage: ((m: unknown) => void) | null }>);
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(() => new Promise(() => {})),
+  invoke: vi.fn((cmd: string, args?: { args?: { path?: string } }) =>
+    cmd === "read_file"
+      ? Promise.resolve({ path: args?.args?.path ?? "", text: "# hi", hash: "h1" })
+      : new Promise(() => {}),
+  ),
   Channel: class {
-    onmessage: unknown = null;
+    onmessage: ((m: unknown) => void) | null = null;
+    constructor() {
+      channels.push(this);
+    }
   },
 }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -97,5 +106,92 @@ describe("App", () => {
     // only possible because it now runs first.
     mount(App, { global: { plugins: [createPinia()] } });
     expect(schedulePaintMark).toHaveBeenCalledTimes(1);
+  });
+
+  it("Mod-Shift-F opens and focuses search and never toggles it closed; Esc closes it and returns focus", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    const press = (init: KeyboardEventInit) =>
+      window.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(false);
+    press({ key: "F", ctrlKey: true, shiftKey: true });
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(true));
+    await wrapper.vm.$nextTick();
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="search-input"]').element);
+    press({ key: "F", ctrlKey: true, shiftKey: true });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(true); // second press focuses, does not close
+    await wrapper.get('[data-testid="search-input"]').trigger("keydown", { key: "Escape" });
+    expect(wrapper.find('[data-testid="search-panel"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  // CodeMirror also asks matchMedia("print") and subscribes, so the stub carries the listener API.
+  const mq = (matches: boolean) => ({
+    matches,
+    addListener: () => undefined,
+    removeListener: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  });
+  const treePush = (m: unknown) => channels[channels.length - 1].onmessage?.(m);
+  const ent = (name: string, kind: "note" | "dir") => ({ name, kind, sidecar: false });
+
+  it("Mod-3 focuses backlinks; Mod-Shift-N is a prevented no-op (new folder is task #43)", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "3", ctrlKey: true, bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(wrapper.get('[data-testid="backlinks"]').element));
+    const ev = new KeyboardEvent("keydown", { key: "N", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(wrapper.find(".marks").text()).toBe("");
+    wrapper.unmount();
+  });
+
+  it("flyover below 720 px: Mod-1 opens it (tree-open), opening a note closes it and focuses the editor", async () => {
+    vi.stubGlobal("matchMedia", (q: string) => mq(q.includes("719px")));
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    expect(wrapper.get(".workspace").classes()).not.toContain("tree-open");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", ctrlKey: true, bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(wrapper.get(".workspace").classes()).toContain("tree-open"));
+    treePush({ kind: "listing", dir: "", entries: [ent("a.md", "note")] });
+    await wrapper.vm.$nextTick();
+    await wrapper.get('[data-path="a.md"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.get(".workspace").classes()).not.toContain("tree-open"));
+    const host = wrapper.get(".cm-editor-host").element;
+    await vi.waitFor(() => expect(host === document.activeElement || host.contains(document.activeElement)).toBe(true));
+    wrapper.unmount();
+  });
+
+  it("Mod-1 docked (>= 720 px) focuses the tree without opening a flyover", async () => {
+    vi.stubGlobal("matchMedia", () => mq(false));
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", ctrlKey: true, bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(wrapper.get('[role="tree"]').element));
+    expect(wrapper.get(".workspace").classes()).not.toContain("tree-open");
+    wrapper.unmount();
+  });
+
+  it("the tree's remove of the open note shows 'no longer exists'; an upsert of the same path clears it", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    treePush({ kind: "listing", dir: "", entries: [ent("a.md", "note")] });
+    await wrapper.vm.$nextTick();
+    await wrapper.get('[data-path="a.md"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="backlinks"]').text()).not.toContain("no longer exists"));
+    treePush({ kind: "remove", dir: "", name: "a.md" });
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="backlinks"]').text()).toContain("This note no longer exists"));
+    treePush({ kind: "upsert", dir: "", entry: ent("a.md", "note"), after: null });
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="backlinks"]').text()).not.toContain("no longer exists"));
+    wrapper.unmount();
+  });
+
+  it("selecting a pending folder shows 'Listing…' in the context pane until its listing lands", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    treePush({ kind: "listing", dir: "", entries: [ent("Later", "dir")] });
+    await wrapper.vm.$nextTick();
+    await wrapper.get('[data-path="Later"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="listing-note"]').text()).toBe("Listing…"));
+    treePush({ kind: "listing", dir: "Later", entries: [ent("x.md", "note")] });
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="listing-note"]').exists()).toBe(false));
+    wrapper.unmount();
   });
 });

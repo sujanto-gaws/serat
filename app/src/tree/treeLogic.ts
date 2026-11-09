@@ -136,3 +136,6 @@ export function isNameUnique(model: TreeModel, name: string): boolean {
   }
   return true;
 }
+
+/** The contract's own text for a stopped `tree://status` (contracts/ipc.rs `TreeStatus`). */
+export const TREE_STOPPED_TEXT = "file tree stopped updating; reopen the vault";
