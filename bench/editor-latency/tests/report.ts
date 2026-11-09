@@ -4,7 +4,7 @@ import type { RunSummary } from "./measure";
 
 export const pct = (x: number) => (x * 100).toFixed(1) + "%";
 /** Engine label with the Chromium version (9.3 Basis: every figure carries the version and the measured R). */
-export const ENGINE = (version: string | undefined) => `headless Chromium ${version ?? "version unknown"} (not gate-eligible)`;
+export const ENGINE = (version: string | undefined) => `headless Chromium ${version ?? "version unknown"} [${process.env.SERAT_BROWSER ?? "browser unknown"}] (not gate-eligible)`;
 
 export const RULE_STATEMENT = (version: string | undefined) =>
   `engine: ${ENGINE(version)}; ` +
