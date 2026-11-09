@@ -644,9 +644,8 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
         bytes: opened.size,
         viewable: is_viewable(mime),
         sidecar_path: sidecar_of(vault, path),
-        // Contract ahead of implementation (task #94, ADR-0017 Amendment 1): the
-        // follow-up sets Some(opened.etag) and checks ReadAssetRangeArgs::if_match.
-        etag: None,
+        // The scheme's ETag, verbatim (ADR-0017 Amendment 1): `"<size hex>-<mtime ns hex>"`.
+        etag: Some(opened.etag),
     })
 }
 
@@ -675,21 +674,36 @@ fn sidecar_of(vault: &Vault, path: &VaultPath) -> Option<String> {
 /// `read_asset_range`: ADR-0017 §Fallback. Steps 2-7 and the span cap, unchanged;
 /// returns raw bytes. A start at or past the end is an empty read.
 ///
+/// `if_match` is the validator the load started with (`AssetInfo::etag`). When it is
+/// present and differs from the opened handle's, nothing is read and the answer is
+/// [`IpcError::AssetChanged`] carrying the current validator (ADR-0017 Amendment 1,
+/// T-07). It is checked after every refusal, so a refused path never reveals it.
+///
 /// # Errors
 ///
-/// [`IpcError::NotFound`] for every refusal; [`IpcError::Io`] if the read fails.
+/// [`IpcError::NotFound`] for every refusal; [`IpcError::AssetChanged`] on a validator
+/// mismatch; [`IpcError::Io`] if the read fails.
 pub(crate) fn read_range(
     vault: &Vault,
     budget: &ByteBudget,
     path: &VaultPath,
     start: u64,
     len: u32,
+    if_match: Option<&str>,
 ) -> Result<Vec<u8>, IpcError> {
     let missing = || IpcError::NotFound {
         path: path.to_string(),
     };
     viewable_mime(vault, path).ok_or_else(missing)?;
     let mut opened = locate(vault, path).ok_or_else(missing)?;
+    if let Some(expected) = if_match
+        && expected != opened.etag
+    {
+        return Err(IpcError::AssetChanged {
+            path: path.to_string(),
+            validator: opened.etag,
+        });
+    }
     if start >= opened.size {
         return Ok(Vec::new());
     }

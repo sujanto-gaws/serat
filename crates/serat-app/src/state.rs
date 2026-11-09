@@ -903,7 +903,14 @@ impl AppState {
     pub fn read_asset_range(&self, args: ReadAssetRangeArgs) -> Result<Vec<u8>, IpcError> {
         let path = Self::vault_path(&args.path)?;
         let vault = self.vault()?;
-        crate::asset::read_range(&vault, &self.asset_budget, &path, args.start, args.len)
+        crate::asset::read_range(
+            &vault,
+            &self.asset_budget,
+            &path,
+            args.start,
+            args.len,
+            args.if_match.as_deref(),
+        )
     }
 
     /// The `serat-asset` scheme's entry point: the open vault, if any, answered

@@ -1185,7 +1185,7 @@ fn asset_info_and_read_range_refuse_symlinks() {
     std::os::unix::fs::symlink(fx.outside().join("secret.png"), fx.base.join("vault/l.png"))
         .unwrap();
     assert!(super::info(&fx.vault, &vp("l.png")).is_err());
-    assert!(read_range(&fx.vault, &fx.budget, &vp("l.png"), 0, 5).is_err());
+    assert!(read_range(&fx.vault, &fx.budget, &vp("l.png"), 0, 5, None).is_err());
 }
 
 #[test]
@@ -1193,27 +1193,27 @@ fn read_asset_range_returns_the_span_and_applies_the_same_cap() {
     let fx = Fx::new("fallback");
     fx.put("a.pdf", ALPHABET);
     assert_eq!(
-        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 3, 4).unwrap(),
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 3, 4, None).unwrap(),
         b"3456"
     );
     assert_eq!(
-        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 20, 100).unwrap(),
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 20, 100, None).unwrap(),
         b"klmno"
     );
     assert!(
-        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 25, 4)
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 25, 4, None)
             .unwrap()
             .is_empty()
     );
     assert!(
-        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 1000, 4)
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 1000, 4, None)
             .unwrap()
             .is_empty()
     );
 
     let size = usize::try_from(SPAN_CAP).unwrap() * 2;
     fx.put("big.pdf", &vec![b'q'; size]);
-    let capped = read_range(&fx.vault, &fx.budget, &vp("big.pdf"), 0, u32::MAX).unwrap();
+    let capped = read_range(&fx.vault, &fx.budget, &vp("big.pdf"), 0, u32::MAX, None).unwrap();
     assert_eq!(
         capped.len() as u64,
         SPAN_CAP,
@@ -1229,9 +1229,120 @@ fn read_asset_range_serves_only_what_the_scheme_would() {
     fx.put("a.exe", b"MZ");
     for path in ["note.md", ".serat/x.png", "a.exe", "missing.pdf"] {
         assert!(
-            read_range(&fx.vault, &fx.budget, &vp(path), 0, 5).is_err(),
+            read_range(&fx.vault, &fx.budget, &vp(path), 0, 5, None).is_err(),
             "{path}"
         );
+    }
+}
+
+fn changed_validator(result: Result<Vec<u8>, IpcError>) -> String {
+    match result {
+        Err(IpcError::AssetChanged { validator, .. }) => validator,
+        other => panic!("expected AssetChanged, got {other:?}"),
+    }
+}
+
+fn set_mtime(path: &std::path::Path, seconds_from_now: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(seconds_from_now),
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_unchanged_file_keeps_its_etag_and_span_across_info_and_read_range() {
+    let fx = Fx::new("validator-stable");
+    fx.put("a.pdf", ALPHABET);
+    let etag = super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap();
+    assert_eq!(
+        super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap(),
+        etag
+    );
+    let span = read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 3, 4, Some(&etag)).unwrap();
+    assert_eq!(span, b"3456");
+    // The format is the scheme's: quoted, size then mtime ns, both hex.
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"') && etag.contains('-'),
+        "{etag}"
+    );
+}
+
+#[test]
+fn a_same_size_rewrite_with_a_new_mtime_is_asset_changed_and_info_agrees() {
+    let fx = Fx::new("validator-rewrite");
+    let file = fx.put("a.pdf", ALPHABET);
+    let old = super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap();
+    let mut rewritten = ALPHABET.to_vec();
+    rewritten[0] = b'Z';
+    std::fs::write(&file, &rewritten).unwrap();
+    set_mtime(&file, 100);
+    let new = changed_validator(read_range(
+        &fx.vault,
+        &fx.budget,
+        &vp("a.pdf"),
+        0,
+        4,
+        Some(&old),
+    ));
+    assert_ne!(new, old);
+    assert_eq!(
+        super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap(),
+        new
+    );
+    assert_eq!(
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 0, 4, Some(&new)).unwrap(),
+        b"Z123"
+    );
+}
+
+#[test]
+fn a_shrunk_file_is_asset_changed_not_a_short_span() {
+    let fx = Fx::new("validator-shrunk");
+    let file = fx.put("a.pdf", ALPHABET);
+    let old = super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap();
+    std::fs::write(&file, b"0123").unwrap();
+    changed_validator(read_range(
+        &fx.vault,
+        &fx.budget,
+        &vp("a.pdf"),
+        0,
+        20,
+        Some(&old),
+    ));
+}
+
+#[test]
+fn an_absent_if_match_still_serves_a_changed_file() {
+    let fx = Fx::new("validator-absent");
+    let file = fx.put("a.pdf", ALPHABET);
+    std::fs::write(&file, b"0123456789").unwrap();
+    set_mtime(&file, 100);
+    assert_eq!(
+        read_range(&fx.vault, &fx.budget, &vp("a.pdf"), 0, 4, None).unwrap(),
+        b"0123"
+    );
+}
+
+#[test]
+fn refusals_come_before_any_validator_logic() {
+    let fx = Fx::new("validator-refusals");
+    fx.put("note.md", b"# n");
+    fx.put(".serat/x.png", b"x");
+    for path in ["note.md", ".serat/x.png", "missing.pdf"] {
+        let err = read_range(&fx.vault, &fx.budget, &vp(path), 0, 5, Some("\"1-1\"")).unwrap_err();
+        assert!(matches!(err, IpcError::NotFound { .. }), "{path}: {err:?}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(fx.outside().join("secret.png"), fx.base.join("vault/l.png"))
+            .unwrap();
+        let err =
+            read_range(&fx.vault, &fx.budget, &vp("l.png"), 0, 5, Some("\"1-1\"")).unwrap_err();
+        assert!(matches!(err, IpcError::NotFound { .. }), "{err:?}");
     }
 }
 
