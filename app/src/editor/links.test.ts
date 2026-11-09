@@ -381,3 +381,107 @@ describe("link under the cursor", () => {
     expect(linkNodeAt(state, 0)).toBeNull();
   });
 });
+
+// Task #22 audit (FR-EDT-03, NFR-PRF-06): every completion path honours abort,
+// `discarded` and `seq`, and embeds go through the same resolver and completion.
+describe("completion: abort, seq and discarded on every path", () => {
+  function sourceFor(doc: string, ipc: LinkIpcAdapter, path: string | null = "src.md") {
+    const { view, resolver } = makeView(doc, ipc, path);
+    const source = makeLinkCompletionSource({ ipc, resolver, getSourcePath: () => path });
+    const ctx = () => new CompletionContext(view.state, doc.length, false);
+    return { source, ctx };
+  }
+  const abort = (c: CompletionContext) => {
+    (c as unknown as { abortListeners: unknown }).abortListeners = null; // what `aborted` reads
+    return c;
+  };
+
+  it("issues no request at all for a context that is already aborted (every mode)", async () => {
+    for (const doc of ["[[Al", "[[Alpha#int", "[[Alpha#^b", "[[#"]) {
+      const ipc = fakeLinks();
+      const { source, ctx } = sourceFor(doc, ipc, "notes/Alpha.md");
+      expect(await source(abort(ctx()))).toBeNull();
+      expect(ipc.switcherQuery).not.toHaveBeenCalled();
+      expect(ipc.noteAnchors).not.toHaveBeenCalled();
+      expect(ipc.resolveLinks).not.toHaveBeenCalled();
+    }
+  });
+
+  it("drops a name answer when the context was aborted while the query was in flight", async () => {
+    const ipc = fakeLinks();
+    const { source, ctx } = sourceFor("[[Al", ipc);
+    const c = ctx();
+    const pending = source(c);
+    abort(c);
+    expect(await pending).toBeNull();
+  });
+
+  it("drops an answer whose seq is not the one just sent", async () => {
+    const ipc = fakeLinks();
+    ipc.switcherQuery.mockImplementationOnce(async ({ seq }: { seq: number }) => ({ seq: seq - 1, corpus: "index", items: [], discarded: false }));
+    const { source, ctx } = sourceFor("[[Al", ipc);
+    expect(await source(ctx())).toBeNull();
+  });
+
+  it("a discarded answer is not 'no matches': it offers nothing and a later live answer still works", async () => {
+    const ipc = fakeLinks();
+    ipc.switcherQuery.mockImplementationOnce(async ({ seq }: { seq: number }) => ({ seq, corpus: "index", items: [], discarded: true }));
+    const { source, ctx } = sourceFor("[[Al", ipc);
+    expect(await source(ctx())).toBeNull();
+    expect(await source(ctx())).not.toBeNull();
+  });
+
+  it("drops anchors when aborted while the target resolves, and while note_anchors is in flight", async () => {
+    const ipc = fakeLinks();
+    const { source, ctx } = sourceFor("[[Alpha#int", ipc);
+    const c1 = ctx();
+    const p1 = source(c1);
+    abort(c1); // aborted while resolve_links is outstanding
+    expect(await p1).toBeNull();
+    expect(ipc.noteAnchors).not.toHaveBeenCalled();
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const real = ipc.noteAnchors;
+    ipc.noteAnchors = vi.fn(async (args: { path: string }) => {
+      await gate;
+      return real(args);
+    });
+    const c2 = ctx();
+    const p2 = source(c2);
+    await vi.advanceTimersByTimeAsync(0);
+    abort(c2); // aborted while note_anchors is outstanding
+    release();
+    expect(await p2).toBeNull();
+    expect(ipc.noteAnchors).toHaveBeenCalledTimes(1);
+  });
+
+  it("an IPC rejection yields no completions and throws nothing into typing", async () => {
+    const ipc = fakeLinks();
+    ipc.switcherQuery.mockRejectedValueOnce(new Error("transport"));
+    const names = sourceFor("[[Al", ipc);
+    expect(await names.source(names.ctx())).toBeNull();
+    ipc.noteAnchors = vi.fn().mockRejectedValue(new Error("transport"));
+    const anchors = sourceFor("[[Alpha#int", ipc);
+    expect(await anchors.source(anchors.ctx())).toBeNull();
+  });
+});
+
+describe("embeds (![[…]]) share the wikilink resolver and completion", () => {
+  it("![[ completes names exactly like [[ and replaces only the typed fragment", async () => {
+    const ipc = fakeLinks();
+    const { view, result } = await complete("![[Alp", ipc);
+    expect(result!.options.map((o) => o.label)).toEqual(["Alpha", "Alphabet"]);
+    expect(result!.from).toBe(3);
+    apply(view, result!.options[0], result!.from, 6);
+    expect(view.state.doc.toString()).toBe("![[Alpha]]");
+  });
+
+  it("visible embeds are resolved in the same single batched resolve_links call as wikilinks", async () => {
+    const ipc = fakeLinks();
+    makeView("[[Alpha]] and ![[pic.png]] and ![[Alpha#Intro]]", ipc);
+    await settle();
+    expect(ipc.resolveLinks).toHaveBeenCalledTimes(1);
+    expect(ipc.resolveLinks.mock.calls[0][0].targets).toEqual(["Alpha", "pic.png", "Alpha#Intro"]);
+  });
+});

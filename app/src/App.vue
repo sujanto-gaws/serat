@@ -30,6 +30,21 @@ const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 const searchOpen = ref(false);
 const editorDirty = ref(false);
+/** "Updated externally" in the status strip for 3 s after a disjoint external edit was merged
+ * into unsaved work (external-change-notice.md, outcome table). */
+const updatedExternally = ref(false);
+let updatedTimer: ReturnType<typeof setTimeout> | null = null;
+/** The persistent "Not saved - file changed on disk" line (editor.md, StaleHash sequencing). */
+const saveBlocked = ref(false);
+
+function onExternalMerged(): void {
+  updatedExternally.value = true;
+  if (updatedTimer) clearTimeout(updatedTimer);
+  updatedTimer = setTimeout(() => {
+    updatedTimer = null;
+    updatedExternally.value = false;
+  }, 3000);
+}
 
 /**
  * Opens `path` in the editor, optionally at a located block (backlinks and
@@ -111,6 +126,7 @@ onMounted(async () => {
   window.addEventListener("keydown", onGlobalKeydown);
 
   unlistenIndexStatus = await onIndexStatus((status) => {
+    store.setVaultId(status.vault_id);
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -122,7 +138,10 @@ onMounted(async () => {
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
-  indexStatus().then((status) => store.setIndexState(status.state));
+  indexStatus().then((status) => {
+    store.setVaultId(status.vault_id);
+    store.setIndexState(status.state);
+  });
 
   if (editorRef.value) {
     // `hydrateBuffer` reads the note and installs it with `loadNote` in one
@@ -136,6 +155,7 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
   unlistenIndexStatus?.();
+  if (updatedTimer) clearTimeout(updatedTimer);
 });
 
 /**
@@ -202,10 +222,13 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <div class="editor-column">
       <CodeMirrorEditor
         ref="editorRef"
+        :vault-id="store.vaultId"
         placeholder="No note open."
         @save-outcome="onSaveOutcome"
         @follow-link="onFollowLink"
         @dirty-changed="(d: boolean) => (editorDirty = d)"
+        @external-merged="onExternalMerged"
+        @save-blocked="(b: boolean) => (saveBlocked = b)"
       />
     </div>
     <aside class="pane pane-context" aria-label="Context">
@@ -219,6 +242,11 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <span v-if="store.refusedNames" class="refused" data-testid="refused-names"
       >{{ store.refusedNames }} {{ store.refusedNames === 1 ? "name" : "names" }} not shown (invalid on this platform)</span
     >
+    <span v-if="updatedExternally" class="updated-externally" data-testid="updated-externally">Updated externally</span>
+    <span v-if="saveBlocked" class="save-blocked" data-testid="save-blocked">
+      Not saved — file changed on disk
+      <button type="button" data-testid="blocked-compare" @click="editorRef?.compareWithDisk()">Compare</button>
+    </span>
     <span class="marks">{{ store.marksText }}</span>
   </footer>
 </template>

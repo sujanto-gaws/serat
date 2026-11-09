@@ -28,6 +28,8 @@ function mockIpc(savePatch = vi.fn()): EditorIpcAdapter {
     readFile: vi.fn(),
     writeFile: vi.fn(),
     onExternalChange: vi.fn().mockResolvedValue(() => undefined),
+    onClosing: vi.fn().mockResolvedValue(() => undefined),
+    flushAck: vi.fn().mockResolvedValue(undefined),
   };
 }
 
