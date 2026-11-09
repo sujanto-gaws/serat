@@ -47,6 +47,12 @@ function onTreeRemoved(path: string): void {
   if (open !== null && (open === path || open.startsWith(`${path}/`))) missingNote.value = open;
 }
 
+/** Delete-then-create saves and git checkouts remove and re-add a path: the note exists again. */
+function onTreeAdded(path: string): void {
+  const gone = missingNote.value;
+  if (gone !== null && (gone === path || gone.startsWith(`${path}/`))) missingNote.value = null;
+}
+
 /**
  * The tree's open event. `newTab` is ignored: there are no tabs in P1. On a narrow
  * window the flyover closes after a selection and focus returns to the editor.
@@ -63,17 +69,12 @@ async function onTreeOpen(payload: { path: string; newTab: boolean; keepFocus: b
 /*
  * Rename (F2) and the context menu are task #43 (tree operations). Until it
  * lands the events are received here and do nothing, so the tree's keys have a
- * handler to bind to; #43 replaces these two bodies. New note / new folder are the
- * same: #43 owns the naming flow and the create commands.
+ * handler to bind to; #43 replaces these two bodies. New note / new folder (the
+ * disabled toolbar buttons, ⌘N, ⌘⇧N) are the same: #43 owns the naming flow
+ * and the create commands, so the chords are no-ops until then.
  */
 function onTreeRename(_payload: { path: string }): void {}
 function onTreeContextMenu(_payload: { path: string }): void {}
-function onTreeNewNote(_payload: { dir: string }): void {
-  store.setMark("new note: arrives with the tree operations");
-}
-function onTreeNewFolder(_payload: { dir: string }): void {
-  store.setMark("new folder: arrives with the tree operations");
-}
 
 function openSearch(): void {
   // Open or focus; never toggles closed (search-panel.md). Esc closes.
@@ -105,6 +106,7 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
       return;
     }
     store.setOpenBuffer(file.path, file.hash);
+    missingNote.value = null;
     if (block) {
       // Exact while the file still has the hash the block was indexed at; by `ord`
       // (and said so) when it has changed since (architecture.md §4.5).
@@ -132,14 +134,15 @@ function onGlobalKeydown(event: KeyboardEvent): void {
     event.preventDefault();
     openSearch();
   } else if (event.shiftKey && key === "n") {
-    event.preventDefault();
-    treeRef.value?.requestNewFolder();
+    event.preventDefault(); // ⌘⇧N: new folder is task #43; a no-op until then
+
   } else if (!event.shiftKey && key === "n") {
-    event.preventDefault();
-    treeRef.value?.requestNewNote();
+    event.preventDefault(); // ⌘N: new note is task #43; a no-op until then
+
   } else if (!event.shiftKey && key === "1") {
     event.preventDefault();
-    treeFlyover.value = true;
+    // The flyover only exists below 720 px (file-tree.md); docked, ⌘1 just focuses.
+    if (window.matchMedia?.("(max-width: 719px)").matches) treeFlyover.value = true;
     void nextTick(() => treeRef.value?.focusTree());
   } else if (!event.shiftKey && key === "3") {
     event.preventDefault();
@@ -282,10 +285,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         @insert-link="onInsertLink"
         @rename="onTreeRename"
         @context-menu="onTreeContextMenu"
-        @new-note="onTreeNewNote"
-        @new-folder="onTreeNewFolder"
         @pending-listing="(p) => (pendingListing = p)"
         @removed="onTreeRemoved"
+        @added="onTreeAdded"
       />
     </aside>
     <div class="editor-column">

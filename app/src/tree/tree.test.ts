@@ -504,18 +504,25 @@ describe("FileTree component", () => {
     wrapper.unmount();
   });
 
-  it("toolbar and requestNew* emit new-note / new-folder with the focused folder", async () => {
+  it("New note / New folder are rendered disabled with the tooltip, not hidden (file-tree.md, task #43)", async () => {
+    const { ipc } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc } });
+    for (const id of ["tree-new-note", "tree-new-folder"]) {
+      const b = wrapper.get(`[data-testid="${id}"]`);
+      expect(b.attributes("disabled")).toBeDefined();
+      expect(b.attributes("title")).toBe("Arrives with tree operations (#43)");
+    }
+    wrapper.unmount();
+  });
+
+  it("an upsert emits added with the full path", async () => {
     const { ipc, push } = fakeIpc();
-    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    const wrapper = mount(FileTree, { props: { ipc } });
     await vi.advanceTimersByTimeAsync(0);
-    push(listing("", [{ name: "Projects", kind: "dir", sidecar: false }]));
-    push(listing("Projects", [note("A.md")]));
-    await wrapper.vm.$nextTick();
-    await wrapper.get('[data-testid="tree-new-note"]').trigger("click");
-    expect(wrapper.emitted("new-note")?.[0][0]).toEqual({ dir: "" });
-    await wrapper.get('[data-path="Projects"]').trigger("click"); // selects + expands
-    await wrapper.get('[data-testid="tree-new-folder"]').trigger("click");
-    expect(wrapper.emitted("new-folder")?.[0][0]).toEqual({ dir: "Projects" });
+    push(listing("", [{ name: "d", kind: "dir", sidecar: false }]));
+    push(listing("d", []));
+    push({ kind: "upsert", dir: "d", entry: note("a.md"), after: null } as TreeMessage);
+    expect(wrapper.emitted("added")?.[0]).toEqual(["d/a.md"]);
     wrapper.unmount();
   });
 

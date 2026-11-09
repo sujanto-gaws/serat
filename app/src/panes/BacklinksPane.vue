@@ -7,7 +7,7 @@
   papered over.
 -->
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import type { Backlink } from "@/ipc/generated/Backlink";
@@ -49,9 +49,13 @@ let unlisten: (() => void) | null = null;
 /** The path the shown state belongs to; a re-read of the same path swaps in place (no skeleton). */
 let shownPath: string | null = null;
 const root = ref<HTMLElement | null>(null);
-/** The entry just activated: it holds a 400 ms confirmation highlight (backlinks-pane.md, Interaction). */
-const confirmed = ref<Backlink | null>(null);
-let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * Roving tabindex: the section is the tab stop until an entry holds focus; then
+ * the focused entry is (tabindex -1, focused programmatically) and the section
+ * steps out of the tab order. The destination flash on navigate is the editor's
+ * (backlinks-pane.md: "the one flash-on-navigate"), not this pane's.
+ */
+const roving = ref(false);
 
 function group(items: Backlink[]): Array<{ source: string; title: string; entries: Backlink[] }> {
   const order: string[] = [];
@@ -118,7 +122,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true;
   token += 1;
-  if (confirmTimer) clearTimeout(confirmTimer);
   unlisten?.();
 });
 
@@ -127,11 +130,6 @@ function flatEntries(): Backlink[] {
 }
 
 function openEntry(entry: Backlink, newTab: boolean): void {
-  confirmed.value = entry;
-  if (confirmTimer) clearTimeout(confirmTimer);
-  confirmTimer = setTimeout(() => {
-    confirmed.value = null;
-  }, 400);
   emit("open", { path: entry.source_path, block: entry.block, newTab });
 }
 
@@ -139,9 +137,9 @@ function onKeydown(event: KeyboardEvent): void {
   const entries = flatEntries();
   if (entries.length === 0) return;
   if (event.key === "ArrowDown") {
-    focusedIndex.value = Math.min(entries.length - 1, focusedIndex.value + 1);
+    moveTo(Math.min(entries.length - 1, focusedIndex.value + 1));
   } else if (event.key === "ArrowUp") {
-    focusedIndex.value = Math.max(0, focusedIndex.value - 1);
+    moveTo(Math.max(0, focusedIndex.value - 1));
   } else if (event.key === "Enter") {
     openEntry(entries[focusedIndex.value], event.ctrlKey || event.metaKey);
   } else {
@@ -157,13 +155,25 @@ function indexOfEntry(entry: Backlink): number {
 function entryId(entry: Backlink): string {
   return `serat-backlink-${indexOfEntry(entry)}`;
 }
-const activeDescendant = computed(() => {
-  const entries = flatEntries();
-  return entries.length > 0 ? `serat-backlink-${focusedIndex.value}` : undefined;
-});
+
+/** Moves the selection and DOM focus together. */
+function moveTo(index: number): void {
+  focusedIndex.value = index;
+  roving.value = true;
+  void nextTick(() => root.value?.querySelector<HTMLElement>(`#serat-backlink-${index}`)?.focus());
+}
+
+/** Tabbing (or ⌘3) onto the section lands on the current entry. */
+function onSectionFocus(event: FocusEvent): void {
+  if (event.target === root.value && flatEntries().length > 0) moveTo(focusedIndex.value);
+}
+
+function onFocusOut(event: FocusEvent): void {
+  if (!root.value?.contains(event.relatedTarget as Node | null)) roving.value = false;
+}
 
 function onEntryClick(entry: Backlink): void {
-  focusedIndex.value = indexOfEntry(entry);
+  moveTo(indexOfEntry(entry));
   openEntry(entry, false);
 }
 
@@ -181,9 +191,10 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
     class="serat-backlinks"
     aria-label="Backlinks"
     data-testid="backlinks"
-    tabindex="0"
-    :aria-activedescendant="activeDescendant"
+    :tabindex="roving ? -1 : 0"
     @keydown="onKeydown"
+    @focus="onSectionFocus"
+    @focusout="onFocusOut"
   >
     <h3>Backlinks<span v-if="state.kind === 'ready'"> ({{ total() }})</span></h3>
     <p v-if="missing" class="serat-backlinks-note">This note no longer exists</p>
@@ -207,10 +218,8 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
             :key="g.source + ':' + (entry.block ? entry.block.block_id : 'fm') + ':' + i"
             role="listitem"
             class="serat-backlink"
-            :class="{
-              'serat-backlink-focused': indexOfEntry(entry) === focusedIndex,
-              'serat-backlink-confirmed': confirmed === entry,
-            }"
+            tabindex="-1"
+            :class="{ 'serat-backlink-focused': indexOfEntry(entry) === focusedIndex }"
             :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
             @click="onEntryClick(entry)"
           >
@@ -236,18 +245,6 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
   padding: 4px 6px;
   font-family: Georgia, serif;
   font-size: 13px;
-}
-.serat-backlink {
-  transition: background-color 200ms ease-out;
-}
-.serat-backlink-confirmed {
-  background: var(--serat-bg-selected-weak, rgba(36, 69, 126, 0.2));
-}
-@media (prefers-reduced-motion: reduce) {
-  /* Same 400 ms hold, no fade. */
-  .serat-backlink {
-    transition: none;
-  }
 }
 .serat-backlink-focused {
   background: rgba(36, 69, 126, 0.12);

@@ -8,7 +8,7 @@
   - Snippets are split on the match delimiters into text nodes; never innerHTML.
 -->
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import type { BlockLocation } from "@/ipc/generated/BlockLocation";
@@ -193,8 +193,8 @@ function openHit(hit: SearchHit, newTab: boolean): void {
 
 function onResultsKeydown(event: KeyboardEvent): void {
   if (hits.value.length === 0) return;
-  if (event.key === "ArrowDown") focusedIndex.value = Math.min(hits.value.length - 1, focusedIndex.value + 1);
-  else if (event.key === "ArrowUp") focusedIndex.value = Math.max(0, focusedIndex.value - 1);
+  if (event.key === "ArrowDown") moveTo(Math.min(hits.value.length - 1, focusedIndex.value + 1));
+  else if (event.key === "ArrowUp") moveTo(Math.max(0, focusedIndex.value - 1));
   else if (event.key === "Enter") openHit(hits.value[focusedIndex.value], event.ctrlKey || event.metaKey);
   else return;
   event.preventDefault();
@@ -218,7 +218,26 @@ function onPanelKeydown(event: KeyboardEvent): void {
   }
 }
 
-const activeDescendant = computed(() => (hits.value.length > 0 ? `serat-hit-${focusedIndex.value}` : undefined));
+/**
+ * Roving tabindex on the results (a plain list is not a composite widget, so no
+ * aria-activedescendant): the list is the tab stop until a hit holds focus.
+ */
+const roving = ref(false);
+const resultsEl = ref<HTMLElement | null>(null);
+
+function moveTo(index: number): void {
+  focusedIndex.value = index;
+  roving.value = true;
+  void nextTick(() => resultsEl.value?.querySelector<HTMLElement>(`#serat-hit-${index}`)?.focus());
+}
+
+function onResultsFocus(event: FocusEvent): void {
+  if (event.target === resultsEl.value && hits.value.length > 0) moveTo(focusedIndex.value);
+}
+
+function onResultsFocusOut(event: FocusEvent): void {
+  if (!resultsEl.value?.contains(event.relatedTarget as Node | null)) roving.value = false;
+}
 
 function focus(): void {
   inputEl.value?.focus();
@@ -297,20 +316,23 @@ defineExpose({ input, run, focus });
         <p class="serat-search-count">{{ hits.length }}{{ hasMore ? "+" : "" }} result{{ hits.length === 1 ? "" : "s" }}</p>
         <div
           role="list"
-          tabindex="0"
+          ref="resultsEl"
+          :tabindex="roving ? -1 : 0"
           data-testid="search-results"
-          :aria-activedescendant="activeDescendant"
           @keydown="onResultsKeydown"
+          @focus="onResultsFocus"
+          @focusout="onResultsFocusOut"
         >
           <div
             v-for="(hit, i) in hits"
             :key="hit.path + ':' + (hit.block ? hit.block.block_id : i)"
             :id="`serat-hit-${i}`"
+            tabindex="-1"
             role="listitem"
             class="serat-hit"
             :class="{ 'serat-hit-focused': i === focusedIndex }"
             :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '')"
-            @click="focusedIndex = i; openHit(hit, false)"
+            @click="moveTo(i); openHit(hit, false)"
           >
             <div class="serat-hit-head">
               <span class="serat-hit-title">{{ titleOf(hit.path, hit.title) }}</span>

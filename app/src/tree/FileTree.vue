@@ -53,12 +53,12 @@ const emit = defineEmits<{
   "insert-link": [payload: { path: string; text: string }];
   "context-menu": [payload: { path: string }];
   rename: [payload: { path: string }];
-  "new-note": [payload: { dir: string }];
-  "new-folder": [payload: { dir: string }];
   /** A pending (not yet listed) folder was selected: the context pane says "Listing…". `null` clears it. */
   "pending-listing": [path: string | null];
   /** An entry (or a folder, with everything under it) disappeared from the tree; the host may need to react. */
   removed: [path: string];
+  /** An entry was created or re-created at this path (an upsert); clears a "removed" the host was holding. */
+  added: [path: string];
 }>();
 
 const model = new TreeModel();
@@ -89,7 +89,7 @@ const windowed = computed(() =>
 const visibleRows = computed(() => rows.value.slice(windowed.value.start, windowed.value.end));
 const rootEmpty = computed(() => {
   void version.value;
-  return model.rootListed && model.rows().length === 0;
+  return model.rootListed && (model.listing("")?.length ?? 0) === 0;
 });
 const noMatches = computed(() => filtering.value && model.rootListed && rows.value.length === 0);
 
@@ -144,6 +144,7 @@ onMounted(() => {
       model.apply(message); // strictly in arrival order, never dropped
       bump();
       if (message.kind === "remove") emit("removed", childPath(message.dir, message.name));
+      else if (message.kind === "upsert") emit("added", childPath(message.dir, message.entry.name));
     })
     .catch(() => undefined);
   // Registered after `open_tree` is on the wire.
@@ -213,7 +214,8 @@ function isDot(row: TreeRow): boolean {
   return row.kind === "asset" && row.sidecar;
 }
 
-// Stable DOM ids for `aria-activedescendant`: one id per path, assigned on first use.
+// Stable DOM ids, one per path, assigned on first use. Bounded by the vault's entry
+// count (only rendered rows ever ask), and the pane lives as long as the vault is open.
 const rowIds = new Map<string, number>();
 function rowId(path: string): string {
   let n = rowIds.get(path);
@@ -330,22 +332,6 @@ function onFilterKeydown(event: KeyboardEvent): void {
   }
 }
 
-/** The folder a new entry goes in: the focused folder, or the focused row's folder, else the root. */
-function currentDir(): string {
-  const path = focusedPath.value;
-  if (path === null) return "";
-  const row = model.rows().find((r) => r.path === path) ?? rows.value.find((r) => r.path === path);
-  if (!row) return "";
-  return row.kind === "dir" ? row.path : row.dir;
-}
-
-function requestNewNote(): void {
-  emit("new-note", { dir: currentDir() });
-}
-function requestNewFolder(): void {
-  emit("new-folder", { dir: currentDir() });
-}
-
 function focusTree(): void {
   void nextTick(() => container.value?.focus());
 }
@@ -356,22 +342,17 @@ function focusFilter(): void {
   });
 }
 
-defineExpose({ model, focusTree, focusFilter, requestNewNote, requestNewFolder, version, filter });
+defineExpose({ model, focusTree, focusFilter, version, filter });
 </script>
 
 <template>
   <div class="serat-tree-pane" data-testid="file-tree-pane" @keydown="onPaneKeydown">
     <div class="serat-tree-toolbar" role="toolbar" aria-label="File tree actions">
-      <button type="button" class="serat-tree-tool" data-testid="tree-new-note" title="New note (⌘N)" @click="requestNewNote">
+      <!-- Disabled, not hidden (file-tree.md): creating entries is task #43 (tree operations). -->
+      <button type="button" class="serat-tree-tool" data-testid="tree-new-note" disabled title="Arrives with tree operations (#43)">
         New note
       </button>
-      <button
-        type="button"
-        class="serat-tree-tool"
-        data-testid="tree-new-folder"
-        title="New folder (⌘⇧N)"
-        @click="requestNewFolder"
-      >
+      <button type="button" class="serat-tree-tool" data-testid="tree-new-folder" disabled title="Arrives with tree operations (#43)">
         New folder
       </button>
       <input

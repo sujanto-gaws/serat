@@ -225,27 +225,33 @@ describe("BacklinksPane (round 2)", () => {
     expect(wrapper.find('[data-testid="backlinks-loading"]').exists()).toBe(true);
   });
 
-  it("aria-activedescendant follows the focused entry and names an element that exists", async () => {
+  it("roving tabindex: the section is the tab stop until an entry is focused; arrows move DOM focus", async () => {
     const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x"), link("B.md", 2, "y")] });
     const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(150);
     const section = wrapper.get("section");
+    expect(section.attributes("tabindex")).toBe("0");
+    expect(section.attributes("aria-activedescendant")).toBeUndefined();
+    (section.element as HTMLElement).focus(); // tabbing in lands on the current entry
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("x");
+    expect(section.attributes("tabindex")).toBe("-1");
     await section.trigger("keydown", { key: "ArrowDown" });
-    const id = section.attributes("aria-activedescendant");
-    expect(id).toBeTruthy();
-    expect(document.getElementById(id as string)?.textContent).toContain("y");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("y");
+    expect(document.activeElement?.getAttribute("tabindex")).toBe("-1");
+    await section.trigger("keydown", { key: "ArrowUp" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("x");
     wrapper.unmount();
   });
 
-  it("the activated entry holds a 400 ms highlight, then releases it", async () => {
+  it("activating an entry opens it; the pane itself does not flash (the destination does, #82)", async () => {
     const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x")] });
     const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc } });
     await vi.advanceTimersByTimeAsync(150);
     await wrapper.get(".serat-backlink").trigger("click");
-    expect(wrapper.find(".serat-backlink-confirmed").exists()).toBe(true);
-    await vi.advanceTimersByTimeAsync(399);
-    expect(wrapper.find(".serat-backlink-confirmed").exists()).toBe(true);
-    await vi.advanceTimersByTimeAsync(2);
+    expect(wrapper.emitted("open")).toHaveLength(1);
     expect(wrapper.find(".serat-backlink-confirmed").exists()).toBe(false);
   });
 
@@ -472,14 +478,21 @@ describe("SearchPanel", () => {
     expect(wrapper.emitted("close")).toHaveLength(2);
   });
 
-  it("aria-activedescendant on the results list follows the arrows", async () => {
+  it("roving tabindex on the results: arrows move DOM focus; the list is the tab stop until then", async () => {
     const search = vi.fn().mockResolvedValue(hits([hit("A.md", null, 1), hit("B.md", null, 2)]));
     const wrapper = mount(SearchPanel, { props: { ipc: ipcWith({ search }).ipc }, attachTo: document.body });
     await wrapper.get('[data-testid="search-input"]').setValue("a");
     await vi.advanceTimersByTimeAsync(300);
     const list = wrapper.get('[data-testid="search-results"]');
+    expect(list.attributes("tabindex")).toBe("0");
+    expect(list.attributes("aria-activedescendant")).toBeUndefined();
+    (list.element as HTMLElement).focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("A");
     await list.trigger("keydown", { key: "ArrowDown" });
-    expect(document.getElementById(list.attributes("aria-activedescendant") as string)?.textContent).toContain("B");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("B");
+    expect(list.attributes("tabindex")).toBe("-1");
     wrapper.unmount();
   });
 
