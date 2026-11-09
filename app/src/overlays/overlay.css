@@ -1,0 +1,117 @@
+/* Shared overlay chrome (components.md §5): quick switcher and command palette. */
+.overlay-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 15vh;
+}
+.overlay-card {
+  width: min(560px, 90vw);
+  background: var(--paper);
+  border: 1px solid var(--ov-hairline);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px var(--ov-shadow);
+  overflow: hidden;
+}
+.overlay-input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--ov-hairline);
+  padding: 12px 14px;
+  font: inherit;
+  font-size: 16px;
+  background: transparent;
+  color: var(--ink);
+  outline: none;
+}
+.overlay-input:focus-visible {
+  box-shadow: inset 0 -2px 0 var(--indigo);
+}
+.overlay-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  max-height: 288px;
+  overflow-y: auto;
+}
+.overlay-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.overlay-row[aria-selected="true"] {
+  background: var(--ov-selected);
+}
+.overlay-row .glyph {
+  color: var(--ov-muted);
+  width: 1em;
+  flex: none;
+}
+.overlay-row .main {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-row .meta {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--ov-muted);
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-row .hit {
+  color: var(--indigo);
+  font-weight: 600;
+}
+.overlay-row.unavailable .main {
+  color: var(--ov-muted);
+}
+.overlay-empty {
+  padding: 10px 14px;
+  color: var(--ov-secondary);
+}
+.overlay-footer {
+  display: flex;
+  gap: 16px;
+  padding: 6px 14px;
+  font-size: 11px;
+  color: var(--ov-muted);
+  border-top: 1px solid var(--ov-hairline);
+}
+.chip {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  background: var(--ov-sunken);
+  border: 1px solid var(--ov-hairline);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 2px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* Tints derived from the identity colours (serat-identity.md), not literals. */
+.overlay-scrim {
+  --ov-hairline: color-mix(in srgb, var(--ink) 15%, transparent);
+  --ov-shadow: color-mix(in srgb, var(--ink) 22%, transparent);
+  --ov-muted: color-mix(in srgb, var(--ink) 55%, transparent);
+  --ov-secondary: color-mix(in srgb, var(--ink) 70%, transparent);
+  --ov-sunken: color-mix(in srgb, var(--ink) 6%, transparent);
+  --ov-selected: color-mix(in srgb, var(--indigo) 10%, transparent);
+}
