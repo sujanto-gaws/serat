@@ -126,6 +126,16 @@ impl IndexHandle {
         self.actor.handle()
     }
 
+    /// The WAL checkpointer's facts (task #56): the pinned-WAL size, when there is one,
+    /// and its counters. Reads atomics only, so a status poll may call it.
+    ///
+    /// The checkpointer lives and dies with this handle: dropping the handle (vault
+    /// close) stops its thread after the writer's last commit.
+    #[must_use]
+    pub fn wal_health(&self) -> std::sync::Arc<crate::checkpoint::WalHealth> {
+        self.actor.wal_health()
+    }
+
     /// Where the index lives.
     #[must_use]
     pub fn index_dir(&self) -> &Path {
@@ -291,8 +301,15 @@ impl IndexHandle {
     pub fn close(self) -> Result<(), IndexError> {
         // The marker not being set (a pinned reader) is not an error; see
         // `WriterHandle::close_clean`.
-        let _marked = self.actor.handle().close_clean()?;
-        self.actor.shutdown()
+        //
+        // The checkpointer is stopped and joined FIRST (an in-flight PASSIVE finishes).
+        // SQLite takes the checkpoint lock without the busy handler, so the writer's
+        // TRUNCATE racing a PASSIVE would return busy at once and leave the marker
+        // cleared, costing a full catch-up at the next open (task #56, S2).
+        let Self { mut actor, .. } = self;
+        actor.stop_checkpointer();
+        let _marked = actor.handle().close_clean()?;
+        actor.shutdown()
     }
 }
 
