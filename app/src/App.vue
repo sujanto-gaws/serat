@@ -151,6 +151,9 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
  * global chords below are matched against its effective bindings.
  */
 const commands = new CommandRegistry();
+commands.onOverrideRefused((ids) =>
+  store.setMark(`keybinding ignored (already used by another command): ${ids.join(", ")}`),
+);
 provide(COMMANDS_KEY, commands);
 const mac = detectPlatform() === "mac";
 const switcherOpen = ref(false);

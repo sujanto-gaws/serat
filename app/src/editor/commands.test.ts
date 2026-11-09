@@ -236,6 +236,50 @@ describe("rebinding editor commands (NFR-USE-01)", () => {
     expect(registry.setOverride("editor.save", "Mod-z")).toBe(false);
   });
 
+  it("a command registered after an override that collides with it does not strand loadNote", async () => {
+    if (!Range.prototype.getClientRects) {
+      Range.prototype.getClientRects = () =>
+        ({ length: 0, item: () => null, [Symbol.iterator]: [][Symbol.iterator] }) as unknown as DOMRectList;
+      Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);
+    }
+    const registry = new CommandRegistry();
+    const refused: string[][] = [];
+    registry.onOverrideRefused((ids) => refused.push(ids));
+    const ipc = {
+      noteOpened: vi.fn().mockResolvedValue(undefined),
+      noteClosed: vi.fn().mockResolvedValue(undefined),
+      savePatch: vi.fn(),
+      requestExternalDiff: vi.fn().mockResolvedValue(null),
+      rebaseBuffer: vi.fn().mockResolvedValue([]),
+      readFile: vi.fn(),
+      writeFile: vi.fn(),
+      onExternalChange: vi.fn().mockResolvedValue(() => undefined),
+      onClosing: vi.fn().mockResolvedValue(() => undefined),
+      flushAck: vi.fn().mockResolvedValue(undefined),
+    };
+    const wrapper = mount(CodeMirrorEditor, { props: { ipc, commands: registry }, attachTo: document.body });
+    // Settings answer first: overrides for ids that do not exist yet are kept...
+    expect(registry.setOverrides([{ command_id: "late.a", key: "Mod-o" }, { command_id: "editor.undo", key: "Mod-j" }])).toEqual([]);
+    // ...then a command whose default is that very chord registers, and another registers under the override.
+    registry.register({ id: "late.a", name: "A", run: () => true });
+    registry.register({ id: "late.b", name: "B", defaultBinding: "Mod-j", when: "editor", run: () => true });
+    registry.register({ id: "late.c", name: "C", defaultBinding: "Mod-o", run: () => true });
+    const api = wrapper.vm as unknown as { loadNote(t: string, p: string, h: string): Promise<boolean>; getText(): string };
+    expect(await api.loadNote("hello", "a.md", "h1")).toBe(true);
+    expect(api.getText()).toBe("hello");
+    expect(() => registry.buildKeymap()).not.toThrow();
+    expect(refused.flat().sort()).toEqual(["editor.undo", "late.a"]);
+    wrapper.unmount();
+  });
+
+  it("buildKeymap itself never throws on an override-caused collision: the overriding command loses the chord", () => {
+    const registry = new CommandRegistry();
+    registry.register({ id: "a", name: "A", defaultBinding: "Mod-b", run: () => true });
+    registry.register({ id: "b", name: "B", defaultBinding: "Mod-c", run: () => true });
+    const keys = registry.buildKeymap(new Map([["b", "Mod-b"]])).map((x) => x.key);
+    expect(keys).toEqual(["Mod-b"]);
+  });
+
   it("two globals on one chord: the second is refused", () => {
     const registry = new CommandRegistry();
     registry.register({ id: "a", name: "A", defaultBinding: "Mod-o", exec: () => {} });

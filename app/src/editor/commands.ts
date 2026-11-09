@@ -63,6 +63,13 @@ export class CommandRegistry {
   private readonly overrides = new Map<CommandId, string | null>();
   private readonly runCounts = new Map<CommandId, number>();
   private readonly listeners = new Set<() => void>();
+  private readonly refusedListeners = new Set<(ids: CommandId[]) => void>();
+
+  /** Hears overrides dropped at `register` time because they collide with a later command. */
+  onOverrideRefused(listener: (ids: CommandId[]) => void): () => void {
+    this.refusedListeners.add(listener);
+    return () => this.refusedListeners.delete(listener);
+  }
 
   /** Calls `listener` after any register/unregister/override. Returns the unsubscribe. */
   subscribe(listener: () => void): () => void {
@@ -87,6 +94,17 @@ export class CommandRegistry {
       throw new Error(`CommandRegistry: command "${command.id}" has neither run nor exec`);
     }
     this.commands.set(command.id, command);
+    // An override already in force (settings are read before late commands register) must not
+    // collide with the newcomer: drop whichever override is at fault and say so.
+    const key = this.effectiveBinding(command.id);
+    const other = key === null ? null : this.collidesWith(command.id, key);
+    if (other !== null) {
+      const drop = this.overrides.has(command.id) ? command.id : this.overrides.has(other) ? other : null;
+      if (drop !== null) {
+        this.overrides.delete(drop);
+        for (const listener of [...this.refusedListeners]) listener([drop]);
+      }
+    }
     this.changed();
     return () => this.unregister(command.id);
   }
@@ -210,31 +228,39 @@ export class CommandRegistry {
    * silently resolve).
    */
   buildKeymap(overrides: ReadonlyMap<CommandId, string | null> = this.overrides): KeyBinding[] {
-    const seen = new Map<string, CommandId>();
+    const seen = new Map<string, { id: CommandId; overridden: boolean; binding: KeyBinding | null }>();
+    const dropped = new Set<KeyBinding>();
     const bindings: KeyBinding[] = [];
     for (const command of this.commands.values()) {
-      const override = overrides.get(command.id);
-      const key = overrides.has(command.id) ? override : command.defaultBinding;
+      const overridden = overrides.has(command.id);
+      const key = overridden ? overrides.get(command.id) : command.defaultBinding;
       if (!key) {
         continue;
       }
       const bucket = `${command.when ?? "*"}::${key}`;
       const existing = seen.get(bucket);
       if (existing) {
-        throw new Error(
-          `CommandRegistry: keybinding collision — "${key}" in context "${command.when ?? "*"}" is bound to both "${existing}" and "${command.id}"`,
-        );
+        // A collision caused by the user's TOML never throws (that would strand a note load
+        // inside the editor's state replacement): the overriding command simply loses the chord.
+        if (overridden) continue;
+        if (existing.overridden) {
+          if (existing.binding) dropped.add(existing.binding);
+        } else {
+          throw new Error(
+            `CommandRegistry: keybinding collision — "${key}" in context "${command.when ?? "*"}" is bound to both "${existing.id}" and "${command.id}"`,
+          );
+        }
       }
-      seen.set(bucket, command.id);
-      if (!command.run) continue; // view-less: handled by the global keydown handler
-      const run = command.run;
-      bindings.push({
-        key,
-        preventDefault: command.preventDefault ?? true,
-        run: (view) => run(view),
-      });
+      let binding: KeyBinding | null = null;
+      if (command.run) {
+        // view-less commands have no CodeMirror binding: the global keydown handler takes them
+        const run = command.run;
+        binding = { key, preventDefault: command.preventDefault ?? true, run: (view) => run(view) };
+        bindings.push(binding);
+      }
+      seen.set(bucket, { id: command.id, overridden, binding });
     }
-    return bindings;
+    return bindings.filter((b) => !dropped.has(b));
   }
 }
 

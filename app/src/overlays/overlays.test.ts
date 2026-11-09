@@ -333,6 +333,17 @@ describe("heading target (CRLF-safe)", () => {
     // moved: found by its plain text even though the source has markup
     expect(headingDocOffset(raw, 0, "Open risks and code")).toBe(raw.indexOf("## **"));
   });
+  it("snake_case survives plain-text reduction; paired emphasis does not", () => {
+    const raw = "x\n\n## the snake_case name\n\n## _Emph_ here\n";
+    expect(headingDocOffset(raw, 0, "the snake_case name")).toBe(raw.indexOf("## the"));
+    expect(headingDocOffset(raw, 0, "Emph here")).toBe(raw.indexOf("## _Emph"));
+  });
+  it("frontmatter is skipped: its last line over the closing --- is not a setext heading", () => {
+    const raw = "---\ntitle: Open risks\n---\n\nbody\n\n# Open risks\n";
+    expect(headingDocOffset(raw, 0, "title: Open risks")).toBe(0); // not a heading anywhere
+    expect(headingDocOffset(raw, 0, "Open risks")).toBe(raw.indexOf("# Open risks"));
+    expect(headingDocOffset(raw, byteOf(raw, "title:"), "Open risks")).toBe(raw.indexOf("# Open risks"));
+  });
   it("setext headings match, at the offset and by search", () => {
     const raw = "intro\n\nOpen risks\n===========\nbody\n";
     const at = byteOf(raw, "Open risks");

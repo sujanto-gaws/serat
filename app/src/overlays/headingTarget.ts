@@ -18,7 +18,8 @@ export function plainHeadingText(text: string): string {
   return text
     .replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, "$1")
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/[*_`~]/g, "")
+    .replace(/(\*\*|__|\*|~~|`)/g, "") // emphasis/code delimiters
+    .replace(/(^|[^\w])_+|_+(?=[^\w]|$)/g, "$1") // single `_` emphasis at word edges; snake_case stays
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -37,6 +38,15 @@ interface Line {
   text: string;
 }
 
+/** Index of the first line after a leading `---` frontmatter block (0 when there is none). */
+function bodyStart(lines: Line[]): number {
+  if (lines[0]?.text.replace(/\r$/, "") !== "---") return 0;
+  for (let i = 1; i < lines.length; i++) {
+    if (/^(---|\.\.\.)[ \t]*\r?$/.test(lines[i].text)) return i + 1;
+  }
+  return 0;
+}
+
 function linesOf(raw: string): Line[] {
   const lines: Line[] = [];
   let at = 0;
@@ -53,9 +63,10 @@ export function headingDocOffset(raw: string, byteStart: number, text: string): 
   const lines = linesOf(raw);
   const index = byteToUtf16Index(raw, byteStart);
   const at = lines.findIndex((l, i) => index >= l.start && (i === lines.length - 1 || index < lines[i + 1].start));
-  if (at >= 0 && headingOf(lines[at].text, lines[at + 1]?.text) !== null) return rawIndexToDocOffset(raw, lines[at].start);
+  const first = bodyStart(lines);
+  if (at >= first && headingOf(lines[at].text, lines[at + 1]?.text) !== null) return rawIndexToDocOffset(raw, lines[at].start);
   const want = plainHeadingText(text);
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = first; i < lines.length; i++) {
     if (headingOf(lines[i].text, lines[i + 1]?.text) === want) return rawIndexToDocOffset(raw, lines[i].start);
   }
   return 0;
