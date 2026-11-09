@@ -138,9 +138,11 @@ CREATE TABLE index_meta (
     -- set again when the session closes after a TRUNCATE checkpoint; a full rebuild
     -- leaves it 1. A 0 found at open therefore means the last session did not close
     -- cleanly, and since the index side of a save does no fsync (architecture
-    -- 3.1.1 item 6) a commit may have been lost: the catch-up walk then compares
-    -- each file's mtime with notes.mtime as well as the paths (task #14). Nothing
-    -- else reads it. It is the index's own state, re-derived by a rebuild (C-02).
+    -- 3.1.1 item 6) a commit may have been lost. It schedules the background
+    -- quick_check and is reported in telemetry. It does not select the catch-up
+    -- mode: since task #64 every open compares each file's mtime with notes.mtime
+    -- as well as the paths (ADR-0015 section 2, FR-VLT-04, A-03). It is the
+    -- index's own state, re-derived by a rebuild (C-02).
     clean_close     INTEGER NOT NULL DEFAULT 0 CHECK (clean_close IN (0, 1))
 );
 

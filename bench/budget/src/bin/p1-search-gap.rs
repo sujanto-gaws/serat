@@ -20,6 +20,20 @@
 //!    one statement object was reused (a hit), and would read 1 every time if each call
 //!    re-prepared. `RePrepare` is read beside it.
 //!
+//! **Task #56: which block gates.** Block I (R1 on S with pool R2 reads in between,
+//! against R1 on S alone) is the product's shape and the criterion at S = 64 MiB.
+//! Blocks A-H run R1 on a 2 MiB pool reader as well, which the architecture forbids, so
+//! with S at 64 MiB they show S 2-3x slower than P and that does not gate.
+//! *Unverified hypothesis:* SQLite's page cache keeps one LRU for every connection in the
+//! process, so a full 2 MiB cache recycles the oldest unpinned page of the group, which
+//! can be another connection's, instead of its own; at 256 MiB on all three nothing is
+//! ever full and the gap vanishes. Source-level support (not proof that it causes the
+//! gap): `libsqlite3-sys` 0.38.2's `build.rs` (line 162) compiles SQLite with
+//! `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which sets `pcache1.separateCache = 0`
+//! (`sqlite3.c`, around line 58370 of the bundled amalgamation), so every connection shares one
+//! page-cache group and its LRU. Not tested here (it would need a source-level look at
+//! pcache1 or a cache-miss counter per connection).
+//!
 //! The handler is OFF on S unless a block says otherwise: #47's 15-30% was measured
 //! with it off. One block runs it ON for completeness.
 //!
@@ -314,6 +328,15 @@ fn measure(
         .map(|t| (t.clone(), doc(t)))
         .filter(|(_, d)| *d > 0)
         .collect();
+    // The product's other reads, for block I: the highest in-degree note's backlinks (R2).
+    let hub: String = probe
+        .query_row(
+            "SELECT p.path FROM links l JOIN notes p ON p.id = l.dst_note
+              GROUP BY l.dst_note ORDER BY count(*) DESC, p.path LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     drop(probe);
     println!();
     println!(
@@ -401,6 +424,25 @@ fn measure(
         let (hp2, hs2) = alternate(&p, &s, term, n, false);
         line("H  S then P, handler ON", &hp2, &hs2, "P", "S");
         sc.set_progress_handler(false).map_err(|e| e.to_string())?;
+        // I: the product's shape (task #56). R1 runs only on S; the pool does R2. S's
+        // R1 between pool backlinks reads, against S alone in a batch (the same
+        // connection, so a cache stolen by the pool shows as the difference).
+        warm(&p, &s);
+        let (mut alone, mut mixed) = (Samples::new(), Samples::new());
+        for _ in 0..n {
+            alone.push(timed(&s, term));
+        }
+        for _ in 0..n {
+            let _ = p.backlinks(&hub).map_err(|e| e.to_string())?;
+            mixed.push(timed(&s, term));
+        }
+        line(
+            "I  S alone | S between pool R2 reads",
+            &alone,
+            &mixed,
+            "S",
+            "S+R2",
+        );
     }
     Ok(())
 }

@@ -623,6 +623,7 @@ impl AppState {
                 state: IndexState::Opening,
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
                 refused_names: None,
+                wal_pinned_bytes: None,
             },
         }
     }
