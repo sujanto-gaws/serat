@@ -58,7 +58,7 @@ fn hostile_a_symlink_planted_at_a_temp_name_is_not_written_through() {
             .join(format!(".serat-tmp-note.md.{}.{n}", std::process::id()));
         std::os::unix::fs::symlink(&victim, &old).unwrap();
     }
-    let patched = vault.write_patch(&path, base, &edit("NEW")).unwrap();
+    let patched = vault.write_patch(&path, base, &edit("NEW")).unwrap().hash;
     vault.write_atomic(&path, b"again\n").unwrap();
     assert_ne!(patched, base);
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"again\n");
@@ -327,4 +327,64 @@ fn write_atomic_if_refuses_a_mismatch_and_a_vanished_file() {
     vault
         .write_atomic_if(&path, Expect::Hash(ok), b"three\n")
         .unwrap();
+}
+
+/// Set a file's mtime to a fixed instant, so "which stat did this come from" is
+/// decidable without sleeping.
+fn set_mtime(path: &std::path::Path, secs: u64) {
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn write_atomic_returns_the_mtime_of_the_renamed_file_not_of_a_later_rewrite() {
+    // ADR-0015 section 2: the mtime beside the hash is from the rename, so an external
+    // rewrite landing after it cannot make the pair claim newer bytes than it hashes.
+    let (dir, vault) = vault();
+    let path = VaultPath::new("note.md").unwrap();
+    let target = dir.path().join("note.md");
+    let written = vault
+        .write_atomic_seams(
+            &path,
+            b"ours\n",
+            None,
+            || {},
+            || {
+                fs::write(&target, b"theirs\n").unwrap();
+                set_mtime(&target, 4_000_000_000);
+            },
+        )
+        .unwrap();
+    assert_eq!(written.hash, crate::hash::hash_bytes(b"ours\n"));
+    assert_ne!(written.mtime_ms, 4_000_000_000_000, "{written:?}");
+    assert!(written.mtime_ms > 1_600_000_000_000);
+}
+
+#[test]
+fn write_patch_returns_the_mtime_of_the_renamed_file_not_of_a_later_rewrite() {
+    let (dir, vault) = vault();
+    let path = VaultPath::new("note.md").unwrap();
+    let target = dir.path().join("note.md");
+    let base = vault.write_atomic(&path, b"aaa\nrest\n").unwrap();
+    let written = vault
+        .write_patch_seams(
+            &path,
+            base,
+            &edit("BBB"),
+            || {},
+            || {},
+            || {
+                fs::write(&target, b"theirs\n").unwrap();
+                set_mtime(&target, 4_000_000_000);
+            },
+        )
+        .unwrap();
+    assert_eq!(written.hash, crate::hash::hash_bytes(b"BBB\nrest\n"));
+    assert_ne!(written.mtime_ms, 4_000_000_000_000, "{written:?}");
+    assert!(written.mtime_ms > 1_600_000_000_000);
 }

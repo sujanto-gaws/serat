@@ -271,33 +271,32 @@ impl Editor {
         // the write runs.
         let held = self.buffers.find(&path, base_hash);
 
-        let new_hash = self
+        let wrote = self
             .vault
             .write_patch(&path, base_hash, &edits)
             .map_err(from_vault_error)?;
+        let new_hash = wrote.hash;
 
-        let mut bytes = 0;
         if let Some(base) = held
             && let Ok(text) = apply_edits(&base.text, &edits, path.as_str())
+            && hash_bytes(text.as_bytes()) == new_hash
         {
-            bytes = text.len() as u64;
-            if hash_bytes(text.as_bytes()) == new_hash {
-                self.buffers.advance(
-                    &path,
-                    Base {
-                        hash: new_hash,
-                        text: text.into(),
-                    },
-                );
-            }
+            self.buffers.advance(
+                &path,
+                Base {
+                    hash: new_hash,
+                    text: text.into(),
+                },
+            );
         }
-        // The stat the contract returns. Size is ours when we computed the bytes.
-        let stat = self.vault.read(&path).map_err(from_vault_error)?;
+        // Hash, mtime and size all come from the write itself (ADR-0015 §2): the
+        // mtime was statted under the path lock right after the rename, so it is never
+        // newer than the bytes the hash describes. No second read or stat here.
         let written = FileWritten {
             path: path.to_string(),
             hash: new_hash.to_hex(),
-            mtime_ms: stat.meta.mtime_ms,
-            bytes: if bytes == 0 { stat.meta.size } else { bytes },
+            mtime_ms: wrote.mtime_ms,
+            bytes: wrote.size,
         };
         Ok((path, written))
     }
@@ -491,6 +490,36 @@ mod tests {
         let hash = hash_of(fx.dir.path(), name);
         fx.editor.note_opened(&args(name, &hash)).expect("opened");
         hash
+    }
+
+    #[test]
+    fn file_written_carries_the_vaults_own_hash_mtime_and_size_without_a_reread() {
+        // ADR-0015 section 2 / #71. The note was never opened, so no held base: size
+        // must still come from the write, not from a read-back. The mtime must be the
+        // one the file has right after the write (nothing touches it in between).
+        let fx = fixture(&[("a.md", b"abc\nrest\n")]);
+        let base = hash_of(fx.dir.path(), "a.md");
+        let (_, written) = fx
+            .editor
+            .save_patch(&save("a.md", &base, vec![patch((0, 0), (0, 3), "WXYZ")]))
+            .expect("saved");
+        let on_disk = fs::read(fx.dir.path().join("a.md")).expect("read");
+        let stat = fs::metadata(fx.dir.path().join("a.md")).expect("stat");
+        let mtime = stat
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_millis() as i64;
+        assert_eq!(written.hash, serat_vault::hash_bytes(&on_disk).to_hex());
+        assert_eq!(written.bytes, on_disk.len() as u64);
+        assert_eq!(written.mtime_ms, mtime);
+        // The save path holds no `Vault::read` / `stat` of its own: the triple is the
+        // write's return value.
+        let src = include_str!("editor.rs");
+        let body = &src[src.find("pub fn save_patch").expect("fn")..];
+        let body = &body[..body.find("/// `request_external_diff`").expect("end")];
+        assert!(!body.contains("vault.read(") && !body.contains("fs::metadata"));
     }
 
     #[test]

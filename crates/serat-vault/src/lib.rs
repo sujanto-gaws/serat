@@ -77,6 +77,19 @@ pub enum Expect {
     Hash(ContentHash),
 }
 
+/// What a write returns: the hash of the bytes written and the mtime the file had
+/// right after the rename (ADR-0015 §2: a recorded mtime must not be newer than the
+/// bytes its hash describes, so the two come from the same moment, not a later read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Written {
+    /// BLAKE3 of the bytes written.
+    pub hash: ContentHash,
+    /// Unix milliseconds, statted once after the rename under the per-path lock.
+    pub mtime_ms: i64,
+    /// Length of the bytes written.
+    pub size: u64,
+}
+
 /// An open vault: a root directory, and the rules for what inside it counts.
 #[derive(Debug, Clone)]
 pub struct Vault {
@@ -437,6 +450,7 @@ impl Vault {
     /// original file is untouched.
     pub fn write_atomic(&self, path: &VaultPath, bytes: &[u8]) -> Result<ContentHash, VaultError> {
         self.write_atomic_hooked(path, bytes, None, || {})
+            .map(|written| written.hash)
     }
 
     /// [`Vault::write_atomic`] guarded by what the caller believes is on disk, checked
@@ -456,7 +470,7 @@ impl Vault {
         path: &VaultPath,
         expect: Expect,
         bytes: &[u8],
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
         self.write_atomic_hooked(path, bytes, Some(expect), || {})
     }
 
@@ -468,7 +482,21 @@ impl Vault {
         bytes: &[u8],
         expect: Option<Expect>,
         before_rename: impl FnOnce(),
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
+        self.write_atomic_seams(path, bytes, expect, before_rename, || {})
+    }
+
+    /// [`Vault::write_atomic_hooked`] plus `after_stat`, which runs after the post-rename
+    /// stat and before the return: where a test lands an external write to prove the
+    /// returned mtime is the one taken at the rename.
+    fn write_atomic_seams(
+        &self,
+        path: &VaultPath,
+        bytes: &[u8],
+        expect: Option<Expect>,
+        before_rename: impl FnOnce(),
+        after_stat: impl FnOnce(),
+    ) -> Result<Written, VaultError> {
         // T-06 / FR-BIN-19: binaries are read, extracted, annotated and queried, never
         // rewritten. The threat model's stated mechanism is that no write path accepts
         // a non-Markdown target, so the refusal belongs here — in the one function that
@@ -551,7 +579,13 @@ impl Vault {
         before_rename();
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        Ok(hash)
+        let mtime_ms = self.mtime_after_commit(&target);
+        after_stat();
+        Ok(Written {
+            hash,
+            mtime_ms,
+            size: bytes.len() as u64,
+        })
     }
 
     /// Apply a patch set against `base_hash` and write the result, atomically
@@ -594,7 +628,7 @@ impl Vault {
         path: &VaultPath,
         base_hash: ContentHash,
         edits: &[patch::Edit],
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
         self.write_patch_hooked(path, base_hash, edits, || {}, || {})
     }
 
@@ -608,7 +642,20 @@ impl Vault {
         edits: &[patch::Edit],
         before_rehash: impl FnOnce(),
         before_rename: impl FnOnce(),
-    ) -> Result<ContentHash, VaultError> {
+    ) -> Result<Written, VaultError> {
+        self.write_patch_seams(path, base_hash, edits, before_rehash, before_rename, || {})
+    }
+
+    /// [`Vault::write_patch_hooked`] plus `after_stat` (see `write_atomic_seams`).
+    fn write_patch_seams(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        before_rehash: impl FnOnce(),
+        before_rename: impl FnOnce(),
+        after_stat: impl FnOnce(),
+    ) -> Result<Written, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
                 path: path.as_str().to_owned(),
@@ -687,7 +734,22 @@ impl Vault {
 
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
 
-        Ok(new_hash)
+        let mtime_ms = self.mtime_after_commit(&target);
+        after_stat();
+        Ok(Written {
+            hash: new_hash,
+            mtime_ms,
+            size: new_bytes.len() as u64,
+        })
+    }
+
+    /// The mtime of the file just renamed into place, for [`Written`]. Called inside
+    /// the per-path lock straight after the rename, so no in-process writer can
+    /// interleave. If the stat fails (an external delete in that instant) the answer
+    /// is `0`: older than any real mtime, so the next comparison sees a change
+    /// rather than a stale agreement (ADR-0015 §2: never newer than the bytes).
+    fn mtime_after_commit(&self, target: &Path) -> i64 {
+        fs::metadata(target).map_or(0, |stat| walk::mtime_ms(&stat))
     }
 
     /// The edit script from `base` to the file as it is on disk now, in `base`'s
@@ -1169,7 +1231,7 @@ mod tests {
                 position::Position::new(0, 4 * 1024 * 1024),
                 replacement.to_string().repeat(4 * 1024 * 1024),
             )];
-            hash = vault.write_patch(&path, hash, &edits).expect("patch");
+            hash = vault.write_patch(&path, hash, &edits).expect("patch").hash;
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().expect("reader");
