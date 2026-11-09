@@ -1,18 +1,21 @@
-//! NFR-PRF-06 allocation, Rust side: `Corpus::query` over the benchmark vault's index
-//! (architecture §9.2) · reported, not the gate.
+//! NFR-PRF-06, Rust side: `Corpus::query` over the benchmark vault's index
+//! (architecture §9.2) · gated at the binding 50 ms with `--assert`; the 20 ms allocation
+//! is a printed finding.
 //!
 //! Serves **NFR-PRF-06**, **FR-NAV-01**, **US-04**. The binding figure is keystroke to
 //! painted results, under 50 ms at p95 at 20,000 notes, in the real binary (task #10's
-//! job, unmerged). §9.2 allots **20 ms p95** of it to `Switcher::query`, and that is
-//! what this times: the matcher alone, in-process, over the corpus built from the vault's
-//! index. It excludes IPC, serialisation and render, so it is a lower bound of the gate.
+//! in-app interval, not yet measured). §9.2 allots **20 ms p95** of it to
+//! `Switcher::query` and calls that "a finding, not a failure". This times the matcher
+//! alone, in-process, over the corpus built from the vault's index. It excludes IPC,
+//! serialisation and render, so it is a lower bound of the binding figure: **a breach of
+//! 50 ms here is a breach of the real figure; a pass proves only that this part fits.**
 //!
 //! The query set is derived from the index (titles, aliases, headings, paths) and is
 //! deterministic: three-character title prefixes, three-character subsequences spread
 //! across a title, path-stem queries, alias prefixes, queries that match nothing, and
 //! the three `#` shapes that put heading mode on the gated third keystroke (`#ab...`,
 //! `a#b...`, `ab#...`). Each query is typed one character at a time and every keystroke
-//! is timed; keystroke 3 (counting `#`) is the gated one, the rest are reported.
+//! is timed; keystroke 3 (counting `#`) is the judged one, the rest are reported.
 //!
 //! History is declared on every line: `absent`, or `fixture-2000` (2,000 deterministic
 //! opens, the record's cap), because frecency changes the work and the order.
@@ -27,9 +30,11 @@
 //! cargo run --release -p budget --bin p1-switcher -- --vault 20k --passes 3 --assert
 //! ```
 //!
-//! `--assert` (task #9/#10, NFR-PRF-08) turns the allocation into the CI gate: exit 1 if
-//! keystroke-3 p95 at **20k**, default mode or heading mode, under any declared history, is
-//! over `ALLOCATION_MS`. 50k is never gated; the adversarial stress is never gated.
+//! `--assert` (task #9/#10, NFR-PRF-08) exits 1 if keystroke-3 p95 at **20k** exceeds
+//! [`BINDING_MS`] in default mode or in heading mode, each judged on its own row under
+//! each declared history (§9.2: "each mode separately"; the pooled row never gates). The
+//! 20 ms allocation is printed per row as a finding and never fails. 50k and the
+//! adversarial stress are never gated.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -40,8 +45,11 @@ use serat_index::history::History;
 use serat_index::switcher::Corpus;
 use serat_vault::Vault;
 
-/// §9.2's allocation to `Switcher::query`, p95.
+/// §9.2's allocation to `Switcher::query`, p95. A finding when exceeded, never a failure.
 const ALLOCATION_MS: f64 = 20.0;
+/// NFR-PRF-06's binding figure, keystroke to painted results, p95 at 20,000 notes. The
+/// matcher alone cannot exceed it without the whole path exceeding it.
+const BINDING_MS: f64 = 50.0;
 const NOW_MS: i64 = 1_800_000_000_000;
 
 struct Query {
@@ -253,22 +261,21 @@ fn run(args: &[String]) -> Result<bool, String> {
         }
     }
 
-    if assert && !vault_names.split(',').any(|n| n == "20k") {
-        return Err("--assert needs the 20k vault in --vault; nothing else gates".to_owned());
-    }
-    let mut breaches = Vec::new();
-    for name in vault_names.split(',') {
+    let names: Vec<&str> = vault_names.split(',').collect();
+    budget::gate::require_20k(assert, &names)?;
+    let mut rows = Vec::new();
+    for name in &names {
         // Only the 20k vault gates (NFR-PRF-06's figure is "at 20,000 notes").
-        measure(name, passes, name == "20k", &mut breaches)?;
+        measure(name, passes, name == &"20k", &mut rows)?;
     }
     stress();
-    if assert && !breaches.is_empty() {
+    let breaches = budget::gate::breaches(BINDING_MS, &rows);
+    if assert {
         for b in &breaches {
-            eprintln!("NFR-PRF-06: over allocation (--assert): {b}");
+            eprintln!("NFR-PRF-06: over the binding {BINDING_MS:.0} ms (--assert): {b}");
         }
-        return Ok(false);
     }
-    Ok(true)
+    Ok(budget::gate::passes(assert, &breaches))
 }
 
 /// Adversarial candidates: long, dense in one letter, 50k of them (review S1). No vault
@@ -313,7 +320,7 @@ fn measure(
     vault_name: &str,
     passes: usize,
     gate: bool,
-    breaches: &mut Vec<String>,
+    rows: &mut Vec<(String, f64)>,
 ) -> Result<(), String> {
     let vault_name = vault_name.to_owned();
     println!("\n==================== vault {vault_name} ====================");
@@ -446,44 +453,33 @@ fn measure(
             }
         }
         println!("\nhistory: {label}");
-        line("  keystroke 3 (gated position)", &gated);
+        line("  keystroke 3 (pooled, reported)", &gated);
         line("    default mode", &gated_default);
         line("    heading mode", &gated_heading);
         line("  every keystroke (reported)", &all);
-        let heading_p95 = gated_heading.percentile(0.95);
-        if gate && heading_p95 > ALLOCATION_MS {
-            breaches.push(format!(
-                "heading mode, history {label}: p95 {heading_p95:.2} ms"
-            ));
-        }
-        println!(
-            "  heading mode, own row, history {label}: p95 {heading_p95:.2} ms against \
-             {ALLOCATION_MS:.0} ms ({:.0}% of allocation). {}",
-            100.0 * heading_p95 / ALLOCATION_MS,
-            if heading_p95 <= ALLOCATION_MS {
-                "Within."
-            } else {
-                "OVER."
+        for (mode, samples) in [("default", &gated_default), ("heading", &gated_heading)] {
+            let p95 = samples.percentile(0.95);
+            if gate {
+                rows.push((format!("{mode} mode, history {label}"), p95));
             }
-        );
-        let p95 = gated.percentile(0.95);
-        if gate && p95 > ALLOCATION_MS {
-            breaches.push(format!("keystroke 3, history {label}: p95 {p95:.2} ms"));
+            println!(
+                "  {mode} mode, own row, history {label}: p95 {p95:.2} ms. Binding NFR-PRF-06 \
+                 {BINDING_MS:.0} ms: {}. Allocation finding (§9.2) {ALLOCATION_MS:.0} ms \
+                 ({:.0}%): {}",
+                if p95 <= BINDING_MS { "within" } else { "OVER" },
+                100.0 * p95 / ALLOCATION_MS,
+                if p95 <= ALLOCATION_MS {
+                    "within."
+                } else {
+                    "over, a finding, not a failure."
+                }
+            );
         }
-        println!(
-            "  NFR-PRF-06 allocation, history {label}: Switcher::query p95 {p95:.2} ms against \
-             {ALLOCATION_MS:.0} ms ({:.0}% of allocation). {}",
-            100.0 * p95 / ALLOCATION_MS,
-            if p95 <= ALLOCATION_MS {
-                "Within."
-            } else {
-                "OVER: a finding, not a failure."
-            }
-        );
     }
     println!(
         "\nBasis: in-process, one thread, release build expected; excludes IPC, serialisation \
-         and render. The binding figure is keystroke to painted results in the real binary (task #10)."
+         and render, so it is a lower bound of keystroke to painted results. --assert fails only \
+         over the binding 50 ms; the in-app interval is task #10's and is not asserted here."
     );
     let _ = std::fs::remove_dir_all(&scratch);
     if vault_name == "50k" {

@@ -196,8 +196,10 @@ jobs:
   # (#13 p1-tree-path, #14 p1-external-change, #16 p1-switcher); these jobs are what
   # make a breach fail the PR. Three rules shared by the three jobs:
   #
-  # * Toolchain: 1.92, spelled out, matching rust-toolchain.toml (NFR-PRF-08: a CI
-  #   number and a laptop number must be comparable). `stable` would drift.
+  # * Toolchain: the real pin is rust-toolchain.toml (1.92); cargo honours it whatever
+  #   the action installs, so the older jobs on `@stable` are unaffected. These jobs also
+  #   spell 1.92 so the installed and the pinned toolchain agree (NFR-PRF-08: a CI number
+  #   and a laptop number must be comparable).
   # * Vault: the 20k preset is generated and its digest asserted before anything is
   #   measured, so a drifted generator fails as "wrong vault", not as "slow".
   # * `gate_eligible`: the `environment` step prints whether this runner's number could
@@ -240,10 +242,11 @@ jobs:
           if-no-files-found: ignore
 
   # FR-VLT-04 (architecture 3.1.2): an external change visible in the index within
-  # 500 ms. --assert gates the single-note shape only; the 100-note batch is printed as
+  # 500 ms. --assert gates p95 of the single-note shape only (max is printed, not gated;
+  # the PRD names no percentile, #81); the 100-note batch is printed as
   # "reported, not gated".
   p1-external-change:
-    name: "FR-VLT-04 · external change visible in the index < 500 ms p95, single note"
+    name: "FR-VLT-04 · external change visible < 500 ms, single note, gated on p95 (PRD criterion carries no percentile, see #81)"
     needs: vault
     runs-on: windows-latest
     steps:
@@ -267,12 +270,14 @@ jobs:
           path: bench/out/p1-external-change*.txt
           if-no-files-found: ignore
 
-  # NFR-PRF-06 (architecture 9.2): 20 ms p95 allocated to Switcher::query at 20k, on
-  # keystroke 3 in default mode and in heading mode (its own row), with and without
-  # history. 50k and the adversarial stress are run and reported, never gated. In-process
-  # and a lower bound of the 50 ms keystroke-to-paint figure (task #10, in the real binary).
+  # NFR-PRF-06 (architecture 9.2): gated at the binding 50 ms p95 at 20k, on keystroke 3
+  # in default mode and in heading mode, each on its own row, with and without history.
+  # The 20 ms allocation to Switcher::query is printed as a finding and never fails
+  # (9.2: "a finding, not a failure"). 50k and the stress are reported, never gated.
+  # In-process, so a lower bound of keystroke-to-paint: a breach is real, a pass proves
+  # only that this part fits.
   p1-switcher:
-    name: "NFR-PRF-06 · Switcher::query < 20 ms p95 at 20k (50k and stress reported)"
+    name: "NFR-PRF-06 · Switcher::query < 50 ms p95 at 20k, default and heading mode (20 ms allocation, 50k, stress reported)"
     needs: vault
     runs-on: windows-latest
     steps:

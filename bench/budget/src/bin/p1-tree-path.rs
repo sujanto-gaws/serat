@@ -1,7 +1,8 @@
-//! FR-VLT-01 tree path, Rust side (ADR-0015 §3) · reported, not the gate.
+//! FR-VLT-01 tree path, Rust side (ADR-0015 §3) · the CI gate with `--assert`, as a
+//! lower bound of the binding interval.
 //!
 //! Serves **FR-VLT-01**, **NFR-CMP-03**, **NFR-PRF-01**. FR-VLT-01's binding interval
-//! is `tree_complete - T_open` in the running application (task #9's job). This times
+//! is `tree_complete - T_open` in the running application (task #24's in-app mark). This times
 //! the part of it that is this repository's Rust: from "the tree session starts" to
 //! the moment `TreeOut::Complete` is written to the sink, on each of ADR-0015's two
 //! arms, with the sink doing the work a channel does that is not IPC (it counts
@@ -19,8 +20,9 @@
 //!   each iteration starts from the same disk state.
 //!
 //! **Not recorded here:** ADR-0015 §3's validity condition 4 (`cpu_load_percent`,
-//! `concurrent_build_processes`, `gate_eligible`). This job reports; it is not
-//! gate-eligible evidence, and the budget job (task #9) records those fields.
+//! `concurrent_build_processes`, `gate_eligible`). The bin does not print them; the
+//! `p1-tree-path` job in budgets.yml runs the `environment` bin beside it and records
+//! them, so this bin's number is gate-eligible evidence only with that line.
 //!
 //! Each run is rejected, not recorded, unless `Complete.entries` equals the manifest's
 //! `notes + assets` and `source` matches the arm (ADR-0015 §3, validity conditions 1-2).
@@ -32,11 +34,12 @@
 //! cargo run --release -p budget --bin p1-tree-path -- --vault 50k --iterations 5 --cold-iterations 3
 //! ```
 //!
-//! Exits 0 whatever it measures; it fails only when it cannot measure or a run is
-//! invalid. With `--assert` (task #9, NFR-PRF-08) it also exits 1 if either arm's p95
-//! is over `BUDGET_MS`: the Rust side is a lower bound of the gated interval, so a
-//! breach here is a breach of the real figure, though a pass proves only that this part
-//! fits. Only meaningful on the 20k vault, so `--assert` refuses any other.
+//! Without `--assert` it exits 0 whatever it measures; it fails only when it cannot
+//! measure or a run is invalid. With `--assert` (NFR-PRF-08) it also exits 1 if either
+//! arm's p95 is over `BUDGET_MS`: the Rust side is a lower bound of the gated interval,
+//! so a breach here is a breach of the real figure, though a pass proves only that this
+//! part fits. At the default n=10 / n=5 the nearest-rank p95 is the max sample. Only
+//! meaningful on the 20k vault, so `--assert` refuses any other.
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -115,9 +118,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         }
     }
 
-    if assert && vault_name != "20k" {
-        return Err("--assert gates FR-VLT-01 at 20,000 notes; use --vault 20k".to_owned());
-    }
+    budget::gate::require_only_20k(assert, &vault_name)?;
     let under_test = ensure_vault(&vault_name)?;
     let expected =
         u32::try_from(under_test.notes + under_test.assets).map_err(|e| e.to_string())?;
@@ -237,21 +238,27 @@ fn run(args: &[String]) -> Result<bool, String> {
     line("  Complete", &cold_complete);
 
     println!();
-    let mut within = true;
+    let mut rows = Vec::new();
     for (arm, s) in [("warm", &complete), ("no-index", &cold_complete)] {
         let p95 = s.percentile(0.95);
-        within &= p95 <= BUDGET_MS;
+        rows.push((format!("{arm} arm"), p95));
         println!(
             "FR-VLT-01 Rust-side lower bound, {arm} arm: p95 {p95:.1} ms against {BUDGET_MS:.0} ms \
-             ({:.1}% of budget). Excludes channel serialisation and the webview apply+paint; \
-             the binding figure is tree_complete - T_open (task #9).",
-            100.0 * p95 / BUDGET_MS
+             ({:.1}% of budget; n={}, and at n<=20 nearest-rank p95 is the max sample). \
+             Excludes channel serialisation and the webview apply+paint; a breach here is a \
+             breach of the binding figure, a pass proves only this part fits. The in-app \
+             tree_complete - T_open belongs to task #24.",
+            100.0 * p95 / BUDGET_MS,
+            s.len()
         );
     }
-    if assert && !within {
-        eprintln!("FR-VLT-01: Rust-side lower bound over {BUDGET_MS:.0} ms (--assert)");
+    let breaches = budget::gate::breaches(BUDGET_MS, &rows);
+    if assert {
+        for b in &breaches {
+            eprintln!("FR-VLT-01: Rust-side lower bound over budget (--assert): {b}");
+        }
     }
-    Ok(within || !assert)
+    Ok(budget::gate::passes(assert, &breaches))
 }
 
 fn check(

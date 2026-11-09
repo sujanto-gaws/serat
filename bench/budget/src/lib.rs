@@ -19,6 +19,7 @@
 //!    Q1), not edited here.
 
 pub mod env;
+pub mod gate;
 pub mod subject;
 pub mod trace;
 
@@ -5245,6 +5246,50 @@ mod tests {
                 text.contains(&format!("\n  {}:", budget.id)),
                 "budget {} has no asserting job in budgets.yml (NFR-PRF-08)",
                 budget.id
+            );
+        }
+    }
+
+    /// The P1 budgets whose gate is a bin's `--assert` rather than a `Budget` run through
+    /// `run_job`: (workflow job id, bin, requirement). A job that quietly lost its
+    /// `--assert` would go green on every number, which is the F-30 failure again.
+    const P1_GATED: &[(&str, &str, &str)] = &[
+        ("p1-tree-path", "p1-tree-path", "FR-VLT-01"),
+        ("p1-external-change", "p1-external-change", "FR-VLT-04"),
+        ("p1-switcher", "p1-switcher", "NFR-PRF-06"),
+    ];
+
+    #[test]
+    fn every_p1_gated_budget_has_a_job_whose_run_line_asserts() {
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        for (job, bin, requirement) in P1_GATED {
+            let head = format!("\n  {job}:");
+            let start = text
+                .find(&head)
+                .unwrap_or_else(|| panic!("{requirement}: no job {job} in budgets.yml"));
+            // The job ends at the next key indented exactly two spaces.
+            let mut body = String::new();
+            for l in text[start + head.len()..].lines() {
+                let key = l.starts_with("  ")
+                    && !l.starts_with("   ")
+                    && !l.trim().is_empty()
+                    && !l.trim_start().starts_with('#');
+                if key {
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+            }
+            let asserting = body.lines().any(|l| {
+                !l.trim_start().starts_with('#')
+                    && l.contains(&format!("--bin {bin} "))
+                    && l.contains("--assert")
+            });
+            assert!(
+                asserting,
+                "{requirement}: job {job} has no run line invoking `--bin {bin}` with --assert (NFR-PRF-08)"
             );
         }
     }
