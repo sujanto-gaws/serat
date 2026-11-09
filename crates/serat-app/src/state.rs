@@ -1143,6 +1143,12 @@ impl AppState {
     /// [`IpcError::VaultNotFound`] with no vault open.
     pub fn search(&self, args: SearchArgs) -> Result<IndexRead<SearchOutcome>, IpcError> {
         let (root, state, search) = self.read_context()?;
+        let vault = self.vault()?;
+        // After the statement and outside SQLite; `Vault::stat` keeps containment.
+        let stat = |path: &str| {
+            let path = Self::vault_path(path).ok()?;
+            vault.stat(&path).ok()
+        };
         Ok(crate::reads::read_when_ready(
             state,
             &root,
@@ -1150,7 +1156,7 @@ impl AppState {
             |reader| {
                 reader
                     .search(&args.query, args.offset, args.limit)
-                    .map(crate::reads::map_outcome)
+                    .map(|outcome| crate::reads::map_outcome(outcome, &stat))
             },
         ))
     }

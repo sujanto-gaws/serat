@@ -366,6 +366,24 @@ impl Vault {
         self.read_hooked(path, || {})
     }
 
+    /// The file's mtime and size without reading it: `(mtime_ms, size)`.
+    ///
+    /// For the search panel's staleness hint (task #88, FR-NAV-02): the mtime is
+    /// converted exactly as the walk converts it, so a comparison with `notes.mtime`
+    /// is the catch-up's own test. It goes through [`Vault::resolve`], so a symlinked
+    /// ancestor is refused exactly as for a read, and it opens nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] if it is gone, [`VaultError::PathEscapesVault`] if it
+    /// resolves through a symlink (T-07), [`VaultError::Io`] otherwise.
+    pub fn stat(&self, path: &VaultPath) -> Result<(i64, u64), VaultError> {
+        let absolute = self.resolve(path)?;
+        let stat =
+            fs::symlink_metadata(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        Ok((walk::mtime_ms(&stat), stat.len()))
+    }
+
     /// [`Vault::read`] with a seam between the stat and the read, so a test can land a
     /// write exactly there (as `write_atomic_hooked` does for the rename).
     fn read_hooked(
