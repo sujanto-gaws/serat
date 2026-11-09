@@ -31,8 +31,7 @@ len: number,
  * reloads from `asset_info` and shows the 4 s "changed on disk" notice
  * (ADR-0017 Amendment 1, the scheme's `If-Range` moved into the transport).
  *
- * **Contract ahead of implementation**, filled by the same follow-up as
- * `AssetInfo::etag`. Until then it is ignored, and a file changed
- * mid-load is not detected.
+ * Implemented by task #98. Absent keeps the old behaviour: the check is
+ * skipped and a file changed mid-load is not detected.
  */
 if_match?: string, };

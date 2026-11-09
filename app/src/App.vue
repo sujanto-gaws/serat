@@ -14,6 +14,8 @@ import BacklinksPane from "@/panes/BacklinksPane.vue";
 import SearchPanel from "@/panes/SearchPanel.vue";
 import { locateBlock } from "@/panes/locate";
 import FileTree from "@/tree/FileTree.vue";
+import ViewerHost from "@/viewers/ViewerHost.vue";
+import { isViewerPath } from "@/viewers/assetKind";
 import { readFile } from "@/ipc/client";
 import type { BlockLocation } from "@/ipc/generated/BlockLocation";
 
@@ -38,6 +40,8 @@ const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
 let unlistenVaultOpened: UnlistenFn | null = null;
 const searchOpen = ref(false);
+/** The PDF/image open in place of the editor (binary-viewers.md); null = the editor shows. */
+const viewing = ref<string | null>(null);
 const editorDirty = ref(false);
 /** "Updated externally" in the status strip for 3 s after a disjoint external edit was merged
  * into unsaved work (external-change-notice.md, outcome table). */
@@ -163,6 +167,29 @@ function closeSearch(): void {
  * `loadNote`; if they cannot be saved the note is not replaced.
  */
 async function openNote(path: string, block: BlockLocation | null = null): Promise<string | null> {
+  if (isViewerPath(path)) {
+    // FR-BIN-11/12: a PDF or image opens in the viewer; the editor (and its buffer) stay mounted.
+    viewing.value = path;
+    return null;
+  }
+  if (viewing.value !== null && path === store.openNote) {
+    // Returning from a viewer to the note still in the editor: its buffer (maybe dirty, with undo
+    // history) is already current; re-reading would race the flush and replace it with stale text.
+    viewing.value = null;
+    const open = editorRef.value;
+    if (!open) return null;
+    const text = open.getText();
+    if (block) {
+      // A block/heading target still reveals, on the existing buffer: exact only while the buffer
+      // is clean (its text is then the file at `baseHash`), by `ord` when it has unsaved edits.
+      const position = locateBlock(text, editorDirty.value ? null : store.baseHash, block);
+      void nextTick(() => open.revealOffset(position.offset));
+      if (position.approximate) store.setMark("approximate location — this note has changed since it was indexed");
+    } else {
+      void nextTick(() => editorRef.value?.focus());
+    }
+    return text; // the buffer's text (not null), so the switcher's heading jump works behind a viewer
+  }
   const editor = editorRef.value;
   if (!editor) return null;
   try {
@@ -173,6 +200,7 @@ async function openNote(path: string, block: BlockLocation | null = null): Promi
       return null;
     }
     store.setOpenBuffer(file.path, file.hash);
+    viewing.value = null;
     missingNote.value = null;
     if (block) {
       // Exact while the file still has the hash the block was indexed at; by `ord`
@@ -404,6 +432,10 @@ function refusalMessage(error: unknown): string {
 /** Mod-Enter on a link. Opening notes needs the file tree and tabs (tasks #1-#4);
  * until then the host only reports what the link resolved to. */
 function onFollowLink(link: { target: string; path: string | null }): void {
+  if (link.path && isViewerPath(link.path)) {
+    viewing.value = link.path;
+    return;
+  }
   store.setMark(link.path ? `link: ${link.path}` : `no note named \u201C${link.target}\u201D`);
 }
 
@@ -444,7 +476,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
         ref="treeRef"
-        :open-path="store.openNote"
+        :open-path="editorDirty && store.openNote ? store.openNote : (viewing ?? store.openNote)"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
         :vault-open="store.vaultOpen"
@@ -458,7 +490,14 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </aside>
     <div class="editor-column">
+      <ViewerHost
+        v-if="viewing !== null"
+        :path="viewing"
+        @open-note="(p: string) => openNote(p)"
+        @reveal="treeRef?.focusTree()"
+      />
       <CodeMirrorEditor
+        v-show="viewing === null"
         ref="editorRef"
         :vault-id="store.vaultId"
         :vault-open="store.vaultOpen"

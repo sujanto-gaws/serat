@@ -190,7 +190,11 @@ class ImageEmbedWidget extends WidgetType {
     // <object>/<iframe>/inline SVG/v-html.
     if (this.resolvedPath === null) return this.placeholder();
     const img = document.createElement("img");
-    img.src = assetUrl(this.resolvedPath);
+    try {
+      img.src = assetUrl(this.resolvedPath);
+    } catch {
+      return this.placeholder(); // a path the builder refuses is never requested
+    }
     img.alt = this.label;
     img.className = "serat-embed-widget";
     if (this.widthAttr && /^\d+$/.test(this.widthAttr)) {
@@ -376,8 +380,8 @@ function buildAll(state: EditorState): BlockWidgetState {
  * or `null` if `pos` sits directly under `Document` with no such ancestor
  * (e.g. a boundary position). Bounds every recompute to "one block", which
  * is what keeps this field's per-keystroke cost independent of note size. */
-function enclosingTopLevelBlock(state: EditorState, pos: number): Span | null {
-  let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, -1);
+function enclosingTopLevelBlock(state: EditorState, pos: number, side: -1 | 1 = -1): Span | null {
+  let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, side);
   while (node && node.parent && node.parent.type.name !== "Document") {
     node = node.parent;
   }
@@ -385,6 +389,69 @@ function enclosingTopLevelBlock(state: EditorState, pos: number): Span | null {
     return null;
   }
   return { from: node.from, to: node.to };
+}
+
+/** The block(s) a position touches: `resolveInner(pos, -1)` alone resolves a block's
+ * FIRST character to the previous node (or to `Document`, so `null`, at offset 0), which
+ * left that block unexamined when the cursor left it and a table stayed raw (FR-EDT-02).
+ * Both sides, deduplicated; two O(depth) lookups, no walk. */
+function touchedTopLevelBlocks(state: EditorState, pos: number): Span[] {
+  const before = enclosingTopLevelBlock(state, pos, -1);
+  const after = enclosingTopLevelBlock(state, pos, 1);
+  if (before && after && before.from === after.from && before.to === after.to) return [before];
+  return [before, after].filter((x): x is Span => x !== null);
+}
+
+/** The span covering every top-level block overlapping `[from, to]`: one tree walk bounded to the range
+ * (it does not descend into a block), so its cost is the selection's, not the note's. */
+function blocksIntersecting(state: EditorState, from: number, to: number): Span[] {
+  let first = -1;
+  let last = -1;
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter(node) {
+      if (node.type.name === "Document") return true;
+      if (node.node.parent?.type.name === "Document") {
+        if (first < 0) first = node.from;
+        last = node.to;
+      }
+      return false;
+    },
+  });
+  // One span, not one per block: select-all on a 5,000-line note is one replaceRegion.
+  return first < 0 ? [] : [{ from: first, to: last }];
+}
+
+/**
+ * The position intervals whose blocks need re-examining for a selection change.
+ * A line selected in both states is revealed in both, so with one range before and
+ * after, no document change, and overlapping ranges, only the two ends that moved
+ * matter (Shift-extending a select-all costs the extension, not the selection).
+ * Anything else (several ranges, disjoint, or a doc change) takes every non-empty
+ * range of both states, mapped.
+ */
+function selectionSpansToRecompute(tr: Transaction): Array<[number, number]> {
+  const oldRanges = tr.startState.selection.ranges;
+  const newRanges = tr.state.selection.ranges;
+  if (!tr.docChanged && oldRanges.length === 1 && newRanges.length === 1) {
+    const o = oldRanges[0];
+    const n = newRanges[0];
+    if (o.from <= n.to && n.from <= o.to) {
+      const spans: Array<[number, number]> = [];
+      if (o.from !== n.from) spans.push([Math.min(o.from, n.from), Math.max(o.from, n.from)]);
+      if (o.to !== n.to) spans.push([Math.min(o.to, n.to), Math.max(o.to, n.to)]);
+      return spans;
+    }
+  }
+  const spans: Array<[number, number]> = [];
+  for (const r of oldRanges) {
+    if (r.anchor !== r.head) spans.push([tr.changes.mapPos(r.from), tr.changes.mapPos(r.to)]);
+  }
+  for (const r of newRanges) {
+    if (r.anchor !== r.head) spans.push([r.from, r.to]);
+  }
+  return spans;
 }
 
 function mergeSpans(spans: Span[]): Span[] {
@@ -440,14 +507,24 @@ function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
     regions.push({ from: start ? Math.min(start.from, growth.from) : growth.from, to: growth.to });
   }
   if (!tr.startState.selection.eq(tr.state.selection)) {
+    // Both ends of every range, old (mapped) and new, plus the top-level blocks a
+    // non-empty range spans: `selectedLines` (buildAll/update) comes from the full
+    // ranges, so the dirty regions must too (FR-EDT-02). A collapsed cursor takes the
+    // two O(depth) lookups only (no walk); cost grows with the selection, never the note.
     for (const range of tr.startState.selection.ranges) {
-      const mapped = tr.changes.mapPos(range.head);
-      const region = enclosingTopLevelBlock(tr.state, mapped);
-      if (region) regions.push(region);
+      regions.push(...touchedTopLevelBlocks(tr.state, tr.changes.mapPos(range.head)));
+      if (range.anchor !== range.head) {
+        regions.push(...touchedTopLevelBlocks(tr.state, tr.changes.mapPos(range.anchor)));
+      }
     }
     for (const range of tr.state.selection.ranges) {
-      const region = enclosingTopLevelBlock(tr.state, range.head);
-      if (region) regions.push(region);
+      regions.push(...touchedTopLevelBlocks(tr.state, range.head));
+      if (range.anchor !== range.head) {
+        regions.push(...touchedTopLevelBlocks(tr.state, range.anchor));
+      }
+    }
+    for (const [from, to] of selectionSpansToRecompute(tr)) {
+      regions.push(...blocksIntersecting(tr.state, from, to));
     }
   }
   return mergeSpans(regions);

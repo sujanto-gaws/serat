@@ -484,6 +484,38 @@ fn measure(
         || reader.attachments().map_or(0, |a| a.len()),
     ));
 
+    // The staleness stat (task #88, architecture section 4.5): serat-app stats each of
+    // the page's hits after R1 returns. Reported beside R1, no gate. One sample is the
+    // whole top-50 page; the per-hit figure is the page over its hit count.
+    {
+        let source = serat_vault::Vault::open(vault_root).map_err(|e| e.to_string())?;
+        let paths: Vec<serat_core::VaultPath> = match reader.search(&commonest, 0, 50) {
+            Ok(SearchOutcome::Hits(hits)) => hits
+                .iter()
+                .filter_map(|h| serat_core::VaultPath::new(&h.path).ok())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let page =
+            |source: &serat_vault::Vault| paths.iter().filter(|p| source.stat(p).is_ok()).count();
+        let mut samples = Samples::new();
+        let n = page(&source);
+        for _ in 0..iterations {
+            let started = Instant::now();
+            assert_eq!(page(&source), n);
+            samples.push(started.elapsed());
+        }
+        let per_hit_us = samples.percentile(0.5) * 1000.0 / n.max(1) as f64;
+        rows.push(Row {
+            name: format!(
+                "R1 staleness stat of {commonest:?} top-50 page (warm; {per_hit_us:.1} us per hit at p50; reported, no expectation)"
+            ),
+            samples,
+            rows: n,
+            expectation_ms: None,
+        });
+    }
+
     // R1 + R3: the commonest in-line term filtered by a property.
     let combined = format!("{commonest} {by_key}");
     rows.push(time(

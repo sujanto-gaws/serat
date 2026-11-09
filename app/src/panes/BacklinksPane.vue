@@ -57,6 +57,13 @@ const root = ref<HTMLElement | null>(null);
  */
 const roving = ref(false);
 
+/** "frontmatter: owner, reviewers" (keys in the order the read returns them); the bare word when the
+ * keys are absent or empty (a body link, an older index, an unattributable key: degraded, not an error). */
+function frontmatterLabel(entry: Backlink): string {
+  const keys = entry.frontmatter_keys;
+  return Array.isArray(keys) && keys.length > 0 ? `frontmatter: ${keys.join(", ")}` : "frontmatter";
+}
+
 function group(items: Backlink[]): Array<{ source: string; title: string; entries: Backlink[] }> {
   const order: string[] = [];
   const bySource = new Map<string, { source: string; title: string; entries: Backlink[] }>();
@@ -220,11 +227,10 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
             class="serat-backlink"
             tabindex="-1"
             :class="{ 'serat-backlink-focused': indexOfEntry(entry) === focusedIndex }"
-            :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
+            :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : frontmatterLabel(entry))"
             @click="onEntryClick(entry)"
           >
-            <!-- TODO(#79): the contract's Backlink carries no frontmatter field key yet; shows "frontmatter" only. -->
-            <span v-if="!entry.block" class="serat-backlink-frontmatter">frontmatter</span>
+            <span v-if="!entry.block" class="serat-backlink-frontmatter">{{ frontmatterLabel(entry) }}</span>
             <span v-else class="serat-backlink-excerpt"
               ><template v-for="(seg, k) in splitSnippet(entry.excerpt)" :key="k">{{ seg.text }}</template></span
             >

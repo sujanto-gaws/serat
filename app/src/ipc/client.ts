@@ -10,6 +10,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { assetUrl as buildAssetUrl } from "../editor/assetUrl";
 import type { AssetArgs } from "./generated/AssetArgs";
 import type { AssetInfo } from "./generated/AssetInfo";
 import type { ReadAssetRangeArgs } from "./generated/ReadAssetRangeArgs";
@@ -164,14 +165,7 @@ export function readAssetRange(args: ReadAssetRangeArgs): Promise<ArrayBuffer> {
  * this is the front end refusing to build a URL it knows will be rewritten.
  */
 export function assetUrl(path: string, windows: boolean): string {
-  const segments = path.split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
-    throw new Error(`not a vault-relative asset path: ${JSON.stringify(path)}`);
-  }
-  const encoded = segments.map(encodeURIComponent).join("/");
-  return windows
-    ? `http://serat-asset.localhost/${encoded}`
-    : `serat-asset://localhost/${encoded}`;
+  return buildAssetUrl(path, windows ? "windows" : "other"); // the one builder, also used by embeds and viewers
 }
 
 /**

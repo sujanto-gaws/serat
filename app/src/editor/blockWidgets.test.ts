@@ -139,6 +139,56 @@ describe("blockWidgetsField", () => {
     // widget, so identity catches it deterministically.
   });
 
+  it("a table's FIRST character (offset 0): leaving it brings the widget back, same count as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}`;
+    const s0 = makeState(doc, 0); // cursor on the first character: table 1 is revealed
+    expect(widgets(s0)).toHaveLength(1);
+    const away = doc.indexOf("mid");
+    const s1 = s0.update({ selection: { anchor: away } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, away)).length);
+    expect(widgets(s1)).toHaveLength(2);
+  });
+
+  it("the first character of a block in the middle of the note behaves the same", () => {
+    const doc = `intro\n\n${TABLE}\n\nmid\n\n${TABLE.replace("1", "7")}\n\nend`;
+    const first = doc.indexOf("| a |");
+    const s0 = makeState(doc, first);
+    expect(widgets(s0)).toHaveLength(1);
+    const s1 = s0.update({ selection: { anchor: doc.length } }).state;
+    expect(widgets(s1)).toHaveLength(widgets(makeState(doc, doc.length)).length);
+    expect(widgets(s1)).toHaveLength(2);
+    // And entering from elsewhere onto a first character reveals it.
+    const s2 = s1.update({ selection: { anchor: first } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+  });
+
+  it("a table's LAST character: leaving it brings the widget back, same as a fresh build", () => {
+    const doc = `${TABLE}\n\nmid paragraph\n\nend`;
+    const last = TABLE.length; // offset just past the final character, the block's end
+    for (const at of [last - 1, last]) {
+      const s0 = makeState(doc, at);
+      expect(widgets(s0)).toHaveLength(0);
+      const away = doc.indexOf("mid");
+      const s1 = s0.update({ selection: { anchor: away } }).state;
+      expect(widgets(s1)).toHaveLength(1);
+      expect(widgets(s1).map((w) => [w.from, w.to])).toEqual(widgets(makeState(doc, away)).map((w) => [w.from, w.to]));
+    }
+  });
+
+  it("property: from every cursor position, moving to 0, a middle paragraph or the end equals a fresh build (FR-EDT-02)", () => {
+    const t = (n: string) => TABLE.replace("1", n);
+    const doc = `${t("a")}\n\nfirst paragraph\n\n${t("b")}\n\n> [!note] Title\n> body line\n\nmiddle paragraph\n\n${t("c")}\n\nlast paragraph`;
+    const shape = (st: EditorState) => widgets(st).map((w) => [w.from, w.to]);
+    const targets = [0, doc.indexOf("middle paragraph") + 3, doc.length];
+    for (let from = 0; from <= doc.length; from += 1) {
+      const s0 = makeState(doc, from);
+      for (const to of targets) {
+        const s1 = s0.update({ selection: { anchor: to } }).state;
+        expect(shape(s1), `from ${from} to ${to}`).toEqual(shape(makeState(doc, to)));
+      }
+    }
+  });
+
   it("the examined watermark maps through edits and never moves back", () => {
     const doc = `intro\n\n${TABLE}\n\nend`;
     const s0 = makeState(doc, 0);
@@ -198,5 +248,103 @@ describe("blockWidgetsField", () => {
     const dom = (found.widget as { toDOM(): HTMLElement }).toDOM();
     expect(dom.querySelector("img")).toBeNull();
     expect(dom.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  // ---- range selections (task #102): dirty regions cover the whole range, not just its head ----
+
+  function makeRange(doc: string, anchor: number, head: number): EditorState {
+    const state = EditorState.create({
+      doc,
+      selection: { anchor, head },
+      extensions: [seratMarkdown(), blockWidgetsExtension()],
+    });
+    ensureSyntaxTree(state, state.doc.length, 5000);
+    return state.update({ selection: { anchor, head }, effects: setResolutions.of([]) }).state;
+  }
+  const shapeOf = (st: EditorState) => widgets(st).map((w) => [w.from, w.to]);
+
+  it("dragging a selection from a paragraph across a table reveals the table raw, equal to a fresh build", () => {
+    const doc = `intro paragraph\n\n${TABLE}\n\nend paragraph`;
+    const s0 = makeState(doc, 2);
+    expect(widgets(s0)).toHaveLength(1);
+    const head = doc.indexOf("end") + 2;
+    const s1 = s0.update({ selection: { anchor: 2, head } }).state;
+    expect(widgets(s1)).toHaveLength(0);
+    expect(shapeOf(s1)).toEqual(shapeOf(makeRange(doc, 2, head)));
+  });
+
+  it("collapsing the selection away brings the widget back", () => {
+    const doc = `intro paragraph\n\n${TABLE}\n\nend paragraph`;
+    const head = doc.indexOf("end") + 2;
+    const s1 = makeState(doc, 2).update({ selection: { anchor: 2, head } }).state;
+    const s2 = s1.update({ selection: { anchor: 2 } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+    expect(shapeOf(s2)).toEqual(shapeOf(makeState(doc, 2)));
+  });
+
+  it("select-all on a three-table note: zero widgets; collapse: all three back", () => {
+    const t = (n: string) => TABLE.replace("1", n);
+    const doc = `${t("a")}\n\nmid\n\n${t("b")}\n\nmid2\n\n${t("c")}\n\nend`;
+    const s0 = makeState(doc, doc.length);
+    expect(widgets(s0)).toHaveLength(3);
+    const all = s0.update({ selection: { anchor: 0, head: doc.length } }).state;
+    expect(widgets(all)).toHaveLength(0);
+    expect(shapeOf(all)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
+    const back = all.update({ selection: { anchor: doc.length } }).state;
+    expect(widgets(back)).toHaveLength(3);
+  });
+
+  it("collapsed-cursor moves do not walk the tree over a range (only the selection-sized path walks)", () => {
+    // The collapsed path takes touchedTopLevelBlocks only; assert by behaviour: a cursor move
+    // across a 50-table note equals a fresh build and reuses untouched widget objects.
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 50 }, (_, i) => `${t(i)}\n\np${i}`).join("\n\n");
+    const s0 = makeState(doc, doc.indexOf("p0"));
+    const before = widgets(s0);
+    const s1 = s0.update({ selection: { anchor: doc.indexOf("p1") } }).state;
+    const after = widgets(s1);
+    expect(shapeOf(s1)).toEqual(shapeOf(makeState(doc, doc.indexOf("p1"))));
+    expect(after.filter((w) => before.some((b) => b.widget === w.widget)).length).toBeGreaterThanOrEqual(48);
+  });
+
+  it("property: for every (anchor, head) pair in a small note the incremental decorations equal a fresh build", () => {
+    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+    const mid = doc.indexOf("p two") + 2;
+    // Start states hoisted: collapsed cursors, a range across the table, and a select-all.
+    const starts: Array<[number, number]> = [
+      [0, 0],
+      [mid, mid],
+      [doc.length, doc.length],
+      [2, mid],
+      [0, doc.length],
+    ];
+    const startStates = starts.map(([a, h]) => makeRange(doc, a, h));
+    const base = makeState(doc, 0);
+    const rebuild = setResolutions.of([]); // the effect forces a full buildAll: the fresh reference
+    // Every 8th position plus every block boundary (blank-line edges) and both ends.
+    const positions = new Set<number>([0, 1, doc.length - 1, doc.length]);
+    for (let i = 0; i <= doc.length; i += 8) positions.add(i);
+    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) [i, i + 2].forEach((p) => positions.has(p) || (p >= 0 && p <= doc.length && positions.add(p)));
+    for (const anchor of positions) {
+      for (const head of positions) {
+        const target = shapeOf(base.update({ selection: { anchor, head }, effects: rebuild }).state);
+        startStates.forEach((st, i) => {
+          const got = shapeOf(st.update({ selection: { anchor, head } }).state);
+          expect(got, `from ${starts[i]} to ${anchor}-${head}`).toEqual(target);
+        });
+      }
+    }
+  });
+
+  it("Shift-extending a select-all on a 5,000-line note equals a fresh build", () => {
+    // Informational: re-measured at ~0.5 ms, was ~20 ms with one replaceRegion per block.
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 700 }, (_, i) => `${t(i)}\n\npara ${i}\n\nmore text ${i}`).join("\n\n");
+    const all = makeRange(doc, 0, doc.length - 1);
+    const t0 = performance.now();
+    const next = all.update({ selection: { anchor: 0, head: doc.length } }).state;
+    const ms = performance.now() - t0;
+    console.log(`select-all extend by one char on ${doc.split("\n").length} lines: ${ms.toFixed(1)} ms`);
+    expect(shapeOf(next)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
   });
 });
