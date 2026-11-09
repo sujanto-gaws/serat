@@ -333,6 +333,8 @@ jobs:
   # `--no-deps`), so a failing control still skips the subject, and the summary says that.
   # The engine version is printed because a figure without one is not a figure (§9.3): a
   # new Chromium (a Playwright bump) re-baselines the controls before any subject figure counts.
+  # TODO once runners schedule (RISK-013): this 20-minute job needs only app/ and
+  # bench/editor-latency/, but `on:` is workflow-wide; split it out or gate it with a paths filter.
   editor-latency:
     name: "NFR-PRF-02 · editor keystroke-to-paint, headless Chromium (report only, not gate-eligible)"
     runs-on: ubuntu-latest
@@ -363,7 +365,12 @@ jobs:
           SERAT_BENCH_DIST: ../../app/dist-bench
           SERAT_SUBJECT_LABEL: "ci @ ${{ github.sha }}"
           SERAT_DUMP_DIR: out/dumps
+        # explicit bash: GitHub's default for a bare `run` is `bash -e` WITHOUT pipefail, so the
+        # step's status would be tee's and a red control, FAIL or INDETERMINATE would show green.
+        # (`--workers=1` repeats the config and changes nothing in rule E0.)
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p out/dumps
           npx playwright test --project=subject --workers=1 2>&1 | tee out/run.log
       - name: Summary (engine, positive-strict margin, subject verdicts)
@@ -371,12 +378,16 @@ jobs:
         working-directory: bench/editor-latency
         shell: bash
         run: |
+          if [ ! -f out/run.log ]; then
+            echo "### NFR-PRF-02 editor latency: the harness did not run (npm ci, build:bench or the Chromium install failed before the tests started)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           {
             echo "### NFR-PRF-02 editor latency: headless Chromium, REPORT ONLY (not gate-eligible, architecture 9.3)"
             echo
-            echo "Engine: $(grep -m1 '^engine:' out/run.log | cut -c1-70 || true)"
+            echo "Engine: $(grep -m1 '^engine:' out/run.log | cut -c1-150 || true)"
             echo
-            echo "Positive controls (bar >= 99% of 300 keys; strict at 99.0% is on the bar, and two more late keys reject the run: the architecture 9.3 margin to watch):"
+            echo "Positive controls (bar >= 99% of 300 keys; record 100% on 141, 99.7% on an earlier 153 run, 99.0% on the 2026-11-09 dry run, which is exactly the bar: one more late key rejects the run. The architecture 9.3 margin to watch):"
             echo '```'
             grep -E '^positive ' out/run.log | cut -c1-110 || true
             echo '```'

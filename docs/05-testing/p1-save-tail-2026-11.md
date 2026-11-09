@@ -4,7 +4,7 @@ Serves NFR-PRF-03 (save to index, 50 ms p95) · NFR-PRF-08 (budgets asserted) ·
 
 ## Verdict: NOT ATTESTED. These figures are diagnostic only.
 
-The instruction was to report `attested 0` or say it did not. **It did not, on either of two attempts.** Two other agents were building throughout (`concurrent_build_processes` is sampled from `/proc` by the harness itself). The second attempt waited for four consecutive quiet polls (about 17 minutes) before it started, and builds began again during the run. The pre-spacing 23.3 ms p95 (attested quiet) therefore has **no quiet post-spacing figure to compare with yet**; #62 stays open until a run prints `attested 0`.
+The instruction was to report `attested 0` or say it did not. **It did not, on either of two attempts.** Two other agents were building during both (`concurrent_build_processes` is sampled from `/proc` by the harness itself; builds were present in 87 of 102 samples in run 1 and 49 of 102 in run 2). The second attempt waited for four consecutive quiet polls (about 17 minutes) before it started, and builds began again during the run. The pre-spacing 23.3 ms p95 (attested quiet; cited in `docs/01-planning/status-p1-editor.md`, whose source report I did not find under `docs/05-testing/reports/`) therefore has **no quiet post-spacing figure to compare with yet**; #62 stays open until a run prints `attested 0`.
 
 Command, both runs: `p1-save-tail --vault 20k --iterations 1000 --gap-ms 1000` (release, 4 cores, linux, 1000 saves of `areas/Retention 2.md`, in-degree 679, warm-up 5, product checkpointer: idle 250 ms, size 4,000 frames, idle spacing 2 s).
 
