@@ -15,7 +15,14 @@ use std::path::{Path, PathBuf};
 /// - anything else is returned unchanged: plain `C:\x`, `\\srv\share\x`, POSIX
 ///   paths, `\\.\` device paths (left as-is, not refused: canonicalisation does
 ///   not yield them and rewriting would change their meaning) and other verbatim
-///   forms such as `\\?\Volume{..}\`, which have no plain spelling.
+///   forms such as `\\?\Volume{..}\`, which have no plain spelling. A bare
+///   `\\?\C:` or `\\?\C:foo` is also left alone: without a separator the plain form
+///   would be drive-relative, a different meaning.
+///
+/// Forward slashes are not separators inside verbatim paths, and `canonicalize`
+/// never emits them. The `Path` wrapper goes through `to_string_lossy`; once
+/// Windows CI exists, a `cfg(windows)` body over `Path::components()` is the
+/// lossless option.
 #[must_use]
 pub fn strip_verbatim_str(text: &str) -> String {
     let Some(rest) = text.strip_prefix(r"\\?\") else {
@@ -27,7 +34,7 @@ pub fn strip_verbatim_str(text: &str) -> String {
         return format!(r"\\{}", &rest[4..]);
     }
     let bytes = rest.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
         return rest.to_owned();
     }
     text.to_owned()
@@ -61,6 +68,12 @@ mod tests {
     fn trailing_separator_kept() {
         assert_eq!(strip_verbatim_str(r"\\?\C:\"), r"C:\");
         assert_eq!(strip_verbatim_str(r"\\?\UNC\srv\share\"), r"\\srv\share\");
+    }
+
+    #[test]
+    fn bare_drive_is_not_made_drive_relative() {
+        assert_eq!(strip_verbatim_str(r"\\?\C:"), r"\\?\C:");
+        assert_eq!(strip_verbatim_str(r"\\?\C:foo"), r"\\?\C:foo");
     }
 
     #[test]
