@@ -74,12 +74,11 @@ fn a_close_landing_during_a_passive_still_sets_the_marker_and_joins_the_checkpoi
         // Joined before the marker was written: nothing is running now, and nothing
         // runs later.
         assert!(!health.checkpoint_in_progress());
-        let runs = health.stats().passive_runs;
-        std::thread::sleep(Duration::from_millis(20));
+        // The thread owns a clone of `health`; once joined, only ours is left.
         assert_eq!(
-            health.stats().passive_runs,
-            runs,
-            "the thread outlived close"
+            std::sync::Arc::strong_count(&health),
+            1,
+            "the checkpointer thread outlived close"
         );
         if overlaps >= 8 {
             break;

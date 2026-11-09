@@ -56,7 +56,8 @@ refused_names?: number,
  * `RESTART` at idle, and, if that fails, leaves this fact in place until a
  * checkpoint completes: there is no further `RESTART`, while a `PASSIVE`
  * keeps retrying every 2 s as long as there are new frames. The status is
- * re-emitted when the fact appears or clears, not as the size moves. The index still works; only disk use is affected.
+ * re-emitted when the fact appears or clears, not as the size moves. The
+ * index still works; only disk use is affected.
  * `None` (absent on the wire) means the WAL is not pinned, or no vault is open.
  * It is a fact about a defect, so it is never `Some(0)`.
  */

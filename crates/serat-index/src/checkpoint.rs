@@ -444,11 +444,15 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
             Some(Msg::Commit { frames }) => {
                 state.last_commit = Instant::now();
                 state.dirty = true;
-                state.frames = frames;
                 if frames < state.base {
                     // The writer reset the WAL; count growth from its start again.
                     state.base = 0;
                 }
+                if frames < state.frames {
+                    // SQLite's backfilled-frame count restarts from zero with the WAL.
+                    state.prev_done = 0;
+                }
+                state.frames = frames;
                 if frames - state.base >= bounds.size_frames {
                     attempt(conn, &mut state, bounds, health, wal, false);
                 }
@@ -846,7 +850,11 @@ mod tests {
             "two idle checkpoints {} us apart; spacing is {spacing:?}",
             after.idle_min_gap_micros
         );
-        assert!(after.frames_checkpointed > 0);
+        assert!(
+            after.frames_checkpointed >= i as u64,
+            "{} frames checkpointed for {i} saves",
+            after.frames_checkpointed
+        );
         actor.shutdown().expect("shutdown");
         drop(dir);
     }

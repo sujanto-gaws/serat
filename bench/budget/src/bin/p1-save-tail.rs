@@ -821,7 +821,7 @@ fn report(
             pinned.map_or("no".to_owned(), |b| format!("{b} B")),
             stats.passive_runs as f64 / (secs / 60.0).max(f64::EPSILON),
             stats.frames_checkpointed as f64 / stats.passive_runs.max(1) as f64,
-            serat_index::checkpoint::IDLE_SPACING.as_secs(),
+            serat_index::Bounds::default().idle_spacing.as_secs(),
         );
     }
     if a.bare {
