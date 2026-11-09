@@ -156,6 +156,40 @@ describe("ViewerHost states (binary-viewers.md)", () => {
     vi.useRealTimers();
   });
 
+  it("the etag goes to the loader; after asset_changed a SAME-SIZE rewrite restarts with the NEW etag and the notice", async () => {
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000, etag: "E1" }));
+    const loads: Array<{ etag: string | undefined; changed: () => void }> = [];
+    const loader = vi.fn(async (_p: string, _l: number, hooks: { onChanged: () => void }, _s?: AbortSignal, etag?: string) => {
+      loads.push({ etag, changed: hooks.onChanged });
+      return { numPages: 3, pageSize: async () => ({ width: 1, height: 1 }), render: async () => {}, destroy: () => {} };
+    });
+    const w = mount(ViewerHost, { props: { path: "d/x.pdf", pdfLoader: loader } });
+    await flushPromises();
+    expect(loads[0].etag).toBe("E1");
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000, etag: "E2" })); // same size
+    loads[0].changed();
+    await flushPromises();
+    expect(loads).toHaveLength(2);
+    expect(loads[1].etag).toBe("E2");
+    expect(w.find('[data-testid="viewer-error"]').exists()).toBe(false);
+    expect(w.find('[data-testid="viewer-changed"]').exists()).toBe(true);
+  });
+
+  it("a restart whose etag is unchanged is the error state, not another load", async () => {
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000, etag: "E1" }));
+    const loads: Array<() => void> = [];
+    const loader = vi.fn(async (_p: string, _l: number, hooks: { onChanged: () => void }) => {
+      loads.push(hooks.onChanged);
+      return new Promise<PdfDocumentHandle>(() => {});
+    });
+    const w = mount(ViewerHost, { props: { path: "d/x.pdf", pdfLoader: loader } });
+    await flushPromises();
+    loads[0]();
+    await flushPromises();
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(w.find('[data-testid="viewer-error"]').exists()).toBe(true);
+  });
+
   it("a restart whose asset_info shows the same size is the error state, not another load", async () => {
     assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000 }));
     const loads: Array<() => void> = [];
@@ -282,7 +316,7 @@ describe("PdfViewer", () => {
     const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 123456, name: "c.pdf", loader } });
     expect(w.find('[data-testid="pdf-loading"]').exists()).toBe(true);
     await flushPromises();
-    expect(loader).toHaveBeenCalledWith("d/c.pdf", 123456, expect.objectContaining({ onChanged: expect.any(Function), onFailed: expect.any(Function) }), expect.anything());
+    expect(loader).toHaveBeenCalledWith("d/c.pdf", 123456, expect.objectContaining({ onChanged: expect.any(Function), onFailed: expect.any(Function) }), expect.anything(), undefined);
     expect(w.get('[data-testid="pdf-count"]').text()).toBe("of 18");
     const field = w.get('[data-testid="pdf-page"]');
     await field.setValue("4");
