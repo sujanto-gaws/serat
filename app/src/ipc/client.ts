@@ -10,6 +10,9 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { AssetArgs } from "./generated/AssetArgs";
+import type { AssetInfo } from "./generated/AssetInfo";
+import type { ReadAssetRangeArgs } from "./generated/ReadAssetRangeArgs";
 import type { Backlink } from "./generated/Backlink";
 import type { ExternalChange } from "./generated/ExternalChange";
 import type { IndexChanged } from "./generated/IndexChanged";
@@ -131,6 +134,39 @@ export function appendGitignoreEntry(): Promise<GitignoreAppended> {
 /** `decline_gitignore_offer`: "Don't ask again", kept in `.serat/prefs.json`. */
 export function declineGitignoreOffer(): Promise<void> {
   return invoke("decline_gitignore_offer");
+}
+
+/** `asset_info`: MIME, size and sidecar of a vault file (FR-BIN-01; ADR-0017). */
+export function assetInfo(args: AssetArgs): Promise<AssetInfo> {
+  return invoke("asset_info", { args });
+}
+
+/**
+ * `read_asset_range`: ADR-0017 fallback only, for a webview that will not deliver a
+ * custom-scheme 206. Raw bytes (an `ArrayBuffer`), at most 1,000 KiB per call.
+ */
+export function readAssetRange(args: ReadAssetRangeArgs): Promise<ArrayBuffer> {
+  return invoke("read_asset_range", { args });
+}
+
+/**
+ * URL of the `serat-asset` scheme for a vault path; the bytes path is not a command.
+ *
+ * `.`, `..` and empty segments are refused rather than encoded: `encodeURIComponent`
+ * leaves dots alone, and a URL parser collapses `a/../b` (and `%2e%2e`) before the
+ * handler ever sees the request, so such a path could never name the file asked for.
+ * The native handler decodes exactly once and re-validates (ADR-0017 steps 3-4);
+ * this is the front end refusing to build a URL it knows will be rewritten.
+ */
+export function assetUrl(path: string, windows: boolean): string {
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`not a vault-relative asset path: ${JSON.stringify(path)}`);
+  }
+  const encoded = segments.map(encodeURIComponent).join("/");
+  return windows
+    ? `http://serat-asset.localhost/${encoded}`
+    : `serat-asset://localhost/${encoded}`;
 }
 
 /**

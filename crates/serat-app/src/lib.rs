@@ -50,6 +50,7 @@ use serde::Serialize;
 use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 
 mod acl_manifest;
+mod asset;
 pub mod cli;
 pub mod commands;
 pub mod consumer;
@@ -326,7 +327,23 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::save_patch,
             commands::request_external_diff,
             commands::rebase_buffer,
+            commands::asset_info,
+            commands::read_asset_range,
         ])
+        // ADR-0017: the one read-only path vault bytes take into the webview.
+        // Runs on the blocking pool (never the main thread, design goal 2); the
+        // handler is asset::serve, which applies steps 1-10 in order.
+        .register_asynchronous_uri_scheme_protocol(
+            ipc::ASSET_SCHEME,
+            |context, request, responder| {
+                use tauri::Manager as _;
+                let state = Arc::clone(&*context.app_handle().state::<Arc<AppState>>());
+                tauri::async_runtime::spawn_blocking(move || {
+                    let reply = state.serve_asset(nav_guard::Platform::current(), &request);
+                    responder.respond(reply.into_http());
+                });
+            },
+        )
         .setup(move |app| {
             state.startup.mark_runtime_ready();
             let handle = app.handle().clone();
@@ -440,6 +457,11 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 WebviewUrl::App("index.html".into()),
             )
             .title("Serat")
+            // ADR-0017: pinned, not defaulted. On Windows the app origin is
+            // `http://tauri.localhost` and the asset page URL is
+            // `http://serat-asset.localhost`; `app_origin()` and the CSP hard-code
+            // `http://`, so the `https` form must never be selected.
+            .use_https_scheme(false)
             .inner_size(geometry.0, geometry.1)
             .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
             // T-09, ADR-0017's correction (task #36): the only control

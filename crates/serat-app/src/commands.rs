@@ -16,11 +16,12 @@ use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::ipc::{
-    Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
-    GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError, MarkTreeArgs,
-    NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadFileArgs, RebaseBufferArgs,
-    RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
-    SwitcherQueryArgs, SwitcherResults, TreeMessage, UiSettings, VaultOpened, WriteFileArgs,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError,
+    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
+    ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome,
+    SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage,
+    UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
@@ -371,4 +372,48 @@ pub fn mark_vault_usable(state: State<'_, Arc<AppState>>, note: Option<String>) 
         eprintln!("serat: settings not saved: {problem}");
     }
     state.startup.elapsed_ms()
+}
+
+/// Runs `work` on the blocking pool. A sync `#[tauri::command]` runs on the main
+/// thread, which is for UI and nothing else (design goal 2); these file reads and
+/// writes never belong there.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: err.to_string(),
+        })?
+}
+
+/// `asset_info(args) -> Result<AssetInfo, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::asset_info`].
+#[tauri::command]
+pub async fn asset_info(
+    state: State<'_, Arc<AppState>>,
+    args: AssetArgs,
+) -> Result<AssetInfo, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.asset_info(args)).await
+}
+
+/// `read_asset_range(args) -> Result<ArrayBuffer, IpcError>`: raw bytes, not JSON.
+///
+/// # Errors
+///
+/// As [`AppState::read_asset_range`].
+#[tauri::command]
+pub async fn read_asset_range(
+    state: State<'_, Arc<AppState>>,
+    args: ReadAssetRangeArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.read_asset_range(args))
+        .await
+        .map(tauri::ipc::Response::new)
 }

@@ -35,12 +35,13 @@ use crate::index::{
     index_dir_for,
 };
 use crate::ipc::{
-    Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten, FolderCreated,
-    GitignoreAppended, GitignoreOffer, IndexChanged, IndexRead, IndexState, IndexStatus, IpcError,
-    KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs, NotePathArgs,
-    OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadFileArgs, RebaseBufferArgs, RefusedName,
-    SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs,
-    SwitcherQueryArgs, SwitcherResults, TreeStatus, UiSettings, VaultOpened, WriteFileArgs,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexChanged, IndexRead, IndexState,
+    IndexStatus, IpcError, KeybindingChange, KeybindingOverride, MarkTreeArgs, NoteBufferArgs,
+    NotePathArgs, OpenVaultArgs, Patch, REFUSED_NAMES_CAP, ReadAssetRangeArgs, ReadFileArgs,
+    RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs,
+    SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeStatus, UiSettings, VaultOpened,
+    WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -354,6 +355,9 @@ pub struct AppState {
     save_handle_missing: AtomicU64,
     save_writer_refused: AtomicU64,
     save_submitted: AtomicU64,
+    /// ADR-0017: bytes the `serat-asset` handler and `read_asset_range` may hold in
+    /// flight at once, across every concurrent request.
+    asset_budget: crate::asset::ByteBudget,
 }
 
 impl std::fmt::Debug for AppState {
@@ -387,6 +391,7 @@ impl AppState {
             save_handle_missing: AtomicU64::new(0),
             save_writer_refused: AtomicU64::new(0),
             save_submitted: AtomicU64::new(0),
+            asset_budget: crate::asset::ByteBudget::new(crate::asset::IN_FLIGHT_BYTES),
         };
         (state, loaded.problem)
     }
@@ -408,6 +413,7 @@ impl AppState {
             save_handle_missing: AtomicU64::new(0),
             save_writer_refused: AtomicU64::new(0),
             save_submitted: AtomicU64::new(0),
+            asset_budget: crate::asset::ByteBudget::new(crate::asset::IN_FLIGHT_BYTES),
         }
     }
 
@@ -789,6 +795,42 @@ impl AppState {
             mtime_ms: loaded.meta.mtime_ms,
             bytes: loaded.meta.size,
         })
+    }
+
+    /// `asset_info`. FR-BIN-01, FR-BIN-11, FR-BIN-12. A vault operation, not an
+    /// index read: it works before the index is `Ready`.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PathEscapesVault`] for a spelling `VaultPath` refuses,
+    /// [`IpcError::VaultNotFound`] with no vault open, [`IpcError::NotFound`] for
+    /// everything else (a refusal carries no detail).
+    pub fn asset_info(&self, args: AssetArgs) -> Result<AssetInfo, IpcError> {
+        let path = Self::vault_path(&args.path)?;
+        let vault = self.vault()?;
+        crate::asset::info(&vault, &path)
+    }
+
+    /// `read_asset_range`, ADR-0017 section Fallback. Raw bytes, at most 1,000 KiB.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::asset_info`], plus [`IpcError::Io`] if the read fails.
+    pub fn read_asset_range(&self, args: ReadAssetRangeArgs) -> Result<Vec<u8>, IpcError> {
+        let path = Self::vault_path(&args.path)?;
+        let vault = self.vault()?;
+        crate::asset::read_range(&vault, &self.asset_budget, &path, args.start, args.len)
+    }
+
+    /// The `serat-asset` scheme's entry point: the open vault, if any, answered
+    /// by [`crate::asset::handle`]. No vault open is a 404, never a panic.
+    pub(crate) fn serve_asset(
+        &self,
+        platform: crate::nav_guard::Platform,
+        request: &tauri::http::Request<Vec<u8>>,
+    ) -> crate::asset::Reply {
+        let vault = self.vault().ok();
+        crate::asset::handle(vault.as_deref(), &self.asset_budget, platform, request)
     }
 
     /// `write_file`. FR-VLT-02, FR-VLT-03.

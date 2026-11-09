@@ -67,6 +67,15 @@ pub(crate) enum Platform {
 }
 
 impl Platform {
+    /// The app's own origin as the webview reports it in an `Origin` header
+    /// (ADR-0017 step 8: the one value `Access-Control-Allow-Origin` may carry).
+    pub(crate) const fn app_origin(self) -> &'static str {
+        match self {
+            Self::Windows => "http://tauri.localhost",
+            Self::Other => "tauri://localhost",
+        }
+    }
+
     pub(crate) const fn current() -> Self {
         if cfg!(windows) {
             Self::Windows

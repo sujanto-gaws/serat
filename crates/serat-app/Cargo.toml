@@ -46,6 +46,7 @@ dirs = "6.0.0"
 # exactly http/https/mailto in capabilities/default.json -- narrower than the
 # plugin's own `default` permission set, which also grants `tel:` -- task #37.
 tauri-plugin-opener = "2.5.5"
+filepath = "0.2.0"
 
 # Task #37: WebKitGTK's own `context-menu` signal is how the default
 # right-click menu is cancelled in release builds (nav_guard.rs); Tauri's
@@ -55,6 +56,11 @@ tauri-plugin-opener = "2.5.5"
 # (nav_guard.rs's doc comment) -- so there is nothing to add here for them.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 webkit2gtk = "2.0.2"
+
+# ADR-0017 step 7: opening a vault file for the scheme needs O_NONBLOCK|O_NOFOLLOW
+# (constants only; the workspace forbids unsafe_code).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

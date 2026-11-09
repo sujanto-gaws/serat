@@ -101,7 +101,9 @@ mod tests {
              going red"
         );
         assert!(
-            directives.contains(&"connect-src ipc: http://ipc.localhost"),
+            directives.contains(
+                &"connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost"
+            ),
             "tauri.conf.json's CSP no longer pins connect-src to the canonical narrow \
              value (was {csp:?}) — task #117 / F-423(c): with no connect-src directive \
              the value fell back to default-src 'self', which blocks the event|listen \
@@ -115,6 +117,19 @@ mod tests {
              enforcement silently; confirmed with vue-frontend-dev that nothing in \
              app/src makes any other network-shaped call (F-423(c), #117)."
         );
+        assert!(
+            directives.contains(&"img-src 'self' serat-asset: http://serat-asset.localhost"),
+            "tauri.conf.json's CSP img-src is not exactly 'self' plus the two serat-asset \
+             origins (was {csp:?}) -- ADR-0017: the only CSP widening task #19 makes. No \
+             remote origin, no data:, no blob: (section 9.3 drops data: URLs)"
+        );
+        for forbidden in ["data:", "blob:", "'unsafe-eval'", "'unsafe-inline'", "*"] {
+            assert!(
+                !csp.split_whitespace().any(|token| token == forbidden),
+                "tauri.conf.json's CSP contains {forbidden:?} (was {csp:?}) -- ADR-0017 \
+                 allows no data:, blob:, wildcard or unsafe-* source in the app CSP"
+            );
+        }
         assert!(
             directives.contains(&"frame-src 'none'"),
             "tauri.conf.json's CSP no longer pins frame-src to 'none' (was {csp:?}) — \
@@ -167,6 +182,7 @@ mod tests {
             "allow-set-keybinding",
             "allow-set-live-preview",
             "allow-create-folder",
+            "allow-asset-info",
             "allow-index-status",
             "allow-mark-first-paint",
             "allow-mark-tree",
@@ -174,6 +190,7 @@ mod tests {
             "allow-note-closed",
             "allow-note-opened",
             "allow-open-tree",
+            "allow-read-asset-range",
             "allow-read-file",
             "allow-rebase-buffer",
             "allow-refused-names",
@@ -239,6 +256,23 @@ mod tests {
             "opener:allow-open-url's scope is {urls:?}, expected exactly {expected:?} — \
              in particular this must never include \"tel:*\", which the plugin's own \
              default permission set grants and Serat does not want"
+        );
+    }
+
+    #[test]
+    fn the_main_window_pins_the_http_custom_protocol_scheme() {
+        // ADR-0017: `app_origin()` and the asset CSP hard-code `http://tauri.localhost`
+        // and `http://serat-asset.localhost`. A builder that left the Windows scheme
+        // at Tauri's default (or chose https) would make every CORS origin check
+        // compare against the wrong string, so the choice is explicit and pinned.
+        const LIB_RS: &str = include_str!("lib.rs");
+        assert!(
+            LIB_RS.contains(".use_https_scheme(false)"),
+            "lib.rs must call .use_https_scheme(false) on the main WebviewWindowBuilder"
+        );
+        assert!(
+            !LIB_RS.contains("use_https_scheme(true)"),
+            "use_https_scheme(true) would move the Windows origin to https://"
         );
     }
 

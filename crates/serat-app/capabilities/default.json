@@ -28,6 +28,8 @@
     "allow-save-patch",
     "allow-request-external-diff",
     "allow-rebase-buffer",
+    "allow-asset-info",
+    "allow-read-asset-range",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

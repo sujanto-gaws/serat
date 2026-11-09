@@ -52,6 +52,8 @@ fn main() {
             "save_patch",
             "request_external_diff",
             "rebase_buffer",
+            "asset_info",
+            "read_asset_range",
         ]),
     ))
     .expect(

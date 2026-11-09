@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { assetUrl } from "./client";
+
 /**
  * The IPC surface against the ACL that admits it (#125, F-467, ADR-0012).
  *
@@ -99,5 +101,27 @@ describe("the IPC client stays inside ADR-0012's grant", () => {
     // The specific instance F-467 filed, pinned so it cannot come back quietly as a
     // wrapper: the note above the wrappers may discuss it, an invoke may not.
     expect(clientSource).not.toMatch(/invoke\(\s*"open_vault"/);
+  });
+
+  it("wraps both asset commands (FR-BIN-01, ADR-0017) and both are granted", () => {
+    expect(invokedCommands()).toEqual(expect.arrayContaining(["asset_info", "read_asset_range"]));
+    expect(grantedCommands()).toEqual(expect.arrayContaining(["asset_info", "read_asset_range"]));
+  });
+});
+
+describe("assetUrl (ADR-0017 steps 3-4: one decode, no collapsible segments)", () => {
+  it("encodes reserved and non-ASCII characters per segment, both spellings", () => {
+    expect(assetUrl("a b/100%/q?x#y\\z/caf\u00e9.png", false)).toBe(
+      "serat-asset://localhost/a%20b/100%25/q%3Fx%23y%5Cz/caf%C3%A9.png",
+    );
+    expect(assetUrl("img/a.png", true)).toBe("http://serat-asset.localhost/img/a.png");
+  });
+
+  it("refuses dot, dot-dot and empty segments, which a URL parser would collapse", () => {
+    for (const path of ["../a.png", "a/../b.png", "a/./b.png", "a//b.png", "/a.png", "a/.."]) {
+      expect(() => assetUrl(path, false), path).toThrow();
+      expect(() => assetUrl(path, true), path).toThrow();
+    }
+    expect(assetUrl("..a/b..png", false)).toBe("serat-asset://localhost/..a/b..png");
   });
 });
