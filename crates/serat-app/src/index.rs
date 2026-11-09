@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ipc::{IndexState, IndexStatus, RebuildReason};
+use crate::ipc::{IndexState, IndexStatus, REFUSED_NAMES_CAP, RebuildReason};
 use crate::startup::Startup;
 
 /// Minimum gap between two `index://status` emissions that do not change the kind of
@@ -69,6 +69,13 @@ pub struct StatusPublisher<S> {
     throttle: Duration,
     inner: Mutex<Published>,
     observer: Mutex<Option<Observer>>,
+    /// The open vault's refusal log, when this publisher belongs to one. Read at the
+    /// moment a status is built, so the count is never older than the poll or the
+    /// emission that carries it.
+    refusals: Option<serat_vault::RefusalLog>,
+    /// The checkpointer's facts, once the vault's `IndexHandle` exists (task #56). Set
+    /// by [`IndexActor::spawn`]'s thread; read, as atomics, whenever a status is built.
+    wal: Mutex<Option<Arc<serat_index::WalHealth>>>,
 }
 
 #[derive(Debug)]
@@ -132,7 +139,49 @@ impl<S: StatusSink> StatusPublisher<S> {
                 last_emit: None,
             }),
             observer: Mutex::new(None),
+            refusals: None,
+            wal: Mutex::new(None),
         }
+    }
+
+    /// Count the names `refusals` holds into every status this publisher builds
+    /// (`IndexStatus::refused_names`, FR-VLT-01, task #34).
+    ///
+    /// Without it `refused_names` is `None`, which the contract defines as "not
+    /// counting" -- the right answer for a publisher with no vault behind it.
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: serat_vault::RefusalLog) -> Self {
+        self.refusals = Some(refusals);
+        self
+    }
+
+    /// Carry the checkpointer's pinned-WAL fact into every status this publisher builds
+    /// (`IndexStatus::wal_pinned_bytes`, task #56), and re-emit the status whenever the
+    /// fact appears, changes or clears, because it is not part of the state and would
+    /// otherwise reach a listening front end only with the next state change.
+    ///
+    /// The callback holds the publisher weakly: the health is owned by the index handle,
+    /// and a reference back would make a cycle.
+    pub fn watch_wal(self: &Arc<Self>, health: Arc<serat_index::WalHealth>) {
+        let weak = Arc::downgrade(self);
+        health.on_change(move || {
+            if let Some(publisher) = weak.upgrade() {
+                publisher.re_emit();
+            }
+        });
+        *self
+            .wal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(health);
+    }
+
+    /// The pinned-WAL size, if the checkpointer reports one. Atomics only.
+    fn wal_pinned_bytes(&self) -> Option<u64> {
+        self.wal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|health| health.pinned_bytes())
     }
 
     /// Watch every published state, including the ones the throttle swallows.
@@ -156,13 +205,41 @@ impl<S: StatusSink> StatusPublisher<S> {
             vault_id: self.vault_id.clone(),
             state: inner.state.clone(),
             since_process_start_ms: inner.since_process_start_ms,
+            refused_names: self.refused_count(),
+            wal_pinned_bytes: self.wal_pinned_bytes(),
         }
+    }
+
+    /// `RefusalLog::len()`, saturating at [`REFUSED_NAMES_CAP`]; `None` with no log.
+    ///
+    /// `len()` is the count of distinct stored paths and the length of the
+    /// `refused_names` list. It is deliberately not added to `overflowed()`, which
+    /// counts refusal *events* past the cap (a path refused twice counts twice) and
+    /// would overstate the number of names. The log already stops storing at the
+    /// same cap, so the `min` is a belt over braces: the contract's "saturates at
+    /// 1000" holds even if the log's bound is later raised.
+    fn refused_count(&self) -> Option<u32> {
+        self.refusals.as_ref().map(|log| {
+            u32::try_from(log.len())
+                .unwrap_or(REFUSED_NAMES_CAP)
+                .min(REFUSED_NAMES_CAP)
+        })
     }
 
     /// The vault this publisher belongs to.
     #[must_use]
     pub fn vault_id(&self) -> &str {
         &self.vault_id
+    }
+
+    /// Emit the current state again, unthrottled, so a fact that is not part of the
+    /// state -- the refused-name count, which the walk changes while the state stays
+    /// `Ready` -- reaches a front end that only listens (invalidation, not proof:
+    /// `index_status()` is still what establishes it).
+    pub fn re_emit(&self) {
+        let status = self.status();
+        self.lock().last_emit = Some(Instant::now());
+        self.sink.emit(&status);
     }
 
     /// Publish a new state.
@@ -206,6 +283,8 @@ impl<S: StatusSink> StatusPublisher<S> {
                 vault_id: self.vault_id.clone(),
                 state: inner.state.clone(),
                 since_process_start_ms: inner.since_process_start_ms,
+                refused_names: self.refused_count(),
+                wal_pinned_bytes: self.wal_pinned_bytes(),
             }
         };
 
@@ -287,6 +366,13 @@ pub trait IndexOpen: Send + 'static {
 /// (FR-VLT-04) instead of NFR-PRF-03's, because nothing recorded an echo for it —
 /// design goal 5, applied to a race rather than to a missing capability.
 pub type IndexHandleSlot = std::sync::Arc<Mutex<Option<serat_index::IndexHandle>>>;
+
+/// App-owned identity of the index database a vault currently has: bumped by
+/// [`IndexActor::spawn`]'s thread each time it puts a new handle in the
+/// [`IndexHandleSlot`]. [`crate::reads::SearchSlot`] keys its connection on it, because
+/// file metadata is not an identity (NTFS tunnelling lets a recreated `index.db`
+/// inherit the old creation time).
+pub type HandleEpoch = Arc<std::sync::atomic::AtomicU64>;
 
 /// The real open check, wired to the vault and the production parser.
 ///
@@ -456,6 +542,8 @@ impl IndexActor {
     /// what the thread does next — which is the first row of §3.4's table, expressed as
     /// code rather than as a comment.
     ///
+    /// `epoch` is bumped whenever the slot receives a handle (see [`HandleEpoch`]).
+    ///
     /// Also returns an [`IndexHandleSlot`], empty until `opener` finishes and
     /// [`IndexOpen::into_handle`] fills it (task #89). The caller polls it rather than
     /// waiting on it, for the same reason the caller does not wait on this thread at
@@ -504,6 +592,7 @@ impl IndexActor {
         mut opener: O,
         vault_root: PathBuf,
         index_dir: PathBuf,
+        epoch: HandleEpoch,
     ) -> std::io::Result<(Self, IndexHandleSlot)> {
         let slot: IndexHandleSlot = Arc::new(Mutex::new(None));
         let slot_for_thread = Arc::clone(&slot);
@@ -526,9 +615,13 @@ impl IndexActor {
                     }
                 });
                 if let Some(index_handle) = opener.into_handle() {
+                    // The checkpointer lives with this handle (stopped when the slot's
+                    // handle is dropped on vault close); the status carries its fact.
+                    publisher.watch_wal(index_handle.wal_health());
                     *slot_for_thread
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index_handle);
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 if let Some(state) = terminal.borrow_mut().take() {
                     publisher.publish(state);
@@ -596,6 +689,37 @@ mod tests {
             total: 20_200,
             walk_complete: true,
         }
+    }
+
+    #[test]
+    fn the_pinned_wal_fact_rides_on_the_status_and_is_re_emitted_when_it_changes() {
+        // Task #56. The fact is not part of the state, so a listening front end gets it
+        // only if the change itself emits; and a poll reads it without SQLite.
+        let (publisher, recorder) = publisher(Duration::from_secs(60));
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+
+        let health = Arc::new(serat_index::WalHealth::default());
+        publisher.watch_wal(Arc::clone(&health));
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+        assert!(recorder.taken().is_empty());
+
+        health.set_pinned_for_test(Some(70 * 1024 * 1024));
+        assert_eq!(publisher.status().wal_pinned_bytes, Some(70 * 1024 * 1024));
+        let seen = recorder.taken();
+        assert_eq!(seen.len(), 1, "the change did not emit: {seen:?}");
+        assert_eq!(seen[0].wal_pinned_bytes, Some(70 * 1024 * 1024));
+
+        // Unchanged is not a change; clearing is.
+        health.set_pinned_for_test(Some(70 * 1024 * 1024));
+        assert_eq!(recorder.taken().len(), 1);
+        // A size that only moves is carried by the next poll, not emitted.
+        health.set_pinned_for_test(Some(80 * 1024 * 1024));
+        assert_eq!(recorder.taken().len(), 1);
+        assert_eq!(publisher.status().wal_pinned_bytes, Some(80 * 1024 * 1024));
+        health.set_pinned_for_test(None);
+        assert_eq!(publisher.status().wal_pinned_bytes, None);
+        assert_eq!(recorder.taken().len(), 2);
+        assert_eq!(recorder.taken()[1].wal_pinned_bytes, None);
     }
 
     #[test]
@@ -730,6 +854,7 @@ mod tests {
             SlowRebuild,
             PathBuf::from("."),
             PathBuf::from("./.serat"),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         let spawn_cost = started.elapsed();
@@ -782,6 +907,7 @@ mod tests {
             SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();
@@ -818,6 +944,7 @@ mod tests {
             SeratIndexOpen::default(),
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();
@@ -918,6 +1045,7 @@ mod tests {
             },
             root.clone(),
             index_dir_for(&root),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         slot_cell.set(Arc::clone(&slot)).expect("shared once");
@@ -1027,6 +1155,7 @@ mod tests {
             FailsWithNoHandle,
             PathBuf::from("."),
             PathBuf::from("./.serat"),
+            HandleEpoch::default(),
         )
         .expect("spawn");
         actor.join();

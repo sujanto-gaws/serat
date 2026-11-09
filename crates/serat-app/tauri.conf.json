@@ -10,7 +10,7 @@
     "withGlobalTauri": false,
     "windows": [],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' serat-asset: http://serat-asset.localhost; connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost; frame-src 'none'; object-src 'none'"
     }
   },
   "bundle": {

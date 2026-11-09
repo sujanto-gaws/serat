@@ -336,14 +336,54 @@ pub fn judge(citations: &[Citation], exists: impl Fn(&str) -> bool) -> Report {
     }
 }
 
-/// Repository root, resolved at compile time from this crate's location.
+pub use reporoot::{ROOT_ENV, Resolved, Rule};
+
+/// Where this crate was built from. A fallback only: it is the wrong answer
+/// whenever the binary is reused from another checkout.
+fn compiled_root() -> PathBuf {
+    reporoot::compiled_root(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Repository root and the rule that chose it, resolved **at run time** (tasks
+/// #45, #54). The rules and their precedence live in the `reporoot` crate, shared
+/// with `budget` and `vaultgen`: `--root`, `SERAT_REPO_ROOT`, a `[workspace]`
+/// manifest above the working directory, the compiled-in location.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn resolve_repo_root() -> Result<Resolved, String> {
+    reporoot::from_process(&compiled_root())
+}
+
+/// The pure form, so each rule is testable without touching process state.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn resolve_root(
+    args: &[String],
+    env: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<Resolved, String> {
+    reporoot::resolve_root(args, env, cwd, &compiled_root())
+}
+
+/// What every bin starts with: resolve the root and print `root: <path> (from
+/// <rule>)` as the first line of the report, so a run that fell back to the
+/// compiled-in checkout says so instead of silently reading the builder's tree.
+///
+/// # Errors
+/// A `--root` with no value.
+pub fn announce_root() -> Result<PathBuf, String> {
+    let r = resolve_repo_root()?;
+    println!("{}", r.report_line());
+    Ok(r.path)
+}
+
+/// Root for the in-crate tests, which read the real tree. A bad `--root` cannot
+/// reach them: the test harness does not take one.
 #[must_use]
 pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    resolve_repo_root().map_or_else(|_| compiled_root(), |r| r.path)
 }
 
 /// Every markdown file the check scans: `docs/03-design/**.md` and

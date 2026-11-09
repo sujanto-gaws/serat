@@ -22,23 +22,33 @@
 pub mod block;
 pub mod error;
 pub mod field;
+pub mod fold;
 pub mod hash;
 pub mod ids;
 pub mod link;
+pub mod mime;
 pub mod note;
 pub mod path;
 pub mod span;
 pub mod task;
 pub mod traits;
+pub mod tree;
 
 pub use block::{Block, BlockKind};
 pub use error::{IndexError, ParseError, SeratError, VaultError};
 pub use field::{Field, FieldKind, FieldSource, FieldValue};
+pub use fold::fold_case;
 pub use hash::ContentHash;
 pub use ids::{BlockId, FieldId, NoteId};
 pub use link::{Link, LinkKind, LinkTarget};
+pub use mime::{
+    OCTET_STREAM, VIEWABLE, attachment_link, is_viewable, mime_for_extension, mime_for_path,
+};
 pub use note::{IndexOp, LoadedNote, NoteKind, NoteMeta, ParsedNote, SourceEntry};
-pub use path::VaultPath;
+pub use path::{Platform, VaultPath};
 pub use span::ByteRange;
 pub use task::Task;
 pub use traits::{EchoGuard, IndexWriter, NoteParser, NoteSource};
+pub use tree::{
+    RawEntry, Snapshot, TreeEntry, TreeKind, TreeModel, TreeOp, group_listings, source_entries,
+};

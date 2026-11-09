@@ -42,7 +42,33 @@ pub struct Settings {
 
     /// Window geometry.
     pub window: WindowSettings,
+
+    /// `[editor]`.
+    pub editor: EditorSettings,
+
+    /// User rebindings, `[keybindings]`: registry command id to CodeMirror key
+    /// notation. An **empty string** means deliberately unbound (TOML has no null); a
+    /// command with no entry uses the registry default (FR-PLT-05).
+    pub keybindings: BTreeMap<String, String>,
 }
+
+/// `[editor]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    /// Live preview on; `false` selects split preview (FR-EDT-10).
+    pub live_preview: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self { live_preview: true }
+    }
+}
+
+/// The longest command id or key notation accepted. Settings are hand-editable; this
+/// only stops a runaway string from a bad caller reaching the file.
+pub const MAX_BINDING_TEXT: usize = 128;
 
 /// Window geometry, restored before the window is created.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@ project: Serat
 artifact: P1 gate protocol
 phase: 05-testing
 owner: test-engineer
-serves: NFR-CMP-01, NFR-CMP-02, NFR-CMP-04, NFR-USE-01, NFR-MNT-01, FR-VLT-08, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-NAV-06, US-01, US-29, RISK-013
+serves: NFR-CMP-01, NFR-CMP-02, NFR-CMP-04, NFR-USE-01, NFR-MNT-01, FR-VLT-08, FR-VLT-11, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12, FR-NAV-06, US-01, US-41, US-29, RISK-013
 ---
 
 # P1 Gate Protocol
@@ -27,6 +27,8 @@ A bright line, decided now rather than argued case-by-case during the week, beca
 - Doing real vault work in **any other tool** (VS Code, a plain text editor, a shell) because Serat could not do it. Swapping Obsidian for a different workaround does not satisfy "without needing Obsidian" — it satisfies the letter and defeats the point.
 - Reaching for Obsidian, or a workaround, to use a **post-P1 capability** — anything the PRD's Phase column puts at P2 or later (Dataview-style queries, the table view, PDF search, block refs — all P2), P3 (lenses, dashboard notes), P4 (the scoped graph view, FR-NAV-07), or v2 (the PRD's four Won't-priority scope exclusions: multiple vaults, audio/video transcription, no sync engine, no plugin API) — **is a "need" by this definition too.** Per the owner's ruling (2026-09-24) it does not fail the gate on its own, but it is not exempt from being logged as a reach; see the GO/NO-GO rule below for what happens to it.
 
+**Creating a note or folder is a P1 capability (FR-VLT-11, US-41, added 2026-10-20 at PRD v1.7).** Opening Obsidian, or any other tool, to create a new note or folder in the real vault is a **missing P1 feature** and NO-GO. Rename and move remain P3 (FR-VLT-09); a reach for those is a post-P1 reach, logged and counted.
+
 **Not needing Obsidian** (does not break the week):
 - The two scheduled NFR-CMP-01 checks (day 0 baseline, day 7 reopen) and item 6's scheduled external-edit test — those exist to exercise compatibility and reconciliation, not to use Obsidian (or another editor) as a tool for getting real work done.
 - Opening Obsidian on a **different** vault, or out of idle curiosity with zero vault interaction.
@@ -45,7 +47,7 @@ Every reach for Obsidian (or an equivalent workaround tool) against the real vau
 Each day of the week the vault is the owner's actual note-taking tool for real work, not a demo performed on the side. Minimum per session:
 
 1. **Open the vault in Serat** (not a copy, not the benchmark vault — the owner's real vault, `docs/01-planning/tasks-p1-editor.md`'s "owner's own vault").
-2. **Write** at least one real note or edit an existing one with live preview on (FR-EDT-02) — read it back without dropping to source view to confirm formatting rendered as typed.
+2. **Write** at least one real note (created in Serat, FR-VLT-11) or edit an existing one with live preview on (FR-EDT-02) — read it back without dropping to source view to confirm formatting rendered as typed.
 3. **Link** — create or follow at least one `[[wikilink]]`/embed, and check its **backlinks** pane (FR-NAV-04) shows the block that referenced it.
 4. **Search or switch** — use the quick switcher (FR-NAV-01) or full-text search (FR-NAV-02, notes only in P1 scope) to reach a note that was not already open, and use the **command palette** (FR-NAV-06) for at least one action instead of a menu.
 5. **Touch a non-Markdown file** if the day's real work has one: open a PDF or image through Serat's viewer (FR-BIN-11/12), confirm a sidecar/asset shows as one entry in the file tree (FR-BIN-03).

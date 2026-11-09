@@ -226,12 +226,15 @@ impl NoteParser for LineParser {
 /// recorded can construct one and ignore it.
 #[derive(Debug, Default)]
 pub struct SpyEcho {
-    pub recorded: Mutex<Vec<ContentHash>>,
+    pub recorded: Mutex<Vec<(VaultPath, ContentHash)>>,
 }
 
 impl EchoGuard for SpyEcho {
-    fn record_echo(&self, hash: ContentHash) {
-        self.recorded.lock().expect("lock").push(hash);
+    fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
+        self.recorded
+            .lock()
+            .expect("lock")
+            .push((path.clone(), hash));
     }
 }
 

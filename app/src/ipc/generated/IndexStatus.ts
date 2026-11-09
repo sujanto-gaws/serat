@@ -24,4 +24,41 @@ state: IndexState,
  * reads this instead of timing an IPC round trip, so the number it reports
  * is the application's, not the harness's.
  */
-since_process_start_ms: number, };
+since_process_start_ms: number, 
+/**
+ * How many file names in this vault the walk and the watcher could not turn
+ * into a vault path and so do not show (task #34's `Vault::refusals()`;
+ * mostly Windows-only name rules: `:`, device names, a trailing dot or
+ * space). FR-VLT-01, design goal 5: a file Serat cannot show is reported,
+ * never silently absent. The front end renders it as one status fact, "N
+ * names not shown", and fetches the list behind it with `refused_names`.
+ *
+ * The count is of distinct paths: `RefusalLog::len()`, the length of the
+ * `refused_names` list. It saturates at [`REFUSED_NAMES_CAP`], and at the
+ * cap the front end says "1000 or more". It does not add
+ * `RefusalLog::overflowed()`. That counter counts refusal events past the
+ * cap, not distinct paths, because an unstored path the watcher refuses
+ * twice is counted twice. Adding it would overstate the number of names.
+ * `None` (absent on the wire) means serat-app is not counting yet, or no
+ * vault is open. It never means zero, so the front end shows nothing for
+ * it rather than "0 names not shown".
+ */
+refused_names?: number, 
+/**
+ * The index's write-ahead log is pinned, and this is its size in bytes. Serves
+ * NFR-PRF-03, NFR-REL-01, task #56 (architecture §2.2 "WAL checkpoints"). The
+ * front end renders it as one quiet status fact, **"index WAL pinned"** with the
+ * size, never as an error or a modal.
+ *
+ * A checkpoint cannot pass a reader that holds a read transaction, so the index
+ * holds the invariant that no reader keeps one outside a single read call. If the
+ * WAL nevertheless passes 64 MiB, the checkpointer reports it here, tries one
+ * `RESTART` at idle, and, if that fails, leaves this fact in place until a
+ * checkpoint completes: there is no further `RESTART`, while a `PASSIVE`
+ * keeps retrying every 2 s as long as there are new frames. The status is
+ * re-emitted when the fact appears or clears, not as the size moves. The
+ * index still works; only disk use is affected.
+ * `None` (absent on the wire) means the WAL is not pinned, or no vault is open.
+ * It is a fact about a defect, so it is never `Some(0)`.
+ */
+wal_pinned_bytes?: number, };

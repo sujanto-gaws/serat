@@ -34,6 +34,13 @@
 //! types a second time, into `crates/serat-app/bindings/`. That directory is ignored
 //! and is not the committed copy.
 
+// Feature unification must not smuggle serat-index's test hooks into a release build
+// (task #52): `cargo build --workspace --release` unifies them in via bench/budget.
+const _: () = assert!(
+    !serat_index::TEST_HOOKS || cfg!(debug_assertions),
+    "test-hooks must not reach a release build"
+);
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -43,14 +50,23 @@ use serde::Serialize;
 use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 
 mod acl_manifest;
+mod asset;
 pub mod cli;
 pub mod commands;
+pub mod consumer;
+pub mod editor;
 pub mod error;
+pub mod folder;
+pub mod gitignore;
 pub mod index;
+mod nav_guard;
+pub mod reads;
 mod security_config;
 pub mod settings;
 pub mod startup;
 pub mod state;
+pub mod switcher;
+pub mod tree_stream;
 pub mod vault;
 
 /// The IPC contract, taken by path from `contracts/`.
@@ -245,9 +261,47 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
     // benchmark thread wants is recorded here and returned below.
     let exit_code = Arc::new(AtomicI32::new(0));
     let setup_exit_code = Arc::clone(&exit_code);
+    let window_state = Arc::clone(&state);
+    let exit_state = Arc::clone(&state);
 
     tauri::Builder::default()
+        // §9.3: opening an external link goes through the system opener, and
+        // only on an explicit click (vue-frontend-dev's side). This crate's
+        // job is registering the plugin and narrowing its capability grant
+        // (capabilities/default.json) to exactly http/https/mailto -- task
+        // #37 -- rather than the plugin's own wider `tel:`-including default.
+        .plugin(tauri_plugin_opener::init())
         .manage(Arc::clone(&state))
+        // The index is closed cleanly before the window is destroyed (architecture
+        // 3.1.1 item 6): without it every session reads as unclean. The close checkpoints
+        // the WAL, so it runs on a thread of its own and the window is destroyed when it
+        // is done; the webview thread waits for nothing. A second close request while it
+        // runs destroys the window mid-close: safe, because the clean-close marker is
+        // set only at the end of a clean close, so the next open reads it as unclean.
+        .on_window_event(move |window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window_state.vault_root().is_some()
+            {
+                let state = Arc::clone(&window_state);
+                let window = window.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("serat-close".to_owned())
+                    .spawn(move || {
+                        state.close_vault();
+                        if let Err(err) = window.destroy() {
+                            eprintln!("serat: the window could not be destroyed: {err}");
+                        }
+                    });
+                // If no thread can be had the close proceeds and `RunEvent::Exit`
+                // below closes the index instead.
+                if spawned.is_ok() {
+                    api.prevent_close();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::open_vault,
             commands::read_file,
@@ -255,7 +309,41 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::index_status,
             commands::mark_first_paint,
             commands::mark_vault_usable,
+            commands::refused_names,
+            commands::create_folder,
+            commands::get_ui_settings,
+            commands::set_live_preview,
+            commands::set_keybinding,
+            commands::gitignore_offer_status,
+            commands::append_gitignore_entry,
+            commands::decline_gitignore_offer,
+            commands::search,
+            commands::switcher_query,
+            commands::backlinks,
+            commands::open_tree,
+            commands::mark_tree,
+            commands::note_opened,
+            commands::note_closed,
+            commands::save_patch,
+            commands::request_external_diff,
+            commands::rebase_buffer,
+            commands::asset_info,
+            commands::read_asset_range,
         ])
+        // ADR-0017: the one read-only path vault bytes take into the webview.
+        // Runs on the blocking pool (never the main thread, design goal 2); the
+        // handler is asset::serve, which applies steps 1-10 in order.
+        .register_asynchronous_uri_scheme_protocol(
+            ipc::ASSET_SCHEME,
+            |context, request, responder| {
+                use tauri::Manager as _;
+                let state = Arc::clone(&*context.app_handle().state::<Arc<AppState>>());
+                tauri::async_runtime::spawn_blocking(move || {
+                    let reply = state.serve_asset(nav_guard::Platform::current(), &request);
+                    responder.respond(reply.into_http());
+                });
+            },
+        )
         .setup(move |app| {
             state.startup.mark_runtime_ready();
             let handle = app.handle().clone();
@@ -269,6 +357,41 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                     // event name Tauri will not accept, and a silently undelivered
                     // status is indistinguishable from an index that never changed.
                     eprintln!("serat: {INDEX_STATUS_EVENT} could not be emitted: {err}");
+                }
+            });
+
+            // 1b. And note://external-change: unthrottled, not ordered against command
+            //     responses (ADR-0016 §2), so the front end's rules decide when to apply it.
+            let external = handle.clone();
+            state.events.install_external(move |change| {
+                if let Err(err) = external.emit(ipc::EXTERNAL_CHANGE_EVENT, change) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::EXTERNAL_CHANGE_EVENT
+                    );
+                }
+            });
+
+            // 1c. And tree://status: the tree stream gave up (goal 5: say so).
+            let tree_status = handle.clone();
+            state.events.install_tree_status(move |status| {
+                if let Err(err) = tree_status.emit(ipc::TREE_STATUS_EVENT, status) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::TREE_STATUS_EVENT
+                    );
+                }
+            });
+
+            // 1d. And index://changed: invalidation only, throttled to ten per second by
+            //     the notifier before it reaches this sink.
+            let changed = handle.clone();
+            state.events.install_changed(move |event| {
+                if let Err(err) = changed.emit(ipc::INDEX_CHANGED_EVENT, event) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::INDEX_CHANGED_EVENT
+                    );
                 }
             });
 
@@ -322,11 +445,79 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             // 3. Then the window.
             let geometry = settings_geometry();
-            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-                .title("Serat")
-                .inner_size(geometry.0, geometry.1)
-                .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
-                .build()?;
+            // §9.3 / task #37: read once, here, rather than inside the closure
+            // below -- `is_app_navigation_target` stays a pure function over
+            // its arguments, and `debug_assertions` is a property of this
+            // build regardless of what ships in the config (see that
+            // function's doc comment).
+            let dev_server_origin = app.config().build.dev_url.clone();
+            let window = WebviewWindowBuilder::new(
+                app,
+                MAIN_WINDOW_LABEL,
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("Serat")
+            // ADR-0017: pinned, not defaulted. On Windows the app origin is
+            // `http://tauri.localhost` and the asset page URL is
+            // `http://serat-asset.localhost`; `app_origin()` and the CSP hard-code
+            // `http://`, so the `https` form must never be selected.
+            .use_https_scheme(false)
+            .inner_size(geometry.0, geometry.1)
+            .initialization_script(format!("window.__SERAT_BOOT__ = {boot_info};"))
+            // T-09, ADR-0017's correction (task #36): the only control
+            // keeping a top-level navigation off the app's own origin --
+            // including a `serat-asset://…` document, which Tauri
+            // classifies as local and would otherwise reach every
+            // command granted to `main` (nav_guard's doc comment).
+            .on_navigation(move |url| {
+                nav_guard::is_app_navigation_target(
+                    url,
+                    dev_server_origin.as_ref(),
+                    nav_guard::Platform::current(),
+                )
+            })
+            // §9.3: "window.open and new-window requests are refused the
+            // same way." One window in P1; nothing opens a second one.
+            .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+            // A browser-native download writes outside the vault, outside
+            // write_atomic, outside every containment check serat-vault
+            // owns (design goal 1, T-07). Nothing in P1 wants one.
+            .on_download(|_webview, event| {
+                !matches!(event, tauri::webview::DownloadEvent::Requested { .. })
+            })
+            .build()?;
+
+            // Task #37, release builds only: the native right-click menu offers
+            // "Open Link", "View Frame Source" and similar actions that exist
+            // outside every guard above -- a user picking "Open Link in New
+            // Window" from it would reach exactly the window on_new_window just
+            // refused, by a path this crate never sees. Left enabled in debug
+            // builds because it is how a developer reaches "Inspect Element"
+            // without a keybinding. Linux/WebKitGTK only today: WebView2's
+            // equivalent is `ICoreWebView2Settings::put_AreDefaultContextMenusEnabled`
+            // through unsafe COM calls, and WKWebView has no settings-level
+            // equivalent at all (it needs an NSView/WKUIDelegate override) --
+            // both are real, separate pieces of platform-specific work, named
+            // rather than silently left undone (task #37's report to the lead).
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            if !cfg!(debug_assertions) {
+                nav_guard::disable_default_context_menu(&window);
+            }
+            // `window` is read on Linux/BSD only, above; elsewhere consume it.
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
+            let _ = window;
 
             // Diagnostic only, and emphatically not "window visible": see
             // crate::startup for why the two are separate values.
@@ -338,12 +529,45 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             Ok(())
         })
-        .run(tauri::generate_context!())?;
+        .build(tauri::generate_context!())?
+        .run(move |_app, event| {
+            // Whatever ended the event loop, the index is closed (idempotent).
+            if matches!(event, tauri::RunEvent::Exit) {
+                close_with_deadline(&exit_state, EXIT_CLOSE_DEADLINE);
+            }
+        });
 
     Ok(match exit_code.load(Ordering::SeqCst) {
         0 => ExitCode::SUCCESS,
         code => ExitCode::from(u8::try_from(code).unwrap_or(1)),
     })
+}
+
+/// The longest `RunEvent::Exit` (on the main thread) waits for the vault to close. Past
+/// it the process exits with the vault unclosed: the clean-close marker is then unset
+/// and the next open compares mtimes, which it does anyway.
+const EXIT_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Close the open vault on a thread of its own and wait for it, but not for ever: the
+/// close joins the vault thread and drains the index writer, either of which could be
+/// slow behind a very large catch-up, and the main thread must not hang at exit.
+fn close_with_deadline(state: &Arc<AppState>, deadline: std::time::Duration) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let closing = Arc::clone(state);
+    let spawned = std::thread::Builder::new()
+        .name("serat-exit-close".to_owned())
+        .spawn(move || {
+            closing.close_vault();
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => {
+            if finished.recv_timeout(deadline).is_err() {
+                eprintln!("serat: the vault did not close within {deadline:?}; exiting anyway");
+            }
+        }
+        Err(_) => state.close_vault(),
+    }
 }
 
 /// Window size, from the settings file's defaults.
@@ -383,6 +607,10 @@ fn spawn_benchmark_exit(
         .spawn(move || {
             let arrived = startup.wait_for_usable(timeout);
             if wait_for_walk && arrived {
+                // The one walk at open (ADR-0015 section 2) is started by the
+                // application itself after the first paint and the watcher, and stands
+                // in for the tree's when nobody has opened one; the benchmark no longer
+                // opens a stream, so it measures the product's own trigger.
                 // FR-VLT-01's quantity, not NFR-PRF-01's: with no index the file tree
                 // comes from the walk, so walk completion is when a tree could first
                 // render (F-151). Only reached under --exit-after-walk; the ordinary
@@ -440,6 +668,9 @@ fn spawn_benchmark_exit(
                     }
                 },
             };
+            // The index is closed after the last save this run submitted and before the
+            // process ends; `exit_now` bypasses `RunEvent::Exit`.
+            state.close_vault();
             exit_code.store(code, Ordering::SeqCst);
             if code == 0 {
                 handle.exit(0);

@@ -38,6 +38,26 @@
 //! that. A future handler list that is itself macro-generated would need this module
 //! revisited; nothing here proves that case, only the one that exists today.
 
+/// A permission entry is either a bare string identifier (`"core:default"`) or an
+/// object that extends a permission's scope (`{"identifier": ..., "allow": [...]}`,
+/// `tauri-utils-2.9.3`'s `PermissionEntry::ExtendedPermission`). Both shapes carry
+/// an identifier; this reads it from either so an exact-set check does not have to
+/// choose one shape over the other.
+#[cfg(test)]
+pub(crate) fn permission_identifier(entry: &serde_json::Value) -> String {
+    entry.as_str().map(str::to_owned).unwrap_or_else(|| {
+        entry["identifier"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "permission entry {entry:?} is neither a string identifier nor an \
+                     object carrying one"
+                )
+            })
+            .to_owned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -116,10 +136,20 @@ mod tests {
             .as_array()
             .expect("capabilities/default.json must have a permissions array")
             .iter()
-            .filter_map(|entry| entry.as_str())
-            .filter_map(|entry| entry.strip_prefix("allow-"))
-            .map(|slug| slug.replace('-', "_"))
+            .map(super::permission_identifier)
+            .filter_map(|id| id.strip_prefix("allow-").map(|slug| slug.replace('-', "_")))
             .collect()
+    }
+
+    #[test]
+    fn object_form_permission_entries_are_seen_by_granted_commands() {
+        // An extended entry ({"identifier": ..., "allow": [...]}) must count as a
+        // grant; silently skipping it would hide it from all four ADR-0012 guards.
+        let entry = serde_json::json!({"identifier": "allow-open-vault"});
+        assert_eq!(super::permission_identifier(&entry), "allow-open-vault");
+        let slug = super::permission_identifier(&entry);
+        let cmd = slug.strip_prefix("allow-").map(|s| s.replace('-', "_"));
+        assert_eq!(cmd.as_deref(), Some("open_vault"));
     }
 
     #[test]
@@ -160,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn the_granted_set_is_exactly_the_five_commands_boot_js_calls() {
+    fn the_granted_set_is_exactly_the_pinned_commands() {
         // ADR-0012, option 3: grant the five commands the webview actually invokes,
         // not all six. open_vault is called only from Rust (state.open_vault(...)
         // inside setup, crates/serat-app/src/lib.rs) and granting it here would
@@ -173,6 +203,26 @@ mod tests {
             "index_status",
             "mark_first_paint",
             "mark_vault_usable",
+            "refused_names",
+            "create_folder",
+            "get_ui_settings",
+            "set_live_preview",
+            "set_keybinding",
+            "gitignore_offer_status",
+            "append_gitignore_entry",
+            "decline_gitignore_offer",
+            "search",
+            "switcher_query",
+            "backlinks",
+            "open_tree",
+            "mark_tree",
+            "note_opened",
+            "note_closed",
+            "save_patch",
+            "request_external_diff",
+            "rebase_buffer",
+            "asset_info",
+            "read_asset_range",
         ]
         .into_iter()
         .map(str::to_owned)

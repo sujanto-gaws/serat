@@ -36,5 +36,11 @@ path = "src/bin/check-prd-join.rs"
 name = "check-table-structure"
 path = "src/bin/check-table-structure.rs"
 
+[dependencies]
+reporoot = { path = "../reporoot" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

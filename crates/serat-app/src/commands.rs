@@ -13,20 +13,28 @@
 use std::sync::Arc;
 
 use tauri::State;
+use tauri::ipc::Channel;
 
 use crate::ipc::{
-    FileContents, FileWritten, IndexStatus, IpcError, OpenVaultArgs, ReadFileArgs, VaultOpened,
-    WriteFileArgs,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus, IpcError,
+    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
+    ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome,
+    SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage,
+    UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::startup;
 use crate::state::AppState;
+use crate::tree_stream::TreeSender;
 
 /// `open_vault(args) -> Result<VaultOpened, IpcError>`
 ///
 /// # Errors
 ///
 /// As [`AppState::open_vault`].
-#[tauri::command]
+// Not a granted command (the ACL test pins that); `async` because opening closes the
+// previous vault, which must never block the webview's thread.
+#[tauri::command(async)]
 pub fn open_vault(
     state: State<'_, Arc<AppState>>,
     args: OpenVaultArgs,
@@ -67,6 +75,232 @@ pub fn write_file(
 #[must_use]
 pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
     state.index_status()
+}
+
+/// `gitignore_offer_status() -> Result<GitignoreOffer, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::gitignore_offer_status`].
+#[tauri::command(async)]
+pub fn gitignore_offer_status(state: State<'_, Arc<AppState>>) -> Result<GitignoreOffer, IpcError> {
+    state.gitignore_offer_status()
+}
+
+/// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`. Takes no path.
+///
+/// # Errors
+///
+/// As [`AppState::append_gitignore_entry`].
+#[tauri::command(async)]
+pub fn append_gitignore_entry(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreAppended, IpcError> {
+    state.append_gitignore_entry()
+}
+
+/// `decline_gitignore_offer() -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::decline_gitignore_offer`].
+#[tauri::command(async)]
+pub fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<(), IpcError> {
+    state.decline_gitignore_offer()
+}
+
+/// `get_ui_settings() -> UiSettings`
+#[tauri::command(async)]
+#[must_use]
+pub fn get_ui_settings(state: State<'_, Arc<AppState>>) -> UiSettings {
+    state.get_ui_settings()
+}
+
+/// `set_live_preview(args) -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::set_live_preview`].
+#[tauri::command(async)]
+pub fn set_live_preview(
+    state: State<'_, Arc<AppState>>,
+    args: SetLivePreviewArgs,
+) -> Result<(), IpcError> {
+    state.set_live_preview(args)
+}
+
+/// `set_keybinding(args) -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::set_keybinding`].
+#[tauri::command(async)]
+pub fn set_keybinding(
+    state: State<'_, Arc<AppState>>,
+    args: SetKeybindingArgs,
+) -> Result<(), IpcError> {
+    state.set_keybinding(args)
+}
+
+/// `search(args) -> Result<IndexRead<SearchOutcome>, IpcError>`
+///
+/// Never waits for the index. The read itself runs in `spawn_blocking`: serat-index's
+/// search connection has one lock (a newer search interrupts the older, which returns
+/// `SearchOutcome::Superseded`, passed through unchanged), and waiting for it blocks a
+/// thread, which must never be a Tauri async worker or the webview main thread.
+///
+/// # Errors
+///
+/// As [`AppState::search`]; a panicked read thread is reported as [`IpcError::Io`].
+#[tauri::command]
+pub async fn search(
+    state: State<'_, Arc<AppState>>,
+    args: SearchArgs,
+) -> Result<IndexRead<SearchOutcome>, IpcError> {
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || state.search(args))
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: format!("the search thread failed: {err}"),
+        })?
+}
+
+/// `switcher_query(args) -> SwitcherResults`
+///
+/// Never fails and never waits for the index (before `Ready` it answers from the tree's
+/// paths). The match runs in `spawn_blocking`, off the webview thread and off a Tauri
+/// async worker: a query serialises behind the one before it, and that wait must not
+/// hold either.
+#[tauri::command]
+pub async fn switcher_query(
+    state: State<'_, Arc<AppState>>,
+    args: SwitcherQueryArgs,
+) -> Result<SwitcherResults, IpcError> {
+    let seq = args.seq;
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || state.switcher_query(&args))
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: format!("the switcher thread failed (query {seq}): {err}"),
+        })
+}
+
+/// `backlinks(args) -> Result<IndexRead<Vec<Backlink>>, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::backlinks`].
+#[tauri::command(async)]
+pub fn backlinks(
+    state: State<'_, Arc<AppState>>,
+    args: NotePathArgs,
+) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
+    state.backlinks(args)
+}
+
+/// `create_folder(args) -> Result<FolderCreated, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::create_folder`].
+#[tauri::command(async)]
+pub fn create_folder(
+    state: State<'_, Arc<AppState>>,
+    args: CreateFolderArgs,
+) -> Result<FolderCreated, IpcError> {
+    state.create_folder(args)
+}
+
+/// `open_tree(on_message: Channel<TreeMessage>) -> Result<(), IpcError>`
+///
+/// Starts the tree stream on the channel and returns at once (ADR-0015). The channel is
+/// ordered and lossless; a send that fails (the webview reloaded) ends the stream
+/// quietly, and the reload's own `open_tree` starts a fresh one from the root.
+///
+/// # Errors
+///
+/// As [`AppState::open_tree`].
+#[tauri::command(async)]
+pub fn open_tree(
+    state: State<'_, Arc<AppState>>,
+    on_message: Channel<TreeMessage>,
+) -> Result<(), IpcError> {
+    let send: TreeSender = Arc::new(move |message| on_message.send(message).is_ok());
+    state.open_tree(send)
+}
+
+/// `mark_tree(args)`: the front end's two FR-VLT-01 marks. Synchronous, lock-free, and
+/// never waits behind the stream (`TreeSession::progress`).
+#[tauri::command]
+pub fn mark_tree(state: State<'_, Arc<AppState>>, args: MarkTreeArgs) {
+    state.mark_tree(&args);
+}
+
+/// `note_opened(args) -> Result<(), IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::note_opened`].
+#[tauri::command(async)]
+pub fn note_opened(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) -> Result<(), IpcError> {
+    state.note_opened(&args)
+}
+
+/// `note_closed(args)`
+#[tauri::command(async)]
+pub fn note_closed(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) {
+    state.note_closed(&args);
+}
+
+/// `save_patch(args) -> Result<FileWritten, IpcError>`: the editor's only save.
+///
+/// # Errors
+///
+/// As [`AppState::save_patch`].
+#[tauri::command(async)]
+pub fn save_patch(
+    state: State<'_, Arc<AppState>>,
+    args: SavePatchArgs,
+) -> Result<FileWritten, IpcError> {
+    state.save_patch(&args)
+}
+
+/// `request_external_diff(args) -> Result<Option<ExternalChange>, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::request_external_diff`].
+#[tauri::command(async)]
+pub fn request_external_diff(
+    state: State<'_, Arc<AppState>>,
+    args: NoteBufferArgs,
+) -> Result<Option<ExternalChange>, IpcError> {
+    state.request_external_diff(&args)
+}
+
+/// `rebase_buffer(args) -> Result<Vec<Patch>, IpcError>`: *Keep mine* (ADR-0016 §4).
+///
+/// # Errors
+///
+/// As [`AppState::rebase_buffer`].
+#[tauri::command(async)]
+pub fn rebase_buffer(
+    state: State<'_, Arc<AppState>>,
+    args: RebaseBufferArgs,
+) -> Result<Vec<Patch>, IpcError> {
+    state.rebase_buffer(&args)
+}
+
+/// `refused_names() -> Vec<RefusedName>`
+///
+/// FR-VLT-01. A read of the refusal log, not a walk; empty with no vault open. Runs
+/// off the main thread (`async`) like every command that touches the vault.
+#[tauri::command(async)]
+#[must_use]
+pub fn refused_names(state: State<'_, Arc<AppState>>) -> Vec<RefusedName> {
+    state.refused_names()
 }
 
 /// The webview has composited its first frame.
@@ -138,4 +372,48 @@ pub fn mark_vault_usable(state: State<'_, Arc<AppState>>, note: Option<String>) 
         eprintln!("serat: settings not saved: {problem}");
     }
     state.startup.elapsed_ms()
+}
+
+/// Runs `work` on the blocking pool. A sync `#[tauri::command]` runs on the main
+/// thread, which is for UI and nothing else (design goal 2); these file reads and
+/// writes never belong there.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|err| IpcError::Io {
+            path: String::new(),
+            message: err.to_string(),
+        })?
+}
+
+/// `asset_info(args) -> Result<AssetInfo, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::asset_info`].
+#[tauri::command]
+pub async fn asset_info(
+    state: State<'_, Arc<AppState>>,
+    args: AssetArgs,
+) -> Result<AssetInfo, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.asset_info(args)).await
+}
+
+/// `read_asset_range(args) -> Result<ArrayBuffer, IpcError>`: raw bytes, not JSON.
+///
+/// # Errors
+///
+/// As [`AppState::read_asset_range`].
+#[tauri::command]
+pub async fn read_asset_range(
+    state: State<'_, Arc<AppState>>,
+    args: ReadAssetRangeArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let state = Arc::clone(&state);
+    blocking(move || state.read_asset_range(args))
+        .await
+        .map(tauri::ipc::Response::new)
 }

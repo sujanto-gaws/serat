@@ -7,9 +7,35 @@
 // runtime, not at compile time — there is no generated command list yet, only
 // generated argument/return types.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { AssetArgs } from "./generated/AssetArgs";
+import type { AssetInfo } from "./generated/AssetInfo";
+import type { ReadAssetRangeArgs } from "./generated/ReadAssetRangeArgs";
+import type { Backlink } from "./generated/Backlink";
+import type { ExternalChange } from "./generated/ExternalChange";
+import type { IndexChanged } from "./generated/IndexChanged";
+import type { MarkTreeArgs } from "./generated/MarkTreeArgs";
+import type { NoteBufferArgs } from "./generated/NoteBufferArgs";
+import type { Patch } from "./generated/Patch";
+import type { RebaseBufferArgs } from "./generated/RebaseBufferArgs";
+import type { SavePatchArgs } from "./generated/SavePatchArgs";
+import type { SwitcherQueryArgs } from "./generated/SwitcherQueryArgs";
+import type { SwitcherResults } from "./generated/SwitcherResults";
+import type { TreeMessage } from "./generated/TreeMessage";
+import type { CreateFolderArgs } from "./generated/CreateFolderArgs";
+import type { FolderCreated } from "./generated/FolderCreated";
+import type { GitignoreAppended } from "./generated/GitignoreAppended";
+import type { GitignoreOffer } from "./generated/GitignoreOffer";
+import type { IndexRead } from "./generated/IndexRead";
+import type { NotePathArgs } from "./generated/NotePathArgs";
+import type { RefusedName } from "./generated/RefusedName";
+import type { SearchArgs } from "./generated/SearchArgs";
+import type { SearchOutcome } from "./generated/SearchOutcome";
+import type { SetKeybindingArgs } from "./generated/SetKeybindingArgs";
+import type { SetLivePreviewArgs } from "./generated/SetLivePreviewArgs";
+import type { UiSettings } from "./generated/UiSettings";
 import type { FileContents } from "./generated/FileContents";
 import type { FileWritten } from "./generated/FileWritten";
 import type { IndexStatus } from "./generated/IndexStatus";
@@ -21,6 +47,12 @@ export type { IpcError };
 
 /** `contracts/ipc.rs::INDEX_STATUS_EVENT`. See that file for why it is not "/". */
 export const INDEX_STATUS_EVENT = "index://status";
+
+/** `contracts/ipc.rs::INDEX_CHANGED_EVENT`. */
+export const INDEX_CHANGED_EVENT = "index://changed";
+
+/** `contracts/ipc.rs::EXTERNAL_CHANGE_EVENT`. */
+export const EXTERNAL_CHANGE_EVENT = "note://external-change";
 
 // There is deliberately no `openVault` wrapper, and its absence is the point rather
 // than an omission. `open_vault` exists as a command, but
@@ -49,6 +81,92 @@ export function writeFile(args: WriteFileArgs): Promise<FileWritten> {
 
 export function indexStatus(): Promise<IndexStatus> {
   return invoke("index_status");
+}
+
+// ---- P1 (task #18). Each wrapper is the command's name and its generated types and
+// nothing else; the rules are in contracts/ipc.rs and crates/serat-app.
+
+/** `refused_names`: the list behind `IndexStatus.refused_names` (FR-VLT-01). */
+export function refusedNames(): Promise<RefusedName[]> {
+  return invoke("refused_names");
+}
+
+/** `create_folder`: one directory, inside the vault (FR-VLT-11). */
+export function createFolder(args: CreateFolderArgs): Promise<FolderCreated> {
+  return invoke("create_folder", { args });
+}
+
+/** `search`: free text, phrases and at most one `[key:value]` (FR-NAV-02, FR-STR-03). */
+export function search(args: SearchArgs): Promise<IndexRead<SearchOutcome>> {
+  return invoke("search", { args });
+}
+
+/** `backlinks`: one entry per distinct (source note, source block) (FR-NAV-04). */
+export function backlinks(args: NotePathArgs): Promise<IndexRead<Backlink[]>> {
+  return invoke("backlinks", { args });
+}
+
+/** `get_ui_settings`: the front end's slice of the settings TOML (FR-PLT-05). */
+export function getUiSettings(): Promise<UiSettings> {
+  return invoke("get_ui_settings");
+}
+
+/** `set_live_preview`: `false` selects split preview (FR-EDT-10). */
+export function setLivePreview(args: SetLivePreviewArgs): Promise<void> {
+  return invoke("set_live_preview", { args });
+}
+
+/** `set_keybinding`: set, unbind or reset one command's binding (FR-PLT-05). */
+export function setKeybinding(args: SetKeybindingArgs): Promise<void> {
+  return invoke("set_keybinding", { args });
+}
+
+/** `gitignore_offer_status`: whether to show the `.serat/` ignore offer (NFR-CMP-04). */
+export function gitignoreOfferStatus(): Promise<GitignoreOffer> {
+  return invoke("gitignore_offer_status");
+}
+
+/** `append_gitignore_entry`: only from the offer's explicit confirmation. Takes no path. */
+export function appendGitignoreEntry(): Promise<GitignoreAppended> {
+  return invoke("append_gitignore_entry");
+}
+
+/** `decline_gitignore_offer`: "Don't ask again", kept in `.serat/prefs.json`. */
+export function declineGitignoreOffer(): Promise<void> {
+  return invoke("decline_gitignore_offer");
+}
+
+/** `asset_info`: MIME, size and sidecar of a vault file (FR-BIN-01; ADR-0017). */
+export function assetInfo(args: AssetArgs): Promise<AssetInfo> {
+  return invoke("asset_info", { args });
+}
+
+/**
+ * `read_asset_range`: ADR-0017 fallback only, for a webview that will not deliver a
+ * custom-scheme 206. Raw bytes (an `ArrayBuffer`), at most 1,000 KiB per call.
+ */
+export function readAssetRange(args: ReadAssetRangeArgs): Promise<ArrayBuffer> {
+  return invoke("read_asset_range", { args });
+}
+
+/**
+ * URL of the `serat-asset` scheme for a vault path; the bytes path is not a command.
+ *
+ * `.`, `..` and empty segments are refused rather than encoded: `encodeURIComponent`
+ * leaves dots alone, and a URL parser collapses `a/../b` (and `%2e%2e`) before the
+ * handler ever sees the request, so such a path could never name the file asked for.
+ * The native handler decodes exactly once and re-validates (ADR-0017 steps 3-4);
+ * this is the front end refusing to build a URL it knows will be rewritten.
+ */
+export function assetUrl(path: string, windows: boolean): string {
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`not a vault-relative asset path: ${JSON.stringify(path)}`);
+  }
+  const encoded = segments.map(encodeURIComponent).join("/");
+  return windows
+    ? `http://serat-asset.localhost/${encoded}`
+    : `serat-asset://localhost/${encoded}`;
 }
 
 /**
@@ -137,4 +255,75 @@ export function onIndexStatus(handler: (status: IndexStatus) => void): Promise<U
 /** True when `err` is the shape `IpcError` promises — Tauri rejects with `unknown`. */
 export function isIpcError(err: unknown): err is IpcError {
   return typeof err === "object" && err !== null && "kind" in err;
+}
+
+// ---- P1 (task #18c): the tree stream and the editor buffers (ADR-0015, ADR-0016).
+
+/**
+ * `open_tree(on_message: Channel<TreeMessage>)`: ordered and lossless, root listing
+ * first. `onMessage` is called once per message, in arrival order. Calling it again
+ * replaces the stream and re-sends the tree from the root.
+ */
+export async function openTree(onMessage: (message: TreeMessage) => void): Promise<void> {
+  const channel = new Channel<TreeMessage>();
+  channel.onmessage = onMessage;
+  await invoke("open_tree", { onMessage: channel });
+}
+
+/** `mark_tree`: `tree_first_screen` / `tree_complete`, stamped on the Rust clock. */
+export function markTree(args: MarkTreeArgs): Promise<void> {
+  return invoke("mark_tree", { args });
+}
+
+/** `note_opened`: an editor pane holds this note at this base (never an embed or preview). */
+export function noteOpened(args: NoteBufferArgs): Promise<void> {
+  return invoke("note_opened", { args });
+}
+
+/** `note_closed`: release the base. */
+export function noteClosed(args: NoteBufferArgs): Promise<void> {
+  return invoke("note_closed", { args });
+}
+
+/** `save_patch`: the editor's only save, patches in base coordinates (ADR-0016 §2). */
+export function savePatch(args: SavePatchArgs): Promise<FileWritten> {
+  return invoke("save_patch", { args });
+}
+
+/** `request_external_diff`: the recovery path; `null` means the disk equals the base. */
+export function requestExternalDiff(args: NoteBufferArgs): Promise<ExternalChange | null> {
+  return invoke("request_external_diff", { args });
+}
+
+/** `rebase_buffer`: *Keep mine* — patches from the disk text to the buffer, in disk coordinates. */
+export function rebaseBuffer(args: RebaseBufferArgs): Promise<Patch[]> {
+  return invoke("rebase_buffer", { args });
+}
+
+/** Subscribes to `note://external-change` (unthrottled, not ordered against responses). */
+export function onExternalChange(handler: (change: ExternalChange) => void): Promise<UnlistenFn> {
+  return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
+}
+
+// ---- P1 (task #18c): the quick switcher and index invalidation (architecture 9.2, 3.1).
+
+/**
+ * `switcher_query`: one call per keystroke (FR-NAV-01, NFR-PRF-06). Never rejects for
+ * a reason of its own and never waits for the index: before it is `Ready` the answer
+ * is built from the tree's paths (`corpus: "tree"`). A `#` switches to heading mode.
+ * Drop any response whose `seq` is not the latest sent, and any with `discarded: true`
+ * (the query was superseded while it waited and was not computed: its empty `items`
+ * is not "no matches").
+ */
+export function switcherQuery(args: SwitcherQueryArgs): Promise<SwitcherResults> {
+  return invoke("switcher_query", { args });
+}
+
+/**
+ * Subscribes to `index://changed`: throttled to ten per second, invalidation only.
+ * Re-query what is open; never treat it as proof that a particular write was indexed.
+ * Discard an event whose `vault_id` is not the current vault's.
+ */
+export function onIndexChanged(handler: (changed: IndexChanged) => void): Promise<UnlistenFn> {
+  return listen<IndexChanged>(INDEX_CHANGED_EVENT, (event) => handler(event.payload));
 }

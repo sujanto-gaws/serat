@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serat_core::{IndexError, IndexOp, IndexWriter, NoteKind, NoteParser, NoteSource, VaultPath};
+use serat_core::{IndexError, IndexWriter, NoteParser, NoteSource, VaultPath};
 
 use crate::schema;
 use crate::writer::{DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
@@ -98,7 +98,7 @@ pub struct RebuildReport {
 /// # Errors
 ///
 /// [`IndexError`] if the database cannot be created or a write fails. An individual
-/// file that cannot be read or parsed is counted in [`RebuildReport::skipped`], not
+/// file that cannot be read is counted in [`RebuildReport::skipped`], not
 /// returned as an error.
 pub fn rebuild(
     source: &dyn NoteSource,
@@ -220,6 +220,7 @@ pub fn rebuild_with_queue_depth(
     // by two names was two vaults and the second paid for a rebuild (F-458, F-459).
     writer.mark_ready(&crate::identity::canonical_root(vault_root))?;
     actor.shutdown()?;
+    truncate_wal(&path);
 
     let mut report = count(&path, skipped)?;
     report.walk = walk;
@@ -231,6 +232,16 @@ pub fn rebuild_with_queue_depth(
 }
 
 /// A file that could not be read or parsed. Counted, not propagated.
+/// The rebuild's own `wal_checkpoint(TRUNCATE)` at the end (architecture §2.2, §4.4):
+/// the finished index is one file, whatever the checkpointer left behind. Nothing else
+/// has the file open by now, so it cannot be held back; if it fails anyway the index is
+/// still correct, and the last connection to close checkpoints it.
+fn truncate_wal(db: &Path) {
+    if let Ok(conn) = schema::open(db) {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
+}
+
 struct Skip;
 
 /// Time spent in each phase, accumulated across files.
@@ -252,18 +263,8 @@ fn index_one(
     let loaded = source.load(path).map_err(|_| Skip)?;
     timing.read_hash += reading.elapsed();
 
-    let op = match loaded.meta.kind {
-        NoteKind::Asset => IndexOp::UpsertAsset { meta: loaded.meta },
-        NoteKind::Note => {
-            let parsing = Instant::now();
-            let parsed = parser.parse(path, &loaded.bytes).map_err(|_| Skip)?;
-            timing.parse += parsing.elapsed();
-            IndexOp::UpsertNote {
-                meta: loaded.meta,
-                parsed: Box::new(parsed),
-            }
-        }
-    };
+    let (op, parse, _) = crate::incremental::build_op(parser, path, loaded);
+    timing.parse += parse;
 
     // Blocking submit, deliberately, and this is the one place it is right.
     //

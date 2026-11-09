@@ -5,16 +5,25 @@
 //! the file we just finished writing — and, worse, the index would race its own
 //! output.
 //!
-//! The set is keyed by **hash, not by path**, and that is the whole design. A genuine
-//! external edit that happens to produce the same bytes is then indistinguishable
-//! from our own write, and is correctly treated as a no-op — because it is one. The
-//! index already holds those bytes. Keying by path would instead drop a real edit
-//! that landed in the same window, which is a lost update.
+//! The set is keyed by the pair **(path, hash)**, and that is the whole design. A
+//! genuine external edit that writes the same bytes to the same path is then
+//! indistinguishable from our own write, and is correctly treated as a no-op —
+//! because it is one. The index already holds those bytes at that path. Keying by path
+//! alone would drop a real edit that landed in the same window, which is a lost
+//! update; keying by hash alone (as P0 did) would let a copy of a just-saved note to
+//! another path consume the entry and be skipped (code-reviewer-14).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
-use serat_core::ContentHash;
+use serat_core::{ContentHash, VaultPath};
+
+/// What an echo is keyed by: the path that was written and the hash it was given.
+/// Keyed by the pair (architecture 3.2, ruling of code-reviewer-14): the argument for
+/// suppressing, that the index already holds those bytes, is true only for the path
+/// the save wrote. By hash alone, `cp A.md B.md` right after a save of A would let B
+/// consume A's entry and be skipped.
+type Key = (VaultPath, ContentHash);
 
 /// How many hashes the set holds before it evicts the oldest.
 ///
@@ -54,8 +63,8 @@ pub struct EchoSuppressor {
 /// keeping them in step is cheaper than a data structure that does both badly.
 #[derive(Debug, Default)]
 struct Inner {
-    order: VecDeque<ContentHash>,
-    set: HashSet<ContentHash>,
+    order: VecDeque<Key>,
+    set: HashSet<Key>,
 }
 
 impl Default for EchoSuppressor {
@@ -100,15 +109,16 @@ impl EchoSuppressor {
     /// `Vault`'s implementation of it calls this once a submit has been accepted; this
     /// method itself only ever records.
     ///
-    /// Recording the same hash again — an editor's autosave after an undo, say —
+    /// Recording the same pair again — an editor's autosave after an undo, say —
     /// refreshes its position to the back of the eviction order rather than adding a
-    /// second entry: keyed by hash, so the newer write's own event is what gets
+    /// second entry, so the newer write's own event is what gets
     /// suppressed, and it is the write most likely to still be waiting.
-    pub fn record(&self, hash: ContentHash) {
+    pub fn record(&self, path: &VaultPath, hash: ContentHash) {
+        let key = (path.clone(), hash);
         let mut inner = self.lock();
-        if inner.set.contains(&hash) {
-            inner.order.retain(|candidate| *candidate != hash);
-            inner.order.push_back(hash);
+        if inner.set.contains(&key) {
+            inner.order.retain(|candidate| *candidate != key);
+            inner.order.push_back(key);
             return;
         }
         if inner.order.len() >= self.capacity
@@ -116,19 +126,20 @@ impl EchoSuppressor {
         {
             inner.set.remove(&oldest);
         }
-        inner.set.insert(hash);
-        inner.order.push_back(hash);
+        inner.set.insert(key.clone());
+        inner.order.push_back(key);
     }
 
-    /// Whether an event carrying these bytes is our own echo, consuming the entry if
-    /// it is.
+    /// Whether an event for `path` carrying these bytes is our own echo, consuming the
+    /// entry if it is. An entry for a different path with the same bytes does not match.
     ///
     /// Consuming matters: two identical writes produce two events, and one recorded
-    /// hash must suppress exactly one of them.
-    pub fn take_echo(&self, hash: ContentHash) -> bool {
+    /// entry must suppress exactly one of them.
+    pub fn take_echo(&self, path: &VaultPath, hash: ContentHash) -> bool {
+        let key = (path.clone(), hash);
         let mut inner = self.lock();
-        if inner.set.remove(&hash) {
-            inner.order.retain(|candidate| *candidate != hash);
+        if inner.set.remove(&key) {
+            inner.order.retain(|candidate| *candidate != key);
             true
         } else {
             false
@@ -162,96 +173,114 @@ mod tests {
     use super::*;
     use crate::hash_bytes;
 
+    fn p(text: &str) -> VaultPath {
+        VaultPath::new(text).expect("path")
+    }
+
     #[test]
     fn our_own_write_is_recognised_once_and_only_once() {
         let echo = EchoSuppressor::new();
         let hash = hash_bytes(b"status:: done\n");
 
-        echo.record(hash);
-        assert!(echo.take_echo(hash), "our own write was not recognised");
+        echo.record(&p("a.md"), hash);
         assert!(
-            !echo.take_echo(hash),
+            echo.take_echo(&p("a.md"), hash),
+            "our own write was not recognised"
+        );
+        assert!(
+            !echo.take_echo(&p("a.md"), hash),
             "one recorded write suppressed two events"
         );
     }
 
     #[test]
+    fn the_same_bytes_at_another_path_are_not_our_echo() {
+        // code-reviewer-14: `cp A.md B.md` right after a save of A. B's event carries
+        // A's hash, and must neither be suppressed nor consume A's entry.
+        let echo = EchoSuppressor::new();
+        let hash = hash_bytes(b"# A\n");
+        echo.record(&p("A.md"), hash);
+
+        assert!(
+            !echo.take_echo(&p("B.md"), hash),
+            "B was taken for A's echo"
+        );
+        assert_eq!(echo.pending(), 1, "B's event consumed A's entry");
+        assert!(echo.take_echo(&p("A.md"), hash), "A's own event was lost");
+    }
+
+    #[test]
     fn an_unrelated_edit_is_not_suppressed() {
         let echo = EchoSuppressor::new();
-        echo.record(hash_bytes(b"ours"));
-        assert!(!echo.take_echo(hash_bytes(b"someone else's")));
+        echo.record(&p("a.md"), hash_bytes(b"ours"));
+        assert!(!echo.take_echo(&p("a.md"), hash_bytes(b"someone else's")));
         // And ours is still waiting.
         assert_eq!(echo.pending(), 1);
     }
 
     #[test]
     fn capacity_bounds_the_set_so_the_oldest_entry_is_evicted_first() {
-        // F-252: the set is now bounded by size, not by time. Two seconds could not
-        // be trusted to expire an entry (F-224 removed the reason it needed to), and
-        // this replaces `entries_expire_so_a_stale_hash_cannot_swallow_a_later_edit`,
-        // which asserted the behaviour this ruling reverses — it would either fail, or
-        // worse, keep passing while meaning nothing, since a duration-based test and a
-        // capacity-based implementation can coincidentally agree on small numbers.
-        //
-        // Checked here that the setup actually reaches eviction, not just that the
-        // assertion is well-formed (F-58): three hashes into a capacity of two must
-        // leave exactly the two most recent, and the oldest specifically, not merely
-        // "some hash", is what must be gone.
+        // F-252: bounded by size, not by time. Three entries into a capacity of two
+        // leave exactly the two most recent; the oldest specifically must be gone.
         let echo = EchoSuppressor::with_capacity(2);
-        let first = hash_bytes(b"first");
-        let second = hash_bytes(b"second");
-        let third = hash_bytes(b"third");
+        let (first, second, third) = (
+            hash_bytes(b"first"),
+            hash_bytes(b"second"),
+            hash_bytes(b"third"),
+        );
 
-        echo.record(first);
-        echo.record(second);
-        echo.record(third);
+        echo.record(&p("a.md"), first);
+        echo.record(&p("a.md"), second);
+        echo.record(&p("a.md"), third);
 
         assert_eq!(echo.pending(), 2, "the set grew past its capacity");
         assert!(
-            !echo.take_echo(first),
+            !echo.take_echo(&p("a.md"), first),
             "the oldest entry was not the one evicted"
         );
-        assert!(echo.take_echo(second), "a surviving entry was evicted");
-        assert!(echo.take_echo(third), "a surviving entry was evicted");
+        assert!(
+            echo.take_echo(&p("a.md"), second),
+            "a surviving entry was evicted"
+        );
+        assert!(
+            echo.take_echo(&p("a.md"), third),
+            "a surviving entry was evicted"
+        );
     }
 
     #[test]
     fn recording_an_entry_again_moves_it_to_the_back_of_the_eviction_order() {
-        // An editor's autosave after an undo re-records the same hash. It must not
-        // count as a second entry against the capacity, and — since it is the more
-        // recently written note — it should be the last one evicted, not the first.
+        // An autosave after an undo re-records the same pair. It must not count as a
+        // second entry, and it should be the last one evicted.
         let echo = EchoSuppressor::with_capacity(2);
         let repeated = hash_bytes(b"same bytes");
         let other = hash_bytes(b"other");
 
-        echo.record(repeated);
-        echo.record(other);
-        echo.record(repeated); // refresh: repeated is now the most recent
+        echo.record(&p("a.md"), repeated);
+        echo.record(&p("b.md"), other);
+        echo.record(&p("a.md"), repeated); // refresh: now the most recent
         let newcomer = hash_bytes(b"newcomer");
-        echo.record(newcomer); // must evict `other`, the true oldest, not `repeated`
+        echo.record(&p("c.md"), newcomer); // must evict b.md, the true oldest
 
         assert_eq!(echo.pending(), 2);
         assert!(
-            !echo.take_echo(other),
+            !echo.take_echo(&p("b.md"), other),
             "the refreshed entry's original slot was evicted instead of it"
         );
-        assert!(echo.take_echo(repeated));
-        assert!(echo.take_echo(newcomer));
+        assert!(echo.take_echo(&p("a.md"), repeated));
+        assert!(echo.take_echo(&p("c.md"), newcomer));
     }
 
     #[test]
-    fn recording_the_same_hash_twice_still_suppresses_only_one_event() {
-        // Saving the same bytes twice is ordinary — an editor's autosave after an
-        // undo. Each write records its own entry, and each event consumes one.
+    fn recording_the_same_pair_twice_still_suppresses_only_one_event() {
         let echo = EchoSuppressor::new();
         let hash = hash_bytes(b"same bytes");
-        echo.record(hash);
-        echo.record(hash);
-        // Keyed by hash, so the second record refreshes the first rather than
-        // stacking: recorded once, suppressed once, and the second event is treated
-        // as a real change that the hash gate then discards for the cost of a hash.
-        assert!(echo.take_echo(hash));
-        assert!(!echo.take_echo(hash));
+        echo.record(&p("a.md"), hash);
+        echo.record(&p("a.md"), hash);
+        // Recorded once (the second refreshes the first), suppressed once; the second
+        // event is a real change that the hash gate then discards for a hash.
+        assert!(echo.take_echo(&p("a.md"), hash));
+        assert!(!echo.take_echo(&p("a.md"), hash));
     }
 
     #[test]
@@ -260,11 +289,11 @@ mod tests {
         let writer = std::sync::Arc::clone(&echo);
         let handle = std::thread::spawn(move || {
             for i in 0..100u8 {
-                writer.record(hash_bytes(&[i]));
+                writer.record(&p("a.md"), hash_bytes(&[i]));
             }
         });
         handle.join().expect("writer thread");
         assert_eq!(echo.pending(), 100);
-        assert!(echo.take_echo(hash_bytes(&[7])));
+        assert!(echo.take_echo(&p("a.md"), hash_bytes(&[7])));
     }
 }

@@ -86,6 +86,51 @@ pub enum VaultError {
         /// What went wrong.
         message: String,
     },
+
+    /// The optimistic lock failed: the file's hash was not the caller's `base_hash`.
+    ///
+    /// ADR-0016 §2: raised both when the pre-patch read disagrees with `base_hash`
+    /// and when the immediate-before-rename re-hash finds the target moved during
+    /// the splice. The two cases share one variant because the caller's response is
+    /// the same either way — refuse, discard the temp file, call
+    /// `request_external_diff` — and distinguishing them would let a caller branch
+    /// on a distinction ADR-0016 says does not matter.
+    #[error("stale hash for {path}: expected {expected}, found {found}")]
+    StaleHash {
+        /// Vault-relative path of the target.
+        path: String,
+        /// The hash the caller supplied.
+        expected: String,
+        /// The hash actually on disk.
+        found: String,
+    },
+
+    /// A patch set could not be applied to its base.
+    ///
+    /// Distinct from `StaleHash`: the hash matched, but the patch itself is
+    /// malformed against that base — a position past the end of a line, ranges out
+    /// of order, or ranges that overlap (ADR-0016 §2 step 2). A client bug, not a
+    /// race, so it is reported rather than silently clamped or reordered.
+    #[error("malformed patch for {path}: {reason}")]
+    MalformedPatch {
+        /// Vault-relative path of the target.
+        path: String,
+        /// Why the patch was refused.
+        reason: String,
+    },
+
+    /// A patch is well formed but applying it would fuse a lone `\r` and a `\n` of a
+    /// mixed-ending note into one `\r\n`, swallowing a line (ADR-0016 §2).
+    ///
+    /// Not a client bug and not a race: the user made a legitimate edit and the only
+    /// byte-preserving outcome is to refuse it. The file is untouched.
+    #[error("saving {path} would fuse two line endings at line {line}")]
+    LineEndingsWouldFuse {
+        /// Vault-relative path of the target.
+        path: String,
+        /// 0-based line, in base coordinates, of the `\r` that would fuse.
+        line: u32,
+    },
 }
 
 impl VaultError {

@@ -235,7 +235,7 @@ export function makeLinkCompletionSource(deps: LinkExtensionDeps): CompletionSou
     if (mode.kind === "name") {
       const mySeq = ++seq;
       const results = await deps.ipc.switcherQuery({ seq: mySeq, query: mode.query, limit: 50 });
-      if (context.aborted || results.seq !== seq) return null; // a newer keystroke wins
+      if (context.aborted || results.discarded || results.seq !== seq) return null; // a newer keystroke wins; discarded = superseded, ignore
       const names = results.corpus === "tree" ? " · file names only" : "";
       const total = results.items.length;
       const options: Completion[] = results.items.map((item, index) => {

@@ -17,4 +17,10 @@ corpus: SwitcherCorpus,
 /**
  * Ranked, best first, one per note.
  */
-items: Array<SwitcherItem>, };
+items: Array<SwitcherItem>, 
+/**
+ * The query was superseded by a newer one while it waited, and was not computed:
+ * `items` is empty because nothing was asked, not because nothing matched. Ignore
+ * the response.
+ */
+discarded: boolean, };

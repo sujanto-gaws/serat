@@ -24,6 +24,7 @@ name = "vaultgen"
 path = "src/main.rs"
 
 [dependencies]
+reporoot = { path = "../reporoot" }
 
 [lints]
 workspace = true
