@@ -122,22 +122,21 @@ describe("blockWidgetsField", () => {
       for (let j = 0; j < 90; j += 1) parts.push(`paragraph ${i}.${j}`, "");
     }
     const doc = parts.join("\n");
-    const s0 = makeState(doc, 0);
+    const s0 = makeState(doc, doc.indexOf("paragraph 0.45"));
     const before = widgets(s0);
-    expect(before.length).toBeGreaterThanOrEqual(49);
-    const t0 = performance.now();
+    expect(before.length).toBe(50);
     const s1 = s0.update({
       changes: { from: doc.length - 1, insert: "x" },
       selection: { anchor: doc.length },
     }).state;
-    const elapsed = performance.now() - t0;
     const after = widgets(s1);
     expect(after.length).toBe(before.length);
     // Every pre-existing widget (those not near the edit/selection) is the same object.
     const reused = after.filter((w, i) => w.widget === before[i].widget).length;
-    expect(reused).toBeGreaterThanOrEqual(before.length - 2);
-    // Loose guard against an accidental whole-document walk (jsdom/CI noise tolerated).
-    expect(elapsed).toBeLessThan(100);
+    expect(reused).toBe(before.length);
+    // NFR-PRF-02: the property is REUSE, asserted above by object identity, not wall time (a 100 ms
+    // single-sample bound failed 1/389 under load, #99). A whole-document rebuild replaces every
+    // widget, so identity catches it deterministically.
   });
 
   it("the examined watermark maps through edits and never moves back", () => {
