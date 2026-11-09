@@ -33,6 +33,7 @@ pub mod span;
 pub mod task;
 pub mod traits;
 pub mod tree;
+pub mod verbatim;
 
 pub use block::{Block, BlockKind};
 pub use error::{IndexError, ParseError, SeratError, VaultError};
