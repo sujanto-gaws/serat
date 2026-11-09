@@ -1305,7 +1305,7 @@ fn a_shrunk_file_is_asset_changed_not_a_short_span() {
     let file = fx.put("a.pdf", ALPHABET);
     let old = super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap();
     std::fs::write(&file, b"0123").unwrap();
-    changed_validator(read_range(
+    let new = changed_validator(read_range(
         &fx.vault,
         &fx.budget,
         &vp("a.pdf"),
@@ -1313,6 +1313,49 @@ fn a_shrunk_file_is_asset_changed_not_a_short_span() {
         20,
         Some(&old),
     ));
+    assert_eq!(
+        super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap(),
+        new
+    );
+    assert!(new.starts_with("\"4-"), "{new}");
+}
+
+#[test]
+fn a_truncation_between_the_stat_and_the_read_is_asset_changed_not_io() {
+    let fx = Fx::new("validator-race-truncate");
+    let file = fx.put("a.pdf", ALPHABET);
+    let old = super::info(&fx.vault, &vp("a.pdf")).unwrap().etag.unwrap();
+    let new = changed_validator(super::read_range_with(
+        &fx.vault,
+        &fx.budget,
+        &vp("a.pdf"),
+        0,
+        20,
+        Some(&old),
+        || std::fs::write(&file, b"0123").unwrap(),
+    ));
+    assert!(new.starts_with("\"4-"), "{new}");
+}
+
+#[test]
+fn a_rewrite_between_the_stat_and_the_read_is_asset_changed_not_stale_bytes() {
+    let fx = Fx::new("validator-race-rewrite");
+    let file = fx.put("a.pdf", ALPHABET);
+    // No if_match: bytes read across a change are not served even so.
+    let result = super::read_range_with(&fx.vault, &fx.budget, &vp("a.pdf"), 0, 4, None, || {
+        let mut rewritten = ALPHABET.to_vec();
+        rewritten[0] = b'Z';
+        std::fs::write(&file, &rewritten).unwrap();
+        set_mtime(&file, 100);
+    });
+    changed_validator(result);
+}
+
+#[test]
+fn info_gives_no_etag_for_an_asset_the_scheme_will_not_serve() {
+    let fx = Fx::new("validator-nonviewable");
+    fx.put("a.exe", b"MZ");
+    assert!(super::info(&fx.vault, &vp("a.exe")).unwrap().etag.is_none());
 }
 
 #[test]

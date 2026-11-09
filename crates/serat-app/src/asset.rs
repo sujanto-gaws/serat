@@ -190,16 +190,22 @@ fn locate(vault: &Vault, path: &VaultPath) -> Option<Opened> {
     }
     let file = open_verified(&absolute, vault)?;
     let meta = file.metadata().ok()?;
+    Some(Opened {
+        size: meta.len(),
+        etag: validator(&meta),
+        file,
+    })
+}
+
+/// The validator of a stat: `"<size hex>-<mtime ns hex>"`, quotes included. The scheme's
+/// `ETag`, `AssetInfo::etag` and `IpcError::AssetChanged::validator` are all this.
+fn validator(meta: &fs::Metadata) -> String {
     let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |elapsed| elapsed.as_nanos());
-    Some(Opened {
-        size: meta.len(),
-        etag: format!("\"{:x}-{:x}\"", meta.len(), mtime_ns),
-        file,
-    })
+    format!("\"{:x}-{:x}\"", meta.len(), mtime_ns)
 }
 
 /// Step 7: open, then check the **handle**. Fails closed.
@@ -645,7 +651,7 @@ pub(crate) fn info(vault: &Vault, path: &VaultPath) -> Result<AssetInfo, IpcErro
         viewable: is_viewable(mime),
         sidecar_path: sidecar_of(vault, path),
         // The scheme's ETag, verbatim (ADR-0017 Amendment 1): `"<size hex>-<mtime ns hex>"`.
-        etag: Some(opened.etag),
+        etag: is_viewable(mime).then_some(opened.etag),
     })
 }
 
@@ -691,6 +697,20 @@ pub(crate) fn read_range(
     len: u32,
     if_match: Option<&str>,
 ) -> Result<Vec<u8>, IpcError> {
+    read_range_with(vault, budget, path, start, len, if_match, || {})
+}
+
+/// [`read_range`] with a seam between the validator's stat and the read (tests only
+/// pass a non-empty one), so a writer racing the read can be reproduced.
+fn read_range_with(
+    vault: &Vault,
+    budget: &ByteBudget,
+    path: &VaultPath,
+    start: u64,
+    len: u32,
+    if_match: Option<&str>,
+    between: impl FnOnce(),
+) -> Result<Vec<u8>, IpcError> {
     let missing = || IpcError::NotFound {
         path: path.to_string(),
     };
@@ -709,7 +729,20 @@ pub(crate) fn read_range(
     }
     let len = u64::from(len).min(SPAN_CAP).min(opened.size - start);
     let _permit = budget.acquire(len);
-    read_span(&mut opened.file, start, len).map_err(|err| IpcError::Io {
+    between();
+    let read = read_span(&mut opened.file, start, len);
+    // A writer between the stat and the read (in place, or a truncation) would serve
+    // new bytes under the old validator, or fail the read. Re-stat the handle: if the
+    // validator moved, the answer is `AssetChanged`, whatever the read did.
+    if let Ok(now) = opened.file.metadata().map(|meta| validator(&meta))
+        && now != opened.etag
+    {
+        return Err(IpcError::AssetChanged {
+            path: path.to_string(),
+            validator: now,
+        });
+    }
+    read.map_err(|err| IpcError::Io {
         path: path.to_string(),
         message: err.to_string(),
     })
