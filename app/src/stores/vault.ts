@@ -45,12 +45,17 @@ export const useVaultStore = defineStore("vault", {
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
     baseHash: null as string | null,
+    /** The open vault's opaque `vault_id` (from `index_status`); compared for equality only. */
+    vaultId: null as string | null,
     /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
     refusedNames: null as number | null,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
   actions: {
+    setVaultId(id: string | null) {
+      this.vaultId = id;
+    },
     setVaultRoot(root: string | null) {
       this.vaultRoot = root;
     },

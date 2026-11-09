@@ -115,7 +115,9 @@ impl Outcome {
 /// exFAT, 2 s), ADR-0015 section 2 as amended.
 const WINDOW_MS: i64 = 2000;
 
-/// `index_meta.caught_up_from_ms`: when the last completed catch-up (or rebuild) began.
+/// `index_meta.caught_up_from_ms`: the window start of the last completed catch-up
+/// (taken immediately before the watcher was armed) or of the rebuild that built the
+/// index (taken before its walk); ADR-0015 section 2.
 fn caught_up_from_ms(conn: &Connection) -> Result<i64, IndexError> {
     conn.query_row(
         "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
@@ -280,7 +282,14 @@ impl Reconciler {
         } else {
             stored
         };
-        let window = stored.saturating_sub(WINDOW_MS);
+        // 0 is "no completed catch-up": no lower bound at all, so even a file stamped
+        // before 1970 is a candidate. (A floor of 0 on the written value below reads back
+        // as this same state, which is the conservative outcome.)
+        let window = if stored == 0 {
+            i64::MIN
+        } else {
+            stored.saturating_sub(WINDOW_MS)
+        };
         let mut scan = Scan {
             window: Some(window),
             unread_from: None,
@@ -622,7 +631,7 @@ mod support;
 
 #[cfg(test)]
 mod tests {
-    use super::support::{DiskVault, LineParser};
+    use super::support::{DiskVault, LineParser, SpyEcho};
     use super::*;
 
     /// Task #66: a catch-up whose final flush fails writes nothing, so the window the
@@ -655,5 +664,148 @@ mod tests {
         assert_eq!(handle.caught_up_from_ms().expect("value"), before);
         // The writer still holds the batch it could not commit; closing says so.
         let _ = handle.close();
+    }
+
+    /// A source that counts the loads the catch-up asks for, so a test can tell where
+    /// in the walk the catch-up thread is without timing it.
+    struct CountingSource {
+        inner: DiskVault,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NoteSource for CountingSource {
+        fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+            self.inner.entries()
+        }
+
+        fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load(path)
+        }
+    }
+
+    const DEPTH: usize = 600;
+
+    /// A vault of `bulk` new notes plus `a.md` (the note the saves rewrite), and an
+    /// index with a channel `DEPTH` deep whose writer the test can hold.
+    fn held_writer_fixture(
+        bulk: usize,
+    ) -> (tempfile::TempDir, DiskVault, IndexHandle, Vec<SourceEntry>) {
+        let dir = tempfile::tempdir().expect("temp");
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(root.join("bulk")).expect("mkdir");
+        std::fs::write(root.join("a.md"), "# A\n").expect("write");
+        for i in 0..bulk {
+            std::fs::write(root.join(format!("bulk/n{i:04}.md")), "# Bulk\nbody\n").expect("write");
+        }
+        let source = DiskVault::new(&root);
+        let entries = source.entries().expect("walk");
+        let handle = IndexHandle::with_queue_depth(&dir.path().join("index"), DEPTH).expect("open");
+        (dir, source, handle, entries)
+    }
+
+    /// Save `a.md` through the non-blocking path `times` times, or until one is refused;
+    /// returns (accepted, refused).
+    fn save_a(
+        writer: &WriterHandle,
+        source: &DiskVault,
+        parser: &LineParser,
+        times: usize,
+    ) -> (usize, usize) {
+        let a = VaultPath::new("a.md").expect("path");
+        for accepted in 0..times {
+            match crate::incremental::apply(writer, source, parser, &SpyEcho::default(), &a) {
+                Ok(()) => {}
+                Err(IndexError::QueueFull { .. }) => return (accepted, 1),
+                Err(other) => panic!("{other}"),
+            }
+        }
+        (times, 0)
+    }
+
+    /// Task #67 (ADR-0011 item 4; FR-VLT-04, NFR-REL-02): what pacing guarantees, with
+    /// the writer held so that its speed is not a variable. Pacing is the catch-up
+    /// stopping at one batch outstanding: with nothing draining, a paced catch-up
+    /// parks in its first flush with BATCH_SIZE ops queued and leaves `DEPTH -
+    /// BATCH_SIZE` slots for saves; an unpaced one keeps submitting until the channel
+    /// is full and every save is refused.
+    ///
+    /// The catch-up is "parked" when it has loaded BATCH_SIZE notes and no more. That
+    /// "no more" cannot be observed without time, so the wait for a load past the
+    /// batch is bounded (500 ms) and the paced case always spends it: a bound too
+    /// short can only make a broken pacer pass, never a correct one fail.
+    #[test]
+    fn a_paced_catch_up_leaves_the_channel_to_saves_while_the_writer_is_held() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, inner, handle, entries) = held_writer_fixture(1_100);
+        let parser = LineParser::default();
+        let source = CountingSource {
+            inner: DiskVault::new(dir.path().join("vault")),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let held = handle.fault_injector().hold();
+        let writer = handle.writer();
+        let reconciler = Reconciler::new(&handle);
+
+        let outcome = std::thread::scope(|scope| {
+            let catch_up = scope.spawn(|| {
+                reconciler.catch_up(&source, &parser, &entries, CatchUp::PathsAndMtime, None)
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while source.loads.load(SeqCst) < crate::writer::BATCH_SIZE {
+                assert!(Instant::now() < deadline, "the catch-up never got going");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Give an unpaced catch-up time to run on to a full channel (601 loads:
+            // one op in the held writer's hand, 600 queued, the next blocking).
+            let bounded = Instant::now() + Duration::from_millis(500);
+            while source.loads.load(SeqCst) <= DEPTH && Instant::now() < bounded {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            // A paced catch-up parks in its first flush at exactly one batch of loads,
+            // so a single load more is a broken pacer, whatever the machine's speed.
+            assert_eq!(
+                source.loads.load(SeqCst),
+                crate::writer::BATCH_SIZE,
+                "the catch-up loaded past one batch with the writer held: not paced"
+            );
+            // The assertion: saves are accepted while the writer is held.
+            let (accepted, refused) = save_a(&writer, &inner, &parser, 50);
+            drop(held);
+            let outcome = catch_up.join().expect("the catch-up thread panicked");
+            assert_eq!(
+                (accepted, refused),
+                (50, 0),
+                "a save was refused with the writer held: the catch-up is not paced \
+                 (loads when the saves began: at least {})",
+                crate::writer::BATCH_SIZE
+            );
+            outcome
+        });
+        outcome.expect("catch up");
+        handle.close().expect("close");
+    }
+
+    /// The negative control for the test above: with the writer held and nothing
+    /// pacing, the channel does fill and a save is refused. If this stops holding, the
+    /// held-writer test pins nothing.
+    #[test]
+    fn with_the_writer_held_an_unpaced_producer_fills_the_channel_and_a_save_is_refused() {
+        let (_dir, source, handle, _entries) = held_writer_fixture(0);
+        let parser = LineParser::default();
+        let held = handle.fault_injector().hold();
+        let writer = handle.writer();
+
+        // At most DEPTH queued plus one in the held writer's hand are ever accepted.
+        let (accepted, refused) = save_a(&writer, &source, &parser, DEPTH + 10);
+        assert_eq!(refused, 1, "{accepted} saves accepted and none refused");
+        assert!(
+            (DEPTH - 1..=DEPTH + 1).contains(&accepted),
+            "accepted {accepted} saves before the refusal"
+        );
+        drop(held);
+        handle.close().expect("close");
     }
 }

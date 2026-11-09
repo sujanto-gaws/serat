@@ -7,7 +7,7 @@
   papered over.
 -->
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import type { Backlink } from "@/ipc/generated/Backlink";
@@ -29,6 +29,7 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
+  // `newTab` is carried for the contract's sake; there are no tabs in P1, so hosts ignore it.
   open: [payload: { path: string; block: BlockLocation | null; newTab: boolean }];
 }>();
 
@@ -43,7 +44,18 @@ type PaneState =
 const state = ref<PaneState>({ kind: "idle" });
 const focusedIndex = ref(0);
 let token = 0;
+let disposed = false;
 let unlisten: (() => void) | null = null;
+/** The path the shown state belongs to; a re-read of the same path swaps in place (no skeleton). */
+let shownPath: string | null = null;
+const root = ref<HTMLElement | null>(null);
+/**
+ * Roving tabindex: the section is the tab stop until an entry holds focus; then
+ * the focused entry is (tabindex -1, focused programmatically) and the section
+ * steps out of the tab order. The destination flash on navigate is the editor's
+ * (backlinks-pane.md: "the one flash-on-navigate"), not this pane's.
+ */
+const roving = ref(false);
 
 function group(items: Backlink[]): Array<{ source: string; title: string; entries: Backlink[] }> {
   const order: string[] = [];
@@ -60,20 +72,28 @@ function group(items: Backlink[]): Array<{ source: string; title: string; entrie
   return order.map((k) => bySource.get(k) as { source: string; title: string; entries: Backlink[] });
 }
 
-async function load(): Promise<void> {
+/**
+ * `background`: an `index://changed` re-read of the note already shown. The old
+ * answer stays on screen and is swapped atomically when the new one lands; the
+ * skeleton is for a path change only.
+ */
+async function load(background = false): Promise<void> {
   const mine = ++token;
   const path = props.path;
   if (!path || props.missing) {
+    shownPath = null;
     state.value = { kind: "idle" };
     return;
   }
-  state.value = { kind: "loading" };
-  const floor = new Promise<void>((resolve) => setTimeout(resolve, props.minLoadingMs));
+  const keep = background && shownPath === path && (state.value.kind === "ready" || state.value.kind === "empty");
+  if (!keep) state.value = { kind: "loading" };
+  shownPath = path;
+  const floor = keep ? Promise.resolve() : new Promise<void>((resolve) => setTimeout(resolve, props.minLoadingMs));
   let result;
   try {
     [result] = await Promise.all([props.ipc.backlinks({ path }), floor]);
   } catch {
-    if (mine === token) state.value = { kind: "error" };
+    if (mine === token && !keep) state.value = { kind: "error" };
     return;
   }
   if (mine !== token) return; // a newer load superseded this one
@@ -84,7 +104,7 @@ async function load(): Promise<void> {
   } else {
     state.value = { kind: "ready", groups: group(result.value), count: result.value.length };
   }
-  focusedIndex.value = 0;
+  focusedIndex.value = keep ? Math.min(focusedIndex.value, Math.max(0, flatEntries().length - 1)) : 0;
 }
 
 watch(() => [props.path, props.missing], () => void load());
@@ -92,13 +112,15 @@ watch(() => [props.path, props.missing], () => void load());
 onMounted(() => {
   void load();
   props.ipc
-    .onIndexChanged(() => void load())
+    .onIndexChanged(() => void load(true))
     .then((off) => {
-      unlisten = off;
+      if (disposed) off(); // resolved after unmount: do not leak the listener
+      else unlisten = off;
     })
     .catch(() => undefined);
 });
 onBeforeUnmount(() => {
+  disposed = true;
   token += 1;
   unlisten?.();
 });
@@ -115,9 +137,9 @@ function onKeydown(event: KeyboardEvent): void {
   const entries = flatEntries();
   if (entries.length === 0) return;
   if (event.key === "ArrowDown") {
-    focusedIndex.value = Math.min(entries.length - 1, focusedIndex.value + 1);
+    moveTo(Math.min(entries.length - 1, focusedIndex.value + 1));
   } else if (event.key === "ArrowUp") {
-    focusedIndex.value = Math.max(0, focusedIndex.value - 1);
+    moveTo(Math.max(0, focusedIndex.value - 1));
   } else if (event.key === "Enter") {
     openEntry(entries[focusedIndex.value], event.ctrlKey || event.metaKey);
   } else {
@@ -130,11 +152,50 @@ function indexOfEntry(entry: Backlink): number {
   return flatEntries().indexOf(entry);
 }
 
+function entryId(entry: Backlink): string {
+  return `serat-backlink-${indexOfEntry(entry)}`;
+}
+
+/** Moves the selection and DOM focus together. */
+function moveTo(index: number): void {
+  focusedIndex.value = index;
+  roving.value = true;
+  void nextTick(() => root.value?.querySelector<HTMLElement>(`#serat-backlink-${index}`)?.focus());
+}
+
+/** Tabbing (or ⌘3) onto the section lands on the current entry. */
+function onSectionFocus(event: FocusEvent): void {
+  if (event.target === root.value && flatEntries().length > 0) moveTo(focusedIndex.value);
+}
+
+function onFocusOut(event: FocusEvent): void {
+  if (!root.value?.contains(event.relatedTarget as Node | null)) roving.value = false;
+}
+
+function onEntryClick(entry: Backlink): void {
+  moveTo(indexOfEntry(entry));
+  openEntry(entry, false);
+}
+
+function focus(): void {
+  root.value?.focus();
+}
+defineExpose({ focus });
+
 const total = (): number => (state.value.kind === "ready" ? state.value.count : 0);
 </script>
 
 <template>
-  <section class="serat-backlinks" aria-label="Backlinks" data-testid="backlinks" tabindex="0" @keydown="onKeydown">
+  <section
+    ref="root"
+    class="serat-backlinks"
+    aria-label="Backlinks"
+    data-testid="backlinks"
+    :tabindex="roving ? -1 : 0"
+    @keydown="onKeydown"
+    @focus="onSectionFocus"
+    @focusout="onFocusOut"
+  >
     <h3>Backlinks<span v-if="state.kind === 'ready'"> ({{ total() }})</span></h3>
     <p v-if="missing" class="serat-backlinks-note">This note no longer exists</p>
     <div v-else-if="state.kind === 'loading'" class="serat-backlinks-skeleton" data-testid="backlinks-loading" aria-hidden="true">
@@ -146,24 +207,30 @@ const total = (): number => (state.value.kind === "ready" ? state.value.count : 
       Building the index — backlinks available shortly.
     </p>
     <p v-else-if="state.kind === 'error'" class="serat-backlinks-note">Backlinks could not be read.</p>
+    <!-- One group per source note; the title labels the group and is never a bare child of a list. -->
     <div v-else-if="state.kind === 'ready'" role="list">
-      <template v-for="g in state.groups" :key="g.source">
-        <h4 class="serat-backlinks-source">{{ g.title }}</h4>
-        <div
-          v-for="(entry, i) in g.entries"
-          :key="g.source + ':' + (entry.block ? entry.block.block_id : 'fm') + ':' + i"
-          role="listitem"
-          class="serat-backlink"
-          :class="{ 'serat-backlink-focused': indexOfEntry(entry) === focusedIndex }"
-          :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
-          @click="openEntry(entry, false)"
-        >
-          <span v-if="!entry.block" class="serat-backlink-frontmatter">frontmatter</span>
-          <span v-else class="serat-backlink-excerpt"
-            ><template v-for="(seg, k) in splitSnippet(entry.excerpt)" :key="k">{{ seg.text }}</template></span
+      <div v-for="g in state.groups" :key="g.source" role="listitem" class="serat-backlinks-group">
+        <div class="serat-backlinks-source" role="presentation">{{ g.title }}</div>
+        <div role="list" :aria-label="g.title">
+          <div
+            v-for="(entry, i) in g.entries"
+            :id="entryId(entry)"
+            :key="g.source + ':' + (entry.block ? entry.block.block_id : 'fm') + ':' + i"
+            role="listitem"
+            class="serat-backlink"
+            tabindex="-1"
+            :class="{ 'serat-backlink-focused': indexOfEntry(entry) === focusedIndex }"
+            :aria-label="g.title + ': ' + (entry.block ? entry.excerpt : 'frontmatter')"
+            @click="onEntryClick(entry)"
           >
+            <!-- TODO(#79): the contract's Backlink carries no frontmatter field key yet; shows "frontmatter" only. -->
+            <span v-if="!entry.block" class="serat-backlink-frontmatter">frontmatter</span>
+            <span v-else class="serat-backlink-excerpt"
+              ><template v-for="(seg, k) in splitSnippet(entry.excerpt)" :key="k">{{ seg.text }}</template></span
+            >
+          </div>
         </div>
-      </template>
+      </div>
     </div>
   </section>
 </template>

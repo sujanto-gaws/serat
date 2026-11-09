@@ -36,9 +36,11 @@ import { buildEditorExtensions, createEditorCommandRegistry, editorScrollExtensi
 import { EditorBuffer, type SaveOutcome } from "@/editor/buffer";
 import { seratMarkdown } from "@/editor/markdownLanguage";
 import Preview from "@/editor/Preview.vue";
+import ExternalCompare from "@/editor/ExternalCompare.vue";
 import { blockWidgetsExtension } from "@/editor/blockWidgets";
 import { minimalReplacement, patchesToChangeSet, planExternal, externalChangeSet } from "@/editor/reconcile";
 import { textFromString } from "@/editor/patches";
+import type { AppClosing } from "@/ipc/generated/AppClosing";
 import type { ExternalChange } from "@/ipc/generated/ExternalChange";
 import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
@@ -53,6 +55,9 @@ import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
  * the save command." */
 const AUTOSAVE_IDLE_MS = 1000;
 
+/** How long a transient notice (confirmation, "disk matches again") stays up. */
+const NOTICE_MS = 3000;
+
 const props = withDefaults(
   defineProps<{
     placeholder?: string;
@@ -63,8 +68,13 @@ const props = withDefaults(
     ipc?: EditorIpcAdapter;
     /** `resolve_links` / `note_anchors` / `switcher_query` / `index://changed`. */
     linkIpc?: LinkIpcAdapter;
+    /** The open vault's `vault_id` (from `index_status`; opaque, compared for equality only).
+     * `null`/absent until known: events are then not filtered, since nothing can be
+     * compared. Captured per buffer at `loadNote`, so an `app://closing` for the OLD
+     * vault of a switch still reaches the buffer that belongs to it (architecture 3.1.1 item 6.7). */
+    vaultId?: string | null;
   }>(),
-  { livePreview: true, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
+  { livePreview: true, vaultId: null, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
 
 const emit = defineEmits<{
@@ -77,6 +87,12 @@ const emit = defineEmits<{
   "follow-link": [target: FollowLinkTarget];
   /** *Compare* on an external-change conflict: the host opens a diff of the two texts. */
   "compare-external": [payload: { path: string; mine: string; disk: string }];
+  /** A disjoint external edit was merged into unsaved work: the host may show "Updated externally" for 3 s
+   * (external-change-notice.md). A clean-buffer reload is silent by spec and emits nothing. */
+  "external-merged": [payload: { path: string }];
+  /** True while a save cannot proceed and nothing explains it (request_external_diff failed outright):
+   * the host shows the persistent "Not saved - file changed on disk" line with Compare (editor.md). */
+  "save-blocked": [blocked: boolean];
 }>();
 
 const host = ref<HTMLDivElement | null>(null);
@@ -113,6 +129,7 @@ async function performSave(explicit = false): Promise<SaveOutcome | null> {
   const started = buffer;
   const outcome = await started.save(props.ipc, { explicit });
   markDirty();
+  if (outcome.kind === "saved") blocked.value = false;
   emit("save-outcome", outcome);
   // ADR-0016 §2: a StaleHash always asks for the diff right away; it does not
   // wait for an event that may already have been dropped.
@@ -140,6 +157,44 @@ interface ExternalConflict {
 const conflict = ref<ExternalConflict | null>(null);
 const deleted = ref(false);
 const notice = ref<string | null>(null);
+/** The conflict notice folded into a brass dot (`Esc` on the focused card); the conflict stays pending. */
+const minimised = ref(false);
+/** The in-place diff (the "Comparing" state of external-change-notice.md). */
+const comparing = ref<{ path: string; mine: string; disk: string; resolvable: boolean } | null>(null);
+/** A refused save that nothing explains: `request_external_diff` itself failed. */
+const blocked = ref(false);
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+watch(blocked, (v) => emit("save-blocked", v));
+watch(conflict, (c, was) => {
+  if (c && !was) minimised.value = false; // a fresh conflict shows the full notice
+  if (!c) {
+    minimised.value = false;
+    if (comparing.value?.resolvable) comparing.value = null;
+  }
+});
+
+/** A short status line that clears itself (confirmations, "disk matches again"). */
+function flashNotice(text: string): void {
+  if (noticeTimer) clearTimeout(noticeTimer);
+  notice.value = text;
+  noticeTimer = setTimeout(() => {
+    noticeTimer = null;
+    if (notice.value === text) notice.value = null;
+  }, NOTICE_MS);
+}
+
+const DISK_MATCHES = "The file on disk matches your last save again; nothing to compare.";
+
+/** The disk equals the base again: the stale block is lifted, and a dirty buffer must resume saving
+ * (otherwise it sits unsaved until the next keystroke). */
+function resumeAfterDiskMatches(b: EditorBuffer): void {
+  b.clearStale();
+  blocked.value = false;
+  markDirty();
+  if (b.isDirty) scheduleAutosave();
+  flashNotice(DISK_MATCHES);
+}
 /** `ExternalChange`s that arrived while a save was in flight (§2: held, not applied). */
 let held: Array<Extract<ExternalChange, { kind: "changed" }>> = [];
 let draining = false;
@@ -160,6 +215,8 @@ function dispatchExternal(changes: ChangeSet): void {
 async function onExternalChange(change: ExternalChange): Promise<void> {
   const b = buffer;
   if (!b || change.path !== b.path) return;
+  // "Session scope; discard if it is not the open vault" (contracts/ipc.rs).
+  if (!isOurVault(change.vault_id)) return;
   if (change.kind === "deleted") {
     deleted.value = true;
     notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
@@ -206,12 +263,16 @@ async function requestFreshDiff(b: EditorBuffer): Promise<void> {
     if (errorKind(error) === "stale_hash") {
       // serat-app no longer holds the base bytes: no guess, conflict path (§2).
       conflict.value = { change: null, newHash: (error as { current_hash: string }).current_hash };
+    } else if (b.isStale) {
+      // The request failed outright after a refused save: nothing explains the refusal, so say so
+      // (persistently) rather than sit at "Unsaved" with no indication (editor.md, StaleHash).
+      blocked.value = true;
     }
     return;
   }
   if (b !== buffer) return;
   if (answer === null) {
-    b.clearStale(); // disk equals the base: nothing diverged after all
+    resumeAfterDiskMatches(b); // disk equals the base: nothing diverged after all
     return;
   }
   if (answer.kind === "deleted") {
@@ -251,6 +312,7 @@ function applyChange(b: EditorBuffer, change: Extract<ExternalChange, { kind: "c
     case "apply-rebased":
       dispatchExternal(plan.externalOnDoc);
       b.adoptExternal(plan.external, change.new_hash, plan.localRebased);
+      emit("external-merged", { path: b.path });
       break;
     case "conflict":
       conflict.value = { change, newHash: change.new_hash };
@@ -303,8 +365,10 @@ async function keepMine(): Promise<void> {
   }
   b.rebaseOnto(disk.text, disk.hash, patchesToChangeSet(textFromString(disk.text), patches));
   conflict.value = null;
+  blocked.value = false;
   markDirty();
   if (b.isDirty) scheduleAutosave();
+  flashNotice("Keeping your version \u2014 the external change will be replaced when you save.");
 }
 
 /** *Take theirs* (§4): replace the buffer in one history-recorded transaction,
@@ -326,17 +390,75 @@ async function takeTheirs(): Promise<void> {
   }
   b.rebaseOnto(disk.text, disk.hash, null);
   conflict.value = null;
+  blocked.value = false;
   markDirty();
+  flashNotice("Took the disk version \u2014 undo brings back what you typed.");
+}
+
+/** Asks serat-app for the diff against the current base right now (ADR-0016 section 2, rule 3):
+ * the disk may have moved since the notice went up. Returns the conflict to compare against,
+ * or null when there is nothing to compare any more (the disk equals the base again, the note
+ * was deleted, or the buffer changed). A failed request keeps the conflict we already have. */
+async function refreshConflict(b: EditorBuffer, c: ExternalConflict): Promise<ExternalConflict | null> {
+  let answer: ExternalChange | null;
+  try {
+    answer = await props.ipc.requestExternalDiff({ path: b.path, base_hash: b.baseHash });
+  } catch (error) {
+    if (errorKind(error) === "stale_hash") {
+      return { change: null, newHash: (error as { current_hash: string }).current_hash };
+    }
+    return c;
+  }
+  if (b !== buffer) return null;
+  if (answer === null) {
+    conflict.value = null; // disk equals the base: nothing diverged after all
+    resumeAfterDiskMatches(b);
+    return null;
+  }
+  if (answer.kind === "deleted") {
+    conflict.value = null;
+    deleted.value = true;
+    notice.value = "This note was deleted on disk. Your text is kept; save to recreate it.";
+    return null;
+  }
+  if (answer.base_hash !== b.baseHash) return { change: null, newHash: answer.new_hash };
+  return { change: answer, newHash: answer.new_hash };
 }
 
 /** *Compare*: hands both texts to the host; nothing is changed or discarded. */
 async function compareExternal(): Promise<void> {
   const b = buffer;
-  const c = conflict.value;
-  if (!b || !c || !view) return;
+  const c0 = conflict.value;
+  if (!b || !c0 || !view) return;
+  const c = await refreshConflict(b, c0);
+  if (!c || b !== buffer || !view) return;
+  conflict.value = c;
   const disk = await diskTextFor(b, c);
   if (!disk) return;
-  emit("compare-external", { path: b.path, mine: view.state.doc.toString(), disk: disk.text });
+  const mine = view.state.doc.toString();
+  emit("compare-external", { path: b.path, mine, disk: disk.text });
+  comparing.value = { path: b.path, mine, disk: disk.text, resolvable: true };
+}
+
+/** *Compare* from the persistent "Not saved - file changed on disk" line: there is no conflict to
+ * resolve, only a refused save, so read the disk and show both (inspection only). */
+async function compareWithDisk(): Promise<void> {
+  const b = buffer;
+  if (!b || !view) return;
+  try {
+    const file = await props.ipc.readFile({ path: b.path });
+    if (b !== buffer || !view) return;
+    const mine = view.state.doc.toString();
+    emit("compare-external", { path: b.path, mine, disk: file.text });
+    comparing.value = { path: b.path, mine, disk: file.text, resolvable: false };
+  } catch {
+    flashNotice("Could not read the file on disk to compare.");
+  }
+}
+
+async function resolveFromCompare(action: () => Promise<void>): Promise<void> {
+  await action();
+  comparing.value = null;
 }
 
 /** ADR-0016 §4: a note deleted on disk keeps its buffer; the save command then
@@ -361,6 +483,70 @@ async function recreateDeletedNote(): Promise<SaveOutcome | null> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Clean close (NFR-REL-01, FR-EDT-01; architecture.md 3.1.1 item 6)
+// ---------------------------------------------------------------------------
+
+/** The vault the current buffer was loaded from; `null` when not known then. */
+let bufferVaultId: string | null = null;
+
+/** True unless both sides know their vault id and they differ. */
+function isOurVault(id: string): boolean {
+  const mine = bufferVaultId ?? props.vaultId;
+  return mine === null || mine === undefined || mine === id;
+}
+
+watch(
+  () => props.vaultId,
+  (id) => {
+    // A buffer opened before the id was known belongs to the first vault we learn of.
+    // KNOWN LIMIT (#80): `store.vaultId` is overwritten by every index_status poll/event with no ordering,
+    // so after a vault switch this could tag a B buffer with A's id. Unreachable today (no frontend
+    // switch path); the vault-switch UI task owns the fix.
+    if (id && buffer && bufferVaultId === null) bufferVaultId = id;
+  },
+);
+
+/** `vault_id`s whose close flush has started: `app://closing` is emitted once per close, but
+ * the ack must be sent exactly once whatever the transport does. */
+const closingSeen = new Set<string>();
+
+async function onClosing(closing: AppClosing): Promise<void> {
+  if (!isOurVault(closing.vault_id)) return; // another vault's close: not ours to ack
+  // Never removed: one close, one flush, one ack per vault id, literally (ids are unique per open).
+  if (closingSeen.has(closing.vault_id)) return;
+  closingSeen.add(closing.vault_id);
+
+  try {
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    const b = buffer;
+    if (b && !deleted.value) {
+      // Awaits an in-flight save, then issues the coalesced remainder. A StaleHash, a refusal or an
+      // error leaves the buffer dirty and untouched (C-04: never re-serialised); we ack anyway,
+      // because the conflict path needs a user and the close does not wait for one. That buffer's
+      // edits are lost at exit: the same residual as a crash during a conflict (architecture 3.1.1
+      // item 6), recorded rather than hidden.
+      //
+      // No deadline race: we never ack while a save is still in flight. An early ack would end the
+      // core's wait and refuse an in-transit save_patch; the core's own 2 s bound is the backstop
+      // for a save that hangs, and the late ack after it is ignored.
+      await b.flush(props.ipc).catch(() => false);
+      markDirty();
+    }
+    // A note deleted on disk is NOT recreated by a close (only the explicit save command does,
+    // ADR-0016 section 4): its unsaved text is lost at exit, the same recorded residual.
+  } finally {
+    try {
+      await props.ipc.flushAck({ vault_id: closing.vault_id });
+    } catch {
+      /* never fails by contract; if the transport does, the core's bound is the backstop */
+    }
+  }
+}
+
 function scheduleAutosave(): void {
   if (autosaveTimer) clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => {
@@ -371,6 +557,7 @@ function scheduleAutosave(): void {
 const resolver = new LinkResolver(props.linkIpc);
 let unlistenIndexChanged: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
+let unlistenClosing: (() => void) | null = null;
 
 export interface FollowLinkTarget {
   /** As written, minus brackets and `|display`. */
@@ -490,6 +677,15 @@ onMounted(() => {
     .catch(() => {
       /* no event channel (tests, early boot): StaleHash still requests the diff */
     });
+  props.ipc
+    .onClosing((closing) => void onClosing(closing))
+    .then((unlisten) => {
+      if (view) unlistenClosing = unlisten;
+      else unlisten();
+    })
+    .catch(() => {
+      /* no event channel (tests, early boot) */
+    });
   view = new EditorView({
     parent: shadowRoot,
     state: EditorState.create({
@@ -504,6 +700,8 @@ onBeforeUnmount(() => {
   unlistenIndexChanged = null;
   unlistenExternal?.();
   unlistenExternal = null;
+  unlistenClosing?.();
+  unlistenClosing = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
   view?.destroy();
@@ -565,10 +763,13 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
     void props.ipc.noteClosed({ path: old.path, base_hash: old.baseHash }).catch(() => undefined);
   }
   buffer = new EditorBuffer(path, text, baseHash);
+  bufferVaultId = props.vaultId ?? null;
   held = [];
   conflict.value = null;
   deleted.value = false;
   notice.value = null;
+  comparing.value = null;
+  blocked.value = false;
   replaceState(text);
   markDirty();
   // Tells serat-app this pane holds the note at this base, so it emits
@@ -631,6 +832,7 @@ defineExpose({
   revealOffset,
   loadNote,
   triggerSave,
+  compareWithDisk,
   isDirty,
   conflict,
   undo: () => view && undo(view),
@@ -641,13 +843,39 @@ defineExpose({
 <template>
   <div class="serat-editor-surface" data-testid="serat-editor">
     <div ref="host" class="cm-editor-host"></div>
-    <div v-if="conflict" class="serat-external-notice" role="status" data-testid="external-conflict">
+    <div
+      v-if="conflict && !minimised"
+      class="serat-external-notice"
+      role="status"
+      tabindex="0"
+      data-testid="external-conflict"
+      @keydown.esc.stop.prevent="minimised = true"
+    >
       <span>This note changed on disk and your unsaved edits overlap the change. Nothing has been discarded.</span>
       <button type="button" data-testid="keep-mine" @click="keepMine">Keep mine</button>
       <button type="button" data-testid="take-theirs" @click="takeTheirs">Take theirs</button>
       <button type="button" data-testid="compare" @click="compareExternal">Compare</button>
     </div>
+    <button
+      v-else-if="conflict"
+      type="button"
+      class="serat-external-dot"
+      title="External change pending \u2014 click to review"
+      aria-label="External change pending \u2014 click to review"
+      data-testid="external-dot"
+      @click="minimised = false"
+    ></button>
     <div v-else-if="notice" class="serat-external-notice" role="status" data-testid="external-notice">{{ notice }}</div>
+    <ExternalCompare
+      v-if="comparing"
+      :path="comparing.path"
+      :mine="comparing.mine"
+      :disk="comparing.disk"
+      :resolvable="comparing.resolvable && !!conflict"
+      @close="comparing = null"
+      @keep-mine="resolveFromCompare(keepMine)"
+      @take-theirs="resolveFromCompare(takeTheirs)"
+    />
     <Preview
       v-if="!livePreview"
       class="serat-editor-split-preview"
@@ -671,6 +899,19 @@ defineExpose({
   border: 1px solid var(--serat-border-hairline, #ddd);
   background: var(--serat-surface-raised, #fff);
   font-size: 0.9em;
+}
+.serat-external-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--serat-accent-secondary, #b08d2f);
+  cursor: pointer;
 }
 .serat-editor-surface {
   position: relative;

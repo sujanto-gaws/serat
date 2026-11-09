@@ -206,7 +206,7 @@ impl Vault {
                 .as_ref()
                 .and_then(|_| fs::metadata(target).ok())
                 .map(|m| m.permissions());
-            let temp = atomic::write_temp(parent, &file_name, &bytes, permissions)
+            let (temp, _) = atomic::write_temp(parent, &file_name, &bytes, permissions)
                 .map_err(|e| failed(e.to_string()))?;
             before_check(attempt);
 
