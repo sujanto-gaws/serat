@@ -287,8 +287,12 @@ pub(crate) enum FailAt {
 /// What a failed open owes (task #90): once `vault://opened` has announced the id, an
 /// open that returns `Err` must leave nothing that can carry it. Armed from the
 /// publisher's creation, disarmed only by [`OpenAttempt::commit`] at the `replace`.
-/// Retire first, then join the actor: after the join no status can be mid-emit and the
-/// actor has closed its handle, so a re-open never meets a second writer on `index.db`.
+/// Retire first, then join the actor for at most `CLOSE_DEADLINE`: a join that finishes
+/// means no status can be mid-emit and the actor has closed its handle, so a re-open
+/// never meets a second writer on `index.db`. Past the deadline the actor is detached
+/// (a close must not wait out a whole rebuild while holding `opening`); retire still
+/// stops every further emit, but the detached rebuild may keep writing `index.db` until
+/// it ends -- the accepted residue.
 struct OpenAttempt {
     publisher: Arc<Publisher>,
     actor: Option<IndexActor>,
@@ -307,7 +311,7 @@ impl Drop for OpenAttempt {
         if self.armed {
             self.publisher.retire();
             if let Some(actor) = self.actor.as_mut() {
-                actor.join();
+                actor.join_within(CLOSE_DEADLINE);
             }
         }
     }
@@ -5069,9 +5073,9 @@ mod tests {
                 "{at:?}: only the actor's own status may fall in the window before Err"
             );
 
-            // Nothing holds `index.db`: the same root opens again with a fresh id.
-            // `FailAt` is cleared by building the retry on a new state, so this is the
-            // same-root reopen on a process that still has the failed attempt's files.
+            // Only that a failed attempt does not wedge a later open of the same root.
+            // It does not prove the join: the fixture is tiny, so the actor is finished
+            // long before this runs. `a_failed_open_waits_for_the_index_thread...` pins it.
             let retry = AppState::with_settings(
                 Arc::new(Startup::begin()),
                 Boot::default(),
@@ -5084,6 +5088,45 @@ mod tests {
             retry.close_vault();
             let _ = std::fs::remove_dir_all(&a);
         }
+    }
+
+    #[test]
+    fn a_failed_open_waits_for_the_index_thread_before_returning_err() {
+        // SF-1 / task #90: the guard retires the publisher and then joins the actor
+        // (bounded by CLOSE_DEADLINE). Removing the join makes `finished` false here.
+        struct Sleeper(Arc<std::sync::atomic::AtomicBool>);
+        impl IndexOpen for Sleeper {
+            fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
+                publish(IndexState::Opening);
+                std::thread::sleep(Duration::from_millis(400));
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (state, _log, a, _b) = switch_state(
+            "opened-join",
+            |_| OpenHooks {
+                fail_at: Some(FailAt::VaultThread),
+                ..OpenHooks::default()
+            },
+            true,
+        );
+        let started = Instant::now();
+        let err = state
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: a.display().to_string(),
+                },
+                Sleeper(Arc::clone(&finished)),
+            )
+            .expect_err("fails at the vault thread");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "open_vault_with returned Err while the index thread was still running"
+        );
+        assert!(started.elapsed() < CLOSE_DEADLINE, "bounded, not unbounded");
+        let _ = std::fs::remove_dir_all(&a);
     }
 
     #[test]

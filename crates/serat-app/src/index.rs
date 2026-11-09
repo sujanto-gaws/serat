@@ -662,8 +662,30 @@ impl IndexActor {
         ))
     }
 
-    /// Wait for the actor to finish. Tests only; the application never joins it on a
-    /// path a user is waiting on.
+    /// Wait, at most `deadline`, for the actor to finish; past it the thread is
+    /// detached and `false` is returned. A failed open uses this (task #90): the
+    /// publisher is retired first so nothing further is emitted, but a detached actor
+    /// may still be inside a synchronous rebuild and writing `index.db` -- that residue
+    /// is accepted rather than holding `opening` (and so a window close) for a whole
+    /// rebuild.
+    pub fn join_within(&mut self, deadline: Duration) -> bool {
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        let limit = Instant::now() + deadline;
+        while !handle.is_finished() {
+            if Instant::now() >= limit {
+                eprintln!("serat: the index thread did not stop within {deadline:?}; detached");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = handle.join();
+        true
+    }
+
+    /// Wait for the actor to finish, unbounded. Tests only: nothing a user waits on may
+    /// call it.
     pub fn join(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
