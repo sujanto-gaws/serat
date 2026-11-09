@@ -1,5 +1,5 @@
 //! FR-VLT-04 · an external change is visible in the index within 500 ms · reported,
-//! with `--assert` as the gate.
+//! with --assert as the gate (p95 over the single-note changes, PRD v1.9 FR-VLT-04; --assert refuses any vault but 20k).
 //!
 //! Serves **FR-VLT-04**, **NFR-REL-01**, **US-35**; architecture §3.1.2 (the watcher
 //! path), not §3.1.1 (the save path, NFR-PRF-03's 50 ms, which has no watcher and no
@@ -217,6 +217,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         }
     }
 
+    budget::gate::require_only_20k(assert, &vault_name)?;
     let pinned = ensure_vault(&vault_name)?;
     let work: PathBuf =
         std::env::temp_dir().join(format!("serat-p1-external-{}", std::process::id()));
@@ -344,7 +345,7 @@ fn run(args: &[String]) -> Result<bool, String> {
          window 150 ms, budget {BUDGET_MS} ms",
         pinned.notes
     );
-    let mut pass = true;
+    let mut rows = Vec::new();
     for (label, runs, size) in [("single", &single, 1), ("batch", &batch, batch_size)] {
         let series = |f: fn(&Measured) -> f64| {
             let mut samples = Samples::new();
@@ -360,20 +361,27 @@ fn run(args: &[String]) -> Result<bool, String> {
         line("  processing to committed", &series(|m| m.processing_ms));
         let within = total.percentile(0.95) <= BUDGET_MS;
         println!(
-            "{label}: p95 {:.1} ms against {BUDGET_MS} ms: {}{}",
+            "{label}: p95 {:.1} ms, max {:.1} ms, against {BUDGET_MS} ms: {}{}",
             total.percentile(0.95),
+            total.max(),
             if within { "within" } else { "OVER" },
             if label == "single" {
-                ""
+                " (gated on p95, PRD v1.9 FR-VLT-04; max reported, not gated)"
             } else {
                 " (reported, not gated)"
             }
         );
         if label == "single" {
-            pass &= within;
+            rows.push(("single note".to_owned(), total.percentile(0.95)));
         }
     }
-    Ok(pass || !assert)
+    let breaches = budget::gate::breaches(BUDGET_MS, &rows);
+    if assert {
+        for b in &breaches {
+            eprintln!("FR-VLT-04: over budget (--assert): {b}");
+        }
+    }
+    Ok(budget::gate::passes(assert, &breaches))
 }
 
 fn main() -> ExitCode {
