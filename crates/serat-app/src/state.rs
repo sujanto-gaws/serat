@@ -739,6 +739,9 @@ impl AppState {
             editor: Arc::clone(&editor),
             indexer: Arc::clone(&indexer),
         });
+        // ADR-0015 section 2 as amended (task #78): the catch-up window starts at the
+        // wall-clock time taken immediately before the watcher is armed.
+        indexer.window_opened(serat_index::rebuild::now_ms());
         let walk = VaultThread::spawn_with(
             Arc::clone(&vault),
             move |stage| {
@@ -3978,6 +3981,50 @@ mod tests {
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_catch_up_window_starts_no_later_than_the_watcher_registering() {
+        // Task #78: the stamp the open's catch-up records predates `WatcherRegistered`.
+        let dir = fixture("window-before-watcher");
+        open_and_close_cleanly(&dir);
+        let old = window_of(&dir);
+        std::thread::sleep(Duration::from_millis(30));
+        let registered: Arc<Mutex<Option<i64>>> = Arc::default();
+        let at = Arc::clone(&registered);
+        let state = state_with(OpenHooks {
+            on_stage: Some(Arc::new(move |stage| {
+                if stage == Stage::WatcherRegistered {
+                    *at.lock().expect("at") = Some(serat_index::rebuild::now_ms());
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })),
+            on_walk_start: None,
+        });
+        state.open_vault(open_args(&dir)).expect("open");
+        wait_until("the catch-up to record its window", || {
+            window_of(&dir) > old
+        });
+        let window = window_of(&dir);
+        let registered = registered.lock().expect("at").expect("stage seen");
+        assert!(
+            window <= registered,
+            "window {window} is after the watcher registered at {registered}"
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn window_of(dir: &Path) -> i64 {
+        rusqlite::Connection::open(dir.join(".serat").join("index.db"))
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(0)
     }
 
     #[test]
