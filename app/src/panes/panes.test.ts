@@ -131,7 +131,7 @@ describe("BacklinksPane", () => {
     expect(wrapper.text()).toContain("<img src=x onerror=alert(1)>");
   });
 
-  it("frontmatter entries show their keys in the order given; absent or empty is the bare word (FR-NAV-02)", async () => {
+  it("frontmatter entries show their keys in the order given; absent or empty is the bare word (FR-NAV-04)", async () => {
     const backlinks = vi.fn().mockResolvedValue({
       kind: "ready",
       value: [
@@ -431,7 +431,7 @@ describe("SearchPanel", () => {
     expect(wrapper.emitted("open")?.[0][0]).toMatchObject({ path: "A.md", block: { block_id: 1 }, newTab: false });
   });
 
-  it("marks a hit 'approximate' in text only when changed_since_indexed is true; the click still opens it at its block (FR-NAV-04)", async () => {
+  it("marks a hit 'approximate' in text only when changed_since_indexed is true; the click still opens it at its block (FR-NAV-02)", async () => {
     const search = vi.fn().mockResolvedValue(
       hits([
         { ...hit("A.md", "alpha", 1), changed_since_indexed: true },
@@ -444,7 +444,8 @@ describe("SearchPanel", () => {
     await vi.advanceTimersByTimeAsync(300);
     const rows = wrapper.findAll('[role="listitem"]');
     expect(rows[0].find('[data-testid="hit-approximate"]').text()).toContain("approximate");
-    expect(rows[0].attributes("aria-label")).toContain("approximate location");
+    expect(rows[0].element.lastElementChild?.getAttribute("data-testid")).toBe("hit-approximate"); // beneath the row, last child
+    expect(rows[0].attributes("aria-label")).toContain("approximate — this note has changed since it was indexed");
     expect(rows[1].find('[data-testid="hit-approximate"]').exists()).toBe(false);
     expect(rows[2].find('[data-testid="hit-approximate"]').exists()).toBe(false);
     expect(rows[1].attributes("aria-label")).not.toContain("approximate");

@@ -331,16 +331,13 @@ defineExpose({ input, run, focus });
             role="listitem"
             class="serat-hit"
             :class="{ 'serat-hit-focused': i === focusedIndex }"
-            :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '') + (hit.changed_since_indexed === true ? ', approximate location' : '')"
+            :aria-label="titleOf(hit.path, hit.title) + (hit.snippet ? ': ' + plainSnippet(hit.snippet) : '') + (hit.changed_since_indexed === true ? ', approximate — this note has changed since it was indexed' : '')"
             @click="moveTo(i); openHit(hit, false)"
           >
             <div class="serat-hit-head">
               <span class="serat-hit-title">{{ titleOf(hit.path, hit.title) }}</span>
               <span v-if="hit.kind === 'asset'" class="serat-hit-kind">{{ hit.mime ?? "file" }}</span>
               <span class="serat-hit-folder">{{ folderOf(hit.path) }}</span>
-            </div>
-            <div v-if="hit.changed_since_indexed === true" class="serat-hit-approx" data-testid="hit-approximate">
-              approximate — this note has changed since it was indexed
             </div>
             <div v-if="hit.snippet" class="serat-hit-snippet">
               <template v-for="(seg, k) in splitSnippet(hit.snippet)" :key="k"
@@ -349,6 +346,9 @@ defineExpose({ input, run, focus });
               >
             </div>
             <div v-else-if="view.filter" class="serat-hit-field">{{ view.filter.slice(1, -1).replace(':', ': ') }}</div>
+            <div v-if="hit.changed_since_indexed === true" class="serat-hit-approx" data-testid="hit-approximate">
+              approximate — this note has changed since it was indexed
+            </div>
           </div>
         </div>
         <button v-if="hasMore" type="button" class="serat-search-more" data-testid="search-more" @click="run(true)">
