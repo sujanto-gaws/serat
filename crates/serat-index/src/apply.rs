@@ -176,17 +176,22 @@ fn upsert_note(
     for field in &parsed.fields {
         insert_field(tx, note_id, id_of(field.block_ord), field)?;
     }
+    let frontmatter_fields: Vec<&Field> = parsed
+        .fields
+        .iter()
+        .filter(|f| f.source == FieldSource::Frontmatter)
+        .collect();
     for link in &parsed.links {
         // The frontmatter field whose byte range contains the link, if any (task #86).
-        let field_key = parsed
-            .fields
-            .iter()
-            .find(|f| {
-                f.source == FieldSource::Frontmatter
-                    && f.range.start <= link.range.start
-                    && link.range.end <= f.range.end
-            })
-            .map(|f| f.key.as_str());
+        // Frontmatter links belong to no block, so a block link skips the search.
+        let field_key = if link.block_ord.is_some() {
+            None
+        } else {
+            frontmatter_fields
+                .iter()
+                .find(|f| f.range.start <= link.range.start && link.range.end <= f.range.end)
+                .map(|f| f.key.as_str())
+        };
         insert_link(tx, note_id, id_of(link.block_ord), link, field_key)?;
     }
     for task in &parsed.tasks {

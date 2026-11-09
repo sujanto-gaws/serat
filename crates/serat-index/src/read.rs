@@ -126,8 +126,10 @@ pub struct Backlink {
     pub block: Option<BlockLocation>,
     /// Block text cut to [`EXCERPT_CHARS`] characters; empty for frontmatter.
     pub excerpt: String,
-    /// Distinct frontmatter keys holding the link(s), ordered; `None` when none of the
-    /// group's links is in frontmatter (never `Some` of an empty list).
+    /// Distinct frontmatter keys holding the link(s), ordered. `None` means "not
+    /// known" (matching the contract): a body group, or a frontmatter link the parser
+    /// could not attribute to a key (unquoted `- [[a]]`, nested map, comment line).
+    /// Never `Some` of an empty list.
     pub frontmatter_keys: Option<Vec<String>>,
 }
 
@@ -635,7 +637,11 @@ impl Reader {
             };
             let text: Option<String> = row.get(8).map_err(sqlite)?;
             let keys: String = row.get(9).map_err(sqlite)?;
-            let keys: Vec<Option<String>> = serde_json::from_str(&keys).unwrap_or_default();
+            // A malformed aggregate is a bug in R2, not "no keys": surface it.
+            let keys: Vec<Option<String>> =
+                serde_json::from_str(&keys).map_err(|e| IndexError::Sqlite {
+                    message: format!("R2 frontmatter_keys aggregate: {e}"),
+                })?;
             let keys: Vec<String> = keys.into_iter().flatten().collect();
             out.push(Backlink {
                 frontmatter_keys: (!keys.is_empty()).then_some(keys),
