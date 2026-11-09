@@ -340,7 +340,8 @@ impl Vault {
         walk::walk(self)
     }
 
-    /// Read a file and hash it.
+    /// Read a file and hash it. The mtime in the result is the handle's, taken before
+    /// the bytes are read (see the body for why the order matters).
     ///
     /// # Errors
     ///
@@ -348,8 +349,15 @@ impl Vault {
     /// resolves through a symlink (T-07), [`VaultError::Io`] otherwise.
     pub fn read(&self, path: &VaultPath) -> Result<LoadedNote, VaultError> {
         let absolute = self.resolve(path)?;
-        let bytes = fs::read(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
-        let stat = fs::metadata(&absolute).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        // One open, stat the handle, then read from it. The mtime must be taken
+        // *before* the bytes: a write landing between the two then leaves an old
+        // mtime beside the new hash, which the next mtime comparison catches. The
+        // other order records the new mtime beside the old hash and hides the change.
+        let io = |err: std::io::Error| VaultError::io(path.as_str(), &err);
+        let mut file = fs::File::open(&absolute).map_err(io)?;
+        let stat = file.metadata().map_err(io)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(stat.len()).unwrap_or(0));
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
 
         Ok(LoadedNote {
             meta: NoteMeta {

@@ -84,6 +84,35 @@ fn paths_in(index: &Path) -> Vec<String> {
         .collect()
 }
 
+/// A source whose `load` returns the new bytes with the mtime taken before the write.
+struct StatBeforeTheWrite(DiskVault, i64);
+
+impl serat_core::NoteSource for StatBeforeTheWrite {
+    fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+        self.0.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        let mut loaded = self.0.load(path)?;
+        loaded.meta.mtime_ms = self.1;
+        Ok(loaded)
+    }
+}
+
+fn never_echo_guard() -> SpyEcho {
+    SpyEcho::default()
+}
+
+fn mtime_of(index: &Path, relative: &str) -> i64 {
+    let conn = schema::open(&serat_index::index_path(index)).expect("open");
+    conn.query_row(
+        "SELECT mtime FROM notes WHERE path = ?1",
+        [relative],
+        |row| row.get(0),
+    )
+    .expect("row")
+}
+
 fn clean_close(index: &Path) -> i64 {
     let conn = schema::open(&serat_index::index_path(index)).expect("open");
     conn.query_row(
@@ -129,6 +158,7 @@ fn an_edit_a_create_and_a_delete_reach_the_index_in_one_batch() {
             upserted: 2,
             removed: 1,
             unchanged: 0,
+            touched: 0,
             unparsed: 0,
             unreadable: 0
         }
@@ -203,7 +233,7 @@ fn a_deleted_directory_takes_what_the_index_held_beneath_it() {
             &DiskVault::new(&f.root),
             &f.parser,
             &walk(&f.root),
-            CatchUp::PathsOnly,
+            CatchUp::PathsAndMtime,
         )
         .expect("catch up");
     assert!(paths_in(&f.index).contains(&"folder/deep/d.md".to_owned()));
@@ -273,7 +303,7 @@ fn reconciling_a_directory_does_not_touch_a_sibling_with_a_similar_name() {
     let reconciler = Reconciler::new(&handle);
     let source = DiskVault::new(&f.root);
     reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsOnly)
+        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
         .expect("catch up");
 
     // folder/ is now empty on disk; folder-2/x.md must survive reconciling it.
@@ -302,7 +332,7 @@ fn catch_up_submits_what_the_index_lacks_and_removes_what_the_disk_lacks() {
             &DiskVault::new(&f.root),
             &f.parser,
             &walk(&f.root),
-            CatchUp::PathsOnly,
+            CatchUp::PathsAndMtime,
         )
         .expect("catch up");
 
@@ -315,25 +345,20 @@ fn catch_up_submits_what_the_index_lacks_and_removes_what_the_disk_lacks() {
 }
 
 #[test]
-fn a_paths_only_catch_up_does_not_read_files_the_index_already_holds() {
+fn a_clean_close_followed_by_an_external_edit_is_reindexed_at_the_next_open() {
+    // ADR-0015 section 2 as amended: the catch-up always compares mtimes, so a file
+    // edited while Serat was closed is found even though the close was clean.
     let f = fixture();
     let handle = IndexHandle::open(&f.index).expect("open");
-    let reconciler = Reconciler::new(&handle);
+    handle.close().expect("close");
+    let before = hash_of(&f.index, "a.md").expect("row");
+
     write(&f.root, "a.md", "# A\nedited behind our back\n");
     nudge(&f.root, "a.md", 120);
 
-    let outcome = reconciler
-        .catch_up(
-            &DiskVault::new(&f.root),
-            &f.parser,
-            &walk(&f.root),
-            CatchUp::PathsOnly,
-        )
-        .expect("catch up");
-    assert_eq!(outcome, Outcome::default(), "paths-only compared content");
-
-    // With the mtime comparison on, the same edit is found.
-    let outcome = reconciler
+    let reopened = IndexHandle::open(&f.index).expect("reopen");
+    assert!(!reopened.opened_after_unclean_shutdown());
+    let outcome = Reconciler::new(&reopened)
         .catch_up(
             &DiskVault::new(&f.root),
             &f.parser,
@@ -342,6 +367,84 @@ fn a_paths_only_catch_up_does_not_read_files_the_index_already_holds() {
         )
         .expect("catch up");
     assert_eq!(outcome.upserted, 1);
+    assert_ne!(hash_of(&f.index, "a.md").expect("row"), before);
+    reopened.close().expect("close");
+}
+
+#[test]
+fn unchanged_content_with_a_moved_mtime_is_not_parsed_and_its_mtime_is_refreshed() {
+    let f = fixture();
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let reconciler = Reconciler::new(&handle);
+    let source = DiskVault::new(&f.root);
+    nudge(&f.root, "a.md", 300); // touched, same bytes
+    let moved = walk(&f.root)
+        .into_iter()
+        .find(|entry| entry.path.as_str() == "a.md")
+        .expect("entry")
+        .mtime_ms;
+    assert_ne!(mtime_of(&f.index, "a.md"), moved);
+    let parsed_before = f.parser.calls.load(Ordering::Relaxed);
+
+    let outcome = reconciler
+        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .expect("catch up");
+    handle.writer().flush().expect("flush");
+
+    assert_eq!(
+        (outcome.upserted, outcome.unchanged, outcome.touched),
+        (0, 1, 1)
+    );
+    assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed_before);
+    assert_eq!(mtime_of(&f.index, "a.md"), moved, "row mtime not refreshed");
+
+    // The next comparison does not read the file again.
+    let again = reconciler
+        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .expect("catch up");
+    assert_eq!(again, Outcome::default());
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_write_between_stat_and_read_leaves_an_old_mtime_that_the_next_catch_up_catches() {
+    // Vault::read stats the open handle before reading it. A write that lands after
+    // the stat is then recorded as (old mtime, new hash), and the old mtime differs
+    // from the file's new one, so the next comparison re-reads. The other order would
+    // record (new mtime, old hash) and every later comparison would pass.
+    let f = fixture();
+    let old = walk(&f.root)
+        .into_iter()
+        .find(|entry| entry.path.as_str() == "a.md")
+        .expect("entry")
+        .mtime_ms;
+    // The state Vault::read leaves when the write lands after its stat: the row holds
+    // the new bytes' hash beside the pre-write mtime.
+    let handle = IndexHandle::open(&f.index).expect("open");
+    let reconciler = Reconciler::new(&handle);
+    write(&f.root, "a.md", "# A\nwritten between stat and read\n");
+    nudge(&f.root, "a.md", 60);
+    let source = DiskVault::new(&f.root);
+    handle
+        .apply(
+            &StatBeforeTheWrite(DiskVault::new(&f.root), old),
+            &f.parser,
+            &never_echo_guard(),
+            &path("a.md"),
+        )
+        .expect("apply");
+    handle.writer().flush().expect("flush");
+    assert_eq!(mtime_of(&f.index, "a.md"), old);
+
+    let parsed_before = f.parser.calls.load(Ordering::Relaxed);
+    let outcome = reconciler
+        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
+        .expect("catch up");
+    handle.writer().flush().expect("flush");
+    // Same content, so no parse; the row's mtime is brought up to the file's.
+    assert_eq!((outcome.upserted, outcome.touched), (0, 1));
+    assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed_before);
+    assert_ne!(mtime_of(&f.index, "a.md"), old);
     handle.close().expect("close");
 }
 
@@ -364,7 +467,10 @@ fn only_files_whose_mtime_moved_are_hashed_and_only_changed_content_is_parsed() 
         )
         .expect("catch up");
 
-    assert_eq!((outcome.upserted, outcome.unchanged), (1, 1));
+    assert_eq!(
+        (outcome.upserted, outcome.unchanged, outcome.touched),
+        (1, 1, 1)
+    );
     assert_eq!(f.parser.calls.load(Ordering::Relaxed), parsed_before + 1);
     handle.close().expect("close");
 }
@@ -499,21 +605,9 @@ fn a_commit_lost_after_the_marker_cleared_is_recovered_by_the_mtime_catch_up() {
     assert!(reopened.opened_after_unclean_shutdown());
     let reconciler = Reconciler::new(&reopened);
 
-    // The path-only catch-up, which is what a clean open would run, finds nothing:
-    let paths_only = reconciler
-        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsOnly)
-        .expect("catch up");
-    assert_eq!(paths_only, Outcome::default());
-    assert_eq!(hash_of(&f.index, "a.md").expect("row"), stale);
-
-    // The rule for an unclean shutdown finds the stale row and fixes it:
+    // The mtime comparison finds the stale row and fixes it:
     let outcome = reconciler
-        .catch_up(
-            &source,
-            &f.parser,
-            &walk(&f.root),
-            CatchUp::after_unclean_shutdown(reopened.opened_after_unclean_shutdown()),
-        )
+        .catch_up(&source, &f.parser, &walk(&f.root), CatchUp::PathsAndMtime)
         .expect("catch up");
     assert_eq!(outcome.upserted, 1);
     assert_eq!(hash_of(&f.index, "a.md").expect("row"), committed);
@@ -797,7 +891,7 @@ fn a_save_during_a_large_catch_up_is_accepted_not_refused() {
     std::thread::scope(|scope| {
         scope.spawn(|| {
             reconciler
-                .catch_up(&source, &f.parser, &entries, CatchUp::PathsOnly)
+                .catch_up(&source, &f.parser, &entries, CatchUp::PathsAndMtime)
                 .expect("catch up");
             done.store(true, Ordering::Relaxed);
         });

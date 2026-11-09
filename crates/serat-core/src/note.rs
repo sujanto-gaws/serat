@@ -99,6 +99,18 @@ pub enum IndexOp {
         /// Where it is.
         to: VaultPath,
     },
+    /// The file's content is what the index holds but its mtime moved (a sync tool,
+    /// a restore): record the new mtime and nothing else, so the open-time
+    /// comparison stops re-reading the file. Metadata-only: no parse, and no column
+    /// but `notes.mtime` changes. If the row has since been replaced, the update
+    /// lands on the newer row (an older mtime beside a newer hash only costs one
+    /// extra hash gate at the next comparison); if it was removed, it does nothing.
+    TouchMtime {
+        /// Vault-relative path.
+        path: VaultPath,
+        /// The mtime observed with the bytes whose hash matched, ms since the epoch.
+        mtime_ms: i64,
+    },
 }
 
 impl IndexOp {
@@ -107,7 +119,7 @@ impl IndexOp {
     pub fn path(&self) -> &VaultPath {
         match self {
             Self::UpsertNote { meta, .. } | Self::UpsertAsset { meta } => &meta.path,
-            Self::Remove { path } => path,
+            Self::Remove { path } | Self::TouchMtime { path, .. } => path,
             Self::Rename { to, .. } => to,
         }
     }

@@ -96,8 +96,8 @@ impl IndexHandle {
     /// Whether the previous session did not close the index cleanly (task #14).
     ///
     /// True means a commit may have been lost to a power cut, because the index side of
-    /// a save does no fsync (architecture §3.1.1 item 6), so the catch-up walk must
-    /// compare mtimes as well as paths: pass this to [`crate::external::CatchUp`].
+    /// a save does no fsync (architecture §3.1.1 item 6). The catch-up always compares mtimes whatever this says
+    /// ([`crate::external::CatchUp`]); this is kept as a diagnostic.
     /// True for a freshly created index too, which is harmless: it holds nothing to
     /// be stale. Fixed at open; the marker itself is cleared as this handle opens and
     /// set again by [`IndexHandle::close`].
@@ -288,12 +288,13 @@ impl IndexHandle {
     }
 
     /// Close the index cleanly: apply anything queued, checkpoint, and set the
-    /// clean-close marker, so the next open can skip the content comparison.
+    /// clean-close marker.
     ///
     /// **Call this** (serat-app: on vault close and at exit). Dropping the handle
     /// stops the writer and loses nothing, but leaves the marker cleared, so the next
-    /// session treats the shutdown as unclean. That costs one stat per file and a hash
-    /// of the files whose mtime moved; it is the safe direction.
+    /// session reports an unclean shutdown. The marker no longer changes what the
+    /// open-time catch-up does (it always compares mtimes, ADR-0015 §2 as amended);
+    /// it is a diagnostic for "a commit may have been lost to a power cut".
     ///
     /// # Errors
     ///
