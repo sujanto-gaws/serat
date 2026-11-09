@@ -117,8 +117,9 @@ export function detectPlatform(): EditorPlatform {
 export function createEditorCommandRegistry(
   handlers: EditorCommandHandlers,
   platform: EditorPlatform = detectPlatform(),
+  /** The app-wide registry to add to (the palette lists it); a fresh one when omitted. */
+  registry: CommandRegistry = new CommandRegistry(),
 ): CommandRegistry {
-  const registry = new CommandRegistry();
 
   registry.register({
     id: "editor.save",

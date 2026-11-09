@@ -8,7 +8,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { CommandRegistry, EDITOR_PRIMARY_ACTION_IDS } from "@/editor/commands";
 import { createEditorCommandRegistry } from "@/editor/codemirrorSetup";
@@ -135,5 +135,77 @@ describe("keymap.of is called in exactly one place", () => {
 
     walk(srcRoot);
     expect(hits).toEqual([join(srcRoot, "editor", "codemirrorSetup.ts")]);
+  });
+});
+
+describe("view-less (global) commands in the one registry (architecture.md 9.3, FR-NAV-06)", () => {
+  const press = (init: KeyboardEventInit) => new KeyboardEvent("keydown", init);
+
+  function withGlobals(): CommandRegistry {
+    const registry = buildDefaultRegistry();
+    for (const [id, key] of [
+      ["switcher.open", "Mod-o"],
+      ["palette.open", "Mod-k"],
+      ["search.open", "Mod-Shift-f"],
+      ["tree.focus", "Mod-1"],
+      ["backlinks.focus", "Mod-3"],
+    ] as const) {
+      registry.register({ id, name: id, defaultBinding: key, exec: () => {} });
+    }
+    return registry;
+  }
+
+  it("global commands share the uniqueness/collision invariant with the editor's", () => {
+    const registry = withGlobals();
+    expect(() => registry.buildKeymap()).not.toThrow();
+    const ids = registry.list().map((c) => c.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    registry.register({ id: "x.dup", name: "Dup", defaultBinding: "Mod-o", exec: () => {} });
+    expect(() => registry.buildKeymap()).toThrow(/keybinding collision/);
+  });
+
+  it("view-less commands stay out of the CodeMirror keymap", () => {
+    const keys = withGlobals().buildKeymap().map((b) => b.key);
+    expect(keys).not.toContain("Mod-o");
+  });
+
+  it("matchGlobal follows the effective binding: an override moves the chord", () => {
+    const registry = withGlobals();
+    expect(registry.matchGlobal(press({ key: "o", ctrlKey: true }), false)?.id).toBe("switcher.open");
+    expect(registry.matchGlobal(press({ key: "o", metaKey: true }), true)?.id).toBe("switcher.open");
+    expect(registry.matchGlobal(press({ key: "k", ctrlKey: true, metaKey: false }), true)).toBeUndefined(); // mac: Ctrl is not Mod
+    expect(registry.matchGlobal(press({ key: "F", ctrlKey: true, shiftKey: true }), false)?.id).toBe("search.open");
+    registry.setOverrides([{ command_id: "switcher.open", key: "Mod-p" }]);
+    expect(registry.matchGlobal(press({ key: "o", ctrlKey: true }), false)).toBeUndefined();
+    expect(registry.matchGlobal(press({ key: "p", ctrlKey: true }), false)?.id).toBe("switcher.open");
+    registry.setOverride("switcher.open", null);
+    expect(registry.effectiveBinding("switcher.open")).toBeNull();
+  });
+
+  it("execute: runs exec, refuses with the unavailable reason, needs a view for editor commands", async () => {
+    const registry = new CommandRegistry();
+    const exec = vi.fn();
+    registry.register({ id: "g", name: "G", exec });
+    registry.register({ id: "u", name: "U", unavailable: () => "Select a file first", exec });
+    registry.register({ id: "e", name: "E", run: () => true });
+    expect(await registry.execute("g", null)).toBeNull();
+    expect(await registry.execute("u", null)).toBe("Select a file first");
+    expect(await registry.execute("e", null)).toBe("Open a note first");
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(registry.ranked()[0].id).toBe("g"); // most-run first
+  });
+
+  it("register returns a disposer; subscribe hears changes", () => {
+    const registry = new CommandRegistry();
+    const heard = vi.fn();
+    registry.subscribe(heard);
+    const off = registry.register({ id: "a", name: "A", exec: () => {} });
+    off();
+    expect(registry.has("a")).toBe(false);
+    expect(heard).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a command with neither run nor exec", () => {
+    expect(() => new CommandRegistry().register({ id: "n", name: "N" })).toThrow(/neither/);
   });
 });

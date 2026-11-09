@@ -15,6 +15,7 @@
 // a second keymap-construction site into existence.
 
 import type { EditorView, KeyBinding } from "@codemirror/view";
+import type { InjectionKey } from "vue";
 
 /** Matches `KeybindingOverride.command_id` shape 1:1 (`contracts/ipc.rs`) —
  * this registry's ids are exactly what the settings TOML keys rebindings by. */
@@ -42,7 +43,14 @@ export interface Command {
    * to true; passthrough bindings carry CodeMirror's own value so native keys
    * (paste, caret movement the editor does not handle) are not swallowed. */
   preventDefault?: boolean;
-  run: (view: EditorView) => boolean;
+  /** Editor-scoped action: runs against the editor's view (CodeMirror keymap). */
+  run?: (view: EditorView) => boolean;
+  /** View-less action (switcher, palette, panes): runs from the global keydown
+   * handler built from this registry, or from the palette. Needs no editor. */
+  exec?: () => void | Promise<void>;
+  /** Context check (command-palette.md "unavailable in context"): `null` when
+   * the command can run now, else a one-line reason shown instead of running. */
+  unavailable?: () => string | null;
 }
 
 /**
@@ -52,17 +60,101 @@ export interface Command {
  */
 export class CommandRegistry {
   private readonly commands = new Map<CommandId, Command>();
+  private readonly overrides = new Map<CommandId, string | null>();
+  private readonly runCounts = new Map<CommandId, number>();
+  private readonly listeners = new Set<() => void>();
+
+  /** Calls `listener` after any register/unregister/override. Returns the unsubscribe. */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private changed(): void {
+    for (const listener of [...this.listeners]) listener();
+  }
 
   /** Throws on a duplicate id — the registry's own invariant, not something
    * left to a test to notice after the fact. */
-  register(command: Command): void {
+  register(command: Command): () => void {
     if (this.commands.has(command.id)) {
       throw new Error(`CommandRegistry: duplicate command id "${command.id}"`);
     }
     if (!command.name.trim()) {
       throw new Error(`CommandRegistry: command "${command.id}" has no name`);
     }
+    if (!command.run && !command.exec) {
+      throw new Error(`CommandRegistry: command "${command.id}" has neither run nor exec`);
+    }
     this.commands.set(command.id, command);
+    this.changed();
+    return () => this.unregister(command.id);
+  }
+
+  /** Removes a command (an editor going away takes its commands with it). */
+  unregister(id: CommandId): void {
+    if (this.commands.delete(id)) this.changed();
+  }
+
+  /**
+   * NFR-USE-01: the user's rebinding, `[keybindings]` in the settings TOML.
+   * `null` unbinds; `undefined` restores the default. Rebind UI, conflict
+   * handling and `set_keybinding` are task #93; this is the read side.
+   */
+  setOverride(id: CommandId, key: string | null | undefined): void {
+    if (key === undefined) this.overrides.delete(id);
+    else this.overrides.set(id, key);
+    this.changed();
+  }
+
+  /** Replaces all overrides at once (`UiSettings.keybindings` at startup). */
+  setOverrides(overrides: ReadonlyArray<{ command_id: string; key: string | null }>): void {
+    this.overrides.clear();
+    for (const o of overrides) this.overrides.set(o.command_id, o.key);
+    this.changed();
+  }
+
+  /** The binding in force: the override (`null` = unbound) else the default. */
+  effectiveBinding(id: CommandId): string | null {
+    if (this.overrides.has(id)) return this.overrides.get(id) ?? null;
+    return this.commands.get(id)?.defaultBinding ?? null;
+  }
+
+  /** Palette order: most-run first, then by name (command-palette.md "Default"). */
+  ranked(): Command[] {
+    return this.list().sort(
+      (a, b) => (this.runCounts.get(b.id) ?? 0) - (this.runCounts.get(a.id) ?? 0) || a.name.localeCompare(b.name),
+    );
+  }
+
+  /**
+   * Runs a command from the palette or a global chord. Returns the reason it
+   * did not run (unavailable, or an editor command with no editor), else null.
+   */
+  async execute(id: CommandId, view: EditorView | null): Promise<string | null> {
+    const command = this.commands.get(id);
+    if (!command) return "Unknown command";
+    const reason = command.unavailable?.() ?? null;
+    if (reason !== null) return reason;
+    if (command.exec) {
+      this.runCounts.set(id, (this.runCounts.get(id) ?? 0) + 1);
+      await command.exec();
+      return null;
+    }
+    if (!view) return "Open a note first";
+    this.runCounts.set(id, (this.runCounts.get(id) ?? 0) + 1);
+    command.run?.(view);
+    return null;
+  }
+
+  /** The view-less global command whose effective binding `event` presses, if any. */
+  matchGlobal(event: KeyboardEvent, mac: boolean): Command | undefined {
+    for (const command of this.commands.values()) {
+      if (!command.exec || command.when) continue;
+      const binding = this.effectiveBinding(command.id);
+      if (binding && chordMatches(binding, event, mac)) return command;
+    }
+    return undefined;
   }
 
   get(id: CommandId): Command | undefined {
@@ -91,7 +183,7 @@ export class CommandRegistry {
    * that is a real ambiguity this registry refuses to ship rather than
    * silently resolve).
    */
-  buildKeymap(overrides: ReadonlyMap<CommandId, string | null> = new Map()): KeyBinding[] {
+  buildKeymap(overrides: ReadonlyMap<CommandId, string | null> = this.overrides): KeyBinding[] {
     const seen = new Map<string, CommandId>();
     const bindings: KeyBinding[] = [];
     for (const command of this.commands.values()) {
@@ -108,10 +200,12 @@ export class CommandRegistry {
         );
       }
       seen.set(bucket, command.id);
+      if (!command.run) continue; // view-less: handled by the global keydown handler
+      const run = command.run;
       bindings.push({
         key,
         preventDefault: command.preventDefault ?? true,
-        run: (view) => command.run(view),
+        run: (view) => run(view),
       });
     }
     return bindings;
@@ -130,3 +224,55 @@ export const EDITOR_PRIMARY_ACTION_IDS: readonly CommandId[] = [
   "editor.undo",
   "editor.redo",
 ];
+
+/** Splits CodeMirror key notation: `Mod-Shift-m` -> ["Mod","Shift","m"]; `Mod--` -> ["Mod","-"]. */
+export function chordParts(binding: string): string[] {
+  return binding.split(/-(?!$)/);
+}
+
+/** Does `event` press `binding` (CodeMirror notation, `Mod` = Cmd on mac, Ctrl elsewhere)? */
+export function chordMatches(binding: string, event: KeyboardEvent, mac: boolean): boolean {
+  const parts = chordParts(binding);
+  const key = (parts.pop() ?? "").toLowerCase();
+  const wants = new Set(parts.map((p) => p.toLowerCase()));
+  const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (wants.has("mod") !== mod) return false;
+  if (wants.has("shift") !== event.shiftKey) return false;
+  if (wants.has("alt") !== event.altKey) return false;
+  return event.key.toLowerCase() === key;
+}
+
+const GLYPHS: Record<string, [string, string]> = {
+  mod: ["⌘", "Ctrl"],
+  shift: ["⇧", "Shift"],
+  alt: ["⌥", "Alt"],
+  enter: ["↵", "Enter"],
+  escape: ["⎋", "Esc"],
+};
+const SPOKEN: Record<string, [string, string]> = {
+  mod: ["Command", "Control"],
+  shift: ["Shift", "Shift"],
+  alt: ["Option", "Alt"],
+  enter: ["Enter", "Enter"],
+  escape: ["Escape", "Escape"],
+};
+
+function mapParts(binding: string, table: Record<string, [string, string]>, mac: boolean): string[] {
+  return chordParts(binding).map((part) => {
+    const hit = table[part.toLowerCase()];
+    return hit ? hit[mac ? 0 : 1] : part.length === 1 ? part.toUpperCase() : part;
+  });
+}
+
+/** Display chips ("⌘", "⇧", "M") for a binding. */
+export function chordGlyphs(binding: string, mac: boolean): string[] {
+  return mapParts(binding, GLYPHS, mac);
+}
+
+/** Spoken names for the accessible label: "Command", "Shift", "M". */
+export function chordSpoken(binding: string, mac: boolean): string[] {
+  return mapParts(binding, SPOKEN, mac);
+}
+
+/** `provide`/`inject` key for the app-wide registry (`App.vue` provides it). */
+export const COMMANDS_KEY: InjectionKey<CommandRegistry> = Symbol("serat.commands");
