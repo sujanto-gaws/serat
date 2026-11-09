@@ -174,10 +174,10 @@ pub(crate) fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath,
 
 /// Modification time in milliseconds since the Unix epoch.
 ///
-/// Zero when the platform will not say, which is a value and not a failure: mtime is
-/// recorded for display and ordering and is never used for change detection — that is
-/// what the hash gate is for, precisely because mtime is unreliable across sync tools
-/// and filesystems.
+/// Zero when the platform will not say, which is a value and not a failure. mtime is
+/// never the authority for change detection: the hash gate is, precisely because mtime
+/// is unreliable across sync tools and filesystems. The catch-up and the search-hit
+/// staleness hint do use it, as a cheap first test whose misses the hash check covers.
 pub(crate) fn mtime_ms(stat: &Metadata) -> i64 {
     stat.modified()
         .ok()

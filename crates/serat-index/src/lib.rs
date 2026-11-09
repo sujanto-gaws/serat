@@ -35,7 +35,7 @@ pub use checkpoint::{Bounds, CheckpointStats, WalHealth};
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild};
-pub use read::{Attachment, Backlink, Reader, SearchConn, SearchHit, SearchOutcome};
+pub use read::{Attachment, Backlink, IndexedStat, Reader, SearchConn, SearchHit, SearchOutcome};
 pub use rebuild::{RebuildReport, index_path, rebuild, rebuild_with_queue_depth};
 pub use schema::{DDL, INDEX_VERSION, IndexState, UnusableReason, bootstrap, inspect, open};
 pub use writer::{ActorOptions, BATCH_SIZE, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
