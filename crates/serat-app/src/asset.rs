@@ -39,6 +39,7 @@ use std::time::UNIX_EPOCH;
 
 use serat_core::VaultPath;
 use serat_core::mime::{OCTET_STREAM, VIEWABLE, is_viewable, mime_for_extension};
+use serat_core::verbatim::strip_verbatim;
 
 use serat_vault::Vault;
 
@@ -242,17 +243,6 @@ fn relative_to_root(real: &Path, root: &Path) -> Option<PathBuf> {
     let real = strip_verbatim(real);
     let root = strip_verbatim(root);
     real.strip_prefix(&root).ok().map(Path::to_path_buf)
-}
-
-fn strip_verbatim(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 /// Reads exactly `len` bytes at `start`; a short read (file truncated since the

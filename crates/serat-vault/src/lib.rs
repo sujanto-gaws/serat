@@ -51,6 +51,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use serat_core::verbatim::strip_verbatim;
 use serat_core::{
     ContentHash, EchoGuard, LoadedNote, NoteKind, NoteMeta, Platform, VaultError, VaultPath,
 };
@@ -730,14 +731,6 @@ impl EchoGuard for Vault {
     fn record_echo(&self, path: &VaultPath, hash: ContentHash) {
         self.echo.record(path, hash);
     }
-}
-
-/// Windows canonicalisation returns `\\?\D:\...`; every path we compare against and
-/// every path we show a user is the plain form.
-fn strip_verbatim(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    text.strip_prefix(r"\\?\")
-        .map_or_else(|| path.to_path_buf(), PathBuf::from)
 }
 
 /// A path for an error message. Lossy on purpose: a path we cannot render is
