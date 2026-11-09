@@ -2,7 +2,7 @@
   "name": "editor-latency",
   "private": true,
   "version": "0.0.0",
-  "description": "NFR-PRF-02 budget harness — keystroke-to-paint p95 in a 5,000-line note. Task #11 (P1/test). See README.md; not wired into CI until it can pass.",
+  "description": "NFR-PRF-02 budget harness — keystroke-to-paint p95 in a 5,000-line note. Task #11 (P1/test). See README.md; CI runs it report-only (job editor-latency in budgets.yml; headless is not gate-eligible).",
   "type": "module",
   "scripts": {
     "test": "playwright test",
