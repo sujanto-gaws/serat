@@ -20,8 +20,8 @@
 
 use rusqlite::{OptionalExtension, Transaction, params};
 use serat_core::{
-    Block, BlockKind, Field, FieldValue, IndexError, IndexOp, Link, LinkKind, NoteMeta, ParsedNote,
-    Task, VaultPath, fold_case,
+    Block, BlockKind, Field, FieldSource, FieldValue, IndexError, IndexOp, Link, LinkKind,
+    NoteMeta, ParsedNote, Task, VaultPath, fold_case,
 };
 
 use crate::resolve;
@@ -177,7 +177,17 @@ fn upsert_note(
         insert_field(tx, note_id, id_of(field.block_ord), field)?;
     }
     for link in &parsed.links {
-        insert_link(tx, note_id, id_of(link.block_ord), link)?;
+        // The frontmatter field whose byte range contains the link, if any (task #86).
+        let field_key = parsed
+            .fields
+            .iter()
+            .find(|f| {
+                f.source == FieldSource::Frontmatter
+                    && f.range.start <= link.range.start
+                    && link.range.end <= f.range.end
+            })
+            .map(|f| f.key.as_str());
+        insert_link(tx, note_id, id_of(link.block_ord), link, field_key)?;
     }
     for task in &parsed.tasks {
         if let Some(block_id) = id_of(Some(task.block_ord)) {
@@ -605,6 +615,7 @@ fn insert_link(
     note_id: i64,
     block_id: Option<i64>,
     link: &Link,
+    field_key: Option<&str>,
 ) -> Result<(), IndexError> {
     let kind = match link.kind {
         LinkKind::Wikilink => "wiki",
@@ -613,8 +624,8 @@ fn insert_link(
         LinkKind::Tag => "tag",
     };
     tx.prepare_cached(
-        "INSERT INTO links (src_note, src_block, dst_path, dst_fold, dst_block_ref, kind, alias)
-         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6)",
+        "INSERT INTO links (src_note, src_block, dst_path, dst_fold, dst_block_ref, kind, alias, field_key)
+         VALUES (?1, ?2, ?3, ?7, ?4, ?5, ?6, ?8)",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -626,6 +637,7 @@ fn insert_link(
         link.target.alias.as_deref(),
         // Stored folded, in Rust, so resolution is a binary `=` (architecture §4.5).
         fold_case(&link.target.note),
+        field_key,
     ])
     .map_err(sqlite)?;
     Ok(())

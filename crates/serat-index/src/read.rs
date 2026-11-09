@@ -126,6 +126,9 @@ pub struct Backlink {
     pub block: Option<BlockLocation>,
     /// Block text cut to [`EXCERPT_CHARS`] characters; empty for frontmatter.
     pub excerpt: String,
+    /// Distinct frontmatter keys holding the link(s), ordered; `None` when none of the
+    /// group's links is in frontmatter (never `Some` of an empty list).
+    pub frontmatter_keys: Option<Vec<String>>,
 }
 
 /// One attachment, as link insertion needs it (FR-VLT-08; architecture §7.4).
@@ -304,7 +307,8 @@ const R3_FIELD: &str = r3!(field_filter!());
 /// two links in one paragraph are one entry, and every frontmatter link of a note
 /// (`src_block IS NULL`) is one entry.
 const R2: &str = "SELECT s.path, s.title, s.hash, b.id, b.ord, b.heading_path,
-                         b.byte_start, b.byte_end, b.text
+                         b.byte_start, b.byte_end, b.text,
+                         json_group_array(DISTINCT l.field_key ORDER BY l.field_key)
                     FROM links l
                     JOIN notes s ON s.id = l.src_note
                     LEFT JOIN blocks b ON b.id = l.src_block
@@ -630,7 +634,11 @@ impl Reader {
                 }),
             };
             let text: Option<String> = row.get(8).map_err(sqlite)?;
+            let keys: String = row.get(9).map_err(sqlite)?;
+            let keys: Vec<Option<String>> = serde_json::from_str(&keys).unwrap_or_default();
+            let keys: Vec<String> = keys.into_iter().flatten().collect();
             out.push(Backlink {
+                frontmatter_keys: (!keys.is_empty()).then_some(keys),
                 source_path: row.get(0).map_err(sqlite)?,
                 source_title: row.get(1).map_err(sqlite)?,
                 block,

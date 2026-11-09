@@ -241,9 +241,7 @@ pub fn map_backlink(link: read::Backlink) -> Backlink {
         source_title: link.source_title,
         block: link.block.map(map_block),
         excerpt: link.excerpt,
-        // Contract ahead of implementation (task #79): filled once serat-index
-        // records links.field_key (INDEX_VERSION 12). None = "not known".
-        frontmatter_keys: None,
+        frontmatter_keys: link.frontmatter_keys,
     }
 }
 
@@ -295,5 +293,63 @@ mod tests {
         assert!(weak.upgrade().is_none(), "the slot no longer holds it");
         let b = slot.get(&db).expect("reopened");
         assert!(weak.upgrade().is_none() && Arc::strong_count(&b) == 2);
+    }
+
+    fn keys_for(reader: &Reader, path: &str) -> Vec<(bool, Option<Vec<String>>)> {
+        reader
+            .backlinks(path)
+            .expect("R2")
+            .into_iter()
+            .map(map_backlink)
+            .map(|b| (b.block.is_none(), b.frontmatter_keys))
+            .collect()
+    }
+
+    #[test]
+    fn backlinks_carry_the_frontmatter_keys_of_the_real_parser_output() {
+        // Task #86 (FR-NAV-04, US-03): real vault, real parser, real index.
+        let vault = tempfile::tempdir().expect("vault");
+        let idx = tempfile::tempdir().expect("index");
+        let w = |name: &str, body: &str| std::fs::write(vault.path().join(name), body).expect("w");
+        w("a.md", "# A\n");
+        w("b.md", "# B\n");
+        w(
+            "n1.md",
+            "---\nrelated: [[a]]\nauthor: [[b]]\n---\n\nbody [[a]]\n",
+        );
+        w(
+            "n2.md",
+            "---\nrelated:\n  - \"[[a]]\"\nauthor: [\"[[a]]\", \"[[b]]\"]\n---\n\nplain\n",
+        );
+        w("n3.md", "---\ntitle: x\n---\n\nonly body [[a]]\n");
+        let source = serat_vault::Vault::open(vault.path()).expect("vault");
+        serat_index::rebuild(
+            &source,
+            &serat_parse::CommonMarkParser,
+            vault.path(),
+            idx.path(),
+        )
+        .expect("rebuild");
+        let reader = Reader::open(&index_path(idx.path())).expect("reader");
+
+        let a = keys_for(&reader, "a.md");
+        // Ordered by source path: n1 (frontmatter group, then body group), n2, n3.
+        assert_eq!(
+            a,
+            vec![
+                (true, Some(vec!["related".to_owned()])),
+                (false, None),
+                (true, Some(vec!["author".to_owned(), "related".to_owned()])),
+                (false, None),
+            ]
+        );
+        let b = keys_for(&reader, "b.md");
+        assert_eq!(
+            b,
+            vec![
+                (true, Some(vec!["author".to_owned()])),
+                (true, Some(vec!["author".to_owned()])),
+            ]
+        );
     }
 }
