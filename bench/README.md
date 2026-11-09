@@ -5,7 +5,7 @@ The verification harness (architecture §10.3). Owned by test-engineer.
 ```
 vaultgen/        the deterministic benchmark vault generator — committed
 budget/          one asserting job per NFR-PRF budget — committed
-editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed; rule E0, controls green, subject partial (3/8 scenarios), needs a `build:bench` build (the branch carrying it is `task/p1-42-prf02-stalls`; not yet on integration)
+editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed; rule E0, controls green, subject partial (3/8 scenarios), needs a `build:bench` build (`npm run build:bench` in `app/`, on main); CI job `editor-latency` REPORTS, it does not gate
 vaults/          generated vaults and their manifests — gitignored, never committed
 out/             budget results — gitignored
 ```
@@ -56,6 +56,8 @@ cargo run --release -p budget --bin p1-catch-up -- --vault 20k --passes 5
 ```
 
 Record the machine conditions either side of a series with `cargo run --release -p budget --bin environment`; on Windows a run with the on-access virus scanner disabled is marked not gate eligible, because the gate figure has to be the one a user would see.
+
+**NFR-PRF-02 in CI is report-only (task #60).** The `editor-latency` job in `budgets.yml` runs `npx playwright test --project=subject --workers=1` (unit, then controls, then subject; never `--no-deps`) against `npm run build:bench`, on Playwright's own headless Chromium, and is `continue-on-error: true`. Headless Chromium is not gate-eligible (architecture §9.3: the gating figure is a reference-machine run of the real WebView2 binary), so the job's name says "report only" and a red job does not fail the PR. Its job summary prints the engine version, the six subject verdicts (3 caret positions x strict and swept cadence), and the positive controls' shares. The positive-strict share is recorded on every run because it is the control's margin to watch (§9.3): it sat at 99.7% on Chromium 141 and at 99.0% (exactly the bar; two more late keys rejects the run) on 153.0.8010.12, so how often that control rejects is read from the accumulated summaries. A new Chromium (a Playwright lockfile bump) re-baselines the controls before any subject figure counts. `out/` (including `run.log` and the per-key dumps in `out/dumps/`) is uploaded as the `editor-latency` artifact. Per RISK-013/F-384 no job has been scheduled runner-side since 2026-09-06; the command sequence was dry-run locally instead (`docs/05-testing/`).
 
 All three are **red today, on purpose**: `serat-index` has no rebuild entry point (I4) or incremental save path (I5), and there is no application to start (D2, S1). Each prints the entry point it needs and the task that unblocks it. Documentation: `docs/05-testing/budget-harness.md`. CI: `.github/workflows/budgets.yml`, one job per budget.
 

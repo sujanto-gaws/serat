@@ -212,3 +212,73 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Budget table matches the PRD, and every budget has a job here
         run: cargo test -p budget --lib
+
+  # NFR-PRF-02 (task #60). REPORT-ONLY, and the name says so: headless Chromium is not
+  # gate-eligible (architecture §9.3 -- the figure that gates is a reference-machine run of
+  # the real WebView2 binary), so this job reports and never gates. `continue-on-error`
+  # keeps a red harness from failing the PR; the summary says what happened. It runs the
+  # real gate command (`--project=subject`: unit, then controls, then subject; never
+  # `--no-deps`), so a failing control still skips the subject, and the summary says that.
+  # The engine version is printed because a figure without one is not a figure (§9.3): a
+  # new Chromium (a Playwright bump) re-baselines the controls before any subject figure counts.
+  editor-latency:
+    name: "NFR-PRF-02 · editor keystroke-to-paint, headless Chromium (report only, not gate-eligible)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            bench/editor-latency/package-lock.json
+      - name: Build the bench bundle
+        working-directory: app
+        run: |
+          npm ci
+          npm run build:bench
+      - name: Install the harness and Chromium only
+        working-directory: bench/editor-latency
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+      - name: Unit, controls, then subject (about 20 minutes)
+        working-directory: bench/editor-latency
+        env:
+          SERAT_BENCH_DIST: ../../app/dist-bench
+          SERAT_SUBJECT_LABEL: "ci @ ${{ github.sha }}"
+          SERAT_DUMP_DIR: out/dumps
+        run: |
+          mkdir -p out/dumps
+          npx playwright test --project=subject --workers=1 2>&1 | tee out/run.log
+      - name: Summary (engine, positive-strict margin, subject verdicts)
+        if: always()
+        working-directory: bench/editor-latency
+        shell: bash
+        run: |
+          {
+            echo "### NFR-PRF-02 editor latency: headless Chromium, REPORT ONLY (not gate-eligible, architecture 9.3)"
+            echo
+            echo "Engine: $(grep -m1 '^engine:' out/run.log | cut -c1-70 || true)"
+            echo
+            echo "Positive controls (bar >= 99% of 300 keys; strict at 99.0% is on the bar, and two more late keys reject the run: the architecture 9.3 margin to watch):"
+            echo '```'
+            grep -E '^positive ' out/run.log | cut -c1-110 || true
+            echo '```'
+            echo
+            echo "Subject verdicts (3 caret positions x strict and swept cadence = six; INDETERMINATE is not a pass):"
+            echo '```'
+            grep -E '^SUBJECT ' out/run.log | grep -oE '\[(start|middle|end)\]|(strict|swept) \(caret|verdict [A-Z]+; [0-9.]+% on time' | sed -E 's/ \(caret//' | paste -sd' ' | sed 's/ \[/\n[/g' || true
+            echo '```'
+            echo
+            echo "No SUBJECT lines above means the unit or a control failed first and the subject was skipped; see run.log in the artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-latency
+          path: bench/editor-latency/out/
+          if-no-files-found: ignore

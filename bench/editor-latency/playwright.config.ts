@@ -6,14 +6,17 @@
 // would itself be an NFR-SEC-01/02 violation in spirit: a test harness has
 // no business phoning out). Override with PW_CHROMIUM_PATH if this ever
 // needs to run somewhere the browser lives elsewhere.
+import { existsSync } from "node:fs";
 import { defineConfig, devices } from "@playwright/test";
 
+// PW_CHROMIUM_PATH wins; else the development container's fixed path if it exists; else Playwright's own
+// browser (what `npx playwright install chromium` provides, i.e. CI's editor-latency job).
 const chromiumPath =
-  process.env.PW_CHROMIUM_PATH ?? "/opt/pw-browsers/chromium";
+  process.env.PW_CHROMIUM_PATH ?? (existsSync("/opt/pw-browsers/chromium") ? "/opt/pw-browsers/chromium" : undefined);
 
 const chromiumUse = {
   ...devices["Desktop Chrome"],
-  launchOptions: { executablePath: chromiumPath },
+  ...(chromiumPath ? { launchOptions: { executablePath: chromiumPath } } : {}),
 };
 
 export default defineConfig({
