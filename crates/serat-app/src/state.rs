@@ -739,6 +739,9 @@ impl AppState {
             editor: Arc::clone(&editor),
             indexer: Arc::clone(&indexer),
         });
+        // ADR-0015 section 2 as amended (task #78): the catch-up window starts at the
+        // wall-clock time taken immediately before the watcher is armed.
+        indexer.window_opened(serat_index::rebuild::now_ms());
         let walk = VaultThread::spawn_with(
             Arc::clone(&vault),
             move |stage| {
@@ -961,7 +964,7 @@ impl AppState {
         // per-path lock so no other in-process writer can land between the check and
         // the rename (ADR-0016 §2). `None` asserts the file does not exist.
         let expect = base_hash.map_or(serat_vault::Expect::Absent, serat_vault::Expect::Hash);
-        vault
+        let wrote = vault
             .write_atomic_if(&path, expect, args.text.as_bytes())
             .map_err(from_vault_error)?;
 
@@ -974,18 +977,14 @@ impl AppState {
         // `index.changed` is how a caller learns the rest.
         self.submit_to_index(open, &path);
 
-        // Re-read for the mtime and size the contract returns. It costs a second read
-        // of a file we just wrote, and it buys a `hash` that is genuinely "BLAKE3 of
-        // what is now on disk" rather than of what we intended to put there. P0 writes
-        // whole documents from a text box; when the byte-range patcher arrives in P2
-        // this is a stat, not a read.
-        let written = vault.read(&path).map_err(from_vault_error)?;
-
+        // Hash, mtime and size come from the write itself (ADR-0015 §2): the mtime was
+        // statted right after the rename under the path lock, never from a later read
+        // that an external write could have moved past the hash.
         Ok(FileWritten {
             path: path.to_string(),
-            hash: written.meta.hash.to_hex(),
-            mtime_ms: written.meta.mtime_ms,
-            bytes: written.meta.size,
+            hash: wrote.hash.to_hex(),
+            mtime_ms: wrote.mtime_ms,
+            bytes: wrote.size,
         })
     }
 
@@ -3533,24 +3532,58 @@ mod tests {
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&tree));
 
-        // Not open: no event however the watcher sees it.
-        std::fs::write(dir.join("broken.md"), "now valid\n").expect("write");
-        std::fs::write(
-            dir.join("10-projects/serat.md"),
-            "---\ntype: project\n---\n\n# Serat, edited elsewhere\n",
-        )
-        .expect("external edit");
-        wait_until("note://external-change", || {
-            !seen.lock().expect("seen").is_empty()
+        // Not open: no event however the watcher sees it. Not "wait a while and see
+        // nothing": the index row for broken.md carries the final hash only once the
+        // batch that held it has been through every `Live::path_changed` (the editor's
+        // included) and `paths_changed`, on the one vault thread. So after this wait the
+        // editor has provably had its say about broken.md, and any event for it is in
+        // `seen` already.
+        wait_ready(&state);
+        let valid = "now valid\n";
+        std::fs::write(dir.join("broken.md"), valid).expect("write");
+        let valid_hash = serat_vault::hash_bytes(valid.as_bytes()).to_hex();
+        wait_until("the index to hold broken.md's final bytes", || {
+            index_hash(&dir, "broken.md").as_deref() == Some(valid_hash.as_str())
+        });
+
+        let edited = "---\ntype: project\n---\n\n# Serat, edited elsewhere\n";
+        let edited_hash = serat_vault::hash_bytes(edited.as_bytes()).to_hex();
+        std::fs::write(dir.join("10-projects/serat.md"), edited).expect("external edit");
+        // `fs::write` is a truncate and then a write. Starved between the two for longer
+        // than the 150 ms window, the watcher flushes the empty file as its own change
+        // and the final bytes follow as a second one (each correct, each from the
+        // registry's newest base). So the wait is for the event that carries the final
+        // hash, never for the first event, and the assertions hold for any such chain.
+        wait_until("note://external-change carrying the final hash", || {
+            seen.lock().expect("seen").iter().any(|change| {
+                matches!(change, crate::ipc::ExternalChange::Changed { new_hash, .. }
+                    if new_hash == &edited_hash)
+            })
         });
         let seen = seen.lock().expect("seen");
-        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen.iter().all(|change| matches!(
+                change,
+                crate::ipc::ExternalChange::Changed { path, .. } if path == "10-projects/serat.md"
+            )),
+            "only the open note is announced: {seen:?}"
+        );
         assert!(matches!(
             &seen[0],
-            crate::ipc::ExternalChange::Changed { path, base_hash, .. }
-                if path == "10-projects/serat.md" && base_hash == &read.hash
+            crate::ipc::ExternalChange::Changed { base_hash, .. } if base_hash == &read.hash
         ));
+        // Each change starts from where the last one ended: the registry advanced.
+        for pair in seen.windows(2) {
+            if let (
+                crate::ipc::ExternalChange::Changed { new_hash, .. },
+                crate::ipc::ExternalChange::Changed { base_hash, .. },
+            ) = (&pair[0], &pair[1])
+            {
+                assert_eq!(new_hash, base_hash, "{seen:?}");
+            }
+        }
         drop(seen);
+        state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3978,6 +4011,52 @@ mod tests {
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_catch_up_window_starts_no_later_than_the_watcher_registering() {
+        // Task #78: the stamp the open's catch-up records predates `WatcherRegistered`. This
+        // guards against stamping at the walk's start (#66's interim); the exact "just
+        // before arming" position is the code's, not pinned by this test.
+        let dir = fixture("window-before-watcher");
+        open_and_close_cleanly(&dir);
+        let old = window_of(&dir);
+        std::thread::sleep(Duration::from_millis(30));
+        let registered: Arc<Mutex<Option<i64>>> = Arc::default();
+        let at = Arc::clone(&registered);
+        let state = state_with(OpenHooks {
+            on_stage: Some(Arc::new(move |stage| {
+                if stage == Stage::WatcherRegistered {
+                    *at.lock().expect("at") = Some(serat_index::rebuild::now_ms());
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })),
+            on_walk_start: None,
+        });
+        state.open_vault(open_args(&dir)).expect("open");
+        wait_until("the catch-up to record its window", || {
+            window_of(&dir) > old
+        });
+        let window = window_of(&dir);
+        let registered = registered.lock().expect("at").expect("stage seen");
+        assert!(
+            window <= registered,
+            "window {window} is after the watcher registered at {registered}"
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn window_of(dir: &Path) -> i64 {
+        rusqlite::Connection::open(dir.join(".serat").join("index.db"))
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT caught_up_from_ms FROM index_meta WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(0)
     }
 
     #[test]

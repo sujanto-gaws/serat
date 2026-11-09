@@ -14,8 +14,9 @@ path: string,
  */
 hash: string, 
 /**
- * Filesystem mtime after the write, unix milliseconds. See
- * `FileContents::mtime_ms`.
+ * Filesystem mtime of the written bytes, unix milliseconds, taken before the
+ * rename and so never newer than `hash` describes (ADR-0015 section 2). See
+ * `FileContents::mtime_ms`. `0` means unknown: treat the file as changed.
  */
 mtime_ms: number, 
 /**

@@ -1,5 +1,5 @@
 <!--
-  The file tree pane (file-tree.md; FR-VLT-01, FR-VLT-08, FR-BIN-03; ADR-0015).
+  The file tree pane (file-tree.md; FR-VLT-01, FR-NAV-03, FR-BIN-03; ADR-0015).
 
   - Messages from `open_tree` are folded into a plain (non-reactive) `TreeModel`
     in arrival order, synchronously, one call per message: nothing is batched
@@ -10,14 +10,22 @@
     double requestAnimationFrame has passed; `complete` the same way after
     `Complete` has been applied. Both are taken from a `flush: 'post'` watcher,
     i.e. after the commit that rendered those rows (ADR-0015 §3).
-  - Keyboard: roving focus on the `role="tree"` container; one meaning per key.
+  - Layout: an outer flex column (toolbar, a persistent live region, the
+    scrolling `role="tree"`). Nothing but rows lives inside the tree or its scroll
+    container, so row offsets are exactly `index * rowHeight`.
+  - Keyboard: roving focus on the `role="tree"` container, announced through
+    `aria-activedescendant`; one meaning per key. `Mod-F` (tree-local) focuses the
+    filter box; the filter bolds matches and hides the rest.
+  - Not built here (task #43, tree operations): rename, the context menu, drag
+    dim/drop line. Their events are emitted and the host handles them.
+  - Not built (no tabs in P1): `newTab` is carried on `open` and ignored by the host.
 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
-import { insertLinkText, isNameUnique, navigate, visibleWindow } from "@/tree/treeLogic";
-import { TreeModel, type TreeRow } from "@/tree/treeModel";
+import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
+import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
 
 const props = withDefaults(
   defineProps<{
@@ -30,8 +38,14 @@ const props = withDefaults(
     openPath?: string | null;
     /** Whether that note has unsaved changes (brass dot). */
     openDirty?: boolean;
+    /**
+     * The open vault's id (from `index_status`). `tree://status` events for any
+     * other vault are discarded. Until the id is known the check is a no-op and
+     * every status is accepted (the event is only emitted for the open vault).
+     */
+    vaultId?: string | null;
   }>(),
-  { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false },
+  { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null },
 );
 
 const emit = defineEmits<{
@@ -39,6 +53,12 @@ const emit = defineEmits<{
   "insert-link": [payload: { path: string; text: string }];
   "context-menu": [payload: { path: string }];
   rename: [payload: { path: string }];
+  /** A pending (not yet listed) folder was selected: the context pane says "Listing…". `null` clears it. */
+  "pending-listing": [path: string | null];
+  /** An entry (or a folder, with everything under it) disappeared from the tree; the host may need to react. */
+  removed: [path: string];
+  /** An entry was created or re-created at this path (an upsert); clears a "removed" the host was holding. */
+  added: [path: string];
 }>();
 
 const model = new TreeModel();
@@ -46,15 +66,22 @@ const version = ref(0);
 const scrollTop = ref(0);
 const viewportHeight = ref(props.fallbackViewportHeight);
 const focusedPath = ref<string | null>(null);
+const filter = ref("");
+const stopped = ref(false);
 const container = ref<HTMLDivElement | null>(null);
+const filterInput = ref<HTMLInputElement | null>(null);
 let resizeObserver: ResizeObserver | null = null;
 let firstScreenMarked = false;
 let completeMarked = false;
+let disposed = false;
+let unlistenStatus: (() => void) | null = null;
+let pendingSelected: string | null = null;
 
 const rows = computed<readonly TreeRow[]>(() => {
   void version.value;
-  return model.rows();
+  return model.rows(filter.value);
 });
+const filtering = computed(() => filter.value.trim() !== "");
 
 const windowed = computed(() =>
   visibleWindow(scrollTop.value, viewportHeight.value, props.rowHeight, rows.value.length),
@@ -62,8 +89,9 @@ const windowed = computed(() =>
 const visibleRows = computed(() => rows.value.slice(windowed.value.start, windowed.value.end));
 const rootEmpty = computed(() => {
   void version.value;
-  return model.rootListed && rows.value.length === 0;
+  return model.rootListed && (model.listing("")?.length ?? 0) === 0;
 });
+const noMatches = computed(() => filtering.value && model.rootListed && rows.value.length === 0);
 
 function bump(): void {
   version.value += 1;
@@ -89,9 +117,20 @@ watch(
         void props.ipc.markTree({ mark: "complete", entries_in_model: model.fileCount }).catch(() => undefined);
       });
     }
+    // A selected pending folder stops saying "Listing…" the moment its listing lands.
+    if (pendingSelected !== null && model.isListed(pendingSelected)) {
+      pendingSelected = null;
+      emit("pending-listing", null);
+    }
   },
   { flush: "post" },
 );
+
+// A new filter changes the row list: start from the top.
+watch(filter, () => {
+  if (container.value) container.value.scrollTop = 0;
+  scrollTop.value = 0;
+});
 
 onMounted(() => {
   measure();
@@ -99,15 +138,33 @@ onMounted(() => {
     resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(container.value);
   }
+  stopped.value = false; // a new open_tree starts afresh (contracts/ipc.rs `TreeStatus`)
   void props.ipc
     .openTree((message) => {
       model.apply(message); // strictly in arrival order, never dropped
       bump();
+      if (message.kind === "remove") emit("removed", childPath(message.dir, message.name));
+      else if (message.kind === "upsert") emit("added", childPath(message.dir, message.entry.name));
+    })
+    .catch(() => undefined);
+  // Registered after `open_tree` is on the wire.
+  void props.ipc
+    .onTreeStatus?.((status) => {
+      if (props.vaultId !== null && status.vault_id !== props.vaultId) return; // another vault's session
+      if (status.stopped) stopped.value = true;
+    })
+    .then((un) => {
+      if (disposed) un(); // resolved after unmount: do not leak the listener
+      else unlistenStatus = un;
     })
     .catch(() => undefined);
 });
 
-onBeforeUnmount(() => resizeObserver?.disconnect());
+onBeforeUnmount(() => {
+  disposed = true;
+  resizeObserver?.disconnect();
+  unlistenStatus?.();
+});
 
 function measure(): void {
   const height = container.value?.clientHeight ?? 0;
@@ -132,8 +189,24 @@ function rowLabel(row: TreeRow): string {
   return row.name.replace(/\.md$/i, "");
 }
 
-function displayName(row: TreeRow): string {
-  return row.kind === "note" ? row.name.replace(/\.md$/i, "") : row.name;
+const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg"]);
+
+/** Format glyph class + text (file-tree.md: PDF, image, generic file; notes and folders their own). */
+function glyph(row: TreeRow): { cls: string; text: string } {
+  if (row.kind === "dir") return { cls: "folder", text: "▭" };
+  if (row.kind === "note") return { cls: "note", text: "≡" };
+  const ext = row.name.includes(".") ? row.name.slice(row.name.lastIndexOf(".") + 1).toLowerCase() : "";
+  if (ext === "pdf") return { cls: "pdf", text: "P" };
+  if (IMAGE_EXT.has(ext)) return { cls: "image", text: "▣" };
+  return { cls: "file", text: "◻" };
+}
+
+/** The row's name split around the filter match, for bolding. */
+function nameParts(row: TreeRow): { before: string; match: string; after: string } {
+  const name = displayName(row.name, row.kind);
+  const range = filtering.value ? matchRange(name, filter.value) : null;
+  if (!range) return { before: name, match: "", after: "" };
+  return { before: name.slice(0, range[0]), match: name.slice(range[0], range[1]), after: name.slice(range[1]) };
 }
 
 function isDot(row: TreeRow): boolean {
@@ -141,15 +214,44 @@ function isDot(row: TreeRow): boolean {
   return row.kind === "asset" && row.sidecar;
 }
 
+// Stable DOM ids, one per path, assigned on first use. Bounded by the vault's entry
+// count (only rendered rows ever ask), and the pane lives as long as the vault is open.
+const rowIds = new Map<string, number>();
+function rowId(path: string): string {
+  let n = rowIds.get(path);
+  if (n === undefined) {
+    n = rowIds.size;
+    rowIds.set(path, n);
+  }
+  return `serat-tree-row-${n}`;
+}
+const activeDescendant = computed(() => {
+  const path = focusedPath.value;
+  return path !== null && visibleRows.value.some((r) => r.path === path) ? rowId(path) : undefined;
+});
+
 function select(path: string): void {
   focusedPath.value = path;
+  const row = rows.value.find((r) => r.path === path);
+  const pending = row && row.kind === "dir" && row.state === "pending" ? path : null;
+  if (pending !== pendingSelected) {
+    pendingSelected = pending;
+    emit("pending-listing", pending);
+  }
+}
+
+function toggleDir(path: string, expand: boolean | null): void {
+  if (filtering.value) return; // the filtered view shows its own expansion; the user's is untouched
+  if (expand === null) model.toggle(path);
+  else if (expand) model.expand(path);
+  else model.collapse(path);
+  bump();
 }
 
 function onRowClick(row: TreeRow): void {
   select(row.path);
   if (row.kind === "dir") {
-    model.toggle(row.path);
-    bump();
+    toggleDir(row.path, null);
   } else {
     emit("open", { path: row.path, newTab: false, keepFocus: false });
   }
@@ -188,12 +290,10 @@ function onKeydown(event: KeyboardEvent): void {
       scrollIntoView(action.path);
       break;
     case "expand":
-      model.expand(action.path);
-      bump();
+      toggleDir(action.path, true);
       break;
     case "collapse":
-      model.collapse(action.path);
-      bump();
+      toggleDir(action.path, false);
       break;
     case "open":
       emit("open", { path: action.path, newTab: action.newTab, keepFocus: action.keepFocus });
@@ -212,54 +312,118 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+/** Mod-F anywhere in the tree pane: the tree's own filter (never the global search chord, Mod-Shift-F). */
+function onPaneKeydown(event: KeyboardEvent): void {
+  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && (event.key === "f" || event.key === "F")) {
+    event.preventDefault();
+    focusFilter();
+  }
+}
+
+function onFilterKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    filter.value = "";
+    focusTree();
+  } else if (event.key === "ArrowDown" || event.key === "Enter") {
+    event.preventDefault();
+    focusTree();
+    if (focusedPath.value === null && rows.value.length > 0) select(rows.value[0].path);
+  }
+}
+
 function focusTree(): void {
   void nextTick(() => container.value?.focus());
 }
+function focusFilter(): void {
+  void nextTick(() => {
+    filterInput.value?.focus();
+    filterInput.value?.select();
+  });
+}
 
-defineExpose({ model, focusTree, version });
+defineExpose({ model, focusTree, focusFilter, version, filter });
 </script>
 
 <template>
-  <div
-    ref="container"
-    class="serat-tree"
-    role="tree"
-    aria-label="Files"
-    tabindex="0"
-    data-testid="file-tree"
-    @scroll="onScroll"
-    @keydown="onKeydown"
-  >
-    <p v-if="rootEmpty" class="serat-tree-empty">Nothing here yet — press ⌘N to start a note.</p>
-    <div v-else class="serat-tree-spacer" :style="{ height: windowed.totalHeight + 'px' }">
-      <div class="serat-tree-window" :style="{ transform: `translateY(${windowed.offsetTop}px)` }">
-        <div
-          v-for="row in visibleRows"
-          :key="row.path"
-          class="serat-tree-row"
-          :class="[
-            `serat-tree-${row.kind}`,
-            `serat-tree-state-${row.state}`,
-            { 'serat-tree-selected': row.path === focusedPath || row.path === openPath },
-          ]"
-          :style="{ height: rowHeight + 'px', paddingLeft: row.depth * 16 + 8 + 'px' }"
-          role="treeitem"
-          :aria-level="row.depth + 1"
-          :aria-expanded="row.kind === 'dir' && (row.state === 'collapsed' || row.state === 'expanded') ? row.state === 'expanded' : undefined"
-          :aria-selected="row.path === focusedPath"
-          :aria-label="rowLabel(row)"
-          :title="row.name"
-          :draggable="row.kind !== 'dir'"
-          :data-path="row.path"
-          @click="onRowClick(row)"
-          @dragstart="onDragStart($event, row)"
-          @contextmenu.prevent="emit('context-menu', { path: row.path })"
-        >
-          <span class="serat-tree-chevron" aria-hidden="true">{{
-            row.state === "expanded" ? "▾" : row.state === "collapsed" ? "▸" : ""
-          }}</span>
-          <span class="serat-tree-name">{{ displayName(row) }}</span>
-          <span v-if="isDot(row)" class="serat-tree-dot" aria-hidden="true">●</span>
+  <div class="serat-tree-pane" data-testid="file-tree-pane" @keydown="onPaneKeydown">
+    <div class="serat-tree-toolbar" role="toolbar" aria-label="File tree actions">
+      <!-- Disabled, not hidden (file-tree.md): creating entries is task #43 (tree operations). -->
+      <button type="button" class="serat-tree-tool" data-testid="tree-new-note" disabled title="Arrives with tree operations (#43)">
+        New note
+      </button>
+      <button type="button" class="serat-tree-tool" data-testid="tree-new-folder" disabled title="Arrives with tree operations (#43)">
+        New folder
+      </button>
+      <input
+        ref="filterInput"
+        v-model="filter"
+        type="search"
+        class="serat-tree-filter"
+        data-testid="tree-filter"
+        placeholder="Filter"
+        aria-label="Filter files"
+        @keydown="onFilterKeydown"
+      />
+    </div>
+    <p
+      class="serat-tree-live"
+      :class="{ 'serat-tree-live-on': stopped }"
+      role="status"
+      aria-live="polite"
+      data-testid="tree-status"
+    >{{ stopped ? TREE_STOPPED_TEXT : "" }}</p>
+    <div
+      ref="container"
+      class="serat-tree"
+      role="tree"
+      aria-label="Files"
+      tabindex="0"
+      data-testid="file-tree"
+      :aria-activedescendant="activeDescendant"
+      @scroll="onScroll"
+      @keydown="onKeydown"
+    >
+      <p v-if="rootEmpty" class="serat-tree-empty">Nothing here yet — press ⌘N to start a note.</p>
+      <p v-else-if="noMatches" class="serat-tree-empty" data-testid="tree-no-matches">No files match “{{ filter.trim() }}”.</p>
+      <div v-else class="serat-tree-spacer" :style="{ height: windowed.totalHeight + 'px' }">
+        <div class="serat-tree-window" :style="{ transform: `translateY(${windowed.offsetTop}px)` }">
+          <div
+            v-for="row in visibleRows"
+            :id="rowId(row.path)"
+            :key="row.path"
+            class="serat-tree-row"
+            :class="[
+              `serat-tree-${row.kind}`,
+              `serat-tree-state-${row.state}`,
+              { 'serat-tree-selected': row.path === focusedPath || row.path === openPath },
+            ]"
+            :style="{ height: rowHeight + 'px', paddingLeft: row.depth * 16 + 8 + 'px' }"
+            role="treeitem"
+            :aria-level="row.depth + 1"
+            :aria-expanded="row.kind === 'dir' && (row.state === 'collapsed' || row.state === 'expanded') ? row.state === 'expanded' : undefined"
+            :aria-selected="row.path === focusedPath"
+            :aria-label="rowLabel(row)"
+            :title="row.name"
+            :draggable="row.kind !== 'dir'"
+            :data-path="row.path"
+            @click="onRowClick(row)"
+            @dragstart="onDragStart($event, row)"
+            @contextmenu.prevent="emit('context-menu', { path: row.path })"
+          >
+            <span class="serat-tree-chevron" aria-hidden="true">{{
+              row.state === "expanded" ? "▾" : row.state === "collapsed" ? "▸" : ""
+            }}</span>
+            <span class="serat-tree-glyph" :class="`serat-glyph-${glyph(row).cls}`" aria-hidden="true">{{
+              glyph(row).text
+            }}</span>
+            <span class="serat-tree-name"
+              >{{ nameParts(row).before
+              }}<b v-if="nameParts(row).match" class="serat-tree-match">{{ nameParts(row).match }}</b
+              >{{ nameParts(row).after }}</span
+            >
+            <span v-if="isDot(row)" class="serat-tree-dot" aria-hidden="true">●</span>
+          </div>
         </div>
       </div>
     </div>
@@ -267,8 +431,34 @@ defineExpose({ model, focusTree, version });
 </template>
 
 <style scoped>
-.serat-tree {
+.serat-tree-pane {
+  display: flex;
+  flex-direction: column;
   height: 100%;
+  min-height: 0;
+}
+.serat-tree-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--serat-border-hairline, rgba(22, 25, 27, 0.12));
+}
+.serat-tree-filter {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.serat-tree-live {
+  margin: 0;
+}
+.serat-tree-live-on {
+  padding: 0.5rem 0.75rem;
+  color: var(--serat-text-secondary, #6b7075);
+  border-bottom: 1px solid var(--serat-border-hairline, #bbb);
+}
+.serat-tree {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   outline: none;
@@ -291,15 +481,28 @@ defineExpose({ model, focusTree, version });
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.serat-tree-match {
+  color: var(--indigo, #24457e);
+  font-weight: 700;
+}
 .serat-tree-chevron {
   width: 1em;
   flex: none;
 }
+.serat-tree-glyph {
+  flex: none;
+  width: 1.1em;
+  text-align: center;
+  color: var(--serat-text-secondary, #6b7075);
+}
 .serat-tree-state-pending {
   color: var(--serat-text-secondary, #6b7075);
 }
-.serat-tree-state-pending .serat-tree-name {
+.serat-tree-state-pending .serat-tree-glyph {
   outline: 1px dashed var(--serat-border-hairline, #bbb);
+}
+.serat-tree-state-pending .serat-tree-name {
+  outline: none;
 }
 .serat-tree-dot {
   color: var(--brass, #c08a47);

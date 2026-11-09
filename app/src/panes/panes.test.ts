@@ -113,8 +113,9 @@ describe("BacklinksPane", () => {
     const wrapper = mount(BacklinksPane, { props: { path: "Target.md", ipc } });
     await vi.advanceTimersByTimeAsync(150);
     expect(backlinks).toHaveBeenCalledWith({ path: "Target.md" });
-    expect(wrapper.findAll('[role="listitem"]')).toHaveLength(3);
-    expect(wrapper.findAll("h4").map((h) => h.text())).toEqual(["Standup", "Roadmap"]); // grouped, header once per note
+    expect(wrapper.findAll(".serat-backlink")).toHaveLength(3);
+    expect(wrapper.findAll(".serat-backlinks-source").map((h) => h.text())).toEqual(["Standup", "Roadmap"]); // grouped, header once per note
+    expect(wrapper.find("h4").exists()).toBe(false); // no heading as a bare child of a list (ARIA)
     expect(wrapper.text()).toContain("Backlinks (3)");
   });
 
@@ -135,10 +136,10 @@ describe("BacklinksPane", () => {
     const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc } });
     await vi.advanceTimersByTimeAsync(10);
     expect(wrapper.find('[data-testid="backlinks-loading"]').exists()).toBe(true);
-    expect(wrapper.findAll('[role="listitem"]')).toHaveLength(0);
+    expect(wrapper.findAll(".serat-backlink")).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(150);
     expect(wrapper.find('[data-testid="backlinks-loading"]').exists()).toBe(false);
-    expect(wrapper.findAll('[role="listitem"]')).toHaveLength(1);
+    expect(wrapper.findAll(".serat-backlink")).toHaveLength(1);
   });
 
   it("states: empty, not ready, missing note", async () => {
@@ -190,6 +191,79 @@ describe("BacklinksPane", () => {
     await vi.advanceTimersByTimeAsync(150);
     expect(wrapper.text()).toContain("second");
     expect(wrapper.text()).not.toContain("first");
+  });
+});
+
+describe("BacklinksPane (round 2)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("index://changed re-reads in the background: no skeleton, old answer stays until the new one swaps in", async () => {
+    let release!: (v: unknown) => void;
+    const backlinks = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: "ready", value: [link("A.md", 1, "old")] })
+      .mockReturnValueOnce(new Promise((r) => (release = r)));
+    const { ipc, fireChanged } = ipcWith({ backlinks });
+    const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc } });
+    await vi.advanceTimersByTimeAsync(150);
+    fireChanged();
+    await vi.advanceTimersByTimeAsync(150);
+    expect(wrapper.find('[data-testid="backlinks-loading"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain("old");
+    release({ kind: "ready", value: [link("B.md", 2, "new")] });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(wrapper.text()).toContain("new");
+    expect(wrapper.text()).not.toContain("old");
+  });
+
+  it("a path change does show the skeleton", async () => {
+    const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x")] });
+    const wrapper = mount(BacklinksPane, { props: { path: "One.md", ipc: ipcWith({ backlinks }).ipc } });
+    await vi.advanceTimersByTimeAsync(150);
+    await wrapper.setProps({ path: "Two.md" });
+    expect(wrapper.find('[data-testid="backlinks-loading"]').exists()).toBe(true);
+  });
+
+  it("roving tabindex: the section is the tab stop until an entry is focused; arrows move DOM focus", async () => {
+    const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x"), link("B.md", 2, "y")] });
+    const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(150);
+    const section = wrapper.get("section");
+    expect(section.attributes("tabindex")).toBe("0");
+    expect(section.attributes("aria-activedescendant")).toBeUndefined();
+    (section.element as HTMLElement).focus(); // tabbing in lands on the current entry
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("x");
+    expect(section.attributes("tabindex")).toBe("-1");
+    await section.trigger("keydown", { key: "ArrowDown" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("y");
+    expect(document.activeElement?.getAttribute("tabindex")).toBe("-1");
+    await section.trigger("keydown", { key: "ArrowUp" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("x");
+    wrapper.unmount();
+  });
+
+  it("activating an entry opens it; the pane itself does not flash (the destination does, #82)", async () => {
+    const backlinks = vi.fn().mockResolvedValue({ kind: "ready", value: [link("A.md", 1, "x")] });
+    const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ backlinks }).ipc } });
+    await vi.advanceTimersByTimeAsync(150);
+    await wrapper.get(".serat-backlink").trigger("click");
+    expect(wrapper.emitted("open")).toHaveLength(1);
+    expect(wrapper.find(".serat-backlink-confirmed").exists()).toBe(false);
+  });
+
+  it("a listener that resolves after unmount is unlistened at once", async () => {
+    const off = vi.fn();
+    let resolve!: (f: () => void) => void;
+    const onIndexChanged = vi.fn(() => new Promise<() => void>((r) => (resolve = r)));
+    const wrapper = mount(BacklinksPane, { props: { path: "T.md", ipc: ipcWith({ onIndexChanged, backlinks: vi.fn().mockResolvedValue({ kind: "ready", value: [] }) }).ipc } });
+    wrapper.unmount();
+    resolve(off);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(off).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -376,5 +450,56 @@ describe("SearchPanel", () => {
     await wrapper.get('[data-testid="search-input"]').setValue("");
     await vi.advanceTimersByTimeAsync(300);
     expect(wrapper.get('[data-testid="search-idle"]').text()).toContain("budget");
+  });
+
+  it("Load more continues the query that produced the results, not what was typed since", async () => {
+    const page1 = Array.from({ length: 50 }, (_, i) => hit(`n${i}.md`, null, i));
+    const search = vi
+      .fn()
+      .mockResolvedValueOnce(hits(page1))
+      .mockResolvedValueOnce(hits([hit("last.md", null, 99)]));
+    const wrapper = mount(SearchPanel, { props: { ipc: ipcWith({ search }).ipc } });
+    await wrapper.get('[data-testid="search-input"]').setValue("note");
+    await vi.advanceTimersByTimeAsync(300);
+    await wrapper.get('[data-testid="search-input"]').setValue("something else");
+    await wrapper.get('[data-testid="search-more"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(search).toHaveBeenNthCalledWith(2, { query: "note", offset: 50, limit: 50 });
+  });
+
+  it("Esc closes from the input and from the results list", async () => {
+    const search = vi.fn().mockResolvedValue(hits([hit("A.md", null)]));
+    const wrapper = mount(SearchPanel, { props: { ipc: ipcWith({ search }).ipc } });
+    await wrapper.get('[data-testid="search-input"]').setValue("a");
+    await vi.advanceTimersByTimeAsync(300);
+    await wrapper.get('[data-testid="search-input"]').trigger("keydown", { key: "Escape" });
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await wrapper.get('[data-testid="search-results"]').trigger("keydown", { key: "Escape" });
+    expect(wrapper.emitted("close")).toHaveLength(2);
+  });
+
+  it("roving tabindex on the results: arrows move DOM focus; the list is the tab stop until then", async () => {
+    const search = vi.fn().mockResolvedValue(hits([hit("A.md", null, 1), hit("B.md", null, 2)]));
+    const wrapper = mount(SearchPanel, { props: { ipc: ipcWith({ search }).ipc }, attachTo: document.body });
+    await wrapper.get('[data-testid="search-input"]').setValue("a");
+    await vi.advanceTimersByTimeAsync(300);
+    const list = wrapper.get('[data-testid="search-results"]');
+    expect(list.attributes("tabindex")).toBe("0");
+    expect(list.attributes("aria-activedescendant")).toBeUndefined();
+    (list.element as HTMLElement).focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("A");
+    await list.trigger("keydown", { key: "ArrowDown" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement?.textContent).toContain("B");
+    expect(list.attributes("tabindex")).toBe("-1");
+    wrapper.unmount();
+  });
+
+  it("focus() focuses the input (the host's open-or-focus chord)", async () => {
+    const wrapper = mount(SearchPanel, { props: { ipc: ipcWith().ipc }, attachTo: document.body });
+    (wrapper.vm as unknown as { focus(): void }).focus();
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="search-input"]').element);
+    wrapper.unmount();
   });
 });

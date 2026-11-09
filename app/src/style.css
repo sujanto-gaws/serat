@@ -61,6 +61,33 @@ body {
 .workspace {
   display: flex;
   min-height: 0;
+  position: relative;
+}
+
+.tree-toggle {
+  display: none;
+  margin-left: auto;
+}
+
+/* file-tree.md, Responsive: below breakpoint-compact (720px) the tree is a flyover. */
+@media (max-width: 719px) {
+  .tree-toggle {
+    display: inline-block;
+  }
+  .pane-tree {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 10;
+    width: 260px;
+    max-width: 85vw;
+    background: var(--paper);
+    transform: translateX(-100%);
+    visibility: hidden;
+  }
+  .tree-open .pane-tree {
+    transform: none;
+    visibility: visible;
+  }
 }
 
 .pane {

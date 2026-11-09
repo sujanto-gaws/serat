@@ -230,11 +230,18 @@ export function makeLinkCompletionSource(deps: LinkExtensionDeps): CompletionSou
     if (!before) return null;
     const mode = classifyLinkInput(before.text.slice(2), before.from + 2, context.explicit);
     if (!mode) return null;
+    // CodeMirror has already superseded this context: no IPC for an answer nobody will read.
+    if (context.aborted) return null;
     const source = deps.getSourcePath();
 
     if (mode.kind === "name") {
       const mySeq = ++seq;
-      const results = await deps.ipc.switcherQuery({ seq: mySeq, query: mode.query, limit: 50 });
+      let results;
+      try {
+        results = await deps.ipc.switcherQuery({ seq: mySeq, query: mode.query, limit: 50 });
+      } catch {
+        return null; // transport failure: no completions, nothing thrown into typing
+      }
       if (context.aborted || results.discarded || results.seq !== seq) return null; // a newer keystroke wins; discarded = superseded, ignore
       const names = results.corpus === "tree" ? " · file names only" : "";
       const total = results.items.length;
@@ -261,7 +268,12 @@ export function makeLinkCompletionSource(deps: LinkExtensionDeps): CompletionSou
       path = answer?.path ?? null;
     }
     if (!path || context.aborted) return null;
-    const anchors = await deps.ipc.noteAnchors({ path });
+    let anchors;
+    try {
+      anchors = await deps.ipc.noteAnchors({ path });
+    } catch {
+      return null;
+    }
     if (context.aborted || anchors.kind !== "ready") return null;
     const pool = mode.kind === "heading" ? anchors.value.headings : anchors.value.block_ids;
     const ranked = rankAnchors(pool, mode.query).filter((a) => !/[\]|\n]/.test(a));

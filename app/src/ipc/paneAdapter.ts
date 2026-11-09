@@ -2,11 +2,12 @@
 // backlinks read (§4.5 R2) and search (§4.5 R1/R3). Mockable like the other
 // adapters: components take a `PaneIpcAdapter` prop, tests substitute their own,
 // and nothing outside this file calls `invoke`/`Channel` for these commands.
-// `serat-app` does not implement them yet (task #18); landing the real commands
-// changes `defaultPaneIpc` alone.
+// The commands are implemented in serat-app and granted to the webview in
+// crates/serat-app/capabilities/default.json (ADR-0012); a command missing from
+// that grant fails at the ACL, not here.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { defaultLinkIpc } from "./linkAdapter";
 import type { Backlink } from "./generated/Backlink";
@@ -16,6 +17,9 @@ import type { NotePathArgs } from "./generated/NotePathArgs";
 import type { SearchArgs } from "./generated/SearchArgs";
 import type { SearchOutcome } from "./generated/SearchOutcome";
 import type { TreeMessage } from "./generated/TreeMessage";
+import type { TreeStatus } from "./generated/TreeStatus";
+
+export const TREE_STATUS_EVENT = "tree://status";
 
 export interface PaneIpcAdapter {
   /**
@@ -31,9 +35,11 @@ export interface PaneIpcAdapter {
   backlinks(args: NotePathArgs): Promise<IndexRead<Backlink[]>>;
   /** `index://changed`: invalidation only. */
   onIndexChanged(handler: () => void): Promise<UnlistenFn>;
+  /** `tree://status`: the stream gave up (ADR-0015). Optional so existing fakes stay valid. */
+  onTreeStatus?(handler: (status: TreeStatus) => void): Promise<UnlistenFn>;
 }
 
-export const defaultPaneIpc: PaneIpcAdapter = {
+export const defaultPaneIpc = {
   async openTree(onMessage) {
     const channel = new Channel<TreeMessage>();
     channel.onmessage = onMessage;
@@ -51,4 +57,7 @@ export const defaultPaneIpc: PaneIpcAdapter = {
   onIndexChanged(handler) {
     return defaultLinkIpc.onIndexChanged(() => handler());
   },
-};
+  onTreeStatus(handler) {
+    return listen<TreeStatus>(TREE_STATUS_EVENT, (event) => handler(event.payload));
+  },
+} satisfies Required<PaneIpcAdapter>;

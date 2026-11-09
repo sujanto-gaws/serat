@@ -20,4 +20,29 @@ block: BlockLocation | null,
 /**
  * Block text, cut to 300 characters in Rust; empty for frontmatter.
  */
-excerpt: string, };
+excerpt: string, 
+/**
+ * For a frontmatter-origin entry (`block: None`), the frontmatter keys the
+ * links to this note were written under (`owner: "[[Person]]"` gives
+ * `["owner"]`), distinct, in byte order. The pane renders them in place of
+ * the excerpt as `frontmatter: owner` (backlinks-pane.md). Serves FR-NAV-04,
+ * US-03; architecture §4.5 R2 (task #79's ruling).
+ *
+ * **The entry shape does not change:** frontmatter is still one entry per
+ * source note, because R2 groups by (source note, source block) and every
+ * frontmatter link has the same NULL block. Two keys naming this note give
+ * one entry with two keys, not two entries.
+ *
+ * `None` (absent on the wire) for a body link, and also whenever the key is
+ * not known: a link the index could not attribute to a key, or an index
+ * written before the column existed. The front end then renders the bare
+ * word `frontmatter`, which is the degraded state, never an error (design
+ * goal 5). Never `Some` of an empty list.
+ *
+ * **Contract ahead of implementation.** Filled by #79's follow-ups
+ * `[P1/impl] Record frontmatter link keys in serat-index (links.field_key,
+ * INDEX_VERSION 12)` (rust-core-dev), which adds the column and the R2
+ * aggregate, then `[P1/impl] Map Backlink::frontmatter_keys in serat-app`
+ * (tauri-app-dev). Until both land, serat-app sends `None`.
+ */
+frontmatter_keys?: Array<string>, };

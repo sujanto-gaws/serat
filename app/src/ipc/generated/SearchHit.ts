@@ -34,4 +34,36 @@ block: BlockLocation | null,
  * Snippet with matches delimited by U+0002 … U+0003. Build text nodes only
  * (T-09); the delimiters can also occur in note text, harmlessly.
  */
-snippet: string | null, };
+snippet: string | null, 
+/**
+ * Whether the file on disk has visibly changed since this hit's block was
+ * indexed, so the result row can say "approximate" **before** the click
+ * (search-panel.md; architecture §4.5 "Location", task #79's ruling).
+ * Serves FR-NAV-02, US-05.
+ *
+ * Computed by serat-app after the statement returns, for hits with a
+ * `block` only (at most 50 per page, R1's ceiling), as one `stat` per hit
+ * compared with the `notes.mtime` and `notes.size` the row was indexed
+ * with. `Some(true)` when either differs or the stat fails; `Some(false)`
+ * when both match. It never reads or hashes the file.
+ *
+ * **A hint, not the authority.** The authority stays the hash compare at
+ * open (`BlockLocation::note_hash` against the bytes just read). A
+ * `Some(false)` hit whose hash nevertheless differs (an edit inside the
+ * mtime granularity that kept the size) is still located by `ord` and
+ * marked approximate after the click, as today. A `Some(true)` hit whose
+ * hash matches (a `touch`, a checkout of identical bytes) jumps exactly,
+ * and the row's marker was merely cautious. Neither case presents a wrong
+ * line as exact.
+ *
+ * `None` (absent on the wire) for a property-only hit (it has no block to
+ * be approximate about) and whenever it was not computed. The front end
+ * shows no marker for `None` and relies on the click-time check.
+ *
+ * **Contract ahead of implementation.** Filled by #79's follow-up
+ * `[P1/impl] Flag search hits changed since indexed` (rust-core-dev returns
+ * `notes.mtime`/`notes.size` from R1 and R1 + R3, no schema change), then
+ * `[P1/impl] Stat search hits and map changed_since_indexed in serat-app`
+ * (tauri-app-dev). Until both land, serat-app sends `None`.
+ */
+changed_since_indexed?: boolean, };
