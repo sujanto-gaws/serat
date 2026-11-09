@@ -225,8 +225,11 @@ pub const STAT_HITS_PER_PAGE: usize = 50;
 /// (task #88, FR-NAV-02, US-05; the ruling in architecture §4.5).
 ///
 /// `Some(mtime != row.mtime || size != row.size)`: the catch-up's own comparator, over
-/// the same millisecond conversion as the walk (`Vault::stat`). `None` when the hit has
-/// no block (a property-only hit is never stat-ed), or the stat fails.
+/// the same millisecond conversion as the walk (`Vault::stat`). A failed stat (the file
+/// vanished, or cannot be read) is `Some(true)`: it is not what was indexed, which is the
+/// honest answer to the hint (architecture §4.5). `None` only when the hit has no block
+/// (a property-only hit is never stat-ed); the caller also leaves hits beyond
+/// [`STAT_HITS_PER_PAGE`] at `None`.
 ///
 /// **It is a hint, not a verdict.** A false positive: a `touch`, or a checkout that
 /// rewrites identical bytes, moves the mtime and reads `Some(true)`. A false negative:
@@ -240,7 +243,9 @@ fn changed_since_indexed(
 ) -> Option<bool> {
     hit.block.as_ref()?;
     let indexed = hit.indexed?;
-    let (mtime_ms, size) = stat(&hit.path)?;
+    let Some((mtime_ms, size)) = stat(&hit.path) else {
+        return Some(true);
+    };
     Some(mtime_ms != indexed.mtime_ms || i64::try_from(size).unwrap_or(i64::MAX) != indexed.size)
 }
 
@@ -411,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vanished_file_a_blockless_hit_and_the_51st_hit_are_none() {
+    fn the_51st_hit_and_a_blockless_hit_are_none_and_a_vanished_file_is_changed() {
         let dir = tempfile::tempdir().expect("dir");
         let vault = Vault::open(dir.path()).expect("vault");
         std::fs::write(dir.path().join("a.md"), "aaaa").expect("write");
@@ -427,15 +432,15 @@ mod tests {
         let got = flags(&vault, hits);
         assert!(got[..STAT_HITS_PER_PAGE].iter().all(|f| *f == Some(false)));
         assert_eq!(got[STAT_HITS_PER_PAGE], None, "the 51st hit is not stat-ed");
-        assert_eq!(got[STAT_HITS_PER_PAGE + 1], None);
+        assert_eq!(got[STAT_HITS_PER_PAGE + 1], None, "beyond 50, even if gone");
         assert_eq!(got[STAT_HITS_PER_PAGE + 2], None);
 
-        // Within the first 50, a vanished file and a blockless hit are None too.
+        // Within the first 50: a vanished file is Some(true), a blockless hit None.
         let got = flags(
             &vault,
             vec![hit("gone.md", indexed, true), hit("a.md", indexed, false)],
         );
-        assert_eq!(got, [None, None]);
+        assert_eq!(got, [Some(true), None]);
     }
 
     fn make_db(db: &Path) {
