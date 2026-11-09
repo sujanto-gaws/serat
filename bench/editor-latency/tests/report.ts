@@ -3,9 +3,11 @@
 import type { RunSummary } from "./measure";
 
 export const pct = (x: number) => (x * 100).toFixed(1) + "%";
-export const ENGINE = () => "headless Chromium (not gate-eligible)";
+/** Engine label with the Chromium version (9.3 Basis: every figure carries the version and the measured R). */
+export const ENGINE = (version: string | undefined) => `headless Chromium ${version ?? "version unknown"} (not gate-eligible)`;
 
-export const RULE_STATEMENT =
+export const RULE_STATEMENT = (version: string | undefined) =>
+  `engine: ${ENGINE(version)}; ` +
   "NFR-PRF-02 rule E0: key LATE iff EventTimingEnd > D = ts_j + 2R (R = median rAF delta over 120 frames, measured per run and printed as R=); " +
   "VALIDITY: a run with R < 16 ms is INVALID (throws), because an absent Event Timing entry (duration < 16 ms) is only provably on time when D - t > R >= 16; " +
   "ABSENT KEY: no Event Timing entry >= 16 ms means presented in < 16 ms, scored ON TIME and counted in 'on time by absence', with the worst margin (D - t - 16) reported; " +

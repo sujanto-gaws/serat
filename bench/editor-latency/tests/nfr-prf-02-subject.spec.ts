@@ -5,7 +5,7 @@
 // end). Missing: inside a table cell, link-dense paragraph, Enter mid-note, Backspace across a bold
 // delimiter, split-preview continuous typing, CRLF/BOM fixture variants, and real-binary IPC latencies
 // (the IPC client is an instant null stub here). A PASS here is therefore not a PASS of NFR-PRF-02.
-// SERAT_BENCH_DIST selects the build (`npm run build:bench`, today only on task/p1-21-editor);
+// SERAT_BENCH_DIST selects the build (`npm run build:bench`, on the branch carrying it, task/p1-42-prf02-stalls; not yet on integration);
 // SERAT_SUBJECT_LABEL names it in the output; SERAT_DUMP_DIR (optional) receives one JSON file per
 // position x cadence with the per-key scores, for diagnosis (record/subject-report.mjs).
 // The positions are independent tests: one failing does not hide the others.
@@ -16,7 +16,7 @@ import { openNoteForLatencyTest } from "./subject";
 import { buildFixtureNote } from "./subject";
 import { ENGINE, RULE_STATEMENT, fmt, pct } from "./report";
 
-test.beforeAll(() => { console.log(RULE_STATEMENT); });
+test.beforeAll(async ({ browser }) => { console.log(RULE_STATEMENT(browser.version())); });
 
 type Position = "start" | "middle" | "end";
 const POSITIONS: Position[] = ["start", "middle", "end"];
@@ -50,7 +50,12 @@ async function placeCaret(page: Page, editor: Locator, where: Position): Promise
     // Control+End scrolls the caret line into view but need not reach the maximum scrollTop (CodeMirror's
     // height estimate), so assert the caret itself: it sits on the LAST rendered line (the viewport holds the
     // document end) and that line is inside the scroller's visible rectangle.
-    await expect.poll(() => editor.evaluate((el) => {
+    // Require the four source lines before the final one to be the four rendered .cm-line siblings before the
+    // caret line, and at least one of them to be a unique line (a numbered Paragraph or `fn f_n`), so the
+    // document end is proven by content and not only by CodeMirror's viewport margin.
+    const prevText = lines.slice(-5, -1);
+    expect(prevText.some((l) => /^(Paragraph \d+ |fn f_\d+\()/.test(l)), "fixture: the tail holds a unique line").toBe(true);
+    await expect.poll(() => editor.evaluate((el, prev: string[]) => {
       const root = el.getRootNode() as ShadowRoot;
       const sel = (root as unknown as { getSelection?: () => Selection | null }).getSelection?.() ?? null;
       const n = sel?.focusNode ?? null;
@@ -58,10 +63,19 @@ async function placeCaret(page: Page, editor: Locator, where: Position): Promise
       const line = e?.closest(".cm-line");
       const all = root.querySelectorAll(".cm-line");
       const sc = root.querySelector(".cm-scroller");
-      if (!line || !sc || all[all.length - 1] !== line) return false;
+      if (!line || !sc) return "no caret line or scroller";
+      if (all[all.length - 1] !== line) return "caret line is not the last rendered line: " + JSON.stringify((line.textContent ?? "").slice(0, 30));
+      // not only the viewport margin: the previous sibling is the fixture's second-to-last line, and the
+      // caret line itself is empty or only the x's typed by an earlier run
+      let sib = line.previousElementSibling;
+      for (let q = prev.length - 1; q >= 0; q--, sib = sib?.previousElementSibling ?? null) {
+        // a code-fence line is rendered hidden (empty), so only its presence is checked, not its text
+        if (!sib || (sib.textContent !== prev[q] && !(prev[q].startsWith("```") && sib.textContent === ""))) return "sibling " + q + " is " + JSON.stringify((sib?.textContent ?? "<none>").slice(0, 40)) + ", want " + JSON.stringify(prev[q].slice(0, 40));
+      }
+      if (!/^x*$/.test(line.textContent ?? "")) return "caret line text is not empty/x: " + JSON.stringify((line.textContent ?? "").slice(0, 30));
       const a = line.getBoundingClientRect(), b = sc.getBoundingClientRect();
-      return a.top >= b.top - 1 && a.bottom <= b.bottom + 1;
-    }), { message: "caret at document end: caret is on the last line and that line is visible" }).toBe(true);
+      return a.top >= b.top - 1 && a.bottom <= b.bottom + 1 ? "ok" : "caret line outside the viewport";
+    }, prevText), { message: "caret at document end: caret is on the last line and that line is visible" }).toBe("ok");
     desc = `end of note (line ${lines.length - 1})`;
   } else {
     await scroller.evaluate((s) => { s.scrollTop = (s.scrollHeight - s.clientHeight) / 2; });
@@ -94,6 +108,7 @@ test.describe("subject positions", () => {
       test.setTimeout(420_000);
       const subject = await openNoteForLatencyTest(page);
       try {
+        const chromiumVersion = page.context().browser()?.version();
         const { refreshIntervalMs } = await installCapture(page);
         const rows: string[] = [];
         let worst = 1;
@@ -114,10 +129,10 @@ test.describe("subject positions", () => {
           if (dump) {
             const fs = await import("node:fs");
             fs.mkdirSync(dump, { recursive: true });
-            fs.writeFileSync(`${dump}/${SUBJECT_LABEL}-${where}-${label}.json`, JSON.stringify({ build: SUBJECT_LABEL, where, cadence: label, R: refreshIntervalMs, summary, scores }));
+            fs.writeFileSync(`${dump}/${SUBJECT_LABEL}-${where}-${label}.json`, JSON.stringify({ build: SUBJECT_LABEL, chromium: chromiumVersion, where, cadence: label, R: refreshIntervalMs, summary, scores }));
           }
         }
-        console.log(`SUBJECT ${SUBJECT_LABEL} [${where}] ${COVERAGE}; n=${SUBJECT_KEYS} per cadence, R=${refreshIntervalMs.toFixed(2)}, ${ENGINE()}: ${rows.join(" | ")}`);
+        console.log(`SUBJECT ${SUBJECT_LABEL} [${where}] ${COVERAGE}; n=${SUBJECT_KEYS} per cadence, R=${refreshIntervalMs.toFixed(2)}, ${ENGINE(chromiumVersion)}: ${rows.join(" | ")}`);
         expect(verdicts, "every cadence must be PASS; INDETERMINATE (95% between the -4 and +4 ms shares) is not a pass").toEqual(["PASS", "PASS"]);
         expect(worst).toBeGreaterThanOrEqual(SUBJECT_MIN_ON_TIME);
       } finally {

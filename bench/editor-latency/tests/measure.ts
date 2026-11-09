@@ -8,7 +8,7 @@
 //   D    = ts_j + 2R           (R = median rAF delta over 120 frames);
 //   ETend = max over the keystroke's keydown / keypress / beforeinput / input
 //           Event Timing entries whose startTime is in [t, t + 4 ms] (a TIME WINDOW, keyup
-//           excluded; NOT grouped by interactionId, which is 0 on input events in Chromium 141),
+//           excluded; NOT grouped by interactionId, which is 0 on input events in Chromium; observed on 141 and 153),
 //           of (startTime + duration), i.e. the moment the
 //           browser reports the frame after the event as PRESENTED
 //           (`PerformanceObserver({type:"event", durationThreshold:16})`);
@@ -114,6 +114,14 @@ export function deadline(tsJ: number, refreshIntervalMs: number): number {
   return tsJ + 2 * refreshIntervalMs;
 }
 
+/** Does this Event Timing entry belong to the keystroke at `t`? One definition, used by scoring and by
+ * the invariant check. keyup is a separate event. The window is [t - 0.01, t + 4] ms: the entry's
+ * startTime is a coarsened copy of the event timeStamp, so it can sit a hair BEFORE the keydown's
+ * `timeStamp`; 0.01 ms (10 us) absorbs that and is far below the 100 ms key spacing. */
+export function inKeyWindow(e: EtEntry, t: number): boolean {
+  return e.name !== "keyup" && e.startTime >= t - 0.01 && e.startTime <= t + 4;
+}
+
 /** Presentation time of the keystroke from its Event Timing entries: the max of
  * `startTime + duration` over keydown, keypress, beforeinput and input entries that
  * start within [t - 0.01, t + 4] ms of the keydown. `null` if there are none.
@@ -122,8 +130,7 @@ export function keystrokeEventEnd(entries: EtEntry[], t: number): number | null 
   let end: number | null = null;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
-    if (e.name === "keyup") continue;
-    if (e.startTime < t - 0.01 || e.startTime > t + 4) continue;
+    if (!inKeyWindow(e, t)) continue;
     const v = e.startTime + e.duration;
     if (end === null || v > end) end = v;
   }
@@ -144,8 +151,7 @@ export function checkKeyInvariants(entries: EtEntry[], t: number): { ok: boolean
   let hi = 0;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
-    if (e.name === "keyup") continue;
-    if (e.startTime < t - 0.01 || e.startTime > t + 4) continue;
+    if (!inKeyWindow(e, t)) continue;
     const v = e.startTime + e.duration;
     if (!any) { lo = v; hi = v; } else { if (v < lo) lo = v; if (v > hi) hi = v; }
     any = true;
@@ -155,7 +161,8 @@ export function checkKeyInvariants(entries: EtEntry[], t: number): { ok: boolean
   if (any && !hasKeydown) {
     return { ok: false, reason: "an Event Timing entry for this key is present but its keydown entry is missing (a lost entry would score the key on time)", spreadMs };
   }
-  if (spreadMs > 8) {
+  // 1e-6 is a floating-point guard, NOT a tolerance: (1000.4+16+8)-(1000.4+16) is 8.000000000000114. The limit stays 8 ms.
+  if (spreadMs > 8 + 1e-6) {
     return { ok: false, reason: "the key's Event Timing entries end " + spreadMs.toFixed(1) + " ms apart (> 8 ms): they are not one presentation", spreadMs };
   }
   return { ok: true, reason: "", spreadMs };
@@ -271,6 +278,7 @@ export const SeratLatencyFns = {
   medianRefreshInterval,
   lastFrameAtOrBefore,
   deadline,
+  inKeyWindow,
   keystrokeEventEnd,
   checkKeyInvariants,
   isLate,

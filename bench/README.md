@@ -5,7 +5,7 @@ The verification harness (architecture §10.3). Owned by test-engineer.
 ```
 vaultgen/        the deterministic benchmark vault generator — committed
 budget/          one asserting job per NFR-PRF budget — committed
-editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed; rule E0, controls green, subject partial (3/8 scenarios), needs a `build:bench` build from `task/p1-21-editor`
+editor-latency/  NFR-PRF-02 keystroke-to-paint harness (Playwright) — committed; rule E0, controls green, subject partial (3/8 scenarios), needs a `build:bench` build (the branch carrying it is `task/p1-42-prf02-stalls`; not yet on integration)
 vaults/          generated vaults and their manifests — gitignored, never committed
 out/             budget results — gitignored
 ```
@@ -38,11 +38,11 @@ All three are **red today, on purpose**: `serat-index` has no rebuild entry poin
 
 ```
 cd bench/editor-latency
-npm install
+npm ci
 npm test
 ```
 
-`npm test` runs all three Playwright projects (unit, controls, subject) in dependency order; the gate is `npx playwright test --project=subject`. The subject needs `SERAT_BENCH_DIST` pointing at a `build:bench` output, which exists today only on `task/p1-21-editor`, and covers 3 of 8 §9.3 scenarios. See `bench/editor-latency/README.md`.
+`npm test` runs all three Playwright projects (unit, controls, subject) in dependency order; the gate is `npx playwright test --project=subject`. The subject needs `SERAT_BENCH_DIST` pointing at a `build:bench` output, which is on the branch carrying it (`task/p1-42-prf02-stalls`; not yet on integration), and covers 3 of 8 §9.3 scenarios. See `bench/editor-latency/README.md`.
 
 ## Serves
 

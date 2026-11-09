@@ -164,6 +164,11 @@ for (const [label, ns] of impls) {
       expect(r.reason).toMatch(/apart/);
       const edge = [{ name: "keydown", startTime: 100, duration: 20 }, { name: "input", startTime: 100, duration: 28 }];
       expect(ns.checkKeyInvariants(edge, 100).ok).toBe(true);
+      // fractional startTime: float error must not reject an exact 8 ms spread
+      const frac = [{ name: "keydown", startTime: 1000.4, duration: 16 }, { name: "input", startTime: 1000.4, duration: 24 }];
+      expect(ns.checkKeyInvariants(frac, 1000.4).ok).toBe(true);
+      const over = [{ name: "keydown", startTime: 1000.4, duration: 16 }, { name: "input", startTime: 1000.4, duration: 24.01 }];
+      expect(ns.checkKeyInvariants(over, 1000.4).ok).toBe(false);
     });
     test("scoreAll throws 'run rejected' with the key index on either invariant failure", () => {
       const frames = [0, R, 2 * R, 3 * R, 4 * R, 5 * R, 6 * R];

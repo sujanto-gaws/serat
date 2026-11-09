@@ -28,19 +28,19 @@ Rule E0 (header of `tests/measure.ts`; selected empirically from `record/`): for
 ## Run it
 
 ```
-npm install                        # Chromium is pre-provisioned at /opt/pw-browsers/chromium (PW_CHROMIUM_PATH overrides); do not run playwright install
+npm ci                             # Chromium is pre-provisioned at /opt/pw-browsers/chromium (PW_CHROMIUM_PATH overrides); do not run playwright install
 npx playwright test --project=subject    # THE GATE: unit, then controls, then subject; a failing control skips the subject
 npx playwright test --project=controls   # unit + controls only
 npm test                                  # bare: runs all three projects in the same order
 ```
 
-A `-g` filter that excludes the controls removes the gating; do not use it for a gated run. The subject needs a bench build:
+`--no-deps` skips the controls; never use it for a gated run (a `-g` filter does not bypass them). The subject needs a bench build:
 
 ```
 SERAT_BENCH_DIST=<checkout>/app/dist-bench SERAT_SUBJECT_LABEL=<name> [SERAT_DUMP_DIR=<dir>] npx playwright test --project=subject
 ```
 
-`npm run build:bench` (in `app/`) exists today only on branch **`task/p1-21-editor`**; without a build the subject fails loudly with the build command. `SERAT_DUMP_DIR` receives per-key JSON; `node record/subject-report.mjs <files>` summarises it. A subject run takes about 20 minutes (3 positions x 2 cadences x 500 keys at 100 ms).
+`npm run build:bench` (in `app/`) is on the branch carrying it, **`task/p1-42-prf02-stalls`** (`app/package.json`); not yet on integration; without a build the subject fails loudly with the build command. `SERAT_DUMP_DIR` receives per-key JSON; `node record/subject-report.mjs <files>` summarises it. A subject run takes about 20 minutes (3 positions x 2 cadences x 500 keys at 100 ms).
 
 Do not read a red subject test as "the editor is over budget" unless the controls passed in the same run on the same machine.
 

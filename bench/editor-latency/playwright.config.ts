@@ -31,7 +31,7 @@ export default defineConfig({
     { name: "unit", testMatch: /measure\.unit\.spec\.ts/, use: chromiumUse },
     { name: "controls", testMatch: /nfr-prf-02-controls\.spec\.ts/, dependencies: ["unit"], use: chromiumUse },
     // The gate: `npx playwright test --project=subject` runs unit, then controls, then subject; a failing
-    // control skips the subject tests. Do not combine with a -g that excludes the controls.
+    // control skips the subject tests. `--no-deps` skips the controls; never use it for a gated run (`-g` does not bypass them).
     { name: "subject", testMatch: /nfr-prf-02-subject\.spec\.ts/, dependencies: ["controls"], use: chromiumUse },
   ],
 });
