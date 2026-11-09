@@ -17,6 +17,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { flushAck, onClosing } from "./client";
 import type { AppClosing } from "./generated/AppClosing";
 import type { ExternalChange } from "./generated/ExternalChange";
 import type { FlushAckArgs } from "./generated/FlushAckArgs";
@@ -31,8 +32,6 @@ import type { WriteFileArgs } from "./generated/WriteFileArgs";
 
 /** Event `note://external-change` (contracts/ipc.rs). Not throttled, not ordered against responses. */
 export const EXTERNAL_CHANGE_EVENT = "note://external-change";
-/** Event `app://closing` (contracts/ipc.rs `APP_CLOSING_EVENT`). */
-export const APP_CLOSING_EVENT = "app://closing";
 
 export interface EditorIpcAdapter {
   /** `note_opened(args) -> Result<(), IpcError>` (ADR-0016 §3). */
@@ -86,9 +85,9 @@ export const defaultEditorIpc: EditorIpcAdapter = {
     return listen<ExternalChange>(EXTERNAL_CHANGE_EVENT, (event) => handler(event.payload));
   },
   onClosing(handler) {
-    return listen<AppClosing>(APP_CLOSING_EVENT, (event) => handler(event.payload));
+    return onClosing(handler);
   },
   flushAck(args) {
-    return invoke("flush_ack", { args });
+    return flushAck(args);
   },
 };

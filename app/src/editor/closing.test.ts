@@ -215,19 +215,43 @@ describe("app://closing: flush, then flush_ack exactly once", () => {
     }
   });
 
-  it("a save that outlasts the deadline: the ack is still sent before the core gives up, and only once", async () => {
+  it("a save that outlasts the deadline: NO early ack (it would end the core's wait and refuse the in-transit save); the ack follows the result, once", async () => {
     const gate = deferred<FileWritten>();
     const { ipc, api, view, fire, wrapper } = harness({ savePatch: vi.fn().mockReturnValue(gate.promise) });
     await api.loadNote("one", "a.md", "h0");
     view.dispatch({ changes: { from: 3, insert: "!" } });
     fire(closing("vA", 2000));
-    await vi.advanceTimersByTimeAsync(1800);
+    await vi.advanceTimersByTimeAsync(5000); // well past the deadline; the core's bound is the backstop
     expect(ipc.flushAck).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(200);
+    gate.resolve(written("h1"));
+    await vi.advanceTimersByTimeAsync(10);
     expect(ipc.flushAck).toHaveBeenCalledTimes(1);
-    gate.resolve(written("h1")); // late: must not produce a second ack
     await vi.advanceTimersByTimeAsync(5000);
     expect(ipc.flushAck).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+  });
+
+  it("exactly once, literally: a repeat event after the ack has completed is ignored too", async () => {
+    const { ipc, api, view, fire, wrapper } = harness();
+    await api.loadNote("one", "a.md", "h0");
+    view.dispatch({ changes: { from: 3, insert: "!" } });
+    fire(closing("vA"));
+    await flush();
+    fire(closing("vA"));
+    await flush();
+    expect(ipc.savePatch).toHaveBeenCalledTimes(1);
+    expect(ipc.flushAck).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+  });
+
+  it("boot race: vault id not yet known, a dirty buffer still flushes and acks the event's id", async () => {
+    const { ipc, api, view, order, fire, wrapper } = harness({}, { vaultId: null });
+    await api.loadNote("one", "a.md", "h0");
+    view.dispatch({ changes: { from: 3, insert: "!" } });
+    fire(closing("vX"));
+    await flush();
+    expect(order).toEqual(["save", "ack"]);
+    expect(ipc.flushAck).toHaveBeenCalledWith({ vault_id: "vX" });
     wrapper.unmount();
   });
 
