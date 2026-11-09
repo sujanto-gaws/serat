@@ -44,8 +44,11 @@ const props = withDefaults(
      * every status is accepted (the event is only emitted for the open vault).
      */
     vaultId?: string | null;
+    /** `false` = no vault open (after a failed open): drop every event, whatever its id. Distinct from a
+     * `null` `vaultId`, which means "not known yet, do not filter". */
+    vaultOpen?: boolean;
   }>(),
-  { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null },
+  { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null, vaultOpen: true },
 );
 
 const emit = defineEmits<{
@@ -150,6 +153,7 @@ onMounted(() => {
   // Registered after `open_tree` is on the wire.
   void props.ipc
     .onTreeStatus?.((status) => {
+      if (!props.vaultOpen) return; // no vault open: nothing is current
       if (props.vaultId !== null && status.vault_id !== props.vaultId) return; // another vault's session
       if (status.stopped) stopped.value = true;
     })

@@ -402,6 +402,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         :open-path="store.openNote"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
         @open="onTreeOpen"
         @insert-link="onInsertLink"
         @rename="onTreeRename"
@@ -415,6 +416,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       <CodeMirrorEditor
         ref="editorRef"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
         :live-preview="livePreview"
         :commands="commands"
         placeholder="No note open."

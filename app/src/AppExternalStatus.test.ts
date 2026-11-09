@@ -145,8 +145,14 @@ describe("App drops index status from another vault (#91, IndexStatus.vault_id)"
     handlers.get("vault://opened")!({ payload: { root: "/b", vault_id: "B", index: { kind: "opening" } } });
     store.openFailed();
     send("A", 4); // the old vault's late status after the failed open
+    send("B", 5); // the announced id's own status, emitted before the Err and delivered after (#103)
     expect(store.indexStatusText).toContain("1 notes");
     expect(store.vaultRoot).toBeNull();
+    handlers.get("vault://opened")!({ payload: { root: "/c", vault_id: "C", index: { kind: "opening" } } });
+    send("B", 6);
+    expect(store.indexStatusText).toContain("1 notes");
+    send("C", 7);
+    expect(store.indexStatusText).toContain("7 notes");
     wrapper.unmount();
     vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
   });

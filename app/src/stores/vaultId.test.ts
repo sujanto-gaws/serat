@@ -70,6 +70,24 @@ describe("vault id sources", () => {
     expect(s.vaultId).toBe("D");
   });
 
+  it("after a failed open EVERY event carrying the announced id is dropped (#103); a later open adopts and its statuses apply", () => {
+    const s = useVaultStore();
+    s.adoptBoot("A");
+    expect(s.vaultOpen).toBe(true);
+    s.vaultOpened(opened("B"));
+    s.openFailed();
+    expect(s.vaultOpen).toBe(false);
+    expect(s.vaultId).toBe("B"); // kept only to recognise
+    expect(s.statusBelongsHere("B")).toBe(false); // emitted before the Err, delivered after
+    expect(s.statusBelongsHere("A")).toBe(false);
+    s.adoptFromIndexStatus("B");
+    expect(s.vaultOpen).toBe(false);
+    s.vaultOpened(opened("C"));
+    expect(s.vaultOpen).toBe(true);
+    expect(s.statusBelongsHere("C")).toBe(true);
+    expect(s.statusBelongsHere("B")).toBe(false);
+  });
+
   it("statusBelongsHere: never empty, never a different known id", () => {
     const s = useVaultStore();
     expect(s.statusBelongsHere("")).toBe(false);

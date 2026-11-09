@@ -74,11 +74,13 @@ const props = withDefaults(
      * compared. Captured per buffer at `loadNote`, so an `app://closing` for the OLD
      * vault of a switch still reaches the buffer that belongs to it (architecture 3.1.1 item 6.7). */
     vaultId?: string | null;
+    /** `false` = no vault open (after a failed open): every event is dropped, whatever its id. */
+    vaultOpen?: boolean;
     /** The app-wide command registry (architecture.md §9.3). The editor adds its commands to
      * it for as long as it is mounted, so the palette lists them; a private one when absent. */
     commands?: CommandRegistry;
   }>(),
-  { livePreview: true, vaultId: null, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
+  { livePreview: true, vaultId: null, vaultOpen: true, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
 
 const emit = defineEmits<{
@@ -496,6 +498,7 @@ let bufferVaultId: string | null = null;
 
 /** True unless both sides know their vault id and they differ. */
 function isOurVault(id: string): boolean {
+  if (!props.vaultOpen) return false; // no vault open: nothing is current (task #103)
   const mine = bufferVaultId ?? props.vaultId;
   return mine === null || mine === undefined || mine === id;
 }

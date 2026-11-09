@@ -431,6 +431,25 @@ describe("FileTree component", () => {
     unknown.unmount();
   });
 
+  it("no vault open (after a failed open): tree://status is dropped even for the announced id; a new open is accepted again (#103)", async () => {
+    const { ipc } = fakeIpc();
+    let fire: (s: { vault_id: string; stopped: boolean }) => void = () => undefined;
+    ipc.onTreeStatus = vi.fn(async (h) => {
+      fire = h;
+      return () => undefined;
+    });
+    const w = mount(FileTree, { props: { ipc, vaultId: "B", vaultOpen: false }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    fire({ vault_id: "B", stopped: true });
+    await w.vm.$nextTick();
+    expect(w.get('[data-testid="tree-status"]').text()).toBe("");
+    await w.setProps({ vaultId: "C", vaultOpen: true });
+    fire({ vault_id: "C", stopped: true });
+    await w.vm.$nextTick();
+    expect(w.get('[data-testid="tree-status"]').text()).toContain("stopped updating");
+    w.unmount();
+  });
+
   it("open_tree is on the wire before the status listener is registered; a late listener resolving after unmount is unlistened", async () => {
     const { ipc } = fakeIpc();
     const order: string[] = [];
