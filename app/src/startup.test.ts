@@ -241,7 +241,7 @@ describe("hydrateBuffer", () => {
       resolvePaint = resolve;
     });
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     const done = hydrateBuffer(store, editor, paintMark);
 
@@ -267,15 +267,28 @@ describe("hydrateBuffer", () => {
     });
     markVaultUsable.mockResolvedValue(31);
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     await hydrateBuffer(store, editor, Promise.resolve(9.0));
 
     expect(readFile).toHaveBeenCalledWith({ path: "a.md" });
-    expect(editor.setText).toHaveBeenCalledWith("# hello");
+    // The bytes that were READ, with the hash they were read at: never getText().
+    expect(editor.loadNote).toHaveBeenCalledWith("# hello", "a.md", "deadbeef");
+    expect(editor.setText).not.toHaveBeenCalled();
     expect(store.openNote).toBe("a.md");
     expect(store.baseHash).toBe("deadbeef");
     expect(markVaultUsable).toHaveBeenCalledWith("a.md");
+  });
+
+  it("installs the buffer right after the read, before waiting for the paint or usable marks", async () => {
+    window.__SERAT_BOOT__ = { vault: "/vault", open: "a.md", exit_after_ready: false };
+    readFile.mockResolvedValue({ path: "a.md", text: "# hello", hash: "deadbeef", mtime_ms: 0, bytes: 7 });
+    markVaultUsable.mockResolvedValue(31);
+    const paintMark = new Promise<number | null>(() => {}); // never resolves
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
+    void hydrateBuffer(useVaultStore(), editor, paintMark);
+    await vi.waitFor(() => expect(editor.loadNote).toHaveBeenCalledWith("# hello", "a.md", "deadbeef"));
+    expect(markVaultUsable).not.toHaveBeenCalled();
   });
 
   it("shows a refused read as text in the buffer rather than a modal (§9.1)", async () => {
@@ -283,7 +296,7 @@ describe("hydrateBuffer", () => {
     readFile.mockRejectedValue({ kind: "not_found", path: "missing.md" });
     markVaultUsable.mockResolvedValue(5);
 
-    const editor = { setText: vi.fn() };
+    const editor = { setText: vi.fn(), loadNote: vi.fn().mockResolvedValue(true) };
     const store = useVaultStore();
     await hydrateBuffer(store, editor, Promise.resolve(1.0));
 

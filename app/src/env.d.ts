@@ -23,6 +23,11 @@ interface SeratBoot {
 declare global {
   interface Window {
     __SERAT_BOOT__?: SeratBoot;
+    /** NFR-PRF-02's benchmark harness seam — see `App.vue`'s `onMounted`
+     * for why this exists and what it does. Not present outside a page
+     * that mounted `App.vue`, and only ever defined in a `--mode bench` build
+     * (`npm run build:bench`); a release build has no such global. */
+    __seratBenchOpenNote?: (text: string) => void;
   }
 }
 

@@ -17,7 +17,7 @@ import { fileURLToPath, URL } from "node:url";
 import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vitest/config";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   base: "./",
   plugins: [vue()],
   resolve: {
@@ -26,7 +26,9 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: fileURLToPath(new URL("../crates/serat-app/webview", import.meta.url)),
+    // A bench build (NFR-PRF-02 harness only; installs `window.__seratBenchOpenNote`)
+    // goes to app/dist-bench so it can never overwrite the shipped webview/.
+    outDir: fileURLToPath(new URL(mode === "bench" ? "./dist-bench" : "../crates/serat-app/webview", import.meta.url)),
     emptyOutDir: true,
     // No inline script and no CDN, so `tauri.conf.json`'s "script-src 'self'" is
     // satisfiable with no changes — but that claim used to be made for "style-src
@@ -59,4 +61,4 @@ export default defineConfig({
     globals: false,
     include: ["src/**/*.test.ts"],
   },
-});
+}));
