@@ -1,5 +1,5 @@
 <!--
-  Image viewer (FR-BIN-01; binary-viewers.md "Image viewer"; ADR-0017 §6). Every format,
+  Image viewer (FR-BIN-12; binary-viewers.md "Image viewer"; ADR-0017 §6). Every format,
   SVG included, is a plain <img src="serat-asset://…"> and nothing else: never <object>,
   <iframe>, inline markup, or a fetched-then-injected string. Zoom: fit by default, 1:1,
   percent field, slider, +/-; drag to pan when larger than the pane; modifier+wheel zooms

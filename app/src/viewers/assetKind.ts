@@ -1,4 +1,4 @@
-// Which surface a vault path opens in (FR-BIN-01, US-18). Extension-only and front-end-side:
+// Which surface a vault path opens in (FR-BIN-11, FR-BIN-12, US-19). Extension-only and front-end-side:
 // the authority on what the scheme will serve is `asset_info.viewable` / ADR-0017 step 5.
 
 /** ADR-0017 §9: an image above this is not served (404), so the viewer does not even ask. */

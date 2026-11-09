@@ -117,8 +117,15 @@ function closeSearch(): void {
  */
 async function openNote(path: string, block: BlockLocation | null = null): Promise<void> {
   if (isViewerPath(path)) {
-    // FR-BIN-01: a PDF or image opens in the viewer; the editor (and its buffer) stay mounted.
+    // FR-BIN-11/12: a PDF or image opens in the viewer; the editor (and its buffer) stay mounted.
     viewing.value = path;
+    return;
+  }
+  if (viewing.value !== null && path === store.openNote) {
+    // Returning from a viewer to the note still in the editor: its buffer (maybe dirty, with undo
+    // history) is already current; re-reading would race the flush and replace it with stale text.
+    viewing.value = null;
+    void nextTick(() => editorRef.value?.focus());
     return;
   }
   const editor = editorRef.value;
@@ -309,7 +316,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
         ref="treeRef"
-        :open-path="viewing ?? store.openNote"
+        :open-path="editorDirty && store.openNote ? store.openNote : (viewing ?? store.openNote)"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
         @open="onTreeOpen"

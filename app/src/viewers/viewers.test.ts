@@ -1,4 +1,4 @@
-// Task #26: viewer states, URL containment, routing helpers (FR-BIN-01, FR-BIN-02, NFR-SEC-06;
+// Task #26: viewer states, URL containment, routing helpers (FR-BIN-11, FR-BIN-12, FR-BIN-02, NFR-SEC-06;
 // ADR-0017; binary-viewers.md).
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,24 +50,25 @@ describe("assetUrl containment on the front end (NFR-SEC-06, ADR-0017 steps 3-4)
     }
   });
 
-  it("never lets a backslash or encoded dots act as a separator or traversal", () => {
-    const u = assetUrl("a\\..\\b.png", "other");
-    expect(u).toBe("serat-asset://localhost/a%5C..%5Cb.png");
+  it("treats a backslash as a separator (native VaultPath::new does), so a\\..\\b and .serat\\x are refused", () => {
+    for (const p of ["a\\..\\b.png", "..\\x.png", ".serat\\index.db", "a\\\\b.png", "\\abs.png"]) {
+      expect(() => assetUrl(p, "other"), p).toThrow();
+    }
+    // A backslash between ordinary names is still encoded, never emitted raw.
+    const u = assetUrl("C:\\Windows\\x.png", "other");
+    expect(u).toBe("serat-asset://localhost/C%3A%5CWindows%5Cx.png");
     expect(u).not.toContain("\\");
-    expect(new URL(u).pathname).toBe("/a%5C..%5Cb.png");
-    expect(() => assetUrl("C:\\Windows\\x.png", "other")).not.toThrow(); // one literal segment, encoded
-    expect(assetUrl("C:\\Windows\\x.png", "other")).not.toContain("\\");
     // `%2e%2e` typed literally is a file named that, encoded once (the handler decodes once).
     expect(assetUrl("%2e%2e/x.png", "other")).toBe("serat-asset://localhost/%252e%252e/x.png");
   });
 
-  it("refuses to build a URL for a path under an ignored directory, in any case", () => {
-    for (const p of [".serat/index.db", "a/.git/x.png", ".SERAT/x.png", "n/.Obsidian/p.png", ".trash/x.pdf"]) {
+  it("refuses a path under an ignored directory (dotted parent, node_modules), in any case", () => {
+    for (const p of [".serat/index.db", "a/.git/x.png", ".SERAT/x.png", "n/.Obsidian/p.png", ".trash/x.pdf", "a/.stfolder/x.png", "a/.gitx/x.png", "node_modules/p.png", "a/Node_Modules/p.png"]) {
       expect(isIgnoredAssetPath(p), p).toBe(true);
       expect(() => assetUrl(p, "other"), p).toThrow();
     }
     expect(isIgnoredAssetPath("serat/x.png")).toBe(false);
-    expect(isIgnoredAssetPath("a/.gitx/x.png")).toBe(false);
+    expect(isIgnoredAssetPath("a/x.png")).toBe(false);
   });
 
   it("builds exactly the two ADR-0017 origins and the sanitiser's recogniser accepts only those", () => {
@@ -129,6 +130,32 @@ describe("ViewerHost states (binary-viewers.md)", () => {
     expect(w.emitted("reveal")).toEqual([["p/x.png"]]);
   });
 
+  it("a PDF that changes on disk restarts at the same page, re-reading asset_info, with a 4 s notice", async () => {
+    vi.useFakeTimers();
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 5000 }));
+    const loads: Array<{ length: number; changed: () => void }> = [];
+    const loader = vi.fn(async (_p: string, length: number, changed: () => void) => {
+      loads.push({ length, changed });
+      return { numPages: 9, pageSize: async () => ({ width: 1, height: 1 }), render: async () => {}, destroy: () => {} };
+    });
+    const w = mount(ViewerHost, { props: { path: "d/x.pdf", pdfLoader: loader } });
+    await flushPromises();
+    expect(loads[0].length).toBe(5000);
+    await w.get('[data-testid="pdf-page"]').setValue("4");
+    await w.get('[data-testid="pdf-page"]').trigger("keydown", { key: "Enter" });
+    assetInfo.mockResolvedValue(info({ path: "d/x.pdf", mime: "application/pdf", bytes: 7000 }));
+    loads[0].changed();
+    await flushPromises();
+    expect(loads).toHaveLength(2);
+    expect(loads[1].length).toBe(7000);
+    expect((w.get('[data-testid="pdf-page"]').element as HTMLInputElement).value).toBe("4");
+    expect(w.get('[data-testid="viewer-changed"]').text()).toContain("changed on disk");
+    vi.advanceTimersByTime(4100);
+    await w.vm.$nextTick();
+    expect(w.find('[data-testid="viewer-changed"]').exists()).toBe(false);
+    vi.useRealTimers();
+  });
+
   it("a path the URL builder refuses never reaches an <img>", async () => {
     assetInfo.mockResolvedValue(info({ path: ".serat/x.png" }));
     const w = mount(ViewerHost, { props: { path: ".serat/x.png" } });
@@ -165,7 +192,7 @@ describe("ViewerHost states (binary-viewers.md)", () => {
     await flushPromises();
     await w2.get('[data-testid="viewer-edit-meta"]').trigger("click");
     await flushPromises();
-    expect(writeFile).toHaveBeenCalledWith({ path: "d/y.pdf.md", text: "---\n---\n", base_hash: null });
+    expect(writeFile).toHaveBeenCalledWith({ path: "d/y.pdf.md", text: "---\n\n---\n", base_hash: null });
     expect(w2.emitted("open-note")).toEqual([["d/y.pdf.md"]]);
   });
 
@@ -237,10 +264,10 @@ describe("PdfViewer", () => {
   it("loads through the injected loader with the URL and the asset_info length, shows page count, Enter jumps", async () => {
     const doc = fakeDoc(18);
     const loader = vi.fn().mockResolvedValue(doc);
-    const w = mount(PdfViewer, { props: { url: "serat-asset://localhost/c.pdf", length: 123456, name: "c.pdf", loader } });
+    const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 123456, name: "c.pdf", loader } });
     expect(w.find('[data-testid="pdf-loading"]').exists()).toBe(true);
     await flushPromises();
-    expect(loader).toHaveBeenCalledWith("serat-asset://localhost/c.pdf", 123456);
+    expect(loader).toHaveBeenCalledWith("d/c.pdf", 123456, expect.any(Function));
     expect(w.get('[data-testid="pdf-count"]').text()).toBe("of 18");
     const field = w.get('[data-testid="pdf-page"]');
     await field.setValue("4");
@@ -255,7 +282,7 @@ describe("PdfViewer", () => {
   it("an out-of-range page reverts in place with the error flash and renders nothing new", async () => {
     vi.useFakeTimers();
     const doc = fakeDoc(3);
-    const w = mount(PdfViewer, { props: { url: "u", length: 1, name: "c.pdf", loader: async () => doc } });
+    const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 1, name: "c.pdf", loader: async () => doc } });
     await flushPromises();
     const before = doc.rendered.length;
     const field = w.get('[data-testid="pdf-page"]');
@@ -271,11 +298,11 @@ describe("PdfViewer", () => {
   });
 
   it("a load failure is stated, and unmounting destroys the document", async () => {
-    const bad = mount(PdfViewer, { props: { url: "u", length: 1, name: "c.pdf", loader: async () => Promise.reject(new Error("x")) } });
+    const bad = mount(PdfViewer, { props: { path: "d/c.pdf", length: 1, name: "c.pdf", loader: async () => Promise.reject(new Error("x")) } });
     await flushPromises();
     expect(bad.get('[data-testid="pdf-error"]').text()).toContain("couldn't be displayed");
     const doc = fakeDoc(2);
-    const ok = mount(PdfViewer, { props: { url: "u", length: 1, name: "c.pdf", loader: async () => doc } });
+    const ok = mount(PdfViewer, { props: { path: "d/c.pdf", length: 1, name: "c.pdf", loader: async () => doc } });
     await flushPromises();
     ok.unmount();
     expect(doc.destroyed).toBe(true);
@@ -283,7 +310,7 @@ describe("PdfViewer", () => {
 
   it("arrow keys page when focus is not in the page field", async () => {
     const doc = fakeDoc(5);
-    const w = mount(PdfViewer, { props: { url: "u", length: 1, name: "c.pdf", loader: async () => doc } });
+    const w = mount(PdfViewer, { props: { path: "d/c.pdf", length: 1, name: "c.pdf", loader: async () => doc } });
     await flushPromises();
     await w.get("section").trigger("keydown", { key: "ArrowRight" });
     expect(doc.rendered.at(-1)).toBe(2);

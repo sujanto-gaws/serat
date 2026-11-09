@@ -1,4 +1,4 @@
-// Task #26 routing through App: activating a PDF/image opens the viewer (FR-BIN-01, US-18),
+// Task #26 routing through App: activating a PDF/image opens the viewer (FR-BIN-11, FR-BIN-12, US-19),
 // a note opens the editor again, and the sidecar opens as an ordinary note (FR-BIN-02).
 import { mount } from "@vue/test-utils";
 import { createPinia } from "pinia";
@@ -44,10 +44,12 @@ beforeEach(() => {
   window.__SERAT_BOOT__ = { vault: "/vault", open: "a.md", exit_after_ready: false };
   vi.stubGlobal("requestAnimationFrame", () => 0);
   calls.length = 0;
+  // jsdom has no execCommand; CodeMirror calls it when focusing a selection.
+  (document as unknown as { execCommand: () => boolean }).execCommand = () => false;
 });
 afterEach(() => vi.unstubAllGlobals());
 
-describe("App routing to the viewers (FR-BIN-01)", () => {
+describe("App routing to the viewers (FR-BIN-11, FR-BIN-12)", () => {
   it("a PDF opens the viewer, not the editor; a note brings the editor back; read_file is never used for the binary", async () => {
     const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
     treePush({
@@ -75,6 +77,29 @@ describe("App routing to the viewers (FR-BIN-01)", () => {
 
     await wrapper.get('[data-path="a.md"]').trigger("click");
     await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(false));
+    wrapper.unmount();
+  });
+
+  it("returning from a viewer to the note still in the editor does not re-read it (its buffer and undo stay)", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    treePush({
+      kind: "listing",
+      dir: "",
+      entries: [
+        { name: "pic.png", kind: "asset", sidecar: false },
+        { name: "a.md", kind: "note", sidecar: false },
+      ],
+    });
+    await wrapper.vm.$nextTick();
+    const reads = () => calls.filter((c) => c.cmd === "read_file" && (c.args as { path: string }).path === "a.md").length;
+    await wrapper.get('[data-path="a.md"]').trigger("click");
+    await vi.waitFor(() => expect(reads()).toBe(1));
+    await new Promise((r) => setTimeout(r, 30)); // let loadNote and setOpenBuffer finish
+    await wrapper.get('[data-path="pic.png"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(true));
+    await wrapper.get('[data-path="a.md"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="viewer-host"]').exists()).toBe(false));
+    expect(reads()).toBe(1);
     wrapper.unmount();
   });
 

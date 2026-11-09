@@ -1,12 +1,19 @@
-// The one place pdf.js is touched (FR-BIN-01, ADR-0017 §pdf.js). Imported lazily so the
+// The one place pdf.js is touched (FR-BIN-11, ADR-0017 §pdf.js). Imported lazily so the
 // ~1 MB library is not on the startup path (NFR-PRF-01). Bundled, inert and local:
-//   * bytes come only from the `serat-asset` URL passed in (CSP `connect-src` allows that
-//     origin and `ipc:`, nothing remote);
-//   * the worker is a same-origin script emitted by Vite (`script-src 'self'`), not a blob:;
-//   * `length` from `asset_info`, `rangeChunkSize` at the 1,000 KiB cap, `disableStream` and
-//     `disableAutoFetch`, so only the spans of the pages being shown are requested;
-//   * no annotation layer is built and the scripting sandbox bundle is never loaded, so a
-//     PDF's JavaScript and links cannot run (links wait for the follow-up; see PdfViewer).
+//   * bytes come only from `read_asset_range` through `assetRangeTransport.ts`; `getDocument` is
+//     given NO url, so pdf.js makes no network request of its own (NFR-SEC-01);
+//   * pdf.js 6.x has no `isEvalSupported` option and no eval path (none in pdf.mjs or the
+//     worker); the control is the app CSP, which has no 'unsafe-eval' (ADR-0017 amendment,
+//     task #94). `useWasm: false` is explicit because the CSP has no 'wasm-unsafe-eval';
+//   * the worker is a same-origin module Worker built from a Vite asset URL, so no blob: wrapper
+//     (blocked by `script-src 'self'`) can silently demote it to a main-thread fake worker; if
+//     a Worker cannot be created the load fails loudly instead;
+//   * no annotation layer is built and the scripting sandbox bundle is never loaded, so a PDF's
+//     JavaScript and links cannot run;
+//   * known gap (ADR-0017 amendment, task #94): cMaps and standard fonts are not shipped.
+
+import { makeAssetTransport } from "./assetRangeTransport";
+import { assetInfo, readAssetRange } from "@/ipc/client";
 
 export interface PdfPageSize {
   width: number;
@@ -22,25 +29,32 @@ export interface PdfDocumentHandle {
   destroy(): void;
 }
 
-export type PdfLoader = (url: string, length: number) => Promise<PdfDocumentHandle>;
+/** Opens `path` (a resolved vault path) of `length` bytes. `onChanged` fires when the file no
+ * longer matches what was opened. */
+export type PdfLoader = (path: string, length: number, onChanged: () => void) => Promise<PdfDocumentHandle>;
 
-/** ADR-0017 §8: the handler's span cap. */
+/** ADR-0017 §9: the handler's span cap, also pdf.js's chunk size. */
 export const RANGE_CHUNK_SIZE = 1000 * 1024;
 
-export const loadPdf: PdfLoader = async (url, length) => {
+export const loadPdf: PdfLoader = async (path, length, onChanged) => {
   const pdfjs = await import("pdfjs-dist");
-  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-    pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).href;
+  if (!pdfjs.GlobalWorkerOptions.workerPort) {
+    if (typeof Worker === "undefined") throw new Error("no Worker: refusing pdf.js's main-thread fake worker");
+    pdfjs.GlobalWorkerOptions.workerPort = new Worker(new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url), {
+      type: "module",
+    });
   }
-  const params = {
-    url,
-    length,
+  const transport = makeAssetTransport(pdfjs.PDFDataRangeTransport, length, {
+    readRange: (start, len) => readAssetRange({ path, start, len }),
+    statBytes: async () => (await assetInfo({ path })).bytes,
+    onChanged,
+  });
+  const task = pdfjs.getDocument({
+    range: transport,
     rangeChunkSize: RANGE_CHUNK_SIZE,
-    disableStream: true,
     disableAutoFetch: true,
-    isEvalSupported: false,
-  };
-  const task = pdfjs.getDocument(params as Parameters<typeof pdfjs.getDocument>[0]);
+    useWasm: false,
+  });
   const doc = await task.promise;
   return {
     numPages: doc.numPages,
@@ -65,7 +79,9 @@ export const loadPdf: PdfLoader = async (url, length) => {
         textLayer.replaceChildren();
         textLayer.style.width = canvas.style.width;
         textLayer.style.height = canvas.style.height;
+        // pdf_viewer.css derives every glyph's size from these (S6).
         textLayer.style.setProperty("--scale-factor", String(scale));
+        textLayer.style.setProperty("--total-scale-factor", String(scale));
         await new pdfjs.TextLayer({
           textContentSource: page.streamTextContent(),
           container: textLayer,

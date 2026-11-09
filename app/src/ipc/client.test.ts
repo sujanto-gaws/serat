@@ -122,6 +122,6 @@ describe("assetUrl (ADR-0017 steps 3-4: one decode, no collapsible segments)", (
       expect(() => assetUrl(path, false), path).toThrow();
       expect(() => assetUrl(path, true), path).toThrow();
     }
-    expect(assetUrl("..a/b..png", false)).toBe("serat-asset://localhost/..a/b..png");
+    expect(assetUrl("x..a/b..png", false)).toBe("serat-asset://localhost/x..a/b..png");
   });
 });

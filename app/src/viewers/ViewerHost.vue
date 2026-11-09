@@ -1,12 +1,12 @@
 <!--
-  Binary viewer host (FR-BIN-01, FR-BIN-02, US-18; binary-viewers.md). Occupies the editor's
+  Binary viewer host (FR-BIN-11, FR-BIN-12, US-19; sidecar action FR-BIN-02, US-18; binary-viewers.md). Occupies the editor's
   place. Reads `asset_info` first (size and MIME before any byte is requested), then hands the
   `assetUrl` of the path to the image or PDF viewer. The sidecar's metadata is reached through
   "Edit metadata note", which opens `x.pdf.md` as an ordinary note in the editor (creating it
   when absent): this component never edits it.
 -->
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 
 import { assetUrl } from "@/editor/assetUrl";
 import { assetInfo, isIpcError, writeFile } from "@/ipc/client";
@@ -27,6 +27,10 @@ const url = ref<string | null>(null);
 const dims = ref<{ w: number; h: number } | null>(null);
 const metaOpen = ref(true);
 const note = ref<string | null>(null);
+/** Page to resume at after a restart, and the 4 s "changed on disk" notice (spec state table). */
+const resumePage = ref(1);
+const changedNotice = ref(false);
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const name = computed(() => props.path.slice(props.path.lastIndexOf("/") + 1));
 const kind = computed(() => openKind(props.path));
@@ -37,12 +41,14 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MiB`;
 }
 
-async function load(path: string): Promise<void> {
+async function load(path: string, restart = false): Promise<void> {
+  if (!restart) resumePage.value = 1;
   state.value = "loading";
   info.value = null;
   url.value = null;
   dims.value = null;
   note.value = null;
+  if (!restart) changedNotice.value = false;
   let result: AssetInfo;
   try {
     result = await assetInfo({ path });
@@ -68,7 +74,22 @@ async function load(path: string): Promise<void> {
     return;
   }
   state.value = "ready";
+  if (restart) {
+    changedNotice.value = true;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (changedNotice.value = false), 4000);
+  }
 }
+
+/** The PDF's bytes no longer match what was opened: re-read asset_info and restart the load. */
+function onPdfChanged(page: number): void {
+  resumePage.value = page;
+  void load(props.path, true);
+}
+
+onBeforeUnmount(() => {
+  if (noticeTimer) clearTimeout(noticeTimer);
+});
 
 watch(() => props.path, (p) => void load(p), { immediate: true });
 
@@ -81,7 +102,7 @@ async function editMetadata(): Promise<void> {
   }
   const target = sidecarPathFor(props.path);
   try {
-    await writeFile({ path: target, text: "---\n---\n", base_hash: null });
+    await writeFile({ path: target, text: "---\n\n---\n", base_hash: null });
   } catch (error) {
     // StaleHash on a create means it already exists (made elsewhere): just open it.
     if (!(isIpcError(error) && error.kind === "stale_hash")) {
@@ -114,6 +135,9 @@ async function editMetadata(): Promise<void> {
       <span v-if="note" role="status" class="hint" data-testid="viewer-note">{{ note }}</span>
     </div>
 
+    <p v-if="changedNotice" class="notice" role="status" data-testid="viewer-changed">
+      This file changed on disk — showing the latest version.
+    </p>
     <div class="body">
       <p v-if="state === 'loading'" class="status" data-testid="viewer-loading">Loading…</p>
       <p v-else-if="state === 'missing'" class="status" role="alert" data-testid="viewer-missing">
@@ -142,10 +166,12 @@ async function editMetadata(): Promise<void> {
       />
       <PdfViewer
         v-else-if="state === 'ready' && kind === 'pdf' && url && info"
-        :url="url"
+        :path="path"
         :length="info.bytes"
         :name="name"
         :loader="pdfLoader"
+        :start-page="resumePage"
+        @changed="onPdfChanged"
       />
     </div>
   </section>
@@ -159,6 +185,7 @@ async function editMetadata(): Promise<void> {
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .spacer { flex: 1; }
 .sidecar { display: flex; align-items: center; gap: 0.75rem; padding: 0.3rem 0.75rem; border-bottom: 1px solid #0002; }
+.notice { margin: 0; padding: 0.25rem 0.75rem; color: #0009; font-size: 0.85rem; }
 .body { flex: 1; min-height: 0; }
 .status { padding: 2rem; text-align: center; color: #0009; }
 button { border: 1px solid #0003; background: transparent; border-radius: 3px; padding: 0.1rem 0.6rem; cursor: pointer; }

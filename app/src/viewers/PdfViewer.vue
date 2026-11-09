@@ -1,16 +1,18 @@
 <!--
-  PDF viewer (FR-BIN-01; binary-viewers.md "PDF viewer"; ADR-0017). One page at a time, drawn
-  by pdf.js (pdfEngine.ts) from the `serat-asset` URL. Toolbar: previous/next, a mono page field
-  (Enter jumps), page count, fit-width / fit-page segmented control, zoom in/out.
-  Deferred, reported: annotation links (none are built, so none can open), pdf.js find bar,
-  the "file changed on disk" restart note (needs If-Range support in the transport).
+  PDF viewer (FR-BIN-11; binary-viewers.md "PDF viewer"; ADR-0017). One page at a time, drawn
+  by pdf.js (pdfEngine.ts) over `read_asset_range` spans (assetRangeTransport.ts). Toolbar:
+  previous/next, a mono page field (Enter jumps), page count, fit-width / fit-page, zoom in/out.
+  A file replaced on disk emits `changed`; the host restarts the load and shows the 4 s notice.
+  Deferred (follow-ups): annotation links (none built, so none can open), pdf.js find bar.
 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { loadPdf, type PdfDocumentHandle, type PdfLoader, type PdfPageSize } from "./pdfEngine";
 
-const props = defineProps<{ url: string; length: number; name: string; loader?: PdfLoader }>();
+const props = defineProps<{ path: string; length: number; name: string; loader?: PdfLoader; startPage?: number }>();
+/** The file on disk no longer matches what was opened; carries the page being read. */
+const emit = defineEmits<{ (e: "changed", page: number): void }>();
 
 type Fit = "width" | "page" | "custom";
 
@@ -59,14 +61,14 @@ async function open(): Promise<void> {
   doc.value?.destroy();
   doc.value = null;
   try {
-    const handle = await (props.loader ?? loadPdf)(props.url, props.length);
+    const handle = await (props.loader ?? loadPdf)(props.path, props.length, () => emit("changed", page.value));
     if (!alive) {
       handle.destroy();
       return;
     }
     doc.value = handle;
-    page.value = 1;
-    pageField.value = "1";
+    page.value = Math.min(Math.max(1, props.startPage ?? 1), handle.numPages);
+    pageField.value = String(page.value);
     await nextTick();
     await draw();
   } catch {
@@ -131,7 +133,7 @@ onBeforeUnmount(() => {
   alive = false;
   doc.value?.destroy();
 });
-watch(() => props.url, () => void open());
+watch(() => props.path, () => void open());
 defineExpose({ goTo });
 </script>
 
@@ -139,7 +141,7 @@ defineExpose({ goTo });
   <section class="pdf" tabindex="0" aria-label="PDF viewer" data-testid="pdf-viewer" @keydown="onKeydown">
     <div class="toolbar" role="toolbar" aria-label="PDF controls">
       <button type="button" aria-label="Previous page" data-testid="pdf-prev" :disabled="page <= 1" @click="goTo(page - 1)">◂</button>
-      <label class="page">
+      <label class="pagefield">
         <span class="sr">Page</span>
         <input
           ref="pageField$"
@@ -169,7 +171,7 @@ defineExpose({ goTo });
       <p v-if="state === 'error'" class="message" role="alert" data-testid="pdf-error">
         This PDF couldn't be displayed
       </p>
-      <div v-show="state === 'ready'" class="page">
+      <div v-show="state === 'ready'" class="sheet">
         <canvas ref="canvas" :aria-label="`${name}, page ${page} of ${numPages}`" role="img"></canvas>
         <div ref="textLayer" class="textLayer"></div>
       </div>
@@ -184,17 +186,24 @@ defineExpose({ goTo });
 .toolbar button[aria-pressed="true"] { background: var(--indigo); color: var(--paper); }
 .toolbar button:disabled { opacity: 0.4; cursor: default; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-.page input { width: 3.5rem; text-align: right; border: 1px solid #0003; border-radius: 3px; padding: 0.1rem 0.3rem; }
-.page input.flash { outline: 2px solid #a3472f; }
+.pagefield input { width: 3.5rem; text-align: right; border: 1px solid #0003; border-radius: 3px; padding: 0.1rem 0.3rem; }
+.pagefield input.flash { outline: 2px solid #a3472f; }
 .count, .pct { color: #0009; }
 .spacer { flex: 1; }
 .segmented { display: inline-flex; gap: 0; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .stage { flex: 1; min-height: 0; overflow: auto; background: #0000000d; display: flex; justify-content: center; padding: 1rem; }
-.page { position: relative; margin: 0 auto; box-shadow: 0 0 0 1px #0002; background: #fff; align-self: flex-start; }
-.page canvas { display: block; }
-.textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; }
-.textLayer :deep(span), .textLayer :deep(br) { color: transparent; position: absolute; white-space: pre; transform-origin: 0 0; cursor: text; }
+.sheet { position: relative; margin: 0 auto; box-shadow: 0 0 0 1px #0002; background: #fff; align-self: flex-start; }
+.sheet canvas { display: block; }
+.textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; transform-origin: 0 0; }
+/* Ported from pdfjs-dist/web/pdf_viewer.css: glyph size/shear come from per-span custom properties. */
+.textLayer :deep(span), .textLayer :deep(br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0 0; user-select: text; }
+.textLayer :deep(> :not(.markedContent)), .textLayer :deep(.markedContent span:not(.markedContent)) {
+  --font-height: 0; --scale-x: 1; --rotate: 0deg;
+  font-size: calc(var(--total-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x));
+}
+.textLayer :deep(.markedContent) { display: contents; }
 .skeleton { width: min(40rem, 90%); aspect-ratio: 1 / 1.414; background: #0000000d; align-self: flex-start; }
 .message { align-self: center; }
 </style>

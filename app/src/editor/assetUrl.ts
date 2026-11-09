@@ -26,24 +26,29 @@ export function detectAssetPlatform(): AssetPlatform {
   return /Win/.test(platform) ? "windows" : "other";
 }
 
-/** Directories the vault never serves (ADR-0017 step 5; case folded, like the Rust side). A
- * defensive duplicate: the native handler is the authority, this just refuses to even ask. */
-const IGNORED_DIRS = new Set([".serat", ".git", ".obsidian", ".trash"]);
+const SEPARATORS = /[\\/]/;
 
+/**
+ * The static part of serat-vault's ignore rules, mirrored so the front end does not even ask
+ * (the handler stays the authority; `.seratignore` and configured extra dirs are unknown here):
+ * any PARENT directory starting with `.` (`.serat`, `.git`, `.obsidian`, `.trash`, `.stfolder`,
+ * `.stversions`, ...) and `node_modules`, case-folded. A backslash counts as a separator because
+ * the native side turns `\` into `/` after its single decode.
+ */
 export function isIgnoredAssetPath(vaultRelativePath: string): boolean {
-  return vaultRelativePath.split("/").some((segment) => IGNORED_DIRS.has(segment.toLowerCase()));
+  const parents = vaultRelativePath.split(SEPARATORS).slice(0, -1);
+  return parents.some((segment) => segment.startsWith(".") || segment.toLowerCase() === "node_modules");
 }
 
 /**
  * `.`, `..` and empty segments (an absolute path starts with an empty one) are refused rather
  * than encoded: `encodeURIComponent` leaves dots alone and a URL parser collapses `a/../b`
- * before the handler sees it, so such a URL could never name the file asked for. A backslash is
- * not a separator here: it is encoded as `%5C` and decoded once natively, so it cannot smuggle
- * a second path component.
+ * before the handler sees it. A backslash is a separator for this check (native `VaultPath::new`
+ * normalises `\` to `/` after one decode), so `a\..\b.png` is refused too.
  */
 export function assetUrl(vaultRelativePath: string, platform: AssetPlatform = detectAssetPlatform()): string {
   const segments = vaultRelativePath.split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+  if (vaultRelativePath.split(SEPARATORS).some((segment) => segment === "" || segment === "." || segment === "..")) {
     throw new Error(`not a vault-relative asset path: ${JSON.stringify(vaultRelativePath)}`);
   }
   if (isIgnoredAssetPath(vaultRelativePath)) {
