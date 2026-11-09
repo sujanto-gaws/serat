@@ -8,7 +8,7 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serat_core::{IndexWriter as _, NoteSource, SourceEntry, VaultPath};
@@ -981,57 +981,102 @@ fn a_copy_of_a_just_saved_note_is_indexed_and_the_saved_one_is_suppressed() {
     handle.close().expect("close");
 }
 
+/// A source that makes a save from inside the catch-up's own loop: every `EVERY`-th
+/// `load` the catch-up asks for, the same thread tries one save through the
+/// non-blocking path. Task #67: the earlier version ran the saver on a second thread
+/// and slept between saves, so whether a save was refused depended on how long the
+/// writer thread was starved of CPU (about 90 saves of headroom at one per 2 ms is
+/// ~180 ms), which says nothing about pacing.
+struct SavingSource<'a> {
+    inner: DiskVault,
+    writer: &'a serat_index::WriterHandle,
+    parser: &'a LineParser,
+    loads: AtomicUsize,
+    saves: AtomicUsize,
+    refused: AtomicUsize,
+}
+
+impl serat_core::NoteSource for SavingSource<'_> {
+    fn entries(&self) -> Result<Vec<serat_core::SourceEntry>, serat_core::VaultError> {
+        self.inner.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        const EVERY: usize = 25;
+        if self
+            .loads
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(EVERY)
+        {
+            match serat_index::apply(
+                self.writer,
+                &self.inner,
+                self.parser,
+                &SpyEcho::default(),
+                &crate::path("a.md"),
+            ) {
+                Ok(()) => {
+                    self.saves.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(serat_core::IndexError::QueueFull { .. }) => {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
+        self.inner.load(path)
+    }
+}
+
 #[test]
 fn a_save_during_a_large_catch_up_is_accepted_not_refused() {
     // ADR-0011 item 4: bulk work must not keep the writer's channel full.
+    //
+    // The invariant pacing gives, and the only one this pins: bulk work has at most
+    // BATCH_SIZE ops in the channel between two flushes, so with a channel deeper than
+    // that the remainder is the saves' however slowly the writer drains. The saves are
+    // made from the catch-up's own thread at fixed points between submits, so the
+    // arithmetic is the same on an idle machine and a starved one: at most 512 bulk
+    // + 21 saves (one per 25 loads) in a 600-deep channel, even if the writer never ran.
+    // (Task #67; FR-VLT-04, NFR-REL-02, ADR-0011.)
     let f = fixture();
     for i in 0..3000 {
         write(&f.root, &format!("bulk/n{i:04}.md"), "# Bulk\nbody\n");
     }
-    // A channel only a little deeper than one pacing batch, so the catch-up would fill it
-    // if it were not paced, and the 3,000 entries are many times that.
     let handle = IndexHandle::with_queue_depth(&f.index, 600).expect("open");
     let reconciler = Reconciler::new(&handle);
-    let source = DiskVault::new(&f.root);
-    let entries = walk(&f.root);
     let writer = handle.writer();
-    let done = std::sync::atomic::AtomicBool::new(false);
-    let mut refused = 0;
-    let mut saves = 0;
+    let source = SavingSource {
+        inner: DiskVault::new(&f.root),
+        writer: &writer,
+        parser: &f.parser,
+        loads: AtomicUsize::new(0),
+        saves: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+    };
+    let entries = walk(&f.root);
 
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            reconciler
-                .catch_up(
-                    &source,
-                    &f.parser,
-                    &entries,
-                    CatchUp::PathsAndMtime,
-                    Some(now()),
-                )
-                .expect("catch up");
-            done.store(true, Ordering::Relaxed);
-        });
-        while !done.load(Ordering::Relaxed) {
-            match serat_index::apply(
-                &writer,
-                &source,
-                &f.parser,
-                &SpyEcho::default(),
-                &path("a.md"),
-            ) {
-                Ok(()) => saves += 1,
-                Err(serat_core::IndexError::QueueFull { .. }) => refused += 1,
-                Err(other) => panic!("{other}"),
-            }
-            // Saves are keystroke-paced, not a hot loop.
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    });
-    assert!(saves > 0, "the catch-up finished before a save was tried");
+    reconciler
+        .catch_up(
+            &source,
+            &f.parser,
+            &entries,
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
+        .expect("catch up");
+
+    let saves = source.saves.load(Ordering::Relaxed);
+    let refused = source.refused.load(Ordering::Relaxed);
+    assert!(
+        saves >= 100,
+        "the catch-up made too few load calls to have tested anything: {saves} saves"
+    );
     assert_eq!(
-        refused, 0,
-        "{refused} saves were refused during the catch-up"
+        refused,
+        0,
+        "{refused} of {} saves were refused during the catch-up",
+        saves + refused
     );
     handle.close().expect("close");
 }

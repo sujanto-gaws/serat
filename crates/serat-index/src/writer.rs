@@ -416,8 +416,9 @@ impl IndexActor {
     /// is actually trying to prove.
     ///
     /// Not itself `#[cfg(test)]`: `pub(crate)` already keeps it out of every
-    /// other crate, and [`FaultInjector::fail_next_commit`] — the only method
-    /// that can make it do anything — is the part gated to tests. A production
+    /// other crate, and its seams ([`FaultInjector::fail_until_a_flush_fails`],
+    /// [`FaultInjector::fail_every_commit`], [`FaultInjector::hold`]) — the only
+    /// methods that can make it do anything — are the part gated to tests. A production
     /// build has no caller for this one, which is the same write-only shape as
     /// the field it reads; see the `allow` there.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -506,6 +507,9 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
+                    // Nobody is waiting on this commit, whatever the last turn's
+                    // `continue` arm left `answering` as.
+                    fault.set_answering(false);
                     let _ = commit(
                         &conn,
                         &mut pending,
@@ -518,6 +522,11 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                 }
             },
         };
+
+        fault.wait_if_held();
+        // Every command but an `Apply` has a caller waiting on a reply, including the
+        // ones that commit in their own arm and `continue` (resolve, bulk load, close).
+        fault.set_answering(!matches!(next, Command::Apply(_)));
 
         let mut barrier: Option<(SyncSender<Result<(), IndexError>>, Barrier)> = None;
         match next {
@@ -667,6 +676,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             }
         }
 
+        fault.set_answering(barrier.is_some());
         let mut result = commit(
             &conn,
             &mut pending,
@@ -675,6 +685,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             fault,
             &mut closed,
         );
+        fault.set_answering(false);
 
         if let Some((reply, extra)) = barrier {
             if result.is_ok() {
@@ -855,16 +866,70 @@ enum Barrier {
 /// this shares the same underlying flag with the writer thread it was made for and no
 /// other.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FaultInjector(
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-);
+pub(crate) struct FaultInjector(#[cfg_attr(not(test), allow(dead_code))] Arc<FaultState>);
+
+/// Every field exists only under `cfg(test)`: a production build carries an empty
+/// struct, and the writer's calls into it compile to nothing.
+#[derive(Debug, Default)]
+struct FaultState {
+    /// [`FaultInjector::fail_until_a_flush_fails`]: fail commits until one that answers
+    /// a caller has failed.
+    #[cfg(test)]
+    armed: std::sync::atomic::AtomicBool,
+    /// Set by the writer thread: true while the turn it is on has a caller waiting for
+    /// its answer (a flush or any other round-trip command), so a failure has somebody
+    /// to reach. Only an `armed` fault reads it.
+    #[cfg(test)]
+    answering: std::sync::atomic::AtomicBool,
+    /// [`FaultInjector::fail_every_commit`]: every commit fails, whoever is waiting.
+    #[cfg(test)]
+    every: std::sync::atomic::AtomicBool,
+    /// [`FaultInjector::hold`]: the writer thread waits here, at the top of a turn,
+    /// while this is true.
+    #[cfg(test)]
+    held: std::sync::Mutex<bool>,
+    #[cfg(test)]
+    released: std::sync::Condvar,
+}
+
+/// The writer thread is held until this is dropped ([`FaultInjector::hold`]).
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct Held(Arc<FaultState>);
+
+#[cfg(test)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        *self
+            .0
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.released.notify_all();
+    }
+}
 
 impl FaultInjector {
-    /// Make the next commit through this handle's actor fail once.
+    /// Fail every commit through this handle's actor from now until one that answers a
+    /// caller (a flush, or any command with a reply: resolve, bulk load, close) has
+    /// failed, then disarm. Commits with nobody waiting (an `Apply` the writer commits
+    /// on its own) fail and leave the batch in hand, as documented on `commit`; they do
+    /// not disarm it.
+    ///
+    /// Not "the next commit", because that is racy by construction (task #67): a quiet
+    /// writer commits the moment an `Apply` arrives, and the test thread arms the fault
+    /// a few instructions after `submit`. Under load the writer wins, the batch commits
+    /// cleanly before the fault is armed, the flush finds nothing pending and returns
+    /// Ok, and the test fails for a reason that says nothing about the code. Armed
+    /// before the `submit`, an auto-commit that gets in first fails too and leaves the
+    /// batch in hand; the flush's commit then fails and reports. A writer that folds
+    /// the `Apply` and the flush into one turn fails once, in the flush. Either
+    /// interleaving ends with the batch in hand and the error at the caller.
     #[cfg(test)]
-    pub(crate) fn fail_next_commit(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn fail_until_a_flush_fails(&self) {
+        self.0
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make every commit through this handle's actor fail until the actor is dropped.
@@ -873,15 +938,76 @@ impl FaultInjector {
     /// then spent on a commit nobody is waiting for.
     #[cfg(test)]
     pub(crate) fn fail_every_commit(&self) {
-        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0
+            .every
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Consume the injected failure, if one is armed. Always false in production: the
-    /// only way to arm it is [`FaultInjector::fail_next_commit`], which does not exist
-    /// outside `#[cfg(test)]`.
+    /// Stop the writer thread at the top of its next turn, after it has taken one
+    /// command off the channel and before it acts on it, until the returned guard is
+    /// dropped. The channel then fills behind it, which is how a test observes what a
+    /// producer does when the writer is behind without depending on how fast the
+    /// writer is (task #67).
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> Held {
+        *self
+            .0
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        Held(Arc::clone(&self.0))
+    }
+
+    /// Called by the writer thread at the top of a turn.
+    fn wait_if_held(&self) {
+        #[cfg(test)]
+        {
+            let mut held = self
+                .0
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while *held {
+                held = self
+                    .0
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
+    /// Called by the writer thread: whether the commit it is about to make has a caller
+    /// waiting for the answer.
+    fn set_answering(&self, answering: bool) {
+        #[cfg(test)]
+        self.0
+            .answering
+            .store(answering, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let _ = answering;
+    }
+
+    /// Whether this commit fails. Always false in production: the only ways to arm it
+    /// are [`FaultInjector::fail_until_a_flush_fails`] and
+    /// [`FaultInjector::fail_every_commit`], which do not exist outside `#[cfg(test)]`.
     fn take(&self) -> bool {
-        self.1.load(std::sync::atomic::Ordering::SeqCst)
-            || self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.0.every.load(SeqCst) {
+                return true;
+            }
+            if !self.0.armed.load(SeqCst) {
+                return false;
+            }
+            if self.0.answering.load(SeqCst) {
+                self.0.armed.store(false, SeqCst);
+            }
+            true
+        }
+        #[cfg(not(test))]
+        false
     }
 }
 
@@ -1026,8 +1152,13 @@ mod tests {
         let actor = IndexActor::with_connection(conn);
         let writer = actor.handle();
 
+        // Armed before the submit, not after (task #67): a quiet writer commits an
+        // `Apply` the moment it arrives, so arming after raced the writer thread and,
+        // under load, lost -- the batch committed cleanly and the flush had nothing to
+        // fail. See `FaultInjector::fail_until_a_flush_fails` for why this order holds
+        // under every interleaving.
+        actor.fault_injector().fail_until_a_flush_fails();
         writer.submit(asset("assets/a.pdf")).expect("submit");
-        actor.fault_injector().fail_next_commit();
 
         let failed = writer.flush();
         assert!(
