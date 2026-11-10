@@ -29,7 +29,7 @@
 // costs this field roughly what one block costs, per keystroke, not what 50
 // tables cost.
 
-import { syntaxTree } from "@codemirror/language";
+import { syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState, RangeSetBuilder, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
@@ -373,7 +373,28 @@ function buildAll(state: EditorState): BlockWidgetState {
   for (const { from, to, decoration } of found) {
     builder.add(from, to, decoration);
   }
-  return { deco: builder.finish(), examined: syntaxTree(state).length };
+  return { deco: builder.finish(), examined: reliableParsedTo(state) };
+}
+
+/**
+ * How far the syntax tree can be trusted: the position up to which the parse has actually
+ * completed. `syntaxTree(state).length` is NOT that: after an edit CodeMirror may hand over a
+ * partial, time-sliced tree whose length is the document's (or longer than what is parsed),
+ * and the parse finishes later in a transaction with no document change and the same length
+ * (#109). The common case, a finished parse, is one call; a partial one binary-searches the
+ * boundary (about log2(n) O(1) calls). Never walks the tree.
+ */
+export function reliableParsedTo(state: EditorState): number {
+  const length = state.doc.length;
+  if (syntaxTreeAvailable(state, length)) return length;
+  let lo = 0;
+  let hi = length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (syntaxTreeAvailable(state, mid)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 /** The top-level block node (a direct child of `Document`) enclosing `pos`,
@@ -471,11 +492,28 @@ function mergeSpans(spans: Span[]): Span[] {
 
 /** Recomputes decorations only within `region`, splicing the result into
  * `deco` (which must already have nothing else inside `region`). */
-function replaceRegion(deco: DecorationSet, state: EditorState, region: Span, selectedLines: ReadonlySet<number>): DecorationSet {
-  const kept = deco.update({
-    filter: (from, to) => to <= region.from || from >= region.to,
+function replaceRegion(deco: DecorationSet, state: EditorState, region0: Span, selectedLines: ReadonlySet<number>): DecorationSet {
+  // Widen the region to every existing decoration it overlaps or touches before walking: a
+  // block cut short at its end (a table's last row deleted) leaves the change point in the
+  // blank line after it, so the walk over the bare region never reaches the shortened block
+  // while the filter below still drops its mapped widget.
+  const region = { ...region0 };
+  deco.between(region0.from, region0.to, (from, to) => {
+    if (from < region.from) region.from = from;
+    if (to > region.to) region.to = to;
   });
   const fresh = decorationsInRange(state, region.from, region.to, selectedLines);
+  // The tree walk also reports blocks that merely touch the region's edge. Such a block
+  // may already be in `deco` (kept by the strict test below), so a fresh one at the same
+  // span replaces it instead of doubling it. A widget whose text was deleted collapses to
+  // an empty span when mapped; no widget is ever empty, so those are dropped too.
+  const freshSpans = new Set(fresh.map((f) => `${f.from}:${f.to}`));
+  // A widget that touches the region's edge is not trusted either: a change at that edge
+  // may have turned it into something else (a callout losing its header), and the walk
+  // above is edge-inclusive, so it is found again if it is still a widget.
+  const kept = deco.update({
+    filter: (from, to) => from < to && (to < region.from || from > region.to) && !freshSpans.has(`${from}:${to}`),
+  });
   if (fresh.length === 0) {
     return kept;
   }
@@ -490,18 +528,26 @@ export function growthRegion(examined: number, treeLength: number): Span | null 
   return treeLength > examined ? { from: examined, to: treeLength } : null;
 }
 
-function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
+function computeDirtyRegions(tr: Transaction, examined: number, reliable: number): Span[] {
   const regions: Span[] = [];
   if (tr.docChanged) {
+    // Both ends of every change, both sides of each (a deletion before a block moves
+    // that block to the change point; a first or last character resolves to the
+    // neighbour on one side only), plus every block the inserted text spans (a pasted
+    // table, a multi-block replace). A single-character insert (ordinary typing) skips
+    // the range walk: it can only touch the blocks at its two ends, so its cost stays
+    // O(depth) and every unrelated widget keeps its object (NFR-PRF-02).
     tr.changes.iterChanges((_fromA, _toA, fromB, toB) => {
-      const region = enclosingTopLevelBlock(tr.state, fromB);
-      regions.push(region ?? { from: fromB, to: Math.max(toB, fromB + 1) });
+      const touched = [...touchedTopLevelBlocks(tr.state, fromB), ...touchedTopLevelBlocks(tr.state, toB)];
+      if (touched.length === 0) touched.push({ from: fromB, to: Math.max(toB, fromB + 1) });
+      regions.push(...touched);
+      if (toB - fromB > 1) regions.push(...blocksIntersecting(tr.state, fromB, toB));
     });
   }
   // CodeMirror parses a long note in time-sliced chunks, and cuts the tree
   // back to the viewport after an edit. Only territory beyond the watermark
   // has never been examined.
-  const growth = growthRegion(examined, syntaxTree(tr.state).length);
+  const growth = growthRegion(examined, reliable);
   if (growth) {
     const start = enclosingTopLevelBlock(tr.state, Math.min(growth.from, tr.state.doc.length));
     regions.push({ from: start ? Math.min(start.from, growth.from) : growth.from, to: growth.to });
@@ -553,10 +599,17 @@ export const blockWidgetsField = StateField.define<BlockWidgetState>({
       return value;
     }
     const deco = value.deco.map(tr.changes);
-    const examined = tr.docChanged ? tr.changes.mapPos(value.examined, -1) : value.examined;
-    const regions = computeDirtyRegions(tr, examined);
-    const treeLength = syntaxTree(tr.state).length;
-    const nextExamined = Math.max(examined, Math.min(treeLength, tr.state.doc.length));
+    // What has been examined with a tree that could be trusted: the old watermark mapped
+    // through the edit, but never beyond what is parsed now. Territory past the parse
+    // boundary was (at best) examined against a partial tree, so it is re-examined once the
+    // parse completes, in the follow-up transaction that carries no document change (#109).
+    // With a finished parse (the normal case) `reliable` is the document end and nothing
+    // here costs more than one `syntaxTreeAvailable` call.
+    const reliable = reliableParsedTo(tr.state);
+    const mapped = tr.docChanged ? tr.changes.mapPos(value.examined, -1) : value.examined;
+    const examined = Math.min(mapped, reliable);
+    const regions = computeDirtyRegions(tr, examined, reliable);
+    const nextExamined = Math.max(examined, reliable);
     if (regions.length === 0) {
       return { deco, examined: nextExamined };
     }

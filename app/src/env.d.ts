@@ -11,14 +11,7 @@ declare module "*.vue" {
  * script runs (crates/serat-app/src/lib.rs's `BootInfo`). Read once, at startup —
  * see src/startup.ts.
  */
-interface SeratBoot {
-  /** Canonical vault root, if one was opened at start. */
-  vault: string | null;
-  /** Vault-relative note to render, if any. */
-  open: string | null;
-  /** Whether this process is a benchmark run. */
-  exit_after_ready: boolean;
-}
+type SeratBoot = import("./ipc/generated/BootInfo").BootInfo;
 
 declare global {
   interface Window {
