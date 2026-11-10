@@ -721,9 +721,7 @@ pub enum IpcError {
     /// asset validator is not one. A handler written for notes must never see
     /// this value in a field it treats as a hash.
     ///
-    /// **Contract ahead of implementation**, filled by the follow-up
-    /// `[P1/impl] Validator check on read_asset_range` (tauri-app-dev). No
-    /// command returns it until then.
+    /// Implemented by task #98: `read_asset_range` returns it.
     AssetChanged {
         /// Vault-relative path.
         path: String,
@@ -1606,11 +1604,9 @@ pub struct AssetInfo {
     /// mtime of the opened handle, ADR-0017 step 10). Opaque, compared for
     /// equality only. The PDF transport passes it back as
     /// `ReadAssetRangeArgs::if_match` on every span (ADR-0017 Amendment 1).
-    /// `None` (absent) when not computed.
+    /// `None` (absent) for an asset the scheme will not serve (`viewable` is false).
     ///
-    /// **Contract ahead of implementation** (task #94). It is filled by the
-    /// follow-up `[P1/impl] Validator check on read_asset_range` (tauri-app-dev),
-    /// which reuses `asset.rs`'s existing `etag`.
+    /// Implemented by task #98, reusing `asset.rs`'s `etag`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub etag: Option<String>,
@@ -1641,9 +1637,8 @@ pub struct ReadAssetRangeArgs {
     /// reloads from `asset_info` and shows the 4 s "changed on disk" notice
     /// (ADR-0017 Amendment 1, the scheme's `If-Range` moved into the transport).
     ///
-    /// **Contract ahead of implementation**, filled by the same follow-up as
-    /// `AssetInfo::etag`. Until then it is ignored, and a file changed
-    /// mid-load is not detected.
+    /// Implemented by task #98. Absent keeps the old behaviour: the check is
+    /// skipped and a file changed mid-load is not detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub if_match: Option<String>,

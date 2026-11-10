@@ -78,26 +78,10 @@ pub mod vault;
 pub mod ipc;
 
 use cli::Boot;
-use ipc::{INDEX_STATUS_EVENT, OpenVaultArgs};
+use ipc::{BootInfo, INDEX_STATUS_EVENT, OpenVaultArgs};
 use security_config::MAIN_WINDOW_LABEL;
 use startup::Startup;
 use state::AppState;
-
-/// What the webview is told before it runs a line of its own script.
-///
-/// An initialization script rather than a command, because the page needs it in order
-/// to make its *first* call and a round trip to fetch it would sit inside the 400 ms
-/// budget. It adds nothing to the IPC surface: these are the process's own arguments,
-/// already known before the window exists.
-#[derive(Debug, Clone, Serialize)]
-struct BootInfo {
-    /// Canonical vault root, if one was opened at start.
-    vault: Option<String>,
-    /// Vault-relative note to render, if any.
-    open: Option<String>,
-    /// Whether this process is a benchmark run.
-    exit_after_ready: bool,
-}
 
 /// What `--exit-after-ready` writes to [`crate::startup::TRACE_ENV`] (task #111).
 ///
@@ -404,14 +388,30 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             //    and returns; §3.4's "in parallel" column starts here, before the
             //    expensive part of the main thread's own row.
             let mut vault_root = None;
+            let mut vault_id = None;
             if let Some(root) = state.boot.vault.clone() {
                 match state.open_vault(OpenVaultArgs {
                     root: root.display().to_string(),
                 }) {
-                    Ok(opened) => vault_root = Some(opened.root),
+                    Ok(opened) => {
+                        vault_root = Some(opened.root);
+                        vault_id = Some(opened.vault_id);
+                    }
                     Err(err) => eprintln!("serat: {} could not be opened: {err:?}", root.display()),
                 }
             }
+            // 2b. `vault://opened` only for opens *after* launch: the window does not exist
+            //     yet, `BootInfo::vault_id` carries the launch vault's id, so the sink
+            //     goes in after the boot open (contract: not emitted for the launch vault).
+            let opened = handle.clone();
+            state.events.install_opened(move |event| {
+                if let Err(err) = opened.emit(ipc::VAULT_OPENED_EVENT, event) {
+                    eprintln!(
+                        "serat: {} could not be emitted: {err}",
+                        ipc::VAULT_OPENED_EVENT
+                    );
+                }
+            });
             let note = state.note_to_open();
 
             // A benchmark run that cannot produce a number must fail cleanly and say
@@ -440,6 +440,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
 
             let boot_info = serde_json::to_string(&BootInfo {
                 vault: vault_root,
+                vault_id,
                 open: note,
                 exit_after_ready: state.boot.exit_after_ready,
             })?;
@@ -900,11 +901,13 @@ mod tests {
     fn the_boot_info_is_json_the_page_can_read() {
         let json = serde_json::to_string(&BootInfo {
             vault: Some("D:/vault".into()),
+            vault_id: Some("v1".into()),
             open: Some("a.md".into()),
             exit_after_ready: true,
         })
         .expect("serialise");
         assert!(json.contains("\"vault\":\"D:/vault\""), "{json}");
+        assert!(json.contains("\"vault_id\":\"v1\""), "{json}");
         assert!(json.contains("\"open\":\"a.md\""), "{json}");
         assert!(json.contains("\"exit_after_ready\":true"), "{json}");
     }
