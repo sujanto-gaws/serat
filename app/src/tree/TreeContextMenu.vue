@@ -15,6 +15,10 @@ export interface MenuItem {
   enabled: boolean;
   /** Why it is unavailable (the tooltip on a disabled entry). */
   reason?: string;
+  /** The accelerator as display chips for this platform ("⌘", "⇧", "N" / "Ctrl", "Shift", "N"). */
+  accel?: string[];
+  /** The same accelerator spoken ("Command", "Shift", "N"): what a screen reader gets instead of glyphs. */
+  spoken?: string[];
 }
 
 const props = defineProps<{ items: readonly MenuItem[]; x: number; y: number; label: string }>();
@@ -97,7 +101,9 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside, true)
       @mousemove="active = i"
       @click="activate(i)"
     >
-      {{ item.label }}
+      <span class="serat-tree-menu-label">{{ item.label }}</span>
+      <span v-if="item.accel?.length" class="serat-tree-menu-accel" aria-hidden="true" data-accel>{{ item.accel.join(" ") }}</span>
+      <span v-if="item.spoken?.length" class="serat-tree-menu-spoken" data-spoken>, shortcut {{ item.spoken.join(" ") }}</span>
     </div>
   </div>
 </template>
@@ -113,8 +119,22 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside, true)
   border: 1px solid var(--serat-border-hairline, #bbb);
 }
 .serat-tree-menu-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
   padding: 4px 12px;
   cursor: pointer;
+}
+.serat-tree-menu-accel {
+  color: var(--serat-text-secondary, #6b7075);
+}
+.serat-tree-menu-spoken {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 .serat-tree-menu-item.active {
   background: var(--serat-surface-selected, rgba(36, 69, 126, 0.12));

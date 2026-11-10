@@ -24,6 +24,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { SaveOutcome } from "@/editor/buffer";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
 import { createFolder, indexStatus, isIpcError, onIndexStatus, onVaultOpened, writeFile } from "@/ipc/client";
+import { installNativeMenuPolicy } from "@/nativeMenu";
 import { describeCreateError, noteFileName, type CreateRequest } from "@/tree/createEntry";
 import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
@@ -228,6 +229,19 @@ commands.onOverrideRefused((ids) =>
   store.setMark(`keybinding ignored (already used by another command): ${ids.join(", ")}`),
 );
 provide(COMMANDS_KEY, commands);
+
+/** The tree menu's accelerators are the registry's effective bindings, so they follow a rebinding. */
+const bindingsVersion = ref(0);
+commands.subscribe(() => (bindingsVersion.value += 1));
+const treeMenuBindings = computed(() => {
+  void bindingsVersion.value;
+  return {
+    "new-note": commands.effectiveBinding("tree.newNote"),
+    "new-folder": commands.effectiveBinding("tree.newFolder"),
+    "insert-link": "Mod-Shift-l",
+    rename: "F2",
+  };
+});
 const mac = detectPlatform() === "mac";
 const switcherOpen = ref(false);
 const paletteOpen = ref(false);
@@ -407,7 +421,11 @@ onMounted(async () => {
   }
 });
 
+// Native webview menu: suppressed everywhere except text fields and the editor (nativeMenu.ts).
+const removeNativeMenuPolicy = installNativeMenuPolicy();
+
 onUnmounted(() => {
+  removeNativeMenuPolicy();
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();
@@ -481,6 +499,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         :vault-id="store.vaultId"
         :vault-open="store.vaultOpen"
         :create-entry="createEntry"
+        :bindings="treeMenuBindings"
         @open="onTreeOpen"
         @insert-link="onInsertLink"
         @rename="onTreeRename"

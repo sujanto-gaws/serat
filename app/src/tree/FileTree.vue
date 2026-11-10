@@ -30,6 +30,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import { folderName, noteFileName, takenNames, uniqueName, type CreateKind, type CreateRequest } from "@/tree/createEntry";
 import TreeContextMenu, { type MenuItem } from "@/tree/TreeContextMenu.vue";
+import { chordGlyphs, chordSpoken } from "@/editor/commands";
+import { detectPlatform } from "@/editor/codemirrorSetup";
 import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
 import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
 
@@ -59,6 +61,11 @@ const props = withDefaults(
      * for tests and embedding; no production host omits it (App.vue always passes one).
      */
     createEntry?: (request: CreateRequest) => Promise<string | null>;
+    /** macOS conventions (⌘ glyphs, Ctrl-click = context menu). Defaults to the detected platform. */
+    mac?: boolean;
+    /** Menu entry id -> CodeMirror-notation binding shown as its accelerator (the registry's effective
+     * bindings, so the menu, the palette and the chips agree). `null` shows none. */
+    bindings?: Record<string, string | null>;
   }>(),
   { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null, vaultOpen: true },
 );
@@ -269,7 +276,20 @@ function toggleDir(path: string, expand: boolean | null): void {
   bump();
 }
 
-function onRowClick(row: TreeRow): void {
+/** Accelerators shown when the host passes none: the tree-local chords of file-tree.md. */
+const DEFAULT_MENU_BINDINGS: Record<string, string | null> = { "insert-link": "Mod-Shift-l", rename: "F2" };
+
+const isMac = computed(() => props.mac ?? detectPlatform() === "mac");
+
+/** The platform's own conventions (components.md §7): on macOS Ctrl-click is a secondary click. WebKit sends
+ * `contextmenu` for it (handled by the row's `@contextmenu`); this also catches an engine that delivers a
+ * `click` with `ctrlKey` instead, so it never OPENS the note. Both paths open the same single menu. */
+function onRowClick(row: TreeRow, event?: MouseEvent): void {
+  if (event && isMac.value && event.ctrlKey) {
+    event.preventDefault();
+    openMenu(row.path, event.clientX, event.clientY);
+    return;
+  }
   select(row.path);
   if (row.kind === "dir") {
     toggleDir(row.path, null);
@@ -458,7 +478,7 @@ function closeMenu(reason: "escape" | "tab" | "outside"): void {
 
 /** WebView2 fires a native `contextmenu` on key-up of Menu / Shift-F10; with no row under it, open ours for
  * the focused row. (Row right-clicks are handled by the row, which prevents default, so skip those.)
- * Windows manual check: #77. */
+ * Windows manual check: #77, see `nativeMenu.ts` for the full list. */
 function onTreeContextMenu(event: MouseEvent): void {
   if (event.defaultPrevented) return;
   event.preventDefault();
@@ -487,13 +507,17 @@ const menuItems = computed<MenuItem[]>(() => {
     },
     { id: "new-folder", label: "New folder here", enabled: !!props.createEntry, reason: "Creating folders is not available right now." },
   );
+  const accelFor = (id: string): Pick<MenuItem, "accel" | "spoken"> => {
+    const binding = (props.bindings ?? DEFAULT_MENU_BINDINGS)[id];
+    return binding ? { accel: chordGlyphs(binding, isMac.value), spoken: chordSpoken(binding, isMac.value) } : {};
+  };
   const later = "Arrives with link repair (P3, FR-VLT-09): moving or renaming without repairing links would break them.";
   items.push(
     { id: "rename", label: "Rename", enabled: false, reason: later },
     { id: "move", label: "Move to\u2026", enabled: false, reason: later },
     { id: "trash", label: "Move to trash", enabled: false, reason: later },
   );
-  return items;
+  return items.map((item) => ({ ...item, ...accelFor(item.id) }));
 });
 
 function onMenuSelect(id: string): void {
@@ -636,7 +660,7 @@ defineExpose({
             :title="row.name"
             :draggable="row.kind !== 'dir'"
             :data-path="row.path"
-            @click="onRowClick(row)"
+            @click="onRowClick(row, $event)"
             @dragstart="onDragStart($event, row)"
             @contextmenu.prevent="openMenu(row.path, $event.clientX, $event.clientY)"
           >
