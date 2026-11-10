@@ -2,13 +2,14 @@
 // NFR-PRF-02, architecture.md §9.3. Widgets only change what is displayed;
 // the document is never touched (C-04).
 
-import { ensureSyntaxTree, syntaxTreeAvailable } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   blockWidgetsExtension,
   blockWidgetsField,
+  reliableParsedTo,
   growthRegion,
   isImageTarget,
   parseCalloutHeader,
@@ -489,5 +490,94 @@ describe("blockWidgetsField", () => {
       for (const b of list) if (b > a && b - a <= 8) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`, sweep);
     }
     expectSkipBudget(sweep, `block-end sweep (end ${end}, cursor ${cursor})`);
+  });
+
+  // ---- partial reparses (task #109) ----
+
+  /** Applies `spec` with CodeMirror's parse budget forced to expire (Date.now jumps 50 ms per call). */
+  function updateWithPartialParse(state: EditorState, spec: { from: number; to?: number; insert?: string }): EditorState {
+    let clock = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (clock += 50));
+    try {
+      return state.update({ changes: spec }).state;
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("reliableParsedTo: the document end for a finished parse, a boundary short of it for a partial one", () => {
+    const doc = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+    const done = makeState(doc, 0);
+    expect(reliableParsedTo(done)).toBe(doc.length);
+    const partial = updateWithPartialParse(done, { from: 3, insert: "z" });
+    expect(syntaxTreeAvailable(partial, partial.doc.length)).toBe(false);
+    expect(reliableParsedTo(partial)).toBeLessThan(partial.doc.length);
+    expect(syntaxTreeAvailable(partial, reliableParsedTo(partial))).toBe(true);
+  });
+
+  // Recorded gap: the partial parse here is forced on a bare EditorState by expiring CodeMirror's
+  // work budget; no test drives it through a mounted EditorView and its idle parse worker.
+  const PARTIAL_DOC = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+  const PARTIAL_INSERTS = ["```\n", "\n", "x", "> "];
+
+  it.each(PARTIAL_INSERTS)("an edit (%j) applied during a partial parse: once the parse completes the widgets equal a fresh build", (insert) => {
+    const doc = PARTIAL_DOC;
+    const base = makeState(doc, 0);
+    let partials = 0;
+    let total = 0;
+    for (let at = 0; at < doc.length; at += 7) {
+      total += 1;
+      const s2 = updateWithPartialParse(base, { from: at, insert });
+      if (!syntaxTreeAvailable(s2, s2.doc.length)) partials += 1;
+      ensureSyntaxTree(s2, s2.doc.length, 5000);
+      const s3 = s2.update({}).state; // the completion transaction: no change, tree identity differs
+      const fresh = s3.update({ effects: setResolutions.of([]) }).state;
+      expect(shapeOf(s3), `insert ${JSON.stringify(insert)} at ${at}`).toEqual(shapeOf(fresh));
+    }
+    expect(partials).toBeGreaterThan(total / 2); // the forced budget really produced partial parses
+  });
+
+  it.each(PARTIAL_INSERTS)("a resolutions rebuild (buildAll) arriving mid partial parse (edit %j) does not mark unparsed territory examined", (insert) => {
+    // buildAll also runs on a setResolutions effect, which can land while the parse is partial.
+    // Its watermark must be the parse boundary, not the (possibly full-length) partial tree's length.
+    const doc = PARTIAL_DOC;
+    const base = makeState(doc, 0);
+    let partials = 0;
+    let total = 0;
+    for (let at = 0; at < doc.length; at += 7) {
+      total += 1;
+      const s2 = updateWithPartialParse(base, { from: at, insert });
+      if (!syntaxTreeAvailable(s2, s2.doc.length)) partials += 1;
+      const rebuilt = s2.update({ effects: setResolutions.of([]) }).state;
+      ensureSyntaxTree(rebuilt, rebuilt.doc.length, 5000);
+      const s3 = rebuilt.update({}).state;
+      const fresh = s3.update({ effects: setResolutions.of([]) }).state;
+      expect(shapeOf(s3), `insert ${JSON.stringify(insert)} at ${at}`).toEqual(shapeOf(fresh));
+    }
+    expect(partials).toBeGreaterThan(total / 2);
+  });
+
+  it("buildAll's watermark is the parse boundary, not the partial tree's length (create and a resolutions rebuild)", () => {
+    // Pins `examined: reliableParsedTo(state)` in buildAll. A mutant using syntaxTree(state).length
+    // there is not observable through the decorations (the nodes inside the partial tree are
+    // correct), so the watermark itself is asserted. Guarded: the partial tree must really be
+    // longer than the parsed boundary for the assertion to mean anything.
+    const T = (n: number) => `${TABLE}\n\npara ${n}`;
+    const doc = Array.from({ length: 100 }, (_, i) => T(i)).join("\n\n");
+    const created = EditorState.create({ doc, selection: { anchor: 0 }, extensions: [seratMarkdown(), blockWidgetsExtension()] });
+    expect(syntaxTreeAvailable(created, created.doc.length)).toBe(false);
+    expect(syntaxTree(created).length).toBeGreaterThan(reliableParsedTo(created));
+    expect(created.field(blockWidgetsField).examined).toBe(reliableParsedTo(created));
+    const rebuilt = created.update({ effects: setResolutions.of([]) }).state;
+    if (!syntaxTreeAvailable(rebuilt, rebuilt.doc.length)) {
+      expect(rebuilt.field(blockWidgetsField).examined).toBe(reliableParsedTo(rebuilt));
+    }
+  });
+
+  it("a finished parse keeps examined at the document end", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const s1 = s0.update({ changes: { from: 2, insert: "x" }, selection: { anchor: 3 } }).state;
+    expect(s1.field(blockWidgetsField).examined).toBe(s1.doc.length);
   });
 });
