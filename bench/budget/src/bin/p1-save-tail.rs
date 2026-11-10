@@ -56,8 +56,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use budget::{Samples, ensure_vault};
-use rusqlite::hooks::{CheckpointMode, Wal};
+use rusqlite::hooks::Wal;
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
+use rusqlite::wal::CheckpointMode;
 use rusqlite::{Connection, OpenFlags};
 use serat_core::{
     IndexOp, IndexWriter as _, LoadedNote, NoteKind, NoteParser as _, NoteSource as _, VaultPath,
@@ -154,7 +155,7 @@ fn on_profile(event: TraceEvent<'_>) {
     }
 }
 
-fn on_wal(wal: &Wal, frames: i32) -> rusqlite::Result<()> {
+fn on_wal(wal: &mut Wal, frames: i32) -> rusqlite::Result<()> {
     let entered = Instant::now();
     let mut ev = WalEv {
         frames,
@@ -455,7 +456,7 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
     // The actor sets the writer's pragmas and starts the checkpointer; the hook below is
     // its observer, so it sees the same commits the checkpointer is signalled for.
     AUTOCKPT.store(a.autockpt, Ordering::Relaxed);
-    let conn = serat_index::open(&db).map_err(|e| e.to_string())?;
+    let mut conn = serat_index::open(&db).map_err(|e| e.to_string())?;
     serat_index::schema::bootstrap_if_empty(&conn).map_err(|e| e.to_string())?;
     if let Some(n) = a.automerge {
         conn.execute(
@@ -465,7 +466,9 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         .map_err(|e| format!("automerge: {e}"))?;
     }
     if !a.bare {
-        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile));
+        if let Err(e) = conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile)) {
+            eprintln!("trace_v2 failed: {e}");
+        }
     } else if !a.checkpointer() {
         // SQLite's own hook at the requested threshold, as before #56 (the actor leaves
         // the pragma alone when the checkpointer is off).

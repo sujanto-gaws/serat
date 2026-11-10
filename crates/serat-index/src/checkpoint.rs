@@ -128,6 +128,9 @@ pub struct WalHealth {
     /// 0 = not pinned.
     pinned_bytes: AtomicU64,
     running: AtomicBool,
+    /// The WAL hook could not be installed (rusqlite 0.41.1: out of memory only), so
+    /// the writer fell back to SQLite's own auto-checkpoint.
+    hook_install_failed: AtomicBool,
     passive_runs: AtomicU64,
     incomplete: AtomicU64,
     restart_runs: AtomicU64,
@@ -157,6 +160,13 @@ impl WalHealth {
             0 => None,
             bytes => Some(bytes),
         }
+    }
+
+    /// Whether the writer's WAL hook failed to install and SQLite's own
+    /// auto-checkpoint (1000 pages) was restored instead.
+    #[must_use]
+    pub fn hook_install_failed(&self) -> bool {
+        self.hook_install_failed.load(Ordering::Relaxed)
     }
 
     /// Whether a checkpoint is running right now.
@@ -250,7 +260,7 @@ enum Msg {
 /// Called from the writer's WAL hook, on the writer thread, with the `Wal` and the frame
 /// count. For the benchmarks: `p1-save-tail` stamps the instant `COMMIT`'s own work is
 /// done. A plain `fn`, because `rusqlite`'s hook is.
-pub type WalObserver = fn(&Wal, i32) -> rusqlite::Result<()>;
+pub type WalObserver = fn(&mut Wal, i32) -> rusqlite::Result<()>;
 
 /// The writer's side: what its WAL hook needs. Set on the writer thread, because the
 /// hook is a plain `fn` and runs on whichever thread commits.
@@ -263,7 +273,7 @@ thread_local! {
     static HOOK: std::cell::RefCell<Option<HookState>> = const { std::cell::RefCell::new(None) };
 }
 
-fn on_wal(wal: &Wal, frames: std::os::raw::c_int) -> rusqlite::Result<()> {
+fn on_wal(wal: &mut Wal, frames: std::os::raw::c_int) -> rusqlite::Result<()> {
     HOOK.with(|hook| {
         if let Some(state) = hook.borrow().as_ref() {
             if let Some(observer) = state.observer {
@@ -296,14 +306,22 @@ impl WriterHook {
 
     /// Install on the writer thread: replaces SQLite's own auto-checkpoint with the
     /// signal (and the observer, when there is one).
-    pub(crate) fn install(self, conn: &Connection) {
+    pub(crate) fn install(self, conn: &mut Connection, health: &WalHealth) {
         HOOK.with(|hook| {
             *hook.borrow_mut() = Some(HookState {
                 tx: self.signal,
                 observer: self.observer,
             });
         });
-        conn.wal_hook(Some(on_wal));
+        // `tune_writer` set wal_autocheckpoint = 0, so a failed install (rusqlite 0.41.1:
+        // out of memory only) would leave no auto-checkpoint and no Commit signals.
+        // Clear the hook (no allocation; also drops one left pointing at freed data),
+        // restore SQLite's own auto-checkpoint, and record it.
+        if conn.wal_hook(Some(on_wal)).is_err() {
+            let _ = conn.wal_hook(None::<WalObserver>);
+            let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 1000;");
+            health.hook_install_failed.store(true, Ordering::Relaxed);
+        }
     }
 }
 

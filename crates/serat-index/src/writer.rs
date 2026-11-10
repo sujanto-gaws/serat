@@ -345,7 +345,7 @@ impl IndexActor {
     ///
     /// Panics if `options.capacity` is zero.
     #[must_use]
-    pub fn with_options(conn: Connection, options: ActorOptions) -> Self {
+    pub fn with_options(mut conn: Connection, options: ActorOptions) -> Self {
         assert!(
             options.capacity > 0,
             "a writer queue with no capacity accepts nothing"
@@ -376,11 +376,12 @@ impl IndexActor {
             (None, Some(observer)) => Some(WriterHook::observer_only(observer)),
             (None, None) => None,
         };
+        let hook_health = Arc::clone(&health);
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
             .spawn(move || {
                 if let Some(hook) = hook {
-                    hook.install(&conn);
+                    hook.install(&mut conn, &hook_health);
                 }
                 run(conn, &rx, &actor_fault);
             })
