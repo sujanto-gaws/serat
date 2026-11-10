@@ -108,18 +108,32 @@ fn pragmas(conn: &Connection) -> Vec<(String, String)> {
     .collect()
 }
 
-/// Hands a closure the connection under test.
-type WithConn<'a> = dyn Fn(&dyn Fn(&Connection)) + 'a;
+/// What `prepare_cache_check` asks of the connection under test. One closure handles all
+/// three, because rusqlite 0.41's `trace_v2` needs `&mut Connection` and the pool reader
+/// cannot be borrowed mutably and shared at once.
+enum Step {
+    TraceOn,
+    TraceOff,
+    Search,
+}
 
-/// Run `n` searches under a trace on the connection `with` hands over, and report what
-/// the statement's own counters say.
-fn prepare_cache_check(label: &str, n: usize, with: &WithConn<'_>, run_one: &dyn Fn()) {
-    with(&|c| c.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile)));
+fn trace(c: &mut Connection, on: bool) {
+    let _ = if on {
+        c.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile))
+    } else {
+        c.trace_v2(TraceEventCodes::empty(), None::<fn(TraceEvent<'_>)>)
+    };
+}
+
+/// Run `n` searches under a trace on the connection `step` owns, and report what the
+/// statement's own counters say.
+fn prepare_cache_check(label: &str, n: usize, step: &mut dyn FnMut(Step)) {
+    step(Step::TraceOn);
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).clear();
     for _ in 0..n {
-        run_one();
+        step(Step::Search);
     }
-    with(&|c| c.trace_v2(TraceEventCodes::empty(), None));
+    step(Step::TraceOff);
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let first = seen.first().copied().unwrap_or((0, 0));
     let last = seen.last().copied().unwrap_or((0, 0));
@@ -264,7 +278,7 @@ fn measure(
     let s = Reader::open(db)
         .map_err(|e| e.to_string())?
         .with_search(sc.clone());
-    let p = Reader::open(db).map_err(|e| e.to_string())?;
+    let mut p = Reader::open(db).map_err(|e| e.to_string())?;
     let p2 = Reader::open(db).map_err(|e| e.to_string())?;
     for pragma in &settings.extra {
         let sql = format!("PRAGMA {pragma}");
@@ -356,22 +370,20 @@ fn measure(
         search_rows(&p, term0);
         search_rows(&s, term0);
     }
-    prepare_cache_check(
-        "pool reader P",
-        20,
-        &|f| p.with_connection(|c| f(c)),
-        &|| {
+    prepare_cache_check("pool reader P", 20, &mut |st| match st {
+        Step::TraceOn => p.with_connection_mut(|c| trace(c, true)),
+        Step::TraceOff => p.with_connection_mut(|c| trace(c, false)),
+        Step::Search => {
             search_rows(&p, term0);
-        },
-    );
-    prepare_cache_check(
-        "search connection S",
-        20,
-        &|f| sc.with_connection(|c| f(c)),
-        &|| {
+        }
+    });
+    prepare_cache_check("search connection S", 20, &mut |st| match st {
+        Step::TraceOn => sc.with_connection_mut(|c| trace(c, true)),
+        Step::TraceOff => sc.with_connection_mut(|c| trace(c, false)),
+        Step::Search => {
             search_rows(&s, term0);
-        },
-    );
+        }
+    });
 
     // Step 1: the timings.
     println!();

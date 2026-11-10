@@ -430,6 +430,13 @@ impl Reader {
         f(&self.conn)
     }
 
+    /// [`Self::with_connection`] with `&mut`, for diagnoses that register a callback
+    /// (rusqlite 0.41 takes `&mut Connection` for `trace_v2`). Bench use only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_connection_mut<R>(&mut self, f: impl FnOnce(&mut Connection) -> R) -> R {
+        f(&mut self.conn)
+    }
+
     /// Route this reader's free-text searches (R1, R1 + R3) to the vault's search
     /// connection. R2, R3 and R4 stay on this reader's own connection.
     #[must_use]
@@ -728,7 +735,7 @@ const PROGRESS_OPS: i32 = 10_000;
 /// running statement whenever `latest != running`. One construction for `open` and the
 /// bench toggle.
 fn install_handler(
-    conn: &Connection,
+    conn: &mut Connection,
     latest: &Arc<AtomicU64>,
     running: &Arc<AtomicU64>,
     #[cfg(test)] calls: &Arc<AtomicU64>,
@@ -771,7 +778,7 @@ impl SearchConn {
         db_path: &Path,
         latest: Arc<AtomicU64>,
     ) -> Result<Arc<Self>, IndexError> {
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -789,7 +796,7 @@ impl SearchConn {
         #[cfg(test)]
         let handler_calls = Arc::new(AtomicU64::new(0));
         install_handler(
-            &conn,
+            &mut conn,
             &latest,
             &running,
             #[cfg(test)]
@@ -817,6 +824,13 @@ impl SearchConn {
         f(&conn)
     }
 
+    /// [`Self::with_connection`] with `&mut`; see [`Reader::with_connection_mut`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_connection_mut<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut conn)
+    }
+
     /// Install a hook called once a statement is prepared and bound, before its first
     /// step, so a test can hold a search mid-flight. Not for production use.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -840,10 +854,10 @@ impl SearchConn {
     /// [`IndexError::Sqlite`].
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_progress_handler(&self, on: bool) -> Result<(), IndexError> {
-        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if on {
             install_handler(
-                &conn,
+                &mut conn,
                 &self.latest,
                 &self.running,
                 #[cfg(test)]

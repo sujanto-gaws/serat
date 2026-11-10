@@ -250,7 +250,7 @@ enum Msg {
 /// Called from the writer's WAL hook, on the writer thread, with the `Wal` and the frame
 /// count. For the benchmarks: `p1-save-tail` stamps the instant `COMMIT`'s own work is
 /// done. A plain `fn`, because `rusqlite`'s hook is.
-pub type WalObserver = fn(&Wal, i32) -> rusqlite::Result<()>;
+pub type WalObserver = fn(&mut Wal, i32) -> rusqlite::Result<()>;
 
 /// The writer's side: what its WAL hook needs. Set on the writer thread, because the
 /// hook is a plain `fn` and runs on whichever thread commits.
@@ -263,7 +263,7 @@ thread_local! {
     static HOOK: std::cell::RefCell<Option<HookState>> = const { std::cell::RefCell::new(None) };
 }
 
-fn on_wal(wal: &Wal, frames: std::os::raw::c_int) -> rusqlite::Result<()> {
+fn on_wal(wal: &mut Wal, frames: std::os::raw::c_int) -> rusqlite::Result<()> {
     HOOK.with(|hook| {
         if let Some(state) = hook.borrow().as_ref() {
             if let Some(observer) = state.observer {
@@ -296,14 +296,16 @@ impl WriterHook {
 
     /// Install on the writer thread: replaces SQLite's own auto-checkpoint with the
     /// signal (and the observer, when there is one).
-    pub(crate) fn install(self, conn: &Connection) {
+    pub(crate) fn install(self, conn: &mut Connection) {
         HOOK.with(|hook| {
             *hook.borrow_mut() = Some(HookState {
                 tx: self.signal,
                 observer: self.observer,
             });
         });
-        conn.wal_hook(Some(on_wal));
+        // rusqlite 0.41 returns a Result here; a failure leaves SQLite's own hook (see
+        // tune_writer: the writer degrades rather than panics).
+        let _ = conn.wal_hook(Some(on_wal));
     }
 }
 
