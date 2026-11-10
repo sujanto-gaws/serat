@@ -156,6 +156,66 @@ mod tests {
     }
 
     #[test]
+    fn no_csp_directive_admits_a_remote_origin_and_the_whole_string_is_pinned() {
+        // NFR-SEC-01 / NFR-SEC-02 / T-02 / T-09. The individual directives above are
+        // each pinned; this is the other direction: whatever the string says, every
+        // source of every fetch directive is `'self'`, one of the two ADR-0017 scheme
+        // origins, or Tauri's own IPC channel (connect-src only), and framing/embedding
+        // is 'none'. A new directive, or a new source on an old one, fails here.
+        const EXPECTED: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+            img-src 'self' serat-asset: http://serat-asset.localhost; \
+            connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost; \
+            frame-src 'none'; object-src 'none'";
+        let csp = tauri_conf()["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp must be a string")
+            .to_owned();
+        assert_eq!(
+            csp, EXPECTED,
+            "the CSP changed: re-run the no-network review (NFR-SEC-01)"
+        );
+
+        const SCHEME_ORIGINS: [&str; 2] = ["serat-asset:", "http://serat-asset.localhost"];
+        const IPC_ORIGINS: [&str; 2] = ["ipc:", "http://ipc.localhost"];
+        const FETCH_DIRECTIVES: [&str; 10] = [
+            "default-src",
+            "script-src",
+            "style-src",
+            "img-src",
+            "font-src",
+            "media-src",
+            "worker-src",
+            "connect-src",
+            "manifest-src",
+            "prefetch-src",
+        ];
+        // `worker-src` is absent and falls back to `script-src 'self'`, which is right for the
+        // same-origin module worker pdf.js is given (viewers/pdfEngine.ts); adding it later
+        // is checked by the loop below.
+        for directive in csp.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+            let mut tokens = directive.split_whitespace();
+            let name = tokens.next().expect("a directive name");
+            let sources: Vec<&str> = tokens.collect();
+            if FETCH_DIRECTIVES.contains(&name) {
+                for source in sources {
+                    let ok = source == "'self'"
+                        || SCHEME_ORIGINS.contains(&source)
+                        || (name == "connect-src" && IPC_ORIGINS.contains(&source));
+                    assert!(
+                        ok,
+                        "{name} admits {source:?}: not 'self' or a scheme origin"
+                    );
+                }
+            } else {
+                assert!(
+                    matches!(name, "frame-src" | "object-src") && sources == ["'none'"],
+                    "unexpected CSP directive {directive:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn capabilities_still_grant_exactly_core_default_the_five_adr_0012_commands_and_opener() {
         // capabilities/default.json's own `description` says widening this list is a
         // threat-model decision, not a convenience. ADR-0012 widened it once, on
