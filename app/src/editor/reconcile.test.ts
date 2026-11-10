@@ -80,7 +80,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function harness(overrides: Partial<EditorIpcAdapter> = {}, extraProps: { vaultId?: string | null } = {}) {
+function harness(overrides: Partial<EditorIpcAdapter> = {}, extraProps: { vaultId?: string | null; vaultOpen?: boolean } = {}) {
   let emit: (change: ExternalChange) => void = () => undefined;
   const ipc: EditorIpcAdapter = {
     noteOpened: vi.fn().mockResolvedValue(undefined),
@@ -506,5 +506,23 @@ describe("external-change audit (FR-VLT-05, NFR-REL-01, C-04)", () => {
       expect(api.isDirty).toBe(true);
       wrapper.unmount();
     });
+  });
+});
+
+describe("no vault open (after a failed open, #103)", () => {
+  it("drops a note://external-change for the announced id; a new open's events apply again", async () => {
+    const { api, send, wrapper } = harness({}, { vaultId: "B", vaultOpen: false });
+    await api.loadNote("one", "a.md", "h0");
+    send({ ...(changed("h0", "h1", [patch(0, 0, 0, 3, "X")]) as object), vault_id: "B" } as ExternalChange);
+    send({ kind: "deleted", vault_id: "B", path: "a.md" });
+    await flush();
+    expect(api.getText()).toBe("one");
+    expect(wrapper.find('[data-testid="external-notice"]').exists()).toBe(false);
+    await wrapper.setProps({ vaultId: "C", vaultOpen: true });
+    await api.loadNote("one", "a.md", "h0"); // the new vault's note: its buffer is tagged "C"
+    send({ ...(changed("h0", "h1", [patch(0, 0, 0, 3, "X")]) as object), vault_id: "C" } as ExternalChange);
+    await flush();
+    expect(api.getText()).toBe("X");
+    wrapper.unmount();
   });
 });
