@@ -2766,6 +2766,7 @@ mod tests {
                 }
             })),
             on_walk_start: None,
+            ..OpenHooks::default()
         });
         // Re-bound after `state` so that, on a failed assertion, the sender drops (and
         // frees the held vault thread) before `state` does: locals drop in reverse
