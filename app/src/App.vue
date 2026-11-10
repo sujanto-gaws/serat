@@ -23,7 +23,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import type { SaveOutcome } from "@/editor/buffer";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
-import { indexStatus, isIpcError, onIndexStatus } from "@/ipc/client";
+import { indexStatus, isIpcError, onIndexStatus, onVaultOpened } from "@/ipc/client";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
@@ -36,6 +36,7 @@ import { getUiSettings, setLivePreview } from "@/ipc/client";
 const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
+let unlistenVaultOpened: UnlistenFn | null = null;
 const searchOpen = ref(false);
 /** The PDF/image open in place of the editor (binary-viewers.md); null = the editor shows. */
 const viewing = ref<string | null>(null);
@@ -303,6 +304,8 @@ onMounted(async () => {
   // is synchronous (the rAF pair is registered before this call returns); only
   // *waiting* on the promise it returns happens later, in `hydrateBuffer` below.
   const paintMark = schedulePaintMark(store);
+  store.adoptBoot(window.__SERAT_BOOT__?.vault_id);
+  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
 
   // Installed next so the first transition the actor publishes is not lost — mirrors
   // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
@@ -325,8 +328,15 @@ onMounted(async () => {
     .catch(() => undefined);
 
 
+  // The vault id's sources (architecture 3.4): BootInfo at launch (read synchronously above),
+  // `vault://opened` for every later open; index_status is a restricted fallback only.
+  void onVaultOpened((opened) => store.vaultOpened(opened))
+    .then((unlisten) => (unlistenVaultOpened = unlisten))
+    .catch(() => undefined);
+
   unlistenIndexStatus = await onIndexStatus((status) => {
-    store.setVaultId(status.vault_id);
+    store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -334,13 +344,12 @@ onMounted(async () => {
     if (typeof refused === "number") store.setRefusedNames(refused);
   });
 
-  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
-
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
   indexStatus().then((status) => {
-    store.setVaultId(status.vault_id);
+    store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return;
     store.setIndexState(status.state);
   });
 
@@ -357,6 +366,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();
+  unlistenVaultOpened?.();
   if (updatedTimer) clearTimeout(updatedTimer);
 });
 
@@ -424,6 +434,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         :open-path="editorDirty && store.openNote ? store.openNote : (viewing ?? store.openNote)"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
         @open="onTreeOpen"
         @insert-link="onInsertLink"
         @rename="onTreeRename"
@@ -444,6 +455,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         v-show="viewing === null"
         ref="editorRef"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
         :live-preview="livePreview"
         :commands="commands"
         placeholder="No note open."
