@@ -13,6 +13,11 @@ serat-core = { workspace = true }
 blake3 = { workspace = true }
 notify = { workspace = true }
 
+# Windows file identity (volume serial + file index) for `FileIdentity`; the handle it
+# opens is dropped at once. Already in the tree through `same-file`.
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

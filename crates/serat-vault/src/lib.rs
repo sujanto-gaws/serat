@@ -30,6 +30,7 @@ pub mod diff;
 pub mod echo;
 mod gitignore;
 pub mod hash;
+pub mod identity;
 pub mod ignore;
 #[cfg(test)]
 mod ignore_file_tests;
@@ -59,6 +60,7 @@ use serat_core::{
 pub use echo::EchoSuppressor;
 pub use gitignore::{GitignoreAppended, gitignore_ignores_serat};
 pub use hash::hash_bytes;
+pub use identity::FileIdentity;
 pub use ignore::{IGNORE_FILE, IgnoreRules, Patterns, is_note_file};
 pub use patch::Edit;
 pub use position::Position;
@@ -110,6 +112,8 @@ pub struct Vault {
     /// One mutex per path being written, shared by every clone (ADR-0016 §2): held
     /// from the first read to the rename in every in-process content write.
     locks: Arc<atomic::PathLocks>,
+    /// The root's identity, read once at open; no handle is kept (task #96).
+    identity: Option<FileIdentity>,
 }
 
 impl Vault {
@@ -151,6 +155,7 @@ impl Vault {
             echo: Arc::new(EchoSuppressor::new()),
             refusals: RefusalLog::new(),
             locks: Arc::default(),
+            identity: FileIdentity::of_dir(&canonical),
         };
         vault.reload_ignore_file();
         Ok(vault)
@@ -192,6 +197,13 @@ impl Vault {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The root's file identity (see [`FileIdentity`]), read when the vault was opened,
+    /// or `None` if the platform could not give one.
+    #[must_use]
+    pub fn identity(&self) -> Option<FileIdentity> {
+        self.identity
     }
 
     /// The ignore rules in force.

@@ -31,8 +31,8 @@ use crate::consumer::{ChangeNotifier, Indexer, OpenCatchUp, SETTLE_BOUND, TREE_G
 use crate::editor::Editor;
 use crate::error::from_vault_error;
 use crate::index::{
-    IndexActor, IndexHandleSlot, IndexOpen, SeratIndexOpen, StatusPublisher, StatusSink,
-    index_dir_for,
+    DetachedWriters, IndexActor, IndexHandleSlot, IndexOpen, SeratIndexOpen, StatusPublisher,
+    StatusSink, index_dir_for,
 };
 use crate::ipc::{
     AppClosing, AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents,
@@ -241,7 +241,7 @@ struct OpenVault {
     vault: Arc<Vault>,
     publisher: Arc<Publisher>,
     /// Kept so the actor outlives the vault it belongs to, and no longer.
-    _index: IndexActor,
+    index: Arc<ActorCell>,
     /// The consumer of external changes, and the owner of `index://changed`'s throttle
     /// (the save path calls into it after a submit).
     indexer: Arc<Indexer>,
@@ -284,25 +284,70 @@ pub(crate) enum FailAt {
     VaultThread,
 }
 
+/// Where the open vault's index actor lives. Usually filled by `open_vault_with` itself;
+/// when a detached actor still holds the same `index.db` (task #96) it is filled later,
+/// by the thread that waited for that one to exit. Cancelling and filling serialise on
+/// the one mutex, so an actor is never spawned for a vault that has already closed.
+#[derive(Default)]
+struct ActorCell {
+    state: Mutex<CellState>,
+}
+
+#[derive(Default)]
+struct CellState {
+    actor: Option<IndexActor>,
+    cancelled: bool,
+}
+
+impl ActorCell {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CellState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `spawn` and keep its actor, unless the cell was cancelled first. Returns the
+    /// spawn's error so the caller can say so.
+    fn install(
+        &self,
+        spawn: impl FnOnce() -> std::io::Result<IndexActor>,
+    ) -> Result<(), std::io::Error> {
+        let mut state = self.lock();
+        if state.cancelled {
+            return Ok(());
+        }
+        state.actor = Some(spawn()?);
+        Ok(())
+    }
+
+    /// No actor will be installed from now on; hands back the one that is.
+    fn cancel(&self) -> Option<IndexActor> {
+        let mut state = self.lock();
+        state.cancelled = true;
+        state.actor.take()
+    }
+}
+
 /// What a failed open owes (task #90): once `vault://opened` has announced the id, an
 /// open that returns `Err` must leave nothing that can carry it. Armed from the
 /// publisher's creation, disarmed only by [`OpenAttempt::commit`] at the `replace`.
-/// Retire first, then join the actor for at most `CLOSE_DEADLINE`: a join that finishes
-/// means no status can be mid-emit and the actor has closed its handle, so a re-open
-/// never meets a second writer on `index.db`. Past the deadline the actor is detached
-/// (a close must not wait out a whole rebuild while holding `opening`); retire still
-/// stops every further emit, but the detached rebuild may keep writing `index.db` until
-/// it ends -- the accepted residue.
+/// Retire first, then cancel any deferred spawn and join the actor for at most
+/// `deadline`: a join that finishes means no status can be mid-emit and the actor has
+/// closed its handle. Past the deadline the actor is detached into `registry` (task
+/// #96): retire still stops every further emit, and the registry keeps a re-open of the
+/// same root from starting a second writer until the detached one has exited.
 struct OpenAttempt {
     publisher: Arc<Publisher>,
-    actor: Option<IndexActor>,
+    index: Arc<ActorCell>,
+    registry: Arc<DetachedWriters>,
+    root: Option<serat_vault::FileIdentity>,
+    deadline: std::time::Duration,
     armed: bool,
 }
 
 impl OpenAttempt {
-    fn commit(mut self) -> Option<IndexActor> {
+    fn commit(mut self) {
         self.armed = false;
-        self.actor.take()
     }
 }
 
@@ -310,8 +355,8 @@ impl Drop for OpenAttempt {
     fn drop(&mut self) {
         if self.armed {
             self.publisher.retire();
-            if let Some(actor) = self.actor.as_mut() {
-                actor.join_within(CLOSE_DEADLINE);
+            if let Some(mut actor) = self.index.cancel() {
+                actor.join_or_register(self.deadline, self.root, &self.registry);
             }
         }
     }
@@ -332,6 +377,12 @@ pub(crate) struct OpenHooks {
     /// Called with the new vault id right after `IndexActor::spawn` returned.
     #[cfg(test)]
     pub(crate) after_index_spawn: Option<SpawnHook>,
+    /// Make the deferred index-actor spawn fail (task #96 review SF-1).
+    #[cfg(test)]
+    pub(crate) fail_deferred_spawn: bool,
+    /// Mutant switch for task #96's test: ignore the detached-writer registry.
+    #[cfg(test)]
+    pub(crate) skip_registry_check: bool,
     /// Called with the new vault id right after `VaultThread::spawn_with` returned.
     #[cfg(test)]
     pub(crate) after_vault_spawn: Option<SpawnHook>,
@@ -353,11 +404,20 @@ impl OpenVault {
     /// own and finds the indexer stopped. A second close request while this runs
     /// waits for it (`AppState::close_after_flush`, under `opening`); if the process is killed mid-close
     /// the marker is unset and the next open reads it as unclean.
-    fn shut_down(mut self) {
+    fn shut_down(mut self, detached: &DetachedWriters) {
+        // Before the slot is looked in: an actor that fills it afterwards sees the
+        // retirement and closes the handle itself (task #96).
+        self.publisher.retire();
         self.indexer.notifier().close();
         self.indexer.stop();
         self.catch_up.cancel();
         self.walk.stop_within(CLOSE_DEADLINE);
+        // The actor was never joined here, so one still inside an open or a rebuild
+        // outlived its vault with nothing recording it (task #96). It is registered so
+        // a re-open of this root waits for it; nothing here waits for it.
+        if let Some(mut actor) = self.index.cancel() {
+            actor.detach_into(self.vault.identity(), detached);
+        }
         self.switcher.shut_down();
         let handle = self
             .index_handle
@@ -463,6 +523,13 @@ pub struct AppState {
     /// How long the tree walk and the vault thread wait for the first paint.
     walk_gate: std::time::Duration,
     hooks: OpenHooks,
+    /// Index actors detached past their deadline, by `index.db` (task #96).
+    detached: Arc<DetachedWriters>,
+    /// How long a failed open waits for its index actor (default `CLOSE_DEADLINE`).
+    actor_deadline: std::time::Duration,
+    /// How long the open's catch-up waits for the index to settle (default
+    /// `SETTLE_BOUND`), counted from when the actor exists.
+    settle_bound: std::time::Duration,
     /// Serialises opens: two concurrent `open_vault` calls must not both find nothing
     /// to close.
     opening: Mutex<()>,
@@ -556,6 +623,9 @@ impl AppState {
             settings_path: loaded.path,
             walk_gate: WALK_GATE_TIMEOUT,
             hooks: OpenHooks::default(),
+            detached: Arc::default(),
+            actor_deadline: CLOSE_DEADLINE,
+            settle_bound: SETTLE_BOUND,
             opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
@@ -581,6 +651,9 @@ impl AppState {
             settings_path: None,
             walk_gate: WALK_GATE_TIMEOUT,
             hooks: OpenHooks::default(),
+            detached: Arc::default(),
+            actor_deadline: CLOSE_DEADLINE,
+            settle_bound: SETTLE_BOUND,
             opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
@@ -597,6 +670,46 @@ impl AppState {
     pub fn with_walk_gate(mut self, gate: std::time::Duration) -> Self {
         self.walk_gate = gate;
         self
+    }
+
+    /// A shorter wait for a failed open's index actor, so a test can detach one.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_actor_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.actor_deadline = deadline;
+        self
+    }
+
+    /// A shorter settle bound, so a test can outlast it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_settle_bound(mut self, bound: std::time::Duration) -> Self {
+        self.settle_bound = bound;
+        self
+    }
+
+    /// Share another state's detached-writer registry: the registry is process-wide in
+    /// effect (one `index.db`, one writer), and a test needs a second state to re-open
+    /// without the first one's failure seam.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_detached(mut self, detached: Arc<DetachedWriters>) -> Self {
+        self.detached = detached;
+        self
+    }
+
+    /// Whether the open vault's indexer owes a whole-vault rescan, for tests.
+    #[cfg(test)]
+    pub(crate) fn rescan_owed(&self) -> bool {
+        self.open_lock()
+            .as_ref()
+            .is_some_and(|open| open.indexer.rescan_owed())
+    }
+
+    /// Detached index actors still live, for tests.
+    #[cfg(test)]
+    pub(crate) fn detached_writers(&self) -> Arc<DetachedWriters> {
+        Arc::clone(&self.detached)
     }
 
     /// Install test seams on the open path.
@@ -690,9 +803,13 @@ impl AppState {
         if let Some(probe) = &self.hooks.publisher_probe {
             *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
         }
-        let mut attempt = OpenAttempt {
+        let index_cell = Arc::new(ActorCell::default());
+        let attempt = OpenAttempt {
             publisher: Arc::clone(&publisher),
-            actor: None,
+            index: Arc::clone(&index_cell),
+            registry: Arc::clone(&self.detached),
+            root: vault.identity(),
+            deadline: self.actor_deadline,
             armed: true,
         };
 
@@ -701,7 +818,25 @@ impl AppState {
         // publishing anything other than `Opening`; `Rebuilding` and `Unavailable`
         // settle it as much as `Ready` does.
         let settled = Arc::clone(&self.startup);
-        let catch_up_gate = Arc::new(OpenCatchUp::new(SETTLE_BOUND, TREE_GRACE));
+        // ADR-0001: one writer per `index.db`. If an actor detached by an earlier close
+        // or failed open still holds this root's index, the vault opens without one --
+        // the publisher stays at `Opening` -- and a thread starts it once that one has
+        // exited. Nothing here waits, and `opening` is not held across the wait. The
+        // catch-up gate's settle clock does not start until that actor exists.
+        #[cfg(test)]
+        let skip_check = self.hooks.skip_registry_check;
+        #[cfg(not(test))]
+        let skip_check = false;
+        let blocker = if skip_check {
+            None
+        } else {
+            self.detached.live(vault.identity())
+        };
+        let catch_up_gate = Arc::new(if blocker.is_some() {
+            OpenCatchUp::awaiting_actor(self.settle_bound, TREE_GRACE)
+        } else {
+            OpenCatchUp::new(self.settle_bound, TREE_GRACE)
+        });
         let publishing = Arc::clone(&catch_up_gate);
         let tree_paths = Arc::new(TreePaths::default());
         #[cfg(test)]
@@ -727,24 +862,76 @@ impl AppState {
         let epoch = crate::index::HandleEpoch::default();
         #[cfg(test)]
         self.inject(FailAt::IndexActor, &root)?;
-        let spawned = IndexActor::spawn(
-            Arc::clone(&publisher),
-            opener,
-            root.clone(),
-            index_dir_for(&root),
-            Arc::clone(&epoch),
-        );
-        // Immediately after the spawn, before its `?`, so no later statement can sit
-        // between the thread starting and this point (the ordering test's hold).
-        #[cfg(test)]
-        if let Some(hook) = &self.hooks.after_index_spawn {
-            hook(&vault_id);
+        let index_handle: IndexHandleSlot = Arc::new(Mutex::new(None));
+        if let Some(blocker) = blocker {
+            let (cell, publisher, slot, epoch, gate) = (
+                Arc::clone(&index_cell),
+                Arc::clone(&publisher),
+                Arc::clone(&index_handle),
+                Arc::clone(&epoch),
+                Arc::clone(&catch_up_gate),
+            );
+            let (deferred_root, dir) = (root.clone(), index_dir_for(&root));
+            #[cfg(test)]
+            let fail_spawn = self.hooks.fail_deferred_spawn;
+            let unavailable = Arc::clone(&publisher);
+            std::thread::Builder::new()
+                .name("serat-index-deferred".to_owned())
+                .spawn(move || {
+                    while !blocker.done() {
+                        if cell.lock().cancelled {
+                            gate.actor_started();
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    let unavailable_path = dir.display().to_string();
+                    let installed = cell.install(|| {
+                        #[cfg(test)]
+                        if fail_spawn {
+                            return Err(std::io::Error::other("injected spawn failure"));
+                        }
+                        IndexActor::spawn_into(slot, publisher, opener, deferred_root, dir, epoch)
+                    });
+                    // The vault is already open here, so a failed spawn must be seen:
+                    // left alone the index would read `Opening` for the whole session
+                    // (goal 5).
+                    if let Err(err) = installed {
+                        eprintln!("serat: the deferred index thread could not start: {err}");
+                        unavailable.publish(IndexState::Unavailable {
+                            message: format!("could not start the index thread: {err}"),
+                            path: unavailable_path,
+                        });
+                    }
+                    // Now, not before: the claimants' settle clocks start here, whether
+                    // or not the spawn succeeded (a failed one then times out as usual).
+                    gate.actor_started();
+                })
+                .map_err(|err| IpcError::Io {
+                    path: root.display().to_string(),
+                    message: format!("could not start the index thread: {err}"),
+                })?;
+        } else {
+            let spawned = IndexActor::spawn_into(
+                Arc::clone(&index_handle),
+                Arc::clone(&publisher),
+                opener,
+                root.clone(),
+                index_dir_for(&root),
+                Arc::clone(&epoch),
+            );
+            // Immediately after the spawn, before its `?`, so no later statement can
+            // sit between the thread starting and this point (the ordering test's hold).
+            #[cfg(test)]
+            if let Some(hook) = &self.hooks.after_index_spawn {
+                hook(&vault_id);
+            }
+            let index = spawned.map_err(|err| IpcError::Io {
+                path: root.display().to_string(),
+                message: format!("could not start the index thread: {err}"),
+            })?;
+            let _ = index_cell.install(|| Ok(index));
         }
-        let (index, index_handle) = spawned.map_err(|err| IpcError::Io {
-            path: root.display().to_string(),
-            message: format!("could not start the index thread: {err}"),
-        })?;
-        attempt.actor = Some(index);
 
         // §3.4 puts the walk off the critical path; measured, being on another thread
         // is not enough to achieve that (see `crate::vault`). The tree's gate holds the
@@ -786,6 +973,10 @@ impl AppState {
             Arc::clone(&index_handle),
             notifier,
         ));
+        // A claim that gives up because the index never settled owes a rescan rather than
+        // dropping the open's catch-up (task #96 review B1).
+        let owing = Arc::clone(&indexer);
+        catch_up_gate.on_unsettled(move || owing.owe_rescan());
         let walk_start = Arc::clone(&indexer);
         let walk_failed = Arc::clone(&indexer);
         let catch_up = Arc::clone(&indexer);
@@ -969,7 +1160,7 @@ impl AppState {
         let previous = self.open_lock_mut().replace(OpenVault {
             vault,
             publisher,
-            _index: attempt.commit().expect("the actor was spawned"),
+            index: index_cell,
             indexer,
             switcher,
             index_handle,
@@ -981,8 +1172,9 @@ impl AppState {
         });
         // The vault that was open is closed cleanly, outside the lock.
         if let Some(previous) = previous {
-            previous.shut_down();
+            previous.shut_down(&self.detached);
         }
+        attempt.commit();
 
         Ok(VaultOpened {
             root: root.display().to_string(),
@@ -1767,6 +1959,11 @@ impl AppState {
     pub fn rebuild_index(&self) -> Result<(), IpcError> {
         // TODO(S7): quiesce the switcher build and the reconciler's readers before the
         // delete; until then this is for tests and the Linux/macOS unlink semantics.
+        // TODO(S7, task #96): this runs `rebuild_in_place` on the caller's thread,
+        // outside the index actor and `ActorCell`, so a close during it registers
+        // nothing and a re-open can remove the db under it. Before it is wired to a
+        // command it must run on the actor, or hold an exit flag in `DetachedWriters`
+        // under this root for its whole duration.
         let (vault, publisher, slot, search, indexer) = {
             let guard = self.open_lock();
             let open = guard.as_ref().ok_or_else(Self::not_open)?;
@@ -1959,7 +2156,7 @@ impl AppState {
         let open = self.open_lock_mut().take();
         if let Some(open) = open {
             self.startup.set_vault(None);
-            open.shut_down();
+            open.shut_down(&self.detached);
         }
     }
 
@@ -5170,6 +5367,365 @@ mod tests {
         );
         assert!(started.elapsed() < CLOSE_DEADLINE, "bounded, not unbounded");
         let _ = std::fs::remove_dir_all(&a);
+    }
+
+    // -- task #96: one index writer per index.db (ADR-0001) -------------------------
+    //
+    // Mutant, run by hand on this commit: `OpenHooks::skip_registry_check = true` on the
+    // re-opening state makes both tests below fail (`max_running == 2`).
+
+    /// An opener that holds the "index" for `hold`, counting how many are inside `open`
+    /// at once. It stands for an actor in a long rebuild.
+    #[derive(Clone)]
+    struct Counting {
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        max: Arc<std::sync::atomic::AtomicUsize>,
+        hold: Duration,
+        rebuild: bool,
+    }
+
+    impl IndexOpen for Counting {
+        fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.running.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(now, SeqCst);
+            if self.rebuild {
+                publish(IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 1,
+                    walk_complete: false,
+                });
+            }
+            std::thread::sleep(self.hold);
+            // Released before the terminal word: the exit flag fires after this.
+            self.running.fetch_sub(1, SeqCst);
+            publish(IndexState::Ready { note_count: 1 });
+        }
+    }
+
+    fn counting(hold_ms: u64) -> Counting {
+        Counting {
+            running: Arc::default(),
+            max: Arc::default(),
+            hold: Duration::from_millis(hold_ms),
+            rebuild: true,
+        }
+    }
+
+    fn plain_state(deadline: Duration) -> AppState {
+        AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO)
+        .with_actor_deadline(deadline)
+    }
+
+    fn reopen_after_detach(
+        first: &AppState,
+        reopen_hooks: OpenHooks,
+        slow: &Counting,
+        dir: &Path,
+    ) -> AppState {
+        let second = plain_state(Duration::from_secs(5))
+            .with_detached(first.detached_writers())
+            .with_open_hooks(reopen_hooks);
+        assert_eq!(
+            first.detached_writers().live_count(),
+            1,
+            "one actor detached"
+        );
+        let fast = Counting {
+            hold: Duration::ZERO,
+            ..slow.clone()
+        };
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                fast,
+            )
+            .expect("the re-open succeeds");
+        assert_eq!(
+            opened.index,
+            IndexState::Opening,
+            "no actor yet: it must wait"
+        );
+        wait_ready(&second);
+        assert_eq!(
+            slow.max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two writers on one index.db at once"
+        );
+        assert_eq!(first.detached_writers().live_count(), 0);
+        second
+    }
+
+    #[test]
+    fn a_reopen_waits_for_an_actor_detached_by_a_failed_open() {
+        let dir = fixture("detached-failed");
+        let slow = counting(700);
+        let first = plain_state(Duration::from_millis(100)).with_open_hooks(OpenHooks {
+            fail_at: Some(FailAt::VaultThread),
+            ..OpenHooks::default()
+        });
+        let err = first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect_err("fails after the actor spawned");
+        assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+        let second = reopen_after_detach(&first, OpenHooks::default(), &slow, &dir);
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reopen_waits_for_an_actor_still_running_when_the_vault_closed() {
+        let dir = fixture("detached-closed");
+        let slow = counting(700);
+        let first = plain_state(Duration::from_secs(5));
+        first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect("open");
+        // The close does not wait for the actor (it never did): it must record it.
+        first.close_vault();
+        let second = reopen_after_detach(&first, OpenHooks::default(), &slow, &dir);
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deferred_reopen_still_runs_the_open_catch_up_after_the_settle_bound() {
+        // Review B1: the settle clock must start when the actor exists, not when the
+        // open starts. Here the detached actor holds for 1.5 s and the bound is 500 ms;
+        // on the previous logic the claims gave up at 500 ms, before the deferred actor
+        // had even been spawned, and no walk ran.
+        let dir = fixture("detached-catch-up");
+        let slow = counting(1500);
+        let first = plain_state(Duration::from_secs(5));
+        first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect("open");
+        first.close_vault();
+        assert_eq!(first.detached_writers().live_count(), 1);
+
+        let walks: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let recorded = Arc::clone(&walks);
+        let second = plain_state(Duration::from_secs(5))
+            .with_detached(first.detached_writers())
+            .with_settle_bound(Duration::from_millis(500))
+            .with_open_hooks(OpenHooks {
+                on_walk_start: Some(Arc::new(move |who| {
+                    recorded.lock().expect("walks").push(who);
+                })),
+                ..OpenHooks::default()
+            });
+        let fast = Counting {
+            hold: Duration::ZERO,
+            rebuild: false,
+            ..slow
+        };
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                fast,
+            )
+            .expect("re-open");
+        assert_eq!(opened.index, IndexState::Opening);
+        wait_ready(&second);
+        wait_until("the catch-up walk", || {
+            !walks.lock().expect("walks").is_empty()
+        });
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state that closed a vault whose actor (holding `hold_ms`) is still running, and
+    /// a second state on the same registry with a short settle bound.
+    fn detached_pair(
+        name: &str,
+        hold_ms: u64,
+        bound_ms: u64,
+    ) -> (AppState, AppState, PathBuf, Counting) {
+        let dir = fixture(name);
+        let slow = counting(hold_ms);
+        let first = plain_state(Duration::from_secs(5));
+        first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect("open");
+        first.close_vault();
+        assert_eq!(first.detached_writers().live_count(), 1);
+        let second = plain_state(Duration::from_secs(5))
+            .with_detached(first.detached_writers())
+            .with_settle_bound(Duration::from_millis(bound_ms));
+        (first, second, dir, slow)
+    }
+
+    #[test]
+    fn a_deferred_reopen_populates_the_tree_without_waiting_for_the_detached_actor() {
+        // Review B1 (round 2): the tree's claim must not sit behind an actor that does
+        // not exist yet. The detached actor holds 2.5 s; the tree must settle well
+        // inside FR-VLT-01's 2 s while it is still live, and the catch-up it was
+        // refused is owed as a rescan, which runs once the real actor is up.
+        let (first, second, dir, _slow) = detached_pair("detached-tree", 2500, 30_000);
+        let started = Instant::now();
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                SeratIndexOpen::default(),
+            )
+            .expect("re-open");
+        assert_eq!(opened.index, IndexState::Opening);
+        let (send, log) = collecting_sender();
+        second.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the tree waited {:?} for the detached actor",
+            started.elapsed()
+        );
+        assert_eq!(
+            first.detached_writers().live_count(),
+            1,
+            "the detached actor must still be live when the tree settled"
+        );
+        assert!(
+            second.rescan_owed(),
+            "the refused catch-up is owed as a rescan"
+        );
+        wait_ready(&second);
+        wait_until("the owed rescan to run", || !second.rescan_owed());
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_catch_up_that_never_settles_owes_a_rescan() {
+        // Review S1: pins `on_unsettled` -> `Indexer::owe_rescan`. The deferred actor
+        // starts but publishes nothing for 1.5 s; the bound is 100 ms. Removing the
+        // `on_unsettled` wiring in `open_vault_with`, or making `owe_rescan` a no-op,
+        // leaves the flag false and fails this test (both mutants run by hand).
+        let (_first, second, dir, slow) = detached_pair("detached-unsettled", 400, 100);
+        let silent = Counting {
+            hold: Duration::from_millis(1500),
+            rebuild: false,
+            ..slow
+        };
+        second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                silent,
+            )
+            .expect("re-open");
+        wait_until("the unsettled claim to owe a rescan", || {
+            second.rescan_owed()
+        });
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_deferred_spawn_leaves_the_index_unavailable_not_opening_forever() {
+        let (_first, second, dir, _slow) = detached_pair("detached-spawn-fails", 300, 30_000);
+        let second = second.with_open_hooks(OpenHooks {
+            fail_deferred_spawn: true,
+            ..OpenHooks::default()
+        });
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                SeratIndexOpen::default(),
+            )
+            .expect("the vault opens without an actor");
+        assert_eq!(opened.index, IndexState::Opening);
+        wait_until("Unavailable", || {
+            matches!(second.index_status().state, IndexState::Unavailable { .. })
+        });
+        let IndexState::Unavailable { message, path } = second.index_status().state else {
+            unreachable!()
+        };
+        assert!(
+            message.contains("could not start the index thread"),
+            "{message}"
+        );
+        assert!(path.contains(".serat"), "{path}");
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deferred_reopen_indexes_what_changed_while_the_vault_was_closed() {
+        // Review SF-2: the effect of the owed rescan, not only that the flag was taken.
+        // A valid index exists (a real open and close), a `Counting` session is detached,
+        // `new.md` appears while closed, and the deferred re-open indexes it.
+        let dir = fixture("detached-effect");
+        let real = plain_state(Duration::from_secs(5));
+        open_dir_real(&real, &dir);
+        wait_ready(&real);
+        real.close_vault();
+        let slow = counting(1500);
+        let detacher = plain_state(Duration::from_secs(5));
+        detacher
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow,
+            )
+            .expect("open");
+        detacher.close_vault();
+        assert_eq!(detacher.detached_writers().live_count(), 1);
+        std::fs::write(dir.join("new.md"), "# written while closed\n").expect("write");
+
+        let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
+        let opened = open_dir_real(&second, &dir);
+        assert_eq!(opened.index, IndexState::Opening);
+        // The tree's refused catch-up is owed as a rescan; the real actor runs it.
+        let (send, log) = collecting_sender();
+        second.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        wait_ready(&second);
+        wait_for_row(&dir, "new.md");
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn open_dir_real(state: &AppState, dir: &Path) -> VaultOpened {
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open")
     }
 
     #[test]

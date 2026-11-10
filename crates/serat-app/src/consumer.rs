@@ -248,11 +248,28 @@ impl NoteSource for Stoppable<'_> {
 #[derive(Debug)]
 pub struct OpenCatchUp {
     settled: Latch,
+    /// Set once the vault's index actor exists. The settle clock does not start before
+    /// it: an open that had to wait for a detached actor (task #96) publishes nothing
+    /// for however long that takes, and a clock running over the wait would give the
+    /// open's catch-up up for good.
+    actor_started: Latch,
+    /// Called when a claim is refused because the index never settled: the catch-up
+    /// that did not run is owed as a rescan instead of being dropped.
+    on_unsettled: Mutex<Option<Owe>>,
     bound: Duration,
     grace: Duration,
     state: Mutex<Claim>,
     /// Signalled when a tree attaches or the vault is cancelled.
     attached: std::sync::Condvar,
+}
+
+/// The unsettled callback, wrapped so `OpenCatchUp` keeps its `Debug`.
+struct Owe(Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Owe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Owe")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -282,13 +299,55 @@ impl OpenCatchUp {
     /// application's own trigger at most `grace` more for a tree to attach.
     #[must_use]
     pub fn new(bound: Duration, grace: Duration) -> Self {
+        let this = Self::build(bound, grace);
+        this.actor_started.set();
+        this
+    }
+
+    fn build(bound: Duration, grace: Duration) -> Self {
+        let actor_started = Latch::default();
         Self {
             settled: Latch::default(),
+            actor_started,
+            on_unsettled: Mutex::new(None),
             bound,
             grace,
             state: Mutex::new(Claim::default()),
             attached: std::sync::Condvar::new(),
         }
+    }
+
+    /// As [`OpenCatchUp::new`], for an open whose index actor does not exist yet: no
+    /// claimant starts its settle clock until [`OpenCatchUp::actor_started`] (or a
+    /// cancel).
+    #[must_use]
+    pub fn awaiting_actor(bound: Duration, grace: Duration) -> Self {
+        Self::build(bound, grace)
+    }
+
+    /// Run the unsettled callback: the open's catch-up did not happen.
+    fn owe(&self) {
+        if let Some(owe) = self
+            .on_unsettled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            (owe.0)();
+        }
+    }
+
+    /// The index actor now exists; claimants' settle clocks start.
+    pub fn actor_started(&self) {
+        self.actor_started.set();
+    }
+
+    /// What to do when a claim gives up because the index never settled.
+    pub fn on_unsettled(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self
+            .on_unsettled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Owe(Box::new(f)));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Claim> {
@@ -316,6 +375,7 @@ impl OpenCatchUp {
     /// The vault is closing: wake every claimant and grant nothing further.
     pub fn cancel(&self) {
         self.lock().cancelled = true;
+        self.actor_started.set();
         self.settled.set();
         self.attached.notify_all();
     }
@@ -364,11 +424,24 @@ impl OpenCatchUp {
     }
 
     fn claim_inner(&self, from_tree: bool, wait_for_tree: bool, bench_walk: bool) -> bool {
+        // The tree never waits for an actor that does not exist yet (FR-VLT-01's 2 s,
+        // goal 5): it is refused at once and walks name-and-kind only, and the
+        // catch-up it would have fed is owed as a rescan.
+        if from_tree && !self.actor_started.is_set() {
+            self.owe();
+            return false;
+        }
+        // The application's own trigger runs on a thread of its own and may wait: this
+        // ends when the actor is spawned, when its spawn failed (the caller starts it
+        // regardless) or at the vault's cancel.
+        while !self.actor_started.wait(Duration::from_secs(1)) {}
         if !self.settled.wait(self.bound) {
             eprintln!(
-                "serat: the index had not settled after {:?}; no catch-up this session",
+                "serat: the index had not settled after {:?}; the open's catch-up is owed \
+                 as a rescan",
                 self.bound
             );
+            self.owe();
             return false;
         }
         let mut claim = self.lock();
@@ -656,6 +729,17 @@ impl Indexer {
     /// it predates the watcher ([`Indexer::window_opened`]).
     pub fn walk_started(&self) {
         *self.journal() = Some(Journal::default());
+    }
+
+    /// Whether a whole-vault rescan is owed. For tests.
+    #[cfg(test)]
+    pub(crate) fn rescan_owed(&self) -> bool {
+        self.deferred().rescan
+    }
+
+    /// Record that the open's catch-up did not run and a rescan is owed.
+    pub fn owe_rescan(&self) {
+        self.deferred().rescan = true;
     }
 
     /// The walk that was to feed the catch-up failed or panicked: close the journal
