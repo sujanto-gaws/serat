@@ -39,23 +39,30 @@ owner: lead
 | 17 | `[P1/impl] Index assets and associate sidecars` | rust-core-dev | 6 | **merged** (approved at dbfa2b5) |
 | 18 | `[P1/impl] P1 IPC commands/events and generated TS types` | tauri-app-dev | 7, 13–17 | **merged** rounds 1–3; last 61c3054 (24b4073). Still blocked: resolve_links/note_anchors, choose_vault |
 | 19 | `[P1/impl] Contained asset serving + .serat/ gitignore offer` | tauri-app-dev | 6, 7 | **merged** fd7f9c6 (Windows by reading only) |
-| 20 | `[P1/test] Verify no outbound network requests` | tauri-app-dev + test-engineer | 18 | pending |
+| 20 | `[P1/test] Verify no outbound network requests` | tauri-app-dev | 18 | **open** task/p1-20-no-network @ de074d9, round 2 (NFR-SEC-01, T-01/T-05/T-09) |
 | 21 | `[P1/impl] Hybrid live-preview editor + split fallback` | vue-frontend-dev | 8, 11 | **merged** (via #42 lineage) |
 | 22 | `[P1/impl] Wikilink autocompletion and embeds` | vue-frontend-dev | 18, 21 | **merged** d6f32da (completion guards, app://closing → savePatch → flush_ack; follow-ups #82–#85) |
 | 23 | `[P1/impl] Reconcile external edits into the open note` | vue-frontend-dev | 12, 18, 21 | **merged** d6f32da (reconcile, Compare view, notice states; follow-ups #83/#84/#85) exist |
 | 24 | `[P1/impl] File tree, backlinks pane, search panel` | vue-frontend-dev | 8, 18 | **merged** 5695394 (three rounds; #43 enables create/rename; #79 fields pending) |
-| 25 | `[P1/impl] Quick switcher and command palette` | vue-frontend-dev | 8, 18 | **open** task/p1-25-switcher-palette @ 21734b6, round 2 (one registry per §9.3; palette is FR-NAV-06) |
-| 26 | `[P1/impl] PDF and image viewers` | vue-frontend-dev | 8, 19 | **open** task/p1-26-binary-viewers @ 82b0793, in review (pdf.js lazy, same-origin worker) |
+| 25 | `[P1/impl] Quick switcher and command palette` | vue-frontend-dev | 8, 18 | **merged** 6a608b8 (one registry per §9.3; palette is FR-NAV-06) |
+| 26 | `[P1/impl] PDF and image viewers` | vue-frontend-dev | 8, 19 | **merged** c41d6cc (+#98 validator, #108 transport restart; cMaps/fonts gap recorded) |
 | 27 | `[P1/test] Test cases for every P1 ID + hostile suite` | test-engineer | 12–17, 22–26 | pending |
 | 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol merged; report last |
 | 30 | `[P1/design] Account for FR-NAV-08 in architecture.md so doclint passes` | architect | 1 | **merged** db1d967 |
 | 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | **open** @ d8e2547, CR + lead WIP; TREE_DELIVERED can flip |
 | 32 | `[P1/req] Amend FR-VLT-01 and NFR-PRF-02 to the owner-approved definitions` (PRD v1.6) | product-analyst | 2, 5 | **merged** 857af57 |
 | 33 | `[P1/impl] Implement ADR-0016 patch-set application and edit-script in serat-vault` | rust-core-dev | 5 | **merged** (with #55) |
-| 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | in progress |
+| 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | **merged** |
 | 35 | `[P1/impl] Report, never drop, vault files whose names Serat refuses` — Windows-only name rules apply on Windows only; refused names are reported with a count (FR-VLT-01, NFR-SEC-06) | rust-core-dev | 34 | in progress |
 | 36 | `[P1/design] Correct ADR-0017's false remote-origin control claim` — real controls: (a) top-level navigation guard, (b) sandbox CSP on scheme responses, (c) app CSP `frame-src 'none'; object-src 'none'` + sanitiser | architect | 6 | **merged** |
-| 37 | `[P1/impl] Install the webview navigation guard, scope the opener to http/https/mailto, pin frame-src/object-src 'none', refuse downloads, disable release context menu` — implements controls (a) and (c) with tests (NFR-SEC-01, NFR-SEC-06, T-09, T-10) | tauri-app-dev | 5, 36 | in progress |
+| 37 | `[P1/impl] Install the webview navigation guard, scope the opener to http/https/mailto, pin frame-src/object-src 'none', refuse downloads, disable release context menu` — implements controls (a) and (c) with tests (NFR-SEC-01, NFR-SEC-06, T-09, T-10) | tauri-app-dev | 5, 36 | **merged** (context-menu suppression is Linux-release only; WebView2/WKWebView follow-ups owed) |
+| 39 | `[P1/impl] Context-menu platform conventions (Windows / macOS / Linux)` (FR-NAV-06, NFR-USE-01, T-07) | vue-frontend-dev | 43 | **merged** b42de75 |
+| 41 | `[P1/test] cargo-deny: licences, advisories, duplicate crates, sources — in CI` (NFR-SEC-01, NFR-MNT-01) | test-engineer | — | **merged** bedf295; #113 adds the job to the gate after #112 |
+| 43 | `[P1/impl] Tree operations UI: create note/folder, context menu` (FR-VLT-11, US-41; rename/move are P3 FR-VLT-09) | vue-frontend-dev | 24 | **merged** 9db3d06 |
+| 49 | `[P1/impl] Read/write off the main thread in serat-app` (NFR-PRF-02, goal 2) | tauri-app-dev | 18 | pending |
+| 96 | `[P1/impl] Refuse a second index writer while a detached actor holds the same index.db` (FR-VLT-04, NFR-REL-01, ADR-0015 §2) | tauri-app-dev | 90 | **open** task/p1-96-detached-writer-registry @ 0dd138f, round 2 |
+| 112 | `[P1/impl] rusqlite 0.41 so libsqlite3-sys ≥ 0.39 (RUSTSEC-2026-0459, NFR-SEC-01)` | rust-core-dev | — | **open** task/p1-112-rusqlite-bump @ c36f07b, approved, round 2 |
+| 113 | `[P1/test] Add the cargo-deny job to the CI gate` (NFR-SEC-01, NFR-MNT-01) | test-engineer | 41, 112 | pending |
 
 Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
 

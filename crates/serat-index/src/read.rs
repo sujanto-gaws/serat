@@ -430,6 +430,13 @@ impl Reader {
         f(&self.conn)
     }
 
+    /// [`Self::with_connection`] with `&mut`, for diagnoses that register a callback
+    /// (rusqlite 0.41 takes `&mut Connection` for `trace_v2`). Bench use only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_connection_mut<R>(&mut self, f: impl FnOnce(&mut Connection) -> R) -> R {
+        f(&mut self.conn)
+    }
+
     /// Route this reader's free-text searches (R1, R1 + R3) to the vault's search
     /// connection. R2, R3 and R4 stay on this reader's own connection.
     #[must_use]
@@ -728,7 +735,7 @@ const PROGRESS_OPS: i32 = 10_000;
 /// running statement whenever `latest != running`. One construction for `open` and the
 /// bench toggle.
 fn install_handler(
-    conn: &Connection,
+    conn: &mut Connection,
     latest: &Arc<AtomicU64>,
     running: &Arc<AtomicU64>,
     #[cfg(test)] calls: &Arc<AtomicU64>,
@@ -771,7 +778,7 @@ impl SearchConn {
         db_path: &Path,
         latest: Arc<AtomicU64>,
     ) -> Result<Arc<Self>, IndexError> {
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -789,7 +796,7 @@ impl SearchConn {
         #[cfg(test)]
         let handler_calls = Arc::new(AtomicU64::new(0));
         install_handler(
-            &conn,
+            &mut conn,
             &latest,
             &running,
             #[cfg(test)]
@@ -817,6 +824,13 @@ impl SearchConn {
         f(&conn)
     }
 
+    /// [`Self::with_connection`] with `&mut`; see [`Reader::with_connection_mut`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_connection_mut<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut conn)
+    }
+
     /// Install a hook called once a statement is prepared and bound, before its first
     /// step, so a test can hold a search mid-flight. Not for production use.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -840,10 +854,10 @@ impl SearchConn {
     /// [`IndexError::Sqlite`].
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_progress_handler(&self, on: bool) -> Result<(), IndexError> {
-        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if on {
             install_handler(
-                &conn,
+                &mut conn,
                 &self.latest,
                 &self.running,
                 #[cfg(test)]
@@ -1068,37 +1082,15 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_bumped_after_prepare_but_before_the_first_step_stops_the_statement() {
-        let (_dir, path) = db_with(20_000);
-        let sc = SearchConn::open(&path).expect("search conn");
-        let reader = reader_on(&path, &sc);
-        let t = Instant::now();
-        assert!(is_hits(&reader.search("commonword", 0, 50).unwrap()));
-        let full = t.elapsed();
-        // The interrupt() that would have stopped it "arrived early": only the
-        // generation moved. The progress handler must still stop the statement.
-        let latest = sc.latest.clone();
-        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
-            latest.fetch_add(1, Ordering::SeqCst);
-        }));
-        let t = Instant::now();
-        assert_eq!(
-            reader.search("commonword", 0, 50).unwrap(),
-            SearchOutcome::Superseded
-        );
-        assert!(
-            t.elapsed() < full / 2,
-            "stopped in {:?}, a full run takes {full:?}",
-            t.elapsed()
-        );
-    }
-
-    #[test]
     fn a_superseded_statement_stops_within_two_handler_calls() {
         // Deterministic bound (architecture 4.5): once the generation moves, the
         // statement stops within two handler calls, which is at most 20,000 VM steps.
         // Counted through the test hook, so CI load cannot fail it. Wall clock is
-        // asserted only at a generous 50 ms, as a gross-regression net.
+        // reported, not asserted (task #107: 140 ms at load 29 after one call). The
+        // generation moves after prepare and before the first step, as when an
+        // interrupt() "arrived early" and only the generation carries the news: the
+        // progress handler must still stop the statement (this subsumes the former
+        // a_generation_bumped_after_prepare... test, merged by #107).
         let (_dir, path) = db_with(20_000);
         let sc = SearchConn::open(&path).expect("search conn");
         let reader = reader_on(&path, &sc);
@@ -1129,10 +1121,6 @@ mod tests {
         assert!(
             (1..=2).contains(&calls),
             "{calls} handler calls after the generation moved; the bound is 2 (20,000 VM steps)"
-        );
-        assert!(
-            wall < std::time::Duration::from_millis(50),
-            "stopped in {wall:?}"
         );
     }
 

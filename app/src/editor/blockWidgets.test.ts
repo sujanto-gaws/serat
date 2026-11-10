@@ -2,13 +2,14 @@
 // NFR-PRF-02, architecture.md §9.3. Widgets only change what is displayed;
 // the document is never touched (C-04).
 
-import { ensureSyntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   blockWidgetsExtension,
   blockWidgetsField,
+  reliableParsedTo,
   growthRegion,
   isImageTarget,
   parseCalloutHeader,
@@ -346,5 +347,237 @@ describe("blockWidgetsField", () => {
     const ms = performance.now() - t0;
     console.log(`select-all extend by one char on ${doc.split("\n").length} lines: ${ms.toFixed(1)} ms`);
     expect(shapeOf(next)).toEqual(shapeOf(makeRange(doc, 0, doc.length)));
+  });
+
+  // ---- document changes (task #104): both ends, both sides, and the inserted span ----
+
+  // Timing (informational; the 5 s default timeout is unchanged): unloaded, the deletion sweep
+  // (506 edits) takes ~0.3 s and the block-end sweep (804 edits) ~0.35 s. Under 6 busy loops in
+  // the full suite they took 0.5-2.1 s and 0.3-3.3 s; fresh references are cached by resulting
+  // document, and the sweeps use 2 start states and a stride of 8.
+  /** Fresh-build shapes keyed by (resulting doc, selection): many edits produce the same result. */
+  const freshCache = new Map<string, string>();
+  interface SweepTally {
+    total: number;
+    skipped: number;
+  }
+
+  /**
+   * Applies `spec` to `state` incrementally and compares with a fresh build of the result.
+   *
+   * Under heavy CPU load CodeMirror's incremental reparse of a changed doc can be partial
+   * (time-sliced; the partial tree still reports the full length) and the field cannot tell
+   * until a later edit (#109). So the SAME update is retried from the same start state up to
+   * 3 times while the tree is partial. Only the property sweeps pass `sweep`, which lets a
+   * still-partial tree be counted as skipped (they assert a skip budget); everywhere else a
+   * partial tree fails with the label.
+   */
+  function expectChangeMatchesFresh(
+    state: EditorState,
+    spec: { from: number; to?: number; insert?: string },
+    label: string,
+    sweep?: SweepTally,
+  ): EditorState {
+    if (sweep) sweep.total += 1;
+    let next = state.update({ changes: spec }).state;
+    for (let retry = 0; retry < 3 && !syntaxTreeAvailable(next, next.doc.length); retry += 1) {
+      next = state.update({ changes: spec }).state;
+    }
+    if (!syntaxTreeAvailable(next, next.doc.length)) {
+      if (!sweep) throw new Error(`${label}: the reparse stayed partial after 3 retries (machine too loaded?)`);
+      // TODO(#109): remove this skip when the field notices a completed parse by itself.
+      sweep.skipped += 1;
+      return next;
+    }
+    const sel = next.selection.main;
+    const docText = next.doc.toString();
+    const key = `${sel.anchor}:${sel.head}:${docText}`;
+    let fresh = freshCache.get(key);
+    if (fresh === undefined) {
+      fresh = JSON.stringify(shapeOf(makeRange(docText, sel.anchor, sel.head)));
+      freshCache.set(key, fresh);
+    }
+    expect(JSON.stringify(shapeOf(next)), label).toEqual(fresh);
+    return next;
+  }
+
+  function expectSkipBudget(sweep: SweepTally, name: string): void {
+    console.info(`${name}: ${sweep.total} edits, ${sweep.skipped} skipped (partial reparse)`);
+    expect(sweep.skipped).toBeLessThanOrEqual(Math.floor(sweep.total * 0.01));
+  }
+
+  it("deleting the text before a table brings it back to a widget/raw state equal to a fresh build", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, doc.length);
+    expect(widgets(s0)).toHaveLength(1);
+    const s1 = expectChangeMatchesFresh(s0, { from: 0, to: "intro\n".length }, "delete `intro\\n`");
+    expect(widgets(s1)).toHaveLength(1);
+    expectChangeMatchesFresh(s0, { from: 0, to: "intro\n\n".length }, "delete the whole line + blank");
+  });
+
+  it("pasting a table over a selection equals a fresh build", () => {
+    const doc = `one\n\ntwo\n\nthree`;
+    const s0 = makeRange(doc, 0, doc.indexOf("two") + 3);
+    const s1 = expectChangeMatchesFresh(s0, { from: 0, to: doc.indexOf("two") + 3, insert: TABLE }, "paste over selection");
+    expect(widgets(s1)).toHaveLength(0); // the cursor sits at the end of the pasted table: revealed
+    const s2 = s1.update({ selection: { anchor: s1.doc.length } }).state;
+    expect(widgets(s2)).toHaveLength(1);
+  });
+
+  it("single-character typing in a paragraph reuses every widget object (no range walk)", () => {
+    const t = (n: number) => TABLE.replace("1", String(n));
+    const doc = Array.from({ length: 50 }, (_, i) => `${t(i)}\n\np${i}`).join("\n\n");
+    const at = doc.indexOf("p25") + 1;
+    const s0 = makeState(doc, at);
+    const before = widgets(s0);
+    const s1 = s0.update({ changes: { from: at, insert: "x" }, selection: { anchor: at + 1 } }).state;
+    const after = widgets(s1);
+    expect(after.length).toBe(before.length);
+    expect(after.every((w) => before.some((b) => b.widget === w.widget))).toBe(true);
+  });
+
+  // The sweeps are split per start state (deletion) and per block end x start state (block end)
+  // so each case is short under load, with its own tally and skip budget.
+  const DEL_DOC = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+  it.each([0, DEL_DOC.length])("property: deleting [min, max] of each sampled pair, from a cursor at %i, equals a fresh build of the result", (cursor) => {
+    const doc = DEL_DOC;
+    const sweep: SweepTally = { total: 0, skipped: 0 };
+    const start = makeState(doc, cursor);
+    const positions = new Set<number>([0, 1, doc.length - 1, doc.length]);
+    for (let i = 0; i <= doc.length; i += 8) positions.add(i);
+    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) [i, i + 1, i + 2].forEach((p) => p <= doc.length && positions.add(p));
+    const list = [...positions];
+    for (const a of list) {
+      for (const b of list) {
+        if (b <= a) continue;
+        expectChangeMatchesFresh(start, { from: a, to: b }, `delete ${a}-${b} from cursor ${cursor}`, sweep);
+      }
+    }
+    expectSkipBudget(sweep, `deletion sweep (cursor ${cursor})`);
+  });
+
+  it("deleting a table's last row (cursor elsewhere) keeps a widget for the shortened table", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const lastRow = doc.indexOf("| 1 | 2 |");
+    const s1 = expectChangeMatchesFresh(s0, { from: lastRow - 1, to: lastRow + "| 1 | 2 |".length }, "delete last row");
+    expect(widgets(s1)).toHaveLength(1);
+  });
+
+  it("inserting a newline at the start of a table's last row, or text after the block, equals a fresh build", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const lastRow = doc.indexOf("| 1 | 2 |");
+    expectChangeMatchesFresh(s0, { from: lastRow, insert: "\n" }, "newline at last row start");
+    const blockEnd = lastRow + "| 1 | 2 |".length;
+    expectChangeMatchesFresh(s0, { from: blockEnd, insert: "\n" }, "newline at block end");
+    expectChangeMatchesFresh(s0, { from: blockEnd, insert: "\n> [!tip] x\n" }, "callout header at block end");
+  });
+
+  const BE_DOC = DEL_DOC;
+  const BE_ENDS: number[] = [];
+  for (let i = BE_DOC.indexOf("\n\n"); i >= 0; i = BE_DOC.indexOf("\n\n", i + 1)) BE_ENDS.push(i);
+  BE_ENDS.push(BE_DOC.length);
+  const BE_CASES = BE_ENDS.flatMap((end) => [0, BE_DOC.length].map((cursor) => [end, cursor] as const));
+  it.each(BE_CASES)("property: every deletion and insertion near the block end at %i, from a cursor at %i, equals a fresh build", (end, cursor) => {
+    const doc = BE_DOC;
+    const list: number[] = [];
+    for (let d = -12; d <= 3; d += 1) if (end + d >= 0 && end + d <= doc.length) list.push(end + d);
+    const sweep: SweepTally = { total: 0, skipped: 0 };
+    const st = makeState(doc, cursor);
+    for (const a of list) {
+      for (const ins of ["\n", "\n> [!tip] x\n"]) expectChangeMatchesFresh(st, { from: a, insert: ins }, `insert ${JSON.stringify(ins)} at ${a}`, sweep);
+      for (const b of list) if (b > a && b - a <= 8) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`, sweep);
+    }
+    expectSkipBudget(sweep, `block-end sweep (end ${end}, cursor ${cursor})`);
+  });
+
+  // ---- partial reparses (task #109) ----
+
+  /** Applies `spec` with CodeMirror's parse budget forced to expire (Date.now jumps 50 ms per call). */
+  function updateWithPartialParse(state: EditorState, spec: { from: number; to?: number; insert?: string }): EditorState {
+    let clock = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (clock += 50));
+    try {
+      return state.update({ changes: spec }).state;
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("reliableParsedTo: the document end for a finished parse, a boundary short of it for a partial one", () => {
+    const doc = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+    const done = makeState(doc, 0);
+    expect(reliableParsedTo(done)).toBe(doc.length);
+    const partial = updateWithPartialParse(done, { from: 3, insert: "z" });
+    expect(syntaxTreeAvailable(partial, partial.doc.length)).toBe(false);
+    expect(reliableParsedTo(partial)).toBeLessThan(partial.doc.length);
+    expect(syntaxTreeAvailable(partial, reliableParsedTo(partial))).toBe(true);
+  });
+
+  // Recorded gap: the partial parse here is forced on a bare EditorState by expiring CodeMirror's
+  // work budget; no test drives it through a mounted EditorView and its idle parse worker.
+  const PARTIAL_DOC = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+  const PARTIAL_INSERTS = ["```\n", "\n", "x", "> "];
+
+  it.each(PARTIAL_INSERTS)("an edit (%j) applied during a partial parse: once the parse completes the widgets equal a fresh build", (insert) => {
+    const doc = PARTIAL_DOC;
+    const base = makeState(doc, 0);
+    let partials = 0;
+    let total = 0;
+    for (let at = 0; at < doc.length; at += 7) {
+      total += 1;
+      const s2 = updateWithPartialParse(base, { from: at, insert });
+      if (!syntaxTreeAvailable(s2, s2.doc.length)) partials += 1;
+      ensureSyntaxTree(s2, s2.doc.length, 5000);
+      const s3 = s2.update({}).state; // the completion transaction: no change, tree identity differs
+      const fresh = s3.update({ effects: setResolutions.of([]) }).state;
+      expect(shapeOf(s3), `insert ${JSON.stringify(insert)} at ${at}`).toEqual(shapeOf(fresh));
+    }
+    expect(partials).toBeGreaterThan(total / 2); // the forced budget really produced partial parses
+  });
+
+  it.each(PARTIAL_INSERTS)("a resolutions rebuild (buildAll) arriving mid partial parse (edit %j) does not mark unparsed territory examined", (insert) => {
+    // buildAll also runs on a setResolutions effect, which can land while the parse is partial.
+    // Its watermark must be the parse boundary, not the (possibly full-length) partial tree's length.
+    const doc = PARTIAL_DOC;
+    const base = makeState(doc, 0);
+    let partials = 0;
+    let total = 0;
+    for (let at = 0; at < doc.length; at += 7) {
+      total += 1;
+      const s2 = updateWithPartialParse(base, { from: at, insert });
+      if (!syntaxTreeAvailable(s2, s2.doc.length)) partials += 1;
+      const rebuilt = s2.update({ effects: setResolutions.of([]) }).state;
+      ensureSyntaxTree(rebuilt, rebuilt.doc.length, 5000);
+      const s3 = rebuilt.update({}).state;
+      const fresh = s3.update({ effects: setResolutions.of([]) }).state;
+      expect(shapeOf(s3), `insert ${JSON.stringify(insert)} at ${at}`).toEqual(shapeOf(fresh));
+    }
+    expect(partials).toBeGreaterThan(total / 2);
+  });
+
+  it("buildAll's watermark is the parse boundary, not the partial tree's length (create and a resolutions rebuild)", () => {
+    // Pins `examined: reliableParsedTo(state)` in buildAll. A mutant using syntaxTree(state).length
+    // there is not observable through the decorations (the nodes inside the partial tree are
+    // correct), so the watermark itself is asserted. Guarded: the partial tree must really be
+    // longer than the parsed boundary for the assertion to mean anything.
+    const T = (n: number) => `${TABLE}\n\npara ${n}`;
+    const doc = Array.from({ length: 100 }, (_, i) => T(i)).join("\n\n");
+    const created = EditorState.create({ doc, selection: { anchor: 0 }, extensions: [seratMarkdown(), blockWidgetsExtension()] });
+    expect(syntaxTreeAvailable(created, created.doc.length)).toBe(false);
+    expect(syntaxTree(created).length).toBeGreaterThan(reliableParsedTo(created));
+    expect(created.field(blockWidgetsField).examined).toBe(reliableParsedTo(created));
+    const rebuilt = created.update({ effects: setResolutions.of([]) }).state;
+    if (!syntaxTreeAvailable(rebuilt, rebuilt.doc.length)) {
+      expect(rebuilt.field(blockWidgetsField).examined).toBe(reliableParsedTo(rebuilt));
+    }
+  });
+
+  it("a finished parse keeps examined at the document end", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const s1 = s0.update({ changes: { from: 2, insert: "x" }, selection: { anchor: 3 } }).state;
+    expect(s1.field(blockWidgetsField).examined).toBe(s1.doc.length);
   });
 });

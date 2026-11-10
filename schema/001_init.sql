@@ -533,7 +533,7 @@ CREATE VIRTUAL TABLE blocks_fts USING fts5(
 --
 -- These fire on cascaded deletes as well as direct ones — verified by running
 -- it on SQLite 3.42.0 and 3.50.4 here and, per finding F-02, through rusqlite on
--- the 3.53.2 the application actually links, with foreign_keys = ON and recursive_triggers
+-- the 3.54.1 the application actually links (re-verified under #112), with foreign_keys = ON and recursive_triggers
 -- left at its default of 0. That is what makes "delete the note, delete its
 -- blocks, delete its search rows" one DELETE FROM notes, and it is the reason
 -- foreign_keys = ON is not optional on any connection: with it off, the blocks
