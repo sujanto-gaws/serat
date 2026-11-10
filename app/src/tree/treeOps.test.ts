@@ -316,3 +316,95 @@ describe("the switcher's Create note row", () => {
     w.unmount();
   });
 });
+
+describe("round 2: focus, close reasons, a11y", () => {
+  it("Esc on the prompt returns focus to where it was before (the editor stand-in), not to the tree", async () => {
+    const outside = document.createElement("textarea");
+    document.body.appendChild(outside);
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    outside.focus();
+    (wrapper.vm as unknown as { newNote(): void }).newNote();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(wrapper.get('[data-testid="tree-prompt-input"]').element);
+    await wrapper.get('[data-testid="tree-prompt"]').trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(outside);
+    wrapper.unmount();
+  });
+
+  it("falls back to the tree when the origin is gone", async () => {
+    const outside = document.createElement("textarea");
+    document.body.appendChild(outside);
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    outside.focus();
+    (wrapper.vm as unknown as { newNote(): void }).newNote();
+    await vi.advanceTimersByTimeAsync(0);
+    outside.remove();
+    await wrapper.get('[data-testid="tree-prompt"]').trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(wrapper.get('[role="tree"]').element);
+    wrapper.unmount();
+  });
+
+  it("the chord again while the prompt is open refocuses it and keeps what was typed", async () => {
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    const api = wrapper.vm as unknown as { newNote(): void };
+    api.newNote();
+    await vi.advanceTimersByTimeAsync(0);
+    await wrapper.get('[data-testid="tree-prompt-input"]').setValue("half typed");
+    (document.activeElement as HTMLElement).blur();
+    api.newNote();
+    await vi.advanceTimersByTimeAsync(0);
+    const input = wrapper.get('[data-testid="tree-prompt-input"]').element as HTMLInputElement;
+    expect(input.value).toBe("half typed");
+    expect(document.activeElement).toBe(input);
+    wrapper.unmount();
+  });
+
+  it("menu close reasons: Esc refocuses the tree; Tab and an outside press do not force it", async () => {
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    const tree = wrapper.get('[role="tree"]').element as HTMLElement;
+
+    await wrapper.get('[data-path="Projects"]').trigger("contextmenu", { clientX: 1, clientY: 1 });
+    await wrapper.get('[role="menu"]').trigger("keydown", { key: "Tab" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+    expect(document.activeElement).not.toBe(tree);
+
+    await wrapper.get('[data-path="Projects"]').trigger("contextmenu", { clientX: 1, clientY: 1 });
+    outside.focus();
+    outside.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(outside);
+
+    await wrapper.get('[data-path="Projects"]').trigger("contextmenu", { clientX: 1, clientY: 1 });
+    await wrapper.get('[role="menu"]').trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(tree);
+    wrapper.unmount();
+  });
+
+  it("disabled entries carry the reason as aria-description too, not only a tooltip", async () => {
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    await wrapper.get('[data-path="Projects"]').trigger("contextmenu", { clientX: 1, clientY: 1 });
+    expect(wrapper.get('[data-item="trash"]').attributes("aria-description")).toContain("P3");
+    expect(wrapper.get('[data-item="new-note"]').attributes("aria-description")).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("a native contextmenu on the tree (WebView2 Menu key / Shift-F10 key-up) opens our menu for the focused row, once", async () => {
+    const { wrapper } = await mountTree(vi.fn().mockResolvedValue(null));
+    const tree = wrapper.get('[role="tree"]');
+    await tree.trigger("keydown", { key: "ArrowDown" }); // Projects
+    await tree.trigger("contextmenu");
+    expect(wrapper.findAll('[role="menu"]')).toHaveLength(1);
+    // A right-click on a row is handled by the row alone: still one menu, for that row.
+    await wrapper.get('[data-path="pic.png"]').trigger("contextmenu", { clientX: 2, clientY: 2 });
+    expect(wrapper.findAll('[role="menu"]')).toHaveLength(1);
+    expect(wrapper.get('[data-path="pic.png"]').attributes("aria-selected")).toBe("true");
+    wrapper.unmount();
+  });
+});

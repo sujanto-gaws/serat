@@ -18,7 +18,7 @@ export interface MenuItem {
 }
 
 const props = defineProps<{ items: readonly MenuItem[]; x: number; y: number; label: string }>();
-const emit = defineEmits<{ select: [id: string]; close: [] }>();
+const emit = defineEmits<{ select: [id: string]; close: [reason: "escape" | "tab" | "outside"] }>();
 
 const root = ref<HTMLElement | null>(null);
 const active = ref(Math.max(0, props.items.findIndex((i) => i.enabled)));
@@ -48,9 +48,11 @@ function onKeydown(event: KeyboardEvent): void {
       activate(active.value);
       break;
     case "Escape":
-    case "Tab":
-      emit("close");
+      emit("close", "escape");
       break;
+    case "Tab":
+      emit("close", "tab");
+      return; // Tab moves on: do not trap or swallow it
     default:
       return;
   }
@@ -59,7 +61,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function onOutside(event: MouseEvent): void {
-  if (root.value && !root.value.contains(event.target as Node)) emit("close");
+  if (root.value && !root.value.contains(event.target as Node)) emit("close", "outside");
 }
 
 onMounted(() => {
@@ -90,6 +92,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside, true)
       role="menuitem"
       :aria-disabled="!item.enabled"
       :title="!item.enabled ? item.reason : undefined"
+      :aria-description="!item.enabled ? item.reason : undefined"
       :data-item="item.id"
       @mousemove="active = i"
       @click="activate(i)"

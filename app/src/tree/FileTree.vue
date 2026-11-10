@@ -55,7 +55,8 @@ const props = withDefaults(
     vaultOpen?: boolean;
     /**
      * Creates a note or folder and resolves to `null` on success or to the core's refusal as a sentence.
-     * Absent: the toolbar buttons stay disabled with a tooltip (disabled, not hidden).
+     * Absent: the toolbar buttons stay disabled with a tooltip (disabled, not hidden). That fallback exists
+     * for tests and embedding; no production host omits it (App.vue always passes one).
      */
     createEntry?: (request: CreateRequest) => Promise<string | null>;
   }>(),
@@ -373,8 +374,27 @@ function currentDir(): string {
   return row.kind === "dir" ? row.path : row.dir;
 }
 
+/** Where focus was when the prompt opened (the editor, usually): Esc and a finished folder go back there. */
+let promptOrigin: HTMLElement | null = null;
+
+function restoreFocus(): void {
+  const back = promptOrigin;
+  promptOrigin = null;
+  if (back && back.isConnected) back.focus();
+  else focusTree();
+}
+
 function startCreate(kind: CreateKind, dir: string = currentDir()): void {
   if (!props.createEntry) return;
+  if (prompt.value && prompt.value.kind === kind) {
+    // The chord again while the prompt is open: back to it, keeping what was typed.
+    void nextTick(() => promptInput.value?.focus());
+    return;
+  }
+  if (!prompt.value) {
+    const active = document.activeElement;
+    promptOrigin = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
   const taken = takenNames(model, dir);
   const value = kind === "note" ? uniqueName(taken, "Untitled", ".md").replace(/\.md$/i, "") : uniqueName(taken, "New folder");
   prompt.value = { kind, dir, value, error: null, busy: false };
@@ -386,7 +406,7 @@ function startCreate(kind: CreateKind, dir: string = currentDir()): void {
 
 function cancelPrompt(): void {
   prompt.value = null;
-  focusTree();
+  restoreFocus();
 }
 
 async function submitPrompt(): Promise<void> {
@@ -419,7 +439,8 @@ async function submitPrompt(): Promise<void> {
     return;
   }
   prompt.value = null;
-  if (p.kind === "folder") focusTree(); // a created note moves focus to the editor (the host)
+  if (p.kind === "folder") restoreFocus();
+  else promptOrigin = null; // a created note moves focus to the editor (the host)
 }
 
 const promptWhere = computed(() => (prompt.value && prompt.value.dir !== "" ? prompt.value.dir : "the vault root"));
@@ -429,9 +450,23 @@ function openMenu(path: string, x: number, y: number): void {
   menu.value = { path, x, y };
 }
 
-function closeMenu(): void {
+/** Esc returns focus to the tree; Tab moves on; a press outside leaves focus where that press put it. */
+function closeMenu(reason: "escape" | "tab" | "outside"): void {
   menu.value = null;
-  focusTree();
+  if (reason === "escape") focusTree();
+}
+
+/** WebView2 fires a native `contextmenu` on key-up of Menu / Shift-F10; with no row under it, open ours for
+ * the focused row. (Row right-clicks are handled by the row, which prevents default, so skip those.)
+ * Windows manual check: #77. */
+function onTreeContextMenu(event: MouseEvent): void {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  const path = focusedPath.value;
+  if (path === null) return;
+  const el = container.value?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
+  const box = el?.getBoundingClientRect();
+  openMenu(path, (box?.left ?? event.clientX) + 24, box?.bottom ?? event.clientY);
 }
 
 const menuItems = computed<MenuItem[]>(() => {
@@ -576,6 +611,7 @@ defineExpose({
       :aria-activedescendant="activeDescendant"
       @scroll="onScroll"
       @keydown="onKeydown"
+      @contextmenu="onTreeContextMenu"
     >
       <p v-if="rootEmpty" class="serat-tree-empty">Nothing here yet — press ⌘N to start a note.</p>
       <p v-else-if="noMatches" class="serat-tree-empty" data-testid="tree-no-matches">No files match “{{ filter.trim() }}”.</p>
