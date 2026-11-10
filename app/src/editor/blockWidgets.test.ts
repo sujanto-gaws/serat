@@ -350,6 +350,10 @@ describe("blockWidgetsField", () => {
 
   // ---- document changes (task #104): both ends, both sides, and the inserted span ----
 
+  // Timing (informational; the 5 s default timeout is unchanged): unloaded, the deletion sweep
+  // (506 edits) takes ~0.3 s and the block-end sweep (804 edits) ~0.35 s. Under 6 busy loops in
+  // the full suite they took 0.5-2.1 s and 0.3-3.3 s; fresh references are cached by resulting
+  // document, and the sweeps use 2 start states and a stride of 8.
   /** Fresh-build shapes keyed by (resulting doc, selection): many edits produce the same result. */
   const freshCache = new Map<string, string>();
   interface SweepTally {
