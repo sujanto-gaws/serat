@@ -376,11 +376,12 @@ impl IndexActor {
             (None, Some(observer)) => Some(WriterHook::observer_only(observer)),
             (None, None) => None,
         };
+        let hook_health = Arc::clone(&health);
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
             .spawn(move || {
                 if let Some(hook) = hook {
-                    hook.install(&mut conn);
+                    hook.install(&mut conn, &hook_health);
                 }
                 run(conn, &rx, &actor_fault);
             })

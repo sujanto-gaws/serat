@@ -466,7 +466,9 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
         .map_err(|e| format!("automerge: {e}"))?;
     }
     if !a.bare {
-        let _ = conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile));
+        if let Err(e) = conn.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile)) {
+            eprintln!("trace_v2 failed: {e}");
+        }
     } else if !a.checkpointer() {
         // SQLite's own hook at the requested threshold, as before #56 (the actor leaves
         // the pragma alone when the checkpointer is off).

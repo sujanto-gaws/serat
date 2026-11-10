@@ -54,7 +54,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_bundled_sqlite_is_new_enough_for_fts5() {
+    fn the_bundled_sqlite_meets_the_feature_and_security_floors() {
         let version = sqlite_version();
         let major_minor: Vec<u32> = version
             .split('.')
@@ -65,6 +65,10 @@ mod tests {
         assert!(
             (major_minor[0], major_minor[1]) >= (3, 44),
             "bundled sqlite is {version}; R2 needs 3.44 (ORDER BY inside json_group_array)"
+        );
+        assert!(
+            (major_minor[0], major_minor[1]) >= (3, 54),
+            "bundled sqlite is {version}; RUSTSEC-2026-0459 (NFR-SEC-01): bundled SQLite must be \u{2265} 3.54.0"
         );
     }
 }

@@ -118,11 +118,14 @@ enum Step {
 }
 
 fn trace(c: &mut Connection, on: bool) {
-    let _ = if on {
+    let result = if on {
         c.trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(on_profile))
     } else {
         c.trace_v2(TraceEventCodes::empty(), None::<fn(TraceEvent<'_>)>)
     };
+    if let Err(e) = result {
+        eprintln!("trace_v2 failed: {e}");
+    }
 }
 
 /// Run `n` searches under a trace on the connection `step` owns, and report what the

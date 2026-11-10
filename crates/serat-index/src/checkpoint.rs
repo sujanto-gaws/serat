@@ -128,6 +128,9 @@ pub struct WalHealth {
     /// 0 = not pinned.
     pinned_bytes: AtomicU64,
     running: AtomicBool,
+    /// The WAL hook could not be installed (rusqlite 0.41.1: out of memory only), so
+    /// the writer fell back to SQLite's own auto-checkpoint.
+    hook_install_failed: AtomicBool,
     passive_runs: AtomicU64,
     incomplete: AtomicU64,
     restart_runs: AtomicU64,
@@ -157,6 +160,13 @@ impl WalHealth {
             0 => None,
             bytes => Some(bytes),
         }
+    }
+
+    /// Whether the writer's WAL hook failed to install and SQLite's own
+    /// auto-checkpoint (1000 pages) was restored instead.
+    #[must_use]
+    pub fn hook_install_failed(&self) -> bool {
+        self.hook_install_failed.load(Ordering::Relaxed)
     }
 
     /// Whether a checkpoint is running right now.
@@ -296,16 +306,22 @@ impl WriterHook {
 
     /// Install on the writer thread: replaces SQLite's own auto-checkpoint with the
     /// signal (and the observer, when there is one).
-    pub(crate) fn install(self, conn: &mut Connection) {
+    pub(crate) fn install(self, conn: &mut Connection, health: &WalHealth) {
         HOOK.with(|hook| {
             *hook.borrow_mut() = Some(HookState {
                 tx: self.signal,
                 observer: self.observer,
             });
         });
-        // rusqlite 0.41 returns a Result here; a failure leaves SQLite's own hook (see
-        // tune_writer: the writer degrades rather than panics).
-        let _ = conn.wal_hook(Some(on_wal));
+        // `tune_writer` set wal_autocheckpoint = 0, so a failed install (rusqlite 0.41.1:
+        // out of memory only) would leave no auto-checkpoint and no Commit signals.
+        // Clear the hook (no allocation; also drops one left pointing at freed data),
+        // restore SQLite's own auto-checkpoint, and record it.
+        if conn.wal_hook(Some(on_wal)).is_err() {
+            let _ = conn.wal_hook(None::<WalObserver>);
+            let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 1000;");
+            health.hook_install_failed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
