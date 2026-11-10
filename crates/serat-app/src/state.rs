@@ -242,8 +242,6 @@ struct OpenVault {
     publisher: Arc<Publisher>,
     /// Kept so the actor outlives the vault it belongs to, and no longer.
     index: Arc<ActorCell>,
-    /// This vault's `.serat/index.db`, the key of the detached-writer registry.
-    index_path: PathBuf,
     /// The consumer of external changes, and the owner of `index://changed`'s throttle
     /// (the save path calls into it after a submit).
     indexer: Arc<Indexer>,
@@ -340,7 +338,7 @@ struct OpenAttempt {
     publisher: Arc<Publisher>,
     index: Arc<ActorCell>,
     registry: Arc<DetachedWriters>,
-    index_path: PathBuf,
+    root: PathBuf,
     deadline: std::time::Duration,
     armed: bool,
 }
@@ -356,7 +354,7 @@ impl Drop for OpenAttempt {
         if self.armed {
             self.publisher.retire();
             if let Some(mut actor) = self.index.cancel() {
-                actor.join_or_register(self.deadline, self.index_path.clone(), &self.registry);
+                actor.join_or_register(self.deadline, &self.root, &self.registry);
             }
         }
     }
@@ -413,7 +411,7 @@ impl OpenVault {
         // outlived its vault with nothing recording it (task #96). It is registered so
         // a re-open of this root waits for it; nothing here waits for it.
         if let Some(mut actor) = self.index.cancel() {
-            actor.detach_into(self.index_path.clone(), detached);
+            actor.detach_into(self.vault.root(), detached);
         }
         self.switcher.shut_down();
         let handle = self
@@ -524,6 +522,9 @@ pub struct AppState {
     detached: Arc<DetachedWriters>,
     /// How long a failed open waits for its index actor (default `CLOSE_DEADLINE`).
     actor_deadline: std::time::Duration,
+    /// How long the open's catch-up waits for the index to settle (default
+    /// `SETTLE_BOUND`), counted from when the actor exists.
+    settle_bound: std::time::Duration,
     /// Serialises opens: two concurrent `open_vault` calls must not both find nothing
     /// to close.
     opening: Mutex<()>,
@@ -619,6 +620,7 @@ impl AppState {
             hooks: OpenHooks::default(),
             detached: Arc::default(),
             actor_deadline: CLOSE_DEADLINE,
+            settle_bound: SETTLE_BOUND,
             opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
@@ -646,6 +648,7 @@ impl AppState {
             hooks: OpenHooks::default(),
             detached: Arc::default(),
             actor_deadline: CLOSE_DEADLINE,
+            settle_bound: SETTLE_BOUND,
             opening: Mutex::new(()),
             open: RwLock::new(None),
             vaults_opened: AtomicU64::new(0),
@@ -669,6 +672,14 @@ impl AppState {
     #[must_use]
     pub(crate) fn with_actor_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.actor_deadline = deadline;
+        self
+    }
+
+    /// A shorter settle bound, so a test can outlast it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_settle_bound(mut self, bound: std::time::Duration) -> Self {
+        self.settle_bound = bound;
         self
     }
 
@@ -779,13 +790,12 @@ impl AppState {
         if let Some(probe) = &self.hooks.publisher_probe {
             *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
         }
-        let index_path = serat_index::index_path(&index_dir_for(&root));
         let index_cell = Arc::new(ActorCell::default());
         let attempt = OpenAttempt {
             publisher: Arc::clone(&publisher),
             index: Arc::clone(&index_cell),
             registry: Arc::clone(&self.detached),
-            index_path: index_path.clone(),
+            root: root.clone(),
             deadline: self.actor_deadline,
             armed: true,
         };
@@ -795,7 +805,25 @@ impl AppState {
         // publishing anything other than `Opening`; `Rebuilding` and `Unavailable`
         // settle it as much as `Ready` does.
         let settled = Arc::clone(&self.startup);
-        let catch_up_gate = Arc::new(OpenCatchUp::new(SETTLE_BOUND, TREE_GRACE));
+        // ADR-0001: one writer per `index.db`. If an actor detached by an earlier close
+        // or failed open still holds this root's index, the vault opens without one --
+        // the publisher stays at `Opening` -- and a thread starts it once that one has
+        // exited. Nothing here waits, and `opening` is not held across the wait. The
+        // catch-up gate's settle clock does not start until that actor exists.
+        #[cfg(test)]
+        let skip_check = self.hooks.skip_registry_check;
+        #[cfg(not(test))]
+        let skip_check = false;
+        let blocker = if skip_check {
+            None
+        } else {
+            self.detached.live(&root)
+        };
+        let catch_up_gate = Arc::new(if blocker.is_some() {
+            OpenCatchUp::awaiting_actor(self.settle_bound, TREE_GRACE)
+        } else {
+            OpenCatchUp::new(self.settle_bound, TREE_GRACE)
+        });
         let publishing = Arc::clone(&catch_up_gate);
         let tree_paths = Arc::new(TreePaths::default());
         #[cfg(test)]
@@ -822,25 +850,13 @@ impl AppState {
         #[cfg(test)]
         self.inject(FailAt::IndexActor, &root)?;
         let index_handle: IndexHandleSlot = Arc::new(Mutex::new(None));
-        // ADR-0001: one writer per `index.db`. If an actor detached by an earlier close
-        // or failed open still holds this file, the vault opens without one -- the
-        // publisher stays at `Opening` -- and a thread starts it once that one has
-        // exited. Nothing here waits, and `opening` is not held across the wait.
-        #[cfg(test)]
-        let skip_check = self.hooks.skip_registry_check;
-        #[cfg(not(test))]
-        let skip_check = false;
-        let blocker = if skip_check {
-            None
-        } else {
-            self.detached.live(&index_path)
-        };
         if let Some(blocker) = blocker {
-            let (cell, publisher, slot, epoch) = (
+            let (cell, publisher, slot, epoch, gate) = (
                 Arc::clone(&index_cell),
                 Arc::clone(&publisher),
                 Arc::clone(&index_handle),
                 Arc::clone(&epoch),
+                Arc::clone(&catch_up_gate),
             );
             let (deferred_root, dir) = (root.clone(), index_dir_for(&root));
             std::thread::Builder::new()
@@ -848,6 +864,7 @@ impl AppState {
                 .spawn(move || {
                     while !blocker.done() {
                         if cell.lock().cancelled {
+                            gate.actor_started();
                             return;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -855,6 +872,9 @@ impl AppState {
                     cell.install(|| {
                         IndexActor::spawn_into(slot, publisher, opener, deferred_root, dir, epoch)
                     });
+                    // Now, not before: the claimants' settle clocks start here, whether
+                    // or not the spawn succeeded (a failed one then times out as usual).
+                    gate.actor_started();
                 })
                 .map_err(|err| IpcError::Io {
                     path: root.display().to_string(),
@@ -922,6 +942,10 @@ impl AppState {
             Arc::clone(&index_handle),
             notifier,
         ));
+        // A claim that gives up because the index never settled owes a rescan rather than
+        // dropping the open's catch-up (task #96 review B1).
+        let owing = Arc::clone(&indexer);
+        catch_up_gate.on_unsettled(move || owing.owe_rescan());
         let walk_start = Arc::clone(&indexer);
         let walk_failed = Arc::clone(&indexer);
         let catch_up = Arc::clone(&indexer);
@@ -1106,7 +1130,6 @@ impl AppState {
             vault,
             publisher,
             index: index_cell,
-            index_path,
             indexer,
             switcher,
             index_handle,
@@ -1905,6 +1928,11 @@ impl AppState {
     pub fn rebuild_index(&self) -> Result<(), IpcError> {
         // TODO(S7): quiesce the switcher build and the reconciler's readers before the
         // delete; until then this is for tests and the Linux/macOS unlink semantics.
+        // TODO(S7, task #96): this runs `rebuild_in_place` on the caller's thread,
+        // outside the index actor and `ActorCell`, so a close during it registers
+        // nothing and a re-open can remove the db under it. Before it is wired to a
+        // command it must run on the actor, or hold an exit flag in `DetachedWriters`
+        // under this root for its whole duration.
         let (vault, publisher, slot, search, indexer) = {
             let guard = self.open_lock();
             let open = guard.as_ref().ok_or_else(Self::not_open)?;
@@ -5315,6 +5343,7 @@ mod tests {
         running: Arc<std::sync::atomic::AtomicUsize>,
         max: Arc<std::sync::atomic::AtomicUsize>,
         hold: Duration,
+        rebuild: bool,
     }
 
     impl IndexOpen for Counting {
@@ -5322,12 +5351,14 @@ mod tests {
             use std::sync::atomic::Ordering::SeqCst;
             let now = self.running.fetch_add(1, SeqCst) + 1;
             self.max.fetch_max(now, SeqCst);
-            publish(IndexState::Rebuilding {
-                reason: RebuildReason::NoIndex,
-                done: 0,
-                total: 1,
-                walk_complete: false,
-            });
+            if self.rebuild {
+                publish(IndexState::Rebuilding {
+                    reason: RebuildReason::NoIndex,
+                    done: 0,
+                    total: 1,
+                    walk_complete: false,
+                });
+            }
             std::thread::sleep(self.hold);
             // Released before the terminal word: the exit flag fires after this.
             self.running.fetch_sub(1, SeqCst);
@@ -5340,6 +5371,7 @@ mod tests {
             running: Arc::default(),
             max: Arc::default(),
             hold: Duration::from_millis(hold_ms),
+            rebuild: true,
         }
     }
 
@@ -5432,6 +5464,59 @@ mod tests {
         // The close does not wait for the actor (it never did): it must record it.
         first.close_vault();
         let second = reopen_after_detach(&first, OpenHooks::default(), &slow, &dir);
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deferred_reopen_still_runs_the_open_catch_up_after_the_settle_bound() {
+        // Review B1: the settle clock must start when the actor exists, not when the
+        // open starts. Here the detached actor holds for 1.5 s and the bound is 500 ms;
+        // on the previous logic the claims gave up at 500 ms, before the deferred actor
+        // had even been spawned, and no walk ran.
+        let dir = fixture("detached-catch-up");
+        let slow = counting(1500);
+        let first = plain_state(Duration::from_secs(5));
+        first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect("open");
+        first.close_vault();
+        assert_eq!(first.detached_writers().live_count(), 1);
+
+        let walks: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let recorded = Arc::clone(&walks);
+        let second = plain_state(Duration::from_secs(5))
+            .with_detached(first.detached_writers())
+            .with_settle_bound(Duration::from_millis(500))
+            .with_open_hooks(OpenHooks {
+                on_walk_start: Some(Arc::new(move |who| {
+                    recorded.lock().expect("walks").push(who);
+                })),
+                ..OpenHooks::default()
+            });
+        let fast = Counting {
+            hold: Duration::ZERO,
+            rebuild: false,
+            ..slow
+        };
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                fast,
+            )
+            .expect("re-open");
+        assert_eq!(opened.index, IndexState::Opening);
+        wait_ready(&second);
+        wait_until("the catch-up walk", || {
+            !walks.lock().expect("walks").is_empty()
+        });
         second.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }

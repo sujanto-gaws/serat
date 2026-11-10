@@ -3212,6 +3212,7 @@ dependencies = [
  "filepath",
  "libc",
  "rusqlite",
+ "same-file",
  "serat-core",
  "serat-index",
  "serat-parse",

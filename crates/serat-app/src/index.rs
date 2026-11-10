@@ -572,38 +572,57 @@ impl Drop for ExitFlag {
     }
 }
 
-/// Actors detached past their deadline, by the index file they may still be writing
-/// (task #96, architecture §3.4 "What a failed open leaves behind"). ADR-0001's single
-/// writer: while an entry here is live, no second actor may open the same `index.db`.
-/// An entry is dropped the first time it is looked up after its flag has fired.
+/// Actors detached past their deadline, by the vault root that holds the index they
+/// may still be writing (task #96, architecture §3.4 "What a failed open leaves
+/// behind"). ADR-0001's single writer: while an entry here is live, no second actor may
+/// open the same `index.db`. An entry is dropped the first time it is looked up after
+/// its flag has fired.
+///
+/// Keyed by the root's **file identity** (device and inode, or volume serial and file
+/// index; `same_file::Handle`), not by its path, so a case-insensitive mount or a bind
+/// mount that reaches one directory by two names still has one key. The index is always
+/// `<root>/.serat/index.db`, so one root is one index; the root is used rather than
+/// `.serat` because `.serat` may not exist yet when an actor is registered.
+///
+/// **Limits.** The registry is per process: nothing stops a second *Serat process* from
+/// opening the same vault, and no single-instance lock exists. If the identity of a root
+/// cannot be read (it vanished), the actor is not recorded and a log line says so.
 #[derive(Debug, Default)]
 pub struct DetachedWriters {
-    by_path: Mutex<std::collections::HashMap<PathBuf, Vec<Arc<AtomicBool>>>>,
+    by_root: Mutex<std::collections::HashMap<same_file::Handle, Vec<Arc<AtomicBool>>>>,
 }
 
 impl DetachedWriters {
     /// Record an actor that has not exited.
-    pub fn register(&self, index_path: PathBuf, exited: Arc<AtomicBool>) {
-        self.by_path
+    pub fn register(&self, root: &Path, exited: Arc<AtomicBool>) {
+        let Ok(key) = same_file::Handle::from_path(root) else {
+            eprintln!(
+                "serat: {} cannot be identified; a detached index thread is not recorded",
+                root.display()
+            );
+            return;
+        };
+        self.by_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(index_path)
+            .entry(key)
             .or_default()
             .push(exited);
     }
 
-    /// A flag that fires when the last live detached actor on `index_path` has exited,
-    /// or `None` if none is live.
+    /// A flag that fires when the last live detached actor on `root`'s index has
+    /// exited, or `None` if none is live.
     #[must_use]
-    pub fn live(&self, index_path: &Path) -> Option<DetachedWait> {
+    pub fn live(&self, root: &Path) -> Option<DetachedWait> {
+        let key = same_file::Handle::from_path(root).ok()?;
         let mut map = self
-            .by_path
+            .by_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let flags = map.get_mut(index_path)?;
+        let flags = map.get_mut(&key)?;
         flags.retain(|f| !f.load(Ordering::SeqCst));
         if flags.is_empty() {
-            map.remove(index_path);
+            map.remove(&key);
             return None;
         }
         Some(DetachedWait(flags.clone()))
@@ -612,7 +631,7 @@ impl DetachedWriters {
     /// How many detached actors are live. For tests and diagnostics.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.by_path
+        self.by_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
@@ -716,7 +735,7 @@ impl IndexActor {
     pub fn spawn_into<S: StatusSink, O: IndexOpen>(
         slot: IndexHandleSlot,
         publisher: Arc<StatusPublisher<S>>,
-        mut opener: O,
+        opener: O,
         vault_root: PathBuf,
         index_dir: PathBuf,
         epoch: HandleEpoch,
@@ -727,8 +746,13 @@ impl IndexActor {
         let handle = std::thread::Builder::new()
             .name("serat-index".to_owned())
             .spawn(move || {
-                // Set when this thread ends, however it ends (task #96).
+                // Set when this thread ends, however it ends (task #96). The captures
+                // are rebound *after* the flag so they drop first -- locals drop in
+                // reverse order, closure captures only after every local -- which makes
+                // the flag the last thing to go even on a panic: it means "the handle
+                // is closed", not merely "the thread is ending".
                 let _exit = exit_flag;
+                let (slot_for_thread, publisher, mut opener) = (slot_for_thread, publisher, opener);
                 // The opener's last word, withheld until the slot below is filled. A
                 // `RefCell` and not a `Mutex`: `publish` is a `&dyn Fn` with no `Send`
                 // bound, so it cannot leave this thread, and only `open` can call it.
@@ -785,7 +809,7 @@ impl IndexActor {
 
     /// Hand an actor that may still be running to `registry` without waiting for it.
     /// Returns whether it had already finished.
-    pub fn detach_into(&mut self, index_path: PathBuf, registry: &DetachedWriters) -> bool {
+    pub fn detach_into(&mut self, root: &Path, registry: &DetachedWriters) -> bool {
         if self.exited.load(Ordering::SeqCst) {
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
@@ -793,7 +817,7 @@ impl IndexActor {
             return true;
         }
         self.handle = None;
-        registry.register(index_path, Arc::clone(&self.exited));
+        registry.register(root, Arc::clone(&self.exited));
         false
     }
 
@@ -802,13 +826,13 @@ impl IndexActor {
     pub fn join_or_register(
         &mut self,
         deadline: Duration,
-        index_path: PathBuf,
+        root: &Path,
         registry: &DetachedWriters,
     ) -> bool {
         if self.join_within(deadline) {
             return true;
         }
-        registry.register(index_path, Arc::clone(&self.exited));
+        registry.register(root, Arc::clone(&self.exited));
         false
     }
 
@@ -836,6 +860,7 @@ impl IndexActor {
 
     /// Wait for the actor to finish, unbounded. Tests only: nothing a user waits on may
     /// call it.
+    #[cfg(test)]
     pub fn join(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();

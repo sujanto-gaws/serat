@@ -19,6 +19,7 @@ name = "serat_app"
 path = "src/lib.rs"
 
 [dependencies]
+same-file = "1"
 # Every capability comes from a crate that owns it (architecture §2.1). serat-app
 # adds none of its own.
 serat-core = { workspace = true }
