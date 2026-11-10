@@ -32,6 +32,7 @@
 //! the first save (architecture §3.1.1, §3.2).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -559,6 +560,78 @@ fn map_rebuild_reason(reason: serat_index::RebuildReason) -> RebuildReason {
 #[derive(Debug)]
 pub struct IndexActor {
     handle: Option<std::thread::JoinHandle<()>>,
+    exited: Arc<AtomicBool>,
+}
+
+/// Sets its flag on drop: the thread's exit, normal or by panic.
+struct ExitFlag(Arc<AtomicBool>);
+
+impl Drop for ExitFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Actors detached past their deadline, by the index file they may still be writing
+/// (task #96, architecture §3.4 "What a failed open leaves behind"). ADR-0001's single
+/// writer: while an entry here is live, no second actor may open the same `index.db`.
+/// An entry is dropped the first time it is looked up after its flag has fired.
+#[derive(Debug, Default)]
+pub struct DetachedWriters {
+    by_path: Mutex<std::collections::HashMap<PathBuf, Vec<Arc<AtomicBool>>>>,
+}
+
+impl DetachedWriters {
+    /// Record an actor that has not exited.
+    pub fn register(&self, index_path: PathBuf, exited: Arc<AtomicBool>) {
+        self.by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(index_path)
+            .or_default()
+            .push(exited);
+    }
+
+    /// A flag that fires when the last live detached actor on `index_path` has exited,
+    /// or `None` if none is live.
+    #[must_use]
+    pub fn live(&self, index_path: &Path) -> Option<DetachedWait> {
+        let mut map = self
+            .by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let flags = map.get_mut(index_path)?;
+        flags.retain(|f| !f.load(Ordering::SeqCst));
+        if flags.is_empty() {
+            map.remove(index_path);
+            return None;
+        }
+        Some(DetachedWait(flags.clone()))
+    }
+
+    /// How many detached actors are live. For tests and diagnostics.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.by_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .filter(|f| !f.load(Ordering::SeqCst))
+            .count()
+    }
+}
+
+/// The detached actors a new actor on the same file must wait for.
+#[derive(Debug)]
+pub struct DetachedWait(Vec<Arc<AtomicBool>>);
+
+impl DetachedWait {
+    /// Whether every one of them has exited.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.0.iter().all(|f| f.load(Ordering::SeqCst))
+    }
 }
 
 impl IndexActor {
@@ -616,16 +689,46 @@ impl IndexActor {
     /// caller publishes [`IndexState::Unavailable`] and the shell runs on as an editor.
     pub fn spawn<S: StatusSink, O: IndexOpen>(
         publisher: Arc<StatusPublisher<S>>,
-        mut opener: O,
+        opener: O,
         vault_root: PathBuf,
         index_dir: PathBuf,
         epoch: HandleEpoch,
     ) -> std::io::Result<(Self, IndexHandleSlot)> {
         let slot: IndexHandleSlot = Arc::new(Mutex::new(None));
-        let slot_for_thread = Arc::clone(&slot);
+        let actor = Self::spawn_into(
+            Arc::clone(&slot),
+            publisher,
+            opener,
+            vault_root,
+            index_dir,
+            epoch,
+        )?;
+        Ok((actor, slot))
+    }
+
+    /// [`IndexActor::spawn`] filling a slot the caller already holds, which is what lets
+    /// an actor be started *later* (task #96: after a detached one has exited) while the
+    /// vault that owns the slot is already open.
+    ///
+    /// # Errors
+    ///
+    /// As [`IndexActor::spawn`].
+    pub fn spawn_into<S: StatusSink, O: IndexOpen>(
+        slot: IndexHandleSlot,
+        publisher: Arc<StatusPublisher<S>>,
+        mut opener: O,
+        vault_root: PathBuf,
+        index_dir: PathBuf,
+        epoch: HandleEpoch,
+    ) -> std::io::Result<Self> {
+        let slot_for_thread = slot;
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_flag = ExitFlag(Arc::clone(&exited));
         let handle = std::thread::Builder::new()
             .name("serat-index".to_owned())
             .spawn(move || {
+                // Set when this thread ends, however it ends (task #96).
+                let _exit = exit_flag;
                 // The opener's last word, withheld until the slot below is filled. A
                 // `RefCell` and not a `Mutex`: `publish` is a `&dyn Fn` with no `Send`
                 // bound, so it cannot leave this thread, and only `open` can call it.
@@ -653,13 +756,60 @@ impl IndexActor {
                 if let Some(state) = terminal.borrow_mut().take() {
                     publisher.publish(state);
                 }
+                // A vault that closed or failed to open while this thread was still working
+                // retired the publisher before looking in the slot; the handle that
+                // arrived afterwards is closed here, so the exit flag (set last, as
+                // this closure's final act) means "connection closed" and not merely
+                // "thread over" (task #96).
+                if publisher.is_retired()
+                    && let Some(handle) = slot_for_thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    && let Err(err) = handle.close()
+                {
+                    eprintln!("serat: the index did not close cleanly: {err}");
+                }
             })?;
-        Ok((
-            Self {
-                handle: Some(handle),
-            },
-            slot,
-        ))
+        Ok(Self {
+            handle: Some(handle),
+            exited,
+        })
+    }
+
+    /// The flag the actor's thread sets as it ends.
+    #[must_use]
+    pub fn exited(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exited)
+    }
+
+    /// Hand an actor that may still be running to `registry` without waiting for it.
+    /// Returns whether it had already finished.
+    pub fn detach_into(&mut self, index_path: PathBuf, registry: &DetachedWriters) -> bool {
+        if self.exited.load(Ordering::SeqCst) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            return true;
+        }
+        self.handle = None;
+        registry.register(index_path, Arc::clone(&self.exited));
+        false
+    }
+
+    /// [`IndexActor::join_within`], registering the actor in `registry` when the
+    /// deadline expires (task #96).
+    pub fn join_or_register(
+        &mut self,
+        deadline: Duration,
+        index_path: PathBuf,
+        registry: &DetachedWriters,
+    ) -> bool {
+        if self.join_within(deadline) {
+            return true;
+        }
+        registry.register(index_path, Arc::clone(&self.exited));
+        false
     }
 
     /// Wait, at most `deadline`, for the actor to finish; past it the thread is
