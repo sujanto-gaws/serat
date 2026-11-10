@@ -11,8 +11,8 @@
     (`note_opened`), so this component does not report anything.
   - Combobox input + listbox/option; `aria-activedescendant` tracks the
     selection and DOM focus stays on the input.
-  - "Create note" on no match is deliberately absent until task #43 provides a
-    create command (it would be a dead end today).
+  - On no match, a `Create note "xyz"` row (quick-switcher.md) runs `createNote` (write_file,
+    FR-VLT-11) and shows the core's refusal inline; it is only offered when the host passes one.
 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
@@ -27,6 +27,8 @@ import { folderOf, titleOf } from "@/panes/text";
 const props = withDefaults(
   defineProps<{
     query?: SwitcherQueryFn;
+    /** Creates the note; resolves to `null` or the refusal sentence. Absent: no create row. */
+    createNote?: (name: string) => Promise<string | null>;
   }>(),
   { query: (args: SwitcherQueryArgs) => defaultLinkIpc.switcherQuery(args) },
 );
@@ -95,6 +97,8 @@ function toRow(item: SwitcherItem): Row {
 
 /** Computed once per answer, not once per render of each row. */
 const rows = computed(() => items.value.map(toRow));
+const createError = ref<string | null>(null);
+let creating = false;
 const noMatch = computed(() => shown.value !== null && shown.value === text.value && items.value.length === 0 && text.value.trim() !== "");
 
 async function ask(query: string): Promise<void> {
@@ -113,6 +117,7 @@ async function ask(query: string): Promise<void> {
 let composing = false;
 function onInput(event: Event): void {
   text.value = (event.target as HTMLInputElement).value;
+  createError.value = null;
   if (composing || (event as InputEvent).isComposing) return; // IME: wait for compositionend
   void ask(text.value);
 }
@@ -123,6 +128,24 @@ function onCompositionEnd(event: Event): void {
   composing = false;
   text.value = (event.target as HTMLInputElement).value;
   void ask(text.value);
+}
+
+/** `Create note "xyz"`: offered only on a settled no-match, when the host can create. */
+const createRow = computed(() => (props.createNote && noMatch.value ? text.value.trim() : null));
+
+async function create(): Promise<void> {
+  const name = createRow.value;
+  if (!name || !props.createNote || creating) return;
+  creating = true;
+  createError.value = null;
+  try {
+    const refusal = await props.createNote(name);
+    if (!alive) return;
+    if (refusal === null) emit("close");
+    else createError.value = refusal;
+  } finally {
+    creating = false;
+  }
 }
 
 function accept(index: number, newTab: boolean): void {
@@ -151,7 +174,8 @@ function onKeydown(event: KeyboardEvent): void {
   } else if (event.key === "Enter") {
     if (event.isComposing) return;
     event.preventDefault();
-    accept(selected.value, event.metaKey || event.ctrlKey);
+    if (n === 0 && createRow.value) void create();
+    else accept(selected.value, event.metaKey || event.ctrlKey);
   } else if (event.key === "Escape") {
     event.preventDefault();
     event.stopPropagation();
@@ -189,7 +213,7 @@ onBeforeUnmount(() => {
         aria-autocomplete="list"
         aria-expanded="true"
         aria-controls="qs-list"
-        :aria-activedescendant="rows.length > 0 ? `qs-opt-${selected}` : undefined"
+        :aria-activedescendant="rows.length > 0 ? `qs-opt-${selected}` : createRow ? 'qs-create' : undefined"
         autocomplete="off"
         spellcheck="false"
         :value="text"
@@ -229,6 +253,13 @@ onBeforeUnmount(() => {
         </li>
       </ul>
       <p v-if="noMatch" class="overlay-empty" role="status" aria-live="polite">No note matches “{{ text }}”</p>
+      <ul v-if="createRow" class="overlay-list" role="listbox" aria-label="Actions">
+        <li id="qs-create" class="overlay-row" role="option" aria-selected="true" data-testid="switcher-create" @click="create">
+          <span class="glyph" aria-hidden="true">+</span>
+          <span class="main">Create note “{{ createRow }}”</span>
+        </li>
+      </ul>
+      <p v-if="createError" class="overlay-empty" role="alert" data-testid="switcher-create-error">{{ createError }}</p>
       <div class="overlay-footer" aria-hidden="true">
         <span>↑↓ navigate</span><span>↵ open</span><span>⌘↵ new tab</span><span>esc</span>
       </div>

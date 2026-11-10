@@ -16,14 +16,20 @@
   - Keyboard: roving focus on the `role="tree"` container, announced through
     `aria-activedescendant`; one meaning per key. `Mod-F` (tree-local) focuses the
     filter box; the filter bolds matches and hides the rest.
-  - Not built here (task #43, tree operations): rename, the context menu, drag
-    dim/drop line. Their events are emitted and the host handles them.
+  - Task #43: New note / New folder (toolbar, ⌘N, ⌘⇧N via the host) with an inline naming
+    prompt, and the context menu (right-click, Shift-F10, Menu key). Creation goes through the
+    host's `createEntry` (write_file / create_folder); the tree shows the result from the stream,
+    never optimistically. NOT built, because contracts/ipc.rs has no command for them (rename and
+    move are P3, FR-VLT-09, as they need link repair): rename (F2 is emitted and the host says so),
+    move, trash, drag-to-move. Their menu entries are Disabled with a tooltip, not hidden.
   - Not built (no tabs in P1): `newTab` is carried on `open` and ignored by the host.
 -->
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
+import { folderName, noteFileName, takenNames, uniqueName, type CreateKind, type CreateRequest } from "@/tree/createEntry";
+import TreeContextMenu, { type MenuItem } from "@/tree/TreeContextMenu.vue";
 import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
 import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
 
@@ -47,6 +53,12 @@ const props = withDefaults(
     /** `false` = no vault open (after a failed open): drop every event, whatever its id. Distinct from a
      * `null` `vaultId`, which means "not known yet, do not filter". */
     vaultOpen?: boolean;
+    /**
+     * Creates a note or folder and resolves to `null` on success or to the core's refusal as a sentence.
+     * Absent: the toolbar buttons stay disabled with a tooltip (disabled, not hidden). That fallback exists
+     * for tests and embedding; no production host omits it (App.vue always passes one).
+     */
+    createEntry?: (request: CreateRequest) => Promise<string | null>;
   }>(),
   { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null, vaultOpen: true },
 );
@@ -54,7 +66,6 @@ const props = withDefaults(
 const emit = defineEmits<{
   open: [payload: { path: string; newTab: boolean; keepFocus: boolean }];
   "insert-link": [payload: { path: string; text: string }];
-  "context-menu": [payload: { path: string }];
   rename: [payload: { path: string }];
   /** A pending (not yet listed) folder was selected: the context pane says "Listing…". `null` clears it. */
   "pending-listing": [path: string | null];
@@ -65,6 +76,12 @@ const emit = defineEmits<{
 }>();
 
 const model = new TreeModel();
+
+/** The inline naming prompt of New note / New folder. */
+const prompt = ref<{ kind: CreateKind; dir: string; value: string; error: string | null; busy: boolean } | null>(null);
+const promptInput = ref<HTMLInputElement | null>(null);
+/** The open context menu: which row, where, and whether it was opened by keyboard. */
+const menu = ref<{ path: string; x: number; y: number } | null>(null);
 const version = ref(0);
 const scrollTop = ref(0);
 const viewportHeight = ref(props.fallbackViewportHeight);
@@ -305,9 +322,12 @@ function onKeydown(event: KeyboardEvent): void {
     case "rename":
       emit("rename", { path: action.path });
       break;
-    case "context-menu":
-      emit("context-menu", { path: action.path });
+    case "context-menu": {
+      const el = container.value?.querySelector<HTMLElement>(`[data-path="${CSS.escape(action.path)}"]`);
+      const box = el?.getBoundingClientRect();
+      openMenu(action.path, (box?.left ?? 0) + 24, box?.bottom ?? 0);
       break;
+    }
     case "insert-link": {
       const row = rows.value.find((r) => r.path === action.path);
       if (row) emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
@@ -346,17 +366,184 @@ function focusFilter(): void {
   });
 }
 
-defineExpose({ model, focusTree, focusFilter, version, filter });
+/** Where New note / New folder create: the selected folder, the selected entry's folder, else the vault root. */
+function currentDir(): string {
+  const path = focusedPath.value;
+  const row = path === null ? undefined : rows.value.find((r) => r.path === path);
+  if (!row) return "";
+  return row.kind === "dir" ? row.path : row.dir;
+}
+
+/** Where focus was when the prompt opened (the editor, usually): Esc and a finished folder go back there. */
+let promptOrigin: HTMLElement | null = null;
+
+function restoreFocus(): void {
+  const back = promptOrigin;
+  promptOrigin = null;
+  if (back && back.isConnected) back.focus();
+  else focusTree();
+}
+
+function startCreate(kind: CreateKind, dir: string = currentDir()): void {
+  if (!props.createEntry) return;
+  if (prompt.value && prompt.value.kind === kind) {
+    // The chord again while the prompt is open: back to it, keeping what was typed.
+    void nextTick(() => promptInput.value?.focus());
+    return;
+  }
+  if (!prompt.value) {
+    const active = document.activeElement;
+    promptOrigin = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  const taken = takenNames(model, dir);
+  const value = kind === "note" ? uniqueName(taken, "Untitled", ".md").replace(/\.md$/i, "") : uniqueName(taken, "New folder");
+  prompt.value = { kind, dir, value, error: null, busy: false };
+  void nextTick(() => {
+    promptInput.value?.focus();
+    promptInput.value?.select();
+  });
+}
+
+function cancelPrompt(): void {
+  prompt.value = null;
+  restoreFocus();
+}
+
+async function submitPrompt(): Promise<void> {
+  const p = prompt.value;
+  if (!p || p.busy || !props.createEntry) return;
+  const fileName = p.kind === "note" ? noteFileName(p.value) : folderName(p.value);
+  if (fileName === null) {
+    p.error = "Give it a name.";
+    return;
+  }
+  // Uniqueness is the front end's job and is case-insensitive (contracts/ipc.rs, create_folder); every
+  // other rule (characters, reserved names, escapes) is the core's and arrives as its refusal below.
+  if (takenNames(model, p.dir).has(fileName.toLowerCase())) {
+    p.error = `A ${p.kind} named \u201C${fileName}\u201D already exists here.`;
+    return;
+  }
+  p.error = null;
+  p.busy = true;
+  const name = p.kind === "note" ? fileName.replace(/\.md$/i, "") : fileName;
+  let refusal: string | null;
+  try {
+    refusal = await props.createEntry({ kind: p.kind, dir: p.dir, name });
+  } catch (error) {
+    refusal = `Could not create it: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (prompt.value !== p) return; // cancelled meanwhile
+  p.busy = false;
+  if (refusal !== null) {
+    p.error = refusal; // stays open with what the user typed
+    return;
+  }
+  prompt.value = null;
+  if (p.kind === "folder") restoreFocus();
+  else promptOrigin = null; // a created note moves focus to the editor (the host)
+}
+
+const promptWhere = computed(() => (prompt.value && prompt.value.dir !== "" ? prompt.value.dir : "the vault root"));
+
+function openMenu(path: string, x: number, y: number): void {
+  select(path);
+  menu.value = { path, x, y };
+}
+
+/** Esc returns focus to the tree; Tab moves on; a press outside leaves focus where that press put it. */
+function closeMenu(reason: "escape" | "tab" | "outside"): void {
+  menu.value = null;
+  if (reason === "escape") focusTree();
+}
+
+/** WebView2 fires a native `contextmenu` on key-up of Menu / Shift-F10; with no row under it, open ours for
+ * the focused row. (Row right-clicks are handled by the row, which prevents default, so skip those.)
+ * Windows manual check: #77. */
+function onTreeContextMenu(event: MouseEvent): void {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  const path = focusedPath.value;
+  if (path === null) return;
+  const el = container.value?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
+  const box = el?.getBoundingClientRect();
+  openMenu(path, (box?.left ?? event.clientX) + 24, box?.bottom ?? event.clientY);
+}
+
+const menuItems = computed<MenuItem[]>(() => {
+  const m = menu.value;
+  if (!m) return [];
+  const row = rows.value.find((r) => r.path === m.path);
+  const items: MenuItem[] = [];
+  if (row && row.kind !== "dir") {
+    const can = props.openPath !== null;
+    items.push({ id: "insert-link", label: "Insert link", enabled: can, reason: "Open a note first to insert a link." });
+  }
+  items.push(
+    {
+      id: "new-note",
+      label: "New note here",
+      enabled: !!props.createEntry,
+      reason: "Creating notes is not available right now.",
+    },
+    { id: "new-folder", label: "New folder here", enabled: !!props.createEntry, reason: "Creating folders is not available right now." },
+  );
+  const later = "Arrives with link repair (P3, FR-VLT-09): moving or renaming without repairing links would break them.";
+  items.push(
+    { id: "rename", label: "Rename", enabled: false, reason: later },
+    { id: "move", label: "Move to\u2026", enabled: false, reason: later },
+    { id: "trash", label: "Move to trash", enabled: false, reason: later },
+  );
+  return items;
+});
+
+function onMenuSelect(id: string): void {
+  const m = menu.value;
+  menu.value = null;
+  if (!m) return;
+  const row = rows.value.find((r) => r.path === m.path);
+  if (!row) return;
+  const dir = row.kind === "dir" ? row.path : row.dir;
+  if (id === "insert-link") {
+    emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
+    focusTree();
+  } else if (id === "new-note") startCreate("note", dir);
+  else if (id === "new-folder") startCreate("folder", dir);
+}
+
+defineExpose({
+  model,
+  focusTree,
+  focusFilter,
+  version,
+  filter,
+  currentDir,
+  newNote: () => startCreate("note"),
+  newFolder: () => startCreate("folder"),
+});
 </script>
 
 <template>
   <div class="serat-tree-pane" data-testid="file-tree-pane" @keydown="onPaneKeydown">
     <div class="serat-tree-toolbar" role="toolbar" aria-label="File tree actions">
-      <!-- Disabled, not hidden (file-tree.md): creating entries is task #43 (tree operations). -->
-      <button type="button" class="serat-tree-tool" data-testid="tree-new-note" disabled title="Arrives with tree operations (#43)">
+      <!-- Disabled, not hidden (file-tree.md), only when the host gave no create command. -->
+      <button
+        type="button"
+        class="serat-tree-tool"
+        data-testid="tree-new-note"
+        :disabled="!createEntry"
+        :title="createEntry ? 'New note (\u2318N)' : 'Creating notes is not available right now'"
+        @click="startCreate('note')"
+      >
         New note
       </button>
-      <button type="button" class="serat-tree-tool" data-testid="tree-new-folder" disabled title="Arrives with tree operations (#43)">
+      <button
+        type="button"
+        class="serat-tree-tool"
+        data-testid="tree-new-folder"
+        :disabled="!createEntry"
+        :title="createEntry ? 'New folder (\u2318\u21E7N)' : 'Creating folders is not available right now'"
+        @click="startCreate('folder')"
+      >
         New folder
       </button>
       <input
@@ -370,6 +557,43 @@ defineExpose({ model, focusTree, focusFilter, version, filter });
         @keydown="onFilterKeydown"
       />
     </div>
+    <form
+      v-if="prompt"
+      class="serat-tree-prompt"
+      data-testid="tree-prompt"
+      @submit.prevent="submitPrompt"
+      @keydown.esc.stop.prevent="cancelPrompt"
+    >
+      <label for="serat-tree-prompt-input">New {{ prompt.kind }} in {{ promptWhere }}</label>
+      <input
+        id="serat-tree-prompt-input"
+        ref="promptInput"
+        v-model="prompt.value"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        data-testid="tree-prompt-input"
+        :aria-invalid="prompt.error !== null"
+        aria-describedby="serat-tree-prompt-error"
+        @input="prompt.error = null"
+      />
+      <p v-if="prompt.error" id="serat-tree-prompt-error" class="serat-tree-prompt-error" role="alert" data-testid="tree-prompt-error">
+        {{ prompt.error }}
+      </p>
+      <span class="serat-tree-prompt-actions">
+        <button type="submit" :disabled="prompt.busy" data-testid="tree-prompt-create">Create</button>
+        <button type="button" data-testid="tree-prompt-cancel" @click="cancelPrompt">Cancel</button>
+      </span>
+    </form>
+    <TreeContextMenu
+      v-if="menu"
+      :items="menuItems"
+      :x="menu.x"
+      :y="menu.y"
+      label="File actions"
+      @select="onMenuSelect"
+      @close="closeMenu"
+    />
     <p
       class="serat-tree-live"
       :class="{ 'serat-tree-live-on': stopped }"
@@ -387,6 +611,7 @@ defineExpose({ model, focusTree, focusFilter, version, filter });
       :aria-activedescendant="activeDescendant"
       @scroll="onScroll"
       @keydown="onKeydown"
+      @contextmenu="onTreeContextMenu"
     >
       <p v-if="rootEmpty" class="serat-tree-empty">Nothing here yet — press ⌘N to start a note.</p>
       <p v-else-if="noMatches" class="serat-tree-empty" data-testid="tree-no-matches">No files match “{{ filter.trim() }}”.</p>
@@ -413,7 +638,7 @@ defineExpose({ model, focusTree, focusFilter, version, filter });
             :data-path="row.path"
             @click="onRowClick(row)"
             @dragstart="onDragStart($event, row)"
-            @contextmenu.prevent="emit('context-menu', { path: row.path })"
+            @contextmenu.prevent="openMenu(row.path, $event.clientX, $event.clientY)"
           >
             <span class="serat-tree-chevron" aria-hidden="true">{{
               row.state === "expanded" ? "▾" : row.state === "collapsed" ? "▸" : ""
@@ -451,6 +676,21 @@ defineExpose({ model, focusTree, focusFilter, version, filter });
 .serat-tree-filter {
   flex: 1 1 100%;
   min-width: 0;
+}
+.serat-tree-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--serat-border-hairline, rgba(22, 25, 27, 0.12));
+}
+.serat-tree-prompt-error {
+  margin: 0;
+  color: var(--serat-rust, #b7410e);
+}
+.serat-tree-prompt-actions {
+  display: flex;
+  gap: 4px;
 }
 .serat-tree-live {
   margin: 0;

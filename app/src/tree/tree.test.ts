@@ -523,13 +523,13 @@ describe("FileTree component", () => {
     wrapper.unmount();
   });
 
-  it("New note / New folder are rendered disabled with the tooltip, not hidden (file-tree.md, task #43)", async () => {
+  it("New note / New folder are rendered disabled with a reason, not hidden, when the host gives no create command (file-tree.md)", async () => {
     const { ipc } = fakeIpc();
     const wrapper = mount(FileTree, { props: { ipc } });
     for (const id of ["tree-new-note", "tree-new-folder"]) {
       const b = wrapper.get(`[data-testid="${id}"]`);
       expect(b.attributes("disabled")).toBeDefined();
-      expect(b.attributes("title")).toBe("Arrives with tree operations (#43)");
+      expect(b.attributes("title")).toContain("not available");
     }
     wrapper.unmount();
   });
