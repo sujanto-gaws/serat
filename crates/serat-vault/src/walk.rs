@@ -587,4 +587,42 @@ mod lexical_tests {
         let outside = dir.path().parent().expect("parent").join("elsewhere.md");
         assert!(relativise_walked(&vault, &outside).is_err());
     }
+
+    /// F-12 (task #107): the walk strips the root lexically and never canonicalises an
+    /// entry. Pinned by count, so load cannot move it; the earlier guard timed the two
+    /// ways and could invert on a busy host. The control: `relativise`, which does
+    /// canonicalise, is counted once per call by the same hook.
+    #[test]
+    fn the_walk_does_not_canonicalise_every_entry() {
+        use crate::CANONICALISE_CALLS;
+        const FILES: usize = 200;
+        let dir = tempfile::tempdir().expect("temp");
+        for i in 0..FILES {
+            write(
+                dir.path(),
+                &format!("{:02}-folder/note-{i:05}.md", i % 10),
+                b"# Note\n",
+            );
+        }
+        let vault = Vault::open(dir.path()).expect("open");
+
+        let before = CANONICALISE_CALLS.with(std::cell::Cell::get);
+        let entries = vault.walk().expect("walk");
+        let during_walk = CANONICALISE_CALLS.with(std::cell::Cell::get) - before;
+        assert_eq!(entries.len(), FILES);
+        assert_eq!(
+            during_walk, 0,
+            "the walk canonicalised {during_walk} times for {FILES} entries"
+        );
+
+        for entry in &entries {
+            let absolute = vault.resolve(&entry.path).expect("resolve");
+            vault.relativise(&absolute).expect("relativise");
+        }
+        let with_relativise = CANONICALISE_CALLS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            with_relativise, FILES,
+            "the control: relativise must count one canonicalise per entry"
+        );
+    }
 }

@@ -135,6 +135,8 @@ impl Vault {
     /// As [`Vault::open`].
     pub fn with_rules(root: impl AsRef<Path>, ignore: IgnoreRules) -> Result<Self, VaultError> {
         let root = root.as_ref();
+        // The root is canonicalised once, at open: not a per-entry cost (F-12).
+        #[allow(clippy::disallowed_methods)]
         let canonical =
             fs::canonicalize(root).map_err(|err| VaultError::io(display(root), &err))?;
         if !canonical.is_dir() {
@@ -337,7 +339,7 @@ impl Vault {
 
         // The file may already be gone — a delete event arrives after the fact — so
         // canonicalisation is best-effort and the lexical path is the fallback.
-        let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let absolute = canonicalize_counted(path).unwrap_or_else(|_| path.to_path_buf());
         let absolute = strip_verbatim(&absolute);
 
         let relative = absolute.strip_prefix(&self.root).map_err(|_| escaped())?;
@@ -865,6 +867,21 @@ pub(crate) fn vault_path_from_relative(
 /// which is the point of using it rather than a string comparison.
 fn is_contained(root: &Path, candidate: &Path) -> bool {
     candidate.starts_with(root)
+}
+
+/// `fs::canonicalize`, counted per thread under test: the one place `relativise` touches
+/// the disk, so a test can pin "the walk does not call it per entry" by count and not by
+/// wall time (task #107; F-12).
+#[allow(clippy::disallowed_methods)]
+fn canonicalize_counted(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    CANONICALISE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    fs::canonicalize(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CANONICALISE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

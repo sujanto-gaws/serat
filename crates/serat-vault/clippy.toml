@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "count it: use canonicalize_counted (F-12, task #107)" },
+]
