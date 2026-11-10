@@ -9,6 +9,9 @@ use std::path::Path;
 
 /// `(volume, file)`: device and inode on Unix, volume serial number and file index on
 /// Windows. Opaque; compare for equality only.
+///
+/// On ReFS the 64-bit file index is not guaranteed unique (`FileIdInfo` gives the
+/// 128-bit id); using it is a follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity(u64, u64);
 

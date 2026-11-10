@@ -306,16 +306,18 @@ impl ActorCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Run `spawn` and keep its actor, unless the cell was cancelled first.
-    fn install(&self, spawn: impl FnOnce() -> std::io::Result<IndexActor>) {
+    /// Run `spawn` and keep its actor, unless the cell was cancelled first. Returns the
+    /// spawn's error so the caller can say so.
+    fn install(
+        &self,
+        spawn: impl FnOnce() -> std::io::Result<IndexActor>,
+    ) -> Result<(), std::io::Error> {
         let mut state = self.lock();
         if state.cancelled {
-            return;
+            return Ok(());
         }
-        match spawn() {
-            Ok(actor) => state.actor = Some(actor),
-            Err(err) => eprintln!("serat: the deferred index thread could not start: {err}"),
-        }
+        state.actor = Some(spawn()?);
+        Ok(())
     }
 
     /// No actor will be installed from now on; hands back the one that is.
@@ -375,6 +377,9 @@ pub(crate) struct OpenHooks {
     /// Called with the new vault id right after `IndexActor::spawn` returned.
     #[cfg(test)]
     pub(crate) after_index_spawn: Option<SpawnHook>,
+    /// Make the deferred index-actor spawn fail (task #96 review SF-1).
+    #[cfg(test)]
+    pub(crate) fail_deferred_spawn: bool,
     /// Mutant switch for task #96's test: ignore the detached-writer registry.
     #[cfg(test)]
     pub(crate) skip_registry_check: bool,
@@ -867,6 +872,9 @@ impl AppState {
                 Arc::clone(&catch_up_gate),
             );
             let (deferred_root, dir) = (root.clone(), index_dir_for(&root));
+            #[cfg(test)]
+            let fail_spawn = self.hooks.fail_deferred_spawn;
+            let unavailable = Arc::clone(&publisher);
             std::thread::Builder::new()
                 .name("serat-index-deferred".to_owned())
                 .spawn(move || {
@@ -877,9 +885,24 @@ impl AppState {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    cell.install(|| {
+                    let unavailable_path = dir.display().to_string();
+                    let installed = cell.install(|| {
+                        #[cfg(test)]
+                        if fail_spawn {
+                            return Err(std::io::Error::other("injected spawn failure"));
+                        }
                         IndexActor::spawn_into(slot, publisher, opener, deferred_root, dir, epoch)
                     });
+                    // The vault is already open here, so a failed spawn must be seen:
+                    // left alone the index would read `Opening` for the whole session
+                    // (goal 5).
+                    if let Err(err) = installed {
+                        eprintln!("serat: the deferred index thread could not start: {err}");
+                        unavailable.publish(IndexState::Unavailable {
+                            message: format!("could not start the index thread: {err}"),
+                            path: unavailable_path,
+                        });
+                    }
                     // Now, not before: the claimants' settle clocks start here, whether
                     // or not the spawn succeeded (a failed one then times out as usual).
                     gate.actor_started();
@@ -907,7 +930,7 @@ impl AppState {
                 path: root.display().to_string(),
                 message: format!("could not start the index thread: {err}"),
             })?;
-            index_cell.install(|| Ok(index));
+            let _ = index_cell.install(|| Ok(index));
         }
 
         // §3.4 puts the walk off the critical path; measured, being on another thread
@@ -5627,6 +5650,82 @@ mod tests {
         });
         second.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_deferred_spawn_leaves_the_index_unavailable_not_opening_forever() {
+        let (_first, second, dir, _slow) = detached_pair("detached-spawn-fails", 300, 30_000);
+        let second = second.with_open_hooks(OpenHooks {
+            fail_deferred_spawn: true,
+            ..OpenHooks::default()
+        });
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                SeratIndexOpen::default(),
+            )
+            .expect("the vault opens without an actor");
+        assert_eq!(opened.index, IndexState::Opening);
+        wait_until("Unavailable", || {
+            matches!(second.index_status().state, IndexState::Unavailable { .. })
+        });
+        let IndexState::Unavailable { message, path } = second.index_status().state else {
+            unreachable!()
+        };
+        assert!(
+            message.contains("could not start the index thread"),
+            "{message}"
+        );
+        assert!(path.contains(".serat"), "{path}");
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deferred_reopen_indexes_what_changed_while_the_vault_was_closed() {
+        // Review SF-2: the effect of the owed rescan, not only that the flag was taken.
+        // A valid index exists (a real open and close), a `Counting` session is detached,
+        // `new.md` appears while closed, and the deferred re-open indexes it.
+        let dir = fixture("detached-effect");
+        let real = plain_state(Duration::from_secs(5));
+        open_dir_real(&real, &dir);
+        wait_ready(&real);
+        real.close_vault();
+        let slow = counting(1500);
+        let detacher = plain_state(Duration::from_secs(5));
+        detacher
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow,
+            )
+            .expect("open");
+        detacher.close_vault();
+        assert_eq!(detacher.detached_writers().live_count(), 1);
+        std::fs::write(dir.join("new.md"), "# written while closed\n").expect("write");
+
+        let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
+        let opened = open_dir_real(&second, &dir);
+        assert_eq!(opened.index, IndexState::Opening);
+        // The tree's refused catch-up is owed as a rescan; the real actor runs it.
+        let (send, log) = collecting_sender();
+        second.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        wait_ready(&second);
+        wait_for_row(&dir, "new.md");
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn open_dir_real(state: &AppState, dir: &Path) -> VaultOpened {
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open")
     }
 
     #[test]
