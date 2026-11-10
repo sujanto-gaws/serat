@@ -232,12 +232,13 @@ provide(COMMANDS_KEY, commands);
 
 /** The tree menu's accelerators are the registry's effective bindings, so they follow a rebinding. */
 const bindingsVersion = ref(0);
-commands.subscribe(() => (bindingsVersion.value += 1));
+const unsubscribeBindings = commands.subscribe(() => (bindingsVersion.value += 1));
 const treeMenuBindings = computed(() => {
   void bindingsVersion.value;
   return {
     "new-note": commands.effectiveBinding("tree.newNote"),
     "new-folder": commands.effectiveBinding("tree.newFolder"),
+    // TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
     "insert-link": "Mod-Shift-l",
     rename: "F2",
   };
@@ -426,6 +427,7 @@ const removeNativeMenuPolicy = installNativeMenuPolicy();
 
 onUnmounted(() => {
   removeNativeMenuPolicy();
+  unsubscribeBindings();
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();

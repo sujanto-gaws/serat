@@ -277,6 +277,9 @@ function toggleDir(path: string, expand: boolean | null): void {
 }
 
 /** Accelerators shown when the host passes none: the tree-local chords of file-tree.md. */
+// TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
+// DEFAULT_MENU_BINDINGS goes away once that follow-up lands (the host then always passes effective bindings).
+// `rename: "F2"` stays fixed (file-tree.md keyboard map).
 const DEFAULT_MENU_BINDINGS: Record<string, string | null> = { "insert-link": "Mod-Shift-l", rename: "F2" };
 
 const isMac = computed(() => props.mac ?? detectPlatform() === "mac");
