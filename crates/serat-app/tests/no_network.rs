@@ -412,11 +412,20 @@ fn findings(source: &str) -> Vec<(usize, String)> {
                 out.push((index + 1, (*pattern).to_owned()));
             }
         }
-        let opens = code.starts_with("use ")
+        // `pub use`, `pub(crate) use` and a leading `::` do not hide the import.
+        let bare = match code.strip_prefix("pub") {
+            Some(rest) if rest.starts_with('(') => rest
+                .split_once(')')
+                .map_or(code, |(_, tail)| tail.trim_start()),
+            Some(rest) => rest.trim_start(),
+            None => code,
+        };
+        let bare = bare.replacen("use ::", "use ", 1);
+        let opens = bare.starts_with("use ")
             && ["std::", "tokio::", "core::"]
                 .iter()
-                .any(|root| code.starts_with(&format!("use {root}")))
-            && code.contains('{');
+                .any(|root| bare.starts_with(&format!("use {root}")))
+            && bare.contains('{');
         if opens {
             in_net_capable_use = true;
         }
@@ -502,6 +511,8 @@ fn the_source_scan_fails_on_what_someone_might_add() {
         "use std::{io, net};",
         "use std::{\n    io,\n    net,\n};",
         "use std::{\n    io,\n    net::TcpStream,\n};",
+        "pub use std::{\n    io,\n    net,\n};",
+        "pub(crate) use ::std::{io, net};",
         "use tokio::net::TcpListener;",
         "use std::os::unix::net::UnixStream;",
         "let c = reqwest::Client::new();",

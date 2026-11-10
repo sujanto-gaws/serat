@@ -7,12 +7,13 @@
 // This proves the ABSENCE OF CODE PATHS in what we ship (no URL a script could fetch, no network
 // API in our own source, pdf.js configured so it has nothing to fetch). It does not observe a
 // running webview; that is the reference-machine protocol's job (docs/05-testing/p1-gate-protocol.md).
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { build } from "vite";
+import { createRequire } from "node:module";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 const APP = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -40,15 +41,7 @@ interface Inert {
 const INERT: Record<string, Inert> = {
   "https://foo.bar": { bench: 2, shipped: 0, reason: "pdf.js: base for `new URL(relative, base)` when parsing a link; never requested" },
   "http://example.com": { bench: 1, shipped: 0, reason: "pdf.js: base for isValidFetchUrl(); never requested" },
-  "https://vuejs.org/error-reference/#runtime-$": { bench: 0, shipped: 1, reason: "Vue: text appended to a console warning; never requested" },
-  "https://cli.vuejs.org/guide/webpack.html#modifying-options-of-a-loader": { bench: 1, shipped: 0, reason: "Vue: documentation link inside a warning message; never requested" },
-  "https://github.com/vitejs/vite-plugin-vue/tree/main/packages/plugin-vue#example-for-passing-options-to-vuecompiler-sfc": {
-    bench: 1,
-    shipped: 0,
-    reason: "Vue (warning text): documentation link; never requested",
-  },
-  "https://link.vuejs.org/feature-flags.": { bench: 1, shipped: 0, reason: "Vue: documentation link inside a warning message; never requested" },
-  "https://pinia.vuejs.org/core-concepts/outside-component-usage.html": { bench: 1, shipped: 0, reason: "Pinia: documentation link inside a warning message; never requested" },
+  "https://vuejs.org/error-reference/#runtime-$": { bench: 1, shipped: 1, reason: "Vue: text appended to a console warning; never requested" },
   "http://": { bench: 1, shipped: 1, reason: "prefix test `startsWith('http://')` (link classification); never requested" },
   "https://": { bench: 1, shipped: 1, reason: "prefix test `startsWith('https://')` (link classification); never requested" },
   "http://$": {
@@ -97,7 +90,15 @@ describe("the shipped webview contains no URL it could request", () => {
     // directory: app/dist-bench belongs to the editor-latency harness, and emptyOutDir would wipe
     // a concurrent run's build.
     benchDir = mkdtempSync(join(tmpdir(), "serat-no-network-"));
-    await build({ root: APP, mode: "bench", logLevel: "silent", build: { outDir: benchDir, emptyOutDir: true } });
+    // A child process with NODE_ENV=production: vitest sets NODE_ENV=test, which an in-process
+    // build() keeps, and a development-flavoured bundle is not what ships (it has dev warnings in
+    // and the `import.meta.env.PROD` / `NODE_ENV === "production"` paths out).
+    const viteBin = join(dirname(createRequire(import.meta.url).resolve("vite/package.json")), "bin", "vite.js");
+    execFileSync(process.execPath, [viteBin, "build", "--mode", "bench", "--outDir", benchDir, "--emptyOutDir", "--logLevel", "silent"], {
+      cwd: APP,
+      env: { ...process.env, NODE_ENV: "production" },
+      stdio: "pipe",
+    });
   }, 240_000);
   afterAll(() => {
     if (benchDir) rmSync(benchDir, { recursive: true, force: true });
@@ -105,6 +106,11 @@ describe("the shipped webview contains no URL it could request", () => {
 
   it("a fresh bench build has no http(s)/ws(s) URL beyond namespaces, the scheme origin and the inert table", () => {
     expect(walk(benchDir).length).toBeGreaterThan(0);
+    // Proof that a PRODUCTION build was scanned: Vue's production error handler carries the
+    // error-reference link; the development build has the longer warning texts instead.
+    const boot = readFileSync(join(benchDir, "boot.js"), "utf8");
+    expect(boot).toContain("https://vuejs.org/error-reference/#runtime-");
+    expect(boot).not.toContain("modifying-options-of-a-loader");
     const { unaccounted, counts } = scan(benchDir);
     expect(unaccounted).toEqual([]);
     expect(counts).toEqual(Object.fromEntries(Object.entries(INERT).map(([url, e]) => [url, e.bench])));
