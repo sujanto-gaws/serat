@@ -4,11 +4,12 @@
 
 import { ensureSyntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   blockWidgetsExtension,
   blockWidgetsField,
+  reliableParsedTo,
   growthRegion,
   isImageTarget,
   parseCalloutHeader,
@@ -489,5 +490,54 @@ describe("blockWidgetsField", () => {
       for (const b of list) if (b > a && b - a <= 8) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`, sweep);
     }
     expectSkipBudget(sweep, `block-end sweep (end ${end}, cursor ${cursor})`);
+  });
+
+  // ---- partial reparses (task #109) ----
+
+  /** Applies `spec` with CodeMirror's parse budget forced to expire (Date.now jumps 50 ms per call). */
+  function updateWithPartialParse(state: EditorState, spec: { from: number; to?: number; insert?: string }): EditorState {
+    let clock = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (clock += 50));
+    try {
+      return state.update({ changes: spec }).state;
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("reliableParsedTo: the document end for a finished parse, a boundary short of it for a partial one", () => {
+    const doc = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+    const done = makeState(doc, 0);
+    expect(reliableParsedTo(done)).toBe(doc.length);
+    const partial = updateWithPartialParse(done, { from: 3, insert: "z" });
+    expect(syntaxTreeAvailable(partial, partial.doc.length)).toBe(false);
+    expect(reliableParsedTo(partial)).toBeLessThan(partial.doc.length);
+    expect(syntaxTreeAvailable(partial, reliableParsedTo(partial))).toBe(true);
+  });
+
+  it("an edit applied during a partial parse: once the parse completes (no doc change, same length) the widgets equal a fresh build", () => {
+    const doc = Array.from({ length: 30 }, (_, i) => `${TABLE}\n\npara ${i}`).join("\n\n");
+    const base = makeState(doc, 0);
+    let partials = 0;
+    let total = 0;
+    for (let at = 0; at < doc.length; at += 7) {
+      for (const insert of ["```\n", "\n", "x", "> "]) {
+        total += 1;
+        const s2 = updateWithPartialParse(base, { from: at, insert });
+        if (!syntaxTreeAvailable(s2, s2.doc.length)) partials += 1;
+        ensureSyntaxTree(s2, s2.doc.length, 5000);
+        const s3 = s2.update({}).state; // the completion transaction: no change, tree identity differs
+        const fresh = s3.update({ effects: setResolutions.of([]) }).state;
+        expect(shapeOf(s3), `insert ${JSON.stringify(insert)} at ${at}`).toEqual(shapeOf(fresh));
+      }
+    }
+    expect(partials).toBeGreaterThan(total / 2); // the forced budget really produced partial parses
+  });
+
+  it("a finished parse costs the keystroke path nothing extra: examined stays the document end", () => {
+    const doc = `intro\n\n${TABLE}\n\nend`;
+    const s0 = makeState(doc, 0);
+    const s1 = s0.update({ changes: { from: 2, insert: "x" }, selection: { anchor: 3 } }).state;
+    expect(s1.field(blockWidgetsField).examined).toBe(s1.doc.length);
   });
 });

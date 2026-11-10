@@ -29,7 +29,7 @@
 // costs this field roughly what one block costs, per keystroke, not what 50
 // tables cost.
 
-import { syntaxTree } from "@codemirror/language";
+import { syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState, RangeSetBuilder, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
@@ -369,7 +369,28 @@ function buildAll(state: EditorState): BlockWidgetState {
   for (const { from, to, decoration } of found) {
     builder.add(from, to, decoration);
   }
-  return { deco: builder.finish(), examined: syntaxTree(state).length };
+  return { deco: builder.finish(), examined: reliableParsedTo(state) };
+}
+
+/**
+ * How far the syntax tree can be trusted: the position up to which the parse has actually
+ * completed. `syntaxTree(state).length` is NOT that: after an edit CodeMirror may hand over a
+ * partial, time-sliced tree whose length is the document's (or longer than what is parsed),
+ * and the parse finishes later in a transaction with no document change and the same length
+ * (#109). The common case, a finished parse, is one call; a partial one binary-searches the
+ * boundary (about log2(n) O(1) calls). Never walks the tree.
+ */
+export function reliableParsedTo(state: EditorState): number {
+  const length = state.doc.length;
+  if (syntaxTreeAvailable(state, length)) return length;
+  let lo = 0;
+  let hi = length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (syntaxTreeAvailable(state, mid)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 /** The top-level block node (a direct child of `Document`) enclosing `pos`,
@@ -503,7 +524,7 @@ export function growthRegion(examined: number, treeLength: number): Span | null 
   return treeLength > examined ? { from: examined, to: treeLength } : null;
 }
 
-function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
+function computeDirtyRegions(tr: Transaction, examined: number, reliable: number): Span[] {
   const regions: Span[] = [];
   if (tr.docChanged) {
     // Both ends of every change, both sides of each (a deletion before a block moves
@@ -522,7 +543,7 @@ function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
   // CodeMirror parses a long note in time-sliced chunks, and cuts the tree
   // back to the viewport after an edit. Only territory beyond the watermark
   // has never been examined.
-  const growth = growthRegion(examined, syntaxTree(tr.state).length);
+  const growth = growthRegion(examined, reliable);
   if (growth) {
     const start = enclosingTopLevelBlock(tr.state, Math.min(growth.from, tr.state.doc.length));
     regions.push({ from: start ? Math.min(start.from, growth.from) : growth.from, to: growth.to });
@@ -574,10 +595,17 @@ export const blockWidgetsField = StateField.define<BlockWidgetState>({
       return value;
     }
     const deco = value.deco.map(tr.changes);
-    const examined = tr.docChanged ? tr.changes.mapPos(value.examined, -1) : value.examined;
-    const regions = computeDirtyRegions(tr, examined);
-    const treeLength = syntaxTree(tr.state).length;
-    const nextExamined = Math.max(examined, Math.min(treeLength, tr.state.doc.length));
+    // What has been examined with a tree that could be trusted: the old watermark mapped
+    // through the edit, but never beyond what is parsed now. Territory past the parse
+    // boundary was (at best) examined against a partial tree, so it is re-examined once the
+    // parse completes, in the follow-up transaction that carries no document change (#109).
+    // With a finished parse (the normal case) `reliable` is the document end and nothing
+    // here costs more than one `syntaxTreeAvailable` call.
+    const reliable = reliableParsedTo(tr.state);
+    const mapped = tr.docChanged ? tr.changes.mapPos(value.examined, -1) : value.examined;
+    const examined = Math.min(mapped, reliable);
+    const regions = computeDirtyRegions(tr, examined, reliable);
+    const nextExamined = Math.max(examined, reliable);
     if (regions.length === 0) {
       return { deco, examined: nextExamined };
     }
