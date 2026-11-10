@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn no_csp_directive_admits_a_remote_origin_and_the_whole_string_is_pinned() {
-        // NFR-SEC-01 / NFR-SEC-06 / T-04 / US-07. The individual directives above are
+        // NFR-SEC-01 / NFR-SEC-02 / T-02 / T-09. The individual directives above are
         // each pinned; this is the other direction: whatever the string says, every
         // source of every fetch directive is `'self'`, one of the two ADR-0017 scheme
         // origins, or Tauri's own IPC channel (connect-src only), and framing/embedding
@@ -189,6 +189,9 @@ mod tests {
             "manifest-src",
             "prefetch-src",
         ];
+        // `worker-src` is absent and falls back to `script-src 'self'`, which is right for the
+        // same-origin module worker pdf.js is given (viewers/pdfEngine.ts); adding it later
+        // is checked by the loop below.
         for directive in csp.split(';').map(str::trim).filter(|d| !d.is_empty()) {
             let mut tokens = directive.split_whitespace();
             let name = tokens.next().expect("a directive name");
