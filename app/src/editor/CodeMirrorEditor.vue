@@ -69,16 +69,18 @@ const props = withDefaults(
     ipc?: EditorIpcAdapter;
     /** `resolve_links` / `note_anchors` / `switcher_query` / `index://changed`. */
     linkIpc?: LinkIpcAdapter;
-    /** The open vault's `vault_id` (from `index_status`; opaque, compared for equality only).
+    /** The open vault's `vault_id` (`BootInfo` / `vault://opened`; opaque, compared for equality only).
      * `null`/absent until known: events are then not filtered, since nothing can be
      * compared. Captured per buffer at `loadNote`, so an `app://closing` for the OLD
      * vault of a switch still reaches the buffer that belongs to it (architecture 3.1.1 item 6.7). */
     vaultId?: string | null;
+    /** `false` = no vault open (after a failed open): every event is dropped, whatever its id. */
+    vaultOpen?: boolean;
     /** The app-wide command registry (architecture.md §9.3). The editor adds its commands to
      * it for as long as it is mounted, so the palette lists them; a private one when absent. */
     commands?: CommandRegistry;
   }>(),
-  { livePreview: true, vaultId: null, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
+  { livePreview: true, vaultId: null, vaultOpen: true, ipc: () => defaultEditorIpc, linkIpc: () => defaultLinkIpc },
 );
 
 const emit = defineEmits<{
@@ -496,6 +498,7 @@ let bufferVaultId: string | null = null;
 
 /** True unless both sides know their vault id and they differ. */
 function isOurVault(id: string): boolean {
+  if (!props.vaultOpen) return false; // no vault open: nothing is current (task #103)
   const mine = bufferVaultId ?? props.vaultId;
   return mine === null || mine === undefined || mine === id;
 }
@@ -503,10 +506,10 @@ function isOurVault(id: string): boolean {
 watch(
   () => props.vaultId,
   (id) => {
-    // A buffer opened before the id was known belongs to the first vault we learn of.
-    // KNOWN LIMIT (#80): `store.vaultId` is overwritten by every index_status poll/event with no ordering,
-    // so after a vault switch this could tag a B buffer with A's id. Unreachable today (no frontend
-    // switch path); the vault-switch UI task owns the fix.
+    // A buffer opened before the id was known belongs to the vault the store then announces. The
+    // store's id is authoritative (BootInfo at launch, `vault://opened` later; the index_status
+    // fallback can only fill an empty id at launch and never after an announcement), so this can no
+    // longer tag a B buffer with A's id (#91; #80's switch UI builds on it).
     if (id && buffer && bufferVaultId === null) bufferVaultId = id;
   },
 );

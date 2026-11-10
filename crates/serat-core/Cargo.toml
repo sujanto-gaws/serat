@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 # Dependencies here are checked by tests/dependency_rule.rs against a short
 # allow-list. "No I/O whatsoever" (architecture §2.1) is only credible if adding

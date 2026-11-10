@@ -23,7 +23,10 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import type { SaveOutcome } from "@/editor/buffer";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
-import { indexStatus, isIpcError, onIndexStatus } from "@/ipc/client";
+import { createFolder, indexStatus, isIpcError, onIndexStatus, onVaultOpened, writeFile } from "@/ipc/client";
+import { installNativeMenuPolicy } from "@/nativeMenu";
+import { describeCreateError, noteFileName, type CreateRequest } from "@/tree/createEntry";
+import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
@@ -36,6 +39,7 @@ import { getUiSettings, setLivePreview } from "@/ipc/client";
 const store = useVaultStore();
 const editorRef = ref<InstanceType<typeof CodeMirrorEditor> | null>(null);
 let unlistenIndexStatus: UnlistenFn | null = null;
+let unlistenVaultOpened: UnlistenFn | null = null;
 const searchOpen = ref(false);
 /** The PDF/image open in place of the editor (binary-viewers.md); null = the editor shows. */
 const viewing = ref<string | null>(null);
@@ -92,15 +96,57 @@ async function onTreeOpen(payload: { path: string; newTab: boolean; keepFocus: b
   }
 }
 
-/*
- * Rename (F2) and the context menu are task #43 (tree operations). Until it
- * lands the events are received here and do nothing, so the tree's keys have a
- * handler to bind to; #43 replaces these two bodies. New note / new folder (the
- * disabled toolbar buttons, ⌘N, ⌘⇧N) are the same: #43 owns the naming flow
- * and the create commands, so the chords are no-ops until then.
+/**
+ * F2. Rename and move are P3 (FR-VLT-09: they need link repair) and contracts/ipc.rs has no command
+ * for them, so say so rather than do nothing.
  */
-function onTreeRename(_payload: { path: string }): void {}
-function onTreeContextMenu(_payload: { path: string }): void {}
+function onTreeRename(_payload: { path: string }): void {
+  store.setMark("Rename arrives with link repair (P3): renaming without repairing links would break them.");
+}
+
+/**
+ * New note / New folder (FR-VLT-11, US-41). A note is `write_file` with `base_hash: null` (ADR-0016), empty
+ * and without a template; a folder is `create_folder`. Resolves to `null`, or to the core's refusal as a
+ * sentence (the tree keeps its prompt open and shows it). The tree itself changes only when the watcher's
+ * `Upsert` arrives: nothing is inserted optimistically.
+ */
+async function createEntry(request: CreateRequest): Promise<string | null> {
+  const fileName = request.kind === "note" ? noteFileName(request.name) : request.name.trim();
+  if (fileName === null || fileName === "") return "Give it a name.";
+  const path = childPath(request.dir, fileName);
+  try {
+    if (request.kind === "note") {
+      await writeFile({ path, text: "", base_hash: null });
+    } else {
+      const made = await createFolder({ path });
+      if (!made.created) return `A folder named \u201C${fileName}\u201D already exists here.`;
+    }
+  } catch (error) {
+    return describeCreateError(error, request.kind, fileName);
+  }
+  if (request.kind === "note") {
+    // The new note opens in the editor and takes focus (US-41).
+    if (treeFlyover.value) treeFlyover.value = false;
+    if ((await openNote(path)) !== null) {
+      await nextTick();
+      editorRef.value?.focus();
+    }
+  }
+  return null;
+}
+
+/** The switcher's `Create note "xyz"` row: in the tree's current folder, or at the path typed when it has a `/`. */
+function createNoteFromSwitcher(typed: string): Promise<string | null> {
+  const dir = typed.includes("/") ? "" : (treeRef.value?.currentDir() ?? "");
+  return createEntry({ kind: "note", dir, name: typed });
+}
+
+function startCreate(kind: "note" | "folder"): void {
+  if (window.matchMedia?.("(max-width: 719px)").matches) treeFlyover.value = true;
+  switcherOpen.value = false;
+  paletteOpen.value = false;
+  void nextTick(() => (kind === "note" ? treeRef.value?.newNote() : treeRef.value?.newFolder()));
+}
 
 function openSearch(): void {
   // Open or focus; never toggles closed (search-panel.md). Esc closes.
@@ -183,6 +229,20 @@ commands.onOverrideRefused((ids) =>
   store.setMark(`keybinding ignored (already used by another command): ${ids.join(", ")}`),
 );
 provide(COMMANDS_KEY, commands);
+
+/** The tree menu's accelerators are the registry's effective bindings, so they follow a rebinding. */
+const bindingsVersion = ref(0);
+const unsubscribeBindings = commands.subscribe(() => (bindingsVersion.value += 1));
+const treeMenuBindings = computed(() => {
+  void bindingsVersion.value;
+  return {
+    "new-note": commands.effectiveBinding("tree.newNote"),
+    "new-folder": commands.effectiveBinding("tree.newFolder"),
+    // TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
+    "insert-link": "Mod-Shift-l",
+    rename: "F2",
+  };
+});
 const mac = detectPlatform() === "mac";
 const switcherOpen = ref(false);
 const paletteOpen = ref(false);
@@ -244,6 +304,8 @@ function registerCommands(): Array<() => void> {
         void nextTick(() => treeRef.value?.focusTree());
       },
     }),
+    commands.register({ id: "tree.newNote", name: "New note", defaultBinding: "Mod-n", exec: () => startCreate("note") }),
+    commands.register({ id: "tree.newFolder", name: "New folder", defaultBinding: "Mod-Shift-n", exec: () => startCreate("folder") }),
     commands.register({ id: "backlinks.focus", name: "Focus backlinks", defaultBinding: "Mod-3", exec: () => backlinksRef.value?.focus() }),
   ];
 }
@@ -256,7 +318,7 @@ function onInsertLink(payload: { path: string; text: string }): void {
 /**
  * Global chords (components.md §7), matched against the registry's effective
  * bindings so a rebinding changes behaviour, not just the palette's chip.
- * ⌘N / ⌘⇧N (new note / folder) are task #43's and stay no-ops until then.
+ * ⌘N / ⌘⇧N are the registry's `tree.newNote` / `tree.newFolder`.
  */
 function onGlobalKeydown(event: KeyboardEvent): void {
   if (event.defaultPrevented) return; // the editor's keymap already took it (mac emacs Ctrl-k/o/n)
@@ -268,7 +330,6 @@ function onGlobalKeydown(event: KeyboardEvent): void {
     void commands.execute(command.id, null);
     return;
   }
-  if (event.key.toLowerCase() === "n") event.preventDefault(); // ⌘N / ⌘⇧N: #43
 }
 
 onMounted(async () => {
@@ -303,6 +364,8 @@ onMounted(async () => {
   // is synchronous (the rAF pair is registered before this call returns); only
   // *waiting* on the promise it returns happens later, in `hydrateBuffer` below.
   const paintMark = schedulePaintMark(store);
+  store.adoptBoot(window.__SERAT_BOOT__?.vault_id);
+  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
 
   // Installed next so the first transition the actor publishes is not lost — mirrors
   // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
@@ -325,8 +388,15 @@ onMounted(async () => {
     .catch(() => undefined);
 
 
+  // The vault id's sources (architecture 3.4): BootInfo at launch (read synchronously above),
+  // `vault://opened` for every later open; index_status is a restricted fallback only.
+  void onVaultOpened((opened) => store.vaultOpened(opened))
+    .then((unlisten) => (unlistenVaultOpened = unlisten))
+    .catch(() => undefined);
+
   unlistenIndexStatus = await onIndexStatus((status) => {
-    store.setVaultId(status.vault_id);
+    store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
     store.setIndexState(status.state);
     // The count of names the vault refused to list is one status fact (not a
     // per-name error). It is read when the status carries it.
@@ -334,13 +404,12 @@ onMounted(async () => {
     if (typeof refused === "number") store.setRefusedNames(refused);
   });
 
-  store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
-
 
   // Late subscribers catch up by polling; the contract has both channels for this
   // reason (architecture §3.4).
   indexStatus().then((status) => {
-    store.setVaultId(status.vault_id);
+    store.adoptFromIndexStatus(status.vault_id);
+    if (!store.statusBelongsHere(status.vault_id)) return;
     store.setIndexState(status.state);
   });
 
@@ -353,10 +422,16 @@ onMounted(async () => {
   }
 });
 
+// Native webview menu: suppressed everywhere except text fields and the editor (nativeMenu.ts).
+const removeNativeMenuPolicy = installNativeMenuPolicy();
+
 onUnmounted(() => {
+  removeNativeMenuPolicy();
+  unsubscribeBindings();
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const dispose of disposeCommands.splice(0)) dispose();
   unlistenIndexStatus?.();
+  unlistenVaultOpened?.();
   if (updatedTimer) clearTimeout(updatedTimer);
 });
 
@@ -424,10 +499,12 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         :open-path="editorDirty && store.openNote ? store.openNote : (viewing ?? store.openNote)"
         :open-dirty="editorDirty"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
+        :create-entry="createEntry"
+        :bindings="treeMenuBindings"
         @open="onTreeOpen"
         @insert-link="onInsertLink"
         @rename="onTreeRename"
-        @context-menu="onTreeContextMenu"
         @pending-listing="(p) => (pendingListing = p)"
         @removed="onTreeRemoved"
         @added="onTreeAdded"
@@ -444,6 +521,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         v-show="viewing === null"
         ref="editorRef"
         :vault-id="store.vaultId"
+        :vault-open="store.vaultOpen"
         :live-preview="livePreview"
         :commands="commands"
         placeholder="No note open."
@@ -467,7 +545,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     </aside>
   </main>
 
-  <QuickSwitcher v-if="switcherOpen" @open="onSwitcherOpen" @close="switcherOpen = false" />
+  <QuickSwitcher v-if="switcherOpen" :create-note="createNoteFromSwitcher" @open="onSwitcherOpen" @close="switcherOpen = false" />
   <CommandPalette v-if="paletteOpen" :registry="commands" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
