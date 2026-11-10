@@ -2602,8 +2602,16 @@ mod tests {
         // loop starts. Holding the hook holds the watcher's only route to the index,
         // so any row that appears while it is held came from the save's own submit,
         // and the wait for it can be as long as a loaded host needs.
-        // Mutation-verified: commenting out the `self.submit_to_index(&vault, &path)`
-        // call in `write_file` turns this red (the wait times out), not merely slow.
+        // The open's catch-up is excluded by the fresh fixture (a rebuild refuses the
+        // standalone claim), not by the hold, which only delays it up to
+        // `WALK_GATE_TIMEOUT` (5 s).
+        //
+        // Mutations: commenting out the `self.submit_to_index(&vault, &path)` call in
+        // `write_file` is caught by the `submitted` counter assertion, not by the hold.
+        // The hold-specific mutant is `handle.apply` replaced by `Ok(())` inside
+        // `submit_to_index`: the counter still moves, no row is written, and the wait
+        // times out at 10 s. With that mutant and the hold also removed, the test
+        // passes, through the watcher: which is what the hold is for.
         //
         // Reads `.serat/index.db` through rusqlite -- a connection this crate uses
         // nowhere else -- rather than through `serat_index`'s own reader, so a bug in
