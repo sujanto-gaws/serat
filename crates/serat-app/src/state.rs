@@ -2723,7 +2723,7 @@ mod tests {
     fn a_save_through_write_file_reaches_the_index_without_the_watcher() {
         // Task #90: the save path of architecture §3.1.1, landed end to end.
         //
-        // A generous deadline here would not be a test: the vault this fixture opens
+        // A generous deadline alone would not be a test: the vault this fixture opens
         // also has a *watcher* running (§3.1.2), which would eventually index the same
         // save through the ordinary filesystem-event path and write the identical row
         // -- same table, same hash, indistinguishable at rest. A first version of this
@@ -2732,50 +2732,55 @@ mod tests {
         // project has a name for (F-13, F-28, F-35, F-50, F-58): the assertion was
         // correct and the setup let the watcher answer for the path under test.
         //
-        // The fix is the one property that tells the two paths apart: the watcher
-        // cannot possibly produce a row inside `serat_vault::watch::COALESCE_WINDOW`
-        // (150 ms, §3.1 step 1) because it does not even look at the event until that
-        // window closes. So the poll below gives up well inside that window --
-        // comfortably above NFR-PRF-03's own 50 ms budget for the direct path, and
-        // comfortably below the watcher's 150 ms floor -- which is a bound the direct
-        // path can meet and the watcher path structurally cannot. Mutation-verified:
-        // commenting out the `self.submit_to_index(&vault, &path)` call in
-        // `write_file` turns this red rather than merely slow.
+        // The property that tells the two paths apart, by structure and not by time
+        // (task #111; this used to give up after 100 ms, under the watcher's 150 ms
+        // window, and failed 6 runs in 50 under load because the direct path is no
+        // faster than a starved thread): the watcher's batches are consumed on the
+        // vault thread, and the stage hook runs on that thread before the consume
+        // loop starts. Holding the hook holds the watcher's only route to the index,
+        // so any row that appears while it is held came from the save's own submit,
+        // and the wait for it can be as long as a loaded host needs.
+        // The open's catch-up is excluded by the fresh fixture (a rebuild refuses the
+        // standalone claim), not by the hold, which only delays it up to
+        // `WALK_GATE_TIMEOUT` (5 s).
+        //
+        // Mutations: commenting out the `self.submit_to_index(&vault, &path)` call in
+        // `write_file` is caught by the `submitted` counter assertion, not by the hold.
+        // The hold-specific mutant is `handle.apply` replaced by `Ok(())` inside
+        // `submit_to_index`: the counter still moves, no row is written, and the wait
+        // times out at 10 s. With that mutant and the hold also removed, the test
+        // passes, through the watcher: which is what the hold is for.
         //
         // Reads `.serat/index.db` through rusqlite -- a connection this crate uses
         // nowhere else -- rather than through `serat_index`'s own reader, so a bug in
         // the wiring cannot also hide the assertion meant to catch it (Cargo.toml's
         // dev-dependency comment).
-        const GIVES_UP_BEFORE_THE_WATCHER_COULD_ANSWER: Duration = Duration::from_millis(100);
-        assert!(
-            GIVES_UP_BEFORE_THE_WATCHER_COULD_ANSWER < serat_vault::watch::COALESCE_WINDOW,
-            "the deadline must stay under the watcher's own coalescing window, or a slow \
-             watcher answering in time would pass this test for the wrong reason"
-        );
-
+        let (release, held_until) = std::sync::mpsc::channel::<()>();
+        let held_until = Mutex::new(held_until);
         let dir = fixture("save-reaches-index");
-        let state = state(&dir);
+        let state = state_with(OpenHooks {
+            on_stage: Some(Arc::new(move |stage| {
+                if stage == Stage::WatcherRegistered {
+                    // Returns when the sender is dropped.
+                    let _ = held_until.lock().expect("hold").recv();
+                }
+            })),
+            on_walk_start: None,
+            ..OpenHooks::default()
+        });
+        // Re-bound after `state` so that, on a failed assertion, the sender drops (and
+        // frees the held vault thread) before `state` does: locals drop in reverse
+        // order, and `state`'s drop joins that thread.
+        let release = release;
+        state.open_vault(open_args(&dir)).expect("open");
 
-        // Wait for the fixture's own initial rebuild to settle before writing. Skipping
-        // this is what let the first version of this test pass under the mutation
-        // above for the wrong reason: on a vault this small the rebuild can still be
-        // reading `serat.md` off disk when `write_file` below overwrites it, so the
-        // rebuild itself sometimes indexed the *new* bytes and the test could not tell
-        // that from `submit_to_index` having done it. Once the vault is `Ready`, the
-        // rebuild is done reading, and only the write below can produce a fresh hash.
-        let ready_by = Instant::now() + Duration::from_secs(2);
-        while !matches!(state.index_status().state, IndexState::Ready { .. }) {
-            assert!(
-                Instant::now() < ready_by,
-                "the fixture vault never reached IndexState::Ready"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // `Ready` publishes slightly before the `IndexHandleSlot` is filled
-        // (index.rs's own doc comment on the type), a gap of at most a couple of
-        // instructions on the same thread. This slack is setup, not measurement --
-        // the 100ms deadline below starts only once the write happens.
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait for the fixture's own initial rebuild to settle before writing: on a
+        // vault this small the rebuild can still be reading `serat.md` when
+        // `write_file` overwrites it, and then the rebuild itself indexes the new bytes
+        // and the test cannot tell that from `submit_to_index` having done it. `Ready`
+        // is published only once the handle slot is filled (#119), so no settling sleep
+        // follows it.
+        wait_ready(&state);
 
         let read = state
             .read_file(ReadFileArgs {
@@ -2814,33 +2819,35 @@ mod tests {
         // product path. It is not a substitute for design goal 2: nothing here is on
         // `write_file`'s own call stack.
         let index_db = dir.join(".serat").join("index.db");
-        let deadline = Instant::now() + GIVES_UP_BEFORE_THE_WATCHER_COULD_ANSWER;
         let mut seen_hash = None;
-        while Instant::now() < deadline {
-            if let Ok(conn) = rusqlite::Connection::open(&index_db) {
-                let row: rusqlite::Result<String> = conn.query_row(
-                    "SELECT hash FROM notes WHERE path = ?1",
-                    ["10-projects/serat.md"],
-                    |row| row.get(0),
-                );
-                if let Ok(hash) = row
-                    && hash == written.hash
-                {
-                    seen_hash = Some(hash);
-                    break;
+        wait_until(
+            "the save's own row in .serat/index.db (watcher held)",
+            || {
+                if let Ok(conn) = rusqlite::Connection::open(&index_db) {
+                    let row: rusqlite::Result<String> = conn.query_row(
+                        "SELECT hash FROM notes WHERE path = ?1",
+                        ["10-projects/serat.md"],
+                        |row| row.get(0),
+                    );
+                    if let Ok(hash) = row
+                        && hash == written.hash
+                    {
+                        seen_hash = Some(hash);
+                        return true;
+                    }
                 }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
+                false
+            },
+        );
         assert_eq!(
-            seen_hash,
-            Some(written.hash),
-            "a note saved through write_file must reach .serat/index.db well inside the \
-             watcher's own 150ms coalescing window, carrying the hash write_file itself \
-             returned -- which only the direct submit path in `write_file` can manage"
+            seen_hash.as_deref(),
+            Some(written.hash.as_str()),
+            "the row carries the hash write_file itself returned"
         );
 
+        // Let the watcher through; the close must not wait on a held vault thread.
+        drop(release);
+        state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
