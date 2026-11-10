@@ -1050,52 +1050,15 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_bumped_after_prepare_but_before_the_first_step_stops_the_statement() {
-        let (_dir, path) = db_with(20_000);
-        let sc = SearchConn::open(&path).expect("search conn");
-        let reader = reader_on(&path, &sc);
-        let before = sc.handler_calls.load(Ordering::SeqCst);
-        let t = Instant::now();
-        assert!(is_hits(&reader.search("commonword", 0, 50).unwrap()));
-        let full = t.elapsed();
-        let full_run_calls = sc.handler_calls.load(Ordering::SeqCst) - before;
-        assert!(
-            full_run_calls > 2,
-            "fixture too small: {full_run_calls} calls"
-        );
-        // The interrupt() that would have stopped it "arrived early": only the
-        // generation moved. The progress handler must still stop the statement.
-        let latest = sc.latest.clone();
-        *sc.after_prepare.lock().unwrap() = Some(Box::new(move || {
-            latest.fetch_add(1, Ordering::SeqCst);
-        }));
-        let before = sc.handler_calls.load(Ordering::SeqCst);
-        let t = Instant::now();
-        assert_eq!(
-            reader.search("commonword", 0, 50).unwrap(),
-            SearchOutcome::Superseded
-        );
-        // Counted, not timed (task #107): the property is "within two handler calls",
-        // and a loaded host stretches wall time without touching it.
-        let calls = sc.handler_calls.load(Ordering::SeqCst) - before;
-        eprintln!(
-            "stopped after {calls} handler call(s) in {:?}; a full run is {full_run_calls} \
-             calls in {full:?}",
-            t.elapsed()
-        );
-        assert!(
-            (1..=2).contains(&calls),
-            "{calls} handler calls after the generation moved before the first step; the \
-             bound is 2 (20,000 VM steps)"
-        );
-    }
-
-    #[test]
     fn a_superseded_statement_stops_within_two_handler_calls() {
         // Deterministic bound (architecture 4.5): once the generation moves, the
         // statement stops within two handler calls, which is at most 20,000 VM steps.
         // Counted through the test hook, so CI load cannot fail it. Wall clock is
-        // reported, not asserted (task #107: 140 ms at load 29 after one call).
+        // reported, not asserted (task #107: 140 ms at load 29 after one call). The
+        // generation moves after prepare and before the first step, as when an
+        // interrupt() "arrived early" and only the generation carries the news: the
+        // progress handler must still stop the statement (this subsumes the former
+        // a_generation_bumped_after_prepare... test, merged by #107).
         let (_dir, path) = db_with(20_000);
         let sc = SearchConn::open(&path).expect("search conn");
         let reader = reader_on(&path, &sc);

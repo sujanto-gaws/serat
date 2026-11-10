@@ -135,6 +135,8 @@ impl Vault {
     /// As [`Vault::open`].
     pub fn with_rules(root: impl AsRef<Path>, ignore: IgnoreRules) -> Result<Self, VaultError> {
         let root = root.as_ref();
+        // The root is canonicalised once, at open: not a per-entry cost (F-12).
+        #[allow(clippy::disallowed_methods)]
         let canonical =
             fs::canonicalize(root).map_err(|err| VaultError::io(display(root), &err))?;
         if !canonical.is_dir() {
@@ -852,6 +854,7 @@ fn is_contained(root: &Path, candidate: &Path) -> bool {
 /// `fs::canonicalize`, counted per thread under test: the one place `relativise` touches
 /// the disk, so a test can pin "the walk does not call it per entry" by count and not by
 /// wall time (task #107; F-12).
+#[allow(clippy::disallowed_methods)]
 fn canonicalize_counted(path: &Path) -> std::io::Result<PathBuf> {
     #[cfg(test)]
     CANONICALISE_CALLS.with(|calls| calls.set(calls.get() + 1));
