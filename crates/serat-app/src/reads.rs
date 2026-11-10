@@ -188,10 +188,27 @@ pub fn read_when_ready<T>(
 
 /// The core's outcome in the contract's terms.
 #[must_use]
-pub fn map_outcome(outcome: read::SearchOutcome) -> SearchOutcome {
+///
+/// `stat` answers for a vault-relative path (see [`StatResult`]). It is called for at most
+/// [`STAT_HITS_PER_PAGE`] hits; see [`changed_since_indexed`].
+pub fn map_outcome(
+    outcome: read::SearchOutcome,
+    stat: &dyn Fn(&str) -> StatResult,
+) -> SearchOutcome {
     match outcome {
         read::SearchOutcome::Hits(hits) => SearchOutcome::Hits {
-            items: hits.into_iter().map(map_hit).collect(),
+            items: hits
+                .into_iter()
+                .enumerate()
+                .map(|(i, hit)| {
+                    let changed = if i < STAT_HITS_PER_PAGE {
+                        changed_since_indexed(&hit, stat)
+                    } else {
+                        None
+                    };
+                    map_hit(hit, changed)
+                })
+                .collect(),
         },
         read::SearchOutcome::NothingToSearch => SearchOutcome::NothingToSearch,
         read::SearchOutcome::TooManyPropertyTerms => SearchOutcome::TooManyPropertyTerms,
@@ -200,7 +217,73 @@ pub fn map_outcome(outcome: read::SearchOutcome) -> SearchOutcome {
     }
 }
 
-fn map_hit(hit: read::SearchHit) -> SearchHit {
+/// What one stat of a hit's file came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatResult {
+    /// `(mtime_ms, size)`.
+    Got(i64, u64),
+    /// The stat failed (gone, unreadable, escapes the vault): not what was indexed.
+    Failed,
+    /// Not attempted: the deadline passed or the search was superseded.
+    Skipped,
+}
+
+/// The whole stat phase's budget (task #88): on a cold network share each stat can
+/// cost ~10 ms, and the phase runs on the blocking thread after R1 has returned.
+pub const STAT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Wrap `stat` so that it stops at `deadline` from now, or once `superseded()` is true;
+/// every hit after that is [`StatResult::Skipped`] and stays `None`.
+pub fn budgeted_stat<'a>(
+    deadline: std::time::Duration,
+    superseded: impl Fn() -> bool + 'a,
+    stat: impl Fn(&str) -> StatResult + 'a,
+) -> impl Fn(&str) -> StatResult + 'a {
+    let cutoff = std::time::Instant::now() + deadline;
+    let stopped = std::cell::Cell::new(false);
+    move |path| {
+        if !stopped.get() && (std::time::Instant::now() >= cutoff || superseded()) {
+            stopped.set(true);
+        }
+        if stopped.get() {
+            StatResult::Skipped
+        } else {
+            stat(path)
+        }
+    }
+}
+
+/// The most hits per page that are stat-ed: R1's ceiling (architecture §4.5).
+pub const STAT_HITS_PER_PAGE: usize = 50;
+
+/// Whether a hit's file differs from what the index recorded, from one stat
+/// (task #88, FR-NAV-02, US-05; the ruling in architecture §4.5).
+///
+/// `Some(mtime != row.mtime || size != row.size)`: the catch-up's own comparator, over
+/// the same millisecond conversion as the walk (`Vault::stat`). A failed stat (the file
+/// vanished, or cannot be read) is `Some(true)`: it is not what was indexed, which is the
+/// honest answer to the hint (architecture §4.5). `None` only when the hit has no block
+/// (a property-only hit is never stat-ed); the caller also leaves hits beyond
+/// [`STAT_HITS_PER_PAGE`] at `None`.
+///
+/// **It is a hint, not a verdict.** A false positive: a `touch`, or a checkout that
+/// rewrites identical bytes, moves the mtime and reads `Some(true)`. A false negative:
+/// an edit that keeps both size and mtime (a same-size rewrite inside one coarse mtime
+/// tick) reads `Some(false)`. Neither presents a wrong line as exact, because the
+/// authority is the hash check at open, which compares `BlockLocation::note_hash` with
+/// the bytes it reads.
+fn changed_since_indexed(hit: &read::SearchHit, stat: &dyn Fn(&str) -> StatResult) -> Option<bool> {
+    hit.block.as_ref()?;
+    let indexed = hit.indexed?;
+    let (mtime_ms, size) = match stat(&hit.path) {
+        StatResult::Got(mtime_ms, size) => (mtime_ms, size),
+        StatResult::Failed => return Some(true),
+        StatResult::Skipped => return None,
+    };
+    Some(mtime_ms != indexed.mtime_ms || i64::try_from(size).unwrap_or(i64::MAX) != indexed.size)
+}
+
+fn map_hit(hit: read::SearchHit, changed_since_indexed: Option<bool>) -> SearchHit {
     SearchHit {
         path: hit.path,
         title: hit.title,
@@ -209,9 +292,7 @@ fn map_hit(hit: read::SearchHit) -> SearchHit {
         sidecar_path: hit.sidecar_path,
         block: hit.block.map(map_block),
         snippet: hit.snippet,
-        // Contract ahead of implementation (task #79): filled by the follow-up that
-        // stats each hit against notes.mtime/size. None = "not computed".
-        changed_since_indexed: None,
+        changed_since_indexed,
     }
 }
 
@@ -252,9 +333,180 @@ mod tests {
     #[test]
     fn superseded_maps_through_unchanged() {
         assert!(matches!(
-            map_outcome(read::SearchOutcome::Superseded),
+            map_outcome(read::SearchOutcome::Superseded, &|_| StatResult::Skipped),
             SearchOutcome::Superseded
         ));
+    }
+
+    // ---- changed_since_indexed (task #88; FR-NAV-02, US-05) ----
+    //
+    // The stat is the real `Vault::stat` over real files; only the index row is
+    // fabricated, because a running watcher would otherwise re-index the edit.
+
+    use serat_core::VaultPath;
+    use serat_vault::Vault;
+    use std::time::{Duration, SystemTime};
+
+    fn hit(path: &str, indexed: (i64, u64), with_block: bool) -> read::SearchHit {
+        read::SearchHit {
+            path: path.to_owned(),
+            title: None,
+            kind: HitKind::Note,
+            mime: None,
+            sidecar_path: None,
+            block: with_block.then(|| read::BlockLocation {
+                block_id: 1,
+                ord: 0,
+                heading_path: None,
+                byte_start: 0,
+                byte_end: 1,
+                note_hash: "h".into(),
+            }),
+            snippet: None,
+            rank: Some(0.0),
+            indexed: Some(read::IndexedStat {
+                mtime_ms: indexed.0,
+                size: i64::try_from(indexed.1).expect("size"),
+            }),
+        }
+    }
+
+    fn vault_stat(vault: &Vault, p: &str) -> StatResult {
+        match VaultPath::new(p).ok().and_then(|p| vault.stat(&p).ok()) {
+            Some((m, s)) => StatResult::Got(m, s),
+            None => StatResult::Failed,
+        }
+    }
+
+    #[test]
+    fn hits_after_the_deadline_or_a_supersession_are_not_stat_ed() {
+        let slow = |_: &str| {
+            std::thread::sleep(Duration::from_millis(30));
+            StatResult::Got(0, 0)
+        };
+        let budgeted = budgeted_stat(Duration::from_millis(50), || false, slow);
+        let got: Vec<_> = (0..10).map(|_| budgeted("a.md")).collect();
+        assert!(got[0] == StatResult::Got(0, 0), "the first runs");
+        assert!(
+            got[3..].iter().all(|r| *r == StatResult::Skipped),
+            "after the cutoff nothing is stat-ed: {got:?}"
+        );
+
+        let flag = std::cell::Cell::new(false);
+        let budgeted = budgeted_stat(
+            Duration::from_secs(60),
+            || flag.get(),
+            |_| StatResult::Failed,
+        );
+        assert_eq!(budgeted("a.md"), StatResult::Failed);
+        flag.set(true);
+        assert_eq!(budgeted("a.md"), StatResult::Skipped);
+        flag.set(false);
+        assert_eq!(budgeted("a.md"), StatResult::Skipped, "stays stopped");
+    }
+
+    fn flags(vault: &Vault, hits: Vec<read::SearchHit>) -> Vec<Option<bool>> {
+        let stat = |p: &str| vault_stat(vault, p);
+        match map_outcome(read::SearchOutcome::Hits(hits), &stat) {
+            SearchOutcome::Hits { items } => {
+                items.into_iter().map(|h| h.changed_since_indexed).collect()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn set_mtime(path: &Path, to: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(to)
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn staleness_follows_the_catch_ups_comparator() {
+        let dir = tempfile::tempdir().expect("dir");
+        let vault = Vault::open(dir.path()).expect("vault");
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "aaaa").expect("write");
+        let stat = |v: &Vault| {
+            v.stat(&VaultPath::new("a.md").expect("path"))
+                .expect("stat")
+        };
+        let indexed = stat(&vault);
+
+        // Untouched.
+        assert_eq!(
+            flags(&vault, vec![hit("a.md", indexed, true)]),
+            [Some(false)]
+        );
+
+        // Same size, bumped mtime, different bytes.
+        std::fs::write(&file, "bbbb").expect("rewrite");
+        set_mtime(&file, SystemTime::now() + Duration::from_secs(10));
+        assert_eq!(
+            flags(&vault, vec![hit("a.md", indexed, true)]),
+            [Some(true)]
+        );
+
+        // Touched, identical bytes: the documented false positive.
+        std::fs::write(&file, "aaaa").expect("restore");
+        set_mtime(&file, SystemTime::now() + Duration::from_secs(20));
+        assert_eq!(
+            flags(&vault, vec![hit("a.md", indexed, true)]),
+            [Some(true)]
+        );
+
+        // Edited with the same size and the same mtime: the documented false negative.
+        std::fs::write(&file, "cccc").expect("edit");
+        set_mtime(
+            &file,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(indexed.0.unsigned_abs()),
+        );
+        assert_eq!(
+            flags(&vault, vec![hit("a.md", indexed, true)]),
+            [Some(false)]
+        );
+
+        // A different size is a change whatever the mtime says.
+        std::fs::write(&file, "longer").expect("grow");
+        set_mtime(
+            &file,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(indexed.0.unsigned_abs()),
+        );
+        assert_eq!(
+            flags(&vault, vec![hit("a.md", indexed, true)]),
+            [Some(true)]
+        );
+    }
+
+    #[test]
+    fn the_51st_hit_and_a_blockless_hit_are_none_and_a_vanished_file_is_changed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let vault = Vault::open(dir.path()).expect("vault");
+        std::fs::write(dir.path().join("a.md"), "aaaa").expect("write");
+        let indexed = vault
+            .stat(&VaultPath::new("a.md").expect("path"))
+            .expect("stat");
+
+        let mut hits: Vec<_> = (0..STAT_HITS_PER_PAGE + 1)
+            .map(|_| hit("a.md", indexed, true))
+            .collect();
+        hits.push(hit("gone.md", indexed, true));
+        hits.push(hit("a.md", indexed, false));
+        let got = flags(&vault, hits);
+        assert!(got[..STAT_HITS_PER_PAGE].iter().all(|f| *f == Some(false)));
+        assert_eq!(got[STAT_HITS_PER_PAGE], None, "the 51st hit is not stat-ed");
+        assert_eq!(got[STAT_HITS_PER_PAGE + 1], None, "beyond 50, even if gone");
+        assert_eq!(got[STAT_HITS_PER_PAGE + 2], None);
+
+        // Within the first 50: a vanished file is Some(true), a blockless hit None.
+        let got = flags(
+            &vault,
+            vec![hit("gone.md", indexed, true), hit("a.md", indexed, false)],
+        );
+        assert_eq!(got, [Some(true), None]);
     }
 
     fn make_db(db: &Path) {

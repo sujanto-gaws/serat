@@ -29,10 +29,8 @@ sidecar_path: string | null,
  * mtime of the opened handle, ADR-0017 step 10). Opaque, compared for
  * equality only. The PDF transport passes it back as
  * `ReadAssetRangeArgs::if_match` on every span (ADR-0017 Amendment 1).
- * `None` (absent) when not computed.
+ * `None` (absent) for an asset the scheme will not serve (`viewable` is false).
  *
- * **Contract ahead of implementation** (task #94). It is filled by the
- * follow-up `[P1/impl] Validator check on read_asset_range` (tauri-app-dev),
- * which reuses `asset.rs`'s existing `etag`.
+ * Implemented by task #98, reusing `asset.rs`'s `etag`.
  */
 etag?: string, };

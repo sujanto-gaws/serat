@@ -113,6 +113,19 @@ pub struct SearchHit {
     /// FTS5's BM25 rank (lower is better) for a full-text hit; `None` for a
     /// property-only hit.
     pub rank: Option<f64>,
+    /// `notes.mtime` (ms) and `notes.size` of the note the block belongs to, as indexed:
+    /// what a stat is compared with to say a hit may be stale (task #88, architecture
+    /// §4.5). `None` for a property-only hit, which has no block and is never stat-ed.
+    pub indexed: Option<IndexedStat>,
+}
+
+/// `notes.mtime` and `notes.size` as the index holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedStat {
+    /// Milliseconds since the epoch, as serat-vault's walk records it.
+    pub mtime_ms: i64,
+    /// Bytes.
+    pub size: i64,
 }
 
 /// One backlink entry.
@@ -274,7 +287,7 @@ macro_rules! r1 {
             "SELECT n.path, n.title, n.hash, b.id, b.ord, b.heading_path,
                     b.byte_start, b.byte_end,
                     snippet(blocks_fts, 0, char(2), char(3), '…', 16),
-                    blocks_fts.rank
+                    blocks_fts.rank, n.mtime, n.size
                FROM blocks_fts
                JOIN blocks b ON b.id = blocks_fts.rowid
                JOIN notes n ON n.id = b.note_id
@@ -565,6 +578,7 @@ impl Reader {
                 block: None,
                 snippet: None,
                 rank: None,
+                indexed: None,
             });
         }
         Ok(hits)
@@ -924,6 +938,10 @@ fn r1_on(
             }),
             snippet: row.get(8)?,
             rank: row.get(9)?,
+            indexed: Some(IndexedStat {
+                mtime_ms: row.get(10)?,
+                size: row.get(11)?,
+            }),
         });
     }
     Ok(hits)
