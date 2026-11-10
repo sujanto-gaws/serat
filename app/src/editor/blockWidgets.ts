@@ -471,11 +471,28 @@ function mergeSpans(spans: Span[]): Span[] {
 
 /** Recomputes decorations only within `region`, splicing the result into
  * `deco` (which must already have nothing else inside `region`). */
-function replaceRegion(deco: DecorationSet, state: EditorState, region: Span, selectedLines: ReadonlySet<number>): DecorationSet {
-  const kept = deco.update({
-    filter: (from, to) => to <= region.from || from >= region.to,
+function replaceRegion(deco: DecorationSet, state: EditorState, region0: Span, selectedLines: ReadonlySet<number>): DecorationSet {
+  // Widen the region to every existing decoration it overlaps or touches before walking: a
+  // block cut short at its end (a table's last row deleted) leaves the change point in the
+  // blank line after it, so the walk over the bare region never reaches the shortened block
+  // while the filter below still drops its mapped widget.
+  const region = { ...region0 };
+  deco.between(region0.from, region0.to, (from, to) => {
+    if (from < region.from) region.from = from;
+    if (to > region.to) region.to = to;
   });
   const fresh = decorationsInRange(state, region.from, region.to, selectedLines);
+  // The tree walk also reports blocks that merely touch the region's edge. Such a block
+  // may already be in `deco` (kept by the strict test below), so a fresh one at the same
+  // span replaces it instead of doubling it. A widget whose text was deleted collapses to
+  // an empty span when mapped; no widget is ever empty, so those are dropped too.
+  const freshSpans = new Set(fresh.map((f) => `${f.from}:${f.to}`));
+  // A widget that touches the region's edge is not trusted either: a change at that edge
+  // may have turned it into something else (a callout losing its header), and the walk
+  // above is edge-inclusive, so it is found again if it is still a widget.
+  const kept = deco.update({
+    filter: (from, to) => from < to && (to < region.from || from > region.to) && !freshSpans.has(`${from}:${to}`),
+  });
   if (fresh.length === 0) {
     return kept;
   }
@@ -493,9 +510,17 @@ export function growthRegion(examined: number, treeLength: number): Span | null 
 function computeDirtyRegions(tr: Transaction, examined: number): Span[] {
   const regions: Span[] = [];
   if (tr.docChanged) {
+    // Both ends of every change, both sides of each (a deletion before a block moves
+    // that block to the change point; a first or last character resolves to the
+    // neighbour on one side only), plus every block the inserted text spans (a pasted
+    // table, a multi-block replace). A single-character insert (ordinary typing) skips
+    // the range walk: it can only touch the blocks at its two ends, so its cost stays
+    // O(depth) and every unrelated widget keeps its object (NFR-PRF-02).
     tr.changes.iterChanges((_fromA, _toA, fromB, toB) => {
-      const region = enclosingTopLevelBlock(tr.state, fromB);
-      regions.push(region ?? { from: fromB, to: Math.max(toB, fromB + 1) });
+      const touched = [...touchedTopLevelBlocks(tr.state, fromB), ...touchedTopLevelBlocks(tr.state, toB)];
+      if (touched.length === 0) touched.push({ from: fromB, to: Math.max(toB, fromB + 1) });
+      regions.push(...touched);
+      if (toB - fromB > 1) regions.push(...blocksIntersecting(tr.state, fromB, toB));
     });
   }
   // CodeMirror parses a long note in time-sliced chunks, and cuts the tree
