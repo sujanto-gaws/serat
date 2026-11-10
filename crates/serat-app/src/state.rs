@@ -338,7 +338,7 @@ struct OpenAttempt {
     publisher: Arc<Publisher>,
     index: Arc<ActorCell>,
     registry: Arc<DetachedWriters>,
-    root: PathBuf,
+    root: Option<serat_vault::FileIdentity>,
     deadline: std::time::Duration,
     armed: bool,
 }
@@ -354,7 +354,7 @@ impl Drop for OpenAttempt {
         if self.armed {
             self.publisher.retire();
             if let Some(mut actor) = self.index.cancel() {
-                actor.join_or_register(self.deadline, &self.root, &self.registry);
+                actor.join_or_register(self.deadline, self.root, &self.registry);
             }
         }
     }
@@ -411,7 +411,7 @@ impl OpenVault {
         // outlived its vault with nothing recording it (task #96). It is registered so
         // a re-open of this root waits for it; nothing here waits for it.
         if let Some(mut actor) = self.index.cancel() {
-            actor.detach_into(self.vault.root(), detached);
+            actor.detach_into(self.vault.identity(), detached);
         }
         self.switcher.shut_down();
         let handle = self
@@ -693,6 +693,14 @@ impl AppState {
         self
     }
 
+    /// Whether the open vault's indexer owes a whole-vault rescan, for tests.
+    #[cfg(test)]
+    pub(crate) fn rescan_owed(&self) -> bool {
+        self.open_lock()
+            .as_ref()
+            .is_some_and(|open| open.indexer.rescan_owed())
+    }
+
     /// Detached index actors still live, for tests.
     #[cfg(test)]
     pub(crate) fn detached_writers(&self) -> Arc<DetachedWriters> {
@@ -795,7 +803,7 @@ impl AppState {
             publisher: Arc::clone(&publisher),
             index: Arc::clone(&index_cell),
             registry: Arc::clone(&self.detached),
-            root: root.clone(),
+            root: vault.identity(),
             deadline: self.actor_deadline,
             armed: true,
         };
@@ -817,7 +825,7 @@ impl AppState {
         let blocker = if skip_check {
             None
         } else {
-            self.detached.live(&root)
+            self.detached.live(vault.identity())
         };
         let catch_up_gate = Arc::new(if blocker.is_some() {
             OpenCatchUp::awaiting_actor(self.settle_bound, TREE_GRACE)
@@ -5516,6 +5524,99 @@ mod tests {
         wait_ready(&second);
         wait_until("the catch-up walk", || {
             !walks.lock().expect("walks").is_empty()
+        });
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state that closed a vault whose actor (holding `hold_ms`) is still running, and
+    /// a second state on the same registry with a short settle bound.
+    fn detached_pair(
+        name: &str,
+        hold_ms: u64,
+        bound_ms: u64,
+    ) -> (AppState, AppState, PathBuf, Counting) {
+        let dir = fixture(name);
+        let slow = counting(hold_ms);
+        let first = plain_state(Duration::from_secs(5));
+        first
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                slow.clone(),
+            )
+            .expect("open");
+        first.close_vault();
+        assert_eq!(first.detached_writers().live_count(), 1);
+        let second = plain_state(Duration::from_secs(5))
+            .with_detached(first.detached_writers())
+            .with_settle_bound(Duration::from_millis(bound_ms));
+        (first, second, dir, slow)
+    }
+
+    #[test]
+    fn a_deferred_reopen_populates_the_tree_without_waiting_for_the_detached_actor() {
+        // Review B1 (round 2): the tree's claim must not sit behind an actor that does
+        // not exist yet. The detached actor holds 2.5 s; the tree must settle well
+        // inside FR-VLT-01's 2 s while it is still live, and the catch-up it was
+        // refused is owed as a rescan, which runs once the real actor is up.
+        let (first, second, dir, _slow) = detached_pair("detached-tree", 2500, 30_000);
+        let started = Instant::now();
+        let opened = second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                SeratIndexOpen::default(),
+            )
+            .expect("re-open");
+        assert_eq!(opened.index, IndexState::Opening);
+        let (send, log) = collecting_sender();
+        second.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the tree waited {:?} for the detached actor",
+            started.elapsed()
+        );
+        assert_eq!(
+            first.detached_writers().live_count(),
+            1,
+            "the detached actor must still be live when the tree settled"
+        );
+        assert!(
+            second.rescan_owed(),
+            "the refused catch-up is owed as a rescan"
+        );
+        wait_ready(&second);
+        wait_until("the owed rescan to run", || !second.rescan_owed());
+        second.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_catch_up_that_never_settles_owes_a_rescan() {
+        // Review S1: pins `on_unsettled` -> `Indexer::owe_rescan`. The deferred actor
+        // starts but publishes nothing for 1.5 s; the bound is 100 ms. Removing the
+        // `on_unsettled` wiring in `open_vault_with`, or making `owe_rescan` a no-op,
+        // leaves the flag false and fails this test (both mutants run by hand).
+        let (_first, second, dir, slow) = detached_pair("detached-unsettled", 400, 100);
+        let silent = Counting {
+            hold: Duration::from_millis(1500),
+            rebuild: false,
+            ..slow
+        };
+        second
+            .open_vault_with(
+                OpenVaultArgs {
+                    root: dir.display().to_string(),
+                },
+                silent,
+            )
+            .expect("re-open");
+        wait_until("the unsettled claim to owe a rescan", || {
+            second.rescan_owed()
         });
         second.close_vault();
         let _ = std::fs::remove_dir_all(&dir);

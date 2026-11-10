@@ -578,66 +578,67 @@ impl Drop for ExitFlag {
 /// open the same `index.db`. An entry is dropped the first time it is looked up after
 /// its flag has fired.
 ///
-/// Keyed by the root's **file identity** (device and inode, or volume serial and file
-/// index; `same_file::Handle`), not by its path, so a case-insensitive mount or a bind
-/// mount that reaches one directory by two names still has one key. The index is always
-/// `<root>/.serat/index.db`, so one root is one index; the root is used rather than
-/// `.serat` because `.serat` may not exist yet when an actor is registered.
+/// Keyed by the root's **file identity** ([`serat_vault::FileIdentity`], read once by
+/// `Vault::open`; a value, no handle is kept), not by its path, so a case-insensitive
+/// mount or a bind mount that reaches one directory by two names still has one key. The
+/// index is always `<root>/.serat/index.db`, so one root is one index; the root is used
+/// rather than `.serat` because `.serat` may not exist yet when an actor is registered.
+/// Fired entries are pruned on every `register`, `live` and `live_count`.
 ///
 /// **Limits.** The registry is per process: nothing stops a second *Serat process* from
-/// opening the same vault, and no single-instance lock exists. If the identity of a root
-/// cannot be read (it vanished), the actor is not recorded and a log line says so.
+/// opening the same vault, and no single-instance lock exists. If a platform cannot give
+/// an identity, the actor is not recorded and a log line says so.
 #[derive(Debug, Default)]
 pub struct DetachedWriters {
-    by_root: Mutex<std::collections::HashMap<same_file::Handle, Vec<Arc<AtomicBool>>>>,
+    by_root: Mutex<std::collections::HashMap<serat_vault::FileIdentity, Vec<Arc<AtomicBool>>>>,
 }
 
 impl DetachedWriters {
     /// Record an actor that has not exited.
-    pub fn register(&self, root: &Path, exited: Arc<AtomicBool>) {
-        let Ok(key) = same_file::Handle::from_path(root) else {
+    pub fn register(&self, root: Option<serat_vault::FileIdentity>, exited: Arc<AtomicBool>) {
+        let Some(key) = root else {
             eprintln!(
-                "serat: {} cannot be identified; a detached index thread is not recorded",
-                root.display()
+                "serat: a vault root cannot be identified; a detached index thread is not recorded"
             );
             return;
         };
-        self.by_root
+        let mut map = self
+            .by_root
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_default()
-            .push(exited);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::prune(&mut map);
+        map.entry(key).or_default().push(exited);
+    }
+
+    fn prune(map: &mut std::collections::HashMap<serat_vault::FileIdentity, Vec<Arc<AtomicBool>>>) {
+        map.retain(|_, flags| {
+            flags.retain(|f| !f.load(Ordering::SeqCst));
+            !flags.is_empty()
+        });
     }
 
     /// A flag that fires when the last live detached actor on `root`'s index has
     /// exited, or `None` if none is live.
     #[must_use]
-    pub fn live(&self, root: &Path) -> Option<DetachedWait> {
-        let key = same_file::Handle::from_path(root).ok()?;
+    pub fn live(&self, root: Option<serat_vault::FileIdentity>) -> Option<DetachedWait> {
+        let key = root?;
         let mut map = self
             .by_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let flags = map.get_mut(&key)?;
-        flags.retain(|f| !f.load(Ordering::SeqCst));
-        if flags.is_empty() {
-            map.remove(&key);
-            return None;
-        }
-        Some(DetachedWait(flags.clone()))
+        Self::prune(&mut map);
+        Some(DetachedWait(map.get(&key)?.clone()))
     }
 
     /// How many detached actors are live. For tests and diagnostics.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.by_root
+        let mut map = self
+            .by_root
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .flatten()
-            .filter(|f| !f.load(Ordering::SeqCst))
-            .count()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::prune(&mut map);
+        map.values().map(Vec::len).sum()
     }
 }
 
@@ -809,7 +810,11 @@ impl IndexActor {
 
     /// Hand an actor that may still be running to `registry` without waiting for it.
     /// Returns whether it had already finished.
-    pub fn detach_into(&mut self, root: &Path, registry: &DetachedWriters) -> bool {
+    pub fn detach_into(
+        &mut self,
+        root: Option<serat_vault::FileIdentity>,
+        registry: &DetachedWriters,
+    ) -> bool {
         if self.exited.load(Ordering::SeqCst) {
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
@@ -826,7 +831,7 @@ impl IndexActor {
     pub fn join_or_register(
         &mut self,
         deadline: Duration,
-        root: &Path,
+        root: Option<serat_vault::FileIdentity>,
         registry: &DetachedWriters,
     ) -> bool {
         if self.join_within(deadline) {

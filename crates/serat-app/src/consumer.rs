@@ -325,6 +325,18 @@ impl OpenCatchUp {
         Self::build(bound, grace)
     }
 
+    /// Run the unsettled callback: the open's catch-up did not happen.
+    fn owe(&self) {
+        if let Some(owe) = self
+            .on_unsettled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            (owe.0)();
+        }
+    }
+
     /// The index actor now exists; claimants' settle clocks start.
     pub fn actor_started(&self) {
         self.actor_started.set();
@@ -412,8 +424,16 @@ impl OpenCatchUp {
     }
 
     fn claim_inner(&self, from_tree: bool, wait_for_tree: bool, bench_walk: bool) -> bool {
-        // Unbounded by design: it ends when the actor is spawned, when its spawn failed
-        // (the caller starts it regardless) or at the vault's cancel.
+        // The tree never waits for an actor that does not exist yet (FR-VLT-01's 2 s,
+        // goal 5): it is refused at once and walks name-and-kind only, and the
+        // catch-up it would have fed is owed as a rescan.
+        if from_tree && !self.actor_started.is_set() {
+            self.owe();
+            return false;
+        }
+        // The application's own trigger runs on a thread of its own and may wait: this
+        // ends when the actor is spawned, when its spawn failed (the caller starts it
+        // regardless) or at the vault's cancel.
         while !self.actor_started.wait(Duration::from_secs(1)) {}
         if !self.settled.wait(self.bound) {
             eprintln!(
@@ -421,14 +441,7 @@ impl OpenCatchUp {
                  as a rescan",
                 self.bound
             );
-            if let Some(owe) = self
-                .on_unsettled
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-            {
-                (owe.0)();
-            }
+            self.owe();
             return false;
         }
         let mut claim = self.lock();
@@ -716,6 +729,12 @@ impl Indexer {
     /// it predates the watcher ([`Indexer::window_opened`]).
     pub fn walk_started(&self) {
         *self.journal() = Some(Journal::default());
+    }
+
+    /// Whether a whole-vault rescan is owed. For tests.
+    #[cfg(test)]
+    pub(crate) fn rescan_owed(&self) -> bool {
+        self.deferred().rescan
     }
 
     /// Record that the open's catch-up did not run and a rescan is owed.

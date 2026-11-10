@@ -3212,7 +3212,6 @@ dependencies = [
  "filepath",
  "libc",
  "rusqlite",
- "same-file",
  "serat-core",
  "serat-index",
  "serat-parse",
@@ -3274,6 +3273,7 @@ dependencies = [
  "notify",
  "serat-core",
  "tempfile",
+ "winapi-util",
 ]
 
 [[package]]
