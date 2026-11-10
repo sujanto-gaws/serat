@@ -1,10 +1,12 @@
 # cargo-deny policy. Task #41. Serves NFR-SEC-01 (no telemetry / no unreviewed network
 # dependency enters the tree), NFR-MNT-01 (the dependency tree is knowable and checked), NFR-PRF-08
-# (a CI gate, not a convention). Owner: test-engineer; licence additions are the lead's call.
+# (a CI gate, not a convention). MECHANISM ONLY for NFR-SEC-01: the telemetry deny-list under
+# [bans] deny is still to be added (threat-model T-01). Owner: test-engineer; licence additions are the lead's call.
 #
 # Run: `cargo deny --workspace check` (CI job `deny` in .github/workflows/ci.yml).
 
 [graph]
+all-features = true
 # Every target Serat ships on, so a licence or advisory that only exists on one platform's
 # dependencies (windows-sys on Windows, gtk on Linux, objc2 on macOS) is still seen.
 targets = [
