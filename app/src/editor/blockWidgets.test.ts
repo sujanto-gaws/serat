@@ -435,10 +435,13 @@ describe("blockWidgetsField", () => {
     expect(after.every((w) => before.some((b) => b.widget === w.widget))).toBe(true);
   });
 
-  it("property: deleting [min, max] of each sampled pair equals a fresh build of the result", () => {
-    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+  // The sweeps are split per start state (deletion) and per block end x start state (block end)
+  // so each case is short under load, with its own tally and skip budget.
+  const DEL_DOC = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
+  it.each([0, DEL_DOC.length])("property: deleting [min, max] of each sampled pair, from a cursor at %i, equals a fresh build of the result", (cursor) => {
+    const doc = DEL_DOC;
     const sweep: SweepTally = { total: 0, skipped: 0 };
-    const startStates = [0, doc.length].map((c) => makeState(doc, c));
+    const start = makeState(doc, cursor);
     const positions = new Set<number>([0, 1, doc.length - 1, doc.length]);
     for (let i = 0; i <= doc.length; i += 8) positions.add(i);
     for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) [i, i + 1, i + 2].forEach((p) => p <= doc.length && positions.add(p));
@@ -446,10 +449,10 @@ describe("blockWidgetsField", () => {
     for (const a of list) {
       for (const b of list) {
         if (b <= a) continue;
-        startStates.forEach((st, i) => expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b} from start ${i}`, sweep));
+        expectChangeMatchesFresh(start, { from: a, to: b }, `delete ${a}-${b} from cursor ${cursor}`, sweep);
       }
     }
-    expectSkipBudget(sweep, "deletion sweep");
+    expectSkipBudget(sweep, `deletion sweep (cursor ${cursor})`);
   });
 
   it("deleting a table's last row (cursor elsewhere) keeps a widget for the shortened table", () => {
@@ -470,21 +473,21 @@ describe("blockWidgetsField", () => {
     expectChangeMatchesFresh(s0, { from: blockEnd, insert: "\n> [!tip] x\n" }, "callout header at block end");
   });
 
-  it("property: every deletion and insertion at every position near each block end equals a fresh build", () => {
-    const doc = `p one\n\n${TABLE}\n\np two\n\n> [!note] T\n> body\n\nend`;
-    const ends: number[] = [];
-    for (let i = doc.indexOf("\n\n"); i >= 0; i = doc.indexOf("\n\n", i + 1)) ends.push(i);
-    ends.push(doc.length);
-    const around = new Set<number>();
-    for (const e of ends) for (let d = -12; d <= 3; d += 1) if (e + d >= 0 && e + d <= doc.length) around.add(e + d);
-    const list = [...around].sort((a, b) => a - b);
+  const BE_DOC = DEL_DOC;
+  const BE_ENDS: number[] = [];
+  for (let i = BE_DOC.indexOf("\n\n"); i >= 0; i = BE_DOC.indexOf("\n\n", i + 1)) BE_ENDS.push(i);
+  BE_ENDS.push(BE_DOC.length);
+  const BE_CASES = BE_ENDS.flatMap((end) => [0, BE_DOC.length].map((cursor) => [end, cursor] as const));
+  it.each(BE_CASES)("property: every deletion and insertion near the block end at %i, from a cursor at %i, equals a fresh build", (end, cursor) => {
+    const doc = BE_DOC;
+    const list: number[] = [];
+    for (let d = -12; d <= 3; d += 1) if (end + d >= 0 && end + d <= doc.length) list.push(end + d);
     const sweep: SweepTally = { total: 0, skipped: 0 };
-    const states = [0, doc.length].map((c) => makeState(doc, c));
+    const st = makeState(doc, cursor);
     for (const a of list) {
-      for (const st of states) {
-        for (const ins of ["\n", "\n> [!tip] x\n"]) expectChangeMatchesFresh(st, { from: a, insert: ins }, `insert ${JSON.stringify(ins)} at ${a}`, sweep);
-        for (const b of list) if (b > a && b - a <= 8) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`, sweep);
-      }
-    }    expectSkipBudget(sweep, "block-end sweep");
+      for (const ins of ["\n", "\n> [!tip] x\n"]) expectChangeMatchesFresh(st, { from: a, insert: ins }, `insert ${JSON.stringify(ins)} at ${a}`, sweep);
+      for (const b of list) if (b > a && b - a <= 8) expectChangeMatchesFresh(st, { from: a, to: b }, `delete ${a}-${b}`, sweep);
+    }
+    expectSkipBudget(sweep, `block-end sweep (end ${end}, cursor ${cursor})`);
   });
 });
