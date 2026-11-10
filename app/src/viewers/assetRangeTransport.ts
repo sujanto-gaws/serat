@@ -5,10 +5,11 @@
 // `asset_info.bytes` and every span is a `read_asset_range` call, uniform on all platforms
 // (steps 2-7 of the scheme apply on the Rust side, spans are capped at 1,000 KiB).
 //
-// Change detection: `read_asset_range` returns bytes only (no ETag, no mtime; contract gap),
-// so a replaced file is noticed by (a) a fresh `asset_info` size before each request and (b) a
-// span that comes back shorter than the range asked for. A same-size in-place rewrite is not
-// detectable with this contract. On detection the transport stops serving and calls
+// Change detection (ADR-0017 Amendment 1): `asset_info.etag` is sent as `if_match` on every
+// span, and the server answers `asset_changed` when it mismatches or the file changes mid-span
+// (in-place rewrite or truncation, at any size). That is the signal. Belt and braces, kept: a
+// span that comes back shorter than asked. With no etag (older server) a fresh `asset_info`
+// size before each request is the fallback. On detection the transport stops serving and calls
 // `onChanged`; the viewer restarts the load (never mixing versions) and shows the 4 s notice.
 
 import type { PDFDataRangeTransport } from "pdfjs-dist";
@@ -19,8 +20,8 @@ export const SPAN = 1000 * 1024;
 export interface RangeDeps {
   /** `read_asset_range` for this path. */
   readRange(start: number, len: number): Promise<ArrayBuffer>;
-  /** `asset_info(path).bytes`, a stat. */
-  statBytes(): Promise<number>;
+  /** `asset_info(path).bytes`, a stat. Only for the no-validator path; omit when spans carry `if_match`. */
+  statBytes?(): Promise<number>;
   /** Evidence the file no longer matches what was opened: size differs, a short span, or gone. */
   onChanged(): void;
   /** A read failed but nothing says the file changed (EIO, offline placeholder): do NOT restart. */
@@ -54,7 +55,9 @@ export function makeAssetTransport(Base: TransportClass, length: number, deps: R
     private async serve(begin: number, end: number): Promise<void> {
       if (this.stale) return;
       try {
-        if ((await deps.statBytes()) !== length) return this.markChanged();
+        // Without a validator the only pre-check is a fresh size; with one, every span carries
+        // `if_match` and the server answers `asset_changed`, so the extra stat is dropped.
+        if (deps.statBytes && (await deps.statBytes()) !== length) return this.markChanged();
         for (let pos = begin; pos < end && !this.stale; pos += SPAN) {
           const want = Math.min(SPAN, end - pos);
           const got = await deps.readRange(pos, want);
@@ -63,10 +66,12 @@ export function makeAssetTransport(Base: TransportClass, length: number, deps: R
           this.onDataRange(pos, new Uint8Array(got));
         }
       } catch (error) {
-        // Only "the file is gone" is evidence of change (the restart then lands on the missing
-        // state). Any other failure with the size unchanged ends in the error state: restarting
+        // Evidence of change: the server's `asset_changed` (validator mismatch or a rewrite/
+        // truncation mid-span, even at the same size) and "the file is gone" (the restart then
+        // lands on the missing state). Any other failure ends in the error state: restarting
         // would loop on a persistent read error and leak a document per pass.
-        if ((error as { kind?: string } | null)?.kind === "not_found") this.markChanged();
+        const kind = (error as { kind?: string } | null)?.kind;
+        if (kind === "asset_changed" || kind === "not_found") this.markChanged();
         else this.markFailed();
       }
     }

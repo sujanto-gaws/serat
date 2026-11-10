@@ -38,7 +38,14 @@ export interface PdfHooks {
 
 /** Opens `path` (a resolved vault path) of `length` bytes. Aborting `signal` destroys the load
  * (a pending `getDocument` is otherwise never released). */
-export type PdfLoader = (path: string, length: number, hooks: PdfHooks, signal?: AbortSignal) => Promise<PdfDocumentHandle>;
+export type PdfLoader = (
+  path: string,
+  length: number,
+  hooks: PdfHooks,
+  signal?: AbortSignal,
+  /** `asset_info.etag`, sent as `if_match` on every span when present. */
+  etag?: string,
+) => Promise<PdfDocumentHandle>;
 
 /** The previous document's destroy: with one shared worker port a new `getDocument` must not start
  * until it finishes ("the worker is being destroyed"). */
@@ -47,7 +54,7 @@ let lastDestroy: Promise<unknown> = Promise.resolve();
 /** ADR-0017 §9: the handler's span cap, also pdf.js's chunk size. */
 export const RANGE_CHUNK_SIZE = 1000 * 1024;
 
-export const loadPdf: PdfLoader = async (path, length, hooks, signal) => {
+export const loadPdf: PdfLoader = async (path, length, hooks, signal, etag) => {
   await lastDestroy;
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   const pdfjs = await import("pdfjs-dist");
@@ -61,8 +68,8 @@ export const loadPdf: PdfLoader = async (path, length, hooks, signal) => {
     });
   }
   const transport = makeAssetTransport(pdfjs.PDFDataRangeTransport, length, {
-    readRange: (start, len) => readAssetRange({ path, start, len }),
-    statBytes: async () => (await assetInfo({ path })).bytes,
+    readRange: (start, len) => readAssetRange(etag === undefined ? { path, start, len } : { path, start, len, if_match: etag }),
+    ...(etag === undefined ? { statBytes: async () => (await assetInfo({ path })).bytes } : {}),
     onChanged: hooks.onChanged,
     onFailed: hooks.onFailed,
   });
