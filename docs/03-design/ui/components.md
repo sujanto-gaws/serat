@@ -14,7 +14,9 @@ Cited requirement IDs are the ones a component exists to satisfy; screen specs i
 
 **Three-pane layout**: file tree (`layout.tree-pane-width-*`) | editor | context pane (`layout.context-pane-width-*`). Panes are separated by a 1px hairline (`color.role.border-hairline`), never a shadow. Each pane is independently collapsible (`Cmd/Ctrl+B` tree, `Cmd/Ctrl+.` context pane). Below `layout.breakpoint-narrow` the context pane collapses to a flyover triggered by its own toolbar icon; below `layout.breakpoint-compact` the tree does the same and the editor becomes the only persistent pane (see each screen's Responsive section).
 
-**Status strip** (bottom of window, `typography.small`, mono for the hash/position fields): cursor `line:col` (mono), word count, index state (`Ready` / `Rebuilding…` / `Unavailable`, per ADR-0015's states — never a blocking spinner over content, per architecture.md §9.1 "extraction/index state is shown on the file, not a global bar"), save state.
+**Status strip** (bottom of window, `typography.small`, mono for the hash/position fields): cursor `line:col` (mono), word count, index state (`Ready` / `Rebuilding…` / `Unavailable`, per ADR-0015's states — never a blocking spinner over content, per architecture.md §9.1 "extraction/index state is shown on the file, not a global bar"), save state, and, only when the vault has refused names, the **refused-names count** (below).
+
+**Refused-names count and panel** (`typography.small`, `ui`; specified in `screens/file-tree.md`, section *Names not shown*; FR-VLT-01, NFR-SEC-06, US-01). A text button in the strip, `N names not shown` (`1000+` at the cap, nothing at none or absent), led by a 6px `accent-error` dot, inside an always-mounted polite live region. It toggles a non-modal `role="dialog"` panel (overlay chrome per §5: `bg-overlay`, hairline, `radius.md`, `elevation.overlay`) listing each refused path (mono) with its reason (ui, `text-secondary`). It lives in the strip rather than the tree because the tree can be collapsed and the strip cannot. Palette command `Show names not shown` (`vault.refused-names`), no default binding.
 
 ---
 
@@ -117,11 +119,21 @@ Every P1 default binding, in one place, so it can be checked once for the regist
 |---|---|
 | `↑` `↓` | Move selection |
 | `→` `←` | Expand / collapse (or open a note without moving focus) |
+| `Home` `End` | First / last visible row |
 | `↵` | Open selected |
 | `⌘↵` | Open in new tab |
 | `F2` | Rename (all platforms — see `file-tree.md` for why `↵` is not overloaded to also mean rename) |
 | `⇧F10` / Menu key | Context menu |
 | `⌘F` | Filter tree (**local** — distinct from the global `⌘⇧F` vault search above; the two can never fire for the same keypress because only one `when` context is active at a time) |
+
+### Local to the refused-names panel (`when` that panel has focus)
+
+| Binding | Command |
+|---|---|
+| `Esc` | Close; focus returns to the status-strip count |
+| `↑` `↓` `PageUp` `PageDown` `Home` `End` | Scroll the list (native, on the list container) |
+
+Opening it has no default chord: `↵`/`Space` on the focused strip count, or the palette command `Show names not shown`.
 
 ### Local to the backlinks list (`when` backlinks-focused)
 
