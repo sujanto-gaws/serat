@@ -2561,7 +2561,10 @@ mod tests {
             }),
             Err(IpcError::VaultNotFound { .. })
         ));
-        assert_eq!(state.index_status().state, IndexState::Opening { reason: None });
+        assert_eq!(
+            state.index_status().state,
+            IndexState::Opening { reason: None }
+        );
         assert_eq!(state.index_status().vault_id, "");
     }
 
@@ -4313,7 +4316,10 @@ mod tests {
         state
             .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default(), 400))
             .expect("open");
-        assert!(matches!(state.index_status().state, IndexState::Opening { .. }));
+        assert!(matches!(
+            state.index_status().state,
+            IndexState::Opening { .. }
+        ));
         let (send, log) = collecting_sender();
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));

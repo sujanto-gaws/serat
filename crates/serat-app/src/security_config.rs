@@ -226,8 +226,10 @@ mod tests {
                 }
             } else {
                 assert!(
-                    matches!(name, "frame-src" | "object-src" | "form-action" | "base-uri")
-                        && sources == ["'none'"],
+                    matches!(
+                        name,
+                        "frame-src" | "object-src" | "form-action" | "base-uri"
+                    ) && sources == ["'none'"],
                     "unexpected CSP directive {directive:?}"
                 );
             }

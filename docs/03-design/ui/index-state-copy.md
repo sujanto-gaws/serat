@@ -2,7 +2,7 @@
 
 Serves: NFR-REL-02, NFR-REL-01, FR-VLT-04 · US-07
 Design basis: architecture.md §3.4 *What the user sees* and *Why the index can wait at `Opening`* (task #115), `contracts/ipc.rs` `IndexState` and `OpeningReason`, components.md §1 (status strip)
-Owner of the words: **frontend-designer** (this brief sets what each message must say, not the final wording). Renderer: vue-frontend-dev, from the field, in `describeIndexState` (`app/src/stores/vault.ts`). Implementing task: **#117 (to be filed)**.
+Owner of the words: **frontend-designer** (this brief sets what each message must say, not the final wording). Renderer: vue-frontend-dev, from the field, in `describeIndexState` (`app/src/stores/vault.ts`). Implementing task: **P1 #117**.
 
 ## Why this brief exists
 
@@ -35,7 +35,7 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 - Infer the reason from elapsed time ("still opening after 2 s, so it must be…"). The field is the only source.
 - Offer a "Cancel" or "Rebuild now" action here. There is nothing safe for it to do: starting a second build is exactly what this wait prevents (ADR-0001).
 
-## Acceptance (for #117's front-end half)
+## Acceptance (for P1 #117's front-end half)
 
 - `describeIndexState({ kind: "opening" })` and `describeIndexState({ kind: "opening", reason: "previous_index_still_closing" })` return different text, and the second names neither an internal term nor a number.
 - An `IndexState` with an unrecognised `reason` string renders as the plain opening text and does not throw.

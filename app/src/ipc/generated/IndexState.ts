@@ -15,7 +15,7 @@ export type IndexState = { "kind": "opening",
  * Why the open check has not started yet. Absent is the ordinary
  * case: the check is running and ends in milliseconds. Optional on
  * the wire, so `{ "kind": "opening" }` stays valid in both
- * directions; filled by serat-app in #117 (to be filed).
+ * directions; filled by serat-app in P1 #117.
  */
 reason?: OpeningReason, } | { "kind": "ready", 
 /**
