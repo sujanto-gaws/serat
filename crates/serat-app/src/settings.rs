@@ -218,16 +218,17 @@ fn key(vault_root: &Path) -> String {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> crate::TestDir {
         let dir =
             crate::test_temp_dir().join(format!("serat-settings-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::TestDir::new(dir)
     }
 
     #[test]
     fn an_absent_file_is_defaults_and_not_a_problem() {
-        let loaded = Settings::load_from(&temp_dir("absent").join("nothing-here.toml"));
+        let dir = temp_dir("absent");
+        let loaded = Settings::load_from(&dir.join("nothing-here.toml"));
         assert_eq!(loaded.settings, Settings::default());
         assert!(loaded.problem.is_none(), "{:?}", loaded.problem);
     }
@@ -237,7 +238,8 @@ mod tests {
         // The mutation to worry about is someone making this a `Result` that `main`
         // propagates: a stray character in a TOML file then stops the application from
         // opening at all, which is the opposite of design goal 5.
-        let path = temp_dir("malformed").join("settings.toml");
+        let dir = temp_dir("malformed");
+        let path = dir.join("settings.toml");
         std::fs::write(&path, "last_vault = [ this is not toml").expect("write");
 
         let loaded = Settings::load_from(&path);
@@ -252,7 +254,8 @@ mod tests {
 
     #[test]
     fn a_file_written_by_a_newer_build_still_loads() {
-        let path = temp_dir("forward").join("settings.toml");
+        let dir = temp_dir("forward");
+        let path = dir.join("settings.toml");
         std::fs::write(
             &path,
             "last_vault = \"D:/vault\"\nsomething_from_p4 = true\n\n[window]\nwidth = 900.0\nheight = 600.0\n",
@@ -267,7 +270,8 @@ mod tests {
 
     #[test]
     fn round_trips_through_the_file() {
-        let path = temp_dir("roundtrip").join("settings.toml");
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("settings.toml");
         let mut settings = Settings::default();
         settings.remember_open(Path::new(r"D:\Projects\vault"), "10-projects/serat.md");
         settings.save_to(&path).expect("save");

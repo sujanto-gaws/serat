@@ -102,6 +102,48 @@ pub(crate) fn test_temp_dir() -> std::path::PathBuf {
     .clone()
 }
 
+/// A fixture directory that removes itself when dropped, so a panicking test cleans up too.
+/// `/dev/shm` is RAM: a fixture left behind there is memory held until the next reboot.
+#[cfg(test)]
+pub(crate) struct TestDir(std::path::PathBuf, std::path::PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self(path.clone(), path)
+    }
+
+    /// Derefs to `path` (a file inside the fixture, say) but removes `root` on drop.
+    pub(crate) fn within(path: std::path::PathBuf, root: std::path::PathBuf) -> Self {
+        Self(path, root)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDir {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        // A test may have replaced the directory with a file to force a write error.
+        if std::fs::remove_dir_all(&self.1).is_err() {
+            let _ = std::fs::remove_file(&self.1);
+        }
+    }
+}
+
 use cli::Boot;
 use ipc::{BootInfo, INDEX_STATUS_EVENT, OpenVaultArgs};
 use security_config::MAIN_WINDOW_LABEL;
