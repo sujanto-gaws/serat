@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { describeIndexState } from "./vault";
+import { createPinia, setActivePinia } from "pinia";
+
+import type { IndexState } from "@/ipc/generated/IndexState";
+
+import { describeIndexDetail, describeIndexState, useVaultStore } from "./vault";
 
 // Exhaustive over IndexState's four variants (contracts/ipc.rs). §3.4: every one of
 // them renders as a status line, never a modal and never a blocking spinner — this
@@ -8,7 +12,7 @@ import { describeIndexState } from "./vault";
 // covers them all.
 describe("describeIndexState", () => {
   it("renders opening", () => {
-    expect(describeIndexState({ kind: "opening" })).toBe("index: opening");
+    expect(describeIndexState({ kind: "opening" })).toBe("Opening index…");
   });
 
   it("renders ready with the note count", () => {
@@ -48,5 +52,37 @@ describe("describeIndexState", () => {
       path: "/vault/.serat/index.sqlite3",
     });
     expect(text).toBe("index: unavailable — task I6 not implemented");
+  });
+});
+
+describe("opening reason (P1 #117)", () => {
+  const waiting = { kind: "opening", reason: "previous_index_still_closing" } as const;
+
+  it("renders the reason copy, with no internal term or number", () => {
+    const text = describeIndexState(waiting);
+    expect(text).toBe("Finishing the previous session's index — search will start when it's done");
+    expect(text).not.toMatch(/actor|writer|detached|index\.db|lock|\d/i);
+    expect(describeIndexDetail(waiting)).toContain("You can keep editing.");
+  });
+
+  it("renders absent, null and unknown reasons as the plain text without throwing", () => {
+    for (const s of [
+      { kind: "opening" },
+      { kind: "opening", reason: null },
+      { kind: "opening", reason: "held_by_another_process" },
+    ]) {
+      expect(describeIndexState(s as unknown as IndexState)).toBe("Opening index…");
+      expect(describeIndexDetail(s as unknown as IndexState)).toBeNull();
+    }
+  });
+
+  it("clears the reason when the state moves to Ready or Rebuilding", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.setIndexState(waiting);
+    expect(store.indexStatusDetail).not.toBeNull();
+    store.setIndexState({ kind: "ready", note_count: 3 });
+    expect(store.indexStatusText).toBe("index: ready · 3 notes");
+    expect(store.indexStatusDetail).toBeNull();
   });
 });

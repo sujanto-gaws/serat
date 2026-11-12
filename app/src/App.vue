@@ -550,7 +550,9 @@ function onSaveOutcome(outcome: SaveOutcome): void {
   <CommandPalette v-if="paletteOpen" :registry="commands" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
-    <span class="index">{{ store.indexStatusText }}</span>
+    <span class="index" :title="store.indexStatusDetail ?? undefined" :aria-description="store.indexStatusDetail ?? undefined" data-testid="index-state">{{ store.indexStatusText }}</span>
+    <!-- Announced once, politely, on entering the waiting state; empty (so silent) otherwise. -->
+    <span class="sr-only" role="status" aria-live="polite" data-testid="index-live">{{ store.indexStatusDetail !== null ? store.indexStatusText : "" }}</span>
     <span v-if="store.refusedNames" class="refused" data-testid="refused-names"
       >{{ store.refusedNames }} {{ store.refusedNames === 1 ? "name" : "names" }} not shown (invalid on this platform)</span
     >

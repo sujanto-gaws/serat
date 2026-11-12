@@ -13,11 +13,28 @@ import type { IndexState } from "@/ipc/generated/IndexState";
 import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
+/** Copy brief index-state-copy.md: the only `reason` with its own copy. An absent, null or unknown
+ * (future) reason is NOT an error and renders as the plain opening text (goal 5); the field is the
+ * only source, never elapsed time. */
+function isWaitingOnPreviousIndex(state: Extract<IndexState, { kind: "opening" }>): boolean {
+  return state.reason === "previous_index_still_closing";
+}
+
+const WAITING_DETAIL =
+  "This vault was closed while its index was still being built. Serat finishes that first so two builds never write the same index. You can keep editing.";
+
+/** Tooltip / aria-description for the waiting state; `null` for every other state. */
+export function describeIndexDetail(state: IndexState): string | null {
+  return state.kind === "opening" && isWaitingOnPreviousIndex(state) ? WAITING_DETAIL : null;
+}
+
 /** §3.4: a rebuild is a status line, never a modal, never a blocking spinner. */
 export function describeIndexState(state: IndexState): string {
   switch (state.kind) {
     case "opening":
-      return "index: opening";
+      return isWaitingOnPreviousIndex(state)
+        ? "Finishing the previous session's index — search will start when it's done"
+        : "Opening index…";
     case "ready":
       return `index: ready · ${state.note_count} notes`;
     case "rebuilding":
@@ -41,7 +58,9 @@ export const useVaultStore = defineStore("vault", {
     /** Canonical vault root, for the title bar. `null` before `open_vault` returns. */
     vaultRoot: null as string | null,
     /** Rendered by `describeIndexState`, updated from the poll and the event both. */
-    indexStatusText: "index: opening",
+    indexStatusText: "Opening index…",
+    /** Tooltip / aria-description of the waiting Opening state; `null` otherwise. */
+    indexStatusDetail: null as string | null,
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -115,6 +134,7 @@ export const useVaultStore = defineStore("vault", {
     },
     setIndexState(state: IndexState) {
       this.indexStatusText = describeIndexState(state);
+      this.indexStatusDetail = describeIndexDetail(state);
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;

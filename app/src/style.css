@@ -133,3 +133,13 @@ body {
   color: var(--brass);
   white-space: nowrap;
 }
+
+/* Visually hidden, still announced: the status strip one-shot live region (index-state-copy.md). */
+.statusbar .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
