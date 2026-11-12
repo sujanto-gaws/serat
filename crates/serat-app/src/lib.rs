@@ -898,6 +898,102 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_page_body_holds_only_the_mount_point_and_scripts() {
+        // #128, and F-505 is why it is the only guard in its family that can work.
+        // Nothing observable at `mark_first_paint` can discriminate a fabricated call
+        // from an honest one -- every value there is supplied by the caller, and the
+        // one that is not (`window_visible - window_created`) is still *determined* by
+        // the caller, since the host stamps the arrival and the caller chooses when to
+        // arrive (F-507). This check is the exception because it is resolved
+        // **without observing the call at all**.
+        //
+        // WHAT IT DEFENDS, and it is not F-504. A fabricated call never consults the
+        // real paint entry, so no property of this page can affect it. What is
+        // defended is F-396(b): that `first-contentful-paint`, *when honestly
+        // reported*, is measuring our own content rather than a skeleton that painted
+        // before Vue mounted. F-482 found the runtime guard no longer corroborates the
+        // entry, so that dependency is live and was, until now, asserted by nothing
+        // (F-464).
+        //
+        // THREE DECISIONS, all architect's (ADR-0014, task #128), because "assert the
+        // body stays contentless" underdetermines the check exactly where it matters:
+        //
+        //   * **The built copy, not `app/index.html`.** `frontendDist` is `"webview"`
+        //     with no `beforeBuildCommand`, so this file is what compiles into
+        //     `serat.exe` and the source is one the binary never opens (F-470). The
+        //     two also differ legitimately -- the source carries a `<script
+        //     type="module" src="/src/main.ts">` in its body and this does not -- so a
+        //     source-side check would have to model Vite's transform to know which
+        //     differences are real. A source-side twin is worth having as the second
+        //     half of an F-510 pair; it is not the guarantee.
+        //   * **An allowlist, not an absence.** "Renders nothing before scripts run"
+        //     is the property wanted and is *not statically decidable*: CSS alone can
+        //     paint a `::before`, a background image, a sized box. So it is not
+        //     attempted. The body may hold the mount point and script elements, and
+        //     nothing else. That is deliberately stricter than the property, so that
+        //     widening it is a decision somebody takes rather than a line somebody
+        //     adds -- the shape of ADR-0012's five-command grant (F-509).
+        //   * **`cargo test`, not CI.** F-384 leaves CI producing no jobs, so a check
+        //     living only there would not run at all.
+        //
+        // NOT F-377's family, which is the objection this invites. F-377's bundle
+        // check asserted that a *behaviour* -- a mark taken inside a double
+        // requestAnimationFrame -- could be inferred from *text*, and it could not:
+        // the substring survived every mutation that mattered. This asserts a property
+        // **of** the text. What markup is present is precisely what text can answer,
+        // and it is the whole property rather than a proxy for one.
+        //
+        // Comments in the body are **not** allowlisted, deliberately. A comment cannot
+        // paint, so this is stricter than the property -- which is the ruling's intent:
+        // whoever needs one takes the widening decision rather than discovering the
+        // allowlist was approximate.
+        let index = webview_bundle().join("index.html");
+        let html = std::fs::read_to_string(&index).expect("index.html");
+
+        let body_open = html
+            .find("<body")
+            .and_then(|start| html[start..].find('>').map(|off| start + off + 1))
+            .expect("index.html has no <body>");
+        let body_close = html.find("</body>").expect("index.html has no </body>");
+        let body = &html[body_open..body_close];
+
+        // Strip the allowlist, then require what is left to be whitespace. Anything
+        // unrecognised survives stripping and fails, which is the safe direction: a
+        // construct this does not know about is refused rather than ignored.
+        let mut rest = String::new();
+        let mut tail = body;
+        while let Some(open) = tail.find("<script") {
+            rest.push_str(&tail[..open]);
+            let after = &tail[open..];
+            let close = after
+                .find("</script>")
+                .map(|i| i + "</script>".len())
+                .unwrap_or(after.len());
+            tail = &after[close..];
+        }
+        rest.push_str(tail);
+        let rest = rest.replace("<div id=\"app\"></div>", "");
+
+        assert!(
+            rest.trim().is_empty(),
+            "the shipped page body holds something other than the mount point \
+             and scripts: {:?}\n\n \
+             The body may contain `<div id=\"app\"></div>` and `<script>` \
+             elements, and nothing else (#128, ADR-0014). It is an allowlist rather \
+             than a check for emptiness because \"renders nothing before scripts \
+             run\" is not statically decidable -- CSS alone paints a ::before or a \
+             background image. Anything else here can produce a contentful paint \
+             before Vue mounts, which would make `first-contentful-paint` measure a \
+             skeleton rather than our content, silently degrading the paint guard to \
+             F-377's mutation B (F-396(b), F-482). If the addition is deliberate, \
+             widening this allowlist is a decision for ADR-0014's table, not a line \
+             to add here -- and the mount point must stay *empty*: `<div \
+             id=\"app\">Loading...</div>` fails this and is meant to.",
+            rest.trim()
+        );
+    }
+
+    #[test]
     fn the_boot_info_is_json_the_page_can_read() {
         let json = serde_json::to_string(&BootInfo {
             vault: Some("D:/vault".into()),
