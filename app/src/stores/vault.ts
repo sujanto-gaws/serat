@@ -10,6 +10,7 @@
 import { defineStore } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
+import type { IndexStatus } from "@/ipc/generated/IndexStatus";
 import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
@@ -58,7 +59,7 @@ export const useVaultStore = defineStore("vault", {
     vaultIdFromBoot: false,
     /** `vault://opened` has been seen: the id is event-sourced and the poll can never change it. */
     announced: false,
-    /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
+    /** Distinct names the vault could not turn into a vault path (FR-VLT-01), as one status fact; `null` = absent (never zero). */
     refusedNames: null as number | null,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
@@ -91,6 +92,7 @@ export const useVaultStore = defineStore("vault", {
      * the editor buffer: #80, the only caller, must do that on `choose_vault` Err BEFORE calling this. */
     openFailed() {
       this.vaultOpen = false;
+      this.refusedNames = null; // no vault, nothing to count
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -118,6 +120,13 @@ export const useVaultStore = defineStore("vault", {
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;
+    },
+    /** One entry for an `index://status` event and the late-subscriber poll alike (architecture 3.4): the state
+     * text and the refused-names count, which is `null` when the status omits it (`None`: not counting yet, or
+     * no vault open; never zero, FR-VLT-01). */
+    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">) {
+      this.setIndexState(status.state);
+      this.setRefusedNames(status.refused_names ?? null);
     },
     setOpenBuffer(note: string | null, baseHash: string | null) {
       this.openNote = note;
