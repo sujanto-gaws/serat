@@ -55,7 +55,42 @@ describe("foldable callout `[!tip]-` (C-01)", () => {
   it("is recognised as a tip callout header, the trailing `-` kept out of the type", () => {
     const header = parseCalloutHeader(TIP_HEADER);
     expect(header?.type).toBe("tip");
-    expect(header?.title).toContain("Collapsed by default");
+    expect(header?.title).toBe("Collapsed by default");
+    expect(header?.fold).toBe("collapsed");
+  });
+
+  it("parses the fold marker only when it directly follows `]`", () => {
+    expect(parseCalloutHeader("> [!tip]- T")).toEqual({ type: "tip", title: "T", fold: "collapsed" });
+    expect(parseCalloutHeader("> [!tip]+ T")).toEqual({ type: "tip", title: "T", fold: "expanded" });
+    expect(parseCalloutHeader("> [!tip] T")).toEqual({ type: "tip", title: "T", fold: null });
+    expect(parseCalloutHeader("> [!tip]-")).toEqual({ type: "tip", title: "Tip", fold: "collapsed" });
+    // a `-` after a space is the title's own
+    expect(parseCalloutHeader("> [!tip] - T")).toEqual({ type: "tip", title: "- T", fold: null });
+  });
+
+  it("the widget honours the initial state: `-` hides the body, `+` and none show it, no marker in the title", () => {
+    const render = (header: string) => {
+      const doc = `${header}\n> body text\n`;
+      const state = EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [seratMarkdown(), blockWidgetsExtension()],
+      });
+      ensureSyntaxTree(state, state.doc.length, 5000);
+      const w = widgetsOf(state.update({ selection: { anchor: doc.length } }).state)[0];
+      return (w.widget as { toDOM(): HTMLElement }).toDOM();
+    };
+    const collapsed = render("> [!tip]- Title");
+    expect(collapsed.querySelector(".serat-callout-title")?.textContent).toBe("Title");
+    expect((collapsed.querySelector(".serat-callout-body") as HTMLElement).hidden).toBe(true);
+    expect(collapsed.getAttribute("data-fold")).toBe("collapsed");
+    const expanded = render("> [!tip]+ Title");
+    expect((expanded.querySelector(".serat-callout-body") as HTMLElement).hidden).toBe(false);
+    expect(expanded.getAttribute("data-fold")).toBe("expanded");
+    const plain = render("> [!tip] Title");
+    expect((plain.querySelector(".serat-callout-body") as HTMLElement).hidden).toBe(false);
+    expect(plain.hasAttribute("data-fold")).toBe(false);
+    expect(render("> [!tip] - Title").querySelector(".serat-callout-title")?.textContent).toBe("- Title");
   });
 
   it("is a widget over exactly its own blockquote, or no widget at all, never something else", () => {

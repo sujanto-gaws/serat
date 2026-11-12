@@ -58,16 +58,21 @@ export function isImageTarget(target: string): boolean {
 export interface CalloutHeader {
   type: string;
   title: string;
+  /** Obsidian's optional marker directly after `]`: `-` = collapsed, `+` = expanded by default, none =
+   * not foldable (`null`). Display state only; the marker stays in the file (C-01, C-04). */
+  fold: "collapsed" | "expanded" | null;
 }
 
 /** Parses a blockquote's first line as an Obsidian-style callout header:
- * `[!type]` or `[!type] Title`. Returns `null` for an ordinary blockquote. */
+ * `[!type]`, `[!type] Title`, with an optional `-` / `+` fold marker directly after `]`. A `-` after
+ * a space belongs to the title. Returns `null` for an ordinary blockquote. */
 export function parseCalloutHeader(firstLine: string): CalloutHeader | null {
-  const match = /^>\s?\[!([\w-]+)\]\s*(.*)$/.exec(firstLine.trim());
+  const match = /^>\s?\[!([\w-]+)\]([+-])?\s*(.*)$/.exec(firstLine.trim());
   if (!match) return null;
   const type = match[1].toLowerCase();
-  const title = match[2].trim() || type.charAt(0).toUpperCase() + type.slice(1);
-  return { type, title };
+  const title = match[3].trim() || type.charAt(0).toUpperCase() + type.slice(1);
+  const fold = match[2] === "-" ? "collapsed" : match[2] === "+" ? "expanded" : null;
+  return { type, title, fold };
 }
 
 /** Strips each line's leading blockquote marker (`> ` or `>`), the same way
@@ -221,6 +226,7 @@ class CalloutWidget extends WidgetType {
     return (
       this.header.type === other.header.type &&
       this.header.title === other.header.title &&
+      this.header.fold === other.header.fold &&
       this.bodyText === other.bodyText
     );
   }
@@ -229,6 +235,7 @@ class CalloutWidget extends WidgetType {
     const container = document.createElement("div");
     container.className = `serat-callout serat-callout-${this.header.type}`;
     container.setAttribute("data-callout", this.header.type);
+    if (this.header.fold !== null) container.setAttribute("data-fold", this.header.fold);
     const title = document.createElement("div");
     title.className = "serat-callout-title";
     title.textContent = this.header.title;
@@ -236,6 +243,8 @@ class CalloutWidget extends WidgetType {
     if (this.bodyText.trim()) {
       const body = document.createElement("div");
       body.className = "serat-callout-body";
+      // Initial fold state from the `-` marker; display only, no document change.
+      if (this.header.fold === "collapsed") body.hidden = true;
       // Text nodes and <br>, no HTML parsing at all: full inline-Markdown
       // rendering inside a callout body is split-preview's job for now, the
       // same trade-off `readTableModel` documents for table cells.
