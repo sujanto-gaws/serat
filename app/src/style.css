@@ -143,3 +143,11 @@ body {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+/* The index text must not change the strip's height when it wraps on narrow windows. */
+.statusbar .index {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}

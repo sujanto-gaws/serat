@@ -61,6 +61,10 @@ export const useVaultStore = defineStore("vault", {
     indexStatusText: "Opening index…",
     /** Tooltip / aria-description of the waiting Opening state; `null` otherwise. */
     indexStatusDetail: null as string | null,
+    /** Live-region text: a snapshot, never bound to `indexStatusText` (Rebuilding's done/total would be
+     * re-announced on every event). Set once on entering the waiting state and once on leaving it;
+     * cleared at the next transition. */
+    indexAnnouncement: "",
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -97,6 +101,11 @@ export const useVaultStore = defineStore("vault", {
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
+      // Seed the strip from the open itself: on the deferred re-open path the event stream never emits
+      // Opening{reason}; its first index://status is the clear (#117). The reason arrives only here and
+      // in the index_status poll. Only a reasoned Opening is seeded: every other state keeps arriving by
+      // event/poll exactly as before (the #91/#103 drop rules are probed through the status text).
+      if (opened.index?.kind === "opening" && opened.index.reason) this.setIndexState(opened.index);
     },
     /** `choose_vault` answered `Err` after `vault://opened`: the window has no vault open and no later
      * event carries the announced id. Task #103's rule (VAULT_OPENED_EVENT, rules 1-3): an `index://status`
@@ -133,8 +142,14 @@ export const useVaultStore = defineStore("vault", {
       this.vaultRoot = root;
     },
     setIndexState(state: IndexState) {
-      this.indexStatusText = describeIndexState(state);
-      this.indexStatusDetail = describeIndexDetail(state);
+      const wasWaiting = this.indexStatusDetail !== null;
+      const text = describeIndexState(state);
+      const detail = describeIndexDetail(state);
+      if (detail !== null && !wasWaiting) this.indexAnnouncement = text; // entered
+      else if (detail === null && wasWaiting) this.indexAnnouncement = text; // left
+      else if (detail === null) this.indexAnnouncement = ""; // a later transition clears it
+      this.indexStatusText = text;
+      this.indexStatusDetail = detail;
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;
