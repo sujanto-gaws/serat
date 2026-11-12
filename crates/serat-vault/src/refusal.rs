@@ -57,13 +57,38 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Inner {
-    /// Store one refusal; the log's bound is enforced here.
-    fn insert(&mut self, refusal: Refusal) {
+    /// Store one refusal, the log's bound enforced here. Returns whether the log
+    /// changed: a new path, a new reason, or one more refusal counted past the cap.
+    fn insert(&mut self, refusal: Refusal) -> bool {
         if self.by_path.len() >= CAPACITY && !self.by_path.contains_key(&refusal.path) {
             self.overflowed += 1;
-            return;
+            return true;
         }
-        self.by_path.insert(refusal.path, refusal.reason);
+        self.by_path
+            .insert(refusal.path, refusal.reason.clone())
+            .as_ref()
+            != Some(&refusal.reason)
+    }
+
+    /// Remove every entry at or below `scope` and return them; no clone of the rest.
+    fn take_scope(&mut self, scope: &str) -> BTreeMap<String, String> {
+        if scope.is_empty() {
+            return std::mem::take(&mut self.by_path);
+        }
+        let below = format!("{scope}/");
+        let mut keys: Vec<String> = self
+            .by_path
+            .range(below.clone()..)
+            .map(|(path, _)| path)
+            .take_while(|path| path.starts_with(&below))
+            .cloned()
+            .collect();
+        if self.by_path.contains_key(scope) {
+            keys.push(scope.to_owned());
+        }
+        keys.into_iter()
+            .filter_map(|key| self.by_path.remove_entry(&key))
+            .collect()
     }
 }
 
@@ -98,14 +123,11 @@ impl RefusalLog {
         self.lock().on_change = Some(Arc::new(f));
     }
 
-    /// Run `change` under the lock and fire the callback, after releasing it, if it
-    /// altered what the log holds.
-    fn mutate(&self, change: impl FnOnce(&mut Inner)) {
+    /// Run `change` under the lock, which returns whether it altered what the log
+    /// holds, and fire the callback, after releasing the lock, if it did.
+    fn mutate(&self, change: impl FnOnce(&mut Inner) -> bool) {
         let mut inner = self.lock();
-        let before = (inner.by_path.clone(), inner.overflowed);
-        change(&mut inner);
-        let changed = before != (inner.by_path.clone(), inner.overflowed);
-        let callback = if changed {
+        let callback = if change(&mut inner) {
             inner.on_change.clone()
         } else {
             None
@@ -121,6 +143,16 @@ impl RefusalLog {
         self.mutate(|inner| inner.insert(refusal));
     }
 
+    /// Record a refusal as the watcher would, so serat-app's tests can drive a storm
+    /// past the cap. Not for production use.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn record_for_test(&self, path: &str, reason: &str) {
+        self.record(Refusal {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+
     /// Replace every entry at or below `scope` (`""`: the whole vault) with `found`,
     /// the refusals a walk of that subtree has just made. This is how entries leave:
     /// at the next walk that covers them, whichever walk it is (`walk`, `walk_tree`,
@@ -132,18 +164,23 @@ impl RefusalLog {
     /// replacement is one change: the callback fires at most once.
     pub(crate) fn replace_scope(&self, scope: &str, found: Vec<Refusal>) {
         self.mutate(|inner| {
+            let overflowed = inner.overflowed;
+            let removed = inner.take_scope(scope);
             if scope.is_empty() {
-                inner.by_path.clear();
                 inner.overflowed = 0;
-            } else {
-                let below = format!("{scope}/");
-                inner
-                    .by_path
-                    .retain(|path, _| path != scope && !path.starts_with(&below));
             }
             for refusal in found {
                 inner.insert(refusal);
             }
+            // Changed unless the scope holds exactly what it held before.
+            let now = if scope.is_empty() {
+                std::mem::take(&mut inner.by_path)
+            } else {
+                inner.take_scope(scope)
+            };
+            let changed = now != removed || inner.overflowed != overflowed;
+            inner.by_path.extend(now);
+            changed
         });
     }
 

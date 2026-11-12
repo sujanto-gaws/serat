@@ -1,14 +1,7 @@
 //! Task #35 (FR-VLT-01, NFR-SEC-06, NFR-CMP-01): the refused-name count reaches the front
 //! end as an event when a name is refused after the open, and the two caps agree.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use crate::cli::Boot;
-use crate::ipc::{IndexState, IndexStatus, OpenVaultArgs, REFUSED_NAMES_CAP};
-use crate::settings::Settings;
-use crate::startup::Startup;
-use crate::state::{AppState, OpenHooks};
+use crate::ipc::REFUSED_NAMES_CAP;
 
 // The vault's cap and the contract's must be one number: the status count saturates at the
 // contract's, and a drift would make "N names not shown" lie at the boundary.
@@ -19,8 +12,20 @@ fn the_vaults_refusal_capacity_is_the_contracts_cap() {
 
 // Mutant, run by hand on this commit: removing `publisher.watch_refusals()` in
 // `open_vault_with` leaves the count only in the polled status and this times out.
+#[cfg(unix)]
 #[test]
 fn a_name_refused_after_the_open_is_announced_by_an_index_status_event() {
+    // Unix only: it creates `aux.md`, which NTFS cannot (a device name). Its imports
+    // live here so the Windows build has none unused.
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::cli::Boot;
+    use crate::ipc::{IndexState, IndexStatus, OpenVaultArgs};
+    use crate::settings::Settings;
+    use crate::startup::Startup;
+    use crate::state::{AppState, OpenHooks};
+
     let dir = std::env::temp_dir().join(format!("serat-refusal-wiring-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("fixture");

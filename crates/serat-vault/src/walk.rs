@@ -284,7 +284,8 @@ mod tests {
     #[test]
     fn a_literal_backslash_in_a_real_file_name_is_reported_not_silently_aliased() {
         // Task #34's amendment, nit (b). A backslash is an ordinary character in
-        // a Unix filename, but the vault's name rules (`VaultPath::new_for_platform`) also treats it as a separator —
+        // a Unix filename, but the vault's name rules (`VaultPath::new_for_platform`)
+        // treat it as a separator —
         // deliberately, for a path a user typed or pasted — so passing an OS
         // path component straight through would silently re-read one file
         // `"a\b.md"` as the two-segment path `"a/b.md"`, aliasing a real name to

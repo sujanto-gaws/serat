@@ -80,7 +80,13 @@ pub struct StatusPublisher<S> {
     /// Set when the open that created this publisher failed after `vault://opened` had
     /// announced its id (task #90): nothing may carry that id afterwards.
     retired: std::sync::atomic::AtomicBool,
+    /// The refused-name count the refusal callback last acted on, [`NOT_EMITTED`]
+    /// before the first change. Lets it re-emit only when the count moved.
+    last_refused: std::sync::atomic::AtomicU32,
 }
+
+/// Sentinel for `last_refused`: above [`REFUSED_NAMES_CAP`], so no count equals it.
+const NOT_EMITTED: u32 = u32::MAX;
 
 #[derive(Debug)]
 struct Published {
@@ -146,6 +152,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             refusals: None,
             wal: Mutex::new(None),
             retired: std::sync::atomic::AtomicBool::new(false),
+            last_refused: std::sync::atomic::AtomicU32::new(NOT_EMITTED),
         }
     }
 
@@ -175,7 +182,13 @@ impl<S: StatusSink> StatusPublisher<S> {
         let weak = Arc::downgrade(self);
         refusals.on_change(move || {
             if let Some(publisher) = weak.upgrade() {
-                publisher.re_emit();
+                // The count saturates at the cap and the status carries nothing else
+                // of the log, so a change that leaves it as it was (a watcher storm
+                // past the cap, a changed reason) would stream identical statuses.
+                let now = publisher.refused_count().unwrap_or(NOT_EMITTED);
+                if publisher.last_refused.swap(now, Ordering::SeqCst) != now {
+                    publisher.re_emit();
+                }
             }
         });
     }
@@ -281,6 +294,9 @@ impl<S: StatusSink> StatusPublisher<S> {
         }
         let status = self.status();
         self.lock().last_emit = Some(Instant::now());
+        if self.is_retired() {
+            return;
+        }
         self.sink.emit(&status);
     }
 
@@ -969,6 +985,42 @@ mod tests {
         assert_eq!(publisher.status().wal_pinned_bytes, None);
         assert_eq!(recorder.taken().len(), 2);
         assert_eq!(recorder.taken()[1].wal_pinned_bytes, None);
+    }
+
+    #[test]
+    fn a_refusal_storm_past_the_cap_emits_only_while_the_count_moves() {
+        // Task #35 S1'. The log counts overflowed refusals as changes, the status does
+        // not carry them: identical statuses must not stream to the webview.
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                recorder.clone(),
+                Duration::from_secs(60),
+            )
+            .with_refusals(log.clone()),
+        );
+        publisher.watch_refusals();
+
+        for i in 0..REFUSED_NAMES_CAP {
+            log.record_for_test(&format!("n-{i:05}.md"), "r");
+        }
+        assert_eq!(recorder.taken().len(), REFUSED_NAMES_CAP as usize);
+        for _ in 0..50 {
+            log.record_for_test("overflow.md", "r");
+        }
+        log.record_for_test("n-00000.md", "a new reason");
+        assert_eq!(
+            recorder.taken().len(),
+            REFUSED_NAMES_CAP as usize,
+            "a change the status cannot show was emitted"
+        );
+        assert_eq!(
+            recorder.taken().last().expect("emitted").refused_names,
+            Some(REFUSED_NAMES_CAP)
+        );
     }
 
     #[test]
