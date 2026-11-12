@@ -1,5 +1,9 @@
+# SIGBUS fix check: serat-app fixtures on tmpfs (task #124)
 
-## Fix check (task #124): serat-app fixtures on tmpfs
+Serves NFR-REL-01 · NFR-PRF-08 · NFR-MNT-01. Owner: test-engineer. Follows `docs/05-testing/sigbus-105.md` (task #105b), which holds the diagnosis; if that file is not on your branch yet it is in the merge queue.
+
+
+## Fix check
 
 Change (test code only, `crates/serat-app/src/lib.rs::test_temp_dir`): every `std::env::temp_dir()` in the serat-app test modules (16 sites in `state.rs`, `index.rs`, `consumer.rs`, `vault.rs`, `settings.rs`, `lib.rs`, `asset/tests.rs`) now goes through a `#[cfg(test)]` helper that uses `/dev/shm` (tmpfs) when it exists and a probe file can be written there, otherwise the ordinary temp dir. The `-shm` mappings of the fixtures' `index.db` are then memory-backed. The shipped app is untouched and keeps WAL on the user's disk (ADR-0015). `crates/serat-app/tests/acl_behaviour.rs` (one `temp_dir()` use) is an integration test that opens no index and was left alone.
 
