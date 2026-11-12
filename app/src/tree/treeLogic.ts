@@ -43,6 +43,8 @@ export interface KeyInfo {
   key: string;
   ctrlOrMeta: boolean;
   shift: boolean;
+  /** The event presses the effective binding of `tree.insertLink` (matched by the host, so a rebinding applies). */
+  insertLink?: boolean;
 }
 
 /**
@@ -53,6 +55,7 @@ export function navigate(rows: readonly TreeRow[], focusedPath: string | null, k
   if (rows.length === 0) return { kind: "none" };
   const index = focusedPath === null ? -1 : rows.findIndex((r) => r.path === focusedPath);
   const row = index >= 0 ? rows[index] : null;
+  if (key.insertLink) return row && row.kind !== "dir" ? { kind: "insert-link", path: row.path } : { kind: "none" };
   const at = (i: number): NavAction => ({ kind: "focus", path: rows[Math.max(0, Math.min(rows.length - 1, i))].path });
 
   switch (key.key) {
@@ -92,11 +95,6 @@ export function navigate(rows: readonly TreeRow[], focusedPath: string | null, k
       return row ? { kind: "context-menu", path: row.path } : { kind: "none" };
     case "F10":
       return key.shift && row ? { kind: "context-menu", path: row.path } : { kind: "none" };
-    case "L":
-    case "l":
-      return key.ctrlOrMeta && key.shift && row && row.kind !== "dir"
-        ? { kind: "insert-link", path: row.path }
-        : { kind: "none" };
     default:
       return { kind: "none" };
   }

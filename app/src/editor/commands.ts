@@ -51,6 +51,9 @@ export interface Command {
   /** Context check (command-palette.md "unavailable in context"): `null` when
    * the command can run now, else a one-line reason shown instead of running. */
   unavailable?: () => string | null;
+  /** The palette lists the command only while `unavailable()` is null (a focus-scoped command such
+   * as `tree.insertLink` has no meaning elsewhere); it stays registered and rebindable regardless. */
+  hideWhenUnavailable?: boolean;
 }
 
 /**

@@ -44,6 +44,7 @@ const rows = computed<Row[]>(() => {
   const q = text.value.trim();
   let matched: Array<{ command: Command; spans: Array<{ start: number; end: number }>; score: number }> = [];
   for (const command of registry.ranked()) {
+    if (command.hideWhenUnavailable && (command.unavailable?.() ?? null) !== null) continue;
     if (q === "") matched.push({ command, spans: [], score: 0 });
     else {
       const hit = fuzzyMatch(q, command.name);

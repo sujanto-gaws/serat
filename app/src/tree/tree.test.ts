@@ -160,7 +160,7 @@ describe("keyboard navigation", () => {
   m.apply(listing("Empty", []));
   m.expand("Open");
   const rows = m.rows();
-  const key = (k: string, extra: Partial<{ ctrlOrMeta: boolean; shift: boolean }> = {}) => ({
+  const key = (k: string, extra: Partial<{ ctrlOrMeta: boolean; shift: boolean; insertLink: boolean }> = {}) => ({
     key: k,
     ctrlOrMeta: false,
     shift: false,
@@ -195,8 +195,9 @@ describe("keyboard navigation", () => {
     expect(navigate(rows, "n.md", key("F10", { shift: true }))).toEqual({ kind: "context-menu", path: "n.md" });
     expect(navigate(rows, "n.md", key("F10"))).toEqual({ kind: "none" });
     expect(navigate(rows, "n.md", key("ContextMenu"))).toEqual({ kind: "context-menu", path: "n.md" });
-    expect(navigate(rows, "n.md", key("L", { ctrlOrMeta: true, shift: true }))).toEqual({ kind: "insert-link", path: "n.md" });
-    expect(navigate(rows, "Open", key("L", { ctrlOrMeta: true, shift: true }))).toEqual({ kind: "none" });
+    expect(navigate(rows, "n.md", key("l", { insertLink: true }))).toEqual({ kind: "insert-link", path: "n.md" });
+    expect(navigate(rows, "n.md", key("L", { ctrlOrMeta: true, shift: true }))).toEqual({ kind: "none" }); // only the host's binding match counts
+    expect(navigate(rows, "Open", key("l", { insertLink: true }))).toEqual({ kind: "none" });
   });
 });
 
@@ -323,7 +324,7 @@ describe("FileTree component", () => {
 
   it("keyboard: arrows move focus (aria-selected), → expands, F2/Menu/Mod-Shift-L emit", async () => {
     const { ipc, push } = fakeIpc();
-    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    const wrapper = mount(FileTree, { props: { ipc, bindings: { "insert-link": "Mod-Shift-l" } }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(0);
     push(listing("", [dir("D"), asset("pic.png", true), note("a.md")]));
     push(listing("D", [note("x.md")]));

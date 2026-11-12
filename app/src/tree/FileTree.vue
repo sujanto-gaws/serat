@@ -30,7 +30,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import { folderName, noteFileName, takenNames, uniqueName, type CreateKind, type CreateRequest } from "@/tree/createEntry";
 import TreeContextMenu, { type MenuItem } from "@/tree/TreeContextMenu.vue";
-import { chordGlyphs, chordSpoken } from "@/editor/commands";
+import { chordGlyphs, chordMatches, chordSpoken } from "@/editor/commands";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
 import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
@@ -276,12 +276,6 @@ function toggleDir(path: string, expand: boolean | null): void {
   bump();
 }
 
-/** Accelerators shown when the host passes none: the tree-local chords of file-tree.md. */
-// TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
-// DEFAULT_MENU_BINDINGS goes away once that follow-up lands (the host then always passes effective bindings).
-// `rename: "F2"` stays fixed (file-tree.md keyboard map).
-const DEFAULT_MENU_BINDINGS: Record<string, string | null> = { "insert-link": "Mod-Shift-l", rename: "F2" };
-
 const isMac = computed(() => props.mac ?? detectPlatform() === "mac");
 
 /** The platform's own conventions (components.md §7): on macOS Ctrl-click is a secondary click. WebKit sends
@@ -320,11 +314,29 @@ function scrollIntoView(path: string): void {
   scrollTop.value = el.scrollTop;
 }
 
+const insertLinkBinding = computed(() => props.bindings?.["insert-link"] ?? null);
+
+/** Why `tree.insertLink` cannot run now (null = it can): the tree holds focus and a file row is selected. */
+function insertLinkUnavailable(): string | null {
+  const el = container.value;
+  if (!el || !el.contains(document.activeElement)) return "Focus the file tree first";
+  const row = rows.value.find((r) => r.path === focusedPath.value);
+  return row && row.kind !== "dir" ? null : "Select a file in the tree first";
+}
+
+/** Runs Insert link for the selected row (the registry command's `exec`). */
+function insertLinkSelected(): void {
+  const row = rows.value.find((r) => r.path === focusedPath.value);
+  if (row && row.kind !== "dir") emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
+}
+
 function onKeydown(event: KeyboardEvent): void {
   const action = navigate(rows.value, focusedPath.value, {
     key: event.key,
     ctrlOrMeta: event.ctrlKey || event.metaKey,
     shift: event.shiftKey,
+    // the host passes the registry's effective `tree.insertLink` binding, so a rebinding moves the key
+    insertLink: insertLinkBinding.value !== null && chordMatches(insertLinkBinding.value, event, isMac.value),
   });
   if (action.kind === "none") return;
   event.preventDefault();
@@ -511,7 +523,7 @@ const menuItems = computed<MenuItem[]>(() => {
     { id: "new-folder", label: "New folder here", enabled: !!props.createEntry, reason: "Creating folders is not available right now." },
   );
   const accelFor = (id: string): Pick<MenuItem, "accel" | "spoken"> => {
-    const binding = (props.bindings ?? DEFAULT_MENU_BINDINGS)[id];
+    const binding = props.bindings?.[id];
     return binding ? { accel: chordGlyphs(binding, isMac.value), spoken: chordSpoken(binding, isMac.value) } : {};
   };
   const later = "Arrives with link repair (P3, FR-VLT-09): moving or renaming without repairing links would break them.";
@@ -541,6 +553,8 @@ defineExpose({
   model,
   focusTree,
   focusFilter,
+  insertLinkUnavailable,
+  insertLinkSelected,
   version,
   filter,
   currentDir,
