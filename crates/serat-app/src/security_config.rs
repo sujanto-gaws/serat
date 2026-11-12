@@ -153,6 +153,24 @@ mod tests {
              Markdown; this is the same rule enforced at the CSP layer rather than \
              only by the sanitiser."
         );
+        assert!(
+            directives.contains(&"form-action 'none'"),
+            "tauri.conf.json's CSP no longer pins form-action to 'none' (was {csp:?}) -- \
+             task #115, ADR-0017 item 7 / T-09: form-action does NOT fall back to \
+             default-src, so without it a form in the app document may submit to any \
+             origin. on_navigation refuses a top-level submission, but it sees the main \
+             frame only; this is the layer that does not depend on it. The one app form \
+             (FileTree.vue's prompt) cancels its submit event, which never reaches the \
+             form-action check."
+        );
+        assert!(
+            directives.contains(&"base-uri 'none'"),
+            "tauri.conf.json's CSP no longer pins base-uri to 'none' (was {csp:?}) -- \
+             task #115, ADR-0017 item 7 / T-09: base-uri does not fall back to \
+             default-src either, and an injected <base href> would re-point every \
+             relative URL the app resolves (pdf.js's worker, a future cMapUrl). The \
+             app emits no <base> element (Vite's base: \"./\" is a build setting)."
+        );
     }
 
     #[test]
@@ -165,7 +183,7 @@ mod tests {
         const EXPECTED: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
             img-src 'self' serat-asset: http://serat-asset.localhost; \
             connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost; \
-            frame-src 'none'; object-src 'none'";
+            frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
         let csp = tauri_conf()["app"]["security"]["csp"]
             .as_str()
             .expect("app.security.csp must be a string")
@@ -208,7 +226,8 @@ mod tests {
                 }
             } else {
                 assert!(
-                    matches!(name, "frame-src" | "object-src") && sources == ["'none'"],
+                    matches!(name, "frame-src" | "object-src" | "form-action" | "base-uri")
+                        && sources == ["'none'"],
                     "unexpected CSP directive {directive:?}"
                 );
             }

@@ -367,7 +367,7 @@ impl OpenCatchUp {
                 _ => {}
             }
         }
-        if !matches!(state, IndexState::Opening) {
+        if !matches!(state, IndexState::Opening { .. }) {
             self.settled.set();
         }
     }
@@ -1251,7 +1251,7 @@ mod tests {
             walk_complete: false,
         };
         let c = OpenCatchUp::new(Duration::from_secs(5), Duration::ZERO);
-        c.index_published(&IndexState::Opening);
+        c.index_published(&IndexState::Opening { reason: None });
         c.index_published(&ready);
         assert!(c.claim(false));
         assert!(!c.claim(true), "once per open vault");

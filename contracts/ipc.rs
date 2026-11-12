@@ -526,7 +526,30 @@ pub enum IndexState {
     /// wait for the check; the front end should render the shell in this state
     /// and expect a transition over `INDEX_STATUS_EVENT` a few milliseconds
     /// later. "Not known yet" is a state to render, not a null to interpret.
-    Opening,
+    ///
+    /// **It can also last a whole rebuild, and then it says why (task #115).**
+    /// Since #96, a re-open of a root whose previous index actor was detached
+    /// still writing `index.db` (a failed open past `CLOSE_DEADLINE`, or a close
+    /// during a rebuild) starts no actor until that one exits: ADR-0001 allows
+    /// one writer. The open check has then not started, so the state is truly
+    /// `Opening`, but "a few milliseconds" becomes "until the old rebuild ends",
+    /// and the user is owed the reason (NFR-REL-02's rule for `Rebuilding`,
+    /// applied here). Architecture §3.4, "Why the index can wait at
+    /// `Opening`"; copy in `docs/03-design/ui/index-state-copy.md`.
+    ///
+    /// Not a separate variant on purpose: every consumer that treats `Opening`
+    /// as "the check has not finished" (the `t_usable` mark, the publisher's
+    /// terminal test, the front end's "not known yet") is right for this case
+    /// too, and a new variant is one each of them could miss.
+    Opening {
+        /// Why the open check has not started yet. Absent is the ordinary
+        /// case: the check is running and ends in milliseconds. Optional on
+        /// the wire, so `{ "kind": "opening" }` stays valid in both
+        /// directions; filled by serat-app in #117 (to be filed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<OpeningReason>,
+    },
 
     /// Usable.
     Ready {
@@ -562,6 +585,26 @@ pub enum IndexState {
         /// The index path that could not be built.
         path: String,
     },
+}
+
+/// Why [`IndexState::Opening`] is lasting longer than the open check does.
+///
+/// A closed set, like [`RebuildReason`], so each member has copy the front end
+/// renders (`docs/03-design/ui/index-state-copy.md`). One member today; the
+/// enum exists so that a second cause (a single-instance lock held by another
+/// Serat process, which #96 records as a limit) is an added variant and not a
+/// change of shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum OpeningReason {
+    /// An index actor from an earlier open of this same vault root (identified
+    /// by `serat_vault::FileIdentity`, not by path) is still running, usually
+    /// finishing a rebuild, and holds `index.db`. This open's actor starts the
+    /// moment it exits. Editing works meanwhile; search, backlinks and views
+    /// wait. The old actor's publisher is retired, so there is no progress
+    /// count to show and none is promised.
+    PreviousIndexStillClosing,
 }
 
 /// Why a rebuild is running.
