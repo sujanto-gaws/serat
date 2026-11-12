@@ -114,10 +114,47 @@ export function passthroughName(key: string, platform: EditorPlatform, shift: bo
   return `${name} (extending selection)`;
 }
 
-/** A chord in the one form two spellings of it share: modifiers lowercased and sorted (`Shift-Mod-z` is
- * `Mod-Shift-z`). The key keeps its case: CodeMirror tells `Ctrl-a` from `Ctrl-A`, and the registered set
- * must stay what it was. */
-export function normaliseChord(binding: string): string {
+const MODIFIER_ALIASES: Record<string, string> = {
+  ctrl: "ctrl",
+  control: "ctrl",
+  c: "ctrl",
+  alt: "alt",
+  option: "alt",
+  a: "alt",
+  shift: "shift",
+  s: "shift",
+  meta: "meta",
+  cmd: "meta",
+  command: "meta",
+  m: "meta",
+};
+
+/**
+ * A chord in the one form every spelling CodeMirror treats as the same chord shares: `Mod` is the platform
+ * modifier (Cmd on mac, Ctrl elsewhere), `Cmd`/`Meta`/`Control`/`Option` and CodeMirror's one-letter
+ * modifier aliases fold to one name, modifier order is irrelevant, and a single uppercase letter means
+ * Shift (`Mod-Z` is `Mod-Shift-z`; `Ctrl-a` and `Ctrl-A` stay distinct, as in CodeMirror).
+ */
+export function normaliseChord(binding: string, platform: EditorPlatform): string {
+  const parts = chordParts(binding);
+  let key = parts.pop() ?? "";
+  const mods = new Set(
+    parts.map((part) => {
+      const lower = part.toLowerCase();
+      return lower === "mod" ? (platform === "mac" ? "meta" : "ctrl") : (MODIFIER_ALIASES[lower] ?? lower);
+    }),
+  );
+  if (key.length === 1 && key !== key.toLowerCase()) {
+    mods.add("shift");
+    key = key.toLowerCase();
+  }
+  return [...[...mods].sort(), key].join("-");
+}
+
+/** The literal spelling with modifiers lowercased and sorted and the key as written: how two CodeMirror
+ * keymap entries are told apart from each other (the upstream mac pair `Ctrl-A` and `Shift-Ctrl-a` are
+ * two registered commands today, and stay so). */
+function rawChord(binding: string): string {
   const parts = chordParts(binding);
   const key = parts.pop() ?? "";
   return [...parts.map((part) => part.toLowerCase()).sort(), key].join("-");
@@ -139,6 +176,9 @@ function registerPassthrough(
   registry: CommandRegistry,
   bindings: readonly KeyBinding[],
   idPrefix: string,
+  /** Folded (`normaliseChord`) chords of the named commands: a passthrough chord equal to one is skipped. */
+  namedChords: ReadonlySet<string>,
+  /** Raw (`rawChord`) chords already registered by passthroughs, shared across both calls. */
   seenKeys: Set<string>,
   platform: EditorPlatform,
 ): void {
@@ -161,8 +201,9 @@ function registerPassthrough(
       return;
     }
     const base = `${idPrefix}.${slugForKey(key)}-${index}`;
-    if (!seenKeys.has(normaliseChord(key))) {
-      seenKeys.add(normaliseChord(key));
+    const raw = rawChord(key);
+    if (!namedChords.has(normaliseChord(key, platform)) && !seenKeys.has(raw)) {
+      seenKeys.add(raw);
       const { run } = binding;
       registry.register({
         id: base,
@@ -179,8 +220,9 @@ function registerPassthrough(
     // (selection-extending variants: Shift-ArrowLeft, Shift-Home ...).
     if (binding.shift) {
       const shiftKey = `Shift-${key}`;
-      if (!seenKeys.has(normaliseChord(shiftKey))) {
-        seenKeys.add(normaliseChord(shiftKey));
+      const rawShift = rawChord(shiftKey);
+      if (!namedChords.has(normaliseChord(shiftKey, platform)) && !seenKeys.has(rawShift)) {
+        seenKeys.add(rawShift);
         const shiftRun = binding.shift;
         registry.register({
           id: `${base}-shift`,
@@ -217,7 +259,7 @@ export function createEditorCommandRegistry(
   platform: EditorPlatform = detectPlatform(),
   /** The app-wide registry to add to (the palette lists it); a fresh one when omitted. */
   registry: CommandRegistry = new CommandRegistry(),
-  /** Test seam: replaces a named command's default binding, so the passthrough skip-set can be shown to follow it. */
+  /** @internal test seam: replaces a named command's default binding, so the passthrough skip-set can be shown to follow it. */
   namedBindings: Readonly<Record<string, string>> = {},
 ): CommandRegistry {
   const bind = (id: string, fallback: string): string => namedBindings[id] ?? fallback;
@@ -317,14 +359,17 @@ export function createEditorCommandRegistry(
   // Keys already given an explicit, named command above are never double-registered under a generic
   // passthrough id (the same physical key under two ids). The set is DERIVED from what this function
   // registered (not a literal list that could drift from the bindings above, architecture §9.3), in the
-  // normalised form `sameChord` compares. Shared across both passthrough calls and mutated by them, so a
-  // key repeated between `historyKeymap` and `defaultKeymap`, or within either, is registered once.
-  const seenKeys = new Set<string>();
+  // folded form `normaliseChord` gives (Mod = the platform modifier, uppercase = Shift). Passthroughs are
+  // compared with each other by their raw spelling, so CodeMirror's own distinct entries all register.
+  // `seenKeys` is shared across both passthrough calls, so a key repeated between `historyKeymap` and
+  // `defaultKeymap`, or within either, is registered once.
+  const namedChords = new Set<string>();
   for (const command of registry.list()) {
-    if (!preexisting.has(command.id) && command.defaultBinding) seenKeys.add(normaliseChord(command.defaultBinding));
+    if (!preexisting.has(command.id) && command.defaultBinding) namedChords.add(normaliseChord(command.defaultBinding, platform));
   }
-  registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys, platform);
-  registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys, platform);
+  const seenKeys = new Set<string>();
+  registerPassthrough(registry, historyKeymap, "editor.cm-history", namedChords, seenKeys, platform);
+  registerPassthrough(registry, defaultKeymap, "editor.cm", namedChords, seenKeys, platform);
 
   return registry;
 }
