@@ -65,5 +65,16 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     globals: false,
     include: ["src/**/*.test.ts"],
+    // Task #131 (NFR-MNT-01, NFR-PRF-08): on a 4-core host under load, parallel workers starve
+    // the vitest main process, whose reply to a worker's RPC then misses vitest's fixed 60 s
+    // window (not configurable in 3.2.7) and the run exits 1 with `[vitest-worker]: Timeout
+    // calling "onTaskUpdate"` although every test passed. One worker at a time: 10 of 10 runs
+    // clean under 4 busy loops, against 6 of 10 failing with the default (2 workers: 3 of 3
+    // failing). See docs/05-testing/test-plan.md, "Flake log". The longer per-test limit
+    // covers a starved worker breaching the 5 s default. Re-check after a vitest major bump.
+    pool: "forks",
+    poolOptions: { forks: { maxForks: 1, minForks: 1 } },
+    testTimeout: 20000,
+    hookTimeout: 20000,
   },
 }));
