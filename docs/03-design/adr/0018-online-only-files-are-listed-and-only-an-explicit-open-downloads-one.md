@@ -1,7 +1,7 @@
 # ADR-0018: Online-only files are listed, and only an explicit open downloads one
-**Status:** proposed — the rule is **P2, Must**, with a **P1 interim** (§P1 interim). The owner has confirmed that the P1 gate vault is local only, so the rule stays in P2. It stays proposed until rust-core-dev, tauri-app-dev, vue-frontend-dev and test-engineer have reviewed it (§Objections recorded) · **Date:** 2026-11-12 · **Serves:** FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06
+**Status:** proposed — the rule is **P2, Must**, with a **P1 interim** (§P1 interim). The owner has confirmed that the P1 gate vault is local only, so the rule stays in P2. That answer covers the primary machine. A synced replica of the real vault under OneDrive or iCloud (p1-gate-protocol.md counts any replica as the real vault) would reopen the P1 question; that is RISK-015's trigger. It stays proposed until rust-core-dev, tauri-app-dev, vue-frontend-dev and test-engineer have reviewed it (§Objections recorded) · **Date:** 2026-11-12 · **Serves:** FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06
 **Honours:** ADR-0002 (rebuild, not migrate), ADR-0011 (the watcher path), ADR-0015 (the tree as complete directory listings; §2's catch-up is amended here), ADR-0016 (saves are patches against a base), ADR-0017 (the asset scheme); threat model T-07; assumption A-03 (sync is external)
-**Round 2 (task #134 review):** the P2/P1 split; demote on free (B-2); locality tested before catch-up candidacy (B-3); no stat added to FR-VLT-01's no-index arm (B-1); the explicit-open table; `NotLocal` arms; the benches to re-run; legacy `.icloud` stubs moved to the exclusions.
+**Round 3:** one byte-reading gate enforced by clippy (B-4), no download on the webview main thread (B-5), chunked `hydrate` for assets, classified editor arms, and RISK-015's replica trigger. **Round 2 (task #134 review):** the P2/P1 split; demote on free (B-2); locality tested before catch-up candidacy (B-3); no stat added to FR-VLT-01's no-index arm (B-1); the explicit-open table; `NotLocal` arms; the benches to re-run; legacy `.icloud` stubs moved to the exclusions.
 
 ## Context
 
@@ -53,8 +53,20 @@ Two pieces ship in P1 because they cost little and stop the worst outcome:
    - **`walk_tree` without metadata** (the no-index arm, `crates/serat-vault/src/tree.rs` around lines 220–230) takes no stat; it uses the directory entry's type only. That is FR-VLT-01's timed arm. **Ruled: `TreeEntry.local` is `None` ("not yet known") on that arm on every platform.** It is filled by a tree update when the rebuild's `Vault::walk` reaches the file. Paying an `lstat` per file on macOS to fill it early was rejected, because it moves FR-VLT-01's no-index number. Windows could fill it for free, but one rule on every platform is one test.
    - **`Vault::resolve` returns the final component's metadata** alongside the path. It already takes an `lstat` of every component (`crates/serat-vault/src/lib.rs` around line 298), so `read`, `stat` and the scheme reuse that result instead of taking another.
 3. **Not-local directories** are a `RECALL_ON_OPEN` directory on Windows or a dataless directory on macOS. `read_dir` on one makes the sync client fetch the listing over the network, inside the timed walk. **Ruled: the predicate applies to files only.** Directories are listed as today, because not descending would hide every note beneath them and break links (option 2's failure). The cost (a walk that is network-bound on such a vault, so FR-VLT-01's number does not hold there) is part of RISK-015 and is measured on the #77 runner.
-4. **Reading.** `Vault::read` refuses a not-local file with `VaultError::NotLocal { path }`. It tests the metadata `resolve` returned **before** opening. On Windows it tests **again on the opened handle's metadata, before reading any byte**: `read_hooked` already calls `file.metadata()` after the open (`crates/serat-vault/src/lib.rs` around line 415). Opening a `RECALL_ON_DATA_ACCESS` file does not download it; the first read does. So the second test closes the race for those files. A `RECALL_ON_OPEN` file downloads on open, so for it the race between `resolve` and `open` remains. Losing it costs one download. **The one downloading function is `Vault::read_hydrating(path)`**, so "who downloads" is a grep.
-   - It goes through `resolve` and the ignored-directory check like every read (NFR-SEC-06, T-07), so it cannot target `.serat/` or a path outside the root.
+4. **Reading.** `Vault::read` refuses a not-local file with `VaultError::NotLocal { path }`. It tests the metadata `resolve` returned **before** opening. On Windows it tests **again on the opened handle's metadata, before reading any byte**: `read_hooked` already calls `file.metadata()` after the open (`crates/serat-vault/src/lib.rs` around line 415). Opening a `RECALL_ON_DATA_ACCESS` file does not download it; the first read does. So the second test closes the race for those files. A `RECALL_ON_OPEN` file downloads on open, so for it the race between `resolve` and `open` remains. Losing it costs one download.
+
+   **One private gate for every byte serat-vault reads (B-4).** "Who downloads" can only be a grep if nothing else reads. Today serat-vault reads bytes directly at these sites:
+   - `crates/serat-vault/src/lib.rs`: `reload_ignore_file` (around line 174), `write_atomic`'s expect check (around 571), `write_patch`'s base read (around 717), its re-read (around 757), `diff_against_disk` (around 805) and `read_hooked` (around 415);
+   - `crates/serat-vault/src/gitignore.rs` around line 240;
+   - and outside the crate, the asset scheme's `open_verified` and `read_span` in `crates/serat-app/src/asset.rs`.
+
+   **Ruled:**
+   - **The gate.** Every byte read in serat-vault goes through one private gate, `open_bytes(path, Hydrate::{No, Yes})`. It does the `resolve` metadata check, the open, the handle re-test and the read.
+   - **Two public wrappers.** `Vault::read` is `Hydrate::No`. `Vault::read_hydrating` is `Hydrate::Yes`, and it is the only public function that downloads.
+   - **A chunked variant.** `Vault::hydrate(path) -> Result<()>` is the gate's chunked-discard variant, for an asset that must be downloaded but not loaded whole (SF-8).
+   - **The asset scheme** opens through a serat-vault function built on the same gate. It keeps its own containment re-check, but not its own `File::open`.
+   - **Mechanical enforcement.** `std::fs::read`, `std::fs::read_to_string` and `std::fs::File::open` go into `disallowed-methods` in `crates/serat-vault/clippy.toml`, with one `#[allow]` on the gate. The precedent is `canonicalize` (task #107). The `.serat/` files (`reload_ignore_file`, `.seratignore`, the gitignore offer) are vault-local by construction, so they go through the gate with `Hydrate::No` too. A `.seratignore` that is itself online-only is then read as "no user patterns", the existing missing-file rule, and is never downloaded.
+   - The gate goes through `resolve` and the ignored-directory check (NFR-SEC-06, T-07), so `read_hydrating` and `hydrate` cannot target `.serat/` or a path outside the root.
    - A failed download is `Err`, never zero bytes (the P1 piece).
    - **To measure on the #77 runner:** `FILE_FLAG_OPEN_NO_RECALL` (`0x0010_0000`, through `OpenOptionsExt::custom_flags`, no `unsafe`) would stop any open from recalling the file and close the race entirely. macOS `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, …)` would do the same for a process, but it needs FFI and the workspace forbids `unsafe`. It is listed and not chosen.
 5. **What counts as an explicit open.** One user action, now, on one named file:
@@ -65,7 +77,7 @@ Two pieces ship in P1 because they cost little and stop the worst outcome:
    | Open a PDF or image in a viewer | Yes |
    | Click **Download** on a not-local embed, transclusion or preview | Yes |
    | Save a note open in a pane whose file was freed meanwhile (ADR-0016's base check) | Yes. The pane is an explicit open. |
-   | Reconcile a remote edit to a note open in a pane (`editor.rs`, the read after `diff_against_disk`) | Yes, **only when mtime or size changed**. A file freed with mtime and size unchanged has nothing to reconcile and is not read. |
+   | Reconcile a remote edit to a note open in a pane | Yes, **only when mtime or size changed**. `request_external_diff` first takes a stat (locality, mtime, size) against the pane's base, **before** `diff_against_disk`, which reads the file itself (`lib.rs` around line 805) ahead of the `editor.rs` read around line 344. A file freed with mtime and size unchanged has nothing to reconcile and is not read. |
    | Export or print one note at the user's request (P2+) | Yes. Exporting a folder or vault does not download; it reports the not-local files it skipped. |
    | Tabs and panes restored at launch, the focused one included | **No.** The pane shows "Stored online only" with **Download**. Restoring is not an action taken now, and a restored session can name many files. |
    | `![[note]]` transclusion, image embeds, hover and link previews | No. Each shows a not-local placeholder with **Download**. |
@@ -88,13 +100,20 @@ Two pieces ship in P1 because they cost little and stop the worst outcome:
    The watcher's hash check (architecture §3.1.2 step 3) takes the same stat first. ADR-0015 §2, architecture §3.1.1 item 6 and §3.1.2 steps 1 and 3 carry "Amended by ADR-0018", and so does `CatchUp::PathsAndMtime`'s doc comment.
 8. **Every `Vault::read` consumer has an explicit `NotLocal` arm (SF-5).** Today any read error other than `NotFound` becomes `Step::Gone { not_found: false }`, "unreadable, row kept" (`crates/serat-index/src/external.rs` around lines 200–204 and 412). Under that, a rebuild would skip a not-local file instead of writing its path-only row. So:
    - `submit` (the rebuild and the watcher) maps `NotLocal` to the path-only row or the demotion of item 6;
-   - the editor's save base check and reconciliation (`crates/serat-app/src/editor.rs`, the reads around line 344) use `read_hydrating`, under item 5's conditions;
-   - the scheme answers 404 and `read_asset_range` answers `IpcError::NotLocal`.
+   - `note_opened` (`crates/serat-app/src/editor.rs` around line 219) uses `Hydrate::No`. A pane restored at launch on a not-local file is accepted, **registers no base and reads nothing**, and shows item 5's "Stored online only" state. The pane registers its base when the user downloads the file.
+   - `stale_against_disk` (around line 324) uses `Hydrate::No`, and `NotLocal` maps to `IpcError::NotLocal`. A stale-hash answer must not download a file to report a hash.
+   - `rebase_buffer` (around line 392, "Keep mine") is explicit, so it uses `Hydrate::Yes`.
+   - The editor's save, through `write_patch`'s base read (`lib.rs` around line 717) and its re-read (around 757), is explicit (item 5), so it uses `Hydrate::Yes`.
+   - The reconciliation read after item 5's stat uses `Hydrate::Yes`.
+   - The scheme answers 404, and `read_asset_range` answers `IpcError::NotLocal`.
 
    Each match on `VaultError` names `NotLocal`, with no `_` arm hiding it.
 9. **The asset scheme never downloads.** A not-local file gets the scheme's ordinary 404, decided from `resolve`'s metadata before `open_verified` opens anything. On Windows it is re-tested on the handle's metadata (`asset.rs`, the `file.metadata()` after the open) before any byte is read. **This is not a security control.** Losing the race costs one download, and containment stays with ADR-0017 step 7's check on the handle's real path (T-07). A cloud placeholder is not a link: on Windows, Rust's `is_symlink` is true only for name-surrogate reparse tags (symlinks, junctions), and the cloud tags are not name surrogates.
 10. **The boundary**, changed by the implementing task:
-    - `ReadFileArgs::hydrate: bool` (absent means `false`) and `AssetArgs::hydrate: bool` (on `asset_info` only). Both reach `Vault::read_hydrating`, and no separate download command exists.
+    - `ReadFileArgs::hydrate: bool` (absent means `false`) reaches `Vault::read_hydrating`.
+    - `AssetArgs::hydrate: bool` reaches `Vault::hydrate`, the chunked-discard variant, so `asset_info` never loads a 100 MB PDF to download it (SF-8). `AssetArgs` is `asset_info`'s argument only; `read_asset_range` has its own type. Its doc comment (`contracts/ipc.rs` around line 1636, "Arguments to `asset_info` and `read_asset_range`'s path") is reworded when `hydrate` is added.
+    - No separate download command exists.
+    - **Nothing downloads on the webview main thread (B-5, goal 2).** `read_file` is today a sync `#[tauri::command]` (`crates/serat-app/src/commands.rs` around lines 52–53), so it runs on the main thread. Task #49 (in the gate) makes it async through `offload::blocking`, as `asset_info` already is through `blocking` (commands.rs around lines 389–411). `ReadFileArgs::hydrate` must not land before #49. Hydrating work inside `save_patch` and `request_external_diff` runs on the blocking pool too, as commands.rs requires around lines 149–152.
     - `IpcError::NotLocal { path }`.
     - `local: Option<bool>` on `TreeEntry` (`None` on the no-index arm, item 2) and `local: bool` on `AssetInfo` and the switcher's entries.
     - `IndexStatus::not_local: Option<u32>`, a count under the same rules as `refused_names`.
@@ -175,7 +194,8 @@ Their objections are recorded here when given.
   - `a_not_local_file_is_listed_by_the_walk_and_refused_by_read`;
   - `read_hydrating_is_the_only_read_that_accepts_a_not_local_file`;
   - `read_hydrating_refuses_dot_serat_and_paths_outside_the_root`;
-  - `the_no_index_tree_walk_takes_no_stat_and_reports_local_unknown`. A counted-syscall test, like `walk.rs`'s.
+  - `the_no_index_tree_walk_takes_no_stat_and_reports_local_unknown`. Its hook is a counted `DirEntry::metadata` wrapper, with `std::fs::DirEntry::metadata` added to serat-vault's `disallowed-methods` and one `#[allow]` on the wrapper, as `canonicalize_counted` is done. The test asserts zero calls on the no-index arm.
+  - `every_byte_read_goes_through_the_gate`. The clippy `disallowed-methods` entries are the enforcement; this test covers the gate's two modes on each listed site's caller.
 - `serat-index`:
   - `a_rebuild_produces_exactly_one_path_only_row`;
   - `freeing_space_demotes_the_row_and_reads_nothing`;
@@ -184,6 +204,7 @@ Their objections are recorded here when given.
   - `a_not_local_file_in_the_racy_window_is_demoted_never_hashed`;
   - `the_index_after_any_locality_change_equals_a_rebuild`.
 - `serat-app`:
+  - `a_restored_pane_registers_no_base_and_reads_nothing`;
   - `the_asset_scheme_404s_a_not_local_file_without_reading_it`;
   - `read_file_refuses_not_local_unless_hydrate_is_set`;
   - `a_restored_pane_does_not_download`.
