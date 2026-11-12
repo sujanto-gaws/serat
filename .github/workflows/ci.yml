@@ -63,7 +63,7 @@ jobs:
 
   # Task #41: licences, advisories, duplicate versions, wildcards and sources, per deny.toml.
   # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It fails its own check (continue-on-error: false) and, since
-  # #113 (#112 fixed RUSTSEC-2026-0459), is in gate.needs and the results loop. The action is
+  # #113 (#112 fixed RUSTSEC-2026-0459), is in gate.needs and the results loop. The action is to be pinned to a patch tag or SHA once runners schedule. It is currently
   # pinned to the v2 major tag (its own line of releases; the exact patch tag could not be
   # verified from the authoring sandbox, so tighten it to a patch tag when runners schedule).
   deny:
