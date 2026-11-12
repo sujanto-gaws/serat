@@ -71,3 +71,15 @@ jobs:
       - name: Print the report either way
         if: always()
         run: cargo run -p doclint --bin check-count-over-list
+
+  conflict-markers:
+    name: "NFR-MNT-01 · no document carries an unresolved conflict marker"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p doclint
+      - name: Print the report either way
+        if: always()
+        run: cargo run -p doclint --bin check-conflict-markers
