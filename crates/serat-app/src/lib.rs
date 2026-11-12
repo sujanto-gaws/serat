@@ -975,8 +975,18 @@ mod tests {
         // source is one the binary never opens (F-470). They also differ *legitimately*
         // -- the source carries the module script in its body and this does not -- so a
         // source-side check would have to model Vite's transform to know which
-        // differences are real. A source-side twin is worth having as the other half of
-        // an F-510 pair; it is not the guarantee.
+        // differences are real.
+        //
+        // A source-side twin is a **convenience, not the other half of an F-510 pair**,
+        // and the distinction is architect's correction to their own ruling. F-510's
+        // two call-site checks caught genuinely *different* attacks, each invisible to
+        // the other. This is not that shape: if the source gains a skeleton and nobody
+        // rebuilds, the shipped artefact is still contentless and the property still
+        // holds, because the binary embeds the built copy. So a source-side check
+        // catches the same markup **earlier**, not additionally, and its whole value is
+        // the length of the feedback loop. The real second half is
+        // `the_shipped_stylesheet_cannot_paint_before_scripts_run`, which closes a
+        // route this check structurally cannot see.
         let index = webview_bundle().join("index.html");
         let html = std::fs::read_to_string(&index).expect("index.html");
         let open = html
