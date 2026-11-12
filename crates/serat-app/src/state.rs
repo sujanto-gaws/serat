@@ -380,6 +380,10 @@ pub(crate) struct OpenHooks {
     /// Make the deferred index-actor spawn fail (task #96 review SF-1).
     #[cfg(test)]
     pub(crate) fail_deferred_spawn: bool,
+    /// Judge names by another platform's rules (task #35), so Windows-only refusals are
+    /// testable end to end on any runner.
+    #[cfg(test)]
+    pub(crate) platform: Option<serat_core::Platform>,
     /// Mutant switch for task #96's test: ignore the detached-writer registry.
     #[cfg(test)]
     pub(crate) skip_registry_check: bool,
@@ -771,9 +775,14 @@ impl AppState {
     ) -> Result<VaultOpened, IpcError> {
         let opening = self.lock_opening();
         let requested = PathBuf::from(&args.root);
-        let vault = Arc::new(
-            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?,
-        );
+        let opened =
+            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?;
+        #[cfg(test)]
+        let opened = match self.hooks.platform {
+            Some(platform) => opened.with_platform(platform),
+            None => opened,
+        };
+        let vault = Arc::new(opened);
         let root = vault.root().to_path_buf();
 
         // The new root is valid; only now is the old vault closed, and *before* the new
@@ -824,6 +833,9 @@ impl AppState {
             // status, so "N names not shown" is a fact of the status, not a second poll.
             .with_refusals(vault.refusals().clone()),
         );
+        // Task #35: a refusal after the open (the watcher's) reaches the front end now,
+        // not with the next state change.
+        publisher.watch_refusals();
         #[cfg(test)]
         if let Some(probe) = &self.hooks.publisher_probe {
             *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
