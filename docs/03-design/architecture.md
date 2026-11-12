@@ -616,6 +616,17 @@ T-07 rests on the second half, for the reason the threat model gives.
 
 **The Windows half has a known limit.** The file index is 64 bits. **ReFS does not guarantee it unique**: ReFS identifies files by a 128-bit id, and the 64-bit index it reports can coincide for two directories. Two different vault roots on one ReFS volume could then share a key. The effect is bounded and safe in direction: a re-open of vault B would wait at `Opening` (see *Why the index can wait at `Opening`*) for a detached actor that belongs to vault A, and then proceed. No index is shared and no vault byte is at risk (C-02). NTFS, the reference platform's filesystem, does guarantee the 64-bit index unique per volume. **The follow-up is `GetFileInformationByHandleEx(FileIdInfo)`**, which returns the 128-bit `FILE_ID_128` with the 64-bit volume serial number, and is what `FileIdentity` should hold on Windows. It is not scheduled for P1, because the failure is a bounded wait and never a shared writer or a lost byte. It is not hypothetical, though: a Windows Dev Drive is ReFS, and developers are exactly who put vaults there. It is recorded here and on `FileIdentity`'s doc comment so that whoever next touches `identity.rs` does not need to rediscover it. If a platform cannot give an identity at all, the registry records nothing and logs it (#96).
 
+##### Online-only files: listed, never downloaded by background work (ADR-0018, task #134)
+
+Cloud clients leave files on disk without their bytes: OneDrive placeholders (`RECALL_ON_DATA_ACCESS`), File Provider dataless files on macOS (`SF_DATALESS`) and legacy `.<name>.icloud` stubs. Reading one makes the operating system download it. **Ruled: only an explicit open of one file by the user downloads it.** The walk detects not-local files from the stat it already takes (`serat_core::locality::is_local`), so it adds no syscall and NFR-PRF-01 is unchanged.
+- `Vault::read` refuses a not-local file with `VaultError::NotLocal`, and `Vault::hydrate` is the one path that downloads.
+- A rebuild writes a path-only `notes` row (`local = 0`, `hash = ''`, no blocks), so the note stays in the tree, the switcher and link resolution and is absent from full-text search.
+- Freeing space with mtime and size unchanged keeps indexed content. A remote edit to a not-local file demotes its row, and a file becoming local is re-read even when mtime and size match.
+- The asset scheme 404s a not-local file without opening it, and `download_file` is the explicit path.
+- Linux FUSE clients cannot be detected and behave as today.
+
+The rule, its cases and the tests that pin it are in ADR-0018. Delivery is the implementing tasks named there.
+
 ##### A note that cannot be parsed is still a note
 
 F-67, and the answer is design goal 5 applied to Markdown rather than to binaries. When the parser cannot produce structures — in practice a `.md` file that is not valid UTF-8, since CommonMark has no parse failures and broken frontmatter already indexes the note and records the problem — the note is indexed as a **bare row**: path, hash, mtime and a title from the filename, with no blocks, no fields and no links.
@@ -1588,6 +1599,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0015 — The file tree arrives as complete directory listings, on a clock that starts at the painted window (serves FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04)
 - ADR-0016 — Editor saves are patches against a base, and external changes arrive in the same coordinates (serves FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04)
 - ADR-0017 — Vault bytes reach the webview through one read-only custom scheme (serves FR-BIN-11, FR-BIN-12, NFR-SEC-06, NFR-SEC-01)
+- ADR-0018 — Online-only files are listed, and only an explicit open downloads one (serves FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-06)
 
 ## Traceability
 
@@ -1623,6 +1635,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | The paint mark evidence: what makes `S_shell` non-forgeable, and which of its five properties are enforced, unenforced or demoted | §3.4 *The split*, ADR-0014 *(the four-property table and #106 closure)*, `app/src/startup.ts`, `crates/serat-app/src/startup.rs`, `bench/budget/src/trace.rs` | NFR-PRF-01, NFR-PRF-08, C-06 |
 | File tree: directory listings, two sources, the FR-VLT-01 interval and marks, open-path catch-up | §3.5, ADR-0015 | FR-VLT-01, FR-VLT-04, NFR-PRF-01, NFR-CMP-03 |
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
+| Online-only (cloud placeholder) files: stat-only detection, `Vault::read` refuses, `Vault::hydrate` on explicit open only, path-only index rows (`notes.local`), scheme 404, `download_file` | §3.1.2 *Online-only files*, ADR-0018 | FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04 |
 | One index writer per vault root: the detached-actor registry keyed by `serat_vault::FileIdentity` (#96), and the reason an open waits at `Opening` (`OpeningReason`, task #115; P1 #117) | §3.4 *Why the index can wait at `Opening`*, §3.1.2 *A vault root's identity*, contracts/ipc.rs, docs/03-design/ui/index-state-copy.md | NFR-REL-01, NFR-REL-02, FR-VLT-04, ADR-0001 |
 | Vault identity: what `index_meta.vault_root` compares, and what a mismatch may cost | §3.4 *Ruling (task #120)*, `schema/001_init.sql` (index_meta.vault_root), ADR-02 | FR-VLT-02, NFR-REL-02, NFR-PRF-04, C-02 |
 | Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, FR-NAV-08, NFR-PRF-05 |
@@ -1676,6 +1689,7 @@ Recorded rather than resolved, because resolving them now would mean guessing. E
 | Is brute-force vector search fast enough at 200,000 chunks?           | A P4 benchmark on the synthetic vault. ADR-09 is written to be reversed cheaply.                                               |
 | Which PDF extractor gives usable layout fidelity on the real archive? | Blueprint move 5 — spike one extractor against actual contracts and papers before committing to the pillar.                    |
 | How much of Markdown table editing needs a widget?                    | Dogfooding during P1. FR-EDT-07 is deliberately Could-priority until there is evidence.                                        |
+| Do OneDrive and iCloud raise a watcher event when a file is freed or downloaded (ADR-0018 §6, §8)? Without one, a download made outside Serat is noticed only by the next open's catch-up. | A run on a OneDrive-synced Windows machine and an iCloud Mac: free one file, download another, and record the `notify` events each produces. Owner: test-engineer, with the Windows runner (#77). |
 | Does the 150ms watcher debounce hold for every sync tool?             | Observation during P1 against git, Syncthing and iCloud, which behave differently.                                             |
 | Should saved views live in .serat or in the vault as notes?           | Follows from whether a user wants views to sync with their vault. Leaning toward notes, for consistency with types and lenses. |
 | Does §3.2's redundant index contend with P2's write-back submits?     | A P2 measurement of writer-queue depth while patching under load. Reasoning settles the correctness half — a redundant index touches no vault byte — and settles nothing about backpressure (ADR-11). |
