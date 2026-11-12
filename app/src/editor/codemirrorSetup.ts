@@ -16,7 +16,7 @@ import { acceptCompletion, closeCompletion, moveCompletionSelection, startComple
 import type { Extension } from "@codemirror/state";
 import { EditorView, keymap, scrollPastEnd, type KeyBinding } from "@codemirror/view";
 
-import { CommandRegistry, type CommandId } from "@/editor/commands";
+import { chordParts, CommandRegistry, type CommandId } from "@/editor/commands";
 import { deleteMarkupBackward, insertNewlineContinueMarkup } from "@/editor/markdownLanguage";
 
 export interface EditorCommandHandlers {
@@ -114,6 +114,15 @@ export function passthroughName(key: string, platform: EditorPlatform, shift: bo
   return `${name} (extending selection)`;
 }
 
+/** A chord in the one form two spellings of it share: modifiers lowercased and sorted (`Shift-Mod-z` is
+ * `Mod-Shift-z`). The key keeps its case: CodeMirror tells `Ctrl-a` from `Ctrl-A`, and the registered set
+ * must stay what it was. */
+export function normaliseChord(binding: string): string {
+  const parts = chordParts(binding);
+  const key = parts.pop() ?? "";
+  return [...parts.map((part) => part.toLowerCase()).sort(), key].join("-");
+}
+
 function slugForKey(key: string): string {
   return key
     .toLowerCase()
@@ -152,8 +161,8 @@ function registerPassthrough(
       return;
     }
     const base = `${idPrefix}.${slugForKey(key)}-${index}`;
-    if (!seenKeys.has(key)) {
-      seenKeys.add(key);
+    if (!seenKeys.has(normaliseChord(key))) {
+      seenKeys.add(normaliseChord(key));
       const { run } = binding;
       registry.register({
         id: base,
@@ -170,8 +179,8 @@ function registerPassthrough(
     // (selection-extending variants: Shift-ArrowLeft, Shift-Home ...).
     if (binding.shift) {
       const shiftKey = `Shift-${key}`;
-      if (!seenKeys.has(shiftKey)) {
-        seenKeys.add(shiftKey);
+      if (!seenKeys.has(normaliseChord(shiftKey))) {
+        seenKeys.add(normaliseChord(shiftKey));
         const shiftRun = binding.shift;
         registry.register({
           id: `${base}-shift`,
@@ -208,19 +217,23 @@ export function createEditorCommandRegistry(
   platform: EditorPlatform = detectPlatform(),
   /** The app-wide registry to add to (the palette lists it); a fresh one when omitted. */
   registry: CommandRegistry = new CommandRegistry(),
+  /** Test seam: replaces a named command's default binding, so the passthrough skip-set can be shown to follow it. */
+  namedBindings: Readonly<Record<string, string>> = {},
 ): CommandRegistry {
+  const bind = (id: string, fallback: string): string => namedBindings[id] ?? fallback;
+  const preexisting = new Set(registry.list().map((c) => c.id));
 
   registry.register({
     id: "editor.save",
     name: "Save now",
-    defaultBinding: "Mod-s",
+    defaultBinding: bind("editor.save", "Mod-s"),
     when: "editor",
     run: handlers.save,
   });
   registry.register({
     id: "editor.toggle-live-preview",
     name: "Toggle live preview / split",
-    defaultBinding: "Mod-Shift-m",
+    defaultBinding: bind("editor.toggle-live-preview", "Mod-Shift-m"),
     run: () => handlers.toggleLivePreview(),
     // Global per components.md §7: works without editor focus and from the palette.
     exec: () => void handlers.toggleLivePreview(),
@@ -228,21 +241,21 @@ export function createEditorCommandRegistry(
   registry.register({
     id: "editor.follow-link",
     name: "Follow link/URL under cursor",
-    defaultBinding: "Mod-Enter",
+    defaultBinding: bind("editor.follow-link", "Mod-Enter"),
     when: "editor",
     run: handlers.followLink,
   });
   registry.register({
     id: "editor.undo",
     name: "Undo",
-    defaultBinding: "Mod-z",
+    defaultBinding: bind("editor.undo", "Mod-z"),
     when: "editor",
     run: (view) => undo(view),
   });
   registry.register({
     id: "editor.redo",
     name: "Redo",
-    defaultBinding: "Mod-y",
+    defaultBinding: bind("editor.redo", "Mod-y"),
     when: "editor",
     run: (view) => redo(view),
   });
@@ -255,7 +268,7 @@ export function createEditorCommandRegistry(
   registry.register({
     id: "editor.markdown-newline",
     name: "Insert newline (continue Markdown list/quote)",
-    defaultBinding: "Enter",
+    defaultBinding: bind("editor.markdown-newline", "Enter"),
     when: "editor",
     // An open completion popup takes Enter first (accept), exactly as the
     // autocompletion keymap would — but through this registry.
@@ -281,7 +294,7 @@ export function createEditorCommandRegistry(
     registry.register({
       id,
       name,
-      defaultBinding: key,
+      defaultBinding: bind(id, key),
       when: "editor",
       run: (view) => popupRun(view) || (fallback ? fallback(view) : false),
     });
@@ -289,39 +302,27 @@ export function createEditorCommandRegistry(
   registry.register({
     id: "editor.start-completion",
     name: "Show completions",
-    defaultBinding: "Ctrl-Space",
+    defaultBinding: bind("editor.start-completion", "Ctrl-Space"),
     when: "editor",
     run: startCompletion,
   });
   registry.register({
     id: "editor.markdown-delete-backward",
     name: "Delete backward (outdent Markdown marker)",
-    defaultBinding: "Backspace",
+    defaultBinding: bind("editor.markdown-delete-backward", "Backspace"),
     when: "editor",
     run: (view) => deleteMarkupBackward(view) || deleteCharBackward(view),
   });
 
-  // Keys already given an explicit, named command above — never
-  // double-registered under a generic passthrough id, which is what would
-  // let the same physical key collide with itself under two different ids.
-  // Shared across both passthrough calls (and mutated by them) so a key
-  // repeated between `historyKeymap` and `defaultKeymap`, or within either
-  // array, is registered exactly once.
-  const seenKeys = new Set([
-    "Mod-s",
-    "Mod-Shift-m",
-    "Mod-Enter",
-    "Mod-z",
-    "Mod-y",
-    "Enter",
-    "Backspace",
-    "ArrowDown",
-    "ArrowUp",
-    "PageDown",
-    "PageUp",
-    "Escape",
-    "Ctrl-Space",
-  ]);
+  // Keys already given an explicit, named command above are never double-registered under a generic
+  // passthrough id (the same physical key under two ids). The set is DERIVED from what this function
+  // registered (not a literal list that could drift from the bindings above, architecture §9.3), in the
+  // normalised form `sameChord` compares. Shared across both passthrough calls and mutated by them, so a
+  // key repeated between `historyKeymap` and `defaultKeymap`, or within either, is registered once.
+  const seenKeys = new Set<string>();
+  for (const command of registry.list()) {
+    if (!preexisting.has(command.id) && command.defaultBinding) seenKeys.add(normaliseChord(command.defaultBinding));
+  }
   registerPassthrough(registry, historyKeymap, "editor.cm-history", seenKeys, platform);
   registerPassthrough(registry, defaultKeymap, "editor.cm", seenKeys, platform);
 
