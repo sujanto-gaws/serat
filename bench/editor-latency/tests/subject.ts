@@ -56,6 +56,17 @@ export function buildFixtureNote(lines: number = FIXTURE_NOTE_LINE_COUNT): strin
   return out.slice(0, lines).join("\n") + "\n";
 }
 
+/** The fixture's three on-disk shapes (ADR-0016: the 20k vault carries CRLF and BOM notes). The editor holds
+ * the same 5,000 lines in all three (CodeMirror splits on \r\n, and a BOM is one character of line 0), so
+ * these exercise the load path and the line model, not a different typing path. */
+export type FixtureVariant = "lf" | "crlf" | "bom+crlf";
+
+export function fixtureVariant(note: string, variant: FixtureVariant): string {
+  if (variant === "lf") return note;
+  const crlf = note.replace(/\n/g, "\r\n");
+  return variant === "crlf" ? crlf : "\uFEFF" + crlf;
+}
+
 function serve(dir: string): Promise<{ url: string; close: () => Promise<void> }> {
   const types: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
   const server = http.createServer((req, res) => {
@@ -87,6 +98,7 @@ const TAURI_STUB = `
       invoke: function (cmd) {
         if (cmd === "plugin:event|listen") return Promise.resolve(++cbs);
         if (cmd === "index_status") return Promise.resolve({ state: "idle" });
+        if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);
       },
     };
@@ -99,8 +111,15 @@ export interface Subject {
   close: () => Promise<void>;
 }
 
+export interface OpenOptions {
+  /** The note to load (default: the LF fixture). */
+  text?: string;
+  /** What `get_ui_settings` answers; `{ live_preview: false }` selects the split-preview mode (FR-EDT-10). */
+  uiSettings?: { live_preview: boolean; keybindings: unknown[] };
+}
+
 /** Serves dist-bench, loads the fixture and returns the editable surface. */
-export async function openNoteForLatencyTest(page: Page): Promise<Subject> {
+export async function openNoteForLatencyTest(page: Page, options: OpenOptions = {}): Promise<Subject> {
   const dir = benchDistDir();
   if (!fs.existsSync(path.join(dir, "index.html"))) {
     throw new Error(
@@ -110,15 +129,21 @@ export async function openNoteForLatencyTest(page: Page): Promise<Subject> {
   const server = await serve(dir);
   const pageErrors: string[] = [];
   page.on("pageerror", (e) => pageErrors.push(String(e)));
+  if (options.uiSettings) {
+    await page.addInitScript({ content: `window.__SERAT_STUB_UI_SETTINGS__ = ${JSON.stringify(options.uiSettings)};` });
+  }
   await page.addInitScript({ content: TAURI_STUB });
   await page.goto(server.url);
   await page.waitForFunction(() => typeof (window as any).__seratBenchOpenNote === "function", null, { timeout: 10_000 }).catch((e) => {
     throw new Error(`window.__seratBenchOpenNote never appeared (is this a --mode bench build?): ${e.message}; page errors: ${pageErrors.join(" | ")}`);
   });
-  const text = buildFixtureNote();
+  const text = options.text ?? buildFixtureNote();
   await page.evaluate((t) => (window as any).__seratBenchOpenNote(t), text);
   const editor = page.locator('[data-testid="serat-editor"] .cm-content');
   await editor.waitFor({ state: "visible", timeout: 10_000 });
   await editor.getByText("Section 0").first().waitFor({ timeout: 10_000 });
+  if (options.uiSettings?.live_preview === false) {
+    await page.locator(".serat-editor-split-preview").waitFor({ state: "attached", timeout: 10_000 });
+  }
   return { editor, close: server.close };
 }

@@ -38,5 +38,7 @@ export default defineConfig({
     // The gate: `npx playwright test --project=subject` runs unit, then controls, then subject; a failing
     // control skips the subject tests. `--no-deps` skips the controls; never use it for a gated run (`-g` does not bypass them).
     { name: "subject", testMatch: /nfr-prf-02-subject\.spec\.ts/, dependencies: ["controls"], use: chromiumUse },
+    // Task #61: the other §9.3 scenarios and the CRLF / BOM+CRLF fixture variants. Report only; same controls gate.
+    { name: "scenarios", testMatch: /nfr-prf-02-scenarios\.spec\.ts/, dependencies: ["controls"], use: chromiumUse },
   ],
 });
