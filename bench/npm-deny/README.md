@@ -13,4 +13,6 @@ node bench/npm-deny/npm-deny.mjs all             # or: audit | licenses | source
 | licenses | every package in `app/package-lock.json`, production and dev, must carry a `license` that the SPDX allow-list accepts. `A OR B` passes on any allowed arm, `A AND B` needs both. A missing field fails. | the lockfile |
 | sources | every package must have a `resolved` URL beginning `sources.registry`. A git, file, http or other-host URL, a link, or a missing `resolved` fails. | the lockfile |
 
+Fail-closed rules (review round 2): the production audit honours no exceptions; an exception needs a GHSA id, the package, a reason of 20 or more characters, an owner and an ISO date, and is matched by id and package; an exception that matches no advisory in the whole-tree report fails the job, so it is removed when its fix lands; an unknown severity fails; a licence expression is parsed (`AND` binds tighter than `OR`, parentheses and `WITH` are honoured) and one that does not parse is not allowed. Licence rulings (lead, 2026-11-12): PSF-2.0 and BlueOak-1.0.0 are accepted; both are recorded in `npm-deny.json`.
+
 Changing the policy is a change to `npm-deny.json`, reviewed like any other; an exception is never added to make a build pass without an owner and a reason. The exceptions are dev-only and expire when the dependency they name is bumped.

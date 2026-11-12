@@ -8,24 +8,38 @@
         "id": "GHSA-5gmw-xhrv-c9v3",
         "package": "tinypool",
         "reason": "dev-only (vitest's worker pool); the options it pollutes are ours, not input. Fix needs vitest 5, a major bump of the test runner.",
-        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
+        "owner": "#128 (vitest 5 bump, vue-frontend-dev)",
         "recorded": "2026-11-12"
       },
       {
         "id": "GHSA-85c8-ppgw-ccpr",
         "package": "tinypool",
         "reason": "as above: dev-only, reached through vitest, fixed by the vitest 5 bump.",
-        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
+        "owner": "#128 (vitest 5 bump, vue-frontend-dev)",
         "recorded": "2026-11-12"
       }
-    ]
+    ],
+    "_doc": "Production dependencies (--omit=dev) are judged at production_level with NO exceptions; the whole tree at all_level, where exceptions apply. An exception needs a GHSA id, the package, a reason (20+ characters), an owner and an ISO date, and must match an advisory in the current report or the job fails (remove it when the fix lands)."
   },
   "licenses": {
-    "_doc": "SPDX identifiers. Same names as deny.toml's [licenses].allow where they coincide; PSF-2.0 and BlueOak-1.0.0 are npm-only additions (both permissive), found in the lockfile on 2026-11-12. An 'A OR B' expression passes if any arm is allowed; 'A AND B' needs both.",
+    "_doc": "SPDX identifiers. Same names as deny.toml's [licenses].allow where they coincide, including 'Apache-2.0 WITH LLVM-exception' for parity with deny.toml. Two npm-only additions, both permissive and ACCEPTED by lead ruling on 2026-11-12: PSF-2.0 (argparse, a production dependency through markdown-it; listed for the third-party notices) and BlueOak-1.0.0 (dev dependencies only: glob, lru-cache, minimatch, minipass, path-scurry). An 'A OR B' expression passes if any arm is allowed; 'A AND B' needs both; parentheses and WITH are parsed, and an expression that does not parse fails.",
     "allow": [
-      "MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "0BSD",
-      "CC0-1.0", "Unlicense", "MPL-2.0", "Unicode-3.0", "Unicode-DFS-2016",
-      "PSF-2.0", "BlueOak-1.0.0"
+      "MIT",
+      "MIT-0",
+      "Apache-2.0",
+      "Apache-2.0 WITH LLVM-exception",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "ISC",
+      "Zlib",
+      "0BSD",
+      "CC0-1.0",
+      "Unlicense",
+      "MPL-2.0",
+      "Unicode-3.0",
+      "Unicode-DFS-2016",
+      "PSF-2.0",
+      "BlueOak-1.0.0"
     ]
   },
   "sources": {
