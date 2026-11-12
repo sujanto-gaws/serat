@@ -195,9 +195,7 @@ describe("keyboard navigation", () => {
     expect(navigate(rows, "n.md", key("F10", { shift: true }))).toEqual({ kind: "context-menu", path: "n.md" });
     expect(navigate(rows, "n.md", key("F10"))).toEqual({ kind: "none" });
     expect(navigate(rows, "n.md", key("ContextMenu"))).toEqual({ kind: "context-menu", path: "n.md" });
-    expect(navigate(rows, "n.md", key("l", { insertLink: true }))).toEqual({ kind: "insert-link", path: "n.md" });
-    expect(navigate(rows, "n.md", key("L", { ctrlOrMeta: true, shift: true }))).toEqual({ kind: "none" }); // only the host's binding match counts
-    expect(navigate(rows, "Open", key("l", { insertLink: true }))).toEqual({ kind: "none" });
+    expect(navigate(rows, "n.md", key("L", { ctrlOrMeta: true, shift: true }))).toEqual({ kind: "none" }); // tree.insertLink is a registry command, not a navigate key
   });
 });
 
@@ -322,9 +320,9 @@ describe("FileTree component", () => {
     wrapper.unmount();
   });
 
-  it("keyboard: arrows move focus (aria-selected), → expands, F2/Menu/Mod-Shift-L emit", async () => {
+  it("keyboard: arrows move focus (aria-selected), → expands, F2/Menu emit", async () => {
     const { ipc, push } = fakeIpc();
-    const wrapper = mount(FileTree, { props: { ipc, bindings: { "insert-link": "Mod-Shift-l" } }, attachTo: document.body });
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
     await vi.advanceTimersByTimeAsync(0);
     push(listing("", [dir("D"), asset("pic.png", true), note("a.md")]));
     push(listing("D", [note("x.md")]));
@@ -336,8 +334,6 @@ describe("FileTree component", () => {
     await tree.trigger("keydown", { key: "ArrowDown" });
     await tree.trigger("keydown", { key: "ArrowDown" });
     expect(wrapper.get('[aria-selected="true"]').attributes("data-path")).toBe("pic.png");
-    await tree.trigger("keydown", { key: "L", ctrlKey: true, shiftKey: true });
-    expect(wrapper.emitted("insert-link")?.[0][0]).toEqual({ path: "pic.png", text: "![[pic.png]]" });
     await tree.trigger("keydown", { key: "F2" });
     expect(wrapper.emitted("rename")?.[0][0]).toEqual({ path: "pic.png" });
     wrapper.unmount();

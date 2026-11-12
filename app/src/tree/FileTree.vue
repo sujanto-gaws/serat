@@ -25,12 +25,12 @@
   - Not built (no tabs in P1): `newTab` is carried on `open` and ignored by the host.
 -->
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import { folderName, noteFileName, takenNames, uniqueName, type CreateKind, type CreateRequest } from "@/tree/createEntry";
 import TreeContextMenu, { type MenuItem } from "@/tree/TreeContextMenu.vue";
-import { chordGlyphs, chordMatches, chordSpoken } from "@/editor/commands";
+import { chordGlyphs, chordSpoken, COMMANDS_KEY, type CommandContextInfo } from "@/editor/commands";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
 import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
@@ -63,12 +63,16 @@ const props = withDefaults(
     createEntry?: (request: CreateRequest) => Promise<string | null>;
     /** macOS conventions (⌘ glyphs, Ctrl-click = context menu). Defaults to the detected platform. */
     mac?: boolean;
-    /** Menu entry id -> CodeMirror-notation binding shown as its accelerator (the registry's effective
-     * bindings, so the menu, the palette and the chips agree). `null` shows none. */
+    /** Display only: menu entry id -> CodeMirror-notation binding shown as its accelerator chip (the
+     * registry's effective bindings, so the menu, the palette and the chips agree). `null` shows none.
+     * It does not drive any key: tree-scoped chords are matched from the injected registry. */
     bindings?: Record<string, string | null>;
   }>(),
   { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null, vaultOpen: true },
 );
+
+/** The app's command registry (provided by App.vue); absent in bare embeds, where no tree-scoped chord fires. */
+const registry = inject(COMMANDS_KEY, null);
 
 const emit = defineEmits<{
   open: [payload: { path: string; newTab: boolean; keepFocus: boolean }];
@@ -314,12 +318,10 @@ function scrollIntoView(path: string): void {
   scrollTop.value = el.scrollTop;
 }
 
-const insertLinkBinding = computed(() => props.bindings?.["insert-link"] ?? null);
-
 /** Why `tree.insertLink` cannot run now (null = it can): the tree holds focus and a file row is selected. */
-function insertLinkUnavailable(): string | null {
+function insertLinkUnavailable(ctx: CommandContextInfo): string | null {
   const el = container.value;
-  if (!el || !el.contains(document.activeElement)) return "Focus the file tree first";
+  if (!el || !ctx.focus || !el.contains(ctx.focus)) return "Focus the file tree first";
   const row = rows.value.find((r) => r.path === focusedPath.value);
   return row && row.kind !== "dir" ? null : "Select a file in the tree first";
 }
@@ -331,12 +333,17 @@ function insertLinkSelected(): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
+  // Tree-scoped registry commands (tree.insertLink): the effective binding decides, `execute` checks availability.
+  const scoped = registry?.matchContext("tree", event, isMac.value);
+  if (scoped) {
+    event.preventDefault();
+    void registry?.execute(scoped.id, null);
+    return;
+  }
   const action = navigate(rows.value, focusedPath.value, {
     key: event.key,
     ctrlOrMeta: event.ctrlKey || event.metaKey,
     shift: event.shiftKey,
-    // the host passes the registry's effective `tree.insertLink` binding, so a rebinding moves the key
-    insertLink: insertLinkBinding.value !== null && chordMatches(insertLinkBinding.value, event, isMac.value),
   });
   if (action.kind === "none") return;
   event.preventDefault();
@@ -361,11 +368,6 @@ function onKeydown(event: KeyboardEvent): void {
       const el = container.value?.querySelector<HTMLElement>(`[data-path="${CSS.escape(action.path)}"]`);
       const box = el?.getBoundingClientRect();
       openMenu(action.path, (box?.left ?? 0) + 24, box?.bottom ?? 0);
-      break;
-    }
-    case "insert-link": {
-      const row = rows.value.find((r) => r.path === action.path);
-      if (row) emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
       break;
     }
   }

@@ -50,11 +50,22 @@ export interface Command {
   exec?: () => void | Promise<void>;
   /** Context check (command-palette.md "unavailable in context"): `null` when
    * the command can run now, else a one-line reason shown instead of running. */
-  unavailable?: () => string | null;
-  /** The palette lists the command only while `unavailable()` is null (a focus-scoped command such
-   * as `tree.insertLink` has no meaning elsewhere); it stays registered and rebindable regardless. */
-  hideWhenUnavailable?: boolean;
+  unavailable?: (ctx: CommandContextInfo) => string | null;
 }
+
+/** Where an action is being invoked from: the palette passes the element focused when it opened
+ * (not its own input), a chord or `execute` passes the currently focused element. */
+export interface CommandContextInfo {
+  focus: Element | null;
+}
+
+/** Chords the tree owns outright (file-tree.md keyboard map): a `when: "tree"` command may not take them. */
+const RESERVED_TREE_KEYS = new Set(
+  ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", "Mod-Enter", "F2", "F10", "Shift-F10", "ContextMenu", "Escape", "Mod-f"].map((k) =>
+    k.toLowerCase(),
+  ),
+);
+const RESERVED = "(reserved key)";
 
 /**
  * The registry NFR-USE-01 requires exactly one of, kept as a class rather
@@ -154,6 +165,7 @@ export class CommandRegistry {
     if (key === null) return null;
     const mine = this.commands.get(id);
     const bucket = mine?.when ?? "*";
+    if (bucket === "tree" && RESERVED_TREE_KEYS.has(key.toLowerCase())) return RESERVED;
     for (const other of this.commands.values()) {
       if (other.id === id || (other.when ?? "*") !== bucket) continue;
       if (this.effectiveBinding(other.id) === key) return other.id;
@@ -181,7 +193,7 @@ export class CommandRegistry {
   async execute(id: CommandId, view: EditorView | null): Promise<string | null> {
     const command = this.commands.get(id);
     if (!command) return "Unknown command";
-    const reason = command.unavailable?.() ?? null;
+    const reason = command.unavailable?.({ focus: document.activeElement }) ?? null;
     if (reason !== null) return reason;
     if (command.exec) {
       this.runCounts.set(id, (this.runCounts.get(id) ?? 0) + 1);
@@ -198,6 +210,17 @@ export class CommandRegistry {
   matchGlobal(event: KeyboardEvent, mac: boolean): Command | undefined {
     for (const command of this.commands.values()) {
       if (!command.exec || command.when) continue;
+      const binding = this.effectiveBinding(command.id);
+      if (binding && chordMatches(binding, event, mac)) return command;
+    }
+    return undefined;
+  }
+
+  /** The view-less command scoped to `when` whose effective binding `event` presses, if any
+   * (the pane's own keydown calls this, then `execute`, so `unavailable` and ranking still apply). */
+  matchContext(when: CommandContext, event: KeyboardEvent, mac: boolean): Command | undefined {
+    for (const command of this.commands.values()) {
+      if (!command.exec || command.when !== when) continue;
       const binding = this.effectiveBinding(command.id);
       if (binding && chordMatches(binding, event, mac)) return command;
     }

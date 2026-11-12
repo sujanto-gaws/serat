@@ -5,7 +5,7 @@ import { mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computed, defineComponent, h, ref } from "vue";
 
-import { CommandRegistry } from "@/editor/commands";
+import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
 import type { PaneIpcAdapter } from "@/ipc/paneAdapter";
 import type { TreeMessage } from "@/ipc/generated/TreeMessage";
 import CommandPalette from "@/overlays/CommandPalette.vue";
@@ -37,7 +37,7 @@ async function mountHost() {
       return () => h(FileTree, { ref: treeRef, ipc, mac: false, openPath: "a.md", bindings: bindings.value });
     },
   });
-  const wrapper = mount(Host, { attachTo: document.body });
+  const wrapper = mount(Host, { attachTo: document.body, global: { provide: { [COMMANDS_KEY as symbol]: registry } } });
   await vi.advanceTimersByTimeAsync(0);
   push({
     kind: "listing",
@@ -71,6 +71,7 @@ describe("tree.insertLink", () => {
   it("rebinding changes the key that works in the tree; the old chord stops working", async () => {
     const { wrapper, tree, registry } = await mountHost();
     const el = tree.get('[role="tree"]');
+    (el.element as HTMLElement).focus();
     await el.trigger("keydown", { key: "ArrowDown" });
     await el.trigger("keydown", { key: "L", ctrlKey: true, shiftKey: true });
     expect(tree.emitted("insert-link") ?? []).toHaveLength(1);
@@ -100,31 +101,78 @@ describe("tree.insertLink", () => {
     registry.setOverride(TREE_INSERT_LINK_ID, null);
     await wrapper.vm.$nextTick();
     expect((await chip()).text).toBeNull();
+    await tree.get('[data-path="b.md"]').trigger("contextmenu", { clientX: 1, clientY: 1 });
+    expect(tree.find('[data-item="insert-link"] [data-spoken]').exists()).toBe(false);
+    expect(tree.get('[data-item="insert-link"]').text()).toBe("Insert link");
     wrapper.unmount();
   });
 
-  it("is inactive without tree focus or a selected file row, and the palette lists it only when active", async () => {
+  it("is inactive without tree focus or a selected file row", async () => {
     const { wrapper, tree, registry } = await mountHost();
     const command = registry.get(TREE_INSERT_LINK_ID)!;
-    expect(command.unavailable?.()).not.toBeNull(); // nothing focused
+    const here = () => ({ focus: document.activeElement });
+    expect(command.unavailable?.(here())).toBe("Focus the file tree first");
     const el = tree.get('[role="tree"]');
     (el.element as HTMLElement).focus();
-    expect(command.unavailable?.()).not.toBeNull(); // focused, no row selected
+    expect(command.unavailable?.(here())).toBe("Select a file in the tree first");
     await el.trigger("keydown", { key: "ArrowDown" });
-    expect(command.unavailable?.()).toBeNull(); // active
+    expect(command.unavailable?.(here())).toBeNull();
     expect(await registry.execute(TREE_INSERT_LINK_ID, null)).toBeNull();
     expect(tree.emitted("insert-link") ?? []).toHaveLength(1);
-
-    const listed = () => {
-      const palette = mount(CommandPalette, { props: { registry }, attachTo: document.body });
-      const text = palette.text();
-      palette.unmount();
-      return text;
-    };
-    expect(listed()).toContain("Insert link to selected file");
     (el.element as HTMLElement).blur();
-    expect(listed()).not.toContain("Insert link to selected file");
-    expect(await registry.execute(TREE_INSERT_LINK_ID, null)).toMatch(/focus/i);
+    expect(await registry.execute(TREE_INSERT_LINK_ID, null)).toBe("Focus the file tree first");
+    wrapper.unmount();
+  });
+
+  it("the palette always lists it; unavailable it is greyed and Enter says why; availability follows where it opened", async () => {
+    const { wrapper, tree, registry } = await mountHost();
+    const el = tree.get('[role="tree"]');
+
+    // Opened with the tree unfocused: listed, greyed, Enter shows the reason.
+    const cold = mount(CommandPalette, { props: { registry }, attachTo: document.body });
+    await cold.get("input").setValue("insert link");
+    const row = cold.findAll('[role="option"]').find((r) => r.text().includes("Insert link to selected file"));
+    expect(row?.classes()).toContain("unavailable");
+    await cold.get("input").trigger("keydown", { key: "Enter" });
+    expect(cold.get('[data-testid="palette-reason"]').text()).toContain("Focus the file tree first");
+    cold.unmount();
+
+    // Opened from the tree with a file selected: available, and stays so while the user types.
+    (el.element as HTMLElement).focus();
+    await el.trigger("keydown", { key: "ArrowDown" });
+    const warm = mount(CommandPalette, { props: { registry }, attachTo: document.body });
+    const rowIn = async () => {
+      await warm.get("input").setValue("insert link");
+      return warm.findAll('[role="option"]').find((r) => r.text().includes("Insert link to selected file"));
+    };
+    expect((await rowIn())?.classes()).not.toContain("unavailable");
+    warm.unmount();
+
+    // Opened from the tree with no row selected: reason names the selection.
+    wrapper.unmount();
+    const second = await mountHost();
+    (second.tree.get('[role="tree"]').element as HTMLElement).focus();
+    const noRow = mount(CommandPalette, { props: { registry: second.registry }, attachTo: document.body });
+    await noRow.get("input").setValue("insert link");
+    await noRow.get("input").trigger("keydown", { key: "Enter" });
+    expect(noRow.get('[data-testid="palette-reason"]').text()).toContain("Select a file in the tree first");
+    noRow.unmount();
+    second.wrapper.unmount();
+  });
+
+  it("refuses a rebinding onto a key the tree owns (Enter still opens)", async () => {
+    const { wrapper, tree, registry } = await mountHost();
+    for (const key of ["Enter", "F2", "Mod-Enter", "ArrowDown", "Mod-f", "Shift-F10", "ContextMenu"]) {
+      expect(registry.setOverride(TREE_INSERT_LINK_ID, key)).toBe(false);
+    }
+    expect(registry.effectiveBinding(TREE_INSERT_LINK_ID)).toBe("Mod-Shift-l");
+    const el = tree.get('[role="tree"]');
+    await el.trigger("keydown", { key: "ArrowDown" });
+    await el.trigger("keydown", { key: "Enter" });
+    expect(tree.emitted("open")).toHaveLength(1);
+    expect(tree.emitted("insert-link")).toBeUndefined();
+    // a settings file naming a reserved chord is dropped the same way
+    expect(registry.setOverrides([{ command_id: TREE_INSERT_LINK_ID, key: "Enter" }])).toEqual([TREE_INSERT_LINK_ID]);
     wrapper.unmount();
   });
 });
