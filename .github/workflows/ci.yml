@@ -118,6 +118,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # Task #119: the npm half of NFR-SEC-07 (US-42, NFR-PRF-08): app/'s dependencies are audited,
+  # licence-checked and registry-only, per /npm-deny.json (the npm counterpart of deny.toml).
+  # The self-test plants a failure in each check first, so a policy script that has gone blind
+  # fails here rather than passing everything. `npm audit` is the only step that needs the
+  # network (the registry's advisory endpoint); licences and sources read package-lock.json.
+  npm-deny:
+    name: npm audit, licences, sources (app/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Self-test the policy script
+        run: node --test bench/npm-deny/npm-deny.test.mjs
+      - name: Apply npm-deny.json to app/package-lock.json
+        run: node bench/npm-deny/npm-deny.mjs all
+
   # Task #27: the generated TypeScript IPC types are current (NFR-MNT-01, ADR-0007).
   # serat-app's docs say "CI regenerates and fails on a diff"; until this job nothing did.
   # The contracts crate is the generator of record and needs no Tauri system libraries.
@@ -244,7 +262,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types]
+    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -259,7 +277,8 @@ jobs:
           li_result="${{ needs['location-independence'].result }}"
           deny_result='${{ needs.deny.result }}'
           ipc_result="${{ needs['ipc-types'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result"
+          npm_result="${{ needs['npm-deny'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then

@@ -105,7 +105,7 @@ mod tests {
                 &"connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost"
             ),
             "tauri.conf.json's CSP no longer pins connect-src to the canonical narrow \
-             value (was {csp:?}) — task #117 / F-423(c): with no connect-src directive \
+             value (was {csp:?}) — task P0 #117 / F-423(c): with no connect-src directive \
              the value fell back to default-src 'self', which blocks the event|listen \
              IPC call @tauri-apps/api/event's listen() makes, so onIndexStatus()'s push \
              subscription was silently dead in a real WebView2 window. `ipc: \
@@ -115,7 +115,7 @@ mod tests {
              T-02's enforcement moves from default-src's fallback to this directive \
              once it is set explicitly, so a wider value here would take over that \
              enforcement silently; confirmed with vue-frontend-dev that nothing in \
-             app/src makes any other network-shaped call (F-423(c), #117)."
+             app/src makes any other network-shaped call (F-423(c), P0 #117)."
         );
         assert!(
             directives.contains(&"img-src 'self' serat-asset: http://serat-asset.localhost"),

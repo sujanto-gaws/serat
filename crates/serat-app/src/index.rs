@@ -149,6 +149,14 @@ impl<S: StatusSink> StatusPublisher<S> {
         }
     }
 
+    /// Start in `Opening` with `reason` (task #117): a deferred open (task #96) says why it
+    /// has no actor yet. `None` is the plain `Opening` every publisher starts in.
+    #[must_use]
+    pub fn with_opening_reason(self, reason: Option<crate::ipc::OpeningReason>) -> Self {
+        self.lock().state = IndexState::Opening { reason };
+        self
+    }
+
     /// Count the names `refusals` holds into every status this publisher builds
     /// (`IndexStatus::refused_names`, FR-VLT-01, task #34).
     ///
@@ -292,7 +300,13 @@ impl<S: StatusSink> StatusPublisher<S> {
 
         let status = {
             let mut inner = self.lock();
-            let transition = kind_of(&inner.state) != kind_of(&state);
+            // A change of `Opening`'s reason is a transition too: a reason that clears
+            // must not be held back by the throttle (task #117).
+            let transition = kind_of(&inner.state) != kind_of(&state)
+                || matches!(
+                    (&inner.state, &state),
+                    (IndexState::Opening { reason: a }, IndexState::Opening { reason: b }) if a != b
+                );
             let due = inner
                 .last_emit
                 .is_none_or(|last| last.elapsed() >= self.throttle);
@@ -920,6 +934,39 @@ mod tests {
         }
     }
 
+    // Task #117. Mutant, run by hand: dropping the reason comparison from `publish`'s
+    // transition test makes the clear below throttled (`false`) and this fail.
+    #[test]
+    fn an_opening_reason_is_polled_and_its_clearing_is_emitted_through_the_throttle() {
+        use crate::ipc::OpeningReason::PreviousIndexStillClosing;
+        let recorder = Recorder::default();
+        let publisher = StatusPublisher::with_throttle(
+            "vault-1",
+            Arc::new(Startup::begin()),
+            recorder.clone(),
+            Duration::from_secs(60),
+        )
+        .with_opening_reason(Some(PreviousIndexStillClosing));
+        assert_eq!(
+            publisher.status().state,
+            IndexState::Opening {
+                reason: Some(PreviousIndexStillClosing)
+            }
+        );
+        // An unthrottled first emit, then the clear inside the 60 s window.
+        assert!(publisher.publish(IndexState::Opening {
+            reason: Some(PreviousIndexStillClosing)
+        }));
+        assert!(
+            publisher.publish(IndexState::Opening { reason: None }),
+            "the clearing of a reason is a transition, not a throttled tick"
+        );
+        assert_eq!(
+            recorder.taken().last().map(|s| s.state.clone()),
+            Some(IndexState::Opening { reason: None })
+        );
+    }
+
     #[test]
     fn the_pinned_wal_fact_rides_on_the_status_and_is_re_emitted_when_it_changes() {
         // Task #56. The fact is not part of the state, so a listening front end gets it
@@ -1117,7 +1164,7 @@ mod tests {
     /// the crate's own source tree) rather than merely a narrower one.
     fn throwaway_vault(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("fixture");
         dir
     }
