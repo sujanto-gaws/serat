@@ -409,6 +409,9 @@ export interface RunOptions {
   key?: string;
   /** Require one trusted `input` event per keystroke (default true: typed characters). */
   expectInputs?: boolean;
+  /** After every `every` keystrokes wait `ms` more (typing in bursts): the editor's debounced save then fires between
+   * bursts and its reply lands inside the next burst's keys, which are scored like any other. */
+  burst?: { every: number; ms: number };
 }
 
 /**
@@ -437,6 +440,7 @@ export async function runKeystrokes(
   for (let i = 0; i < count; i++) {
     await page.keyboard.press(opts.key ?? "x");
     await new Promise((r) => setTimeout(r, interval + next() * R));
+    if (opts.burst && (i + 1) % opts.burst.every === 0) await new Promise((r) => setTimeout(r, opts.burst!.ms));
   }
   // Let the last frames present and Event Timing deliver, then flush the observer.
   await new Promise((r) => setTimeout(r, 500));

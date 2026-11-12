@@ -50,15 +50,30 @@ export async function goToLine(page: Page, editor: Locator, lines: string[], tar
   throw new Error(`goToLine(${target}): "${needle}" never rendered`);
 }
 
-/** Clicks the line (real mouse, trusted) at its start or end, then normalises with Home or End, and asserts the caret line. */
-export async function placeOnLine(page: Page, editor: Locator, line: Locator, needle: string, at: "start" | "end"): Promise<void> {
-  const box = await line.boundingBox();
-  if (!box) throw new Error(`line "${needle}" has no bounding box`);
-  if (at === "start") await page.mouse.click(box.x + 2, box.y + 6);
-  else await page.mouse.click(box.x + box.width - 2, box.y + box.height - 6);
-  await page.keyboard.press(at === "start" ? "Home" : "End");
-  const text = await caretLineText(editor);
-  if (!text.includes(needle)) throw new Error(`caret is on ${JSON.stringify(text.slice(0, 60))}, wanted a line containing "${needle}"`);
+/** Clicks the line's start with the real mouse and asserts the caret line. For `at: "end"` it then walks ArrowRight
+ * across the line's raw source (`rawLength` characters), because End stops at the end of the first VISUAL line of a
+ * wrapped paragraph, and a click on the right-hand blank area does not leave a caret CodeMirror's End key respects. */
+export async function placeOnLine(page: Page, editor: Locator, line: Locator, needle: string, at: "start" | "end", rawLength = 0): Promise<void> {
+  // Layout can shift between the measurement and the click (widgets re-measure after a scroll), so a click that
+  // lands on a neighbouring line is retried; a caret that never reaches the wanted line fails the scenario.
+  let text = "";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await line.scrollIntoViewIfNeeded();
+    await new Promise((r) => setTimeout(r, 250));
+    const box = await line.boundingBox();
+    if (!box) throw new Error(`line "${needle}" has no bounding box`);
+    await page.mouse.click(box.x + 2, box.y + 6);
+    await page.keyboard.press("Home");
+    text = await caretLineText(editor);
+    if (text.includes(needle)) break;
+    if (attempt === 3) throw new Error(`caret is on ${JSON.stringify(text.slice(0, 60))}, wanted a line containing "${needle}"`);
+  }
+  if (at === "end") {
+    if (rawLength <= 0) throw new Error("placeOnLine(end) needs the raw source length of the line");
+    await move(page, "ArrowRight", rawLength);
+    const after = await caretLineText(editor);
+    if (!after.includes(needle)) throw new Error(`after walking to the end the caret is on ${JSON.stringify(after.slice(0, 60))}`);
+  }
 }
 
 export async function move(page: Page, key: "ArrowRight" | "ArrowLeft", times: number): Promise<void> {

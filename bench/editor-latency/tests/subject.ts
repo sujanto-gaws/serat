@@ -95,8 +95,22 @@ const TAURI_STUB = `
       metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
       transformCallback: function () { return ++cbs; },
       unregisterCallback: function () {},
-      invoke: function (cmd) {
+      invoke: function (cmd, payload) {
         if (cmd === "plugin:event|listen") return Promise.resolve(++cbs);
+        // The real-IPC arm (task #61): forward every command to a real serat-app AppState over loopback.
+        if (window.__SERAT_IPC_BRIDGE__ && cmd.indexOf("plugin:") !== 0) {
+          return fetch(window.__SERAT_IPC_BRIDGE__ + "/invoke/" + cmd, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload || {}),
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (v) { return v && v.__error ? Promise.reject(v.__error) : v; });
+        }
+        if (cmd === "save_patch") {
+          var a = (payload && payload.args) || {};
+          return Promise.resolve({ path: a.path || "", hash: "stub-hash-" + (++cbs), mtime_ms: 0, bytes: 0 });
+        }
         if (cmd === "index_status") return Promise.resolve({ state: "idle" });
         if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);
@@ -116,6 +130,10 @@ export interface OpenOptions {
   text?: string;
   /** What `get_ui_settings` answers; `{ live_preview: false }` selects the split-preview mode (FR-EDT-10). */
   uiSettings?: { live_preview: boolean; keybindings: unknown[] };
+  /** Base URL of the editor_ipc_bridge example: every IPC command is answered by a real `serat-app`. */
+  ipcBridge?: string;
+  /** With a bridge: the note's vault path and its real content hash (from `read_file`). */
+  note?: { path: string; hash: string };
 }
 
 /** Serves dist-bench, loads the fixture and returns the editable surface. */
@@ -132,13 +150,16 @@ export async function openNoteForLatencyTest(page: Page, options: OpenOptions = 
   if (options.uiSettings) {
     await page.addInitScript({ content: `window.__SERAT_STUB_UI_SETTINGS__ = ${JSON.stringify(options.uiSettings)};` });
   }
+  if (options.ipcBridge) {
+    await page.addInitScript({ content: `window.__SERAT_IPC_BRIDGE__ = ${JSON.stringify(options.ipcBridge)};` });
+  }
   await page.addInitScript({ content: TAURI_STUB });
   await page.goto(server.url);
   await page.waitForFunction(() => typeof (window as any).__seratBenchOpenNote === "function", null, { timeout: 10_000 }).catch((e) => {
     throw new Error(`window.__seratBenchOpenNote never appeared (is this a --mode bench build?): ${e.message}; page errors: ${pageErrors.join(" | ")}`);
   });
   const text = options.text ?? buildFixtureNote();
-  await page.evaluate((t) => (window as any).__seratBenchOpenNote(t), text);
+  await page.evaluate(({ t, n }) => (window as any).__seratBenchOpenNote(t, n?.path, n?.hash), { t: text, n: options.note });
   const editor = page.locator('[data-testid="serat-editor"] .cm-content');
   await editor.waitFor({ state: "visible", timeout: 10_000 });
   await editor.getByText("Section 0").first().waitFor({ timeout: 10_000 });

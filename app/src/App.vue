@@ -352,8 +352,14 @@ onMounted(async () => {
   // contains neither the branch nor the global. A shipped app must not expose
   // a window-level "replace the open note's buffer" entry point.
   if (import.meta.env.MODE === "bench") {
-    window.__seratBenchOpenNote = (text: string) => {
-      void editorRef.value?.loadNote(text, "__bench__.md", "bench-hash-not-a-real-blake3");
+    // `path` and `hash` default to the stub's: with the real-IPC arm (task #61) the harness opens a note
+    // that exists in a real vault and passes its real path and hash, so saves are real.
+    window.__seratBenchOpenNote = (
+      text: string,
+      path = "__bench__.md",
+      hash = "bench-hash-not-a-real-blake3",
+    ) => {
+      void editorRef.value?.loadNote(text, path, hash);
     };
   }
 

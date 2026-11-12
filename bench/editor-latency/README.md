@@ -15,15 +15,19 @@ Rule E0 (header of `tests/measure.ts`; selected empirically from `record/`): for
 - **Warm-up: none** (`warm-up 0` is printed); every key counts.
 - Event Timing is Chromium/WebView2 only and `duration` is rounded to 8 ms. Headless Chromium output is labelled "not gate-eligible".
 
-## Structure (three Playwright projects, workers 1)
+## Structure (five Playwright projects, workers 1)
 
 | Project | File | Contents |
 |---|---|---|
 | `unit` | `tests/measure.unit.spec.ts` | pure E0 functions, each run on the direct import and on the `new Function` round trip the page uses; invariant tests |
 | `controls` (depends on `unit`) | `tests/nfr-prf-02-controls.spec.ts` | positive bare contenteditable (strict and phase-swept, 300 keys, >= 99% on time); negative (busy-wait in the input handler) and render2 (busy-wait in a queued rAF), each over both cadences, 100 keys, >= 95% late; mutation (`isLate -> false` must turn both negative arms red); graded 1.5R (reported, not gated) |
 | `subject` (depends on `controls`) | `tests/nfr-prf-02-subject.spec.ts` | the real editor build, 5,000-line note, caret at start / middle / end (asserted, not assumed), 500 keys per cadence (strict and swept), >= 95% on time and PASS on both cadences |
+| `scenarios` (depends on `controls`) | `tests/nfr-prf-02-scenarios.spec.ts`, `tests/caret.ts` | task #61: the other five §9.3 scenarios (table cell, link-dense paragraph, Enter mid-note, Backspace across a bold delimiter, split-preview typing) and the fixture loaded as CRLF and as BOM+CRLF. Each: 500 keys per cadence, a fresh document per cadence, the caret placed by a real click and asserted. Report only |
+| `real-ipc` (depends on `controls`) | `tests/nfr-prf-02-real-ipc.spec.ts` | task #61: mid-note typing in bursts (25 keys, then a pause that puts the 1 s autosave at the next burst), in two arms: the instant stub, and **real serat-app** behind a loopback bridge (`crates/serat-app/examples/editor_ipc_bridge.rs`). Asserts the real saves landed (the note on disk is the fixture plus exactly the typed characters) and prints the bridge's own p50/p95/max per command. Needs the bridge binary. Report only |
 
-**Subject coverage is partial: 3 of 8 §9.3 scenarios.** Missing: inside a table cell, link-dense paragraph, Enter mid-note, Backspace across a bold delimiter, split-preview continuous typing, CRLF/BOM fixture variants, and real-binary IPC latencies (the IPC client is an instant null stub). A PASS here is not a PASS of NFR-PRF-02. This is printed on every subject line.
+**Coverage (task #61).** Subject: 3 of the 8 §9.3 scenarios (start, middle, end typing). Scenarios: the other five and the two fixture variants. Real-IPC: the save/index round trip through a real `serat-app`. **Still not covered:** the real Tauri transport between the webview and Rust (WebView2's message channel and the custom-protocol serialisation are not in any figure), WebView2 itself (headless Chromium is the same engine, not the same process or compositor), and the reference machine. A PASS here is not a PASS of NFR-PRF-02 until that run exists; every line says so.
+
+**Known harness limits.** Keys that CodeMirror handles in its own `keydown` keymap (Enter, Backspace) raise no native `input` event, so those scenarios run with `expectInputs: false`; the per-key invariants still demand the keydown entry. The Backspace scenario grows a bold span to 520 characters first (unmeasured), steps over the closing `**`, and measures 500 Backspaces: the first two cross the delimiter, the rest delete inside what is then plain text. Re-opening the same note path through `__seratBenchOpenNote` does not reset the buffer, so a cadence that mutates the text reloads the page.
 
 ## Run it
 
@@ -38,6 +42,9 @@ npm test                                  # bare: runs all three projects in the
 
 ```
 SERAT_BENCH_DIST=<checkout>/app/dist-bench SERAT_SUBJECT_LABEL=<name> [SERAT_DUMP_DIR=<dir>] npx playwright test --project=subject
+npx playwright test --project=scenarios          # same environment; about 35 minutes
+cargo build --example editor_ipc_bridge -p serat-app
+SERAT_IPC_BRIDGE=<target>/debug/examples/editor_ipc_bridge npx playwright test --project=real-ipc
 ```
 
 `npm run build:bench` (in `app/`) is on main (`app/package.json`). CI runs this exact sequence in the report-only `editor-latency` job (task #60; headless Chromium is not gate-eligible, so it never gates); without a build the subject fails loudly with the build command. `SERAT_DUMP_DIR` receives per-key JSON; `node record/subject-report.mjs <files>` summarises it. A subject run takes about 20 minutes (3 positions x 2 cadences x 500 keys at 100 ms).

@@ -17,6 +17,7 @@
 // machine exists. A red here is a finding about the editor or about this harness; it is not weakened to go green.
 // Every result line carries the engine version, binary and mode, and R. The IPC client is still the stub of
 // subject.ts (instant answers); the real-IPC arm is nfr-prf-02-real-ipc.spec.ts.
+import os from "node:os";
 import { test, expect, type Page } from "@playwright/test";
 import { installCapture, runKeystrokes, percentOnTime, p95FramesToPaint, latencyDiagnostic, type Cadence } from "./measure";
 import { SUBJECT_MIN_ON_TIME, SUBJECT_KEYS } from "./arms";
@@ -81,7 +82,7 @@ const SCENARIOS: Scenario[] = [
       const at = findLine(LINES, 0.4, (l) => /^Paragraph \d+ links/.test(l));
       const n = /^Paragraph (\d+) /.exec(LINES[at])![1];
       const line = await goToLine(page, editor, LINES, at, `Paragraph ${n} links`);
-      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end");
+      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end", LINES[at].length);
       return { caret: `end of source line ${at}`, key: "Enter", expectInputs: false };
     },
   },
@@ -109,7 +110,7 @@ const SCENARIOS: Scenario[] = [
       const at = findLine(LINES, 0.5, (l) => /^Paragraph \d+ links/.test(l));
       const n = /^Paragraph (\d+) /.exec(LINES[at])![1];
       const line = await goToLine(page, editor, LINES, at, `Paragraph ${n} links`);
-      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end");
+      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end", LINES[at].length);
       expect(await page.locator(".serat-editor-split-preview").count(), "the preview pane is mounted").toBe(1);
       return { caret: `end of source line ${at}, preview pane mounted` };
     },
@@ -122,7 +123,7 @@ const SCENARIOS: Scenario[] = [
       const at = findLine(LINES, 0.5, (l) => /^Paragraph \d+ links/.test(l));
       const n = /^Paragraph (\d+) /.exec(LINES[at])![1];
       const line = await goToLine(page, editor, LINES, at, `Paragraph ${n} links`);
-      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end");
+      await placeOnLine(page, editor, line, `Paragraph ${n} links`, "end", LINES[at].length);
       return { caret: `end of source line ${at}` };
     },
   })),
@@ -169,7 +170,7 @@ test.describe("scenarios", () => {
             fs.writeFileSync(`${dump}/${SUBJECT_LABEL}-scenario-${sc.id}-${label}.json`, JSON.stringify({ build: SUBJECT_LABEL, chromium: chromiumVersion, scenario: sc.id, cadence: label, R: rs[rs.length - 1], summary, scores }));
           }
         }
-        console.log(`SCENARIO ${SUBJECT_LABEL} [${sc.id}] report-only; n=${SUBJECT_KEYS} per cadence, R=${rs.map((r) => r.toFixed(2)).join("/")}, ${ENGINE(chromiumVersion)}: ${rows.join(" | ")}`);
+        console.log(`SCENARIO ${SUBJECT_LABEL} [${sc.id}] report-only; n=${SUBJECT_KEYS} per cadence, R=${rs.map((r) => r.toFixed(2)).join("/")}, load average ${os.loadavg().map((x) => x.toFixed(1)).join("/")} on ${os.cpus().length} CPUs, ${ENGINE(chromiumVersion)}: ${rows.join(" | ")}`);
         expect(verdicts, "every cadence must be PASS; INDETERMINATE (95% between the -4 and +4 ms shares) is not a pass").toEqual(["PASS", "PASS"]);
         expect(worst).toBeGreaterThanOrEqual(SUBJECT_MIN_ON_TIME);
       } finally {
