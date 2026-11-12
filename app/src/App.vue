@@ -323,7 +323,8 @@ const disposeCommands = registerCommands();
 
 /** The panel's button is gone (the count fell to none): focus goes to the tree's selected row, or the editor when compact. */
 function focusAfterRefused(): void {
-  if (window.matchMedia?.("(max-width: 719px)").matches) editorRef.value?.focus();
+  // the tree has no collapse control yet; below the compact breakpoint it is hidden unless its flyover is open
+  if (window.matchMedia?.("(max-width: 719px)").matches && !treeFlyover.value) editorRef.value?.focus();
   else treeRef.value?.focusTree();
 }
 
