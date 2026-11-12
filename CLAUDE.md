@@ -7,7 +7,7 @@ Serat is a local-first, Obsidian-compatible knowledge app: **Tauri v2 shell, Rus
 |---|---|
 | Vision, principles, milestones P0–P5, gates | docs/01-planning/project-charter.md, docs/01-planning/risk-register.md |
 | Requirements (FR-/NFR-), acceptance criteria, traceability, glossary, assumptions A-nn, constraints C-nn | docs/02-requirements/prd.md |
-| User stories US-01..40 with Given/When/Then | docs/02-requirements/user-stories.md |
+| User stories US-01..42 with Given/When/Then | docs/02-requirements/user-stories.md |
 | Crate graph, threading, data model, key flows, verification harness | docs/03-design/architecture.md |
 | The ten expensive-to-reverse decisions | docs/03-design/adr/0001..0010 |
 | Security mechanisms | docs/03-design/threat-model.md |
