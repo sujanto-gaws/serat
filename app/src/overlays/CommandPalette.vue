@@ -24,7 +24,8 @@ const selected = ref(0);
 const reason = ref<string | null>(null);
 const input = ref<HTMLInputElement | null>(null);
 const card = ref<HTMLElement | null>(null);
-let origin: HTMLElement | null = null;
+// Captured at setup, before the input takes focus: availability is judged against where the palette opened.
+let origin: HTMLElement | null = (document.activeElement as HTMLElement | null) ?? null;
 let restoreFocus = false;
 
 /** Bumped when commands or bindings change, so `rows` recomputes. */
@@ -59,7 +60,7 @@ const rows = computed<Row[]>(() => {
       pieces: splitBySpans(command.name, spans),
       chord: binding ? chordGlyphs(binding, mac) : [],
       spoken: binding ? chordSpoken(binding, mac) : [],
-      reason: command.unavailable?.() ?? null,
+      reason: command.unavailable?.({ focus: origin }) ?? null,
     };
   });
 });
@@ -123,7 +124,6 @@ function onFocusout(event: FocusEvent): void {
 }
 
 onMounted(() => {
-  origin = (document.activeElement as HTMLElement | null) ?? null;
   input.value?.focus();
 });
 

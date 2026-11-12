@@ -25,12 +25,12 @@
   - Not built (no tabs in P1): `newTab` is carried on `open` and ignored by the host.
 -->
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { defaultPaneIpc, type PaneIpcAdapter } from "@/ipc/paneAdapter";
 import { folderName, noteFileName, takenNames, uniqueName, type CreateKind, type CreateRequest } from "@/tree/createEntry";
 import TreeContextMenu, { type MenuItem } from "@/tree/TreeContextMenu.vue";
-import { chordGlyphs, chordSpoken } from "@/editor/commands";
+import { chordGlyphs, chordSpoken, COMMANDS_KEY, type CommandContextInfo } from "@/editor/commands";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { insertLinkText, isNameUnique, navigate, TREE_STOPPED_TEXT, visibleWindow } from "@/tree/treeLogic";
 import { childPath, displayName, matchRange, TreeModel, type TreeRow } from "@/tree/treeModel";
@@ -63,12 +63,16 @@ const props = withDefaults(
     createEntry?: (request: CreateRequest) => Promise<string | null>;
     /** macOS conventions (⌘ glyphs, Ctrl-click = context menu). Defaults to the detected platform. */
     mac?: boolean;
-    /** Menu entry id -> CodeMirror-notation binding shown as its accelerator (the registry's effective
-     * bindings, so the menu, the palette and the chips agree). `null` shows none. */
+    /** Display only: menu entry id -> CodeMirror-notation binding shown as its accelerator chip (the
+     * registry's effective bindings, so the menu, the palette and the chips agree). `null` shows none.
+     * It does not drive any key: tree-scoped chords are matched from the injected registry. */
     bindings?: Record<string, string | null>;
   }>(),
   { ipc: () => defaultPaneIpc, rowHeight: 26, fallbackViewportHeight: 600, openPath: null, openDirty: false, vaultId: null, vaultOpen: true },
 );
+
+/** The app's command registry (provided by App.vue); absent in bare embeds, where no tree-scoped chord fires. */
+const registry = inject(COMMANDS_KEY, null);
 
 const emit = defineEmits<{
   open: [payload: { path: string; newTab: boolean; keepFocus: boolean }];
@@ -276,12 +280,6 @@ function toggleDir(path: string, expand: boolean | null): void {
   bump();
 }
 
-/** Accelerators shown when the host passes none: the tree-local chords of file-tree.md. */
-// TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
-// DEFAULT_MENU_BINDINGS goes away once that follow-up lands (the host then always passes effective bindings).
-// `rename: "F2"` stays fixed (file-tree.md keyboard map).
-const DEFAULT_MENU_BINDINGS: Record<string, string | null> = { "insert-link": "Mod-Shift-l", rename: "F2" };
-
 const isMac = computed(() => props.mac ?? detectPlatform() === "mac");
 
 /** The platform's own conventions (components.md §7): on macOS Ctrl-click is a secondary click. WebKit sends
@@ -320,7 +318,28 @@ function scrollIntoView(path: string): void {
   scrollTop.value = el.scrollTop;
 }
 
+/** Why `tree.insertLink` cannot run now (null = it can): the tree holds focus and a file row is selected. */
+function insertLinkUnavailable(ctx: CommandContextInfo): string | null {
+  const el = container.value;
+  if (!el || !ctx.focus || !el.contains(ctx.focus)) return "Focus the file tree first";
+  const row = rows.value.find((r) => r.path === focusedPath.value);
+  return row && row.kind !== "dir" ? null : "Select a file in the tree first";
+}
+
+/** Runs Insert link for the selected row (the registry command's `exec`). */
+function insertLinkSelected(): void {
+  const row = rows.value.find((r) => r.path === focusedPath.value);
+  if (row && row.kind !== "dir") emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
+}
+
 function onKeydown(event: KeyboardEvent): void {
+  // Tree-scoped registry commands (tree.insertLink): the effective binding decides, `execute` checks availability.
+  const scoped = registry?.matchContext("tree", event, isMac.value);
+  if (scoped) {
+    event.preventDefault();
+    void registry?.execute(scoped.id, null);
+    return;
+  }
   const action = navigate(rows.value, focusedPath.value, {
     key: event.key,
     ctrlOrMeta: event.ctrlKey || event.metaKey,
@@ -349,11 +368,6 @@ function onKeydown(event: KeyboardEvent): void {
       const el = container.value?.querySelector<HTMLElement>(`[data-path="${CSS.escape(action.path)}"]`);
       const box = el?.getBoundingClientRect();
       openMenu(action.path, (box?.left ?? 0) + 24, box?.bottom ?? 0);
-      break;
-    }
-    case "insert-link": {
-      const row = rows.value.find((r) => r.path === action.path);
-      if (row) emit("insert-link", { path: row.path, text: insertLinkText(row, isNameUnique(model, row.name)) });
       break;
     }
   }
@@ -511,7 +525,7 @@ const menuItems = computed<MenuItem[]>(() => {
     { id: "new-folder", label: "New folder here", enabled: !!props.createEntry, reason: "Creating folders is not available right now." },
   );
   const accelFor = (id: string): Pick<MenuItem, "accel" | "spoken"> => {
-    const binding = (props.bindings ?? DEFAULT_MENU_BINDINGS)[id];
+    const binding = props.bindings?.[id];
     return binding ? { accel: chordGlyphs(binding, isMac.value), spoken: chordSpoken(binding, isMac.value) } : {};
   };
   const later = "Arrives with link repair (P3, FR-VLT-09): moving or renaming without repairing links would break them.";
@@ -541,6 +555,8 @@ defineExpose({
   model,
   focusTree,
   focusFilter,
+  insertLinkUnavailable,
+  insertLinkSelected,
   version,
   filter,
   currentDir,
