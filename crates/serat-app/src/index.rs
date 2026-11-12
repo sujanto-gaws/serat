@@ -160,6 +160,26 @@ impl<S: StatusSink> StatusPublisher<S> {
         self
     }
 
+    /// Re-emit the status whenever the refusal log changes (task #35): a name refused by
+    /// the watcher after the open changes the count while the state stays `Ready`, and
+    /// would otherwise reach a listening front end only with the next state change.
+    ///
+    /// Call once, right after the publisher is in its `Arc`; a no-op with no log. The
+    /// callback holds the publisher weakly: the log is owned by the vault, and a reference
+    /// back would make a cycle. It runs on the walk's or the watcher's thread and only
+    /// builds a status and hands it to the sink, so it does not block.
+    pub fn watch_refusals(self: &Arc<Self>) {
+        let Some(refusals) = &self.refusals else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        refusals.on_change(move || {
+            if let Some(publisher) = weak.upgrade() {
+                publisher.re_emit();
+            }
+        });
+    }
+
     /// Carry the checkpointer's pinned-WAL fact into every status this publisher builds
     /// (`IndexStatus::wal_pinned_bytes`, task #56), and re-emit the status whenever the
     /// fact appears, changes or clears, because it is not part of the state and would
