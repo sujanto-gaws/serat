@@ -549,6 +549,9 @@ pub struct AppState {
     flush: Mutex<FlushState>,
     flush_cv: std::sync::Condvar,
     window_destroyed: std::sync::atomic::AtomicBool,
+    /// Test seam (task #49): a note whose `read_file` sleeps, standing for a slow disk.
+    #[cfg(test)]
+    pub(crate) slow_read: Mutex<Option<(String, std::time::Duration)>>,
 }
 
 /// The bound on the wait for `flush_ack` (`contracts/ipc.rs::CLOSING_FLUSH_DEADLINE_MS`).
@@ -618,6 +621,8 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_read: Mutex::new(None),
             boot,
             settings: Mutex::new(loaded.settings),
             settings_path: loaded.path,
@@ -646,6 +651,8 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_read: Mutex::new(None),
             boot,
             settings: Mutex::new(settings),
             settings_path: None,
@@ -1196,6 +1203,8 @@ impl AppState {
     pub fn read_file(&self, args: ReadFileArgs) -> Result<FileContents, IpcError> {
         let path = Self::vault_path(&args.path)?;
         let vault = self.vault()?;
+        #[cfg(test)]
+        self.slow_read_seam(path.as_str());
         let loaded = vault.read(&path).map_err(from_vault_error)?;
 
         let text = String::from_utf8(loaded.bytes).map_err(|_| IpcError::NotUtf8 {
@@ -1209,6 +1218,20 @@ impl AppState {
             mtime_ms: loaded.meta.mtime_ms,
             bytes: loaded.meta.size,
         })
+    }
+
+    #[cfg(test)]
+    fn slow_read_seam(&self, path: &str) {
+        let slow = self
+            .slow_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((slow_path, hold)) = slow
+            && slow_path == path
+        {
+            std::thread::sleep(hold);
+        }
     }
 
     /// `asset_info`. FR-BIN-01, FR-BIN-11, FR-BIN-12. A vault operation, not an
