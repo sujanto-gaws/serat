@@ -119,6 +119,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # Task #27: the generated TypeScript IPC types are current (NFR-MNT-01, ADR-0007).
+  # serat-app's docs say "CI regenerates and fails on a diff"; until this job nothing did.
+  # The contracts crate is the generator of record and needs no Tauri system libraries.
+  # `git status --porcelain` rather than `git diff` so a file the generator adds, which is
+  # untracked, fails the job as well as one it changes. A file the generator no longer
+  # emits shows as a deletion.
+  ipc-types:
+    name: generated IPC types are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate into app/src/ipc/generated and require no change
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app/src/ipc/generated
+          (cd contracts && TS_RS_EXPORT_DIR=../app/src/ipc/generated cargo test -p serat-contracts)
+          changed=$(git status --porcelain -- app/src/ipc/generated)
+          if [ -n "$changed" ]; then
+            echo "generated IPC types are stale; regenerate and commit:"
+            echo "$changed"
+            exit 1
+          fi
+
   # The member list, read from cargo rather than typed out, so the matrix below
   # cannot drift away from the workspace.
   members:
@@ -219,7 +245,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence]
+    needs: [fmt, clippy, workspace, crate, location-independence, ipc-types]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -232,7 +258,8 @@ jobs:
           workspace_result='${{ needs.workspace.result }}'
           crate_result='${{ needs.crate.result }}'
           li_result="${{ needs['location-independence'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result"
+          ipc_result='${{ needs.ipc-types.result }}'
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $ipc_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then
