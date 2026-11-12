@@ -4377,11 +4377,16 @@ mod tests {
             Settings::default(),
         )
         .with_walk_gate(Duration::ZERO);
-        let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&rebuilt);
+        // The walk mark comes from the vault walker's thread and the `Rebuilding` event from
+        // the index actor's, so the mark can be taken before the event is delivered: reading
+        // a flag the moment the mark lands is a race (task #129, seen under load in the #115
+        // gate). The transition is awaited on a channel instead, with a deadline, so the
+        // test passes when the event is published at all and fails when it never is.
+        let (seen, rebuilding) = std::sync::mpsc::channel::<()>();
+        let seen = Mutex::new(seen);
         state.events.install(move |status| {
             if matches!(status.state, IndexState::Rebuilding { .. }) {
-                flag.store(true, Ordering::SeqCst);
+                let _ = seen.lock().expect("sender").send(());
             }
         });
         state.open_vault(open_args(&dir)).expect("open");
@@ -4392,8 +4397,8 @@ mod tests {
             "no walk mark"
         );
         assert!(
-            rebuilt.load(Ordering::SeqCst),
-            "this test is about the rebuilt-index case, so a Rebuilding must have been seen"
+            rebuilding.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "this test is about the rebuilt-index case, so a Rebuilding must be published"
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
