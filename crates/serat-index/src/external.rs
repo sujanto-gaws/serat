@@ -68,6 +68,11 @@ pub enum CatchUp {
     /// mtime differs goes through the hash gate and is re-indexed if its content
     /// differs, or has its mtime refreshed if it does not. One stat per file the walk
     /// already made, and a hash only where the mtime moved.
+    ///
+    /// Amended by ADR-0018 (P2, not yet implemented): `local` is compared too, and
+    /// first. A not-local file is never a candidate and never hashed, the racy
+    /// window included; its row is demoted to path-only instead. A local file whose
+    /// row says `local = 0` is a candidate whatever mtime and size say.
     PathsAndMtime,
 }
 
