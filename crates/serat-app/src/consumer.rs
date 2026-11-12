@@ -367,7 +367,7 @@ impl OpenCatchUp {
                 _ => {}
             }
         }
-        if !matches!(state, IndexState::Opening) {
+        if !matches!(state, IndexState::Opening { .. }) {
             self.settled.set();
         }
     }
@@ -833,7 +833,7 @@ mod tests {
 
     fn vault_dir(name: &str) -> std::path::PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-consumer-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-consumer-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fixture");
         std::fs::write(dir.join("a.md"), "# a\n").expect("fixture");
@@ -1251,7 +1251,7 @@ mod tests {
             walk_complete: false,
         };
         let c = OpenCatchUp::new(Duration::from_secs(5), Duration::ZERO);
-        c.index_published(&IndexState::Opening);
+        c.index_published(&IndexState::Opening { reason: None });
         c.index_published(&ready);
         assert!(c.claim(false));
         assert!(!c.claim(true), "once per open vault");

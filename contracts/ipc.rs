@@ -369,9 +369,13 @@ pub const REFUSED_NAMES_CAP: u32 = 1000;
 /// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
 /// distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
 /// watcher sees it change) replaces its reason rather than adding an entry.
-/// **Entries leave only at the next walk**, which clears the log and refills it.
-/// A refused file that is deleted or renamed away stays listed until then, so
-/// the list can name a file that is already gone. That is accepted, because
+/// **Entries leave at the next walk that covers their subtree** (serat-vault's
+/// `RefusalLog::replace_scope`): a walk of a directory (`walk_tree`, `walk_dir`)
+/// replaces only the entries at or below it with what it found, and only a
+/// whole-vault walk clears every entry and resets the overflow count behind
+/// [`REFUSED_NAMES_CAP`]. A refused file that is deleted or renamed away stays
+/// listed until a walk covers its directory, so the list can name a file that
+/// is already gone. That is accepted, because
 /// the list is a report, never a path a command acts on.
 /// **A read, not a
 /// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
@@ -526,7 +530,30 @@ pub enum IndexState {
     /// wait for the check; the front end should render the shell in this state
     /// and expect a transition over `INDEX_STATUS_EVENT` a few milliseconds
     /// later. "Not known yet" is a state to render, not a null to interpret.
-    Opening,
+    ///
+    /// **It can also last a whole rebuild, and then it says why (task #115).**
+    /// Since #96, a re-open of a root whose previous index actor was detached
+    /// still writing `index.db` (a failed open past `CLOSE_DEADLINE`, or a close
+    /// during a rebuild) starts no actor until that one exits: ADR-0001 allows
+    /// one writer. The open check has then not started, so the state is truly
+    /// `Opening`, but "a few milliseconds" becomes "until the old rebuild ends",
+    /// and the user is owed the reason (NFR-REL-02's rule for `Rebuilding`,
+    /// applied here). Architecture §3.4, "Why the index can wait at
+    /// `Opening`"; copy in `docs/03-design/ui/index-state-copy.md`.
+    ///
+    /// Not a separate variant on purpose: every consumer that treats `Opening`
+    /// as "the check has not finished" (the `t_usable` mark, the publisher's
+    /// terminal test, the front end's "not known yet") is right for this case
+    /// too, and a new variant is one each of them could miss.
+    Opening {
+        /// Why the open check has not started yet. Absent is the ordinary
+        /// case: the check is running and ends in milliseconds. Optional on
+        /// the wire, so `{ "kind": "opening" }` stays valid in both
+        /// directions; filled by serat-app in P1 #117.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<OpeningReason>,
+    },
 
     /// Usable.
     Ready {
@@ -562,6 +589,26 @@ pub enum IndexState {
         /// The index path that could not be built.
         path: String,
     },
+}
+
+/// Why [`IndexState::Opening`] is lasting longer than the open check does.
+///
+/// A closed set, like [`RebuildReason`], so each member has copy the front end
+/// renders (`docs/03-design/ui/index-state-copy.md`). One member today; the
+/// enum exists so that a second cause (a single-instance lock held by another
+/// Serat process, which #96 records as a limit) is an added variant and not a
+/// change of shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum OpeningReason {
+    /// An index actor from an earlier open of this same vault root (identified
+    /// by `serat_vault::FileIdentity`, not by path) is still running, usually
+    /// finishing a rebuild, and holds `index.db`. This open's actor starts the
+    /// moment it exits. Editing works meanwhile; search, backlinks and views
+    /// wait. The old actor's publisher is retired, so there is no progress
+    /// count to show and none is promised.
+    PreviousIndexStillClosing,
 }
 
 /// Why a rebuild is running.

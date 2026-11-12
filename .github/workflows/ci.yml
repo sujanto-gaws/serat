@@ -62,9 +62,8 @@ jobs:
       - run: cargo fmt --all --check
 
   # Task #41: licences, advisories, duplicate versions, wildcards and sources, per deny.toml.
-  # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It fails its own check (continue-on-error: false) but is
-  # not yet in gate.needs: that would turn every PR red until #112 (RUSTSEC-2026-0459); it is
-  # added to the gate when #112 lands (#113). The action is
+  # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It fails its own check (continue-on-error: false) and, since
+  # #113 (#112 fixed RUSTSEC-2026-0459), is in gate.needs and the results loop. The action is to be pinned to a patch tag or SHA once runners schedule. It is currently
   # pinned to the v2 major tag (its own line of releases; the exact patch tag could not be
   # verified from the authoring sandbox, so tighten it to a patch tag when runners schedule).
   deny:
@@ -118,6 +117,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  # Task #119: the npm half of NFR-SEC-07 (US-42, NFR-PRF-08): app/'s dependencies are audited,
+  # licence-checked and registry-only, per /npm-deny.json (the npm counterpart of deny.toml).
+  # The self-test plants a failure in each check first, so a policy script that has gone blind
+  # fails here rather than passing everything. `npm audit` is the only step that needs the
+  # network (the registry's advisory endpoint); licences and sources read package-lock.json.
+  npm-deny:
+    name: npm audit, licences, sources (app/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Self-test the policy script
+        run: node --test bench/npm-deny/npm-deny.test.mjs
+      - name: Apply npm-deny.json to app/package-lock.json
+        run: node bench/npm-deny/npm-deny.mjs all
+
+  # Task #27: the generated TypeScript IPC types are current (NFR-MNT-01, ADR-0007).
+  # serat-app's docs say "CI regenerates and fails on a diff"; until this job nothing did.
+  # The contracts crate is the generator of record and needs no Tauri system libraries.
+  # `git status --porcelain` rather than `git diff` so a file the generator adds, which is
+  # untracked, fails the job as well as one it changes. A file the generator no longer
+  # emits shows as a deletion.
+  ipc-types:
+    name: generated IPC types are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate into app/src/ipc/generated and require no change
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app/src/ipc/generated
+          (cd contracts && TS_RS_EXPORT_DIR=../app/src/ipc/generated cargo test -p serat-contracts)
+          changed=$(git status --porcelain -- app/src/ipc/generated)
+          if [ -n "$changed" ]; then
+            echo "generated IPC types are stale; regenerate and commit:"
+            echo "$changed"
+            exit 1
+          fi
 
   # The member list, read from cargo rather than typed out, so the matrix below
   # cannot drift away from the workspace.
@@ -219,7 +262,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence]
+    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -232,7 +275,10 @@ jobs:
           workspace_result='${{ needs.workspace.result }}'
           crate_result='${{ needs.crate.result }}'
           li_result="${{ needs['location-independence'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result"
+          deny_result='${{ needs.deny.result }}'
+          ipc_result="${{ needs['ipc-types'].result }}"
+          npm_result="${{ needs['npm-deny'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then

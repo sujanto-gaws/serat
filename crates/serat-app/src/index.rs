@@ -138,7 +138,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             sink,
             throttle,
             inner: Mutex::new(Published {
-                state: IndexState::Opening,
+                state: IndexState::Opening { reason: None },
                 since_process_start_ms,
                 last_emit: None,
             }),
@@ -351,7 +351,7 @@ impl<S: StatusSink> StatusPublisher<S> {
 /// transition and defeat the throttle entirely.
 fn kind_of(state: &IndexState) -> u8 {
     match state {
-        IndexState::Opening => 0,
+        IndexState::Opening { .. } => 0,
         IndexState::Ready { .. } => 1,
         IndexState::Rebuilding { .. } => 2,
         IndexState::Unavailable { .. } => 3,
@@ -369,7 +369,7 @@ fn kind_of(state: &IndexState) -> u8 {
 fn is_terminal(state: &IndexState) -> bool {
     match state {
         IndexState::Ready { .. } | IndexState::Unavailable { .. } => true,
-        IndexState::Opening | IndexState::Rebuilding { .. } => false,
+        IndexState::Opening { .. } | IndexState::Rebuilding { .. } => false,
     }
 }
 
@@ -523,7 +523,7 @@ impl IndexOpen for SeratIndexOpen {
 /// could silently drift if a variant were ever added to one and not mapped here.
 fn map_open_status(status: serat_index::IndexStatus, index_dir: &Path) -> Option<IndexState> {
     match status {
-        serat_index::IndexStatus::Opening => Some(IndexState::Opening),
+        serat_index::IndexStatus::Opening => Some(IndexState::Opening { reason: None }),
         // Task #120. Not a contract state and deliberately not one: the index is
         // usable, nothing is rebuilding, and inventing an `IndexState` for it would put
         // a transient on the wire that every consumer would have to learn to ignore.
@@ -1116,7 +1116,7 @@ mod tests {
         );
         assert_eq!(
             publisher.status().state,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "the shell paints Opening while the actor is still working"
         );
 
@@ -1137,7 +1137,7 @@ mod tests {
     /// the crate's own source tree) rather than merely a narrower one.
     fn throwaway_vault(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("fixture");
         dir
     }
@@ -1201,7 +1201,7 @@ mod tests {
         assert_eq!(
             seen.lock().expect("not poisoned").clone(),
             vec![
-                IndexState::Opening,
+                IndexState::Opening { reason: None },
                 IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
                     done: 0,
@@ -1357,7 +1357,7 @@ mod tests {
                 },
                 true,
             ),
-            (IndexState::Opening, false),
+            (IndexState::Opening { reason: None }, false),
             (
                 IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,

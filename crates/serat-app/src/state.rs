@@ -796,7 +796,7 @@ impl AppState {
         self.events.emit_opened(&VaultOpened {
             root: root.display().to_string(),
             vault_id: vault_id.clone(),
-            index: IndexState::Opening,
+            index: IndexState::Opening { reason: None },
         });
         let publisher = Arc::new(
             Publisher::new(
@@ -865,7 +865,7 @@ impl AppState {
         let observing = Arc::clone(&switcher);
         publisher.on_publish(move |state| {
             publishing.index_published(state);
-            if !matches!(state, IndexState::Opening) {
+            if !matches!(state, IndexState::Opening { .. }) {
                 settled.mark_index_settled();
             }
             observing.index_state_changed(matches!(state, IndexState::Ready { .. }));
@@ -1348,7 +1348,7 @@ impl AppState {
             Some(open) => open.publisher.status(),
             None => IndexStatus {
                 vault_id: String::new(),
-                state: IndexState::Opening,
+                state: IndexState::Opening { reason: None },
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
                 refused_names: None,
                 wal_pinned_bytes: None,
@@ -2205,9 +2205,9 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    fn fixture(name: &str) -> PathBuf {
+    fn fixture(name: &str) -> crate::TestDir {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(
@@ -2217,7 +2217,7 @@ mod tests {
         .expect("fixture");
         std::fs::write(dir.join("contract.pdf"), [0x25, 0x50, 0x44, 0x46]).expect("fixture");
         std::fs::write(dir.join("broken.md"), [0xff, 0xfe, 0x00, 0x9f]).expect("fixture");
-        dir
+        crate::TestDir::new(dir)
     }
 
     fn state(dir: &Path) -> AppState {
@@ -2243,7 +2243,7 @@ mod tests {
         );
         let err = state
             .open_vault(OpenVaultArgs {
-                root: std::env::temp_dir()
+                root: crate::test_temp_dir()
                     .join("serat-no-such-vault")
                     .display()
                     .to_string(),
@@ -2351,7 +2351,7 @@ mod tests {
         );
         assert_eq!(
             opened.index,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "the shell paints whatever state the actor has published, which is nothing yet"
         );
         // And index_status, called immediately, must also not block.
@@ -2573,7 +2573,10 @@ mod tests {
             }),
             Err(IpcError::VaultNotFound { .. })
         ));
-        assert_eq!(state.index_status().state, IndexState::Opening);
+        assert_eq!(
+            state.index_status().state,
+            IndexState::Opening { reason: None }
+        );
         assert_eq!(state.index_status().vault_id, "");
     }
 
@@ -2834,7 +2837,7 @@ mod tests {
         // against a real symlink. F-58: a broken guard would make this return `Ok`
         // with the outside file's bytes, not merely error some other way.
         let dir = fixture("symlink-read");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-read-{}",
             std::process::id()
         ));
@@ -2885,7 +2888,7 @@ mod tests {
         // `write_atomic` -- isolating containment as the only thing standing between
         // the request and the bytes outside the vault.
         let dir = fixture("symlink-write");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-write-{}",
             std::process::id()
         ));
@@ -3535,7 +3538,7 @@ mod tests {
             matches!(
                 answer,
                 IndexRead::NotReady {
-                    state: IndexState::Opening
+                    state: IndexState::Opening { reason: None }
                 }
             ),
             "{answer:?}"
@@ -3544,8 +3547,9 @@ mod tests {
 
     // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
 
-    fn settings_state(name: &str) -> (AppState, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+    fn settings_state(name: &str) -> (AppState, crate::TestDir) {
+        let dir =
+            crate::test_temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.toml");
         let mut state = AppState::with_settings(
@@ -3554,7 +3558,7 @@ mod tests {
             Settings::default(),
         );
         state.settings_path = Some(path.clone());
-        (state, path)
+        (state, crate::TestDir::within(path, dir))
     }
 
     #[test]
@@ -3648,7 +3652,7 @@ mod tests {
         // A file where the directory should be makes the write fail.
         std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
         std::fs::write(path.parent().unwrap(), b"not a dir").unwrap();
-        state.settings_path = Some(path);
+        state.settings_path = Some(path.to_path_buf());
         let err = state
             .set_live_preview(SetLivePreviewArgs { enabled: false })
             .expect_err("unwritable");
@@ -4325,7 +4329,10 @@ mod tests {
         state
             .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default(), 400))
             .expect("open");
-        assert!(matches!(state.index_status().state, IndexState::Opening));
+        assert!(matches!(
+            state.index_status().state,
+            IndexState::Opening { .. }
+        ));
         let (send, log) = collecting_sender();
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5158,7 +5165,7 @@ mod tests {
         name: &str,
         hooks: impl FnOnce(&EventLog) -> OpenHooks,
         with_opened: bool,
-    ) -> (Arc<AppState>, EventLog, PathBuf, PathBuf) {
+    ) -> (Arc<AppState>, EventLog, crate::TestDir, crate::TestDir) {
         let (a, b) = (fixture(&format!("{name}-a")), fixture(&format!("{name}-b")));
         let log: EventLog = Arc::default();
         let state = Arc::new(
@@ -5234,6 +5241,14 @@ mod tests {
         wait_until("WalkSettled", || settled(&tree));
         std::fs::write(b.join("external.md"), "# other tool\n").expect("write");
         wait_for_row(&b, "external.md");
+        // The row being in the index is not the event being logged: `index://changed`
+        // is emitted from the change signal's own thread, throttled, after the commit
+        // (task #122: sampling the log here failed once in ten loaded runs with "no
+        // index://changed for B"). Wait on the event itself, bounded, before sampling;
+        // the negative assertions below still read the whole log.
+        wait_until("index://changed for B", || {
+            logged(&log, "index://changed", &b_id)
+        });
         open_note(&state);
         close_flush(&state, Duration::from_secs(10));
 
@@ -5349,7 +5364,7 @@ mod tests {
         struct Sleeper(Arc<std::sync::atomic::AtomicBool>);
         impl IndexOpen for Sleeper {
             fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
-                publish(IndexState::Opening);
+                publish(IndexState::Opening { reason: None });
                 std::thread::sleep(Duration::from_millis(400));
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -5463,7 +5478,7 @@ mod tests {
             .expect("the re-open succeeds");
         assert_eq!(
             opened.index,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "no actor yet: it must wait"
         );
         wait_ready(&second);
@@ -5562,7 +5577,7 @@ mod tests {
                 fast,
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         wait_ready(&second);
         wait_until("the catch-up walk", || {
             !walks.lock().expect("walks").is_empty()
@@ -5577,7 +5592,7 @@ mod tests {
         name: &str,
         hold_ms: u64,
         bound_ms: u64,
-    ) -> (AppState, AppState, PathBuf, Counting) {
+    ) -> (AppState, AppState, crate::TestDir, Counting) {
         let dir = fixture(name);
         let slow = counting(hold_ms);
         let first = plain_state(Duration::from_secs(5));
@@ -5613,7 +5628,7 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5679,7 +5694,7 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("the vault opens without an actor");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         wait_until("Unavailable", || {
             matches!(second.index_status().state, IndexState::Unavailable { .. })
         });
@@ -5721,7 +5736,7 @@ mod tests {
 
         let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
         let opened = open_dir_real(&second, &dir);
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         // The tree's refused catch-up is owed as a rescan; the real actor runs it.
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
