@@ -66,6 +66,7 @@ pub mod folder;
 pub mod gitignore;
 pub mod index;
 mod nav_guard;
+pub mod offload;
 pub mod reads;
 mod security_config;
 pub mod settings;
@@ -1418,5 +1419,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod opening_reason_tests;
 #[cfg(test)]
 mod refusal_wiring_tests;
