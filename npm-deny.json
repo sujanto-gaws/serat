@@ -3,22 +3,7 @@
   "audit": {
     "production_level": "high",
     "all_level": "critical",
-    "exceptions": [
-      {
-        "id": "GHSA-5gmw-xhrv-c9v3",
-        "package": "tinypool",
-        "reason": "dev-only (vitest's worker pool); the options it pollutes are ours, not input. Fix needs vitest 5, a major bump of the test runner.",
-        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
-        "recorded": "2026-11-12"
-      },
-      {
-        "id": "GHSA-85c8-ppgw-ccpr",
-        "package": "tinypool",
-        "reason": "as above: dev-only, reached through vitest, fixed by the vitest 5 bump.",
-        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
-        "recorded": "2026-11-12"
-      }
-    ]
+    "exceptions": []
   },
   "licenses": {
     "_doc": "SPDX identifiers. Same names as deny.toml's [licenses].allow where they coincide; PSF-2.0 and BlueOak-1.0.0 are npm-only additions (both permissive), found in the lockfile on 2026-11-12. An 'A OR B' expression passes if any arm is allowed; 'A AND B' needs both.",

@@ -315,7 +315,7 @@ describe("[[ completion", () => {
     const ipc = fakeLinks();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
-    const first = ipc.switcherQuery.getMockImplementation()!;
+    const first = ipc.switcherQuery.getMockImplementation()! as unknown as (args: { seq: number; query: string }) => Promise<unknown>;
     ipc.switcherQuery.mockImplementationOnce(async (args: { seq: number; query: string }) => {
       await gate;
       return first(args);
