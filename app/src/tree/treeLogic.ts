@@ -36,7 +36,6 @@ export type NavAction =
   | { kind: "open"; path: string; newTab: boolean; keepFocus: boolean }
   | { kind: "rename"; path: string }
   | { kind: "context-menu"; path: string }
-  | { kind: "insert-link"; path: string }
   | { kind: "none" };
 
 export interface KeyInfo {
@@ -92,11 +91,6 @@ export function navigate(rows: readonly TreeRow[], focusedPath: string | null, k
       return row ? { kind: "context-menu", path: row.path } : { kind: "none" };
     case "F10":
       return key.shift && row ? { kind: "context-menu", path: row.path } : { kind: "none" };
-    case "L":
-    case "l":
-      return key.ctrlOrMeta && key.shift && row && row.kind !== "dir"
-        ? { kind: "insert-link", path: row.path }
-        : { kind: "none" };
     default:
       return { kind: "none" };
   }

@@ -338,3 +338,37 @@ describe("CodeMirrorEditor keymap", () => {
     wrapper.unmount();
   });
 });
+
+// FR-EDT-10, US-08: with live preview turned off the editor is a source pane beside a
+// rendered preview, and the source stays editable. The control (live preview on) has no
+// split pane, so the assertion cannot pass by the pane always being there.
+describe("split preview fallback (FR-EDT-10, US-08)", () => {
+  it("live_preview false shows the source editor and the preview pane, and the source is editable", async () => {
+    const wrapper = mount(CodeMirrorEditor, {
+      props: { ipc: mockIpc(), livePreview: false },
+      attachTo: document.body,
+    });
+    const host = wrapper.find(".cm-editor-host").element as HTMLElement;
+    const content = host.shadowRoot!.querySelector(".cm-content") as HTMLElement;
+    const view = EditorView.findFromDOM(content)!;
+    const api = wrapper.vm as unknown as { loadNote(t: string, p: string, h: string): Promise<boolean>; isDirty: boolean };
+    await api.loadNote("# Title\n\nbody", "a.md", "h0");
+
+    expect(wrapper.find(".serat-editor-split-preview").exists()).toBe(true);
+    expect(view.state.readOnly).toBe(false);
+    expect(content.getAttribute("contenteditable")).toBe("true");
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "!" } });
+    expect(view.state.doc.toString()).toBe("# Title\n\nbody!");
+    expect(api.isDirty).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("live_preview true has no split pane", () => {
+    const wrapper = mount(CodeMirrorEditor, {
+      props: { ipc: mockIpc(), livePreview: true },
+      attachTo: document.body,
+    });
+    expect(wrapper.find(".serat-editor-split-preview").exists()).toBe(false);
+    wrapper.unmount();
+  });
+});
