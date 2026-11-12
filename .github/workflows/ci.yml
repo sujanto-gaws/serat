@@ -62,9 +62,8 @@ jobs:
       - run: cargo fmt --all --check
 
   # Task #41: licences, advisories, duplicate versions, wildcards and sources, per deny.toml.
-  # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It fails its own check (continue-on-error: false) but is
-  # not yet in gate.needs: that would turn every PR red until #112 (RUSTSEC-2026-0459); it is
-  # added to the gate when #112 lands (#113). The action is
+  # NFR-SEC-01, NFR-MNT-01, NFR-PRF-08. It fails its own check (continue-on-error: false) and, since
+  # #113 (#112 fixed RUSTSEC-2026-0459), is in gate.needs and the results loop. The action is
   # pinned to the v2 major tag (its own line of releases; the exact patch tag could not be
   # verified from the authoring sandbox, so tighten it to a patch tag when runners schedule).
   deny:
@@ -219,7 +218,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence]
+    needs: [fmt, clippy, workspace, crate, location-independence, deny]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -232,7 +231,8 @@ jobs:
           workspace_result='${{ needs.workspace.result }}'
           crate_result='${{ needs.crate.result }}'
           li_result="${{ needs['location-independence'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result"
+          deny_result='${{ needs.deny.result }}'
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then
