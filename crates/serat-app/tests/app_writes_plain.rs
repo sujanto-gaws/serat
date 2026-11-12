@@ -19,7 +19,8 @@
 //! 5. `.serat/` holds a SQLite database (and its WAL files) and UTF-8 JSON, and the vault
 //!    with `.serat/` deleted opens and indexes again with every note byte-identical
 //!    (the index is disposable, C-02);
-//! 6. the settings file, which lives outside the vault, is UTF-8 TOML that parses back.
+//! 6. the settings file is UTF-8 TOML that parses back (where it lives is not asserted here:
+//!    the test chooses the path, so an assertion on it could not fail).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -168,13 +169,12 @@ fn what_serat_app_writes_is_plain_utf8_in_the_vaults_own_line_endings_and_nothin
     state.decline_gitignore_offer().expect("decline");
     state.append_gitignore_entry().expect("append");
 
-    // Let the index settle, then close cleanly so `.serat/` is in its final shape.
-    wait_ready(&state);
+    // Close cleanly so `.serat/` is in its final shape (the index was ready above).
     state.close_vault();
     let after = snapshot(&root);
 
     // 1. Outside .serat/, only the asked-for paths changed.
-    let outside = |p: &String| !p.starts_with(".serat");
+    let outside = |p: &String| !(p == ".serat" || p.starts_with(".serat/"));
     let allowed_new = ["Notes/", "Notes/Idea.md", "Untitled.md"];
     let allowed_changed = [".gitignore", "Inbox.md"];
     for (path, bytes) in before.iter().filter(|(p, _)| outside(p)) {
@@ -285,8 +285,4 @@ fn what_serat_app_writes_is_plain_utf8_in_the_vaults_own_line_endings_and_nothin
     assert!(!raw.starts_with(b"\xEF\xBB\xBF"));
     let parsed: toml::Table = text.parse().expect("settings are TOML");
     assert!(parsed.contains_key("editor"));
-    assert!(
-        !settings_path.starts_with(&root),
-        "settings must not live in the vault (C-02)"
-    );
 }
