@@ -31,6 +31,17 @@ use std::path::{Path, PathBuf};
 use serat_core::VaultPath;
 use serat_vault::Vault;
 
+/// A test that cannot run on this runner says so. With `SERAT_WINDOWS_STRICT=1` (set by the
+/// "Windows-only checks" step of ci.yml) a skip is a failure instead, so a runner that cannot
+/// create an administrative share, a `subst` drive or an 8.3 alias cannot pass these vacuously.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("SERAT_WINDOWS_STRICT").is_none_or(|v| v != "1"),
+        "SERAT_WINDOWS_STRICT=1 and the test would have skipped: {reason}"
+    );
+    eprintln!("SKIPPED: {reason}");
+}
+
 fn put(root: &Path, relative: &str, bytes: &[u8]) {
     let target = root.join(relative);
     fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
@@ -59,8 +70,12 @@ fn verbatim(path: &Path) -> PathBuf {
     }
 }
 
-/// What a vault opened at `spelling` must look like, checked the same way for each.
-fn assert_one_vault(spelling: &Path, reference: &Vault, what: &str) {
+/// What a vault opened at `spelling` must look like. `collapses` says whether the spelling
+/// resolves onto the reference directory's own path (a verbatim spelling and a `subst` drive
+/// do: `canonicalize` returns the real `C:\...` path) or stays a different root (a UNC share
+/// does not: through the SMB redirector `canonicalize` returns `\\?\UNC\host\share\...`, which
+/// is a different recorded root from the local drive path and is adopted as one).
+fn assert_one_vault(spelling: &Path, reference: &Vault, what: &str, collapses: bool) {
     let vault = Vault::open(spelling).unwrap_or_else(|e| panic!("{what}: open: {e:?}"));
     let root = vault.root().to_string_lossy().into_owned();
     assert!(
@@ -71,13 +86,21 @@ fn assert_one_vault(spelling: &Path, reference: &Vault, what: &str) {
         !root.starts_with("UNC\\"),
         "{what}: mangled UNC root (#72): {root}"
     );
+    let recorded = serat_index::canonical_root(spelling);
+    let local = serat_index::canonical_root(reference.root());
+    if collapses {
+        assert_eq!(
+            recorded, local,
+            "{what}: the index would see a different root"
+        );
+    } else {
+        assert_ne!(
+            recorded, local,
+            "{what}: a share must not be mistaken for the local path"
+        );
+    }
     assert_eq!(
-        serat_index::canonical_root(spelling),
-        serat_index::canonical_root(reference.root()),
-        "{what}: the index would see a different root"
-    );
-    assert_eq!(
-        serat_index::canonical_root(spelling),
+        recorded,
         root.trim_end_matches(['\\', '/']),
         "{what}: Vault::root and canonical_root disagree (F-458)"
     );
@@ -118,7 +141,7 @@ fn root_fixture() -> (tempfile::TempDir, Vault) {
 #[test]
 fn a_verbatim_root_opens_as_the_plain_form_with_one_identity() {
     let (dir, reference) = root_fixture();
-    assert_one_vault(&verbatim(dir.path()), &reference, r"\\?\C:\ root");
+    assert_one_vault(&verbatim(dir.path()), &reference, r"\\?\C:\ root", true);
 }
 
 /// `\\localhost\C$\...` is the administrative share of the runner's own drive: a real UNC
@@ -131,23 +154,32 @@ fn a_unc_root_opens_as_a_unc_form_not_the_mangled_one() {
     let (drive, rest) = plain.split_at(2); // "C:" and "\Users\..."
     let unc = PathBuf::from(format!(r"\\localhost\{}${rest}", &drive[..1]));
     if fs::metadata(&unc).is_err() {
-        eprintln!(
-            "SKIPPED: {} is not reachable; administrative shares are disabled",
+        skip(&format!(
+            "{} is not reachable; administrative shares are disabled",
             unc.display()
-        );
+        ));
         return;
     }
-    assert_one_vault(&unc, &reference, "UNC admin share");
+    assert_one_vault(&unc, &reference, "UNC admin share", false);
     let verbatim_unc = PathBuf::from(format!(r"\\?\UNC\localhost\{}${rest}", &drive[..1]));
-    assert_one_vault(&verbatim_unc, &reference, r"\\?\UNC\ admin share");
-    let root = Vault::open(&unc)
-        .expect("open")
-        .root()
-        .to_string_lossy()
-        .into_owned();
+    assert_one_vault(&verbatim_unc, &reference, r"\\?\UNC\ admin share", false);
+    // Both spellings are one root, spelled as a UNC path: two backslashes, the host, no
+    // verbatim prefix and no mangled `UNC\` (#72).
+    let root = |p: &Path| {
+        Vault::open(p)
+            .expect("open")
+            .root()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (plain, verbatim_root) = (root(&unc), root(&verbatim_unc));
     assert!(
-        root.starts_with(r"\\"),
-        "a UNC root keeps its two backslashes: {root}"
+        plain.to_ascii_lowercase().starts_with(r"\\localhost\"),
+        "a UNC root keeps its two backslashes and its host: {plain}"
+    );
+    assert_eq!(
+        plain, verbatim_root,
+        "the two spellings of the share are one root"
     );
 }
 
@@ -168,7 +200,7 @@ fn a_mapped_drive_root_is_the_same_vault_as_the_directory_behind_it() {
         .rev()
         .find(|l| !Path::new(&format!("{l}:\\")).exists())
     else {
-        eprintln!("SKIPPED: every drive letter is in use");
+        skip("every drive letter is in use");
         return;
     };
     let drive = format!("{letter}:");
@@ -177,7 +209,7 @@ fn a_mapped_drive_root_is_the_same_vault_as_the_directory_behind_it() {
         .arg(dir.path())
         .status();
     if !made.is_ok_and(|s| s.success()) {
-        eprintln!("SKIPPED: subst {drive} failed on this runner");
+        skip(&format!("subst {drive} failed on this runner"));
         return;
     }
     let _guard = Subst(drive.clone());
@@ -185,12 +217,15 @@ fn a_mapped_drive_root_is_the_same_vault_as_the_directory_behind_it() {
         Path::new(&format!("{drive}\\")),
         &reference,
         "subst drive root",
+        true,
     );
 }
 
 /// `C:name` means "`name` in the current directory of drive C", a different place from
-/// `C:\name`. A root spelled that way must open exactly what the OS resolves it to or fail;
-/// it must never open some other directory. A name that exists nowhere is an error.
+/// `C:\name`. Only the negative case is asserted: a name that exists nowhere is an error, never
+/// some other directory. The positive case (a name that does exist, opened through the
+/// per-drive current directory) would have to change the process's working directory, which is
+/// global to every test thread, so it is not written.
 #[test]
 fn a_drive_relative_root_that_names_nothing_is_an_error() {
     let result = Vault::open(r"C:serat-no-such-directory-0f3a9");
@@ -225,14 +260,20 @@ fn create_refused(root: &Path) {
     }
 }
 
-fn remove_refused(root: &Path) {
-    // `tempfile`'s cleanup uses Win32 paths and cannot delete these; use the verbatim form.
-    let _ = fs::remove_dir_all(verbatim(root));
+/// Removes the tree through its verbatim path when dropped, so a failing assertion still
+/// cleans up (`tempfile`'s own cleanup uses Win32 paths and cannot delete the refused names).
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(verbatim(&self.0));
+    }
 }
 
 #[test]
 fn the_walk_lists_what_ntfs_allows_and_reports_what_win32_would_refuse() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let _cleanup = Cleanup(dir.path().to_owned());
     for name in ALLOWED {
         put(dir.path(), name, b"# ok\n");
     }
@@ -265,16 +306,18 @@ fn the_walk_lists_what_ntfs_allows_and_reports_what_win32_would_refuse() {
         );
     }
     assert!(vault.refusals().len() >= 3, "{refused:?}");
-    remove_refused(dir.path());
 }
 
 #[test]
 fn relativise_refuses_what_ntfs_stores_and_win32_would_not_create() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let _cleanup = Cleanup(dir.path().to_owned());
     create_refused(dir.path());
     let vault = Vault::open(dir.path()).expect("open");
+    // `vault.root()`, not `dir.path()`: TEMP may be the 8.3 form (`RUNNER~1`), which is not under the
+    // canonical root lexically, and the lexical fallback would then say PathEscapesVault.
     for name in ["aux.md", "trailing.md."] {
-        let result = vault.relativise(&dir.path().join(name));
+        let result = vault.relativise(&vault.root().join(name));
         assert!(
             matches!(result, Err(serat_core::VaultError::InvalidPath { .. })),
             "{name}: {result:?}"
@@ -284,12 +327,11 @@ fn relativise_refuses_what_ntfs_stores_and_win32_would_not_create() {
     put(dir.path(), "ok.md", b"# ok\n");
     assert_eq!(
         vault
-            .relativise(&dir.path().join("ok.md"))
+            .relativise(&vault.root().join("ok.md"))
             .expect("relativise")
             .to_string(),
         "ok.md"
     );
-    remove_refused(dir.path());
 }
 
 // -- 3. OneDrive Files-On-Demand placeholders -------------------------------------

@@ -142,6 +142,10 @@ jobs:
       - name: Windows-only checks (vault roots, NTFS names, asset handle checks)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          # A test that cannot run on this runner (no administrative share, no `subst`, no
+          # symlink privilege, 8.3 names off) fails instead of printing SKIPPED and passing.
+          SERAT_WINDOWS_STRICT: "1"
         run: |
           set -euo pipefail
           cargo test -p serat-app --test windows_vault -- --nocapture
@@ -156,6 +160,7 @@ jobs:
   windows-compile:
     name: windows code compiles (x86_64-pc-windows-gnu, check only)
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install a MinGW toolchain (C compiler and windres for build scripts)

@@ -800,6 +800,15 @@ mod unix_only {
 mod windows_only {
     use super::*;
 
+    /// With `SERAT_WINDOWS_STRICT=1` (the "Windows-only checks" step of ci.yml) a skip fails.
+    fn skip(reason: &str) {
+        assert!(
+            std::env::var_os("SERAT_WINDOWS_STRICT").is_none_or(|v| v != "1"),
+            "SERAT_WINDOWS_STRICT=1 and the test would have skipped: {reason}"
+        );
+        eprintln!("SKIPPED: {reason}");
+    }
+
     /// `mklink /J link target`: an NTFS directory junction.
     fn junction(target: &std::path::Path, link: &std::path::Path) {
         let status = std::process::Command::new("cmd")
@@ -820,8 +829,10 @@ mod windows_only {
     fn a_junctioned_directory_component_is_refused() {
         let fx = Fx::new("w-junction");
         fx.put("real/a.png", b"REAL");
-        junction(&fx.base.join("vault/real"), &fx.base.join("vault/alias"));
-        junction(&fx.outside(), &fx.base.join("vault/escape"));
+        let vault = fx.base.join("vault");
+        // Native separators throughout: `cmd /C mklink` does not accept forward slashes.
+        junction(&vault.join("real"), &vault.join("alias"));
+        junction(&fx.outside(), &vault.join("escape"));
         assert_eq!(
             fx.get(Platform::Windows, "real/a.png").status,
             200,
@@ -887,7 +898,7 @@ mod windows_only {
             .iter()
             .find(|name| root.join(name).join("x.png").exists())
         else {
-            eprintln!("SKIPPED: this volume has 8.3 short names disabled; no alias for .serat");
+            skip("this volume has 8.3 short names disabled; no alias for .serat");
             return;
         };
         assert!(
@@ -913,9 +924,16 @@ mod windows_only {
         let fx = Fx::new("w-final");
         let root = fx.vault.root().to_path_buf();
         let target = fx.outside().join("secret.png");
-        if let Err(err) = std::os::windows::fs::symlink_file(&target, root.join("a.png")) {
-            eprintln!("SKIPPED: no symlink privilege on this runner: {err}");
-            return;
+        match std::os::windows::fs::symlink_file(&target, root.join("a.png")) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD: the only error that means "this runner cannot make one".
+            Err(err) if err.raw_os_error() == Some(1314) => {
+                skip(&format!("no symlink privilege on this runner: {err}"));
+                return;
+            }
+            Err(err) => {
+                panic!("creating the symlink failed for a reason other than privilege: {err}")
+            }
         }
         assert!(open_verified(&root.join("a.png"), &fx.vault).is_none());
         assert_refused(&fx.get(Platform::Windows, "a.png"), "file symlink outside");
@@ -925,7 +943,15 @@ mod windows_only {
     fn an_alternate_data_stream_name_is_refused() {
         let fx = Fx::new("w-ads");
         fx.put("a.png", b"REAL");
-        assert_eq!(fx.get(Platform::Windows, "a.png").status, 200, "control");
+        // A real stream: `a.png:hidden` is a second data stream of a.png on NTFS, so naming it
+        // must be refused although the bytes exist. (Without this the refusal could be "no such
+        // file", which proves nothing.)
+        fs::write(fx.base.join("vault").join("a.png:hidden"), b"STREAM").unwrap();
+        let control = fx.get(Platform::Windows, "a.png");
+        assert_eq!(
+            (control.status, control.body.as_slice()),
+            (200, &b"REAL"[..])
+        );
         for path in [
             "a.png%3Ahidden",
             "a.png%3A%3A%24DATA",
