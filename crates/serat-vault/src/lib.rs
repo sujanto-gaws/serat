@@ -27,6 +27,10 @@
 
 mod atomic;
 pub mod diff;
+/// Whether the `test-hooks` feature is compiled in. serat-app asserts it is not in a
+/// release build, as it does for serat-index.
+pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
+
 pub mod echo;
 mod gitignore;
 pub mod hash;
@@ -34,7 +38,7 @@ pub mod identity;
 pub mod ignore;
 #[cfg(test)]
 mod ignore_file_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod name_rules_tests;
 pub mod patch;
 #[cfg(test)]
@@ -117,7 +121,7 @@ pub struct Vault {
     /// The root's identity, read once at open; no handle is kept (task #96).
     identity: Option<FileIdentity>,
     /// The name rules every walked and watched name is judged by. Always
-    /// [`Platform::current`] outside tests (see [`Vault::with_platform`]).
+    /// [`Platform::current`] unless a test overrides it.
     platform: Platform,
 }
 
@@ -173,8 +177,14 @@ impl Vault {
     /// A seam so the Windows-only name rules (device names, trailing dot or space,
     /// `:`) can be driven through a real walk on any CI runner: the refusal, its
     /// reason and its count are then tested end to end rather than only at
-    /// `VaultPath` (FR-VLT-01, NFR-SEC-06, task #35). The app never calls it.
-    #[doc(hidden)]
+    /// `VaultPath` (FR-VLT-01, NFR-SEC-06, task #35).
+    ///
+    /// **Test-only.** Judging by another platform's rules can switch off the
+    /// containment rules (T-07, T-10, NFR-SEC-06), so it exists only under `cfg(test)`
+    /// or the `test-hooks` feature, which serat-app enables from its
+    /// `[dev-dependencies]` alone and asserts absent from a release build
+    /// ([`TEST_HOOKS`]).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn with_platform(mut self, platform: Platform) -> Self {
         self.platform = platform;

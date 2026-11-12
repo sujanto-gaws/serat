@@ -46,7 +46,6 @@ fn listed(vault: &Vault) -> Vec<String> {
     seen
 }
 
-#[cfg(not(windows))]
 #[test]
 fn names_only_windows_refuses_are_shown_and_not_reported_on_this_platform() {
     let dir = fixture();
