@@ -15,6 +15,10 @@
 //! offset, so the expected file is `base[..from] + insert + base[to..]` per edit with
 //! nothing else computed. A multi-byte character elsewhere on the line, or on a later
 //! line, must come through untouched.
+//!
+//! Deliberately not here, because they need the model in `patch_props.rs`: edit columns
+//! past non-ASCII text (UTF-16 against bytes), deletions that span a CRLF, and the
+//! conversion of an inserted newline to the note's own line ending.
 
 use std::fs;
 use std::path::{Path, PathBuf};

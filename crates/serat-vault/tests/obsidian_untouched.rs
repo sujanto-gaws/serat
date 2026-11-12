@@ -75,13 +75,7 @@ fn a_session_leaves_obsidian_config_and_untouched_files_byte_identical_and_write
     let vault = Vault::open(root).expect("open");
     for entry in vault.walk().expect("walk") {
         if entry.path.as_str().ends_with(".md") {
-            vault
-                .read(
-                    &vault
-                        .relativise(&root.join(entry.path.as_str()))
-                        .expect("rel"),
-                )
-                .expect("read");
+            vault.read(&entry.path).expect("read");
         }
     }
     // Create, save whole, patch.
@@ -101,18 +95,18 @@ fn a_session_leaves_obsidian_config_and_untouched_files_byte_identical_and_write
         )
         .expect("patch new");
     // Patch an existing CRLF note: one field, nothing else moves.
-    let alpha_bytes = fs::read(root.join("Projects/Alpha.md")).expect("alpha");
+    let inbox_bytes = fs::read(root.join("Inbox.md")).expect("inbox");
     vault
         .write_patch(
-            &vp("Projects/Alpha.md"),
-            hash_bytes(&alpha_bytes),
+            &vp("Inbox.md"),
+            hash_bytes(&inbox_bytes),
             &[Edit::new(
-                Position::new(1, 7),
-                Position::new(1, 8),
-                "b".to_owned(),
+                Position::new(1, 0),
+                Position::new(1, 4),
+                "LINE".to_owned(),
             )],
         )
-        .expect("patch alpha");
+        .expect("patch inbox");
     vault.append_gitignore_entry().expect("gitignore");
     vault
         .update_prefs(|_| Some(b"{\"x\":1}".to_vec()))
@@ -122,7 +116,7 @@ fn a_session_leaves_obsidian_config_and_untouched_files_byte_identical_and_write
 
     // 1. Nothing under .obsidian/ and no file the session did not write changed.
     for (path, (bytes, mtime)) in &before {
-        if path == "Projects/Alpha.md" {
+        if path == "Inbox.md" {
             continue;
         }
         let (now, now_mtime) = after.get(path).unwrap_or_else(|| panic!("{path} vanished"));
@@ -145,10 +139,7 @@ fn a_session_leaves_obsidian_config_and_untouched_files_byte_identical_and_write
 
     // 3. Plain text, and exactly the bytes the caller gave (the patch is one range).
     assert_eq!(after["New note.md"].0, b"# New\nfirst draft\n");
-    assert_eq!(
-        after["Projects/Alpha.md"].0,
-        b"---\ntags: [b]\n---\nbody [[Inbox]]\n"
-    );
+    assert_eq!(after["Inbox.md"].0, b"# Inbox\r\nLINE two\r\n");
     assert_eq!(after[".gitignore"].0, b"/.serat/\n");
     for path in new_paths {
         std::str::from_utf8(&after[path].0).unwrap_or_else(|_| panic!("{path} is not UTF-8 text"));
