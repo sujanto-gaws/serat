@@ -29,7 +29,7 @@ interface Inert {
   reason: string;
   /** Occurrences in a fresh bench build. An exact count: a new occurrence fails. */
   bench: number;
-  /** Occurrences in the committed crates/serat-app/webview build (stale; see the evidence doc). */
+  /** Occurrences in the committed crates/serat-app/webview build (rebuilt in production mode at #116; equals the bench count). */
   shipped: number;
 }
 
@@ -39,16 +39,16 @@ interface Inert {
  * occurs, fails the test until someone reads it and edits this table on purpose.
  */
 const INERT: Record<string, Inert> = {
-  "https://foo.bar": { bench: 2, shipped: 0, reason: "pdf.js: base for `new URL(relative, base)` when parsing a link; never requested" },
-  "http://example.com": { bench: 1, shipped: 0, reason: "pdf.js: base for isValidFetchUrl(); never requested" },
+  "https://foo.bar": { bench: 2, shipped: 2, reason: "pdf.js: base for `new URL(relative, base)` when parsing a link; never requested" },
+  "http://example.com": { bench: 1, shipped: 1, reason: "pdf.js: base for isValidFetchUrl(); never requested" },
   "https://vuejs.org/error-reference/#runtime-$": { bench: 1, shipped: 1, reason: "Vue: text appended to a console warning; never requested" },
   "http://": { bench: 1, shipped: 1, reason: "prefix test `startsWith('http://')` (link classification); never requested" },
   "https://": { bench: 1, shipped: 1, reason: "prefix test `startsWith('https://')` (link classification); never requested" },
   "http://$": {
     bench: 4,
-    shipped: 2,
+    shipped: 4,
     reason:
-      "template prefix `http://${url}` for a bare `www.` link: markdown-it linkify (2: the shipped build) and pdf.js (2 more in the bench build: the pdf chunk and the worker); rendered as an <a>, never requested",
+      "template prefix `http://${url}` for a bare `www.` link: markdown-it linkify (2) and pdf.js (2 more: the pdf chunk and the worker); rendered as an <a>, never requested",
   },
 };
 
