@@ -263,17 +263,217 @@ describe("panel", () => {
   });
 });
 
+describe("loading and failures", () => {
+  const mountPanel = (count: number | null, load: () => Promise<RefusedName[]>) =>
+    mount(RefusedNames, { props: { count, load }, attachTo: document.body });
+  const deferred = <T,>() => {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => ((resolve = res), (reject = rej)));
+    return { promise, resolve, reject };
+  };
+  const status = (w: ReturnType<typeof mount>) => w.get('[data-testid="refused-panel-status"]');
+
+  it("first open: no loading line for a fast read; 'Loading the list…' only after 150 ms, announced once, then the result", async () => {
+    const fast = mountPanel(1, () => Promise.resolve([row("a:b")]));
+    await fast.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fast.find('[data-testid="refused-loading"]').exists()).toBe(false);
+    expect(status(fast).text()).toMatch(/^1 file in your vault folder/);
+    fast.unmount();
+
+    const d = deferred<RefusedName[]>();
+    const w = mountPanel(2, () => d.promise);
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(149);
+    expect(w.find('[data-testid="refused-loading"]').exists()).toBe(false);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(w.get('[data-testid="refused-loading"]').text()).toBe("Loading the list…");
+    expect(status(w).text()).toBe("Loading the list");
+    expect(status(w).attributes("role")).toBe("status");
+    expect(w.find(".spinner, [role='progressbar']").exists()).toBe(false);
+    d.resolve([row("a:b"), row("c:d")]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(w.find('[data-testid="refused-loading"]').exists()).toBe(false);
+    expect(status(w).text()).toMatch(/^2 files in your vault folder/);
+    w.unmount();
+  });
+
+  it("first open that finds nothing announces the empty line", async () => {
+    const w = mountPanel(1, () => Promise.resolve([]));
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(status(w).text()).toBe("Every name in this vault can be shown.");
+    w.unmount();
+  });
+
+  it("first-open failure shows the load-failure state and announces it", async () => {
+    const w = mountPanel(1, () => Promise.reject(new Error("x")));
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(w.get('[data-testid="refused-failed"]').text()).toContain("Couldn't load the list.");
+    expect(status(w).text()).toContain("Couldn't load the list.");
+    w.unmount();
+  });
+
+  it("a re-fetch with an old list shows no loading state; if it fails the old list stays with a line and Retry above it", async () => {
+    let mode: "ok" | "fail" | "slow" = "ok";
+    const gate = deferred<RefusedName[]>();
+    const load = vi.fn(() => (mode === "fail" ? Promise.reject(new Error("x")) : mode === "slow" ? gate.promise : Promise.resolve([row("a:b")])));
+    const w = mountPanel(1, load);
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+
+    mode = "slow";
+    await w.setProps({ count: 2 });
+    await vi.advanceTimersByTimeAsync(500 + 300);
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(w.find('[data-testid="refused-loading"]').exists()).toBe(false); // old list, no loading state
+    expect(w.findAll('[data-testid="refused-path"]')).toHaveLength(1);
+    gate.resolve([row("a:b"), row("c:d")]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    mode = "fail";
+    await w.setProps({ count: 3 });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(load).toHaveBeenCalledTimes(3);
+    expect(w.findAll('[data-testid="refused-path"]')).toHaveLength(2); // the old list stays
+    expect(w.get('[data-testid="refused-refresh-failed"]').text()).toBe("Couldn't refresh the list. It may be out of date.");
+    expect(w.get('[data-testid="refused-sentence"]').text()).toMatch(/^2 files/); // header keeps the old count
+    expect(status(w).text()).toBe("Couldn't refresh the list. It may be out of date.");
+    // the line sits between the header sentence and the first row
+    const html = w.get('[data-testid="refused-panel"]').html();
+    expect(html.indexOf("refused-sentence")).toBeLessThan(html.indexOf("refused-refresh-failed"));
+    expect(html.indexOf("refused-refresh-failed")).toBeLessThan(html.indexOf("refused-list"));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(load).toHaveBeenCalledTimes(3); // no retry loop
+
+    mode = "ok";
+    await w.get('[data-testid="refused-retry"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(w.find('[data-testid="refused-refresh-failed"]').exists()).toBe(false);
+    expect(w.findAll('[data-testid="refused-path"]')).toHaveLength(1);
+    w.unmount();
+  });
+
+  it("a later count change re-fetches and clears the failure line when it succeeds", async () => {
+    let fail = false;
+    const load = vi.fn(() => (fail ? Promise.reject(new Error("x")) : Promise.resolve([row("a:b")])));
+    const w = mountPanel(1, load);
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    fail = true;
+    await w.setProps({ count: 2 });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(w.find('[data-testid="refused-refresh-failed"]').exists()).toBe(true);
+    fail = false;
+    await w.setProps({ count: 3 });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(w.find('[data-testid="refused-refresh-failed"]').exists()).toBe(false);
+    w.unmount();
+  });
+});
+
+describe("focus is never dropped to the body", () => {
+  const mountPanel = (count: number | null, load: () => Promise<RefusedName[]>) =>
+    mount(RefusedNames, { props: { count, load }, attachTo: document.body });
+
+  it("Retry succeeding moves focus to the dialog, and Esc still closes", async () => {
+    const load = vi.fn().mockRejectedValueOnce(new Error("x")).mockResolvedValue([row("a:b")]);
+    const w = mountPanel(1, load);
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(500);
+    (w.get('[data-testid="refused-retry"]').element as HTMLElement).focus();
+    await w.get('[data-testid="refused-retry"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(w.find('[data-testid="refused-retry"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(w.get('[role="dialog"]').element);
+    await w.get('[role="dialog"]').trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(w.find('[role="dialog"]').exists()).toBe(false);
+    w.unmount();
+  });
+
+  it("the focused list emptying on a re-fetch moves focus to the dialog", async () => {
+    let answer = [row("a:b")];
+    const w = mountPanel(1, () => Promise.resolve(answer));
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    (w.get('[data-testid="refused-list"]').element as HTMLElement).focus();
+    answer = [];
+    await w.setProps({ count: 0 });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(w.find('[data-testid="refused-list"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(w.get('[role="dialog"]').element);
+    await w.get('[role="dialog"]').trigger("keydown", { key: "Escape" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(w.find('[role="dialog"]').exists()).toBe(false);
+    w.unmount();
+  });
+});
+
+describe("untrusted text edge cases", () => {
+  it("a literal escape-looking name does not render like a real U+202E", () => {
+    const literal = escapeUntrusted("a" + String.fromCodePoint(0x27e8) + "U+202E" + String.fromCodePoint(0x27e9) + "b");
+    const real = escapeUntrusted("a" + String.fromCodePoint(0x202e) + "b");
+    expect(literal).not.toBe(real);
+    expect(literal).toContain("U+27E8");
+  });
+
+  it("escapes tag characters and the soft hyphen too", () => {
+    expect(escapeUntrusted("a" + String.fromCodePoint(0xad) + "b")).toContain("U+00AD");
+    expect(escapeUntrusted(String.fromCodePoint(0xe0041))).toContain("U+E0041");
+  });
+
+  it("an unpaired backtick in a reason stays literal text", async () => {
+    const w = mount(RefusedNames, {
+      props: { count: 1, load: () => Promise.resolve([row("a:b", "contains a `:` and a stray ` here")]) },
+      attachTo: document.body,
+    });
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(0);
+    const reason = w.get('[data-testid="refused-reason"]');
+    expect(reason.text()).toBe("Contains a : and a stray ` here");
+    expect(reason.findAll("code")).toHaveLength(1);
+    w.unmount();
+  });
+});
+
+describe("store: vault switch and poll ordering", () => {
+  beforeEach(() => setActivePinia(createPinia()));
+  const ready = { kind: "ready", note_count: 1 } as const;
+
+  it("a different vault id clears the count; the same id keeps it", () => {
+    const store = useVaultStore();
+    store.vaultOpened({ vault_id: "v1", root: "/a" } as never);
+    store.setRefusedNames(4);
+    store.vaultOpened({ vault_id: "v1", root: "/a" } as never);
+    expect(store.refusedNames).toBe(4);
+    store.vaultOpened({ vault_id: "v2", root: "/b" } as never);
+    expect(store.refusedNames).toBeNull();
+  });
+
+  it("a poll answer after an event is ignored; before any event it applies", () => {
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: ready, refused_names: 2 }, "poll");
+    expect(store.refusedNames).toBe(2);
+    store.applyIndexStatus({ state: ready, refused_names: 5 }, "event");
+    store.applyIndexStatus({ state: ready, refused_names: 1 }, "poll");
+    expect(store.refusedNames).toBe(5);
+  });
+});
+
 describe("store: status event and poll share one entry", () => {
   beforeEach(() => setActivePinia(createPinia()));
   const ready = { kind: "ready", note_count: 1 } as const;
 
   it("takes the count from the status, and None clears it", () => {
     const store = useVaultStore();
-    store.applyIndexStatus({ state: ready, refused_names: 3 });
+    store.applyIndexStatus({ state: ready, refused_names: 3 }, "event");
     expect(store.refusedNames).toBe(3);
-    store.applyIndexStatus({ state: ready, refused_names: 0 });
+    store.applyIndexStatus({ state: ready, refused_names: 0 }, "event");
     expect(store.refusedNames).toBe(0);
-    store.applyIndexStatus({ state: ready });
+    store.applyIndexStatus({ state: ready }, "event");
     expect(store.refusedNames).toBeNull();
   });
 });

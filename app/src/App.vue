@@ -326,6 +326,10 @@ function focusAfterRefused(): void {
   // the tree has no collapse control yet; below the compact breakpoint it is hidden unless its flyover is open
   if (window.matchMedia?.("(max-width: 719px)").matches && !treeFlyover.value) editorRef.value?.focus();
   else treeRef.value?.focusTree();
+  // Focus is never dropped to <body>: if the tree could not take it, the workspace itself can.
+  void nextTick(() => {
+    if (document.activeElement === document.body || !document.activeElement) document.querySelector<HTMLElement>("main.workspace")?.focus();
+  });
 }
 
 function onInsertLink(payload: { path: string; text: string }): void {
@@ -348,8 +352,6 @@ function onGlobalKeydown(event: KeyboardEvent): void {
     return;
   }
 }
-
-let statusEventSeen = false;
 
 onMounted(async () => {
   // NFR-PRF-02's harness seam (`bench/editor-latency/tests/subject.ts`,
@@ -417,8 +419,7 @@ onMounted(async () => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
     // The count of names the vault refused to list is one status fact (not a per-name error).
-    statusEventSeen = true;
-    store.applyIndexStatus(status);
+    store.applyIndexStatus(status, "event");
   });
 
 
@@ -427,8 +428,7 @@ onMounted(async () => {
   indexStatus().then((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
-    // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
-    if (!statusEventSeen) store.applyIndexStatus(status);
+    store.applyIndexStatus(status, "poll");
   });
 
   if (editorRef.value) {
@@ -510,7 +510,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <button type="button" class="tree-toggle" aria-label="Toggle file tree" @click="treeFlyover = !treeFlyover">Files</button>
   </header>
 
-  <main class="workspace" :class="{ 'tree-open': treeFlyover }">
+  <main class="workspace" tabindex="-1" :class="{ 'tree-open': treeFlyover }">
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
         ref="treeRef"

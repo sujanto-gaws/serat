@@ -61,6 +61,8 @@ export const useVaultStore = defineStore("vault", {
     announced: false,
     /** Distinct names the vault could not turn into a vault path (FR-VLT-01), as one status fact; `null` = absent (never zero). */
     refusedNames: null as number | null,
+    /** An `index://status` event has been applied, so a late poll answer must not overwrite it. */
+    statusEventSeen: false,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
@@ -76,6 +78,7 @@ export const useVaultStore = defineStore("vault", {
     vaultOpened(opened: VaultOpened) {
       this.announced = true; // from now on, no poll may set the id, even after a failed open
       if (!opened.vault_id) return; // never adopt an empty id
+      if (opened.vault_id !== this.vaultId) this.refusedNames = null; // another vault: the old count is not its count
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
@@ -124,7 +127,10 @@ export const useVaultStore = defineStore("vault", {
     /** One entry for an `index://status` event and the late-subscriber poll alike (architecture 3.4): the state
      * text and the refused-names count, which is `null` when the status omits it (`None`: not counting yet, or
      * no vault open; never zero, FR-VLT-01). */
-    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">) {
+    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">, source: "event" | "poll") {
+      // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
+      if (source === "poll" && this.statusEventSeen) return;
+      if (source === "event") this.statusEventSeen = true;
       this.setIndexState(status.state);
       this.setRefusedNames(status.refused_names ?? null);
     },

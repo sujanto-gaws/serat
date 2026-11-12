@@ -10,7 +10,14 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 
 import { refusedNames } from "@/ipc/client";
 import type { RefusedName } from "@/ipc/generated/RefusedName";
-import { ANNOUNCE_DEBOUNCE_MS, escapeUntrusted, REFETCH_DEBOUNCE_MS, REFUSED_NAMES_CAP, refusedCountText } from "@/refused/refusedText";
+import {
+  ANNOUNCE_DEBOUNCE_MS,
+  escapeUntrusted,
+  LOADING_DELAY_MS,
+  REFETCH_DEBOUNCE_MS,
+  REFUSED_NAMES_CAP,
+  refusedCountText,
+} from "@/refused/refusedText";
 
 const props = withDefaults(
   defineProps<{
@@ -29,7 +36,12 @@ const emit = defineEmits<{
 
 const open = ref(false);
 const list = ref<RefusedName[] | null>(null);
-const failed = ref(false);
+/** `first`: the first load failed (no earlier list); `refresh`: a background re-fetch failed and the old list stays. */
+const failed = ref<false | "first" | "refresh">(false);
+/** First open only: the call is still pending after LOADING_DELAY_MS, so the one-line "Loading the list…" shows. */
+const slow = ref(false);
+/** Panel-scoped polite status text: loading, what the first load found, or a failure; quiet on a good re-fetch. */
+const panelStatus = ref("");
 const root = ref<HTMLElement | null>(null);
 const button = ref<HTMLButtonElement | null>(null);
 const dialog = ref<HTMLElement | null>(null);
@@ -68,16 +80,55 @@ const sentence = computed(() => {
 });
 
 let fetchSeq = 0;
+let slowTimer: ReturnType<typeof setTimeout> | null = null;
+const FAILED_FIRST = "Couldn't load the list. The count in the status strip is still correct.";
+const FAILED_REFRESH = "Couldn't refresh the list. It may be out of date.";
+const EMPTY_TEXT = "Every name in this vault can be shown.";
+
+function clearSlow(): void {
+  if (slowTimer) clearTimeout(slowTimer);
+  slowTimer = null;
+  slow.value = false;
+}
+
+/** Applies a state change and, if focus was inside the dialog and the change unmounted its holder (Retry,
+ * a row), puts it on the dialog so it is never dropped to <body> and Esc keeps working. */
+async function settle(update: () => void): Promise<void> {
+  const el = dialog.value;
+  const hadFocus = !!el && el.contains(document.activeElement);
+  update();
+  await nextTick();
+  const now = document.activeElement;
+  if (open.value && hadFocus && (!now || now === document.body || !now.isConnected)) dialog.value?.focus();
+}
+
 async function fetchList(): Promise<void> {
   const seq = ++fetchSeq;
+  const firstLoad = list.value === null;
+  if (firstLoad && !slowTimer) {
+    slowTimer = setTimeout(() => {
+      slowTimer = null;
+      if (seq !== fetchSeq || list.value !== null) return;
+      slow.value = true;
+      panelStatus.value = "Loading the list";
+    }, LOADING_DELAY_MS);
+  }
   try {
     const next = await props.load();
     if (seq !== fetchSeq) return;
-    list.value = next; // replaced in one step: the old list stays on screen until now
-    failed.value = false;
+    clearSlow();
+    await settle(() => {
+      list.value = next; // replaced in one step: the old list stays on screen until now
+      failed.value = false;
+    });
+    if (firstLoad && open.value) panelStatus.value = next.length === 0 ? EMPTY_TEXT : sentence.value;
   } catch {
     if (seq !== fetchSeq) return;
-    failed.value = true; // no retry loop: the Retry button asks again
+    clearSlow();
+    await settle(() => {
+      failed.value = list.value === null ? "first" : "refresh"; // no retry loop: Retry asks again
+    });
+    panelStatus.value = failed.value === "first" ? FAILED_FIRST : FAILED_REFRESH;
   }
 }
 
@@ -85,6 +136,8 @@ async function openPanel(): Promise<void> {
   if (open.value) return;
   list.value = null;
   failed.value = false;
+  slow.value = false;
+  panelStatus.value = "";
   opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   open.value = true;
   void fetchList();
@@ -104,6 +157,7 @@ function closePanel(restore: boolean): void {
   if (refetchTimer) clearTimeout(refetchTimer);
   refetchTimer = null;
   fetchSeq += 1; // a late answer must not repaint a closed panel
+  clearSlow();
   if (!restore) return;
   void nextTick(() => {
     // A click does not focus a button in every browser, so "nothing focused" means the strip button opened it.
@@ -149,10 +203,10 @@ function onKeydown(event: KeyboardEvent): void {
 function reasonParts(reason: string): Array<{ text: string; mono: boolean }> {
   const safe = escapeUntrusted(reason);
   const cased = safe.charAt(0).toUpperCase() + safe.slice(1);
-  return cased
-    .split("`")
-    .map((text, i) => ({ text, mono: i % 2 === 1 }))
-    .filter((part) => part.text !== "");
+  const pieces = cased.split("`");
+  // An odd number of backticks leaves the last one unpaired: it stays as literal text, nothing else changes.
+  if (pieces.length % 2 === 0) pieces.splice(-2, 2, pieces[pieces.length - 2] + "`" + pieces[pieces.length - 1]);
+  return pieces.map((text, i) => ({ text, mono: i % 2 === 1 })).filter((part) => part.text !== "");
 }
 
 /** Focus moved to a non-overlay element, or into another overlay: close, and leave focus where it went. */
@@ -194,50 +248,62 @@ defineExpose({ open: openPanel, close: () => closePanel(false), isOpen: () => op
       <template v-else>{{ text }}</template>
     </button>
 
-    <div
-      v-if="open"
-      ref="dialog"
-      class="refused-panel"
-      role="dialog"
-      aria-modal="false"
-      aria-labelledby="refused-title"
-      aria-describedby="refused-sentence"
-      tabindex="-1"
-      data-testid="refused-panel"
-      @keydown="onKeydown"
-    >
-      <div class="refused-head">
-        <h2 id="refused-title">Names not shown</h2>
-        <button type="button" class="refused-close" aria-label="Close" data-testid="refused-close" @click="closePanel(true)">&times;</button>
-      </div>
+    <Transition name="refused-panel">
+      <div
+        v-if="open"
+        ref="dialog"
+        class="refused-panel"
+        role="dialog"
+        aria-modal="false"
+        aria-labelledby="refused-title"
+        aria-describedby="refused-sentence"
+        tabindex="-1"
+        data-testid="refused-panel"
+        @keydown="onKeydown"
+      >
+        <span role="status" aria-live="polite" aria-atomic="true" class="sr-only" data-testid="refused-panel-status">{{ panelStatus }}</span>
+        <div class="refused-head">
+          <h2 id="refused-title">Names not shown</h2>
+          <button type="button" class="refused-close" aria-label="Close" data-testid="refused-close" @click="closePanel(true)">&times;</button>
+        </div>
 
-      <template v-if="failed">
-        <p id="refused-sentence" class="refused-secondary" data-testid="refused-failed">
-          Couldn't load the list. The count in the status strip is still correct.
-        </p>
-        <button type="button" class="refused-retry" data-testid="refused-retry" @click="fetchList">Retry</button>
-      </template>
-      <p v-else-if="list === null" id="refused-sentence" class="refused-secondary" aria-busy="true">Loading…</p>
-      <p v-else-if="list.length === 0" id="refused-sentence" class="refused-secondary" data-testid="refused-empty">
-        Every name in this vault can be shown.
-      </p>
-      <template v-else>
-        <p id="refused-sentence" class="refused-secondary" data-testid="refused-sentence">{{ sentence }}</p>
-        <ul role="list" tabindex="0" aria-label="Names not shown" class="refused-list" data-testid="refused-list">
-          <li v-for="row in list" :key="row.path" class="refused-row">
-            <span class="refused-path" data-testid="refused-path">{{ escapeUntrusted(row.path) }}</span>
-            <span class="refused-secondary refused-reason" data-testid="refused-reason"><template v-for="(part, i) in reasonParts(row.reason)" :key="i"
-                ><code v-if="part.mono" class="refused-mono">{{ part.text }}</code
-                ><template v-else>{{ part.text }}</template></template
-              ></span
-            >
-          </li>
-        </ul>
-        <p class="refused-secondary refused-foot">
-          A name stays listed until Serat next scans its folder, even if you have since renamed or deleted the file.
-        </p>
-      </template>
-    </div>
+        <template v-if="list === null">
+          <template v-if="failed === 'first'">
+            <p id="refused-sentence" class="refused-secondary" data-testid="refused-failed">
+              Couldn't load the list. The count in the status strip is still correct.
+            </p>
+            <button type="button" class="refused-retry" data-testid="refused-retry" @click="fetchList">Retry</button>
+          </template>
+          <p v-else-if="slow" id="refused-sentence" class="refused-secondary" aria-busy="true" data-testid="refused-loading">Loading the list…</p>
+        </template>
+        <template v-else>
+          <p v-if="list.length === 0" id="refused-sentence" class="refused-secondary" data-testid="refused-empty">
+            Every name in this vault can be shown.
+          </p>
+          <p v-else id="refused-sentence" class="refused-secondary" data-testid="refused-sentence">{{ sentence }}</p>
+          <div v-if="failed === 'refresh'" class="refused-refresh-failed">
+            <p class="refused-secondary" data-testid="refused-refresh-failed">Couldn't refresh the list. It may be out of date.</p>
+            <button type="button" class="refused-retry" data-testid="refused-retry" @click="fetchList">Retry</button>
+          </div>
+          <template v-if="list.length > 0">
+            <ul role="list" tabindex="0" aria-label="Names not shown" class="refused-list" data-testid="refused-list">
+              <li v-for="row in list" :key="row.path" class="refused-row">
+                <span class="refused-path" data-testid="refused-path">{{ escapeUntrusted(row.path) }}</span>
+                <span class="refused-secondary refused-reason" data-testid="refused-reason"
+                  ><template v-for="(part, i) in reasonParts(row.reason)" :key="i"
+                    ><code v-if="part.mono" class="refused-mono">{{ part.text }}</code
+                    ><template v-else>{{ part.text }}</template></template
+                  ></span
+                >
+              </li>
+            </ul>
+            <p class="refused-secondary refused-foot">
+              A name stays listed until Serat next scans its folder, even if you have since renamed or deleted the file.
+            </p>
+          </template>
+        </template>
+      </div>
+    </Transition>
   </span>
 </template>
 
@@ -268,14 +334,6 @@ defineExpose({ open: openPanel, close: () => closePanel(false), isOpen: () => op
   border-radius: 50%;
   background: var(--rust, #a8452f);
 }
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
 .refused-panel {
   position: absolute;
   bottom: calc(100% + 6px);
@@ -291,7 +349,6 @@ defineExpose({ open: openPanel, close: () => closePanel(false), isOpen: () => op
   border: 1px solid color-mix(in srgb, var(--ink) 15%, transparent);
   border-radius: 8px;
   box-shadow: 0 12px 32px color-mix(in srgb, var(--ink) 22%, transparent);
-  animation: refused-in 160ms ease-out;
 }
 .refused-head {
   display: flex;
@@ -344,20 +401,21 @@ defineExpose({ open: openPanel, close: () => closePanel(false), isOpen: () => op
 .refused-retry {
   align-self: flex-start;
 }
-@keyframes refused-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
+.refused-panel-enter-active,
+.refused-panel-leave-active {
+  transition:
+    opacity 160ms ease-out,
+    transform 160ms ease-out;
 }
-@keyframes refused-fade {
-  from {
-    opacity: 0;
-  }
+.refused-panel-enter-from,
+.refused-panel-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
 }
 @media (prefers-reduced-motion: reduce) {
-  .refused-panel {
-    animation-name: refused-fade;
+  .refused-panel-enter-from,
+  .refused-panel-leave-to {
+    transform: none;
   }
 }
 @media (max-width: 719px) {
