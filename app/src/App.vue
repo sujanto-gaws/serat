@@ -326,9 +326,16 @@ function focusAfterRefused(): void {
   // the tree has no collapse control yet; below the compact breakpoint it is hidden unless its flyover is open
   if (window.matchMedia?.("(max-width: 719px)").matches && !treeFlyover.value) editorRef.value?.focus();
   else treeRef.value?.focusTree();
-  // Focus is never dropped to <body>: if the tree could not take it, the workspace itself can.
+  // Focus is never dropped to <body>: if the tree could not take it, the workspace itself can. It is made
+  // focusable only for this, so a click on blank workspace never lands on it (that would change the
+  // relatedTarget overlays see).
   void nextTick(() => {
-    if (document.activeElement === document.body || !document.activeElement) document.querySelector<HTMLElement>("main.workspace")?.focus();
+    if (document.activeElement !== document.body && document.activeElement) return;
+    const main = document.querySelector<HTMLElement>("main.workspace");
+    if (!main) return;
+    main.setAttribute("tabindex", "-1");
+    main.focus();
+    main.addEventListener("blur", () => main.removeAttribute("tabindex"), { once: true });
   });
 }
 
@@ -510,7 +517,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
     <button type="button" class="tree-toggle" aria-label="Toggle file tree" @click="treeFlyover = !treeFlyover">Files</button>
   </header>
 
-  <main class="workspace" tabindex="-1" :class="{ 'tree-open': treeFlyover }">
+  <main class="workspace" :class="{ 'tree-open': treeFlyover }">
     <aside class="pane pane-tree" aria-label="File tree">
       <FileTree
         ref="treeRef"

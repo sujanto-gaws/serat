@@ -412,6 +412,60 @@ describe("focus is never dropped to the body", () => {
   });
 });
 
+describe("the leaving panel", () => {
+  it("is inert, hidden and id-free during the fade, so one #refused-title remains after a quick reopen", async () => {
+    const real = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation(((el: Element, pseudo?: string | null) => {
+      const style = real(el, pseudo);
+      return new Proxy(style, {
+        get: (target, prop) => {
+          if (prop === "transitionDuration") return "0.16s";
+          if (prop === "transitionDelay") return "0s";
+          if (prop === "transitionProperty") return "opacity";
+          const v = Reflect.get(target, prop);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }) as typeof window.getComputedStyle);
+    const w = mount(RefusedNames, {
+      props: { count: 1, load: () => Promise.resolve([row("a:b")]) },
+      attachTo: document.body,
+      global: { stubs: { transition: false } },
+    });
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(300);
+    await w.get('[data-testid="refused-close"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(10);
+    const leaving = document.querySelector<HTMLElement>('[data-testid="refused-panel"]');
+    expect(leaving).not.toBeNull();
+    expect(leaving?.hasAttribute("inert")).toBe(true);
+    expect(leaving?.getAttribute("aria-hidden")).toBe("true");
+    expect(leaving?.querySelector("[id]")).toBeNull();
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(document.querySelectorAll("#refused-title")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(document.querySelectorAll('[data-testid="refused-panel"]')).toHaveLength(1);
+    w.unmount();
+    vi.restoreAllMocks();
+  });
+
+  it("a repeated identical failure is announced again, and Retry leaves the failure state while loading", async () => {
+    const load = vi.fn(() => Promise.reject(new Error("x")));
+    const w = mount(RefusedNames, { props: { count: 1, load }, attachTo: document.body });
+    await w.get("button").trigger("click");
+    await vi.advanceTimersByTimeAsync(200);
+    const status = () => w.get('[data-testid="refused-panel-status"]').text();
+    expect(status()).toContain("Couldn't load the list.");
+    await w.get('[data-testid="refused-retry"]').trigger("click");
+    expect(status()).toBe(""); // cleared before the call, so the same sentence is a change
+    expect(w.find('[data-testid="refused-failed"]').exists()).toBe(false);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(status()).toContain("Couldn't load the list.");
+    w.unmount();
+  });
+});
+
 describe("untrusted text edge cases", () => {
   it("a literal escape-looking name does not render like a real U+202E", () => {
     const literal = escapeUntrusted("a" + String.fromCodePoint(0x27e8) + "U+202E" + String.fromCodePoint(0x27e9) + "b");

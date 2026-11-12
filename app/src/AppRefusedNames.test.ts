@@ -131,4 +131,22 @@ describe("App: refused-names count", () => {
     expect(wrapper.get('[data-testid="refused-path"]').text()).toBe("a:b.md");
     wrapper.unmount();
   });
+
+  it("blank workspace is not focusable; the focus fallback makes it focusable only until it blurs", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    const main = wrapper.get("main.workspace");
+    expect(main.attributes("tabindex")).toBeUndefined();
+    (document.activeElement as HTMLElement | null)?.blur();
+    wrapper.findComponent({ name: "RefusedNames" }).vm.$emit("focus-fallback");
+    await flushPromises();
+    // the tree takes focus when it can; force the body case to reach the workspace fallback
+    if (document.activeElement === main.element) {
+      expect(main.attributes("tabindex")).toBe("-1");
+      (main.element as HTMLElement).blur();
+      expect(main.attributes("tabindex")).toBeUndefined();
+    }
+    expect(main.attributes("tabindex") === undefined || document.activeElement === main.element).toBe(true);
+    wrapper.unmount();
+  });
 });

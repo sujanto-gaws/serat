@@ -104,6 +104,12 @@ async function settle(update: () => void): Promise<void> {
 
 async function fetchList(): Promise<void> {
   const seq = ++fetchSeq;
+  // Clear first, so an identical result (the same failure twice) is a change the live region announces again.
+  panelStatus.value = "";
+  // Retry on a first-open failure: back to loading, not a stale failure (and focus must not drop with the Retry button).
+  if (list.value === null && failed.value) await settle(() => (failed.value = false));
+  else await nextTick();
+  if (seq !== fetchSeq) return;
   const firstLoad = list.value === null;
   if (firstLoad && !slowTimer) {
     slowTimer = setTimeout(() => {
@@ -166,6 +172,16 @@ function closePanel(restore: boolean): void {
     if (target) target.focus();
     else emit("focus-fallback"); // the opener is gone (the count fell to none): the host picks the tree row or the editor
   });
+}
+
+/** The leaving panel stays in the DOM for the fade: make it inert and invisible to assistive technology, and
+ * strip its ids so a reopened panel's title and sentence are the only ones the page has. */
+function onBeforeLeave(el: Element): void {
+  el.setAttribute("inert", "");
+  el.setAttribute("aria-hidden", "true");
+  el.removeAttribute("aria-labelledby");
+  el.removeAttribute("aria-describedby");
+  for (const node of el.querySelectorAll("[id]")) node.removeAttribute("id");
 }
 
 function toggle(): void {
@@ -248,7 +264,7 @@ defineExpose({ open: openPanel, close: () => closePanel(false), isOpen: () => op
       <template v-else>{{ text }}</template>
     </button>
 
-    <Transition name="refused-panel">
+    <Transition name="refused-panel" @before-leave="onBeforeLeave">
       <div
         v-if="open"
         ref="dialog"
