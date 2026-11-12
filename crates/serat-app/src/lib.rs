@@ -897,100 +897,171 @@ mod tests {
         }
     }
 
+    /// Does `selector` name `token` as a whole selector token rather than as part of
+    /// a longer name? `.body-x` does not name `body`.
+    fn selector_names(selector: &str, token: &str) -> bool {
+        selector.match_indices(token).any(|(i, _)| {
+            let before_ok = selector[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '#')));
+            let after_ok = selector[i + token.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')));
+            before_ok && after_ok
+        })
+    }
+
+    /// Does `declarations` declare `content` as a **property**?
+    ///
+    /// code-reviewer's matcher, and the reason it is theirs: anchoring on start, `;`,
+    /// `{` or whitespace excludes `justify-content`, `align-content` and
+    /// `place-content` **without enumerating them**, so it does not decay as CSS gains
+    /// further `*-content` properties. A naive `content:` substring search returns 1
+    /// against the shipped file today and this returns 0 -- the trap has caught three
+    /// of us independently, which is why it is a named function and not an inline
+    /// pattern.
+    fn declares_content_property(declarations: &str) -> bool {
+        declarations.match_indices("content").any(|(i, _)| {
+            let anchored = declarations[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c == '{' || c == ';' || c.is_whitespace());
+            anchored
+                && declarations[i + "content".len()..]
+                    .trim_start()
+                    .starts_with(':')
+        })
+    }
+
     #[test]
-    fn the_shipped_page_body_holds_only_the_mount_point_and_scripts() {
-        // #128, and F-505 is why it is the only guard in its family that can work.
-        // Nothing observable at `mark_first_paint` can discriminate a fabricated call
-        // from an honest one -- every value there is supplied by the caller, and the
-        // one that is not (`window_visible - window_created`) is still *determined* by
-        // the caller, since the host stamps the arrival and the caller chooses when to
-        // arrive (F-507). This check is the exception because it is resolved
-        // **without observing the call at all**.
+    fn the_shipped_page_body_is_exactly_the_mount_point() {
+        // #128, first half. F-505 is why this family has exactly one workable member:
+        // nothing observable at `mark_first_paint` can discriminate a fabricated call
+        // from an honest one, because everything there is caller-supplied and the one
+        // thing that is not is still caller-*determined* -- the host stamps the arrival
+        // and the caller chooses when to arrive (F-507). This check is the exception
+        // because it is resolved **without observing the call at all**.
         //
-        // WHAT IT DEFENDS, and it is not F-504. A fabricated call never consults the
-        // real paint entry, so no property of this page can affect it. What is
-        // defended is F-396(b): that `first-contentful-paint`, *when honestly
-        // reported*, is measuring our own content rather than a skeleton that painted
-        // before Vue mounted. F-482 found the runtime guard no longer corroborates the
-        // entry, so that dependency is live and was, until now, asserted by nothing
-        // (F-464).
+        // SCOPE, in architect's words rather than paraphrased: this check does nothing
+        // about F-504 -- a fabricated call never consults the real paint entry, so no
+        // property of `index.html` can affect it. What it defends is F-396(b): that
+        // `first-contentful-paint`, *when honestly reported*, is measuring our content
+        // rather than a skeleton that painted before Vue mounted.
         //
-        // THREE DECISIONS, all architect's (ADR-0014, task #128), because "assert the
-        // body stays contentless" underdetermines the check exactly where it matters:
+        // NOT THE WHOLE PROPERTY, and this comment must not imply otherwise. "Renders
+        // nothing before scripts run" is not statically decidable. What is bounded is
+        // the set of ways a *contentful* paint can happen: text nodes, image-bearing
+        // elements, background images, and CSS generated content. This half covers the
+        // first two; `the_shipped_stylesheet_cannot_paint_before_scripts_run` covers
+        // the other two, and neither is the guarantee alone (F-510).
         //
-        //   * **The built copy, not `app/index.html`.** `frontendDist` is `"webview"`
-        //     with no `beforeBuildCommand`, so this file is what compiles into
-        //     `serat.exe` and the source is one the binary never opens (F-470). The
-        //     two also differ legitimately -- the source carries a `<script
-        //     type="module" src="/src/main.ts">` in its body and this does not -- so a
-        //     source-side check would have to model Vite's transform to know which
-        //     differences are real. A source-side twin is worth having as the second
-        //     half of an F-510 pair; it is not the guarantee.
-        //   * **An allowlist, not an absence.** "Renders nothing before scripts run"
-        //     is the property wanted and is *not statically decidable*: CSS alone can
-        //     paint a `::before`, a background image, a sized box. So it is not
-        //     attempted. The body may hold the mount point and script elements, and
-        //     nothing else. That is deliberately stricter than the property, so that
-        //     widening it is a decision somebody takes rather than a line somebody
-        //     adds -- the shape of ADR-0012's five-command grant (F-509).
-        //   * **`cargo test`, not CI.** F-384 leaves CI producing no jobs, so a check
-        //     living only there would not run at all.
+        // THE FORM IS AN ALLOWLIST, deliberately stricter than the property, so that
+        // widening it is a decision somebody takes rather than a line somebody adds --
+        // ADR-0012's five-command grant is the model (F-509). The body's inner HTML
+        // must be *exactly* the mount point. There is no clause for `<script>`:
+        // architect had written one and code-reviewer found the body has none, because
+        // Vite emits the module script into `<head>`, so permitting it would be looser
+        // than the artefact for no benefit. Verified by parsing rather than grepping --
+        // one script in `<head>`, zero in `<body>`.
         //
-        // NOT F-377's family, which is the objection this invites. F-377's bundle
-        // check asserted that a *behaviour* -- a mark taken inside a double
-        // requestAnimationFrame -- could be inferred from *text*, and it could not:
-        // the substring survived every mutation that mattered. This asserts a property
-        // **of** the text. What markup is present is precisely what text can answer,
-        // and it is the whole property rather than a proxy for one.
+        // The known cost, chosen rather than discovered: a legitimate `<noscript>`, or
+        // a Vite change injecting a preload into the body, goes red with nothing wrong.
+        // That is the intended behaviour -- red sends someone to the table.
         //
-        // Comments in the body are **not** allowlisted, deliberately. A comment cannot
-        // paint, so this is stricter than the property -- which is the ruling's intent:
-        // whoever needs one takes the widening decision rather than discovering the
-        // allowlist was approximate.
+        // THE BUILT COPY, not `app/index.html`. `frontendDist` is `"webview"` with no
+        // `beforeBuildCommand`, so this is the file compiled into `serat.exe` and the
+        // source is one the binary never opens (F-470). They also differ *legitimately*
+        // -- the source carries the module script in its body and this does not -- so a
+        // source-side check would have to model Vite's transform to know which
+        // differences are real. A source-side twin is worth having as the other half of
+        // an F-510 pair; it is not the guarantee.
         let index = webview_bundle().join("index.html");
         let html = std::fs::read_to_string(&index).expect("index.html");
-
-        let body_open = html
+        let open = html
             .find("<body")
-            .and_then(|start| html[start..].find('>').map(|off| start + off + 1))
+            .and_then(|at| html[at..].find('>').map(|off| at + off + 1))
             .expect("index.html has no <body>");
-        let body_close = html.find("</body>").expect("index.html has no </body>");
-        let body = &html[body_open..body_close];
+        let close = html.find("</body>").expect("index.html has no </body>");
 
-        // Strip the allowlist, then require what is left to be whitespace. Anything
-        // unrecognised survives stripping and fails, which is the safe direction: a
-        // construct this does not know about is refused rather than ignored.
-        let mut rest = String::new();
-        let mut tail = body;
-        while let Some(open) = tail.find("<script") {
-            rest.push_str(&tail[..open]);
-            let after = &tail[open..];
-            let close = after
-                .find("</script>")
-                .map(|i| i + "</script>".len())
-                .unwrap_or(after.len());
-            tail = &after[close..];
-        }
-        rest.push_str(tail);
-        let rest = rest.replace("<div id=\"app\"></div>", "");
-
-        assert!(
-            rest.trim().is_empty(),
-            "the shipped page body holds something other than the mount point \
-             and scripts: {:?}\n\n \
-             The body may contain `<div id=\"app\"></div>` and `<script>` \
-             elements, and nothing else (#128, ADR-0014). It is an allowlist rather \
-             than a check for emptiness because \"renders nothing before scripts \
-             run\" is not statically decidable -- CSS alone paints a ::before or a \
-             background image. Anything else here can produce a contentful paint \
-             before Vue mounts, which would make `first-contentful-paint` measure a \
-             skeleton rather than our content, silently degrading the paint guard to \
-             F-377's mutation B (F-396(b), F-482). If the addition is deliberate, \
-             widening this allowlist is a decision for ADR-0014's table, not a line \
-             to add here -- and the mount point must stay *empty*: `<div \
-             id=\"app\">Loading...</div>` fails this and is meant to.",
-            rest.trim()
+        assert_eq!(
+            html[open..close].trim(),
+            "<div id=\"app\"></div>",
+            "the shipped page body is not exactly the mount point. It may contain \
+             `<div id=\"app\"></div>` and nothing else -- no text, no elements, not \
+             even a comment (#128, ADR-0014). Anything else here can produce a \
+             contentful paint before Vue mounts, which would make \
+             `first-contentful-paint` measure a skeleton rather than our content and \
+             silently degrade the paint guard to F-377's mutation B (F-396(b), \
+             F-482). The mount point must also stay *empty*: \
+             `<div id=\"app\">Loading...</div>` fails this and is meant to. If the \
+             addition is deliberate, widening this allowlist is a decision for \
+             ADR-0014's table, not a line to change here."
         );
+    }
+
+    #[test]
+    fn the_shipped_stylesheet_cannot_paint_before_scripts_run() {
+        // #128, second half, and it is the half that would never have been observed
+        // failing: `shell.css` has no generated content today, so this lands green.
+        // Fifteen guards-that-cannot-fail are on record and four were found in one day,
+        // which is why its acceptance criterion is a mutation of its own --
+        // `body::after{content:"x"}`, built, run, red required.
+        //
+        // WHY IT IS NEEDED AT ALL, which is code-reviewer's contribution and neither
+        // architect nor I had it: the stylesheet is a `<link>` in `<head>` and the
+        // bundle is a **module** script, therefore deferred -- **so the stylesheet
+        // applies before `boot.js` executes**. A `body::before{content:"Loading..."}`
+        // paints contentful text before Vue mounts with the body still exactly the
+        // mount point, so the markup half alone cannot see it. That is the cheapest
+        // remaining route and the one a designer takes innocently.
+        //
+        // BOUNDED, not a CSS parser. Generated content or a background image can only
+        // paint pre-script on an element that *exists* pre-script, and there are three
+        // -- `html`, `body`, `#app` -- plus the universal selector. Rules touching
+        // anything else cannot paint until Vue has created what they select.
+        //
+        // A background *colour* is First Paint, not First *Contentful* Paint, so
+        // `body{background:var(--paper)}` is correctly ignored: this looks for `url(`,
+        // not for `background`. That distinction corrected architect's own
+        // justification for the allowlist -- two of the three examples it cited as
+        // undecidable were First Paint -- and a check written against *any styling*
+        // would have been wrong rather than merely strict.
+        let sheet = webview_bundle().join("shell.css");
+        let css = std::fs::read_to_string(&sheet).expect("shell.css");
+
+        const PRE_SCRIPT: [&str; 3] = ["html", "body", "#app"];
+        for rule in css.split('}') {
+            let Some((selector, declarations)) = rule.split_once('{') else {
+                continue;
+            };
+            let reaches_pre_script = selector.contains('*')
+                || PRE_SCRIPT
+                    .iter()
+                    .any(|token| selector_names(selector, token));
+            if !reaches_pre_script {
+                continue;
+            }
+            assert!(
+                !declares_content_property(declarations),
+                "`{}` declares CSS generated content on an element that exists \
+                 before `boot.js` runs, so it paints before Vue mounts and \
+                 `first-contentful-paint` would measure it rather than our content \
+                 (#128, F-396(b)). `content: none` and `content: normal` are inert \
+                 and are refused here anyway: permitting them is a widening decision \
+                 for ADR-0014's table, not one this test takes on its own.",
+                selector.trim()
+            );
+            assert!(
+                !declarations.contains("url("),
+                "`{}` sets a background image on an element that exists before \
+                 `boot.js` runs. An image is contentful paint, unlike a background \
+                 *colour*, so it would make `first-contentful-paint` measure the \
+                 image rather than our content (#128, F-396(b)).",
+                selector.trim()
+            );
+        }
     }
 
     #[test]
