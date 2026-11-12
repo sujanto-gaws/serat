@@ -30,6 +30,7 @@ import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
+import RefusedNames from "@/refused/RefusedNames.vue";
 import { registerTreeInsertLink, TREE_INSERT_LINK_ID } from "@/tree/insertLinkCommand";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { headingDocOffset } from "@/overlays/headingTarget";
@@ -61,6 +62,7 @@ function onExternalMerged(): void {
   }, 3000);
 }
 
+const refusedRef = ref<InstanceType<typeof RefusedNames> | null>(null);
 const treeRef = ref<InstanceType<typeof FileTree> | null>(null);
 const backlinksRef = ref<InstanceType<typeof BacklinksPane> | null>(null);
 const searchRef = ref<InstanceType<typeof SearchPanel> | null>(null);
@@ -307,10 +309,23 @@ function registerCommands(): Array<() => void> {
     commands.register({ id: "tree.newNote", name: "New note", defaultBinding: "Mod-n", exec: () => startCreate("note") }),
     commands.register({ id: "tree.newFolder", name: "New folder", defaultBinding: "Mod-Shift-n", exec: () => startCreate("folder") }),
     registerTreeInsertLink(commands, () => treeRef.value),
+    // No default chord (§9.3, components.md §7): reachable from the strip button and the palette.
+    commands.register({
+      id: "vault.refused-names",
+      name: "Show names not shown",
+      unavailable: () => (store.refusedNames === null ? "Open a vault first" : store.refusedNames === 0 ? "Every name can be shown" : null),
+      exec: () => void refusedRef.value?.open(),
+    }),
     commands.register({ id: "backlinks.focus", name: "Focus backlinks", defaultBinding: "Mod-3", exec: () => backlinksRef.value?.focus() }),
   ];
 }
 const disposeCommands = registerCommands();
+
+/** The panel's button is gone (the count fell to none): focus goes to the tree's selected row, or the editor when compact. */
+function focusAfterRefused(): void {
+  if (window.matchMedia?.("(max-width: 719px)").matches) editorRef.value?.focus();
+  else treeRef.value?.focusTree();
+}
 
 function onInsertLink(payload: { path: string; text: string }): void {
   if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
@@ -332,6 +347,8 @@ function onGlobalKeydown(event: KeyboardEvent): void {
     return;
   }
 }
+
+let statusEventSeen = false;
 
 onMounted(async () => {
   // NFR-PRF-02's harness seam (`bench/editor-latency/tests/subject.ts`,
@@ -398,11 +415,9 @@ onMounted(async () => {
   unlistenIndexStatus = await onIndexStatus((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
-    store.setIndexState(status.state);
-    // The count of names the vault refused to list is one status fact (not a
-    // per-name error). It is read when the status carries it.
-    const refused = (status as { refused_names?: number }).refused_names;
-    if (typeof refused === "number") store.setRefusedNames(refused);
+    // The count of names the vault refused to list is one status fact (not a per-name error).
+    statusEventSeen = true;
+    store.applyIndexStatus(status);
   });
 
 
@@ -411,7 +426,8 @@ onMounted(async () => {
   indexStatus().then((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
-    store.setIndexState(status.state);
+    // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
+    if (!statusEventSeen) store.applyIndexStatus(status);
   });
 
   if (editorRef.value) {
@@ -551,9 +567,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
 
   <footer class="statusbar">
     <span class="index">{{ store.indexStatusText }}</span>
-    <span v-if="store.refusedNames" class="refused" data-testid="refused-names"
-      >{{ store.refusedNames }} {{ store.refusedNames === 1 ? "name" : "names" }} not shown (invalid on this platform)</span
-    >
+    <RefusedNames ref="refusedRef" :count="store.refusedNames" @focus-fallback="focusAfterRefused" />
     <span v-if="updatedExternally" class="updated-externally" data-testid="updated-externally">Updated externally</span>
     <span v-if="saveBlocked" class="save-blocked" data-testid="save-blocked">
       Not saved — file changed on disk
