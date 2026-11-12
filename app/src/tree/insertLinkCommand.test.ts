@@ -45,6 +45,7 @@ async function mountHost() {
     entries: [
       { name: "a.md", kind: "note", sidecar: false },
       { name: "b.md", kind: "note", sidecar: false },
+      { name: "pic.png", kind: "asset", sidecar: false },
     ],
   });
   await wrapper.vm.$nextTick();
@@ -72,15 +73,23 @@ describe("tree.insertLink", () => {
     const { wrapper, tree, registry } = await mountHost();
     const el = tree.get('[role="tree"]');
     (el.element as HTMLElement).focus();
+    registry.register({ id: "a.other", name: "A other", exec: () => undefined });
+    await el.trigger("keydown", { key: "ArrowDown" });
+    await el.trigger("keydown", { key: "ArrowDown" });
+    expect(tree.get('[aria-selected="true"]').attributes("data-path")).toBe("b.md");
+    await el.trigger("keydown", { key: "L", ctrlKey: true, shiftKey: true });
+    expect(tree.emitted("insert-link")?.[0][0]).toEqual({ path: "b.md", text: "[[b]]" });
     await el.trigger("keydown", { key: "ArrowDown" });
     await el.trigger("keydown", { key: "L", ctrlKey: true, shiftKey: true });
-    expect(tree.emitted("insert-link") ?? []).toHaveLength(1);
+    expect(tree.emitted("insert-link")?.[1][0]).toEqual({ path: "pic.png", text: "![[pic.png]]" });
+    expect(registry.ranked()[0].id).toBe(TREE_INSERT_LINK_ID); // chord presses count as runs
+    await el.trigger("keydown", { key: "ArrowUp" });
     expect(registry.setOverride(TREE_INSERT_LINK_ID, "Mod-Alt-j")).toBe(true);
     await wrapper.vm.$nextTick();
     await el.trigger("keydown", { key: "L", ctrlKey: true, shiftKey: true });
-    expect(tree.emitted("insert-link") ?? []).toHaveLength(1); // old chord: nothing
+    expect(tree.emitted("insert-link") ?? []).toHaveLength(2); // old chord: nothing
     await el.trigger("keydown", { key: "j", ctrlKey: true, altKey: true });
-    expect(tree.emitted("insert-link") ?? []).toHaveLength(2);
+    expect(tree.emitted("insert-link")?.[2][0]).toEqual({ path: "b.md", text: "[[b]]" });
     wrapper.unmount();
   });
 
@@ -158,6 +167,18 @@ describe("tree.insertLink", () => {
     expect(noRow.get('[data-testid="palette-reason"]').text()).toContain("Select a file in the tree first");
     noRow.unmount();
     second.wrapper.unmount();
+  });
+
+  it("refuses a rebinding onto a live global chord, including a rebound one", async () => {
+    const { wrapper, registry } = await mountHost();
+    registry.register({ id: "tree.newNote", name: "New note", defaultBinding: "Mod-n", exec: () => undefined });
+    registry.register({ id: "search.open", name: "Search vault", defaultBinding: "Mod-Shift-f", exec: () => undefined });
+    expect(registry.setOverride(TREE_INSERT_LINK_ID, "Mod-n")).toBe(false);
+    expect(registry.setOverride(TREE_INSERT_LINK_ID, "Mod-Shift-f")).toBe(false);
+    expect(registry.setOverride("search.open", "Mod-Alt-s")).toBe(true);
+    expect(registry.setOverride(TREE_INSERT_LINK_ID, "Mod-Alt-s")).toBe(false);
+    expect(registry.setOverride(TREE_INSERT_LINK_ID, "Mod-Shift-f")).toBe(true); // freed by the rebind
+    wrapper.unmount();
   });
 
   it("refuses a rebinding onto a key the tree owns (Enter still opens)", async () => {

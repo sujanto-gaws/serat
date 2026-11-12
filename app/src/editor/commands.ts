@@ -59,7 +59,8 @@ export interface CommandContextInfo {
   focus: Element | null;
 }
 
-/** Chords the tree owns outright (file-tree.md keyboard map): a `when: "tree"` command may not take them. */
+/** Chords the tree owns outright, matched literally after lowercasing (normalise modifier order if a
+ * multi-modifier chord is ever reserved) (file-tree.md keyboard map): a `when: "tree"` command may not take them. */
 const RESERVED_TREE_KEYS = new Set(
   ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", "Mod-Enter", "F2", "F10", "Shift-F10", "ContextMenu", "Escape", "Mod-f"].map((k) =>
     k.toLowerCase(),
@@ -167,7 +168,11 @@ export class CommandRegistry {
     const bucket = mine?.when ?? "*";
     if (bucket === "tree" && RESERVED_TREE_KEYS.has(key.toLowerCase())) return RESERVED;
     for (const other of this.commands.values()) {
-      if (other.id === id || (other.when ?? "*") !== bucket) continue;
+      const otherBucket = other.when ?? "*";
+      // A tree-scoped chord also shadows global chords (the tree's keydown would swallow them), and the
+      // reverse; the live effective bindings are compared, so rebound globals are tracked.
+      const clash = otherBucket === bucket || (bucket === "tree" && otherBucket === "*") || (bucket === "*" && otherBucket === "tree");
+      if (other.id === id || !clash) continue;
       if (this.effectiveBinding(other.id) === key) return other.id;
     }
     return null;

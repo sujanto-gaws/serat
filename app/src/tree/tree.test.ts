@@ -160,7 +160,7 @@ describe("keyboard navigation", () => {
   m.apply(listing("Empty", []));
   m.expand("Open");
   const rows = m.rows();
-  const key = (k: string, extra: Partial<{ ctrlOrMeta: boolean; shift: boolean; insertLink: boolean }> = {}) => ({
+  const key = (k: string, extra: Partial<{ ctrlOrMeta: boolean; shift: boolean }> = {}) => ({
     key: k,
     ctrlOrMeta: false,
     shift: false,
