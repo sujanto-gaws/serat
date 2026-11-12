@@ -787,7 +787,7 @@ impl AppState {
         self.events.emit_opened(&VaultOpened {
             root: root.display().to_string(),
             vault_id: vault_id.clone(),
-            index: IndexState::Opening,
+            index: IndexState::Opening { reason: None },
         });
         let publisher = Arc::new(
             Publisher::new(
@@ -853,7 +853,7 @@ impl AppState {
         let observing = Arc::clone(&switcher);
         publisher.on_publish(move |state| {
             publishing.index_published(state);
-            if !matches!(state, IndexState::Opening) {
+            if !matches!(state, IndexState::Opening { .. }) {
                 settled.mark_index_settled();
             }
             observing.index_state_changed(matches!(state, IndexState::Ready { .. }));
@@ -1336,7 +1336,7 @@ impl AppState {
             Some(open) => open.publisher.status(),
             None => IndexStatus {
                 vault_id: String::new(),
-                state: IndexState::Opening,
+                state: IndexState::Opening { reason: None },
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
                 refused_names: None,
                 wal_pinned_bytes: None,
@@ -2339,7 +2339,7 @@ mod tests {
         );
         assert_eq!(
             opened.index,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "the shell paints whatever state the actor has published, which is nothing yet"
         );
         // And index_status, called immediately, must also not block.
@@ -2561,7 +2561,10 @@ mod tests {
             }),
             Err(IpcError::VaultNotFound { .. })
         ));
-        assert_eq!(state.index_status().state, IndexState::Opening);
+        assert_eq!(
+            state.index_status().state,
+            IndexState::Opening { reason: None }
+        );
         assert_eq!(state.index_status().vault_id, "");
     }
 
@@ -3523,7 +3526,7 @@ mod tests {
             matches!(
                 answer,
                 IndexRead::NotReady {
-                    state: IndexState::Opening
+                    state: IndexState::Opening { reason: None }
                 }
             ),
             "{answer:?}"
@@ -4313,7 +4316,10 @@ mod tests {
         state
             .open_vault_with(open_args(&dir), Slow(SeratIndexOpen::default(), 400))
             .expect("open");
-        assert!(matches!(state.index_status().state, IndexState::Opening));
+        assert!(matches!(
+            state.index_status().state,
+            IndexState::Opening { .. }
+        ));
         let (send, log) = collecting_sender();
         state.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5337,7 +5343,7 @@ mod tests {
         struct Sleeper(Arc<std::sync::atomic::AtomicBool>);
         impl IndexOpen for Sleeper {
             fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
-                publish(IndexState::Opening);
+                publish(IndexState::Opening { reason: None });
                 std::thread::sleep(Duration::from_millis(400));
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -5451,7 +5457,7 @@ mod tests {
             .expect("the re-open succeeds");
         assert_eq!(
             opened.index,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "no actor yet: it must wait"
         );
         wait_ready(&second);
@@ -5550,7 +5556,7 @@ mod tests {
                 fast,
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         wait_ready(&second);
         wait_until("the catch-up walk", || {
             !walks.lock().expect("walks").is_empty()
@@ -5601,7 +5607,7 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5667,7 +5673,7 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("the vault opens without an actor");
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         wait_until("Unavailable", || {
             matches!(second.index_status().state, IndexState::Unavailable { .. })
         });
@@ -5709,7 +5715,7 @@ mod tests {
 
         let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
         let opened = open_dir_real(&second, &dir);
-        assert_eq!(opened.index, IndexState::Opening);
+        assert_eq!(opened.index, IndexState::Opening { reason: None });
         // The tree's refused catch-up is owed as a rescan; the real actor runs it.
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");

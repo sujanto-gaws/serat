@@ -14,7 +14,7 @@ Cited requirement IDs are the ones a component exists to satisfy; screen specs i
 
 **Three-pane layout**: file tree (`layout.tree-pane-width-*`) | editor | context pane (`layout.context-pane-width-*`). Panes are separated by a 1px hairline (`color.role.border-hairline`), never a shadow. Each pane is independently collapsible (`Cmd/Ctrl+B` tree, `Cmd/Ctrl+.` context pane). Below `layout.breakpoint-narrow` the context pane collapses to a flyover triggered by its own toolbar icon; below `layout.breakpoint-compact` the tree does the same and the editor becomes the only persistent pane (see each screen's Responsive section).
 
-**Status strip** (bottom of window, `typography.small`, mono for the hash/position fields): cursor `line:col` (mono), word count, index state (`Ready` / `Rebuilding…` / `Unavailable`, per ADR-0015's states — never a blocking spinner over content, per architecture.md §9.1 "extraction/index state is shown on the file, not a global bar"), save state.
+**Status strip** (bottom of window, `typography.small`, mono for the hash/position fields): cursor `line:col` (mono), word count, index state (`Opening…`, with its reason when it has one / `Ready` / `Rebuilding…` / `Unavailable`; copy for `Opening` in `index-state-copy.md`, task #115 — never a blocking spinner over content, per architecture.md §9.1 "extraction/index state is shown on the file, not a global bar"), save state.
 
 ---
 
