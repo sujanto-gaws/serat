@@ -220,7 +220,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-settings-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-settings-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
     }

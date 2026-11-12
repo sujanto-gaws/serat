@@ -2195,7 +2195,7 @@ mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(
@@ -2231,7 +2231,7 @@ mod tests {
         );
         let err = state
             .open_vault(OpenVaultArgs {
-                root: std::env::temp_dir()
+                root: crate::test_temp_dir()
                     .join("serat-no-such-vault")
                     .display()
                     .to_string(),
@@ -2822,7 +2822,7 @@ mod tests {
         // against a real symlink. F-58: a broken guard would make this return `Ok`
         // with the outside file's bytes, not merely error some other way.
         let dir = fixture("symlink-read");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-read-{}",
             std::process::id()
         ));
@@ -2873,7 +2873,7 @@ mod tests {
         // `write_atomic` -- isolating containment as the only thing standing between
         // the request and the bytes outside the vault.
         let dir = fixture("symlink-write");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-write-{}",
             std::process::id()
         ));
@@ -3533,7 +3533,8 @@ mod tests {
     // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
 
     fn settings_state(name: &str) -> (AppState, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+        let dir =
+            crate::test_temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.toml");
         let mut state = AppState::with_settings(

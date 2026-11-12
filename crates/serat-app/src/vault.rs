@@ -296,7 +296,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn fixture(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_temp_dir().join(format!(
             "serat-vault-thread-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()

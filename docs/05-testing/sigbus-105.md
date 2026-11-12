@@ -1,0 +1,12 @@
+
+## Fix check (task #124): serat-app fixtures on tmpfs
+
+Change (test code only, `crates/serat-app/src/lib.rs::test_temp_dir`): every `std::env::temp_dir()` in the serat-app test modules (16 sites in `state.rs`, `index.rs`, `consumer.rs`, `vault.rs`, `settings.rs`, `lib.rs`, `asset/tests.rs`) now goes through a `#[cfg(test)]` helper that uses `/dev/shm` (tmpfs) when it exists and a probe file can be written there, otherwise the ordinary temp dir. The `-shm` mappings of the fixtures' `index.db` are then memory-backed. The shipped app is untouched and keeps WAL on the user's disk (ADR-0015). `crates/serat-app/tests/acl_behaviour.rs` (one `temp_dir()` use) is an integration test that opens no index and was left alone.
+
+Repeat of the relink experiment, same method as experiment 2 (same loop, `--test-threads=1`, relink of the same path under the running binary, 10 rounds, fresh target dir with `CARGO_PROFILE_DEV_DEBUG=0`): **0 SIGBUS in 10 rounds** (all binary runs exit 0, 353 passed; all builds exit 0; in the three rounds sampled (1, 5, 10) the binary was still running and finished 9 to 11 s after the build log; no core). Baseline before the fix: 1 SIGBUS in 5. Ten clean rounds is not proof (at a 20% baseline the chance of ten clean rounds with no fix is 0.8^10, about 11%), so treat it as supporting evidence and keep the process rule from the previous section.
+
+### Same hazard elsewhere (not changed here; named for owners)
+- `crates/serat-index` tests (`src/*.rs` and `tests/*.rs`, about 100 `temp_dir()` uses): same hazard, they open a WAL index on `/tmp`.
+- `crates/serat-vault` tests (`src/*.rs`, about 45 uses): same hazard only where a test opens an index; the vault crate itself holds no SQLite, so its fixtures map nothing.
+- `bench/budget` (`lib.rs`, `subject.rs`, `tests/vault_gate.rs`, `tests/frontmatter_lists.rs`) and the 20k vault under `bench/vaults`: the vault is generated into the repo, and the budget jobs index it with a real WAL `index.db` on the checkout's disk. That is the hazard, and unavoidable by design for the budget jobs: they must measure the real disk, so they must not run concurrently with another cargo (process rule) and cannot move to tmpfs without changing what they measure.
+- Fixtures never delete their directories: 4,892 leftover `/tmp/serat-app-state-*` directories existed at the start of #124. On tmpfs each full serat-app test run leaves about 6 MB in `/dev/shm` (22 entries after one run), which is RAM, not disk.
