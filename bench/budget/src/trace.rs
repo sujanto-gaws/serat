@@ -144,6 +144,16 @@ pub struct StartupTrace {
     /// `None` on any trace taken before the field existed, or if the app never
     /// sent it.
     pub raf2_ms: Option<f64>,
+    /// `true` when the build renders a file tree and says so (`"tree": true`, task #141,
+    /// ADR-0015 section 5). `false` on a trace from a build that predates the field, which
+    /// parses exactly as before.
+    pub tree: bool,
+    /// Spawn to the tree's first screen (root listing applied and painted, ADR-0015
+    /// section 3): `t_usable`'s tree term. **Present if and only if `tree` is true**: a
+    /// declared tree with no first screen is an incomplete trace and [`StartupTrace::parse`]
+    /// refuses it, so a build that stops reporting the tree fails the budget job rather
+    /// than passing a number that no longer waits for it.
+    pub tree_first_screen_ms: Option<f64>,
 }
 
 impl StartupTrace {
@@ -188,6 +198,16 @@ impl StartupTrace {
             string(line, key).ok_or_else(|| format!("the startup trace has no {key}: {line}"))
         };
 
+        // `"tree":true` (compact) or `"tree": true`; absent on older builds.
+        let tree = bool_true(line, "tree");
+        let tree_first_screen_ms = number(line, "t0_to_tree_first_screen_ms");
+        if tree && tree_first_screen_ms.is_none() {
+            return Err(format!(
+                "the startup trace declares a tree but has no t0_to_tree_first_screen_ms: the \
+                 trace is incomplete (ADR-0015 section 5), so vault_usable cannot be trusted \
+                 to have waited for the tree: {line}"
+            ));
+        }
         let trace = StartupTrace {
             main_ms: num("t0_to_main_ms")?,
             state_ready_ms: num("t0_to_state_ready_ms")?,
@@ -202,6 +222,8 @@ impl StartupTrace {
             last_open: string(line, "last_open").unwrap_or_default(),
             paint_evidence_ms: number(line, "paint_evidence_ms"),
             raf2_ms: number(line, "raf2_ms"),
+            tree,
+            tree_first_screen_ms,
         };
         trace.validate()?;
         Ok(trace)
@@ -288,6 +310,24 @@ impl StartupTrace {
                  shipping a blank rectangle.",
                 self.paint_gap_ms()
             ));
+        }
+        // Task #141: `vault_usable` is the latest of paint, tree first screen, index
+        // settled and watcher, so the tree mark can never be later than it. A trace
+        // where it is was not produced by an app that waited on the tree.
+        if let Some(tree_ms) = self.tree_first_screen_ms {
+            if !tree_ms.is_finite() || tree_ms < 0.0 {
+                return Err(format!(
+                    "t0_to_tree_first_screen_ms is {tree_ms}, which is not a duration"
+                ));
+            }
+            if tree_ms > self.vault_usable_ms + 0.001 {
+                return Err(format!(
+                    "t0_to_tree_first_screen_ms ({tree_ms:.1} ms) is after t0_to_vault_usable_ms \
+                     ({:.1} ms), but usable is the later of the tree and the other \
+                     preconditions (ADR-0015 section 5): this app did not wait for the tree.",
+                    self.vault_usable_ms
+                ));
+            }
         }
         Ok(())
     }
@@ -394,6 +434,13 @@ fn number(text: &str, key: &str) -> Option<f64> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E'))
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// Whether `"key":true` appears (any whitespace after the colon). Absent or `false` is `false`.
+fn bool_true(text: &str, key: &str) -> bool {
+    let needle = format!("\"{key}\":");
+    text.find(&needle)
+        .is_some_and(|i| text[i + needle.len()..].trim_start().starts_with("true"))
 }
 
 fn string(text: &str, key: &str) -> Option<String> {
@@ -562,6 +609,69 @@ mod tests {
         );
         StartupTrace::parse(&line)
             .expect("raf2_ms absence must not reject an otherwise-valid trace");
+    }
+
+    // ---------------------------------------------------------------- #141 / NFR-PRF-01
+
+    fn with_tree(tree_fields: &str) -> String {
+        good().replace(
+            "\"schema_version\": 1}",
+            &format!("{tree_fields} \"schema_version\": 1}}"),
+        )
+    }
+
+    #[test]
+    fn a_trace_without_a_tree_field_parses_as_before() {
+        // Older builds: no `tree`, no first-screen mark. Not an error, and not a tree.
+        let t = StartupTrace::parse(&good()).expect("valid trace");
+        assert!(!t.tree);
+        assert_eq!(t.tree_first_screen_ms, None);
+    }
+
+    #[test]
+    fn a_declared_tree_carries_its_first_screen_number() {
+        // Both spellings: the app writes compact JSON, hand-built fixtures spaced.
+        for tree in ["\"tree\":true,", "\"tree\": true,"] {
+            let line = with_tree(&format!("{tree} \"t0_to_tree_first_screen_ms\": 790.5,"));
+            let t = StartupTrace::parse(&line).expect("valid trace");
+            assert!(t.tree, "{tree}");
+            assert_eq!(t.tree_first_screen_ms, Some(790.5));
+        }
+    }
+
+    #[test]
+    fn a_declared_tree_with_no_first_screen_is_an_incomplete_trace_not_a_pass() {
+        // Mutant, run by hand: delete the `tree && is_none` check in `parse` and this
+        // fails, because the trace then parses and the budget job would pass a usable
+        // number that never waited on the tree.
+        let err = StartupTrace::parse(&with_tree("\"tree\":true,")).expect_err("incomplete");
+        assert!(err.contains("t0_to_tree_first_screen_ms"), "{err}");
+        assert!(err.contains("incomplete"), "{err}");
+        // `"tree":false` declares nothing, so it does not demand the field.
+        StartupTrace::parse(&with_tree("\"tree\":false,")).expect("no tree declared");
+    }
+
+    #[test]
+    fn a_real_trace_from_the_p1_build_parses_with_its_tree_term_binding() {
+        // Captured 2026-11-12 from `serat --vault <9-note vault> --exit-after-ready` (release
+        // build of 3972bf0) under Xvfb with software rendering, so the times are slow and
+        // mean nothing; the *shape* is what this pins: the real app's compact JSON, `tree`
+        // true, and the tree's first screen the binding term of usable.
+        let line = r#"{"t0_to_window_visible_ms":8632.471092,"paint_evidence_ms":499.0,"raf2_ms":1586.0,"t0_to_vault_usable_ms":8712.396634,"t0_to_main_ms":1871.213577,"t0_to_state_ready_ms":1871.278607,"t0_to_runtime_ready_ms":2320.076207,"t0_to_setup_done_ms":2320.493865,"t0_to_window_created_ms":5450.86045,"t0_to_buffer_rendered_ms":8643.078711,"tree":true,"t0_to_tree_first_screen_ms":8712.396634,"t0_to_index_settled_ms":2321.006057,"t0_to_watcher_ms":2323.555551,"watcher":"registered","t0_to_walk_complete_ms":8632.774893,"t0_source":"harness","profile":"release","schema_version":12,"notes_walked":9,"vault":"v","last_open":null}"#;
+        let t = StartupTrace::parse(line).expect("the real app's trace parses");
+        assert!(t.tree);
+        assert_eq!(t.tree_first_screen_ms, Some(8712.396634));
+        assert_eq!(t.tree_first_screen_ms, Some(t.vault_usable_ms));
+    }
+
+    #[test]
+    fn a_first_screen_after_usable_is_rejected_because_usable_is_the_latest_term() {
+        let line = with_tree("\"tree\":true, \"t0_to_tree_first_screen_ms\": 900.0,");
+        let err = StartupTrace::parse(&line).expect_err("803.1 usable < 900 tree");
+        assert!(err.contains("did not wait for the tree"), "{err}");
+        // Equal is the normal case (the tree was the last term).
+        let line = with_tree("\"tree\":true, \"t0_to_tree_first_screen_ms\": 803.1,");
+        StartupTrace::parse(&line).expect("tree is the last term");
     }
 
     // ---------------------------------------------------------------- #106 / F-381
