@@ -5228,6 +5228,14 @@ mod tests {
         wait_until("WalkSettled", || settled(&tree));
         std::fs::write(b.join("external.md"), "# other tool\n").expect("write");
         wait_for_row(&b, "external.md");
+        // The row being in the index is not the event being logged: `index://changed`
+        // is emitted from the change signal's own thread, throttled, after the commit
+        // (task #122: sampling the log here failed once in ten loaded runs with "no
+        // index://changed for B"). Wait on the event itself, bounded, before sampling;
+        // the negative assertions below still read the whole log.
+        wait_until("index://changed for B", || {
+            logged(&log, "index://changed", &b_id)
+        });
         open_note(&state);
         close_flush(&state, Duration::from_secs(10));
 
