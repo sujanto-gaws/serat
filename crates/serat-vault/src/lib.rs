@@ -34,6 +34,8 @@ pub mod identity;
 pub mod ignore;
 #[cfg(test)]
 mod ignore_file_tests;
+#[cfg(test)]
+mod name_rules_tests;
 pub mod patch;
 #[cfg(test)]
 mod patch_props;
@@ -114,6 +116,9 @@ pub struct Vault {
     locks: Arc<atomic::PathLocks>,
     /// The root's identity, read once at open; no handle is kept (task #96).
     identity: Option<FileIdentity>,
+    /// The name rules every walked and watched name is judged by. Always
+    /// [`Platform::current`] outside tests (see [`Vault::with_platform`]).
+    platform: Platform,
 }
 
 impl Vault {
@@ -156,9 +161,24 @@ impl Vault {
             refusals: RefusalLog::new(),
             locks: Arc::default(),
             identity: FileIdentity::of_dir(&canonical),
+            platform: Platform::current(),
         };
         vault.reload_ignore_file();
         Ok(vault)
+    }
+
+    /// Judge every name the walk and the watcher meet by `platform`'s rules instead
+    /// of this binary's own.
+    ///
+    /// A seam so the Windows-only name rules (device names, trailing dot or space,
+    /// `:`) can be driven through a real walk on any CI runner: the refusal, its
+    /// reason and its count are then tested end to end rather than only at
+    /// `VaultPath` (FR-VLT-01, NFR-SEC-06, task #35). The app never calls it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = platform;
+        self
     }
 
     /// Re-read the ignore file ([`IGNORE_FILE`], at the root) into the rules in
@@ -355,7 +375,7 @@ impl Vault {
         let absolute = strip_verbatim(&absolute);
 
         let relative = absolute.strip_prefix(&self.root).map_err(|_| escaped())?;
-        vault_path_from_relative(Platform::current(), relative)
+        vault_path_from_relative(self.platform, relative)
     }
 
     /// Every indexable file in the vault, in a deterministic order.
@@ -867,7 +887,7 @@ pub(crate) fn vault_path_from_relative(
             }
         }
     }
-    VaultPath::new(joined)
+    VaultPath::new_for_platform(joined, platform)
 }
 
 /// Whether `candidate` is `root` itself, or lies inside it.

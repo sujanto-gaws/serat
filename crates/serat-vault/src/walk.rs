@@ -4,7 +4,7 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use serat_core::{NoteKind, Platform, SourceEntry, VaultError, VaultPath};
+use serat_core::{NoteKind, SourceEntry, VaultError, VaultPath};
 
 use crate::refusal::Refusal;
 use crate::{Vault, ignore::is_note_file};
@@ -169,7 +169,7 @@ pub(crate) fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath,
         .map_err(|_| VaultError::PathEscapesVault {
             path: path.to_string_lossy().into_owned(),
         })?;
-    crate::vault_path_from_relative(Platform::current(), relative)
+    crate::vault_path_from_relative(vault.platform, relative)
 }
 
 /// Modification time in milliseconds since the Unix epoch.
