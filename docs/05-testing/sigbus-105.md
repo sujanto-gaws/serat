@@ -2,9 +2,13 @@
 
 Serves NFR-REL-01 (no crash path in the shipped test gate) · NFR-PRF-08 (budget jobs are part of the gate and must not destabilise it) · NFR-MNT-01 (the suite is trustworthy). Owner: test-engineer.
 
-## Verdict: NOT REPRODUCED (10 of 10 sequenced runs exit without a signal). The hypothesis is neither confirmed nor refuted.
+## Verdict: REPRODUCED under a concurrent build in the same target dir (1 of 5, round 2 of experiment 2). NOT reproduced by data pressure alone (experiment 1: 10 of 10 clean; experiment 2: 2 concurrent 3 GB writes clean).
 
-Absence of a repro on this host is weak evidence: the original crashes were on the lead's checkout, and 50 loaded runs of the binary alone also never reproduced it. What this experiment does show is that **budget generation followed by the binary, and 5 GB of dirty page cache followed by the binary, are not sufficient on a 16 GB / thin-provisioned VM**. If the fault needs memory pressure at the same time as the page-fault, the sequencing used here (binary runs after the pressure has ended) would not produce it. See "What this does not test".
+The fault is not in the executable image. It is a SQLite WAL `-shm` page fault, at test 245 of 353 (`state::tests::a_benchmark_run_never_takes_the_note_from_the_settings_file` was the next test): the same neighbourhood as "test 238 of 336" in the lead's three crashes. See Experiment 2. The concurrent build is the trigger observed; whether it acts through CPU, memory or disk contention rather than through the relink itself is not separated (no control run), so the process rule below is the conservative fix.
+
+## Experiment 1 (first report): data pressure only
+
+Summary kept below; details in the Environment, Method and Results sections that follow.
 
 ## Environment
 
@@ -56,3 +60,34 @@ No `PRAGMA mmap_size` is set anywhere in `crates/` or `bench/` (grep for `mmap`:
 2. **Cheapest discriminating experiment**: run the lib binary while `dd` writes 5 GB (memory plus IO pressure concurrent), and a second variant while `touch`-truncating nothing but running `cargo build -p serat-app --tests` against the same target dir. If either reproduces, the cause is concurrency on the target dir or pressure, not the code.
 3. **Mitigation if reproduced**: CI job order puts `-p serat-app` before `-p budget` (budget needs the large vault; app tests do not); `cargo test --workspace` and the budget jobs never share a target dir with a concurrent build; add a disk headroom check that measures a real write (not `df` available) before the budget job.
 4. **Disk**: `df` available overstates headroom on this host by about 1.2 GB per 5 GB written, so any "keep 4 GB free" gate should be set at 8 GB or measured by writing.
+
+## Experiment 2 (coordinator follow-up): relink under a running binary, and dd concurrent with the binary
+
+Script (scratchpad, not committed). The target dir was rebuilt (`CARGO_PROFILE_DEV_DEBUG=0` to fit the disk; the 9 GB debug-info target no longer fitted in about 8 GB free). The binary dir is the same as before, `serat_app-e6366411e7419a68`. For round i in 1..5: start a loop that runs the lib binary (`--test-threads=1`, so a run lasts well over 9 s) back to back, wait 3 s, append `// relink probe i` to `crates/serat-app/src/lib.rs`, run `cargo test -p serat-app --lib --no-run` against the SAME target dir (this relinks the binary at the same path), stop the loop after the build, `git checkout` the file. Then twice: run the binary (default threads) while `dd` writes 3 GB concurrently.
+
+| Round | inode before | inode after | build exit | binary runs |
+|---|---|---|---|---|
+| 1 | 2200796 | 2195518 | 0 | run 1 exit 0 (353 pass) |
+| 2 | 2195518 | 2195550 | 0 | run 1 **exit 135 = SIGBUS** (core dumped; 244 tests had passed); run 2 exit 0 |
+| 3 | 2195550 | 2195567 | 0 | exit 0 |
+| 4 | 2195567 | 2195592 | 0 | exit 0 |
+| 5 | 2195592 | 2195610 | 0 | exit 0 |
+| dd-concurrent 1 | n/a | n/a | n/a | exit 0 (page cache 11.3 GB) |
+| dd-concurrent 2 | n/a | n/a | n/a | exit 0 (page cache 10.8 GB) |
+
+**Inode:** every relink produced a new inode, so the path is replaced, not rewritten in place. A process already running keeps its old, unlinked inode, which is why the executable image itself was never the faulting mapping.
+
+**Core analysis (gdb on the core; the core is 75 MB, deleted after analysis):**
+- `Program terminated with signal SIGBUS`, `si_code` 2 (`BUS_ADRERR`, no physical page behind the address), `si_addr` 0x7f2994dce000.
+- Faulting frame: `__memset_avx512_unaligned_erms` called from `walIndexAppend` <- `walFrames` <- `sqlite3WalFrames`, i.e. SQLite appending to the WAL index.
+- That address lies in the mapping `0x7f2994dcd000-0x7f2994dd5000 (0x8000)` of `/tmp/serat-app-state-benchfallback-24315/.serat/index.db-shm`, at offset 0x1000. The test fixture `benchfallback` is `crates/serat-app/src/state.rs:2653`.
+- `/tmp` here is the same ext4 filesystem as everything else (`/dev/vda`, mounted `without journal`, "mounting unchecked fs" in dmesg), thin-provisioned. So the `-shm` is an ordinary file mapping on that disk, and the fault means the kernel could not supply a page for a mapped file at that instant. `dmesg` shows nothing further.
+- Timing: the crash (02:08:18) fell while the concurrent `cargo` was building (build log finished 02:08:36), not at the relink instant itself.
+
+### Revised verdict on the hypothesis
+The mechanism in the hypothesis (a later page fault on a mapped file fails) is confirmed, and the mapped file is the WAL `-shm`, not the executable image. The trigger is a concurrent cargo build in the same checkout, which matches the lead's history (the TaskCompleted hook runs `cargo test --workspace` in the root during gates), not page-cache volume (dd alone: 0 of 7). One reproduction in 7 trials; the rate is low and a rerun is needed before quoting a probability.
+
+### Fix (process rule first, mitigation second)
+1. **Process rule:** no second cargo in a checkout whose test binaries are running, and CI jobs never share a target dir or a checkout. Finding **F-234** is where this belongs; the **TaskCompleted hook** that runs `cargo test --workspace` in the root must either be serialised with gate runs (a lock file around both) or run against its own `CARGO_TARGET_DIR` and worktree.
+2. **Mitigation in code (owner: rust-core-dev / test fixtures):** point the state-dir fixtures (`serat-app-state-*`, `std::env::temp_dir()`) at tmpfs (`/dev/shm`) or give test connections `PRAGMA locking_mode=EXCLUSIVE` (SQLite then keeps the WAL index in heap memory and creates no `-shm` mapping). Either removes the file-backed mapping from the failing path. This changes test fixtures only; the shipped app keeps its WAL and `-shm` behaviour unless the architect decides otherwise.
+3. **Still open:** a control run (the same loop with a CPU/memory-heavy but unrelated build in a different target dir) would tell whether the relink matters or any heavy neighbour will do. Not run; the disk could not hold a second target dir.
