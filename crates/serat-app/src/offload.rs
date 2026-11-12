@@ -26,14 +26,32 @@
 //! * **The asset validator and the read use one handle**: `asset_info` and `read_asset_range`
 //!   clone the `Arc<Vault>` once and run both steps inside one blocking job.
 //!
+//! * **A job finds the vault when it starts and carries no vault id.** A command queued
+//!   before a switch may therefore run against the vault that is open when the job starts,
+//!   not the one open when the command was sent; the front end already drops answers for a
+//!   vault it has left, and the same held for the `async` commands this replaces.
+//!
+//! # Writers and the settings file
+//!
+//! Every command that writes (`create_folder`, `append_gitignore_entry`,
+//! `decline_gitignore_offer`, `set_live_preview`, `set_keybinding`, the settings write inside
+//! `mark_vault_usable`) goes through [`blocking`] too.
+//!
+//! # Still on a Tokio worker
+//!
+//! `backlinks`, `open_tree` and `gitignore_offer_status` are sync `command(async)` functions,
+//! not routed here: they are index or tree reads that wait on their own bounded locks rather
+//! than doing note I/O, and moving them is a separate change (follow-up filed by the lead).
+//!
 //! Nothing here is domain logic: each method is `blocking(|| self.x(args))`.
 
 use std::sync::Arc;
 
 use crate::ipc::{
-    AssetArgs, AssetInfo, ExternalChange, FileContents, FileWritten, IpcError, NoteBufferArgs,
-    OpenVaultArgs, Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, SavePatchArgs,
-    VaultOpened, WriteFileArgs,
+    AssetArgs, AssetInfo, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, IpcError, NoteBufferArgs, OpenVaultArgs, Patch,
+    ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, SavePatchArgs, SetKeybindingArgs,
+    SetLivePreviewArgs, VaultOpened, WriteFileArgs,
 };
 use crate::state::AppState;
 
@@ -141,6 +159,67 @@ impl AppState {
     ) -> Result<Vec<Patch>, IpcError> {
         let state = Arc::clone(self);
         blocking(move || state.rebase_buffer(&args)).await
+    }
+
+    /// [`AppState::create_folder`] on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::create_folder`].
+    pub async fn create_folder_off_thread(
+        self: &Arc<Self>,
+        args: CreateFolderArgs,
+    ) -> Result<FolderCreated, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.create_folder(args)).await
+    }
+
+    /// [`AppState::append_gitignore_entry`] on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::append_gitignore_entry`].
+    pub async fn append_gitignore_entry_off_thread(
+        self: &Arc<Self>,
+    ) -> Result<GitignoreAppended, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.append_gitignore_entry()).await
+    }
+
+    /// [`AppState::decline_gitignore_offer`] on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::decline_gitignore_offer`].
+    pub async fn decline_gitignore_offer_off_thread(self: &Arc<Self>) -> Result<(), IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.decline_gitignore_offer()).await
+    }
+
+    /// [`AppState::set_live_preview`] on the blocking pool (it writes the settings file).
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::set_live_preview`].
+    pub async fn set_live_preview_off_thread(
+        self: &Arc<Self>,
+        args: SetLivePreviewArgs,
+    ) -> Result<(), IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.set_live_preview(args)).await
+    }
+
+    /// [`AppState::set_keybinding`] on the blocking pool (it writes the settings file).
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::set_keybinding`].
+    pub async fn set_keybinding_off_thread(
+        self: &Arc<Self>,
+        args: SetKeybindingArgs,
+    ) -> Result<(), IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.set_keybinding(args)).await
     }
 
     /// [`AppState::asset_info`] on the blocking pool.

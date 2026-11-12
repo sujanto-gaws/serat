@@ -69,6 +69,7 @@ fn a_slow_read_of_one_note_does_not_hold_the_caller_or_delay_an_unrelated_comman
     let info = tauri::async_runtime::block_on(state.asset_info_off_thread(AssetArgs {
         path: "fast.md".to_string(),
     }));
+    assert!(info.is_ok(), "{info:?}");
     assert!(
         other.elapsed() < Duration::from_millis(400),
         "unrelated commands ({info:?}) waited {:?} behind the slow read",
@@ -186,8 +187,10 @@ fn a_switch_off_the_calling_thread_still_flushes_before_it_closes() {
             .push(format!("closing:{}", c.vault_id));
         let (acker, id) = (Arc::clone(&acker), c.vault_id.clone());
         // The ack arrives later, from another thread, as the webview's would.
+        let l = Arc::clone(&l);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
+            l.lock().expect("log").push("ack".to_string());
             acker.flush_ack(&FlushAckArgs { vault_id: id });
         });
     });
@@ -214,7 +217,20 @@ fn a_switch_off_the_calling_thread_still_flushes_before_it_closes() {
         *log,
         vec![
             format!("closing:{old_id}"),
+            "ack".to_string(),
             format!("opened:{}", opened.vault_id)
         ]
     );
+}
+
+// A panic in the work is an `Io` error, not a crashed command, and the pool still serves.
+#[test]
+fn a_panicking_job_is_an_io_error_and_the_next_command_still_works() {
+    let (state, _dir) = open_state(&[("n.md", "a\n")]);
+    let err = tauri::async_runtime::block_on(blocking::<()>(|| panic!("boom")))
+        .expect_err("a panic is an error");
+    assert!(matches!(err, IpcError::Io { .. }), "{err:?}");
+    let read = tauri::async_runtime::block_on(state.read_file_off_thread(read("n.md")))
+        .expect("read after panic");
+    assert_eq!(read.text, "a\n");
 }
