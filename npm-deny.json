@@ -8,14 +8,14 @@
         "id": "GHSA-5gmw-xhrv-c9v3",
         "package": "tinypool",
         "reason": "dev-only (vitest's worker pool); the options it pollutes are ours, not input. Fix needs vitest 5, a major bump of the test runner.",
-        "owner": "vue-frontend-dev",
+        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
         "recorded": "2026-11-12"
       },
       {
         "id": "GHSA-85c8-ppgw-ccpr",
         "package": "tinypool",
         "reason": "as above: dev-only, reached through vitest, fixed by the vitest 5 bump.",
-        "owner": "vue-frontend-dev",
+        "owner": "vue-frontend-dev, task #128 (vitest 5 bump)",
         "recorded": "2026-11-12"
       }
     ]
