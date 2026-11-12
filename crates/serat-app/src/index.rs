@@ -1117,7 +1117,7 @@ mod tests {
     /// the crate's own source tree) rather than merely a narrower one.
     fn throwaway_vault(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("fixture");
         dir
     }
