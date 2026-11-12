@@ -202,11 +202,16 @@ describe("pdf.js is configured with nothing to fetch", () => {
     await loadPdf("d/x.pdf", 10, { onChanged: () => {}, onFailed: () => {} });
     const args = (pdfjs.getDocument.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
     for (const key of ["url", "httpHeaders", "withCredentials"]) expect(args[key], key).toBeUndefined();
-    // ADR-0017 Amendment 1 item 6 may require cMapUrl / standardFontDataUrl, served from the
-    // bundle: if present they must be relative (same origin), never a scheme or `//host`.
+    // ADR-0017 Amendment 1 item 6: cMapUrl / standardFontDataUrl are served from the bundle, so they
+    // are present and must be relative (same origin), never a scheme or `//host`; wasmUrl and iccUrl stay unset.
     for (const key of ["cMapUrl", "standardFontDataUrl", "wasmUrl", "iccUrl"]) {
       if (args[key] !== undefined && args[key] !== null) expect(isRelativeUrl(args[key]), `${key}: ${String(args[key])}`).toBe(true);
     }
+    expect(args.cMapUrl).toBe("./cmaps/");
+    expect(args.cMapPacked).toBe(true);
+    expect(args.standardFontDataUrl).toBe("./standard_fonts/");
+    expect(args.wasmUrl).toBeUndefined();
+    expect(args.iccUrl).toBeUndefined();
     expect(args.useWasm).toBe(false);
     vi.unstubAllGlobals();
   });
