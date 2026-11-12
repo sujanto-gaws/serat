@@ -17,6 +17,12 @@ const RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
 const GHSA = /^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$/;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+/** A calendar date that round-trips: `2026-02-30` is rolled to March by Date.parse, so it fails here. */
+const isRealDate = (text) => {
+  const d = new Date(`${text}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === text;
+};
+
 /** Problems with the exception list itself; an empty array means it is acceptable. */
 export function validateExceptions(exceptions) {
   const problems = [];
@@ -31,7 +37,7 @@ export function validateExceptions(exceptions) {
     if (blank("reason") || e.reason.trim().length < 20)
       problems.push(`${at}: reason is empty or shorter than 20 characters`);
     if (blank("owner")) problems.push(`${at}: owner is empty`);
-    if (typeof e?.recorded !== "string" || !ISO_DATE.test(e.recorded) || Number.isNaN(Date.parse(e.recorded)))
+    if (typeof e?.recorded !== "string" || !ISO_DATE.test(e.recorded) || !isRealDate(e.recorded))
       problems.push(`${at}: recorded is not an ISO date`);
   });
   return problems;

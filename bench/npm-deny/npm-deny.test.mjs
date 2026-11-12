@@ -72,6 +72,9 @@ test("exceptions: a well-formed entry passes; each missing or blank field is a p
   assert.equal(validateExceptions([{ ...good, id: "GHSA-cccc-cccc-ccco" }]).length, 1); // 'o' is not in the alphabet
   assert.equal(validateExceptions([{ ...good, recorded: "12 Nov 2026" }]).length, 1);
   assert.equal(validateExceptions([{ ...good, recorded: "2026-13-45" }]).length, 1);
+  assert.equal(validateExceptions([{ ...good, recorded: "2026-02-30" }]).length, 1); // rolls to March
+  assert.equal(validateExceptions([{ ...good, recorded: "2025-02-29" }]).length, 1); // not a leap year
+  assert.deepEqual(validateExceptions([{ ...good, recorded: "2028-02-29" }]), []); // a leap day is real
   assert.equal(validateExceptions([good, good]).length, 1); // listed twice
 });
 
