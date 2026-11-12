@@ -2193,9 +2193,9 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    fn fixture(name: &str) -> PathBuf {
+    fn fixture(name: &str) -> crate::TestDir {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(
@@ -2205,7 +2205,7 @@ mod tests {
         .expect("fixture");
         std::fs::write(dir.join("contract.pdf"), [0x25, 0x50, 0x44, 0x46]).expect("fixture");
         std::fs::write(dir.join("broken.md"), [0xff, 0xfe, 0x00, 0x9f]).expect("fixture");
-        dir
+        crate::TestDir::new(dir)
     }
 
     fn state(dir: &Path) -> AppState {
@@ -2231,7 +2231,7 @@ mod tests {
         );
         let err = state
             .open_vault(OpenVaultArgs {
-                root: std::env::temp_dir()
+                root: crate::test_temp_dir()
                     .join("serat-no-such-vault")
                     .display()
                     .to_string(),
@@ -2825,7 +2825,7 @@ mod tests {
         // against a real symlink. F-58: a broken guard would make this return `Ok`
         // with the outside file's bytes, not merely error some other way.
         let dir = fixture("symlink-read");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-read-{}",
             std::process::id()
         ));
@@ -2876,7 +2876,7 @@ mod tests {
         // `write_atomic` -- isolating containment as the only thing standing between
         // the request and the bytes outside the vault.
         let dir = fixture("symlink-write");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-write-{}",
             std::process::id()
         ));
@@ -3535,8 +3535,9 @@ mod tests {
 
     // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
 
-    fn settings_state(name: &str) -> (AppState, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+    fn settings_state(name: &str) -> (AppState, crate::TestDir) {
+        let dir =
+            crate::test_temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.toml");
         let mut state = AppState::with_settings(
@@ -3545,7 +3546,7 @@ mod tests {
             Settings::default(),
         );
         state.settings_path = Some(path.clone());
-        (state, path)
+        (state, crate::TestDir::within(path, dir))
     }
 
     #[test]
@@ -3639,7 +3640,7 @@ mod tests {
         // A file where the directory should be makes the write fail.
         std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
         std::fs::write(path.parent().unwrap(), b"not a dir").unwrap();
-        state.settings_path = Some(path);
+        state.settings_path = Some(path.to_path_buf());
         let err = state
             .set_live_preview(SetLivePreviewArgs { enabled: false })
             .expect_err("unwritable");
@@ -5152,7 +5153,7 @@ mod tests {
         name: &str,
         hooks: impl FnOnce(&EventLog) -> OpenHooks,
         with_opened: bool,
-    ) -> (Arc<AppState>, EventLog, PathBuf, PathBuf) {
+    ) -> (Arc<AppState>, EventLog, crate::TestDir, crate::TestDir) {
         let (a, b) = (fixture(&format!("{name}-a")), fixture(&format!("{name}-b")));
         let log: EventLog = Arc::default();
         let state = Arc::new(
@@ -5579,7 +5580,7 @@ mod tests {
         name: &str,
         hold_ms: u64,
         bound_ms: u64,
-    ) -> (AppState, AppState, PathBuf, Counting) {
+    ) -> (AppState, AppState, crate::TestDir, Counting) {
         let dir = fixture(name);
         let slow = counting(hold_ms);
         let first = plain_state(Duration::from_secs(5));
