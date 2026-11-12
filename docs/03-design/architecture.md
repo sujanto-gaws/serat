@@ -616,7 +616,9 @@ T-07 rests on the second half, for the reason the threat model gives.
 
 **The Windows half has a known limit.** The file index is 64 bits. **ReFS does not guarantee it unique**: ReFS identifies files by a 128-bit id, and the 64-bit index it reports can coincide for two directories. Two different vault roots on one ReFS volume could then share a key. The effect is bounded and safe in direction: a re-open of vault B would wait at `Opening` (see *Why the index can wait at `Opening`*) for a detached actor that belongs to vault A, and then proceed. No index is shared and no vault byte is at risk (C-02). NTFS, the reference platform's filesystem, does guarantee the 64-bit index unique per volume. **The follow-up is `GetFileInformationByHandleEx(FileIdInfo)`**, which returns the 128-bit `FILE_ID_128` with the 64-bit volume serial number, and is what `FileIdentity` should hold on Windows. It is not scheduled for P1, because the failure is a bounded wait and never a shared writer or a lost byte. It is not hypothetical, though: a Windows Dev Drive is ReFS, and developers are exactly who put vaults there. It is recorded here and on `FileIdentity`'s doc comment so that whoever next touches `identity.rs` does not need to rediscover it. If a platform cannot give an identity at all, the registry records nothing and logs it (#96).
 
-##### Online-only files: listed, and only an explicit open downloads one (ADR-0018, task #134)
+##### Online-only files: listed, and only an explicit open downloads one (ADR-0018, task #134; FR-VLT-12, US-43)
+
+Serves **FR-VLT-12** (Must, P2) and US-43. FR-VLT-13 (Won't) excludes legacy iCloud stubs, and A-09 records that Linux FUSE clients give no signal (PRD v1.11).
 
 Cloud clients leave files on disk without their bytes: OneDrive placeholders (`RECALL_ON_DATA_ACCESS`), File Provider dataless files on macOS (`SF_DATALESS`) and legacy `.<name>.icloud` stubs. Reading one makes the operating system download it.
 
@@ -1607,7 +1609,7 @@ Security enforcement mechanisms are also recorded in `threat-model.md`.
 - ADR-0015 — The file tree arrives as complete directory listings, on a clock that starts at the painted window (serves FR-VLT-01, NFR-PRF-01, NFR-CMP-03, FR-VLT-04)
 - ADR-0016 — Editor saves are patches against a base, and external changes arrive in the same coordinates (serves FR-VLT-03, FR-VLT-05, NFR-REL-01, NFR-CMP-01, C-04)
 - ADR-0017 — Vault bytes reach the webview through one read-only custom scheme (serves FR-BIN-11, FR-BIN-12, NFR-SEC-06, NFR-SEC-01)
-- ADR-0018 — Online-only files are listed, and only an explicit open downloads one; P2 rule, P1 interim (serves FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06)
+- ADR-0018 — Online-only files are listed, and only an explicit open downloads one; P2 rule, P1 interim (serves FR-VLT-12, FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06)
 
 ## Traceability
 
@@ -1643,7 +1645,7 @@ A path in the Where column marked *(planned)* names a repo-ready file **that is 
 | The paint mark evidence: what makes `S_shell` non-forgeable, and which of its five properties are enforced, unenforced or demoted | §3.4 *The split*, ADR-0014 *(the four-property table and #106 closure)*, `app/src/startup.ts`, `crates/serat-app/src/startup.rs`, `bench/budget/src/trace.rs` | NFR-PRF-01, NFR-PRF-08, C-06 |
 | File tree: directory listings, two sources, the FR-VLT-01 interval and marks, open-path catch-up | §3.5, ADR-0015 | FR-VLT-01, FR-VLT-04, NFR-PRF-01, NFR-CMP-03 |
 | Index open check and rebuild trigger    | §3.4, schema/001_init.sql (index_meta), ADR-02 | NFR-REL-02                                                |
-| Online-only (cloud placeholder) files. P1: `locality::is_local` and a failed read is never zero bytes (RISK-015 for the interim). P2: `Vault::read` refuses and `read_hydrating` only on an explicit open, path-only rows (`notes.local`), demotion on free, locality before catch-up candidacy, scheme 404 | §3.1.2 *Online-only files*, ADR-0018 | FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06 |
+| Online-only (cloud placeholder) files. P1: `locality::is_local` and a failed read is never zero bytes (RISK-015 for the interim). P2: `Vault::read` refuses and `read_hydrating` only on an explicit open, path-only rows (`notes.local`), demotion on free, locality before catch-up candidacy, scheme 404, all behind the `open_bytes` gate (P2; US-43) | §3.1.2 *Online-only files*, ADR-0018 | FR-VLT-12, FR-VLT-01, FR-VLT-02, FR-VLT-04, NFR-CMP-01, NFR-PRF-01, NFR-PRF-04, NFR-SEC-02, NFR-SEC-06 |
 | One index writer per vault root: the detached-actor registry keyed by `serat_vault::FileIdentity` (#96), and the reason an open waits at `Opening` (`OpeningReason`, task #115; P1 #117) | §3.4 *Why the index can wait at `Opening`*, §3.1.2 *A vault root's identity*, contracts/ipc.rs, docs/03-design/ui/index-state-copy.md | NFR-REL-01, NFR-REL-02, FR-VLT-04, ADR-0001 |
 | Vault identity: what `index_meta.vault_root` compares, and what a mismatch may cost | §3.4 *Ruling (task #120)*, `schema/001_init.sql` (index_meta.vault_root), ADR-02 | FR-VLT-02, NFR-REL-02, NFR-PRF-04, C-02 |
 | Index schema and indexes                | §4, schema/001_init.sql    | FR-STR-03, FR-STR-04, FR-STR-05, FR-BIN-01, FR-BIN-06, FR-NAV-02, FR-NAV-04, FR-NAV-08, NFR-PRF-05 |
