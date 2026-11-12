@@ -60,6 +60,7 @@ pub mod folder;
 pub mod gitignore;
 pub mod index;
 mod nav_guard;
+pub mod offload;
 pub mod reads;
 mod security_config;
 pub mod settings;
@@ -1411,3 +1412,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod opening_reason_tests;
