@@ -83,9 +83,11 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
 /// # Errors
 ///
 /// As [`AppState::gitignore_offer_status`].
-#[tauri::command(async)]
-pub fn gitignore_offer_status(state: State<'_, Arc<AppState>>) -> Result<GitignoreOffer, IpcError> {
-    state.gitignore_offer_status()
+#[tauri::command]
+pub async fn gitignore_offer_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreOffer, IpcError> {
+    state.gitignore_offer_status_off_thread().await
 }
 
 /// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`. Takes no path.

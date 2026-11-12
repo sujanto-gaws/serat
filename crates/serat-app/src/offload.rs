@@ -28,8 +28,10 @@
 //!
 //! * **A job finds the vault when it starts and carries no vault id.** A command queued
 //!   before a switch may therefore run against the vault that is open when the job starts,
-//!   not the one open when the command was sent; the front end already drops answers for a
-//!   vault it has left, and the same held for the `async` commands this replaces.
+//!   not the one open when the command was sent. The front end filters *events* by
+//!   `vault_id` (`CodeMirrorEditor.vue`, `App.vue`), but a command's answer carries no id
+//!   and is not filtered. That residual is inherited: the `async` commands this replaces
+//!   resolved the vault when they ran in just the same way.
 //!
 //! # Writers and the settings file
 //!
@@ -39,9 +41,10 @@
 //!
 //! # Still on a Tokio worker
 //!
-//! `backlinks`, `open_tree` and `gitignore_offer_status` are sync `command(async)` functions,
-//! not routed here: they are index or tree reads that wait on their own bounded locks rather
-//! than doing note I/O, and moving them is a separate change (follow-up filed by the lead).
+//! `backlinks`, `open_tree`, `note_closed`, `get_ui_settings` and `refused_names` are sync
+//! `command(async)` functions, not routed here: they are index or tree reads, or in-memory
+//! lookups, that wait on their own bounded locks rather than doing note I/O. Moving them is
+//! a separate change, tracked as #133.
 //!
 //! Nothing here is domain logic: each method is `blocking(|| self.x(args))`.
 
@@ -49,8 +52,8 @@ use std::sync::Arc;
 
 use crate::ipc::{
     AssetArgs, AssetInfo, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
-    FolderCreated, GitignoreAppended, IpcError, NoteBufferArgs, OpenVaultArgs, Patch,
-    ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, SavePatchArgs, SetKeybindingArgs,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IpcError, NoteBufferArgs, OpenVaultArgs,
+    Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, SavePatchArgs, SetKeybindingArgs,
     SetLivePreviewArgs, VaultOpened, WriteFileArgs,
 };
 use crate::state::AppState;
@@ -220,6 +223,19 @@ impl AppState {
     ) -> Result<(), IpcError> {
         let state = Arc::clone(self);
         blocking(move || state.set_keybinding(args)).await
+    }
+
+    /// [`AppState::gitignore_offer_status`] on the blocking pool (it stats `.git` and reads
+    /// `.gitignore` and the declined marker).
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::gitignore_offer_status`].
+    pub async fn gitignore_offer_status_off_thread(
+        self: &Arc<Self>,
+    ) -> Result<GitignoreOffer, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.gitignore_offer_status()).await
     }
 
     /// [`AppState::asset_info`] on the blocking pool.
