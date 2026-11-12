@@ -388,3 +388,95 @@ fn write_patch_returns_the_mtime_the_bytes_had_at_the_rename_not_a_later_rewrite
     assert_ne!(written.mtime_ms, 4_000_000_000_000, "{written:?}");
     assert!(written.mtime_ms > 1_600_000_000_000);
 }
+
+/// A reader that yields `good` bytes of `inner` and then fails, as a dropped network
+/// mount or a cloud client that cannot finish a download does.
+struct FailsAfter {
+    inner: fs::File,
+    good: usize,
+    kind: std::io::ErrorKind,
+}
+
+impl std::io::Read for FailsAfter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.good == 0 {
+            return Err(std::io::Error::new(self.kind, "injected read failure"));
+        }
+        let take = buf.len().min(self.good);
+        let n = self.inner.read(&mut buf[..take])?;
+        self.good -= n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn a_failed_or_interrupted_read_is_an_error_never_zero_bytes() {
+    // ADR-0018 §1, NFR-REL-01: a read that dies part-way (or at once) is `Err`, not
+    // `Ok` with the prefix or with nothing, which a patch or diff would treat as the
+    // whole note and truncate it.
+    let (_dir, vault) = vault();
+    let path = VaultPath::new("note.md").unwrap();
+    vault
+        .write_atomic(&path, b"a long enough note body\nline two\n")
+        .unwrap();
+    for good in [0, 1, 10] {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Other,
+        ] {
+            let result = vault.read_via(&path, || {}, |inner| FailsAfter { inner, good, kind });
+            assert!(
+                matches!(result, Err(VaultError::Io { .. })),
+                "{good} good bytes then {kind:?}: {:?}",
+                result.map(|note| note.bytes)
+            );
+        }
+    }
+    // And the same read with no fault is whole.
+    let ok = vault
+        .read_via(
+            &path,
+            || {},
+            |inner| FailsAfter {
+                inner,
+                good: usize::MAX,
+                kind: std::io::ErrorKind::Other,
+            },
+        )
+        .unwrap();
+    assert_eq!(ok.bytes, b"a long enough note body\nline two\n");
+}
+
+#[test]
+fn a_save_whose_base_read_fails_writes_nothing() {
+    // C-04, ADR-0008, ADR-0018 §1: step 1's read fails, so the patch is refused and the
+    // file is byte-identical, with no temp file left beside it.
+    let (dir, vault) = vault();
+    let path = VaultPath::new("note.md").unwrap();
+    let before = b"aaa\nrest of the note\n";
+    let base = vault.write_atomic(&path, before).unwrap();
+    let target = dir.path().join("note.md");
+
+    let result = vault.write_patch_core(
+        &path,
+        base,
+        &edit("BBB"),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injected read failure",
+            ))
+        },
+        || {},
+        || {},
+        || {},
+    );
+    assert!(matches!(result, Err(VaultError::Io { .. })), "{result:?}");
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert!(temps(dir.path()).is_empty(), "{:?}", temps(dir.path()));
+
+    // The real read still patches, so the refusal above was the injected failure.
+    vault.write_patch(&path, base, &edit("BBB")).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"BBB\nrest of the note\n");
+}

@@ -26,6 +26,7 @@ pub mod fold;
 pub mod hash;
 pub mod ids;
 pub mod link;
+pub mod locality;
 pub mod mime;
 pub mod note;
 pub mod path;
