@@ -60,6 +60,7 @@ pub mod folder;
 pub mod gitignore;
 pub mod index;
 mod nav_guard;
+pub mod offload;
 pub mod reads;
 mod security_config;
 pub mod settings;
