@@ -989,6 +989,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         let trace = startup.trace().expect("complete");
         write_trace(&trace, None).expect("stdout");
 
@@ -1021,6 +1022,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         let trace = startup.trace().expect("complete");
 
         let report = BenchmarkExitReport {
