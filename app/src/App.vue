@@ -435,6 +435,7 @@ onMounted(async () => {
   indexStatus().then((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
+    // The poll carries the count like the event does (task #35); one store entry for both.
     store.applyIndexStatus(status, "poll");
   });
 
