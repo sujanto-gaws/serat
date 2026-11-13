@@ -114,4 +114,8 @@ describe("a PDF with a CJK CMap", () => {
     expect(text.length).toBeGreaterThan(0);
     expect(text).toContain("日本語");
   });
+
+  it("does not without them: the test can fail", async () => {
+    expect(await textOf(false)).not.toContain("日本語");
+  });
 });
