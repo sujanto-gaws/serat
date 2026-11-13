@@ -298,6 +298,43 @@ New tests and the mutants that show each can fail (task #27):
 | `ipc-types` job | a field added to `AppClosing` in `contracts/ipc.rs`: regeneration leaves `M app/src/ipc/generated/AppClosing.ts` |
 | `app_writes_plain.rs` | `write_file` appends a `0xFF` byte to what the caller sent: fails ("Untitled.md is not UTF-8"). `write_file` prefixes `---\nserat-id: 1\n---\n`: fails (the created note is not exactly the caller's bytes; the Serat-only-markup scan is the second line of defence). `serat-vault` `.gitignore` append always writes `\n`: fails ("a bare LF in a CRLF .gitignore") |
 
+## Flake log
+
+### 2026-11-12, task #131: `npm test` in `app/` exits 1 with `[vitest-worker]: Timeout calling "onTaskUpdate"` (NFR-MNT-01, NFR-PRF-08)
+
+**Symptom.** Under load, a full `npm test` exits 1 although every test passed (or a handful fail on the 5 s test limit), with `Error: [vitest-worker]: Timeout calling "onTaskUpdate"` as an unhandled error.
+
+**Diagnosis.** vitest 3.2.7, pool `forks` (the v3 default, no `test.pool` set; the `test` block is in `app/vite.config.ts`, there is no `vitest.config.ts`), 4 cores, so the default runs up to 3 workers beside the main process. Each worker reports task progress to the main process over birpc, and the call has a fixed 60 s window (`node_modules/vitest/dist/chunks/rpc.-pEldfrD.js`, no config option reaches it). When the host is oversubscribed the main process does not get scheduled in time, the reply is late, and the worker throws. A quiet host runs the suite in 56 to 74 s with no failure. During these measurements other sessions' work held the host load average at 10 to 40 on 4 cores, so every figure below is under heavier load than the 4 busy loops alone.
+
+**Measured** (`npm test`, 561 tests, 34 files; 4 busy `while :; do :; done` loops running; exit code and whether the timeout error appeared):
+
+| Configuration | Runs | Exit 1 | Of which with the `onTaskUpdate` timeout | Run time |
+|---|---|---|---|---|
+| default pool (3 workers), first set (host busier from other sessions only in runs 1 and 2) | 10 | 2 (runs 1 and 2; the log of run 1 was lost) | 1 seen (run 2; 1 test also hit the 5 s limit) | 295, 270, then 220 down to 56 s |
+| default pool (3 workers), second set, on integration `092e897` | 10 | **6** (runs 5 to 10) | 6 of 6 (3 of them also had 5 to 8 tests fail on the 5 s limit) | 98 to 417 s |
+| `maxForks: 2`, `testTimeout: 20000` | 3 (stopped) | 3 | 3 of 3 | 250 to 455 s |
+| **`maxForks: 1`, `testTimeout: 20000`** | 10 | **0** | 0 | 170 to 335 s, 561 passed every time |
+
+**Fix (vitest 3.2.7, superseded below).** `app/vite.config.ts`: `pool: "forks"`, `poolOptions.forks.maxForks: 1`, `minForks: 1`, `testTimeout` and `hookTimeout` 20000. One worker at a time stops the workers competing with the main process for cores. Two workers did not help. The per-test limit is raised because a starved worker also breached the 5 s default; the 10 clean runs include that change, and I did not measure the timeout change alone. Cost: on a quiet host the suite is serial, so expect it slower than the 56 to 74 s above; I did not time it unloaded.
+
+**What to re-check after #128 (vitest 5 bump); done 2026-11-13, see below.** (1) The option names: `poolOptions` may be renamed or removed in a later major (I believe the next one moves the worker cap to a top-level `maxWorkers`, not checked), so the cap may be silently ignored; run `npm test` with 4 busy loops and look for more than one worker. (2) Whether the 60 s RPC window became configurable or the main process stopped being the bottleneck; if so the cap can go. (3) That the repeat of the 10 runs above still shows 0 failures.
+
+**After vitest 5.1.0 (#128, 2026-11-13).** The configuration above does not survive the bump, and the reason matters:
+
+- **`poolOptions` is gone.** vitest 4 removed `test.poolOptions` ("All previous `poolOptions` are now top-level options"); vitest 5.1.0 prints one `DEPRECATED  test.poolOptions was removed in Vitest 4` line and otherwise ignores it, so `maxForks: 1` would have kept three workers with a green-looking config. The option is now the top-level `maxWorkers`, set to 1 in `app/vite.config.ts`.
+- **Observed, not inferred.** A sampler counted the worker processes under each run's main process every second (workers are `node --experimental-import-meta-resolve ...` children). With `maxWorkers: 1`: a maximum of 1 worker in all 10 runs. With the old `poolOptions` config on vitest 5.1.0: a maximum of 3 workers (the cap ignored), and that run exited 1 with two tests (`src/editor/links.test.ts`, "issues no request at all for a context that is already aborted" and "an IPC rejection yields no completions") timing out at the 5 s default under load. One run, so an observation, not a rate.
+- **The 60 s RPC window is gone, not configurable.** vitest 5.1.0's worker RPC is created with `timeout: -1` (`node_modules/vitest/dist/chunks/rpc.Uhkwr2NM.js`), i.e. no window, so the `onTaskUpdate` timeout cannot occur as before; it was 0 in every run below. The cap is kept for the 5 s test limits and because it costs nothing: the reviewer measured 561 tests at 60.7 s wall with one worker against 63.1 s with three at load 3.4 on 4 cores.
+- **Default `testTimeout` and `hookTimeout` (5 s) with the cap: sufficient.** The 20000 ms overrides are removed; 10 of 10 runs under 4 busy loops exited 0 with 561 passed (180 to 386 s per run, the host load average 10 to 25 from other sessions).
+
+| Configuration, vitest 5.1.0 | Runs | Exit 1 | `onTaskUpdate` timeouts | Max workers seen | Run time |
+|---|---|---|---|---|---|
+| `maxWorkers: 1`, default 5 s test and hook timeouts | 10 | **0** | 0 | 1 | 180 to 386 s, 561 passed every time |
+| old `poolOptions` config (cap ignored), default timeouts | 1 | 1 (2 tests on the 5 s limit) | 0 | 3 | 163 s |
+
+I did not run the uncapped default (three workers) 10 times on vitest 5, so whether the cap is still needed is shown only by that one run and the reviewer's timing; keep it unless a later bump makes the question worth the hour.
+
+**Caveat.** The load was not held constant (other sessions shared the host), so the comparison is between runs under similar-to-heavy contention, not a controlled experiment. It is 10 of 10 against 6 of 10 and 3 of 3, which is large, but the exact failure rate on a CI runner is unknown.
+
 ## Reports
 
 One report per gate, in `reports/`, from `reports/TEMPLATE-test-report.md`. Every report records the reference machine, the benchmark vault's `tree_digest_sha256`, the generator's `VAULT_FORMAT_VERSION`, the measurement environment (real-time scanner state and power plan), and the raw numbers — not just the pass/fail. P0 numbers replace the blueprint targets before P1 starts (charter §Milestones, working agreement 6), so they are reported to product-analyst and architect explicitly rather than left in a file for someone to find.
