@@ -3,22 +3,7 @@
   "audit": {
     "production_level": "high",
     "all_level": "critical",
-    "exceptions": [
-      {
-        "id": "GHSA-5gmw-xhrv-c9v3",
-        "package": "tinypool",
-        "reason": "dev-only (vitest's worker pool); the options it pollutes are ours, not input. Fix needs vitest 5, a major bump of the test runner.",
-        "owner": "#128 (vitest 5 bump, vue-frontend-dev)",
-        "recorded": "2026-11-12"
-      },
-      {
-        "id": "GHSA-85c8-ppgw-ccpr",
-        "package": "tinypool",
-        "reason": "as above: dev-only, reached through vitest, fixed by the vitest 5 bump.",
-        "owner": "#128 (vitest 5 bump, vue-frontend-dev)",
-        "recorded": "2026-11-12"
-      }
-    ],
+    "exceptions": [],
     "_doc": "Production dependencies (--omit=dev) are judged at production_level with NO exceptions; the whole tree at all_level, where exceptions apply. An exception needs a GHSA id, the package, a reason (20+ characters), an owner and an ISO date, and must match an advisory in the current report or the job fails (remove it when the fix lands)."
   },
   "licenses": {
