@@ -40,6 +40,12 @@ const _: () = assert!(
     !serat_index::TEST_HOOKS || cfg!(debug_assertions),
     "test-hooks must not reach a release build"
 );
+// The same for serat-vault's (task #35): `Vault::with_platform` can switch off the
+// containment rules (T-07, T-10, NFR-SEC-06), so it must never be reachable in a release.
+const _: () = assert!(
+    !serat_vault::TEST_HOOKS || cfg!(debug_assertions),
+    "serat-vault test-hooks must not reach a release build"
+);
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,6 +66,7 @@ pub mod folder;
 pub mod gitignore;
 pub mod index;
 mod nav_guard;
+pub mod offload;
 pub mod reads;
 mod security_config;
 pub mod settings;
@@ -1411,3 +1418,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod opening_reason_tests;
+#[cfg(test)]
+mod refusal_wiring_tests;

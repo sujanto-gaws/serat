@@ -3,16 +3,16 @@ project: Serat
 artifact: P1 status
 phase: 01-planning
 owner: lead
-status: in progress — 2026-11-10 — gate NOT reached; switcher, palette, viewers, tree create/context menu, vault-id delivery, validator, cargo-deny on main; #20/#96/#112 in round 2, #111 fixing a merge
+status: in progress — 2026-11-12 — gate NOT reached; no-network proofs, detached-writer registry, rusqlite bump, refused names, IO off the main thread, Opening reason, test cases per ID, cargo-deny and npm-deny in the gate, ADR-0018 and PRD v1.11 on main; fourteen branches review-ready
 ---
 
 # P1 — An editor you could live in — Status
 
 **Gate (charter §Milestones):** owner opens their own vault in Serat for a week without needing Obsidian. Protocol: `docs/05-testing/p1-gate-protocol.md` (merged).
 
-**Where P1 stands.** On `main`: the Rust core and serat-app plumbing (tree, search, backlinks, patch-set saves, assets and sidecars, switcher index, always-mtime catch-up with the window stamped before the watcher is armed, WAL checkpointer off the save path, asset scheme with the size-mtime validator, open/close/switch with the editor's bounded flush, `BootInfo.vault_id` and `vault://opened`), the editor with external-change reconciliation, wikilink completion, block widgets whose three reveal defects are fixed (#101, #102, #104, #109), the file tree / backlinks / search panes with create note / create folder and a keyboard-complete context menu on every platform, the quick switcher and command palette on one registry, the PDF and image viewers with the contained range transport that restarts on a changed file, backlink frontmatter keys and the search "approximate" marker, CI budget jobs for FR-VLT-01, FR-VLT-04 and NFR-PRF-06, the report-only NFR-PRF-02 job, cargo-deny, and PRD v1.9. In round 2 after review: #20 no-network proofs, #96 detached index-writer registry, #112 rusqlite bump (RUSTSEC-2026-0459). #111 (a deterministic save-reaches-index test) is being re-merged after a semantic conflict. Not started: #27, #35, #49, #113 (after #112); the week-in-vault report; the reference-machine NFR-PRF-02 run; the attested hub-save run (#62).
+**Where P1 stands.** On `main`: the Rust core and serat-app plumbing (tree, search, backlinks, patch-set saves, assets and sidecars, switcher index, always-mtime catch-up with the window stamped before the watcher is armed, WAL checkpointer off the save path, asset scheme with the size-mtime validator, open/close/switch with the editor's bounded flush, `BootInfo.vault_id` and `vault://opened`), the editor with external-change reconciliation, wikilink completion, block widgets whose three reveal defects are fixed (#101, #102, #104, #109), the file tree / backlinks / search panes with create note / create folder and a keyboard-complete context menu on every platform, the quick switcher and command palette on one registry, the PDF and image viewers with the contained range transport that restarts on a changed file, backlink frontmatter keys and the search "approximate" marker, CI budget jobs for FR-VLT-01, FR-VLT-04 and NFR-PRF-06, the report-only NFR-PRF-02 job, cargo-deny, and PRD v1.9. Since the last refresh, also on `main`: the no-network proofs in CI (#20), the detached index-writer registry (#96), rusqlite 0.41 / SQLite 3.54.1 (#112), the save-reaches-index test (#111), `tree.insertLink` as a registered command (#114), test cases for every P1 ID with the hostile-suite map and the ipc-types drift job (#27), cargo-deny (#113) and npm-deny (#119) in the CI gate, the rebuilt webview bundle (#116), the SIGBUS root cause and tmpfs fixtures (#105b, #124), the review rulings (#115: CSP `form-action`/`base-uri 'none'`, ADR-0017 item 6, `OpeningReason`), PRD v1.10 (NFR-SEC-07, US-42) and v1.11 (FR-VLT-12/13, A-09, US-43), the refused-names spec (#125), plain-UTF-8 app writes (#121), two deterministic ordering tests (#122, #129), reads and writes off the main thread (#49), the gate-protocol no-ID rule (#140), ADR-0018 online-only files (#134, P2), the `OpeningReason` publish and clear (#117 serat-app half) and refused names reported with a count (#35). Review-ready, held for the owner's word on reviewers: #126, #128, #132, #127 (both halves + #148), #117b, #137, #138, #139, #133, #143, #141, #77 round 2, #61, #146, #135, #144, #131 (after #128), #136 (last). Not started: the week-in-vault report; the reference-machine NFR-PRF-02 run; #62; #147 (needs runners).
 
-`main` == integration branch `claude/great-mccarthy-jywddn` == **6e065c0**. Every merge goes through the full gate first: `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --check`, `cargo check -p serat-app --release`, doclint, ts-rs drift, `npm test` and `vue-tsc` in `app/`. Index schema version on main: **12** (`links.field_key`, #86). Toolchain: pinned Rust 1.92; Chromium 153 for the latency harness; pdfjs-dist 6.5.438.
+`main` == integration branch `claude/great-mccarthy-jywddn` == **3ff7806**. Every merge goes through the full gate first: `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --check`, `cargo check -p serat-app --release`, doclint, ts-rs drift, `npm test` and `vue-tsc` in `app/`. Index schema version on main: **12** (`links.field_key`, #86). Toolchain: pinned Rust 1.92; Chromium 153 for the latency harness; pdfjs-dist 6.5.438.
 
 ## Owner decisions recorded during P1
 
@@ -85,28 +85,65 @@ status: in progress — 2026-11-10 — gate NOT reached; switcher, palette, view
 | 104 | document-change path re-examines both sides and the changed span; sweeps split per case | approved after 4 rounds |
 | 109 | `reliableParsedTo`: partial reparse territory re-examined when the parse completes | approved after 2 rounds |
 | 107 | two load-sensitive tests pinned by counts; `walk_cost.rs` deleted; clippy forbids uncounted `canonicalize` in serat-vault | approved |
+| 112 | rusqlite 0.41, libsqlite3-sys 0.39.1, bundled SQLite 3.54.1; real fallback when `wal_hook` fails | approved after 2 rounds |
+| 111 | save-reaches-index test holds the watcher instead of racing it | approved; re-merged after `OpenHooks` grew |
+| 20 | no outbound network: `cargo tree --offline`, deny-list, bundle scans, INERT counts, pdf.js pin; `NODE_ENV=production` | approved after 3 rounds |
+| 96 | second index writer refused while a detached actor holds `index.db`; actor-started latch, rescan backstop, keyed by `FileIdentity` | approved after 4 rounds |
+| 114 | `tree.insertLink` registered; palette greys unavailable commands; reserved chords; global-chord collisions | approved after 3 rounds |
+| 27 (+113) | test cases for every P1 ID, hostile-suite map, two real-note corpus tests, ipc-types drift job; cargo-deny in `gate.needs` | approved |
+| 105b | SIGBUS root cause: page-in failure of a fixture's `index.db-shm` on the thin disk under a concurrent build in the same target dir | approved |
+| 116 | committed webview bundle rebuilt in production mode (stale again since; rebuilt at integration after the vue set lands) | approved |
+| 115b (+118) | CSP `form-action 'none'; base-uri 'none'` (ADR-0017 Amendment 2); item 6 corrected to `connect-src 'self'` when cMaps ship; `IndexState::Opening { reason }`; `FileIdentity` on ReFS; PRD v1.10 NFR-SEC-07 + US-42 | approved after 2 rounds |
+| 125 (+follow-up) | refused-names spec: status-strip count button, anchored non-modal panel; background re-fetch failure keeps the old list | approved |
+| 122 | `vault://opened` ordering test waits for B's `index://changed` | approved |
+| 120b (+123) | binary-viewers.md records the cMaps/fonts gap; ADR-0007 records the ipc-types job | approved |
+| 130b | ADR-0007 generated-file count; §9.3 command inventory | approved |
+| 119 | npm audit + licence allow-list + registry-only sources for `app/` (NFR-SEC-07 npm half); SPDX parser, stale-exception check | approved after 4 rounds |
+| 121 | every file serat-app writes itself is plain UTF-8 Obsidian accepts (NFR-CMP-02) | approved |
+| 124 | serat-app fixtures on `/dev/shm` with a Drop guard; 0 SIGBUS in 15 relink-under-run rounds | approved |
+| 129 | bench-flag walk-complete test awaits `Rebuilding` instead of sampling it | approved |
+| 49 | vault bytes, settings and folder writers on the blocking pool; `offload::blocking()` | approved after 2 rounds |
+| 140b | gate protocol: a reach mapping to no PRD ID counts as missing P1 | approved |
+| 134b | ADR-0018: online-only files are listed and only an explicit open downloads one (P2 Must; P1 carries RISK-015, vault is local only by owner decision) | approved after 3 rounds |
+| 142c | PRD v1.11: FR-VLT-12 (Must, P2), FR-VLT-13 (Won't), A-09, US-43; architecture accounting | doclint green |
+| 117 | `OpeningReason::previous_index_still_closing` published on a deferred re-open, cleared before the open check; §3.4 amended | approved after 2 rounds |
+| 35 | refused names: capped `RefusalLog` with `on_change`, count on `IndexStatus`, `vault.refused-names`, re-emit only when the count moves; `test-hooks` feature with release assert | approved after 3 rounds |
 
-## Open branches
+## Open branches (all review-ready unless stated)
 
 | # | Branch @ head | State | Next |
 |---|---|---|---|
-| 20 | `task/p1-20-no-network` @ de074d9 | round 2 after NOT APPROVED (B1: `cargo tree --offline` fails on a clean runner; IDs corrected to NFR-SEC-01/T-01/T-05/T-09; deny-list, scans, INERT counts, pdf.js pin) | re-review, merge |
-| 96 | `task/p1-96-detached-writer-registry` @ 0dd138f | round 2 after NOT APPROVED (B1: a deferred re-open lost the open-time catch-up past `SETTLE_BOUND`; now an actor-started latch and a rescan backstop; keyed by file identity) | re-review, merge |
-| 112 | `task/p1-112-rusqlite-bump` @ c36f07b | approved; round 2 (real fallback when `wal_hook` fails, SQLite ≥ 3.54 floor test) | merge; then #113 adds the deny job to the gate |
-| 111 | `task/p1-111-save-reaches-index-window` @ 7915c1d | approved; merge failed to compile (`OpenHooks` gained fields after its cut point); author merging integration | re-gate, merge |
-| 12 | `task/p1-12-compat-corpus` @ 1a081c7 | pre-reset WIP | resume |
-| 28b | `task/p1-28b-no-id-reach` @ e9564c4 | pre-reset, unreviewed | review |
-| 31 | `task/p1-31-tree-first-screen-mark` @ d8e2547 | pre-reset CR + lead WIP | finish, re-review |
-| 40 | `task/p1-40-block-widgets` @ b5d3424 | pre-reset WIP; superseded in substance by #101/#102/#104/#109 | owner decides |
-| — | `task/p1-design-merge-preview`, `-09-tree-budget`, `-10-switcher-budget`, `-79`, `-79b`, `-94`, `-94b`, `-103`, `-110`, `-110b` | superseded (re-authored or replaced) | owner deletes |
+| 126 | `task/p1-126-refused-names-ui` @ b1a6f38 | final round pushed (approved at c0c4574; SF-a/SF-b done; §9.3 entry moved) | re-check, merge first of the vue set (global `.sr-only`) |
+| 117b | `task/p1-117b-opening-reason-ui` @ 27685ac | approved at 5e2995e; round 2 done (announce on leave, `aria-describedby`, App test, no layout shift); seeds only a reasoned `Opening` from `VaultOpened.index` | re-check, merge after #126 (drop scoped `.sr-only`) |
+| 128 | `task/p1-128-vitest-5` @ 495fb33 | round 2 (jsdom `execCommand` shim as a setupFile; #119 policy merged; TC-130) | re-review, merge |
+| 132 | `task/p1-132-seenkeys-derived` @ 25f7c25 | round 2 (platform-aware `normaliseChord`) | re-review, merge |
+| 135 | `task/p1-135-chord-canonicaliser` @ 7ab9ae9 | one canonicaliser for the four call sites; `Command.fallthrough` for CodeMirror's mac pair | review, merge after #132 |
+| 127 (+148b) | `task/p1-127-pdf-cmaps-fonts` @ 2a61d35; `task/p1-148b-t02-wording` @ 430ddc5 | vue half (cmaps + standard fonts shipped, relative URLs) and tauri half (`connect-src 'self'` pinned, containment test); T-02 row rewritten | review, merge; then the integration bundle rebuild |
+| 137 | `task/p1-137-contentless-body` @ b5cfaad | shipped page body is exactly the mount point; TC-131 | review, merge |
+| 138 | `task/p1-138-conflict-markers` @ b9ff637 | `check-conflict-markers` doclint binary + CI job; TC-132..134 | review, merge |
+| 139 | `task/p1-139-link-corpus` @ 10821f4 | Obsidian link corpus under `bench/compat/corpus/links/`; serat-index and serat-parse pinned; TC-135..139 | review, merge |
+| 146 | `task/p1-146-callout-fold-marker` @ 7774e32 | `]-`/`]+` parsed into a fold state, not the title | review, merge after #139 |
+| 133 | `task/p1-133-reads-off-workers` @ 6761b54 | backlinks and `get_ui_settings` on the blocking pool; the rest documented in `offload.rs` | review, merge |
+| 144 | `task/p1-144-refusal-throttle` @ 4eb3d19 | refused-names re-emit through the throttle with a trailing flush | review, merge |
+| 143 | `task/p1-143-locality-and-no-zero-bytes` @ 9007f35 | `serat_core::locality::is_local`; a failed read is an error, never zero bytes (ADR-0018's P1 pieces) | review, merge |
+| 141 | `task/p1-141-tree-first-screen` @ c2600f8 | `tree_first_screen` in the NFR-PRF-01 trace; usable = latest of four terms; `root_sent` stored before the sink; TC-140 | review (rust-core-dev glances at the serat-vault reorder), merge |
+| 77 | `task/p1-77-windows-ci-prep` @ 7db0ea0 | round 2 (UNC assertions, NTFS names, `SERAT_WINDOWS_STRICT`); runner-only assumptions in MISSING-WIN-1 | re-review, merge; Windows runner owed |
+| 61 | `task/p1-61-prf02-scenarios` @ 5da738c | 5 remaining scenarios, CRLF/BOM, real-IPC bridge example; figures informational (positive control failed under load) | review, merge; #147 quiet re-run |
+| 131 | `task/p1-131-vitest-worker-timeout` @ ba0aecc | `maxForks 1`, 20 s timeouts; 10/10 clean under load | after #128: re-check on vitest 5, then merge |
+| 136 | `task/p1-136-bundle-drift` @ 537c16a | `frontend-bundle` CI job; bundle on integration has drifted | merge LAST of the vue set with a fresh rebuild commit |
+| — | 115 merged branches and 11 superseded (`task/p1-40`, `-09`, `-10`, `-design-merge-preview`, `-103`, `-110`, `-110b`, `-79`, `-79b`, `-94`, `-94b`) | contained in `main` or replaced | owner deletes (lists in the lead's scratchpad; deletion is denied to the lead) |
 
 ## Not started (P1 scope)
 
-#27 test cases per P1 ID + hostile suite · #35 refused names · #49 read/write off main thread · #113 cargo-deny job into the CI gate (after #112) · the week-in-vault report · the reference-machine NFR-PRF-02 run · #62 attested hub-save run.
+The week-in-vault report · the reference-machine NFR-PRF-02 run · #62 attested hub-save run · #147 quiet-machine NFR-PRF-02 scenarios (needs runners) · #145 parser: tags inside inline code spans (after #139) · #68, #69, #75 carried.
 
 ## Follow-ups filed this run
 
 #61 remaining 5 PRF-02 scenarios + CRLF/BOM + real IPC · #68 TreeSession replay on reload · #69 background quick_check · #75 48 px scroll-margin token · #77 Windows CI run · #80 vault-switch id handling in the front end · #82 editor-side 400 ms destination-block flash on backlink navigate · #83 tabs-dependent notice behaviour · #84 Compare diff view (per-hunk, ↓/↑ between ranges, assertive live region, virtualise) · #85 Mod-Shift-K/O/D notice bindings · #93 ⌘R rebind editor + `set_keybinding` + conflict UI (NFR-USE-01) · #100 · #105 SIGBUS in the serat-app lib test binary under a full workspace run (not reproduced in isolation; hypothesis: page-cache pressure from the budget benches that run before it) · register `tree.insertLink` so the tree menu's chord is not hard-coded (#39 review) · a reason shown for a long `Opening` while a detached writer finishes (#96 review) · CSP `form-action`/`base-uri 'none'` and the ADR-0017 item 6 `connect-src 'self'` inconsistency (architect, #20 review) · #37 platform follow-ups: native-menu suppression on WebView2 and WKWebView · the committed `crates/serat-app/webview` build is stale (no pdf chunk) · NFR-PRF-06 keystroke-to-paint browser bench · #26 follow-ups: PDF annotation links, find, changed-on-disk restart (`PDFDataRangeTransport` + `readAssetRange` fallback), cMaps/fonts, `AssetInfo` pixel dimensions, FileTree reveal-by-path.
+
+## Follow-ups filed since 2026-11-10
+
+#131 vitest worker RPC timeout · #133 remaining commands off the workers · #134/#143 online-only files (ADR-0018) · #135 chord canonicaliser · #136 bundle-drift job · #137/#138/#139 salvaged P0 branches · #140 no-ID reach · #141 tree first screen in the trace · #142 PRD v1.11 · #144 refusal throttle · #145 tags in code spans · #146 callout fold marker · #147 quiet NFR-PRF-02 re-run · #148 T-02 wording. Findings recorded without a task: table-cell and split-preview typing are the weakest NFR-PRF-02 scenarios under load; bridge-side `save_patch` p95 723 ms under load (both re-measured by #147 first).
 
 ## Budget numbers (20k vault unless stated)
 
@@ -128,8 +165,10 @@ status: in progress — 2026-11-10 — gate NOT reached; switcher, palette, view
 - **NFR-PRF-02 is not gateable headless.** The reference-machine run (WebView2) must test the editor with and without scroll margins.
 - **RISK-013 / F-384:** CI still produces no jobs; #60 cannot gate until it does.
 - **Shared target directory:** a TaskCompleted hook or any second cargo in the integration checkout relinks test binaries under the lead's gate (SIGBUS, F-234's shape). The lead now completes tasks only while no gate runs. The three load-sensitive tests are deterministic since #67.
-- **RUSTSEC-2026-0459** (libsqlite3-sys 0.38.2, uninitialised page-cache memory with an untrusted `-wal`): the `deny` job from #41 is red on main until #112 merges; #112 is approved and clears it (verified by `cargo deny` on a trial merge).
-- **SIGBUS (#105):** the serat-app lib test binary died with signal 7 three times in full `cargo test --workspace` gate runs, never in isolation or in 50 loaded runs; `gate3.sh` now captures core-pattern and disk diagnostics. The two wall-time tests that masked it are deterministic since #107.
+- **RUSTSEC-2026-0459** closed by #112 (libsqlite3-sys 0.39.1); the `deny` job is in the gate (#113) and green.
+- **RISK-015 (ADR-0018):** on a cloud-synced vault a read can hydrate an online-only file silently; the P1 gate vault is local only (owner), the locality predicate ships with #143, the gate is P2 (FR-VLT-12).
+- **Committed webview bundle drift:** the bundle differs from `app/` since the #116 merge; #136's job will be red until the integration rebuild that follows the vue set.
+- **SIGBUS (#105, closed):** root cause is a failed page-in of a fixture's `index.db-shm` mapping on the thin disk while a concurrent build in the same target dir relinks the binary (#105b); fixtures now live on `/dev/shm` with a Drop guard (#124): 0 in 15 relink-under-run rounds.
 - **Disk:** the session allowance overflowed once with three concurrent Rust builds; `~/.cargo/config.toml` sets incremental=false and debug=0, and each agent uses a uniquely named target dir.
 
 ## Process notes
