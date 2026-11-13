@@ -866,7 +866,8 @@ pub fn cold_start_once(vault: &Path, run: usize) -> Result<StartupTrace, String>
 
         let line = std::fs::read_to_string(&trace_path)
             .map_err(|e| format!("reading {}: {e}", trace_path.display()))?;
-        let trace = StartupTrace::parse(line.trim()).map_err(|e| format!("run {run}: {e}"))?;
+        let trace = StartupTrace::parse_requiring_tree(line.trim())
+            .map_err(|e| format!("run {run}: {e}"))?;
         let _ = std::fs::remove_file(&trace_path);
 
         Ok(trace)

@@ -191,6 +191,22 @@ impl StartupTrace {
     /// which, because a cold-start job that fails without saying why is a bug
     /// report nobody can act on.
     pub fn parse(line: &str) -> Result<StartupTrace, String> {
+        Self::parse_with(line, false)
+    }
+
+    /// As [`StartupTrace::parse`], for the **current** build: a trace with no `tree` field
+    /// is refused rather than read as an older build. Without this a P1 build that stopped
+    /// emitting `tree` would pass the cold-start job with a `t_usable` that never waited
+    /// for the tree (task #141). The cold-start budget job calls this; `parse` stays
+    /// lenient so archived traces from older builds still read.
+    ///
+    /// # Errors
+    /// As [`StartupTrace::parse`], plus a trace that does not declare `"tree": true`.
+    pub fn parse_requiring_tree(line: &str) -> Result<StartupTrace, String> {
+        Self::parse_with(line, true)
+    }
+
+    fn parse_with(line: &str, require_tree: bool) -> Result<StartupTrace, String> {
         let num = |key: &str| -> Result<f64, String> {
             number(line, key).ok_or_else(|| format!("the startup trace has no {key}: {line}"))
         };
@@ -201,6 +217,13 @@ impl StartupTrace {
         // `"tree":true` (compact) or `"tree": true`; absent on older builds.
         let tree = bool_true(line, "tree");
         let tree_first_screen_ms = number(line, "t0_to_tree_first_screen_ms");
+        if require_tree && !tree {
+            return Err(format!(
+                "the startup trace does not declare a tree (no \"tree\":true) but this build is \
+                 required to: t_usable may not have waited for the file tree (ADR-0015 section \
+                 5), so the run is refused rather than read as an older build: {line}"
+            ));
+        }
         if tree && tree_first_screen_ms.is_none() {
             return Err(format!(
                 "the startup trace declares a tree but has no t0_to_tree_first_screen_ms: the \
@@ -626,6 +649,22 @@ mod tests {
         let t = StartupTrace::parse(&good()).expect("valid trace");
         assert!(!t.tree);
         assert_eq!(t.tree_first_screen_ms, None);
+    }
+
+    #[test]
+    fn a_tree_less_trace_fails_for_the_current_build_and_still_parses_for_an_old_one() {
+        // The cold-start job parses with `parse_requiring_tree`. Mutant, run by hand:
+        // make `parse_requiring_tree` call `parse_with(line, false)` and the error
+        // assertion fails, which is the P1 build that stopped emitting `tree`.
+        let err = StartupTrace::parse_requiring_tree(&good()).expect_err("no tree declared");
+        assert!(err.contains("does not declare a tree"), "{err}");
+        let declared = with_tree("\"tree\":true, \"t0_to_tree_first_screen_ms\": 790.5,");
+        StartupTrace::parse_requiring_tree(&declared).expect("a declared tree passes");
+        // `"tree":false` is not a declaration either.
+        StartupTrace::parse_requiring_tree(&with_tree("\"tree\":false,"))
+            .expect_err("false is not a tree");
+        // Without the requirement the same tree-less line still reads.
+        StartupTrace::parse(&good()).expect("an older build's trace parses");
     }
 
     #[test]
