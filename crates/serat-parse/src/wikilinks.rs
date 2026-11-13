@@ -8,16 +8,16 @@
 //! scanner produce byte-accurate `range`s for all of them without a second pass
 //! through comrak's inline tree to re-locate what it already saw.
 //!
-//! Scoped deliberately: `exclude` keeps this out of frontmatter and out of fenced
-//! code / HTML blocks. It does not keep it out of an *inline* code span (`` `#not
-//! a tag` ``) — comrak's inline tree would have to be walked to find those, and nothing
-//! in the corpus this lands with exercises the difference yet. Recorded here rather
-//! than left to be rediscovered: a documented gap is worth more than a hidden one.
+//! Scoped deliberately: `exclude` keeps this out of frontmatter, out of fenced code /
+//! HTML blocks and out of *inline* code spans (`` `#not a tag` ``), whose ranges the
+//! caller takes from comrak's inline tree (task #145; Obsidian indexes nothing inside
+//! a code span).
 
 use serat_core::{ByteRange, Link, LinkKind, LinkTarget};
 
 /// Every wikilink, embed and tag in `text`, outside of `exclude`d ranges.
 pub(crate) fn scan(text: &str, exclude: &[ByteRange]) -> Vec<Link> {
+    let exclude = &merged(exclude);
     let bytes = text.as_bytes();
     let mut links = Vec::new();
     let mut i = 0;
@@ -64,9 +64,26 @@ pub(crate) fn scan(text: &str, exclude: &[ByteRange]) -> Vec<Link> {
 }
 
 fn excluded(exclude: &[ByteRange], offset: usize) -> bool {
-    exclude
-        .iter()
-        .any(|range| range.start <= offset && offset < range.end)
+    // `exclude` is sorted and disjoint (see `merged`): the only candidate is the last
+    // range starting at or before `offset`.
+    let after = exclude.partition_point(|range| range.start <= offset);
+    after > 0 && offset < exclude[after - 1].end
+}
+
+/// `exclude` sorted by start with overlapping or touching ranges joined, so
+/// [`excluded`] is a binary search rather than a scan of every range per byte (a note
+/// with thousands of code spans would otherwise be quadratic).
+fn merged(exclude: &[ByteRange]) -> Vec<ByteRange> {
+    let mut sorted = exclude.to_vec();
+    sorted.sort_by_key(|range| range.start);
+    let mut out: Vec<ByteRange> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match out.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => out.push(range),
+        }
+    }
+    out
 }
 
 /// A tag starting at `text[start]` (which is `#`), or `None` if what follows is not

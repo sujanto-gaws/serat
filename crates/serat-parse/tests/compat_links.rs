@@ -93,3 +93,24 @@ fn embed_fixture_keeps_the_width_as_alias_and_the_heading_scope() {
         ]
     );
 }
+
+#[test]
+fn an_inline_code_span_holds_no_tag_and_no_wikilink() {
+    // Task #145, NFR-CMP-01: Obsidian indexes nothing inside a code span. The fenced
+    // block was already skipped; the inline span used to yield a Tag for `#abc`.
+    let links = links_of("code-span-tag.md");
+    assert_eq!(
+        links,
+        vec![
+            (LinkKind::Tag, s("real"), None, None, None),
+            (
+                LinkKind::Wikilink,
+                s("heading-and-block-target"),
+                None,
+                None,
+                None
+            ),
+        ],
+        "{links:?}"
+    );
+}

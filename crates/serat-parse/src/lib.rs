@@ -205,7 +205,7 @@ struct Walker<'b> {
     /// level of a new heading before it is pushed, which is what turns a flat
     /// sequence of headings into a path.
     heading_stack: Vec<(u8, String)>,
-    /// Frontmatter's range, plus every code/HTML block's range: wikilinks.rs's scan
+    /// Frontmatter's range, plus every code/HTML block's and inline code span's range: wikilinks.rs's scan
     /// runs over the whole file's text and needs to know what to skip.
     excluded: Vec<ByteRange>,
 }
@@ -384,6 +384,13 @@ impl<'b> Walker<'b> {
     fn collect_markdown_links<'a>(&mut self, node: Node<'a>) {
         for descendant in node.descendants() {
             let (value, sourcepos) = node_kind(descendant);
+            // An inline code span (backticks included) is no place for a tag or a
+            // wikilink: the scan skips it (task #145).
+            if let NodeValue::Code(_) = value {
+                let range = self.lines.range(self.bytes, sourcepos);
+                self.excluded.push(range);
+                continue;
+            }
             if let NodeValue::Link(link) = value {
                 let range = self.lines.range(self.bytes, sourcepos);
                 let alias = text::collect(descendant);
