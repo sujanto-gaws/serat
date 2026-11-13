@@ -66,8 +66,8 @@ describe("pure helpers", () => {
     expect(isSeratAssetUrl("https://example.com/x.png")).toBe(false);
   });
   it("parses callout headers and strips quote markers", () => {
-    expect(parseCalloutHeader("> [!warning] Careful")).toEqual({ type: "warning", title: "Careful" });
-    expect(parseCalloutHeader("> [!note]")).toEqual({ type: "note", title: "Note" });
+    expect(parseCalloutHeader("> [!warning] Careful")).toEqual({ type: "warning", title: "Careful", fold: null });
+    expect(parseCalloutHeader("> [!note]")).toEqual({ type: "note", title: "Note", fold: null });
     expect(parseCalloutHeader("> plain quote")).toBeNull();
     expect(stripBlockquoteMarkers("> a\n>b\n> > c")).toBe("a\nb\n> c");
   });
