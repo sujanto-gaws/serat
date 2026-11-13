@@ -123,3 +123,32 @@ harness. It is not needed to carry this ruling — the attested run above alread
 question on its own — but it is independent confirmation of the mechanism the ruling assumes,
 and it is worth keeping on record because it is exactly the kind of evidence F-327 predicted
 without anyone going looking for it.
+
+## Task #145: code spans leave the scan (not a gate run)
+
+**What changed.** The parser now excludes inline code spans from the tag and wikilink scan
+(`crates/serat-parse`), and the exclusion test became a binary search over merged ranges. On
+the 20k vault this **changes what is indexed**: tags and links inside code spans no longer
+produce rows (about 687 spans' worth), so link and tag counts before and after differ. The
+digest and the note count are unchanged, and the budget's note-count guard passed in every run.
+
+**Before and after, `prf04-full-rebuild --profile reference` on the 20k vault** (digest
+`35fcb867…`), three runs each of the median-of-3 job, alternated, same host, binaries built from
+`271b066` (before: the parent of the first #145 commit) and from the #145 head. **Not attested:**
+a shared 4-core Linux host at load average 13 to 15 throughout, `concurrent rustc/link processes
+unknown`; these are indicative, not a gate-quality reading.
+
+| Run | before: wall median (spread) | before: parse phase | after: wall median (spread) | after: parse phase |
+|---|---|---|---|---|
+| 1 | 14,768 ms (25.6%) | 6,521 ms | 13,930 ms (9.7%) | 6,406 ms |
+| 2 | 14,602 ms (26.6%) | 6,035 ms | 17,617 ms (40.9%) | 8,229 ms |
+| 3 | 15,716 ms (13.4%) | 6,876 ms | 16,929 ms (20.3%) | 6,856 ms |
+
+Medians of the three: before 14,768 ms, after 16,929 ms; parse phase before 6,521 ms, after
+6,856 ms. The run-to-run spread inside a single side (13,930 to 17,617 ms after; 14,602 to
+15,716 ms before) is larger than the gap between sides, and run 2 after is a 41%-spread outlier
+under load, so **no change is distinguishable from noise**. The reviewer's earlier loaded rounds
+(parse 4,467 to 4,619 ms and 5,656 to 5,478 ms) point the same way, and a hostile note with
+50,000 code spans parses in 124 ms, so the new exclusion is not quadratic. All six readings are
+far under the 30,000 ms limit. An attested re-run belongs with the next quiet window.
+
