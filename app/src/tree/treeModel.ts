@@ -49,6 +49,19 @@ export class TreeModel {
   /** Upserts whose `after` sibling was missing (Rust and the model disagreeing); appended, counted. */
   misplacedUpserts = 0;
 
+  /** Forgets everything: a different vault is being opened (#151); nothing of the old one may stay. */
+  clear(): void {
+    this.dirs.clear();
+    this.expandedDirs.clear();
+    this.rowsCache = null;
+    this.rowsCacheFilter = "";
+    this.fileCount = 0;
+    this.complete = null;
+    this.emptyFolders = null;
+    this.applied = 0;
+    this.misplacedUpserts = 0;
+  }
+
   // ---- applying messages -------------------------------------------------
 
   apply(message: TreeMessage): void {
