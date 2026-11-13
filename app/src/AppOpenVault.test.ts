@@ -8,10 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 type Handler = (event: { payload: unknown }) => void;
 const handlers = new Map<string, Handler>();
 let chooseImpl: () => Promise<unknown> = () => Promise.resolve(null);
-const chooseCalls = vi.hoisted(() => ({ n: 0 }));
+const chooseCalls = vi.hoisted(() => ({ n: 0, openTree: 0 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((cmd: string) => {
+    if (cmd === "open_tree") chooseCalls.openTree += 1;
     if (cmd === "choose_vault") {
       chooseCalls.n += 1;
       return chooseImpl();
@@ -43,6 +44,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   handlers.clear();
   chooseCalls.n = 0;
+  chooseCalls.openTree = 0;
   chooseImpl = () => Promise.resolve(null);
   window.__SERAT_BOOT__ = { vault: "/a", vault_id: "A", open: null, exit_after_ready: false } as never;
   vi.stubGlobal("requestAnimationFrame", () => 0);
@@ -173,6 +175,80 @@ describe("adopting a new vault", () => {
     expect(editor.getText()).toBe("old note");
     expect(store.vaultId).toBe("A");
     expect(store.vaultRoot).toBe("/a");
+    wrapper.unmount();
+  });
+});
+
+describe("the file tree follows the chosen vault (#151 round 2)", () => {
+  async function runCommand(wrapper: ReturnType<typeof mount>) {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await flushPromises();
+    await wrapper.get('[data-testid="command-palette"] input').setValue("Open vault");
+    await wrapper.get('[data-testid="command-palette"] input').trigger("keydown", { key: "Enter" });
+    await flushPromises();
+  }
+
+  it("open_tree is invoked again after a non-null answer, from the no-vault state", async () => {
+    window.__SERAT_BOOT__ = { open: null, exit_after_ready: false } as never;
+    chooseImpl = () => Promise.resolve(OPENED_B);
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    const before = chooseCalls.openTree;
+    await wrapper.get('[data-testid="no-vault-open"]').trigger("click");
+    await flushPromises();
+    expect(chooseCalls.openTree).toBe(before + 1);
+    wrapper.unmount();
+  });
+
+  it("on a switch, and not for null or an Err", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    const before = chooseCalls.openTree;
+    await runCommand(wrapper); // null
+    expect(chooseCalls.openTree).toBe(before);
+    chooseImpl = () => Promise.resolve(OPENED_B);
+    await runCommand(wrapper);
+    expect(chooseCalls.openTree).toBe(before + 1);
+    wrapper.unmount();
+  });
+
+  it("refuses to switch while the open note has unsaved text, and says why", async () => {
+    const pinia = createPinia();
+    const wrapper = mount(App, { global: { plugins: [pinia] }, attachTo: document.body });
+    await flushPromises();
+    const editor = wrapper.findComponent(CodeMirrorEditor).vm as unknown as {
+      loadNote(t: string, p: string, h: string): Promise<boolean>;
+      getView(): { dispatch(spec: unknown): void } | undefined;
+      getText(): string;
+    };
+    await editor.loadNote("old", "a.md", "h1");
+    editor.getView()?.dispatch({ changes: { from: 3, insert: "!" } });
+    chooseImpl = () => Promise.resolve(OPENED_B);
+    await runCommand(wrapper);
+    expect(chooseCalls.n).toBe(0);
+    expect(useVaultStore(pinia).marksText).toContain("not switching vault");
+    expect(editor.getText()).toBe("old!");
+    wrapper.unmount();
+  });
+});
+
+describe("the editor is read-only from the closing ack until the new vault is adopted (#151)", () => {
+  it("freezes on app://closing, thaws on adopt", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    const editor = wrapper.findComponent(CodeMirrorEditor).vm as unknown as {
+      loadNote(t: string, p: string, h: string): Promise<boolean>;
+      getView(): { state: { readOnly: boolean } } | undefined;
+    };
+    await editor.loadNote("old", "a.md", "h1");
+    expect(editor.getView()?.state.readOnly).toBe(false);
+    handlers.get("app://closing")?.({ payload: { vault_id: "A" } });
+    await flushPromises();
+    expect(editor.getView()?.state.readOnly).toBe(true);
+    handlers.get("vault://opened")?.({ payload: OPENED_B });
+    await flushPromises();
+    await editor.loadNote("new", "b.md", "h2");
+    expect(editor.getView()?.state.readOnly).toBe(false);
     wrapper.unmount();
   });
 });

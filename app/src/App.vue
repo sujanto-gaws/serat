@@ -299,6 +299,7 @@ const noVault = computed(() => bootRead.value && (store.vaultRoot === null || !s
 /** #80's rule: the editor closes any buffer of the previous vault BEFORE the new id is adopted. */
 function resetForNewVault(): void {
   editorRef.value?.closeNote();
+  editorRef.value?.thaw(); // frozen since the closing ack; the new vault starts editable
   store.setOpenBuffer(null, null);
   viewing.value = null;
   editorDirty.value = false;
@@ -316,10 +317,22 @@ async function openVaultDialog(): Promise<void> {
   if (openingVault) return;
   openingVault = true;
   const before = store.vaultId;
+  // The close flush cannot save a conflicted, deleted or unsaved buffer, and the switch discards it: refuse
+  // before the dialog opens, with the reason, rather than lose text (#151).
+  const unsafe = editorRef.value?.unsafeToClose() ?? null;
+  if (unsafe !== null) {
+    store.setMark(`not switching vault: ${unsafe}. Resolve it first.`);
+    openingVault = false;
+    return;
+  }
   try {
     const opened = await chooseVault();
-    if (opened) adoptOpened(opened); // null = cancelled: nothing changes
+    if (opened) {
+      adoptOpened(opened); // null = cancelled: nothing changes
+      treeRef.value?.reopen(); // from the ANSWER, when the new vault is installed; the event comes earlier
+    } else editorRef.value?.thaw();
   } catch (e) {
+    editorRef.value?.thaw(); // a switch that failed before the close leaves the old buffer editable
     // `Err` after `vault://opened` means the window has no vault open (#103): reset, then drop every event.
     if (store.vaultId !== before) {
       resetForNewVault();

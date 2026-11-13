@@ -29,7 +29,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
-import { ChangeSet, Compartment, EditorState, type Extension, Transaction } from "@codemirror/state";
+import { ChangeSet, Compartment, EditorState, type Extension, Prec, Transaction } from "@codemirror/state";
 import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
 
 import type { CommandRegistry } from "@/editor/commands";
@@ -523,6 +523,7 @@ async function onClosing(closing: AppClosing): Promise<void> {
   // Never removed: one close, one flush, one ack per vault id, literally (ids are unique per open).
   if (closingSeen.has(closing.vault_id)) return;
   closingSeen.add(closing.vault_id);
+  freeze(); // from here to the adoption nothing typed could be saved (#151)
 
   try {
     if (autosaveTimer) {
@@ -636,8 +637,35 @@ const unsubscribeRegistry = registry.subscribe(() => {
   }
 });
 
+/** True from the close ack of a vault switch until the new vault is adopted (or the switch is known not to
+ * have happened): typing then would be lost with the buffer (#151). */
+let frozen = false;
+const freezeCompartment = new Compartment();
+const FROZEN_EXTENSIONS: Extension = Prec.highest([EditorState.readOnly.of(true), EditorView.editable.of(false)]);
+
+/** Read-only until `thaw` or the buffer is closed. */
+function freeze(): void {
+  frozen = true;
+  view?.dispatch({ effects: freezeCompartment.reconfigure(FROZEN_EXTENSIONS) });
+}
+function thaw(): void {
+  frozen = false;
+  view?.dispatch({ effects: freezeCompartment.reconfigure([]) });
+}
+
+/** Why a vault switch must not start now, or `null` when nothing would be lost: the close flush cannot
+ * save a conflicted, deleted or unsaved buffer, and the switch then discards it (#151). */
+function unsafeToClose(): string | null {
+  if (!buffer) return null;
+  if (conflict.value !== null) return "the open note has a conflict with the file on disk";
+  if (deleted.value) return "the open note was deleted on disk and has unsaved text";
+  if (blocked.value || buffer.isDirty) return "the open note has changes that could not be saved yet";
+  return null;
+}
+
 function buildExtensions(livePreview: boolean): Extension[] {
   return [
+    freezeCompartment.of(frozen ? FROZEN_EXTENSIONS : []),
     lineNumbers(),
     // Read-only until `loadNote` installs a buffer: text typed in any earlier
     // window would have no base to be a patch against (C-04, NFR-REL-01).
@@ -817,6 +845,7 @@ function closeNote(): void {
   }
   buffer = null;
   bufferVaultId = null;
+  frozen = false; // the placeholder is read-only anyway; the next loadNote starts editable
   held = [];
   conflict.value = null;
   deleted.value = false;
@@ -881,6 +910,8 @@ defineExpose({
   revealOffset,
   loadNote,
   closeNote,
+  unsafeToClose,
+  thaw,
   triggerSave,
   compareWithDisk,
   isDirty,
