@@ -4,7 +4,7 @@
 import { CompletionContext, type Completion, type CompletionResult } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import { LinkResolver } from "@/editor/linkResolver";
 import {
@@ -58,7 +58,7 @@ function resolveOne(target: string): LinkResolution {
   return { target, path: hits[0]?.path ?? null, subpath_found: null, via: "index" };
 }
 
-function fakeLinks(corpus: SwitcherCorpus = "index"): LinkIpcAdapter & { resolveLinks: ReturnType<typeof vi.fn>; switcherQuery: ReturnType<typeof vi.fn> } {
+function fakeLinks(corpus: SwitcherCorpus = "index"): LinkIpcAdapter & { resolveLinks: ReturnType<typeof vi.fn>; switcherQuery: Mock<LinkIpcAdapter["switcherQuery"]> } {
   return {
     resolveLinks: vi.fn(async ({ targets }: { targets: string[] }) => targets.map(resolveOne)),
     noteAnchors: vi.fn(async ({ path }: { path: string }) => {
@@ -316,7 +316,7 @@ describe("[[ completion", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const first = ipc.switcherQuery.getMockImplementation()!;
-    ipc.switcherQuery.mockImplementationOnce(async (args: { seq: number; query: string }) => {
+    ipc.switcherQuery.mockImplementationOnce(async (args) => {
       await gate;
       return first(args);
     });
