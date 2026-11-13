@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { describeIndexState } from "./vault";
+import { createPinia, setActivePinia } from "pinia";
 
+import type { IndexState } from "@/ipc/generated/IndexState";
+
+import { describeIndexDetail, describeIndexState, useVaultStore } from "./vault";
+
+// Serves NFR-REL-01, NFR-REL-02, FR-VLT-04, US-01, US-07.
 // Exhaustive over IndexState's four variants (contracts/ipc.rs). §3.4: every one of
 // them renders as a status line, never a modal and never a blocking spinner — this
 // asserts each has a defined, non-empty rendering rather than assuming the switch
 // covers them all.
 describe("describeIndexState", () => {
   it("renders opening", () => {
-    expect(describeIndexState({ kind: "opening" })).toBe("index: opening");
+    expect(describeIndexState({ kind: "opening" })).toBe("Opening index…");
   });
 
   it("renders ready with the note count", () => {
@@ -48,5 +53,56 @@ describe("describeIndexState", () => {
       path: "/vault/.serat/index.sqlite3",
     });
     expect(text).toBe("index: unavailable — task I6 not implemented");
+  });
+});
+
+describe("opening reason (P1 #117)", () => {
+  const waiting = { kind: "opening", reason: "previous_index_still_closing" } as const;
+
+  it("renders the reason copy, with no internal term or number", () => {
+    const text = describeIndexState(waiting);
+    expect(text).toBe("Finishing the previous session's index — search will start when it's done");
+    // \d: no count or percentage for this state (brief, "No fake progress").
+    expect(text).not.toMatch(/actor|writer|detached|index\.db|lock|\d/i);
+    expect(describeIndexDetail(waiting)).toContain("You can keep editing.");
+  });
+
+  it("renders absent, null and unknown reasons as the plain text without throwing", () => {
+    for (const s of [
+      { kind: "opening" },
+      { kind: "opening", reason: null },
+      { kind: "opening", reason: "held_by_another_process" },
+    ]) {
+      expect(describeIndexState(s as unknown as IndexState)).toBe("Opening index…");
+      expect(describeIndexDetail(s as unknown as IndexState)).toBeNull();
+    }
+  });
+
+  it("clears the reason when the state moves to Ready or Rebuilding", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.setIndexState(waiting);
+    expect(store.indexStatusDetail).not.toBeNull();
+    store.setIndexState({ kind: "ready", note_count: 3 });
+    expect(store.indexStatusText).toBe("index: ready · 3 notes");
+    expect(store.indexStatusDetail).toBeNull();
+  });
+});
+
+describe("seeding from VaultOpened (P1 #117)", () => {
+  it("shows the waiting reason from vault://opened, announces it once, and a later Opening{None} clears it", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened({
+      root: "/v",
+      vault_id: "V",
+      index: { kind: "opening", reason: "previous_index_still_closing" },
+    } as never);
+    expect(store.indexStatusText).toContain("Finishing the previous session's index");
+    expect(store.indexStatusDetail).not.toBeNull();
+    expect(store.indexAnnouncement).toBe(store.indexStatusText);
+    store.setIndexState({ kind: "opening" });
+    expect(store.indexStatusText).toBe("Opening index…");
+    expect(store.indexStatusDetail).toBeNull();
   });
 });

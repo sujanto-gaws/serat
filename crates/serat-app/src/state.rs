@@ -556,6 +556,12 @@ pub struct AppState {
     /// Test seam (task #49): a note whose `read_file` sleeps, standing for a slow disk.
     #[cfg(test)]
     pub(crate) slow_read: Mutex<Option<(String, std::time::Duration)>>,
+    /// Test seam (task #133): how long `update_settings` holds the settings lock, standing
+    /// for a slow settings-file write, and a channel it signals once the lock is taken so a
+    /// test waits on the fact rather than on a sleep.
+    #[cfg(test)]
+    pub(crate) slow_settings_write:
+        Mutex<Option<(std::time::Duration, std::sync::mpsc::Sender<()>)>>,
 }
 
 /// The bound on the wait for `flush_ack` (`contracts/ipc.rs::CLOSING_FLUSH_DEADLINE_MS`).
@@ -627,6 +633,8 @@ impl AppState {
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
+            #[cfg(test)]
+            slow_settings_write: Mutex::new(None),
             boot,
             settings: Mutex::new(loaded.settings),
             settings_path: loaded.path,
@@ -657,6 +665,8 @@ impl AppState {
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
+            #[cfg(test)]
+            slow_settings_write: Mutex::new(None),
             boot,
             settings: Mutex::new(settings),
             settings_path: None,
@@ -1472,6 +1482,19 @@ impl AppState {
         change: impl FnOnce(&mut Settings) -> Result<(), IpcError>,
     ) -> Result<(), IpcError> {
         let mut guard = self.lock_settings();
+        #[cfg(test)]
+        {
+            // Copied out first: the seam's own mutex is not held through the sleep.
+            let seam = self
+                .slow_settings_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((hold, taken)) = seam {
+                let _ = taken.send(());
+                std::thread::sleep(hold);
+            }
+        }
         let mut next = guard.clone();
         change(&mut next)?;
         if let Some(path) = &self.settings_path {
@@ -1568,6 +1591,8 @@ impl AppState {
     /// no vault open.
     pub fn backlinks(&self, args: NotePathArgs) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
         let path = Self::vault_path(&args.path)?;
+        #[cfg(test)]
+        self.slow_read_seam(path.as_str());
         let (root, state, _, _) = self.read_context()?;
         Ok(crate::reads::read_when_ready(
             state,
