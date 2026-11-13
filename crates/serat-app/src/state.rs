@@ -380,6 +380,10 @@ pub(crate) struct OpenHooks {
     /// Make the deferred index-actor spawn fail (task #96 review SF-1).
     #[cfg(test)]
     pub(crate) fail_deferred_spawn: bool,
+    /// Judge names by another platform's rules (task #35), so Windows-only refusals are
+    /// testable end to end on any runner.
+    #[cfg(test)]
+    pub(crate) platform: Option<serat_core::Platform>,
     /// Mutant switch for task #96's test: ignore the detached-writer registry.
     #[cfg(test)]
     pub(crate) skip_registry_check: bool,
@@ -771,9 +775,14 @@ impl AppState {
     ) -> Result<VaultOpened, IpcError> {
         let opening = self.lock_opening();
         let requested = PathBuf::from(&args.root);
-        let vault = Arc::new(
-            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?,
-        );
+        let opened =
+            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?;
+        #[cfg(test)]
+        let opened = match self.hooks.platform {
+            Some(platform) => opened.with_platform(platform),
+            None => opened,
+        };
+        let vault = Arc::new(opened);
         let root = vault.root().to_path_buf();
 
         // The new root is valid; only now is the old vault closed, and *before* the new
@@ -791,10 +800,27 @@ impl AppState {
         // old vault is closed and the new id is minted, before anything that can carry
         // that id exists. The three steps below can still fail through `?`; the front end
         // then treats the window as having no vault open (see `VAULT_OPENED_EVENT`).
+        // ADR-0001 (task #96): if an actor detached by an earlier close still holds this
+        // root's index, the open is deferred and says why (task #117), from the first word
+        // the front end hears.
+        #[cfg(test)]
+        let skip_check = self.hooks.skip_registry_check;
+        #[cfg(not(test))]
+        let skip_check = false;
+        let blocker = if skip_check {
+            None
+        } else {
+            self.detached.live(vault.identity())
+        };
+        let opening_reason = blocker
+            .as_ref()
+            .map(|_| crate::ipc::OpeningReason::PreviousIndexStillClosing);
         self.events.emit_opened(&VaultOpened {
             root: root.display().to_string(),
             vault_id: vault_id.clone(),
-            index: IndexState::Opening { reason: None },
+            index: IndexState::Opening {
+                reason: opening_reason,
+            },
         });
         let publisher = Arc::new(
             Publisher::new(
@@ -802,10 +828,14 @@ impl AppState {
                 Arc::clone(&self.startup),
                 Arc::clone(&self.events),
             )
+            .with_opening_reason(opening_reason)
             // FR-VLT-01: a name the walk or the watcher refused is counted into every
             // status, so "N names not shown" is a fact of the status, not a second poll.
             .with_refusals(vault.refusals().clone()),
         );
+        // Task #35: a refusal after the open (the watcher's) reaches the front end now,
+        // not with the next state change.
+        publisher.watch_refusals();
         #[cfg(test)]
         if let Some(probe) = &self.hooks.publisher_probe {
             *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
@@ -830,15 +860,6 @@ impl AppState {
         // the publisher stays at `Opening` -- and a thread starts it once that one has
         // exited. Nothing here waits, and `opening` is not held across the wait. The
         // catch-up gate's settle clock does not start until that actor exists.
-        #[cfg(test)]
-        let skip_check = self.hooks.skip_registry_check;
-        #[cfg(not(test))]
-        let skip_check = false;
-        let blocker = if skip_check {
-            None
-        } else {
-            self.detached.live(vault.identity())
-        };
         let catch_up_gate = Arc::new(if blocker.is_some() {
             OpenCatchUp::awaiting_actor(self.settle_bound, TREE_GRACE)
         } else {
@@ -893,6 +914,10 @@ impl AppState {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     let unavailable_path = dir.display().to_string();
+                    // The previous actor has exited: the reason no longer holds. Cleared
+                    // before the real actor exists, so its first state replaces a plain
+                    // `Opening` and the strip never keeps a reason past the wait.
+                    unavailable.publish(IndexState::Opening { reason: None });
                     let installed = cell.install(|| {
                         #[cfg(test)]
                         if fail_spawn {
@@ -5544,10 +5569,25 @@ mod tests {
             .expect("the re-open succeeds");
         assert_eq!(
             opened.index,
-            IndexState::Opening { reason: None },
-            "no actor yet: it must wait"
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "no actor yet: it must wait, and say why"
+        );
+        // While deferred the polled status carries the same reason (task #117).
+        assert_eq!(
+            second.index_status().state,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "the 700 ms blocker is still running"
         );
         wait_ready(&second);
+        // Ready carries no reason; and a plain open never gets one.
+        assert!(matches!(
+            second.index_status().state,
+            IndexState::Ready { .. }
+        ));
         assert_eq!(
             slow.max.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -5643,7 +5683,13 @@ mod tests {
                 fast,
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         wait_ready(&second);
         wait_until("the catch-up walk", || {
             !walks.lock().expect("walks").is_empty()
@@ -5694,7 +5740,13 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5760,7 +5812,13 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("the vault opens without an actor");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         wait_until("Unavailable", || {
             matches!(second.index_status().state, IndexState::Unavailable { .. })
         });
@@ -5802,7 +5860,13 @@ mod tests {
 
         let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
         let opened = open_dir_real(&second, &dir);
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         // The tree's refused catch-up is owed as a rescan; the real actor runs it.
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
