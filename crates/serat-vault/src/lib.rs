@@ -435,14 +435,30 @@ impl Vault {
         path: &VaultPath,
         after_stat: impl FnOnce(),
     ) -> Result<LoadedNote, VaultError> {
+        self.read_via(path, after_stat, |file| file)
+    }
+
+    /// [`Vault::read_hooked`] reading through `wrap(file)`, so a test can hand the read
+    /// a reader that fails part-way. Any read error is returned as [`VaultError::Io`],
+    /// never as the bytes read so far (ADR-0018 §1: a prefix hashed and patched would
+    /// truncate the note). A reader that hits EOF early (the file shrank after the stat)
+    /// returns fewer bytes than `stat.len()`; that is `Ok`, and the hash or mtime check
+    /// catches the change.
+    fn read_via<R: std::io::Read>(
+        &self,
+        path: &VaultPath,
+        after_stat: impl FnOnce(),
+        wrap: impl FnOnce(fs::File) -> R,
+    ) -> Result<LoadedNote, VaultError> {
         let absolute = self.resolve(path)?;
         // One open, stat the handle, then read from it. The mtime must be taken
         // *before* the bytes: a write landing between the two then leaves an old
         // mtime beside the new hash, which the next mtime comparison catches. The
         // other order records the new mtime beside the old hash and hides the change.
         let io = |err: std::io::Error| VaultError::io(path.as_str(), &err);
-        let mut file = fs::File::open(&absolute).map_err(io)?;
+        let file = fs::File::open(&absolute).map_err(io)?;
         let stat = file.metadata().map_err(io)?;
+        let mut file = wrap(file);
         after_stat();
         let mut bytes = Vec::with_capacity(usize::try_from(stat.len()).unwrap_or(0));
         std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
@@ -722,6 +738,30 @@ impl Vault {
         before_rename: impl FnOnce(),
         after_commit: impl FnOnce(),
     ) -> Result<Written, VaultError> {
+        self.write_patch_core(
+            path,
+            base_hash,
+            edits,
+            |target: &Path| fs::read(target),
+            before_rehash,
+            before_rename,
+            after_commit,
+        )
+    }
+
+    /// [`Vault::write_patch_seams`] with the step 1 base read injectable, so a test
+    /// can fail it (ADR-0018 §1: an `Err` is never acted on as though it were content).
+    #[allow(clippy::too_many_arguments)]
+    fn write_patch_core(
+        &self,
+        path: &VaultPath,
+        base_hash: ContentHash,
+        edits: &[patch::Edit],
+        read_base: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+        before_rehash: impl FnOnce(),
+        before_rename: impl FnOnce(),
+        after_commit: impl FnOnce(),
+    ) -> Result<Written, VaultError> {
         if !path.is_markdown() {
             return Err(VaultError::NotAMarkdownTarget {
                 path: path.as_str().to_owned(),
@@ -744,7 +784,8 @@ impl Vault {
         // Step 1: the hash lock. A delete or a rewrite between the caller's read
         // and this call surfaces here rather than silently patching the wrong
         // bytes.
-        let current_bytes = fs::read(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        let current_bytes =
+            read_base(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
         let current_hash = hash_bytes(&current_bytes);
         if current_hash != base_hash {
             return Err(stale(current_hash));

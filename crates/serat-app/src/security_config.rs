@@ -102,7 +102,7 @@ mod tests {
         );
         assert!(
             directives.contains(
-                &"connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost"
+                &"connect-src 'self' ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost"
             ),
             "tauri.conf.json's CSP no longer pins connect-src to the canonical narrow \
              value (was {csp:?}) — task P0 #117 / F-423(c): with no connect-src directive \
@@ -115,7 +115,11 @@ mod tests {
              T-02's enforcement moves from default-src's fallback to this directive \
              once it is set explicitly, so a wider value here would take over that \
              enforcement silently; confirmed with vue-frontend-dev that nothing in \
-             app/src makes any other network-shaped call (F-423(c), P0 #117)."
+             app/src makes any other network-shaped call (F-423(c), P0 #117). \
+             `'self'` was added by task #127 (ADR-0017 item 6, Amendment 2): pdf.js \
+             fetches its bundled cMaps and standard fonts as same-origin relative URLs, \
+             which `connect-src` governs; it is first-party only, and `form-action` and \
+             `base-uri` stay 'none' so a re-pointed base cannot redirect those fetches."
         );
         assert!(
             directives.contains(&"img-src 'self' serat-asset: http://serat-asset.localhost"),
@@ -182,7 +186,7 @@ mod tests {
         // is 'none'. A new directive, or a new source on an old one, fails here.
         const EXPECTED: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
             img-src 'self' serat-asset: http://serat-asset.localhost; \
-            connect-src ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost; \
+            connect-src 'self' ipc: http://ipc.localhost serat-asset: http://serat-asset.localhost; \
             frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
         let csp = tauri_conf()["app"]["security"]["csp"]
             .as_str()
