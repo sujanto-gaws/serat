@@ -43,6 +43,32 @@ pub async fn open_vault(
     state.open_vault_off_thread(args).await
 }
 
+/// `choose_vault() -> Result<Option<VaultOpened>, IpcError>`
+///
+/// Shows the native folder dialog and opens the folder the user picks (task #151, US-01).
+/// The webview sends no path and the dialog is not exposed to it: the plugin is called from
+/// here only. `Ok(None)` is a cancelled dialog and changes nothing.
+///
+/// # Errors
+///
+/// As [`AppState::open_vault`].
+#[tauri::command]
+pub async fn choose_vault(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<VaultOpened>, IpcError> {
+    use tauri_plugin_dialog::DialogExt as _;
+    state
+        .choose_vault_off_thread(move || {
+            // Blocks the pool thread until the user answers; never the webview's.
+            app.dialog()
+                .file()
+                .blocking_pick_folder()
+                .and_then(|picked| picked.into_path().ok())
+        })
+        .await
+}
+
 /// `read_file(args) -> Result<FileContents, IpcError>`
 ///
 /// # Errors

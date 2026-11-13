@@ -264,6 +264,7 @@ mod tests {
             "allow-set-live-preview",
             "allow-create-folder",
             "allow-asset-info",
+            "allow-choose-vault",
             "allow-index-status",
             "allow-mark-first-paint",
             "allow-mark-tree",

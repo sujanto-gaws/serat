@@ -1207,6 +1207,7 @@ impl AppState {
             previous.shut_down(&self.detached);
         }
         attempt.commit();
+        self.record_last_vault(&root);
 
         Ok(VaultOpened {
             root: root.display().to_string(),
@@ -1856,6 +1857,68 @@ impl AppState {
         match &self.settings_path {
             Some(path) => settings.save_to(path),
             None => Ok(()),
+        }
+    }
+
+    /// Remember `root` as the vault to reopen at launch (task #151), on every successful
+    /// open and not only when a note is remembered. A benchmark run never touches the
+    /// user's settings, an unchanged value is not rewritten, and a failed write is logged
+    /// and changes nothing: the open already succeeded.
+    fn record_last_vault(&self, root: &std::path::Path) {
+        if self.boot.exit_after_ready || self.boot.exit_after_walk {
+            return;
+        }
+        let shown = root.display().to_string();
+        let settings = {
+            let mut settings = self.lock_settings();
+            if settings.last_vault.as_deref() == Some(shown.as_str()) {
+                return;
+            }
+            settings.last_vault = Some(shown);
+            settings.clone()
+        };
+        if let Some(path) = &self.settings_path
+            && let Err(problem) = settings.save_to(path)
+        {
+            eprintln!("serat: settings not saved: {problem}");
+        }
+    }
+
+    /// The vault to open at launch when `--vault` was not given (task #151): the remembered
+    /// one, if it still exists and is a directory. `None` otherwise, silently: a vault that
+    /// moved is "no vault", not an error. Never under `--exit-after-ready` or
+    /// `--exit-after-walk` (a measurement opens only what it was told to), and never when
+    /// `--vault` was given.
+    #[must_use]
+    pub fn launch_last_vault(&self) -> Option<PathBuf> {
+        if self.boot.vault.is_some() || self.boot.exit_after_ready || self.boot.exit_after_walk {
+            return None;
+        }
+        let remembered = self.lock_settings().last_vault.clone()?;
+        let path = PathBuf::from(remembered);
+        path.is_dir().then_some(path)
+    }
+
+    /// `choose_vault`, with the folder dialog supplied as `pick` (task #151, US-01). The
+    /// webview never sends a path: `pick` is the native dialog, run on the calling thread,
+    /// which must not be the webview's. A cancelled dialog is `Ok(None)` and changes
+    /// nothing; a chosen folder goes through the same switch as any open (validate it,
+    /// flush and close the current vault, spawn the new one, all under `opening`).
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::open_vault`].
+    pub fn choose_vault_with(
+        &self,
+        pick: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<Option<VaultOpened>, IpcError> {
+        match pick() {
+            None => Ok(None),
+            Some(root) => self
+                .open_vault(OpenVaultArgs {
+                    root: root.display().to_string(),
+                })
+                .map(Some),
         }
     }
 
@@ -5328,6 +5391,191 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    // Task #151. `choose_vault_with` is `open_vault` behind a picker, so the ordering this pins
+    // is the existing switch's (see the #90/#103 tests above); no separate mutant was run.
+    #[test]
+    fn choose_vault_switches_through_the_same_path_closing_the_old_vault_first() {
+        let (state, log, a, b) = switch_state("choose-vault", |_| OpenHooks::default(), true);
+        let first = open_dir(&state, &a).expect("open A");
+        wait_ready(&state);
+        open_note(&state);
+        let a_id = first.vault_id;
+
+        let b_root = b.clone();
+        let opened = state
+            .choose_vault_with(move || Some(b_root))
+            .expect("the switch")
+            .expect("a chosen folder is opened");
+        assert_ne!(opened.vault_id, a_id);
+        assert_eq!(state.vault_id().as_deref(), Some(opened.vault_id.as_str()));
+
+        let log = log.lock().expect("log").clone();
+        let closing_a = log
+            .iter()
+            .position(|e| *e == ("app://closing", a_id.clone()))
+            .expect("A's flush");
+        let opened_b = log
+            .iter()
+            .position(|e| *e == ("vault://opened", opened.vault_id.clone()))
+            .expect("vault://opened for B");
+        assert!(closing_a < opened_b, "{log:?}");
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_cancelled_choose_vault_changes_nothing() {
+        let (state, log, a, b) = switch_state("choose-cancel", |_| OpenHooks::default(), true);
+        let first = open_dir(&state, &a).expect("open A");
+        wait_ready(&state);
+        let before = log.lock().expect("log").len();
+        assert!(
+            state
+                .choose_vault_with(|| None)
+                .expect("no error")
+                .is_none()
+        );
+        assert_eq!(state.vault_id().as_deref(), Some(first.vault_id.as_str()));
+        assert_eq!(
+            log.lock()
+                .expect("log")
+                .iter()
+                .filter(|(k, _)| *k == "vault://opened" || *k == "app://closing")
+                .count(),
+            1,
+            "a cancel emitted a switch event ({before} events before)"
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_chosen_folder_that_cannot_be_opened_is_an_error_and_keeps_the_open_vault() {
+        let (state, _log, a, b) = switch_state("choose-bad", |_| OpenHooks::default(), true);
+        let first = open_dir(&state, &a).expect("open A");
+        let missing = b.join("no-such-dir");
+        let err = state
+            .choose_vault_with(move || Some(missing))
+            .expect_err("not a vault");
+        assert!(matches!(err, IpcError::VaultNotFound { .. }), "{err:?}");
+        assert_eq!(state.vault_id().as_deref(), Some(first.vault_id.as_str()));
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    fn state_remembering(last_vault: Option<String>, boot: Boot) -> AppState {
+        let settings = Settings {
+            last_vault,
+            ..Settings::default()
+        };
+        AppState::with_settings(Arc::new(Startup::begin()), boot, settings)
+    }
+
+    #[test]
+    fn launch_reopens_a_remembered_directory_and_silently_skips_a_stale_one() {
+        let dir = fixture("last-vault");
+        let shown = dir.display().to_string();
+        let state = state_remembering(Some(shown.clone()), Boot::default());
+        assert_eq!(state.launch_last_vault(), Some(dir.clone()));
+
+        // Gone, a file, or never set: no vault, no error.
+        let gone = dir.join("moved-away");
+        assert_eq!(
+            state_remembering(Some(gone.display().to_string()), Boot::default())
+                .launch_last_vault(),
+            None
+        );
+        let file = dir.join("10-projects/serat.md");
+        assert_eq!(
+            state_remembering(Some(file.display().to_string()), Boot::default())
+                .launch_last_vault(),
+            None
+        );
+        assert_eq!(
+            state_remembering(None, Boot::default()).launch_last_vault(),
+            None
+        );
+
+        // `--vault` wins, and a measurement opens only what it was told to.
+        let explicit = Boot {
+            vault: Some(dir.clone()),
+            ..Boot::default()
+        };
+        assert_eq!(
+            state_remembering(Some(shown.clone()), explicit).launch_last_vault(),
+            None
+        );
+        for boot in [
+            Boot {
+                exit_after_ready: true,
+                ..Boot::default()
+            },
+            Boot {
+                exit_after_walk: true,
+                ..Boot::default()
+            },
+        ] {
+            assert_eq!(
+                state_remembering(Some(shown.clone()), boot).launch_last_vault(),
+                None
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_successful_open_remembers_the_vault_but_a_benchmark_does_not() {
+        let (a, b) = (fixture("remember-a"), fixture("remember-b"));
+        let state = state_remembering(None, Boot::default());
+        let opened = state
+            .open_vault(OpenVaultArgs {
+                root: a.display().to_string(),
+            })
+            .expect("open A");
+        assert_eq!(state.lock_settings().last_vault, Some(opened.root));
+        let second = state
+            .choose_vault_with({
+                let b = b.clone();
+                move || Some(b)
+            })
+            .expect("switch")
+            .expect("opened");
+        assert_eq!(state.lock_settings().last_vault, Some(second.root));
+        // A refused open leaves it alone.
+        let _ = state.open_vault(OpenVaultArgs {
+            root: a.join("nope").display().to_string(),
+        });
+        assert_eq!(
+            state.lock_settings().last_vault.as_deref(),
+            Some(second_root_of(&state).as_str())
+        );
+        state.close_vault();
+
+        let measuring = state_remembering(
+            None,
+            Boot {
+                exit_after_ready: true,
+                ..Boot::default()
+            },
+        );
+        measuring
+            .open_vault(OpenVaultArgs {
+                root: a.display().to_string(),
+            })
+            .expect("open");
+        assert_eq!(measuring.lock_settings().last_vault, None);
+        measuring.close_vault();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    fn second_root_of(state: &AppState) -> String {
+        state.vault_root().expect("open").display().to_string()
     }
 
     #[test]
