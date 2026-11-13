@@ -39,22 +39,34 @@
 //! `decline_gitignore_offer`, `set_live_preview`, `set_keybinding`, the settings write inside
 //! `mark_vault_usable`) goes through [`blocking`] too.
 //!
-//! # Still on a Tokio worker
+//! # Reads routed here on evidence (task #133)
 //!
-//! `backlinks`, `open_tree`, `note_closed`, `get_ui_settings` and `refused_names` are sync
-//! `command(async)` functions, not routed here: they are index or tree reads, or in-memory
-//! lookups, that wait on their own bounded locks rather than doing note I/O. Moving them is
-//! a separate change, tracked as #133.
+//! `backlinks` opens a SQLite read connection and queries it (file I/O), and
+//! `get_ui_settings` takes the settings lock, which `update_settings` holds across the
+//! settings-file write, so it can wait on disk. Both go through [`blocking`].
+//!
+//! # Left on a Tokio worker, and why
+//!
+//! These stay sync `command(async)` functions because nothing on their path does file I/O
+//! or waits on a lock that is held across any:
+//!
+//! * `note_closed`: one `Buffers` map operation under its leaf mutex (no I/O, no other lock).
+//! * `refused_names`: clones at most 1,000 entries from the refusal log under its leaf mutex.
+//! * `open_tree`: takes short leaf mutexes (feed state, marks) and spawns the `serat-tree`
+//!   thread; the walk and every send happen on that thread, never in the command.
+//!
+//! The vault-open lock they all take is held exclusively only for a `replace` or `take`;
+//! the close's flush and join run after it is released.
 //!
 //! Nothing here is domain logic: each method is `blocking(|| self.x(args))`.
 
 use std::sync::Arc;
 
 use crate::ipc::{
-    AssetArgs, AssetInfo, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
-    FolderCreated, GitignoreAppended, GitignoreOffer, IpcError, NoteBufferArgs, OpenVaultArgs,
-    Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, SavePatchArgs, SetKeybindingArgs,
-    SetLivePreviewArgs, VaultOpened, WriteFileArgs,
+    AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IpcError, NoteBufferArgs,
+    NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs,
+    SavePatchArgs, SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::state::AppState;
 
@@ -225,6 +237,31 @@ impl AppState {
         blocking(move || state.set_keybinding(args)).await
     }
 
+    /// [`AppState::backlinks`] on the blocking pool: it opens a SQLite read connection and
+    /// queries it.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::backlinks`].
+    pub async fn backlinks_off_thread(
+        self: &Arc<Self>,
+        args: NotePathArgs,
+    ) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.backlinks(args)).await
+    }
+
+    /// [`AppState::get_ui_settings`] on the blocking pool: the settings lock is held across
+    /// the settings-file write by `update_settings`, so a read can wait on disk.
+    ///
+    /// # Errors
+    ///
+    /// Only a panicked job ([`IpcError::Io`]); the read itself cannot fail.
+    pub async fn get_ui_settings_off_thread(self: &Arc<Self>) -> Result<UiSettings, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || Ok(state.get_ui_settings())).await
+    }
+
     /// [`AppState::gitignore_offer_status`] on the blocking pool (it stats `.git` and reads
     /// `.gitignore` and the declined marker).
     ///
@@ -267,3 +304,6 @@ impl AppState {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reads_tests;
