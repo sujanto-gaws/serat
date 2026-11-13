@@ -36,16 +36,24 @@ In every case the name, size and mtime are on disk and the bytes are not. Readin
 
 Two pieces ship in P1 because they cost little and stop the worst outcome:
 1. **A failed or interrupted read is an error, never zero bytes.** This is a goal-1 invariant: a patch or a diff built on an empty "read" would truncate the note. `Vault::read` returns `Err` when the read fails part-way, and never `Ok` with what it had read. The save path and reconciliation never act on an `Err` as though it were content. Tests are in §Tested against.
-2. **`serat_core::locality::is_local(platform, raw)`**, the pure predicate of §P2 rule item 1, with unit tests and no callers yet. The P2 work then starts from a tested function, and the predicate's facts are settled while #77's runner is being stood up.
+2. **`serat_core::locality`**, the predicates of §P2 rule item 1, with unit tests and no callers yet. *(Amended by task #150 to the shape #143 shipped.)* There are two pure predicates over raw values, `is_local_attrs(u32)` for Windows attributes and `is_local_flags(u32)` for macOS `st_flags`, plus `is_local(&std::fs::Metadata) -> Option<bool>`, which picks the right one for the platform it is compiled for. The P2 work then starts from a tested function, and the predicate's facts are settled while #77's runner is being stood up.
 
 ### P2 rule
 
 **One rule: an online-only file is downloaded only by an explicit open of that one file by the user (item 5), and by nothing else.**
 
-1. **Detection is a pure function of a stat Serat already holds**, `is_local(platform, raw)`.
+1. **Detection is a pure function of a stat Serat already holds** (`serat_core::locality`, as amended by task #150).
+   - **`is_local_attrs(file_attributes: u32) -> bool`** and **`is_local_flags(st_flags: u32) -> bool`** are `const` functions over raw values. They compile and are tested on every platform, so the Windows and macOS facts are checked on Linux CI.
+   - **`is_local(&Metadata) -> Option<bool>`** is gated per platform. It returns `Some(is_local_attrs(..))` on Windows, `Some(is_local_flags(..))` on macOS and **`None` on Linux**. It reads a `Metadata` the caller already has, and opens and stats nothing (serat-core has no I/O).
+   - It takes `Metadata` rather than `(platform, raw)` because `serat_core::Platform` has no macOS variant, so the earlier signature could not express `SF_DATALESS`.
    - **Windows:** a file is not local if `MetadataExt::file_attributes()` intersects `RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE`. The attributes come from `DirEntry::metadata()`, which is the `FindNextFileW` data and opens nothing. They can also come from `symlink_metadata`, which opens the file with access 0 and does not download it. **Including `OFFLINE` also catches HSM storage and Offline Files (client-side caching).** That is intended: their bytes are not local either.
    - **macOS:** a file is not local if `std::os::macos::fs::MetadataExt::st_flags() & SF_DATALESS`, from an `lstat`. macOS has no `statx`.
-   - **Linux:** always local. FUSE clients (rclone, onedriver) download inside `read` and give no signal (§PRD impact, assumption).
+   - **Linux:** `None`, meaning unknown. This replaces the earlier "always local": FUSE clients (rclone, onedriver) download inside `read` and give no signal (A-09), so claiming "local" would be false.
+   - **How P2 callers treat `None` (ruled, task #150):**
+     - **The gate treats `None` as local.** `open_bytes` with `Hydrate::No` reads the file, because there is no signal to act on. On a FUSE mount that read may download, which is A-09's stated limit, not a defect of the gate.
+     - **The index records what was done, not what was proven.** A file read under `None` gets `notes.local = 1`, which means "bytes read and indexed".
+     - **The UI never claims "local" for `None`.** The cloud glyph and the "N files online only" count are driven by `Some(false)` alone. `TreeEntry.local` crosses the boundary as `None`, so the front end shows neither a cloud glyph nor any "stored locally" state, the same as for the no-index arm's unknown (item 2).
+     - **The tests assert it:** on Linux `is_local` is `None`, the gate reads, and no row or tree entry is marked not local.
    - **To measure on the #77 runner:** whether the Windows placeholder-compatibility ("disguise") mode hides these attributes from Serat's process. If it does, detection fails open, and Serat behaves as the P1 interim does on that machine.
 2. **Where the stat comes from, path by path (B-1).** No path may pay a stat it does not pay today.
    - **`Vault::walk`** (the rebuild, and the catch-up's walk) already calls `entry.metadata()` (`crates/serat-vault/src/walk.rs` line 77), so locality is free there.
@@ -171,7 +179,7 @@ No requirement covers this today. **Proposed, for product-analyst to word and nu
 A story to match, if wanted: *"As a user whose vault lives in OneDrive with Files-On-Demand, I want Serat to open my vault without downloading it, so that my freed disk space and my metered connection are respected."*
 
 **Implementing tasks, for lead to file.**
-- **P1, rust-core-dev, serat-core and serat-vault:** `locality::is_local` and its tests, and the failed-read test.
+- **P1, rust-core-dev, serat-core and serat-vault:** `serat_core::locality` (`is_local_attrs`, `is_local_flags`, `is_local`) and its tests, and the failed-read test.
 - **P2, rust-core-dev, serat-vault:** `resolve` returning metadata, `NotLocal`, the handle re-test, `read_hydrating` and the test seam.
 - **P2, rust-core-dev, serat-index:** the `local` column and DDL, path-only rows, demotion, the catch-up and watcher rules of item 7, and the `NotLocal` arms.
 - **P2, tauri-app-dev:** the `hydrate` arguments, the scheme's 404 and handle re-test, `NotLocal`, the contract fields and the count.
@@ -188,6 +196,8 @@ The first round of review came from code-reviewer through lead: three BLOCKING f
 
 Their objections are recorded here when given.
 
+**code-reviewer-35, on #143 (task #150): the shipped API did not match this ADR.** The ADR specified `is_local(platform, raw)`, with Linux "always local". #143 shipped two raw predicates and `is_local(&Metadata) -> Option<bool>`, which is `None` on Linux. The review blocked #143 on the mismatch. **Ruled: the ADR is amended to the shipped shape.** The shipped shape is better on both counts. `Platform` has no macOS variant, so the old signature could not express `SF_DATALESS`. And `None` is the honest answer for Linux FUSE clients (A-09), where "local" was a claim nobody could check. How callers treat `None` is ruled in §P2 rule item 1.
+
 ## Tested against
 
 **#77's case**, supplied by tauri-app-dev: one online-only `placeholder.md` in a OneDrive folder. Under the P2 rule:
@@ -195,7 +205,7 @@ Their objections are recorded here when given.
 - a background read must fail with `NotLocal` and leave it online-only. That is stronger than #77's "refused **or** reported", because it rules out "downloaded, then reported".
 
 **P1 tests:**
-- `serat-core`: `is_local` cases for each Windows attribute bit, alone and combined, and for `SF_DATALESS`, each evaluated on every platform through `Platform`. Linux is always local.
+- `serat-core`: `is_local_attrs` cases for each Windows attribute bit, alone and combined, and `is_local_flags` cases for `SF_DATALESS`, alone and with other flags, all run on every platform. `is_local(&Metadata)` is `None` on Linux (`linux_has_no_signal`, shipped by #143). **Still owed:** a test that it is `Some(true)` for an ordinary local file on Windows and on macOS. It needs a Windows or macOS test run, the #77 runner or the manual Mac run.
 - `serat-vault`: `a_failed_or_interrupted_read_is_an_error_never_zero_bytes`, through a test reader that fails after N bytes; `Vault::read` must return `Err` and not `Ok` with a prefix.
 - `serat-app`: `a_save_whose_base_read_fails_writes_nothing`, which checks that the note's bytes are unchanged.
 - On the #77 runner (ignored in CI): `an_offline_placeholder_read_is_an_error_not_an_empty_note`.

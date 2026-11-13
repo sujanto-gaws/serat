@@ -319,7 +319,7 @@ async function openVaultDialog(): Promise<void> {
   const before = store.vaultId;
   // The close flush cannot save a conflicted, deleted or unsaved buffer, and the switch discards it: refuse
   // before the dialog opens, with the reason, rather than lose text (#151).
-  const unsafe = editorRef.value?.unsafeToClose() ?? null;
+  const unsafe = (await editorRef.value?.unsafeToClose()) ?? null;
   if (unsafe !== null) {
     store.setMark(`not switching vault: ${unsafe}. Resolve it first.`);
     openingVault = false;
@@ -337,6 +337,7 @@ async function openVaultDialog(): Promise<void> {
     if (store.vaultId !== before) {
       resetForNewVault();
       store.openFailed();
+      treeRef.value?.clear(); // no vault: the old vault's rows must not sit under "No vault open"
     }
     store.setMark(`could not open the vault: ${JSON.stringify(e)}`);
   } finally {
@@ -435,8 +436,14 @@ onMounted(async () => {
   // contains neither the branch nor the global. A shipped app must not expose
   // a window-level "replace the open note's buffer" entry point.
   if (import.meta.env.MODE === "bench") {
-    window.__seratBenchOpenNote = (text: string) => {
-      void editorRef.value?.loadNote(text, "__bench__.md", "bench-hash-not-a-real-blake3");
+    // `path` and `hash` default to the stub's: with the real-IPC arm (task #61) the harness opens a note
+    // that exists in a real vault and passes its real path and hash, so saves are real.
+    window.__seratBenchOpenNote = (
+      text: string,
+      path = "__bench__.md",
+      hash = "bench-hash-not-a-real-blake3",
+    ) => {
+      void editorRef.value?.loadNote(text, path, hash);
     };
   }
 
@@ -636,7 +643,18 @@ function onSaveOutcome(outcome: SaveOutcome): void {
   <CommandPalette v-if="paletteOpen" :registry="commands" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
-    <span class="index">{{ store.indexStatusText }}</span>
+    <!-- title: hover (and the full text when the strip ellipsises). aria-describedby: the accessible description
+         (aria-description is ARIA 1.3 draft with uneven support, WebKitGTK worst; index-state-copy.md). -->
+    <span
+      class="index"
+      :title="store.indexStatusDetail ?? store.indexStatusText"
+      :aria-describedby="store.indexStatusDetail !== null ? 'index-state-detail' : undefined"
+      data-testid="index-state"
+      >{{ store.indexStatusText }}</span
+    >
+    <span v-if="store.indexStatusDetail !== null" id="index-state-detail" class="sr-only">{{ store.indexStatusDetail }}</span>
+    <!-- One-shot snapshot on entering and on leaving the waiting state (index-state-copy.md: announced once). -->
+    <span class="sr-only" role="status" aria-live="polite" data-testid="index-live">{{ store.indexAnnouncement }}</span>
     <RefusedNames ref="refusedRef" :count="store.refusedNames" @focus-fallback="focusAfterRefused" />
     <span v-if="updatedExternally" class="updated-externally" data-testid="updated-externally">Updated externally</span>
     <span v-if="saveBlocked" class="save-blocked" data-testid="save-blocked">

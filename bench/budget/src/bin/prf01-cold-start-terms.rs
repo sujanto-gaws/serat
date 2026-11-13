@@ -109,7 +109,7 @@ fn main() -> ExitCode {
              \"s_settle_ms\":{:.1},\"s_main_ms\":{:.1},\"s_front_ms\":{:.1},\
              \"serat_term_ms\":{:.1},\"platform_term_ms\":{:.1},\
              \"window_visible_ms\":{:.1},\"vault_usable_ms\":{:.1},\
-             \"paint_evidence_ms\":{},\"raf2_ms\":{},\"frame_to_paint_gap_ms\":{}}}",
+             \"tree_first_screen_ms\":{},\"paint_evidence_ms\":{},\"raf2_ms\":{},\"frame_to_paint_gap_ms\":{}}}",
             terms.p_load_ms,
             terms.s_pre_ms,
             terms.p_builder_ms,
@@ -123,6 +123,9 @@ fn main() -> ExitCode {
             terms.platform_term_ms(),
             t.window_visible_ms,
             t.vault_usable_ms,
+            t.tree_first_screen_ms
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "null".to_string()),
             t.paint_evidence_ms
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "null".to_string()),

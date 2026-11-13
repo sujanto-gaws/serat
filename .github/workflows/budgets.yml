@@ -373,6 +373,20 @@ jobs:
           set -o pipefail
           mkdir -p out/dumps
           npx playwright test --project=subject --workers=1 2>&1 | tee out/run.log
+      - name: Other scenarios and CRLF/BOM variants (task #61; report only, about 35 minutes)
+        # Table cell, link-dense paragraph, Enter mid-note, Backspace across a bold delimiter, split-preview
+        # typing, and the fixture loaded as CRLF and as BOM+CRLF (architecture 9.3 "Scenarios"). Same controls
+        # gate it (it depends on them). `|| true`: a FAIL here is a finding, never a red PR (headless is not
+        # gate-eligible); the verdicts are in the log and the artifact.
+        working-directory: bench/editor-latency
+        env:
+          SERAT_BENCH_DIST: ../../app/dist-bench
+          SERAT_SUBJECT_LABEL: "ci @ ${{ github.sha }}"
+          SERAT_DUMP_DIR: out/dumps
+        shell: bash
+        run: |
+          mkdir -p out/dumps
+          npx playwright test --project=scenarios --workers=1 2>&1 | tee out/run-scenarios.log || true
       - name: Summary (engine, positive-strict margin, subject verdicts)
         if: always()
         working-directory: bench/editor-latency
@@ -403,5 +417,62 @@ jobs:
         if: always()
         with:
           name: editor-latency
+          path: bench/editor-latency/out/
+          if-no-files-found: ignore
+
+  # NFR-PRF-02, the real-IPC arm (task #61). REPORT-ONLY for the same reason as editor-latency. The
+  # harness forwards the editor's IPC to a real serat-app AppState over loopback
+  # (crates/serat-app/examples/editor_ipc_bridge.rs), so a debounced save and the index work it starts
+  # land inside the measured keystrokes. Not included, and the log says so: Tauri's own webview-to-Rust
+  # transport. Needs the Tauri Linux build dependencies to build the bridge.
+  editor-latency-real-ipc:
+    name: "NFR-PRF-02 · editor keystroke-to-paint with real serat-app IPC (report only, not gate-eligible)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            bench/editor-latency/package-lock.json
+      - name: Build the bench bundle
+        working-directory: app
+        run: |
+          npm ci
+          npm run build:bench
+      - name: Install Tauri's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the IPC bridge
+        run: cargo build --example editor_ipc_bridge -p serat-app
+      - name: Install the harness and Chromium only
+        working-directory: bench/editor-latency
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+      - name: Controls, then the stub and real IPC arms
+        working-directory: bench/editor-latency
+        env:
+          SERAT_BENCH_DIST: ../../app/dist-bench
+          SERAT_IPC_BRIDGE: ${{ github.workspace }}/target/debug/examples/editor_ipc_bridge
+          SERAT_SUBJECT_LABEL: "ci @ ${{ github.sha }}"
+          SERAT_DUMP_DIR: out/dumps
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p out/dumps
+          npx playwright test --project=real-ipc --workers=1 2>&1 | tee out/run-real-ipc.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-latency-real-ipc
           path: bench/editor-latency/out/
           if-no-files-found: ignore

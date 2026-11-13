@@ -655,12 +655,25 @@ function thaw(): void {
 
 /** Why a vault switch must not start now, or `null` when nothing would be lost: the close flush cannot
  * save a conflicted, deleted or unsaved buffer, and the switch then discards it (#151). */
-function unsafeToClose(): string | null {
+async function unsafeToClose(): Promise<string | null> {
   if (!buffer) return null;
-  if (conflict.value !== null) return "the open note has a conflict with the file on disk";
-  if (deleted.value) return "the open note was deleted on disk and has unsaved text";
-  if (blocked.value || buffer.isDirty) return "the open note has changes that could not be saved yet";
-  return null;
+  const refusal = (): string | null => {
+    if (conflict.value !== null) return "the open note has a conflict with the file on disk";
+    if (deleted.value) return "the open note was deleted on disk and has unsaved text";
+    if (blocked.value || (buffer?.isDirty ?? false)) return "the open note has changes that could not be saved yet";
+    return null;
+  };
+  if (conflict.value !== null || deleted.value) return refusal();
+  if (buffer.isDirty) {
+    // A pending autosave is not a reason to refuse: save now, refuse only if that fails.
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    await performSave().catch(() => null);
+    markDirty();
+  }
+  return refusal();
 }
 
 function buildExtensions(livePreview: boolean): Extension[] {

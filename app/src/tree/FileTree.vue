@@ -183,6 +183,14 @@ function startOpenTree(): void {
 /** A different vault was opened (#151): drop every row of the old one and open the tree again. Called by
  * the host after `choose_vault` answers, when the new vault is installed (not on `vault://opened`). */
 function reopen(): void {
+  clear();
+  startOpenTree();
+}
+
+/** Forgets the old vault's rows without opening anything: a failed switch leaves no vault (#151, #103), and
+ * the empty state must not sit over the old vault's rows. An earlier stream is cut off too. */
+function clear(): void {
+  treeGeneration += 1;
   model.clear();
   filter.value = "";
   scrollTop.value = 0;
@@ -194,7 +202,6 @@ function reopen(): void {
   menu.value = null;
   emit("pending-listing", null);
   bump();
-  startOpenTree();
 }
 
 onMounted(() => {
@@ -580,6 +587,7 @@ function onMenuSelect(id: string): void {
 defineExpose({
   model,
   reopen,
+  clear,
   focusTree,
   focusFilter,
   insertLinkUnavailable,

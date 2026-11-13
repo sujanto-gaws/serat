@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use serat_core::{TreeKind, TreeOp};
@@ -332,6 +332,42 @@ fn creates_and_deletes_racing_the_walk_never_leave_the_front_end_wrong() {
             );
         }
     }
+}
+
+// Task #141. Mutant, run by hand: moving the `root_sent` / `set_complete` stores back after
+// `(self.sink)(out)` in `Inner::emit` makes both observations below false.
+#[test]
+fn progress_already_says_sent_when_the_sink_receives_the_message() {
+    // The front end marks once, from the message it received. If `progress()` still said
+    // "not sent" while the sink held that message, a mark racing the emitting thread would
+    // be rejected for good.
+    let (_dir, vault) = fixture();
+    let slot: Arc<OnceLock<Arc<TreeSession>>> = Arc::default();
+    let seen: Arc<Mutex<Vec<(&'static str, bool)>>> = Arc::default();
+    let (probe, log) = (Arc::clone(&slot), Arc::clone(&seen));
+    let session = Arc::new(TreeSession::new(move |out| {
+        let progress = probe.get().expect("session published").progress();
+        match out {
+            TreeOut::Op(TreeOp::Listing { ref dir, .. }) if dir.is_empty() => {
+                log.lock().expect("log").push(("root", progress.root_sent));
+            }
+            TreeOut::Complete { .. } => {
+                log.lock()
+                    .expect("log")
+                    .push(("complete", progress.complete.is_some()));
+            }
+            _ => {}
+        }
+    }));
+    assert!(slot.set(Arc::clone(&session)).is_ok(), "set once");
+    session.populate_from_walk(&vault).expect("walk");
+    let seen = seen.lock().expect("log");
+    assert!(seen.contains(&("root", true)), "{seen:?}");
+    assert!(seen.contains(&("complete", true)), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, sent)| *sent),
+        "a message reached the sink before progress said it was sent: {seen:?}"
+    );
 }
 
 #[test]

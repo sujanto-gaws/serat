@@ -53,7 +53,7 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 | Budget | Interval |
 |---|---|
 | NFR-PRF-01 window visible | process spawn to the first **composited frame** of the shell (architecture §3.4 row 1) |
-| NFR-PRF-01 vault usable | process spawn to the file tree rendered and the last-open buffer accepting keystrokes (§3.4 row 2) |
+| NFR-PRF-01 vault usable | process spawn to the latest of: first paint, the tree's first screen (root listing applied and painted, ADR-0015 §3, from P1 task #141; P0 used the last-open buffer), index settled, watcher settled (§3.4 row 2) |
 | NFR-PRF-03 | `apply()` submitted through `flush()` returning — Serat's own save path, no watcher, no debounce |
 | NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
 

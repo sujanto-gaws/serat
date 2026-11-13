@@ -9,10 +9,16 @@ type Handler = (event: { payload: unknown }) => void;
 const handlers = new Map<string, Handler>();
 let chooseImpl: () => Promise<unknown> = () => Promise.resolve(null);
 const chooseCalls = vi.hoisted(() => ({ n: 0, openTree: 0 }));
+const treeChannels = vi.hoisted(() => [] as Array<{ onmessage: ((m: unknown) => void) | null }>);
+let savePatch: () => Promise<unknown> = () => Promise.reject(new Error("disk full"));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn((cmd: string) => {
-    if (cmd === "open_tree") chooseCalls.openTree += 1;
+  invoke: vi.fn((cmd: string, args?: { onMessage?: { onmessage: ((m: unknown) => void) | null } }) => {
+    if (cmd === "open_tree") {
+      chooseCalls.openTree += 1;
+      if (args?.onMessage) treeChannels.push(args.onMessage);
+    }
+    if (cmd === "save_patch") return savePatch();
     if (cmd === "choose_vault") {
       chooseCalls.n += 1;
       return chooseImpl();
@@ -45,6 +51,8 @@ beforeEach(() => {
   handlers.clear();
   chooseCalls.n = 0;
   chooseCalls.openTree = 0;
+  treeChannels.length = 0;
+  savePatch = () => Promise.reject(new Error("disk full"));
   chooseImpl = () => Promise.resolve(null);
   window.__SERAT_BOOT__ = { vault: "/a", vault_id: "A", open: null, exit_after_ready: false } as never;
   vi.stubGlobal("requestAnimationFrame", () => 0);
@@ -249,6 +257,53 @@ describe("the editor is read-only from the closing ack until the new vault is ad
     await flushPromises();
     await editor.loadNote("new", "b.md", "h2");
     expect(editor.getView()?.state.readOnly).toBe(false);
+    wrapper.unmount();
+  });
+});
+
+describe("a failed switch leaves no rows, and a pending autosave is not a refusal (#151)", () => {
+  const LISTING = { kind: "listing", dir: "", entries: [{ name: "old.md", kind: "file", sidecar: false }] };
+
+  it("clears the old vault's rows under No vault open without calling open_tree", async () => {
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    treeChannels[0].onmessage?.(LISTING);
+    await flushPromises();
+    const tree = wrapper.findComponent({ name: "FileTree" }).vm as unknown as { model: { fileCount: number } };
+    expect(tree.model.fileCount).toBe(1);
+    const opens = chooseCalls.openTree;
+    chooseImpl = () => {
+      handlers.get("vault://opened")?.({ payload: OPENED_B });
+      return Promise.reject({ kind: "vault_not_found", path: "/b" });
+    };
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await flushPromises();
+    await wrapper.get('[data-testid="command-palette"] input').setValue("Open vault");
+    await wrapper.get('[data-testid="command-palette"] input').trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(tree.model.fileCount).toBe(0);
+    expect(chooseCalls.openTree).toBe(opens);
+    expect(wrapper.find('[data-testid="no-vault"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("a dirty buffer is saved first and the switch proceeds when the save succeeds", async () => {
+    savePatch = () => Promise.resolve({ kind: "saved", hash: "h2" });
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await flushPromises();
+    const editor = wrapper.findComponent(CodeMirrorEditor).vm as unknown as {
+      loadNote(t: string, p: string, h: string): Promise<boolean>;
+      getView(): { dispatch(spec: unknown): void } | undefined;
+    };
+    await editor.loadNote("old", "a.md", "h1");
+    editor.getView()?.dispatch({ changes: { from: 3, insert: "!" } });
+    chooseImpl = () => Promise.resolve(null);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await flushPromises();
+    await wrapper.get('[data-testid="command-palette"] input').setValue("Open vault");
+    await wrapper.get('[data-testid="command-palette"] input').trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(chooseCalls.n).toBe(1);
     wrapper.unmount();
   });
 });

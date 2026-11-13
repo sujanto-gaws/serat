@@ -143,10 +143,13 @@ pub async fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<
 }
 
 /// `get_ui_settings() -> UiSettings`
-#[tauri::command(async)]
-#[must_use]
-pub fn get_ui_settings(state: State<'_, Arc<AppState>>) -> UiSettings {
-    state.get_ui_settings()
+///
+/// Runs on the blocking pool: the settings lock is held across the file write of a
+/// concurrent `set_*` (task #133). Tauri requires an async command that borrows `State`
+/// to return a `Result`; this never fails on its own.
+#[tauri::command]
+pub async fn get_ui_settings(state: State<'_, Arc<AppState>>) -> Result<UiSettings, IpcError> {
+    state.get_ui_settings_off_thread().await
 }
 
 /// `set_live_preview(args) -> Result<(), IpcError>`
@@ -214,12 +217,12 @@ pub async fn switcher_query(
 /// # Errors
 ///
 /// As [`AppState::backlinks`].
-#[tauri::command(async)]
-pub fn backlinks(
+#[tauri::command]
+pub async fn backlinks(
     state: State<'_, Arc<AppState>>,
     args: NotePathArgs,
 ) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
-    state.backlinks(args)
+    state.backlinks_off_thread(args).await
 }
 
 /// `create_folder(args) -> Result<FolderCreated, IpcError>`

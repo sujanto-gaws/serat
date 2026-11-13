@@ -120,6 +120,7 @@ fn uri(_platform: Platform, encoded_path: &str) -> String {
     format!("serat-asset://localhost/{encoded_path}")
 }
 
+#[cfg(not(windows))]
 fn body_text(reply: &Reply) -> String {
     String::from_utf8_lossy(&reply.body).into_owned()
 }
@@ -600,6 +601,49 @@ fn only_pdf_and_images_are_served() {
     }
 }
 
+// Task #127 (ADR-0017 item 6): pdf.js's cMaps and standard fonts ship in the app bundle and are
+// fetched as `./cmaps/<name>.bcmap` and `./standard_fonts/<name>.pfb` from the app's own origin.
+// The vault scheme is not their path: a vault file with such a name is not viewable, so the
+// scheme, the info command and the span fallback all refuse it, with either platform spelling
+// and through an encoded traversal, and the bundle's bytes can never be had by naming them.
+#[test]
+fn bundle_cmaps_and_fonts_are_never_served_from_the_vault() {
+    let fx = Fx::new("bundle-names");
+    fx.put("cmaps/Adobe-Japan1-UCS2.bcmap", b"VAULT-CMAP");
+    fx.put("standard_fonts/FoxitSans.pfb", b"VAULT-FONT");
+    fx.put("a.pdf", b"%PDF");
+    for name in [
+        "cmaps/Adobe-Japan1-UCS2.bcmap",
+        "standard_fonts/FoxitSans.pfb",
+        "./cmaps/Adobe-Japan1-UCS2.bcmap",
+        "./standard_fonts/FoxitSans.pfb",
+        "..%2Fcmaps%2FAdobe-Japan1-UCS2.bcmap",
+        "x/..%2F..%2Fstandard_fonts%2FFoxitSans.pfb",
+    ] {
+        for platform in BOTH {
+            let reply = fx.get(platform, name);
+            assert_refused(&reply, name);
+            assert!(
+                !body_text(&reply).contains("VAULT-"),
+                "{name}: vault bytes reached the response"
+            );
+        }
+    }
+    for path in [
+        "cmaps/Adobe-Japan1-UCS2.bcmap",
+        "standard_fonts/FoxitSans.pfb",
+    ] {
+        let described = super::info(&fx.vault, &vp(path)).expect("info describes any vault file");
+        assert!(!described.viewable, "{path} must not be viewable");
+        assert!(
+            read_range(&fx.vault, &fx.budget, &vp(path), 0, 5, None).is_err(),
+            "{path}"
+        );
+    }
+    // A control: the scheme is not simply refusing everything in these directories' neighbourhood.
+    assert_eq!(fx.get(Platform::Other, "a.pdf").status, 200);
+}
+
 #[test]
 fn ignored_directories_are_refused_whatever_their_case() {
     let fx = Fx::new("ignored");
@@ -779,6 +823,200 @@ mod unix_only {
             .expect("a FIFO must be refused promptly, not read");
         assert_eq!(status, 404);
         assert_eq!(fx.get(Platform::Other, "real.png").status, 200, "control");
+    }
+}
+
+// -- steps 6 and 7 on Windows --------------------------------------------------
+//
+// Task #77, ADR-0017 *Tested against* ("the Windows handle APIs are read, not run").
+// The Unix module above uses symlinks; on Windows a symlink needs Developer Mode or an
+// elevated process, so these use NTFS **junctions** (`mklink /J`, no privilege; task #76
+// measured that `symlink_metadata().is_symlink()` is true for one and that reading
+// through one succeeds when nothing refuses it). The handle query under test is
+// `GetFinalPathNameByHandle` through the `filepath` crate, which no Linux run reaches.
+//
+// Compiled only on Windows, so they run in the `workspace (windows-latest)` job and in
+// the named step "Windows-only checks" of `.github/workflows/ci.yml`; on Linux they do not
+// exist. They were written by reading the APIs and the Linux twins, and compile-checked
+// with `cargo check --target x86_64-pc-windows-gnu`; they have not been run (F-384).
+#[cfg(windows)]
+mod windows_only {
+    use super::*;
+
+    /// With `SERAT_WINDOWS_STRICT=1` (the "Windows-only checks" step of ci.yml) a skip fails.
+    fn skip(reason: &str) {
+        assert!(
+            std::env::var_os("SERAT_WINDOWS_STRICT").is_none_or(|v| v != "1"),
+            "SERAT_WINDOWS_STRICT=1 and the test would have skipped: {reason}"
+        );
+        eprintln!("SKIPPED: {reason}");
+    }
+
+    /// `mklink /J link target`: an NTFS directory junction.
+    fn junction(target: &std::path::Path, link: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("running mklink");
+        assert!(
+            status.success(),
+            "mklink /J {} {}",
+            link.display(),
+            target.display()
+        );
+    }
+
+    #[test]
+    fn a_junctioned_directory_component_is_refused() {
+        let fx = Fx::new("w-junction");
+        fx.put("real/a.png", b"REAL");
+        let vault = fx.base.join("vault");
+        // Native separators throughout: `cmd /C mklink` does not accept forward slashes.
+        junction(&vault.join("real"), &vault.join("alias"));
+        junction(&fx.outside(), &vault.join("escape"));
+        assert_eq!(
+            fx.get(Platform::Windows, "real/a.png").status,
+            200,
+            "control"
+        );
+        assert_refused(&fx.get(Platform::Windows, "alias/a.png"), "junction inside");
+        assert_refused(
+            &fx.get(Platform::Windows, "escape/secret.png"),
+            "junction outside",
+        );
+    }
+
+    /// Step 7 alone, as `the_handle_check_alone_catches_a_component_swapped_after_resolve`:
+    /// `open_verified` is handed a path step 6 never saw, and the handle's final path
+    /// (`\\?\C:\...`, normalised against the root) must be what refuses it.
+    #[test]
+    fn the_handle_check_alone_catches_a_component_swapped_for_a_junction() {
+        let fx = Fx::new("w-toctou");
+        fx.put("dir/a.png", b"INSIDE");
+        let root = fx.vault.root().to_path_buf();
+        let honest = root.join("dir").join("a.png");
+        assert!(
+            open_verified(&honest, &fx.vault).is_some(),
+            "control: an honest path opens"
+        );
+        fs::rename(root.join("dir"), root.join("dir.moved")).unwrap();
+        fs::write(fx.outside().join("a.png"), b"OUTSIDE").unwrap();
+        junction(&fx.outside(), &root.join("dir"));
+        assert!(
+            open_verified(&honest, &fx.vault).is_none(),
+            "the handle now lives outside the root; step 7 must refuse it"
+        );
+        assert_refused(&fx.get(Platform::Windows, "dir/a.png"), "swapped component");
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_junction_into_serat_is_refused_by_step_7() {
+        let fx = Fx::new("w-toctou-serat");
+        fx.put("dir/x.png", b"INSIDE");
+        fx.put(".serat/x.png", b"INDEX");
+        let root = fx.vault.root().to_path_buf();
+        let honest = root.join("dir").join("x.png");
+        assert!(open_verified(&honest, &fx.vault).is_some(), "control");
+        fs::rename(root.join("dir"), root.join("dir.moved")).unwrap();
+        junction(&root.join(".serat"), &root.join("dir"));
+        assert!(
+            open_verified(&honest, &fx.vault).is_none(),
+            "the handle lives in .serat/, an ignored directory"
+        );
+    }
+
+    /// An 8.3 short name is a second spelling of a directory that the name-based
+    /// ignored-directory rule (step 5) does not recognise; the handle's final path is the
+    /// long name, so step 7 must catch it. Skips, loudly, on a volume with short names
+    /// disabled (the alias then does not exist and there is nothing to test).
+    #[test]
+    fn an_8_3_short_name_for_dot_serat_is_refused_by_step_7() {
+        let fx = Fx::new("w-short");
+        fx.put(".serat/x.png", b"INDEX");
+        fx.put("plain/y.png", b"OK");
+        let root = fx.vault.root().to_path_buf();
+        let Some(short) = ["SERAT~1", "SERAT~2"]
+            .iter()
+            .find(|name| root.join(name).join("x.png").exists())
+        else {
+            skip("this volume has 8.3 short names disabled; no alias for .serat");
+            return;
+        };
+        assert!(
+            open_verified(&root.join(short).join("x.png"), &fx.vault).is_none(),
+            "the short name {short} opened a file in .serat/"
+        );
+        assert_refused(
+            &fx.get(Platform::Windows, &format!("{short}/x.png")),
+            "8.3 alias of .serat",
+        );
+        assert_eq!(
+            fx.get(Platform::Windows, "plain/y.png").status,
+            200,
+            "control"
+        );
+    }
+
+    /// A final-component symlink is followed by the open on Windows (no reparse flag, so
+    /// a OneDrive placeholder still opens); the handle's final path says where it landed.
+    /// Needs the symlink privilege, so it skips, loudly, when the runner lacks it.
+    #[test]
+    fn a_final_component_symlink_to_outside_is_refused_by_the_handle_check() {
+        let fx = Fx::new("w-final");
+        let root = fx.vault.root().to_path_buf();
+        let target = fx.outside().join("secret.png");
+        match std::os::windows::fs::symlink_file(&target, root.join("a.png")) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD: the only error that means "this runner cannot make one".
+            Err(err) if err.raw_os_error() == Some(1314) => {
+                skip(&format!("no symlink privilege on this runner: {err}"));
+                return;
+            }
+            Err(err) => {
+                panic!("creating the symlink failed for a reason other than privilege: {err}")
+            }
+        }
+        assert!(open_verified(&root.join("a.png"), &fx.vault).is_none());
+        assert_refused(&fx.get(Platform::Windows, "a.png"), "file symlink outside");
+    }
+
+    #[test]
+    fn an_alternate_data_stream_name_is_refused() {
+        let fx = Fx::new("w-ads");
+        fx.put("a.png", b"REAL");
+        // A real stream: `a.png:hidden` is a second data stream of a.png on NTFS, so naming it
+        // must be refused although the bytes exist. (Without this the refusal could be "no such
+        // file", which proves nothing.)
+        fs::write(fx.base.join("vault").join("a.png:hidden"), b"STREAM").unwrap();
+        let control = fx.get(Platform::Windows, "a.png");
+        assert_eq!(
+            (control.status, control.body.as_slice()),
+            (200, &b"REAL"[..])
+        );
+        for path in [
+            "a.png%3Ahidden",
+            "a.png%3A%3A%24DATA",
+            "a.png%3A%3A%24DATA%3Ax",
+        ] {
+            assert_refused(&fx.get(Platform::Windows, path), path);
+        }
+    }
+
+    /// The handle outside the root is refused even for an honest-looking path, with the
+    /// two verbatim spellings of the same root (`\\?\C:\...` from the handle, `C:\...`
+    /// from `Vault::root`) compared after normalisation: this is the case that fails if
+    /// `relative_to_root` stops stripping `\\?\`.
+    #[test]
+    fn a_file_inside_the_root_opens_although_the_handle_path_is_verbatim() {
+        let fx = Fx::new("w-verbatim");
+        let inside = fx.put("a.png", b"INSIDE");
+        assert!(
+            open_verified(&inside, &fx.vault).is_some(),
+            "control: the root and the handle path agree after normalisation"
+        );
+        assert!(open_verified(&fx.outside().join("secret.png"), &fx.vault).is_none());
     }
 }
 
