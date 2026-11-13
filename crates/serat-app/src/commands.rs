@@ -60,9 +60,11 @@ pub async fn choose_vault(
     use tauri_plugin_dialog::DialogExt as _;
     state
         .choose_vault_off_thread(move || {
-            // Parented to the window, so it is modal over it and the main window cannot be
-            // closed while it is open. Blocks the pool thread until the user answers, never
-            // the webview's.
+            // Parented to the window, which makes it modal over it where the window manager
+            // honours that (not guaranteed on Linux GTK); the real control is the
+            // `closed_for_exit` guard in `choose_vault_with`, which refuses a pick that
+            // returns after the exit's close. Blocks the pool thread until the user answers,
+            // never the webview's.
             window
                 .dialog()
                 .file()

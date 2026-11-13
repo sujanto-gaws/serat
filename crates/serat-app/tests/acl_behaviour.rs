@@ -397,11 +397,24 @@ fn every_dialog_plugin_command_is_refused_to_the_webview() {
         "plugin:dialog|ask",
         "plugin:dialog|confirm",
     ] {
-        let answer = invoke(
-            &webview,
-            cmd,
-            json!({ "options": { "directory": true, "title": "x" } }),
-        );
+        // On a thread with a bounded wait: if the grant ever lets the call through, the
+        // plugin command really runs under the mock runtime and waits for a dialog nobody
+        // answers, which would hang this test instead of failing it with a reason.
+        let (done, answered) = std::sync::mpsc::channel();
+        let caller = webview.clone();
+        std::thread::spawn(move || {
+            let answer = invoke(
+                &caller,
+                cmd,
+                json!({ "options": { "directory": true, "title": "x" } }),
+            );
+            let _ = done.send(answer);
+        });
+        let answer = answered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                panic!("{cmd} was not answered in 5 s: the ACL let it through and it is waiting")
+            });
         let err = answer.expect_err(&format!("{cmd} must be refused to the webview"));
         assert!(
             is_acl_rejection(&err),
