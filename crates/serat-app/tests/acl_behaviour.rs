@@ -360,3 +360,52 @@ fn open_vault_is_refused_and_the_five_granted_commands_are_not() {
         );
     }
 }
+
+/// Task #151: the dialog plugin is registered (its `choose_vault` caller needs it) but no
+/// `dialog:*` permission is granted, so the webview cannot reach its commands. The grant
+/// list is the only guard, so this is a runtime test of the refusal, not just of the file.
+#[test]
+fn every_dialog_plugin_command_is_refused_to_the_webview() {
+    let state = Arc::new(AppState::with_settings(
+        Arc::new(Startup::begin()),
+        Boot::default(),
+        Settings::default(),
+    ));
+    let app = mock_builder()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(Arc::clone(&state))
+        // `choose_vault` takes the real runtime's window type, which the mock runtime cannot
+        // supply; the plugin's own commands are what is under test.
+        .invoke_handler(tauri::generate_handler![commands::index_status])
+        .build(tauri::generate_context!())
+        .expect("mock app builds with the real generated context");
+    let webview = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
+        .build()
+        .expect("main window builds under the mock runtime");
+
+    // A control: a granted command is not refused, so a refusal below is the dialog's.
+    let status = invoke(&webview, "index_status", json!({}));
+    assert!(
+        !matches!(&status, Err(e) if is_acl_rejection(e)),
+        "index_status was refused: {status:?}"
+    );
+
+    for cmd in [
+        "plugin:dialog|open",
+        "plugin:dialog|save",
+        "plugin:dialog|message",
+        "plugin:dialog|ask",
+        "plugin:dialog|confirm",
+    ] {
+        let answer = invoke(
+            &webview,
+            cmd,
+            json!({ "options": { "directory": true, "title": "x" } }),
+        );
+        let err = answer.expect_err(&format!("{cmd} must be refused to the webview"));
+        assert!(
+            is_acl_rejection(&err),
+            "{cmd} was not refused by the ACL layer: {err}"
+        );
+    }
+}

@@ -655,6 +655,7 @@ pub(crate) fn on_close_requested(
                 // in progress finishes first (lock order: `opening`, then the close wait).
                 let _opening = state.lock_opening();
                 state.close_after_flush(&_opening, state::CLOSING_FLUSH_DEADLINE);
+                state.mark_closed_for_exit();
             }
             if state.claim_window_destroy() {
                 destroy();
@@ -681,6 +682,7 @@ fn close_with_deadline(state: &Arc<AppState>, deadline: std::time::Duration) {
             // vault it installs is the one closed (architecture 3.1.1 item 8).
             let _opening = closing.lock_opening();
             closing.close_vault();
+            closing.mark_closed_for_exit();
             let _ = done.send(());
         });
     match spawned {

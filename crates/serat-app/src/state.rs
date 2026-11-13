@@ -553,6 +553,10 @@ pub struct AppState {
     flush: Mutex<FlushState>,
     flush_cv: std::sync::Condvar,
     window_destroyed: std::sync::atomic::AtomicBool,
+    /// The exit's close has run (task #151 review): a folder picked after it must not open
+    /// a vault nothing will close. Set under `opening`, so a pick either opens first (and
+    /// the close that follows takes it down) or finds this set.
+    closed_for_exit: std::sync::atomic::AtomicBool,
     /// Test seam (task #49): a note whose `read_file` sleeps, standing for a slow disk.
     #[cfg(test)]
     pub(crate) slow_read: Mutex<Option<(String, std::time::Duration)>>,
@@ -625,6 +629,7 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            closed_for_exit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
             boot,
@@ -655,6 +660,7 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            closed_for_exit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
             boot,
@@ -774,6 +780,17 @@ impl AppState {
         opener: O,
     ) -> Result<VaultOpened, IpcError> {
         let opening = self.lock_opening();
+        self.open_vault_guarded(&opening, args, opener)
+    }
+
+    /// The body of [`AppState::open_vault_with`], for a caller that already holds `opening`
+    /// (`choose_vault_with` checks for an exit under it, then opens under the same guard).
+    fn open_vault_guarded<O: IndexOpen>(
+        &self,
+        opening: &std::sync::MutexGuard<'_, ()>,
+        args: OpenVaultArgs,
+        opener: O,
+    ) -> Result<VaultOpened, IpcError> {
         let requested = PathBuf::from(&args.root);
         let opened =
             Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?;
@@ -790,7 +807,7 @@ impl AppState {
         // same root reopened), or the old close setting `clean_close` after the new
         // open cleared it, are the failures this order rules out. The editor gets its
         // bounded flush first (NFR-REL-01): this runs off the webview's thread.
-        self.close_after_flush(&opening, CLOSING_FLUSH_DEADLINE);
+        self.close_after_flush(opening, CLOSING_FLUSH_DEADLINE);
 
         let vault_id = format!(
             "v{}",
@@ -1912,14 +1929,32 @@ impl AppState {
         &self,
         pick: impl FnOnce() -> Option<PathBuf>,
     ) -> Result<Option<VaultOpened>, IpcError> {
-        match pick() {
-            None => Ok(None),
-            Some(root) => self
-                .open_vault(OpenVaultArgs {
-                    root: root.display().to_string(),
-                })
-                .map(Some),
+        let Some(root) = pick() else {
+            return Ok(None);
+        };
+        // After the pick, under `opening`: the dialog can outlive the window's close, and a
+        // vault opened once the exit's close has run is never closed cleanly. Such a pick is
+        // a cancel.
+        let opening = self.lock_opening();
+        if self.closed_for_exit.load(Ordering::SeqCst)
+            || self.window_destroyed.load(Ordering::SeqCst)
+        {
+            return Ok(None);
         }
+        self.open_vault_guarded(
+            &opening,
+            OpenVaultArgs {
+                root: root.display().to_string(),
+            },
+            SeratIndexOpen::default(),
+        )
+        .map(Some)
+    }
+
+    /// The window's close or the process exit has closed the vault, under `opening`
+    /// (task #151 review): from here a chosen folder is not opened.
+    pub(crate) fn mark_closed_for_exit(&self) {
+        self.closed_for_exit.store(true, Ordering::SeqCst);
     }
 
     /// The canonical root of the open vault, if one is open.
@@ -5451,6 +5486,38 @@ mod tests {
         state.close_vault();
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_folder_picked_after_the_exit_close_is_not_opened() {
+        for how in ["closed for exit", "window destroyed"] {
+            let (state, _log, a, b) = switch_state("choose-exit", |_| OpenHooks::default(), true);
+            open_dir(&state, &a).expect("open A");
+            // The dialog is open while the window's close runs: the pick returns afterwards.
+            let closer = Arc::clone(&state);
+            let b_root = b.clone();
+            let opened = state
+                .choose_vault_with(move || {
+                    {
+                        let opening = closer.lock_opening();
+                        closer.close_after_flush(&opening, Duration::from_millis(50));
+                        if how == "closed for exit" {
+                            closer.mark_closed_for_exit();
+                        } else {
+                            assert!(closer.claim_window_destroy());
+                        }
+                    }
+                    Some(b_root)
+                })
+                .expect("no error");
+            assert!(
+                opened.is_none(),
+                "{how}: a vault was opened during teardown"
+            );
+            assert!(state.vault_id().is_none(), "{how}: a vault is open");
+            let _ = std::fs::remove_dir_all(&a);
+            let _ = std::fs::remove_dir_all(&b);
+        }
     }
 
     #[test]

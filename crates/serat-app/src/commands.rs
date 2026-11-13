@@ -54,15 +54,19 @@ pub async fn open_vault(
 /// As [`AppState::open_vault`].
 #[tauri::command]
 pub async fn choose_vault(
-    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<VaultOpened>, IpcError> {
     use tauri_plugin_dialog::DialogExt as _;
     state
         .choose_vault_off_thread(move || {
-            // Blocks the pool thread until the user answers; never the webview's.
-            app.dialog()
+            // Parented to the window, so it is modal over it and the main window cannot be
+            // closed while it is open. Blocks the pool thread until the user answers, never
+            // the webview's.
+            window
+                .dialog()
                 .file()
+                .set_parent(&window)
                 .blocking_pick_folder()
                 .and_then(|picked| picked.into_path().ok())
         })
