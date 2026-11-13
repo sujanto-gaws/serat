@@ -3,20 +3,40 @@
 //! ADR-0001 makes one writer per vault the design, but "one" was only enforced inside a
 //! process (serat-app's detached-writer registry, task #96). A second Serat instance, or
 //! a benchmark run beside the app, on the same vault would open its own writer, and a
-//! rebuild by either deletes `index.db`, `-wal` and `-shm` under the other's mapping of
-//! `-shm`. SQLite maps `-shm` into every connection, and a mapped page whose file was
-//! unlinked and re-created is the SIGBUS test-engineer found in `walIndexAppend`
-//! (`docs/05-testing/sigbus-105.md`).
+//! rebuild by either unlinks `index.db`, `-wal` and `-shm` while the other still has
+//! them open. Across processes that leaves the first writing to an unlinked file while
+//! its readers see the new database (silent drift), or two database inodes sharing one
+//! `-wal`/`-shm` pair (corruption); on Windows the `remove_file` on an open `index.db`
+//! fails. Inside one process the worse case is the SIGBUS test-engineer found in
+//! `walIndexAppend` (`docs/05-testing/sigbus-105.md`): unlinking alone does not fault a
+//! mapping, but truncating the shared `-shm` does, and that needs two database inodes
+//! sharing one `-shm` in one process, where SQLite's own locks (per process on POSIX) do
+//! not separate them.
 //!
 //! So an advisory lock on `.serat/index.lock` is taken **before any rebuild or writer
 //! open** and held for as long as the writer lives. It is `File::try_lock`: `flock` on
 //! Unix, `LockFileEx` on Windows, no `unsafe`. The operating system drops it when the
-//! process dies, so a crash leaves nothing stale. A holder elsewhere makes the open fail
-//! with [`IndexError::HeldByAnotherProcess`]; it never waits, because a writer that
-//! blocked an open would block the window (design goal 2).
+//! process dies, so a crash leaves nothing stale on a local disk. A holder elsewhere
+//! makes the open fail with [`IndexError::HeldByAnotherProcess`]; it never waits,
+//! because a writer that blocked an open would block the window (design goal 2). A
+//! failure to create or take the lock for another reason is [`IndexError::Io`].
 //!
 //! Locks of two separate opens conflict even inside one process, so this also refuses a
 //! second writer in the same process, whatever the registry saw.
+//!
+//! # Limits
+//!
+//! * **Deleting `.serat/` while the app runs** unlinks `index.lock`: a second instance
+//!   then creates a new file and wins, so there are two writers again (no SIGBUS from
+//!   this lock's absence, but the old hazard). The lock is a backstop, not a guard
+//!   against a user removing the directory under a running app.
+//! * **NFS:** `flock` is emulated as a whole-file `fcntl` lock on Linux, which is per
+//!   process, so two opens in one process do not conflict there; it also needs a lock
+//!   manager, and on a `nolock` mount it is local to the client. Cross-machine
+//!   exclusion is not promised.
+//! * **SMB:** not verified.
+//! * **Windows after a crash:** the lock is released when the process's handles are
+//!   closed, which can lag the exit; a quick relaunch may be refused for a moment.
 //!
 //! Cost: one `open` and one `flock` per index open, measured in the open-time benches.
 
@@ -40,12 +60,15 @@ impl IndexLock {
     /// # Errors
     ///
     /// [`IndexError::HeldByAnotherProcess`] if another holder has it;
-    /// [`IndexError::Corrupt`] if the lock file cannot be created or locked for any
-    /// other reason.
+    /// [`IndexError::Io`] if the lock file cannot be created or locked for any other
+    /// reason.
     pub(crate) fn acquire(index_dir: &Path) -> Result<Self, IndexError> {
         let path: PathBuf = index_dir.join(LOCK_FILE);
-        let io = |what: &str, err: &std::io::Error| IndexError::Corrupt {
-            message: format!("could not {what} {}: {err}", path.display()),
+        let io = |what: &str, err: &std::io::Error| IndexError::Io {
+            message: format!(
+                "could not {what} {}: {err}. The index could not be locked here",
+                path.display()
+            ),
         };
         std::fs::create_dir_all(index_dir).map_err(|err| io("create the directory of", &err))?;
         let file = OpenOptions::new()

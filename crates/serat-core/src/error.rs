@@ -222,10 +222,23 @@ pub enum IndexError {
     /// beside the app, is refused here rather than allowed to rebuild the files under
     /// the first one's `-shm` mapping (a SIGBUS). The caller reports the index as
     /// unavailable for this session; the vault itself stays editable.
-    #[error("another process holds the index writer lock ({path})")]
+    #[error(
+        "another process, or another open in this process, holds the index writer lock ({path})"
+    )]
     HeldByAnotherProcess {
         /// The lock file.
         path: String,
+    },
+
+    /// The index's writer lock could not be created or taken here, for a reason other
+    /// than a holder (a read-only directory, a filesystem without locking).
+    ///
+    /// Task #154. Not corruption: nothing in the index is wrong. The caller treats it as
+    /// "no index this session", like any open that fails.
+    #[error("the index could not be locked here: {message}")]
+    Io {
+        /// What failed, with the path.
+        message: String,
     },
 
     /// The writer thread is gone, so no further writes can be accepted.

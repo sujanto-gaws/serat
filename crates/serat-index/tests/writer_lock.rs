@@ -136,53 +136,99 @@ fn two_threads_opening_a_vault_with_no_index_never_fault_or_corrupt() {
     }
 }
 
-/// The child half of the two-process test: does nothing unless the parent set
-/// [`CHILD_ENV`]. Opens the shared vault in a loop, as fast as it can.
+/// Child half of the refusal test: opens once and exits by panicking unless the open is
+/// refused with `HeldByAnotherProcess`. Ignored so a normal run never executes it
+/// outside the parent that sets [`CHILD_ENV`].
 #[test]
-fn child_process_hammers_the_shared_index() {
+#[ignore = "child of two_processes_a_second_process_is_refused_by_a_live_writer"]
+fn child_expects_to_be_refused() {
     let Ok(dir) = std::env::var(CHILD_ENV) else {
-        return;
+        return; // `--ignored` run directly, not by a parent
     };
-    let index_dir = Path::new(&dir).join(".serat");
-    for _ in 0..300 {
-        match open(&index_dir) {
-            Ok(handle) => {
-                assert_eq!(handle.note_count().expect("count"), 3);
-            }
-            Err(IndexError::HeldByAnotherProcess { .. }) => {}
-            Err(other) => panic!("child: {other:?}"),
-        }
-    }
+    let result = open(&Path::new(&dir).join(".serat"));
+    assert!(
+        matches!(result, Err(IndexError::HeldByAnotherProcess { .. })),
+        "the child was admitted beside a live writer: {:?}",
+        result.map(|_| ())
+    );
 }
 
-/// Two processes, same vault, no index: neither may die of a signal (SIGBUS is signal
-/// 7) or fail for any reason but the refusal. Ignored by default: it spawns this
-/// binary.
+/// Child half of the storm: opens in a loop and prints how often it was refused.
 #[test]
-#[ignore = "spawns this test binary; run with --ignored"]
-fn two_processes_on_one_vault_never_fault() {
-    let dir = tempfile::tempdir().expect("temp");
-    let exe = std::env::current_exe().expect("exe");
-    let child = |dir: &Path| {
-        std::process::Command::new(&exe)
-            .args([
-                "--exact",
-                "child_process_hammers_the_shared_index",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, dir)
-            .spawn()
-            .expect("spawn")
+#[ignore = "child of two_processes_hammering_one_vault_never_fault"]
+fn child_hammers_the_shared_index() {
+    let Ok(dir) = std::env::var(CHILD_ENV) else {
+        return; // `--ignored` run directly, not by a parent
     };
-    let mut other = child(dir.path());
-    let index_dir = dir.path().join(".serat");
+    let index_dir = Path::new(&dir).join(".serat");
+    let mut refused = 0;
     for _ in 0..300 {
         match open(&index_dir) {
             Ok(handle) => assert_eq!(handle.note_count().expect("count"), 3),
-            Err(IndexError::HeldByAnotherProcess { .. }) => {}
+            Err(IndexError::HeldByAnotherProcess { .. }) => refused += 1,
+            Err(other) => panic!("child: {other:?}"),
+        }
+    }
+    println!("REFUSED={refused}");
+}
+
+fn spawn_child(test: &str, dir: &Path) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", test, "--ignored", "--nocapture"])
+        .env(CHILD_ENV, dir)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn")
+}
+
+/// Deterministic: the parent holds a writer, a second process opens the same vault and
+/// must be refused. Without the lock the child is admitted and exits non-zero.
+#[test]
+fn two_processes_a_second_process_is_refused_by_a_live_writer() {
+    let dir = tempfile::tempdir().expect("temp");
+    let held = open(&dir.path().join(".serat")).expect("parent open");
+    let out = spawn_child("child_expects_to_be_refused", dir.path())
+        .wait_with_output()
+        .expect("child");
+    assert!(
+        out.status.success(),
+        "the other process was not refused: {:?}",
+        out.status
+    );
+    drop(held);
+}
+
+/// Two processes race to open an index-less vault: neither may die of a signal (SIGBUS
+/// is 7) or fail for any reason but the refusal, and across both at least one open was
+/// refused. Ignored by default: it spawns this binary and runs a few seconds.
+#[test]
+#[ignore = "spawns this test binary; run with --ignored"]
+fn two_processes_hammering_one_vault_never_fault() {
+    let dir = tempfile::tempdir().expect("temp");
+    let child = spawn_child("child_hammers_the_shared_index", dir.path());
+    let index_dir = dir.path().join(".serat");
+    let mut refused = 0;
+    for _ in 0..300 {
+        match open(&index_dir) {
+            Ok(handle) => assert_eq!(handle.note_count().expect("count"), 3),
+            Err(IndexError::HeldByAnotherProcess { .. }) => refused += 1,
             Err(other) => panic!("parent: {other:?}"),
         }
     }
-    let status = other.wait().expect("child");
-    assert!(status.success(), "the other process died: {status:?}");
+    let out = child.wait_with_output().expect("child");
+    assert!(
+        out.status.success(),
+        "the other process died: {:?}",
+        out.status
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let theirs: u32 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("REFUSED="))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the child reports its refusals");
+    assert!(
+        refused + theirs > 0,
+        "the two processes never overlapped, so nothing was exercised"
+    );
 }
