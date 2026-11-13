@@ -65,6 +65,8 @@ export const useVaultStore = defineStore("vault", {
      * re-announced on every event). Set once on entering the waiting state and once on leaving it;
      * cleared at the next transition. */
     indexAnnouncement: "",
+    /** `kind` of the state the snapshot was taken in; the snapshot is kept while the kind holds. */
+    indexAnnouncementKind: "" as string,
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -145,9 +147,15 @@ export const useVaultStore = defineStore("vault", {
       const wasWaiting = this.indexStatusDetail !== null;
       const text = describeIndexState(state);
       const detail = describeIndexDetail(state);
-      if (detail !== null && !wasWaiting) this.indexAnnouncement = text; // entered
-      else if (detail === null && wasWaiting) this.indexAnnouncement = text; // left
-      else if (detail === null) this.indexAnnouncement = ""; // a later transition clears it
+      if ((detail !== null && !wasWaiting) || (detail === null && wasWaiting)) {
+        this.indexAnnouncement = text; // entered or left: one snapshot
+        this.indexAnnouncementKind = state.kind;
+      } else if (detail === null && state.kind !== this.indexAnnouncementKind) {
+        // Cleared only on a change of kind, not on each progress event: a polite region can drop a
+        // snapshot that is wiped milliseconds after it is written (worst on WebKit).
+        this.indexAnnouncement = "";
+        this.indexAnnouncementKind = "";
+      }
       this.indexStatusText = text;
       this.indexStatusDetail = detail;
     },

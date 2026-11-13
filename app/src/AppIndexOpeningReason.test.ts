@@ -89,9 +89,14 @@ describe("App status strip: Opening reason", () => {
     }
     await flush();
     expect(announced).toEqual([]);
-    expect(live.textContent).toBe("");
+    // The leave snapshot survives the progress events (same kind); only a change of kind clears it.
+    expect(live.textContent).toContain("Rebuilding index");
     // Non-waiting states carry their full text as the title.
     expect(wrapper.find('[data-testid="index-state"]').attributes("title")).toContain("Rebuilding index");
+    await send({ kind: "ready", note_count: 3 });
+    await flush();
+    expect(announced).toEqual([]);
+    expect(live.textContent).toBe("");
 
     observer.disconnect();
     wrapper.unmount();
