@@ -40,6 +40,12 @@ const _: () = assert!(
     !serat_index::TEST_HOOKS || cfg!(debug_assertions),
     "test-hooks must not reach a release build"
 );
+// The same for serat-vault's (task #35): `Vault::with_platform` can switch off the
+// containment rules (T-07, T-10, NFR-SEC-06), so it must never be reachable in a release.
+const _: () = assert!(
+    !serat_vault::TEST_HOOKS || cfg!(debug_assertions),
+    "serat-vault test-hooks must not reach a release build"
+);
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -77,6 +83,73 @@ pub mod vault;
 /// there is nothing to keep in sync, because there is only one file.
 #[path = "../../../contracts/ipc.rs"]
 pub mod ipc;
+
+/// Where this crate's tests put their fixture directories (NFR-REL-01, NFR-MNT-01).
+///
+/// Every fixture that opens an index leaves a WAL `index.db-shm`, which SQLite maps into the
+/// process. On a thin-provisioned disk under a concurrent build, a page fault on that mapping
+/// failed and killed the test binary with SIGBUS (`docs/05-testing/sigbus-105.md`). `/dev/shm`
+/// is tmpfs, so the mapping is memory-backed and cannot fail for want of a disk block; it is
+/// used when it exists and is writable, otherwise the ordinary temp dir. Test code only: the
+/// shipped app keeps WAL on the user's disk (ADR-0015).
+#[cfg(test)]
+pub(crate) fn test_temp_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let shm = std::path::Path::new("/dev/shm");
+        let probe = shm.join(format!("serat-app-probe-{}", std::process::id()));
+        if shm.is_dir() && std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            shm.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        }
+    })
+    .clone()
+}
+
+/// A fixture directory that removes itself when dropped, so a panicking test cleans up too.
+/// `/dev/shm` is RAM: a fixture left behind there is memory held until the next reboot.
+#[cfg(test)]
+pub(crate) struct TestDir(std::path::PathBuf, std::path::PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self(path.clone(), path)
+    }
+
+    /// Derefs to `path` (a file inside the fixture, say) but removes `root` on drop.
+    pub(crate) fn within(path: std::path::PathBuf, root: std::path::PathBuf) -> Self {
+        Self(path, root)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDir {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        // A test may have replaced the directory with a file to force a write error.
+        if std::fs::remove_dir_all(&self.1).is_err() {
+            let _ = std::fs::remove_file(&self.1);
+        }
+    }
+}
 
 use cli::Boot;
 use ipc::{BootInfo, INDEX_STATUS_EVENT, OpenVaultArgs};
@@ -926,7 +999,7 @@ mod tests {
         let trace = startup.trace().expect("complete");
         write_trace(&trace, None).expect("stdout");
 
-        let path = std::env::temp_dir()
+        let path = crate::test_temp_dir()
             .join(format!("serat-trace-{}", std::process::id()))
             .join("prf01.json");
         write_trace(&trace, Some(&path)).expect("file");
@@ -1010,7 +1083,7 @@ mod tests {
         );
 
         // And through the real write path, not just serde in isolation.
-        let path = std::env::temp_dir()
+        let path = crate::test_temp_dir()
             .join(format!(
                 "serat-benchmark-exit-report-{}",
                 std::process::id()
@@ -1045,7 +1118,8 @@ mod tests {
     /// real save path that test proved reaches the index without the watcher. Not
     /// reused directly: that helper is private to `state.rs`'s own test module.
     fn open_fixture_for_save_benchmark(name: &str) -> (std::path::PathBuf, AppState) {
-        let dir = std::env::temp_dir().join(format!("serat-app-lib-{name}-{}", std::process::id()));
+        let dir =
+            crate::test_temp_dir().join(format!("serat-app-lib-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(dir.join("10-projects/a.md"), "# A\n").expect("fixture");
@@ -1147,7 +1221,7 @@ mod tests {
 
     #[test]
     fn run_save_benchmark_refuses_a_list_file_that_is_not_there() {
-        let missing = std::env::temp_dir().join(format!(
+        let missing = crate::test_temp_dir().join(format!(
             "serat-app-lib-save-bench-missing-list-{}.txt",
             std::process::id()
         ));
@@ -1224,7 +1298,7 @@ mod tests {
         // `WriterHandle::submit`, bypassing the vault entirely -- no read, no write,
         // nothing but the submit itself -- which is what makes it fast enough to
         // contend continuously for the single slot for the run's whole duration.
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_temp_dir().join(format!(
             "serat-app-lib-save-bench-refusal-{}",
             std::process::id()
         ));
@@ -1344,3 +1418,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod opening_reason_tests;
+#[cfg(test)]
+mod refusal_wiring_tests;

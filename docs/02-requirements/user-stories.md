@@ -104,6 +104,28 @@ As a daily user, I want to create a note or folder without leaving Serat, so tha
 - Given a folder selected in the file tree, when I choose New folder, then the folder appears in the tree and I can create notes in it.
 - Given a note I created, when I open it in a plain text editor outside Serat, then it is ordinary Markdown with no template or proprietary syntax.
 
+### US-42 — Trust what is inside the app  (serves NFR-SEC-07)
+**Phase:** P1 · **Size:** S
+
+As a privacy-minded vault owner, I want every third-party component in Serat to come from a public registry under a known licence with no unresolved security advisory, so that I can trust code that runs over my notes without auditing it myself.
+
+**Acceptance criteria**
+
+- Given a change that adds a dependency from a git URL, a local path or an unlisted registry, when CI runs, then the dependency job fails and the change cannot merge.
+- Given a dependency whose licence is not on the recorded allow-list, or which has an open advisory at or above the recorded severity, when CI runs, then the job fails and names the crate and the rule.
+- Given an advisory ignore in `deny.toml`, when it is reviewed, then it carries a written reason.
+
+### US-43 — Open a cloud-synced vault without downloading it  (serves FR-VLT-12)
+**Phase:** P2 · **Size:** M
+
+As a user whose vault lives in OneDrive with Files-On-Demand, I want Serat to open my vault without downloading it, so that my freed disk space and my metered connection are respected.
+
+**Acceptance criteria**
+
+- Given a vault in which some notes are online-only, when I open it, rebuild its index or leave it running, then no online-only file is downloaded, and each still appears in the file tree and the quick switcher, resolves as a link target, and is counted as not stored locally.
+- Given an online-only note listed in the tree, when I open it, then that one file is downloaded and opened and no other online-only file is downloaded.
+- Given I restore a session whose tabs name online-only notes, when Serat starts, then none is downloaded and each shows that it is stored online only, with a way to download it.
+
 ### US-38 — Arrange my workspace  (serves FR-EDT-09, NFR-USE-03)
 **Phase:** P2 · **Size:** M
 

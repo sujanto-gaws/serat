@@ -1,6 +1,6 @@
 # Screen: File tree — progressive population, attachments, sidecar folding, insert-link
 
-Serves: FR-VLT-01, FR-VLT-08, FR-BIN-03 · US-01, US-18
+Serves: FR-VLT-01, FR-VLT-08, FR-BIN-03, NFR-SEC-06, NFR-USE-01 · US-01, US-18
 Design basis: ADR-0015 (complete directory listings, progressive), architecture.md §3.5, §7.4
 
 ## Layout
@@ -56,6 +56,83 @@ Non-Markdown files are listed exactly like notes, with a format-specific glyph (
 - A small affordance in that metadata panel, `Edit metadata note`, opens the sidecar itself in the editor when the user actually wants to touch its Markdown directly (e.g. to add a field the metadata panel doesn't surface yet) — an escape hatch, not the default path.
 - Deleting the sidecar turns the row back into a plain asset (dot disappears); deleting the asset turns the sidecar back into a plain note row. Both are single-entry tree updates (ADR §7.4), so this transition is instant and not a full-folder refresh.
 
+## Names not shown — refused-names count and list (FR-VLT-01, NFR-SEC-06)
+
+A file the vault cannot turn into a vault path (a NUL byte, a `..` segment, a literal `\` in a name, a non-UTF-8 name on non-Windows platforms, and the Windows name rules: `:`, device names, a trailing dot or space) is never silently absent from the tree (design goal 5). The tree cannot show it, so the *report* lives beside the tree rather than in it. `IndexStatus.refused_names` carries the count; the `refused_names` command returns the list (`contracts/ipc.rs`).
+
+### Decision: a status-strip count that opens a panel, not a tree footer
+
+| Option | Verdict |
+|---|---|
+| **Status-strip count + anchored panel** | **Chosen.** |
+| Tree footer | Rejected. The tree pane is collapsible (`⌘B`) and becomes a flyover below `breakpoint-compact`, so a fact kept in its footer would vanish exactly when the pane is hidden. A footer also takes a permanent row from a virtualised list for a condition most vaults never have, and it would put a status fact inside the tree, which *File tree* above keeps free of progress and index state. The strip is always visible, already carries the other vault facts (index state, `Updated externally`), and costs nothing when the count is absent. |
+
+### The count (status strip)
+
+- **Absent, not zero.** `refused_names` of `None` or `0` renders nothing: no "0 names not shown", no empty slot. The strip does not reserve space for it.
+- **Wording.** `1 name not shown`, `12 names not shown`, and at the cap `1000+ names not shown`. The old trailing "(invalid on this platform)" is dropped: the reasons vary per name and are in the list, and the clause was wrong for a name refused on any other ground.
+- **Control.** A text button, updated immediately when the count changes, `typography.small`, `ui` family, `text-secondary`, led by a 6px `accent-error` status dot (components.md §6: rust = refused). Hover raises the text to `text-primary`; no underline until hover or focus. The dot is a reinforcement: the text carries the meaning, so it is never colour alone.
+- **Semantics.** `<button aria-haspopup="dialog" aria-expanded>`; its name is its visible text. At the cap the visible `1000+` is `aria-hidden` and a visually-hidden `1000 or more` stands in, so a screen reader never reads "plus". The button is **not** inside the live region below.
+- **Live region.** A separate, always-mounted, visually hidden `role="status"` node (polite, atomic), a sibling of the button, carries the sentence ("3 names not shown") and is empty when the count is absent, so a count that appears, changes or clears is announced. The button text updates at once; only the status node's sentence is coalesced with a 1s trailing debounce, so a walk that raises the count name by name announces once, not per file. This is a deliberate exception to "don't narrate what the user can already see": focus is not on the strip, and the user cannot see a count they are not looking at.
+- **Reach.** The button is in the strip's Tab order. Also a palette command, `Show names not shown` (`vault.refused-names`, no default binding, greyed with the reason "Every name can be shown" when the count is zero and "Open a vault first" when it is `None`). It opens the same panel and returns focus the same way. It is not a primary action for NFR-USE-01's purposes (it is a report, not something the user does to the vault), so it does not join that primary-action list; it is still listed and bindable in the palette like every command.
+
+### The list (anchored, non-modal panel)
+
+Opens above the strip at its left edge, width 440px (max 90vw), `max-height` 50vh, `bg-overlay`, 1px `border-hairline`, `radius.md`, `elevation.overlay`, anchored to the button as a non-modal notice (components.md §5). Below `breakpoint-compact` it is a full-width sheet above the strip, `max-height` 60vh. Open/close 160ms (`motion.duration.panel`): opacity and a 4px rise; opacity only under `prefers-reduced-motion`.
+
+```
+┌ Names not shown ────────────────────── [×] ┐
+│ 12 files in your vault folder can't be      │
+│ listed on this computer. Serat leaves them  │
+│ as they are.                                │
+│ ─────────────────────────────────────────── │
+│ notes/meeting: friday.md          (mono)    │
+│ Contains a : (mono), which is a drive       │
+│ prefix or an NTFS alternate data stream on  │
+│ Windows                                     │
+│ ─────────────────────────────────────────── │
+│ ...                                         │
+│ A name stays listed until Serat next scans  │
+│ its folder, even if you have since renamed  │
+│ or deleted the file.                        │
+└─────────────────────────────────────────────┘
+```
+
+- **Header.** Title `Names not shown` (`ui-medium`), close button (24x24 hit target). Under it, one sentence, `text-secondary`: `N files in your vault folder can't be listed on this computer. Serat leaves them as they are.` (`1 file ... can't`). N comes from the list length, not the status count.
+- **Rows.** Path first, in `mono` `small`, `text-primary`, wrapping at any character (never truncated: the exact name is the point). Reason second, in `ui` `small`, `text-secondary`. The backend writes reasons as lowercase predicates with Markdown backticks (`contains a `:`, which is a drive prefix ...`); the panel presents them by capitalising the first letter and rendering each backticked span as inline `mono` without the backticks (`Contains a :, which is a drive prefix ...`), and changes nothing else. One row per distinct path, in the backend's byte order, separated by a hairline. No icons, no per-row actions: a path in this list failed to become a vault path, so nothing can open or act on it, and it is never passed back to a command (contract: display only).
+- **Untrusted text (NFR-SEC-06).** Paths and reasons are rendered as text, never HTML. Control characters and bidi overrides in a path **or in a reason** (reasons interpolate the name) are shown as visible escapes (`⟨U+202E⟩`) so a hostile name cannot reorder its own display or hide its extension. Text is selectable, and what is copied is the display form: escaped, and with U+FFFD where a non-UTF-8 name was decoded lossily. The panel does not promise a byte-exact name to paste into a file manager; the user finds the file by its visible shape.
+- **Footer.** One line, `text-secondary`: `A name stays listed until Serat next scans its folder, even if you have since renamed or deleted the file.` (the contract's accepted staleness, said once instead of left to surprise; the log drops entries per scanned subtree).
+- **Overflow at the cap (1000).** The strip reads `1000+ names not shown`; the header sentence becomes `1000 or more files in your vault folder can't be listed on this computer. This list shows 1000 of them. Serat leaves them as they are.` The list never claims a total it does not know. At 1000 rows the list is a plain scroll container (no virtualisation; the cap is its bound), with `content-visibility: auto` on rows.
+- **Empty state** (the panel is open and the list is empty, whether it opened that way or the count fell to zero while open): one line, `text-secondary`: `Every name in this vault can be shown.` The panel is not closed for the user; it waits for `Esc`.
+- **Loading** (first open only, when there is no earlier list): the list area shows one line, `text-secondary`, `Loading the list…`, with no spinner and no skeleton rows. It appears only if the call is still pending after 150ms, so a fast read never flashes it. It sits in a panel-scoped polite `role="status"` node that announces `Loading the list` once. When the call returns, the same node announces the header sentence (`12 files in your vault folder can't be listed on this computer…`, or the empty-state line), so a screen-reader user hears that loading ended and what it found. Focus does not move. A re-fetch with an earlier list on screen shows no loading state at all (see *When the count changes* below).
+- **Load failure, first open** (no earlier list): `Couldn't load the list. The count in the status strip is still correct.` with a `Retry` secondary button replaces the list area. The status node announces the same sentence. No retry loop.
+- **Load failure, background re-fetch** (the count changed while the panel was open and the call errors): the old list **stays**, and the failure line with `Retry` appears **above it**, between the header sentence and the first row: `Couldn't refresh the list. It may be out of date.` The old rows are a true report of an earlier moment and are more use than nothing, and replacing them would make a transient error erase information the user may be mid-way through reading or copying. The header sentence keeps the old list's count. The status node announces the failure line once. `Retry` runs the re-fetch; on success the line disappears and the list is replaced in place under the same scroll and focus rules. A further status event that changes the count also triggers a fresh re-fetch (debounced as usual) and clears the line if it succeeds. No automatic retry loop.
+
+### Keyboard and focus
+
+| Action | Behaviour |
+|---|---|
+| Open | `↵` or `Space` on the strip button, or the palette command. Click toggles. |
+| Focus on open | Moves to the panel (`tabindex="-1"` on the dialog) so the title and description are read. `Tab` then reaches `×` (it precedes the list in reading order), then the list container. |
+| Scroll the list | The list container is `tabindex="0"` with `role="list"` and an `aria-label` of `Names not shown`; `↑ ↓ PageUp PageDown Home End` scroll natively. Rows are not individually focusable (they have no action). |
+| Close | `Esc`, the `×` button, activating the strip button again, opening any overlay (palette, switcher), or focus moving to a non-overlay element (components.md §5 rule). A pointer press outside also closes it, except on the anchor button (which toggles). Window blur does not close it. |
+| Focus return | To the element that was focused when the panel opened: the strip button if opened from it, otherwise the palette's opener (the palette already restores it). If that element is gone (the count fell to none and the button unmounted), the chain is the tree's selected row, then the editor; the editor also when the tree is collapsed, not only below `breakpoint-compact`. Focus is never dropped to `<body>`. If focus left the panel on its own (the user pressed `⌘2`), it is not pulled back. |
+
+### Accessibility
+
+- `role="dialog"` with `aria-modal="false"`, `aria-labelledby` the title, `aria-describedby` the header sentence. It is non-modal: no focus trap, no scrim, the rest of the app stays operable, so a user can read a name here and fix it in a file manager without dismissing anything first.
+- The panel's own count sentence is not a live region; only the strip's is, so a change is announced once.
+- Contrast. Light: `text-primary` and `text-secondary` on `bg-overlay` meet 4.5:1 (components.md baseline); the `accent-error` dot is about 5.4:1 on paper. Dark (P2, NFR-USE-03; no new hue): roles map to an ink ground and paper text. The `accent-error` dot is about 2.9:1 on ink, under the 3:1 non-text minimum, so the dark ramp must supply a lighter `accent-error` before dark ships. Until then nothing depends on the dot, because the text states the fact.
+
+### When the count changes while the list is open
+
+- Each status event whose `refused_names` differs triggers one re-fetch of the list, 500ms trailing debounce. The old list stays on screen until the new one arrives: no spinner, no blank flash, no loading line. If the re-fetch fails, the old list stays and the failure line appears above it (see *Load failure, background re-fetch*).
+- The scroll position and, if the user has focus inside the list, that focus are kept. Rows inserted above the viewport do not move what the user is reading (`overflow-anchor: auto`).
+- The header sentence updates in place. The strip's live region announces the new count once; the panel stays quiet.
+- A count that returns to zero shows the empty state (above). A count that goes absent (`None`, the vault closed) closes the panel with the usual focus return, because the thing it described no longer exists.
+- Entries leave the log when a walk covering their subtree replaces it (contract), so the count can change in steps. The 500ms re-fetch debounce still applies; the panel keeps the old list until the new one arrives.
+- If the list and the count disagree after a fetch (the log moved between the two reads), the panel trusts its own list for its sentence, the strip keeps the status value, and the next event reconciles them. Neither is shown as an error.
+
 ## States
 
 | State | Presentation |
@@ -77,6 +154,7 @@ Non-Markdown files are listed exactly like notes, with a format-specific glyph (
 |---|---|
 | Focus tree pane | `⌘` `1` |
 | Move selection | `↑` `↓` |
+| First / last row | `Home` `End` |
 | Expand / collapse | `→` `←` (also toggles on a note row: `→` opens it into the editor without moving focus) |
 | Open selected | `↵` |
 | Open in new tab | `⌘` `↵` |

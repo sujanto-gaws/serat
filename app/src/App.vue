@@ -30,6 +30,7 @@ import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
+import { registerTreeInsertLink, TREE_INSERT_LINK_ID } from "@/tree/insertLinkCommand";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { headingDocOffset } from "@/overlays/headingTarget";
 import CommandPalette from "@/overlays/CommandPalette.vue";
@@ -238,9 +239,8 @@ const treeMenuBindings = computed(() => {
   return {
     "new-note": commands.effectiveBinding("tree.newNote"),
     "new-folder": commands.effectiveBinding("tree.newFolder"),
-    // TODO(#39 follow-up: register tree.insertLink in the CommandRegistry, default Mod-Shift-l, active only when the tree has focus; route treeLogic.ts:89 and this menu through commands.effectiveBinding)
-    "insert-link": "Mod-Shift-l",
-    rename: "F2",
+    "insert-link": commands.effectiveBinding(TREE_INSERT_LINK_ID),
+    rename: "F2", // fixed (file-tree.md keyboard map), not a registry command
   };
 });
 const mac = detectPlatform() === "mac";
@@ -306,6 +306,7 @@ function registerCommands(): Array<() => void> {
     }),
     commands.register({ id: "tree.newNote", name: "New note", defaultBinding: "Mod-n", exec: () => startCreate("note") }),
     commands.register({ id: "tree.newFolder", name: "New folder", defaultBinding: "Mod-Shift-n", exec: () => startCreate("folder") }),
+    registerTreeInsertLink(commands, () => treeRef.value),
     commands.register({ id: "backlinks.focus", name: "Focus backlinks", defaultBinding: "Mod-3", exec: () => backlinksRef.value?.focus() }),
   ];
 }
@@ -411,6 +412,9 @@ onMounted(async () => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
     store.setIndexState(status.state);
+    // The poll carries the count like the event does (task #35).
+    const refused = (status as { refused_names?: number }).refused_names;
+    if (typeof refused === "number") store.setRefusedNames(refused);
   });
 
   if (editorRef.value) {

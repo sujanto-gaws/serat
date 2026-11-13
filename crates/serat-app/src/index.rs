@@ -80,7 +80,13 @@ pub struct StatusPublisher<S> {
     /// Set when the open that created this publisher failed after `vault://opened` had
     /// announced its id (task #90): nothing may carry that id afterwards.
     retired: std::sync::atomic::AtomicBool,
+    /// The refused-name count the refusal callback last acted on, [`NOT_EMITTED`]
+    /// before the first change. Lets it re-emit only when the count moved.
+    last_refused: std::sync::atomic::AtomicU32,
 }
+
+/// Sentinel for `last_refused`: above [`REFUSED_NAMES_CAP`], so no count equals it.
+const NOT_EMITTED: u32 = u32::MAX;
 
 #[derive(Debug)]
 struct Published {
@@ -138,7 +144,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             sink,
             throttle,
             inner: Mutex::new(Published {
-                state: IndexState::Opening,
+                state: IndexState::Opening { reason: None },
                 since_process_start_ms,
                 last_emit: None,
             }),
@@ -146,7 +152,16 @@ impl<S: StatusSink> StatusPublisher<S> {
             refusals: None,
             wal: Mutex::new(None),
             retired: std::sync::atomic::AtomicBool::new(false),
+            last_refused: std::sync::atomic::AtomicU32::new(NOT_EMITTED),
         }
+    }
+
+    /// Start in `Opening` with `reason` (task #117): a deferred open (task #96) says why it
+    /// has no actor yet. `None` is the plain `Opening` every publisher starts in.
+    #[must_use]
+    pub fn with_opening_reason(self, reason: Option<crate::ipc::OpeningReason>) -> Self {
+        self.lock().state = IndexState::Opening { reason };
+        self
     }
 
     /// Count the names `refusals` holds into every status this publisher builds
@@ -158,6 +173,32 @@ impl<S: StatusSink> StatusPublisher<S> {
     pub fn with_refusals(mut self, refusals: serat_vault::RefusalLog) -> Self {
         self.refusals = Some(refusals);
         self
+    }
+
+    /// Re-emit the status whenever the refusal log changes (task #35): a name refused by
+    /// the watcher after the open changes the count while the state stays `Ready`, and
+    /// would otherwise reach a listening front end only with the next state change.
+    ///
+    /// Call once, right after the publisher is in its `Arc`; a no-op with no log. The
+    /// callback holds the publisher weakly: the log is owned by the vault, and a reference
+    /// back would make a cycle. It runs on the walk's or the watcher's thread and only
+    /// builds a status and hands it to the sink, so it does not block.
+    pub fn watch_refusals(self: &Arc<Self>) {
+        let Some(refusals) = &self.refusals else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        refusals.on_change(move || {
+            if let Some(publisher) = weak.upgrade() {
+                // The count saturates at the cap and the status carries nothing else
+                // of the log, so a change that leaves it as it was (a watcher storm
+                // past the cap, a changed reason) would stream identical statuses.
+                let now = publisher.refused_count().unwrap_or(NOT_EMITTED);
+                if publisher.last_refused.swap(now, Ordering::SeqCst) != now {
+                    publisher.re_emit();
+                }
+            }
+        });
     }
 
     /// Carry the checkpointer's pinned-WAL fact into every status this publisher builds
@@ -261,6 +302,9 @@ impl<S: StatusSink> StatusPublisher<S> {
         }
         let status = self.status();
         self.lock().last_emit = Some(Instant::now());
+        if self.is_retired() {
+            return;
+        }
         self.sink.emit(&status);
     }
 
@@ -292,7 +336,13 @@ impl<S: StatusSink> StatusPublisher<S> {
 
         let status = {
             let mut inner = self.lock();
-            let transition = kind_of(&inner.state) != kind_of(&state);
+            // A change of `Opening`'s reason is a transition too: a reason that clears
+            // must not be held back by the throttle (task #117).
+            let transition = kind_of(&inner.state) != kind_of(&state)
+                || matches!(
+                    (&inner.state, &state),
+                    (IndexState::Opening { reason: a }, IndexState::Opening { reason: b }) if a != b
+                );
             let due = inner
                 .last_emit
                 .is_none_or(|last| last.elapsed() >= self.throttle);
@@ -331,7 +381,7 @@ impl<S: StatusSink> StatusPublisher<S> {
 /// transition and defeat the throttle entirely.
 fn kind_of(state: &IndexState) -> u8 {
     match state {
-        IndexState::Opening => 0,
+        IndexState::Opening { .. } => 0,
         IndexState::Ready { .. } => 1,
         IndexState::Rebuilding { .. } => 2,
         IndexState::Unavailable { .. } => 3,
@@ -349,7 +399,7 @@ fn kind_of(state: &IndexState) -> u8 {
 fn is_terminal(state: &IndexState) -> bool {
     match state {
         IndexState::Ready { .. } | IndexState::Unavailable { .. } => true,
-        IndexState::Opening | IndexState::Rebuilding { .. } => false,
+        IndexState::Opening { .. } | IndexState::Rebuilding { .. } => false,
     }
 }
 
@@ -503,7 +553,7 @@ impl IndexOpen for SeratIndexOpen {
 /// could silently drift if a variant were ever added to one and not mapped here.
 fn map_open_status(status: serat_index::IndexStatus, index_dir: &Path) -> Option<IndexState> {
     match status {
-        serat_index::IndexStatus::Opening => Some(IndexState::Opening),
+        serat_index::IndexStatus::Opening => Some(IndexState::Opening { reason: None }),
         // Task #120. Not a contract state and deliberately not one: the index is
         // usable, nothing is rebuilding, and inventing an `IndexState` for it would put
         // a transient on the wire that every consumer would have to learn to ignore.
@@ -920,6 +970,39 @@ mod tests {
         }
     }
 
+    // Task #117. Mutant, run by hand: dropping the reason comparison from `publish`'s
+    // transition test makes the clear below throttled (`false`) and this fail.
+    #[test]
+    fn an_opening_reason_is_polled_and_its_clearing_is_emitted_through_the_throttle() {
+        use crate::ipc::OpeningReason::PreviousIndexStillClosing;
+        let recorder = Recorder::default();
+        let publisher = StatusPublisher::with_throttle(
+            "vault-1",
+            Arc::new(Startup::begin()),
+            recorder.clone(),
+            Duration::from_secs(60),
+        )
+        .with_opening_reason(Some(PreviousIndexStillClosing));
+        assert_eq!(
+            publisher.status().state,
+            IndexState::Opening {
+                reason: Some(PreviousIndexStillClosing)
+            }
+        );
+        // An unthrottled first emit, then the clear inside the 60 s window.
+        assert!(publisher.publish(IndexState::Opening {
+            reason: Some(PreviousIndexStillClosing)
+        }));
+        assert!(
+            publisher.publish(IndexState::Opening { reason: None }),
+            "the clearing of a reason is a transition, not a throttled tick"
+        );
+        assert_eq!(
+            recorder.taken().last().map(|s| s.state.clone()),
+            Some(IndexState::Opening { reason: None })
+        );
+    }
+
     #[test]
     fn the_pinned_wal_fact_rides_on_the_status_and_is_re_emitted_when_it_changes() {
         // Task #56. The fact is not part of the state, so a listening front end gets it
@@ -949,6 +1032,42 @@ mod tests {
         assert_eq!(publisher.status().wal_pinned_bytes, None);
         assert_eq!(recorder.taken().len(), 2);
         assert_eq!(recorder.taken()[1].wal_pinned_bytes, None);
+    }
+
+    #[test]
+    fn a_refusal_storm_past_the_cap_emits_only_while_the_count_moves() {
+        // Task #35 S1'. The log counts overflowed refusals as changes, the status does
+        // not carry them: identical statuses must not stream to the webview.
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                recorder.clone(),
+                Duration::from_secs(60),
+            )
+            .with_refusals(log.clone()),
+        );
+        publisher.watch_refusals();
+
+        for i in 0..REFUSED_NAMES_CAP {
+            log.record_for_test(&format!("n-{i:05}.md"), "r");
+        }
+        assert_eq!(recorder.taken().len(), REFUSED_NAMES_CAP as usize);
+        for _ in 0..50 {
+            log.record_for_test("overflow.md", "r");
+        }
+        log.record_for_test("n-00000.md", "a new reason");
+        assert_eq!(
+            recorder.taken().len(),
+            REFUSED_NAMES_CAP as usize,
+            "a change the status cannot show was emitted"
+        );
+        assert_eq!(
+            recorder.taken().last().expect("emitted").refused_names,
+            Some(REFUSED_NAMES_CAP)
+        );
     }
 
     #[test]
@@ -1096,7 +1215,7 @@ mod tests {
         );
         assert_eq!(
             publisher.status().state,
-            IndexState::Opening,
+            IndexState::Opening { reason: None },
             "the shell paints Opening while the actor is still working"
         );
 
@@ -1117,7 +1236,7 @@ mod tests {
     /// the crate's own source tree) rather than merely a narrower one.
     fn throwaway_vault(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-index-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("fixture");
         dir
     }
@@ -1181,7 +1300,7 @@ mod tests {
         assert_eq!(
             seen.lock().expect("not poisoned").clone(),
             vec![
-                IndexState::Opening,
+                IndexState::Opening { reason: None },
                 IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
                     done: 0,
@@ -1337,7 +1456,7 @@ mod tests {
                 },
                 true,
             ),
-            (IndexState::Opening, false),
+            (IndexState::Opening { reason: None }, false),
             (
                 IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,

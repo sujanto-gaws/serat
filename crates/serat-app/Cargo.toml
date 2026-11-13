@@ -74,6 +74,9 @@ tauri-build = { version = "2.6.3", features = [] }
 [dev-dependencies]
 # task #52: the command-layer supersession test parks a search mid-flight.
 serat-index = { path = "../serat-index", features = ["test-hooks"] }
+# task #35: the end-to-end refusal test judges names by another platform's rules
+# (`Vault::with_platform`). Dev-only, and asserted absent from a release build in lib.rs.
+serat-vault = { path = "../serat-vault", features = ["test-hooks"] }
 rusqlite = { workspace = true }
 # Test fixtures that clean up after themselves.
 tempfile = { workspace = true }
