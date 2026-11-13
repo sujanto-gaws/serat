@@ -23,18 +23,18 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 |---|---|---|---|
 | `{ kind: "opening" }` (no reason) | The open check is running. Normally milliseconds. | Nothing beyond "starting". It usually disappears before it is read. | `Opening index…` |
 | `{ kind: "opening", reason: "previous_index_still_closing" }` | A re-open of a vault whose earlier session is still finishing its index (#96). Can last a whole rebuild. | (1) Search, backlinks and views are waiting. (2) Why: the previous session of this vault is still finishing. (3) It will continue by itself. (4) Editing works. | `Finishing the previous session's index — search will start when it's done` |
-| `{ kind: "opening", reason: "index_held_by_another_process" }` | Another Serat process (a second window, or a benchmark run still finishing) holds this vault's index lock (#154). The open retries every 2 s for up to 60 s (#155); after that the state becomes `Unavailable`. | (1) Search, backlinks and views are waiting. (2) Why: another Serat window or process has this vault's index open. (3) It will continue by itself when that one lets go. (4) Editing works. | `Another Serat window has this vault's index open — search will start when it lets go` |
+| `{ kind: "opening", reason: "index_held_by_another_process" }` | Another Serat session holds this vault's index lock (#154): a second window, a benchmark run still finishing, another open of the same vault in this process, or a lock a crashed process left that Windows has not yet released. The open retries every 2 s for up to 60 s (#155); after that the state becomes `Unavailable`. | (1) Search, backlinks and views are waiting. (2) Why: another Serat session is using this vault's index. (3) It will continue by itself when that session is done. (4) Editing works. | `Another Serat session is using this vault's index — search will start when it's free` |
 | any other | As today (`Ready`, `Rebuilding`, `Unavailable`) | Unchanged by this brief | Unchanged |
 
 **Tooltip / accessible description** for the waiting state (on hover and as the status item's `aria-description`): `This vault was closed while its index was still being built. Serat finishes that first so two builds never write the same index. You can keep editing.`
 
-**Tooltip for `index_held_by_another_process` (draft, #155; architect ratifies).** `Only one Serat window can use a vault's index at a time. Serat keeps trying for up to a minute, then tells you if it could not get it. You can keep editing.` After the minute the state is `Unavailable`, whose message ("another Serat window or process still has this vault's index open after waiting 60 seconds…") is the Rust side's and is shown as written.
+**Tooltip / accessible description for `index_held_by_another_process`:** `Only one Serat session can update a vault's index at a time. Serat keeps trying for a while and tells you if it cannot get it. You can keep editing.` After the retry bound the state becomes `Unavailable`, whose message is the Rust side's and is shown as written.
 
-**Announcement.** The strip's live region announces the waiting state **once**, politely, when it is entered, and the following `Rebuilding` or `Ready` as usual. It does not re-announce while the state holds.
+**Announcement.** The strip's live region announces each waiting state once, politely, when it is entered. It also announces the following `Rebuilding`, `Ready` or `Unavailable` as usual. It does not re-announce while a state holds, and it does not announce the plain `Opening` that follows a cleared reason: that state lasts only until the open check's first state and would be noise.
 
 ## What the front end must not do
 
-- Treat an unknown `reason` as an error. `OpeningReason` may gain a member (a lock held by another Serat process is the expected one). Render an unknown reason as the plain `Opening index…`.
+- Treat an unknown `reason` as an error. `OpeningReason` may gain members. Render an unknown reason as the plain `Opening index…`.
 - Infer the reason from elapsed time ("still opening after 2 s, so it must be…"). The field is the only source.
 - Offer a "Cancel" or "Rebuild now" action here. There is nothing safe for it to do: starting a second build is exactly what this wait prevents (ADR-0001).
 
@@ -43,3 +43,4 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 - `describeIndexState({ kind: "opening" })` and `describeIndexState({ kind: "opening", reason: "previous_index_still_closing" })` return different text, and the second names neither an internal term nor a number.
 - An `IndexState` with an unrecognised `reason` string renders as the plain opening text and does not throw.
 - The transition from the waiting state to `Rebuilding` replaces the text without a modal or a layout shift.
+- `describeIndexState({ kind: "opening", reason: "index_held_by_another_process" })` returns text different from both other opening states, and names neither an internal term nor a number.

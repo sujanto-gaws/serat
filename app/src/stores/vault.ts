@@ -14,28 +14,39 @@ import type { IndexStatus } from "@/ipc/generated/IndexStatus";
 import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
-/** Copy brief index-state-copy.md: the only `reason` with its own copy. An absent, null or unknown
- * (future) reason is NOT an error and renders as the plain opening text (goal 5); the field is the
- * only source, never elapsed time. */
-function isWaitingOnPreviousIndex(state: Extract<IndexState, { kind: "opening" }>): boolean {
-  return state.reason === "previous_index_still_closing";
+import type { OpeningReason } from "@/ipc/generated/OpeningReason";
+
+/** Copy brief index-state-copy.md: each known `reason` has its own text and tooltip. An absent, null or
+ * unknown (future) reason is NOT an error and renders as the plain opening text (goal 5); the field is the
+ * only source, never elapsed time. Neither text carries a count or percentage ("No fake progress"). */
+const OPENING_COPY: Record<OpeningReason, { text: string; detail: string }> = {
+  previous_index_still_closing: {
+    text: "Finishing the previous session's index — search will start when it's done",
+    detail:
+      "This vault was closed while its index was still being built. Serat finishes that first so two builds never write the same index. You can keep editing.",
+  },
+  index_held_by_another_process: {
+    text: "Another Serat session is using this vault's index — search will start when it's free",
+    detail:
+      "Only one Serat session can update a vault's index at a time. Serat keeps trying for a while and tells you if it cannot get it. You can keep editing.",
+  },
+};
+
+function openingCopy(state: Extract<IndexState, { kind: "opening" }>): { text: string; detail: string } | null {
+  const reason = state.reason;
+  return typeof reason === "string" && Object.hasOwn(OPENING_COPY, reason) ? OPENING_COPY[reason] : null;
 }
 
-const WAITING_DETAIL =
-  "This vault was closed while its index was still being built. Serat finishes that first so two builds never write the same index. You can keep editing.";
-
-/** Tooltip / aria-description for the waiting state; `null` for every other state. */
+/** Tooltip / aria-description for a waiting state; `null` for every other state. */
 export function describeIndexDetail(state: IndexState): string | null {
-  return state.kind === "opening" && isWaitingOnPreviousIndex(state) ? WAITING_DETAIL : null;
+  return state.kind === "opening" ? (openingCopy(state)?.detail ?? null) : null;
 }
 
 /** §3.4: a rebuild is a status line, never a modal, never a blocking spinner. */
 export function describeIndexState(state: IndexState): string {
   switch (state.kind) {
     case "opening":
-      return isWaitingOnPreviousIndex(state)
-        ? "Finishing the previous session's index — search will start when it's done"
-        : "Opening index…";
+      return openingCopy(state)?.text ?? "Opening index…";
     case "ready":
       return `index: ready · ${state.note_count} notes`;
     case "rebuilding":
@@ -68,6 +79,9 @@ export const useVaultStore = defineStore("vault", {
     indexAnnouncement: "",
     /** `kind` of the state the snapshot was taken in; the snapshot is kept while the kind holds. */
     indexAnnouncementKind: "" as string,
+    /** A cleared reason just left the strip at a plain Opening: that state is not announced (it lasts until
+     * the open check's first state and would be noise); the state after it is. */
+    indexAfterWaiting: false,
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -152,9 +166,27 @@ export const useVaultStore = defineStore("vault", {
       const wasWaiting = this.indexStatusDetail !== null;
       const text = describeIndexState(state);
       const detail = describeIndexDetail(state);
-      if ((detail !== null && !wasWaiting) || (detail === null && wasWaiting)) {
-        this.indexAnnouncement = text; // entered or left: one snapshot
+      const plainOpening = state.kind === "opening" && detail === null;
+      if (detail !== null && (!wasWaiting || text !== this.indexStatusText)) {
+        this.indexAnnouncement = text; // entered (or the reason changed): one snapshot
         this.indexAnnouncementKind = state.kind;
+        this.indexAfterWaiting = false;
+      } else if (detail === null && wasWaiting) {
+        if (plainOpening) {
+          // Opening{None} after a cleared reason: say nothing, announce the state after it instead.
+          this.indexAnnouncement = "";
+          this.indexAnnouncementKind = state.kind;
+          this.indexAfterWaiting = true;
+        } else {
+          this.indexAnnouncement = text; // left: one snapshot
+          this.indexAnnouncementKind = state.kind;
+        }
+      } else if (detail === null && this.indexAfterWaiting) {
+        if (!plainOpening) {
+          this.indexAnnouncement = text;
+          this.indexAnnouncementKind = state.kind;
+          this.indexAfterWaiting = false;
+        }
       } else if (detail === null && state.kind !== this.indexAnnouncementKind) {
         // Cleared only on a change of kind, not on each progress event: a polite region can drop a
         // snapshot that is wiped milliseconds after it is written (worst on WebKit).

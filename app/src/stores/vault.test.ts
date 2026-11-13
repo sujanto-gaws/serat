@@ -106,3 +106,42 @@ describe("seeding from VaultOpened (P1 #117)", () => {
     expect(store.indexStatusDetail).toBeNull();
   });
 });
+
+describe("opening reason: index held by another process (P1 #155)", () => {
+  const held = { kind: "opening", reason: "index_held_by_another_process" } as const;
+  const HELD_TEXT = "Another Serat session is using this vault's index — search will start when it's free";
+
+  it("renders its own copy and tooltip, different from the previous-session reason, with no digits", () => {
+    expect(describeIndexState(held)).toBe(HELD_TEXT);
+    expect(describeIndexState(held)).not.toBe(describeIndexState({ kind: "opening", reason: "previous_index_still_closing" }));
+    expect(describeIndexState(held)).not.toMatch(/\d/); // no fake progress
+    expect(describeIndexDetail(held)).toContain("Only one Serat session can update a vault's index at a time.");
+    expect(describeIndexDetail(held)).toContain("You can keep editing.");
+  });
+
+  it("falls back to the plain text for a prototype-key reason", () => {
+    for (const reason of ["constructor", "toString", "__proto__"]) {
+      expect(describeIndexState({ kind: "opening", reason } as unknown as IndexState)).toBe("Opening index…");
+    }
+  });
+
+  it("announces on entering, skips the plain Opening{None}, announces the state after it, then Ready clears", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.setIndexState(held);
+    expect(store.indexAnnouncement).toBe(HELD_TEXT);
+    store.setIndexState(held);
+    expect(store.indexAnnouncement).toBe(HELD_TEXT);
+    store.setIndexState({ kind: "opening" });
+    expect(store.indexStatusDetail).toBeNull();
+    expect(store.indexAnnouncement).toBe(""); // the plain Opening after a cleared reason is not announced
+    store.setIndexState({ kind: "opening" });
+    expect(store.indexAnnouncement).toBe("");
+    store.setIndexState({ kind: "rebuilding", reason: "no_index", done: 0, total: 5, walk_complete: false });
+    expect(store.indexAnnouncement).toContain("Rebuilding index"); // the state after it is
+    store.setIndexState({ kind: "rebuilding", reason: "no_index", done: 1, total: 5, walk_complete: false });
+    expect(store.indexAnnouncement).toContain("Rebuilding index");
+    store.setIndexState({ kind: "ready", note_count: 2 });
+    expect(store.indexAnnouncement).toBe("");
+  });
+});
