@@ -4,7 +4,7 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use serat_core::{NoteKind, Platform, SourceEntry, VaultError, VaultPath};
+use serat_core::{NoteKind, SourceEntry, VaultError, VaultPath};
 
 use crate::refusal::Refusal;
 use crate::{Vault, ignore::is_note_file};
@@ -169,7 +169,7 @@ pub(crate) fn relativise_walked(vault: &Vault, path: &Path) -> Result<VaultPath,
         .map_err(|_| VaultError::PathEscapesVault {
             path: path.to_string_lossy().into_owned(),
         })?;
-    crate::vault_path_from_relative(Platform::current(), relative)
+    crate::vault_path_from_relative(vault.platform, relative)
 }
 
 /// Modification time in milliseconds since the Unix epoch.
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn names_only_windows_would_refuse_are_indexed_on_this_platform() {
         // Task #34's regression, pinned at the walk level rather than only at
-        // `VaultPath::new`'s: `aux.md`, a colon in a filename and a directory
+        // the vault's name rules': `aux.md`, a colon in a filename and a directory
         // named with a trailing dot are all ordinary, legal names here, and the
         // walk must produce a row for each rather than silently dropping it
         // (FR-VLT-01, design goal 5). code-reviewer-2's probe named the first
@@ -284,7 +284,8 @@ mod tests {
     #[test]
     fn a_literal_backslash_in_a_real_file_name_is_reported_not_silently_aliased() {
         // Task #34's amendment, nit (b). A backslash is an ordinary character in
-        // a Unix filename, but `VaultPath::new` also treats it as a separator —
+        // a Unix filename, but the vault's name rules (`VaultPath::new_for_platform`)
+        // treat it as a separator —
         // deliberately, for a path a user typed or pasted — so passing an OS
         // path component straight through would silently re-read one file
         // `"a\b.md"` as the two-segment path `"a/b.md"`, aliasing a real name to
