@@ -10,6 +10,7 @@
 import { defineStore } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
+import type { IndexStatus } from "@/ipc/generated/IndexStatus";
 import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
@@ -83,8 +84,10 @@ export const useVaultStore = defineStore("vault", {
     vaultIdFromBoot: false,
     /** `vault://opened` has been seen: the id is event-sourced and the poll can never change it. */
     announced: false,
-    /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
+    /** Distinct names the vault could not turn into a vault path (FR-VLT-01), as one status fact; `null` = absent (never zero). */
     refusedNames: null as number | null,
+    /** An `index://status` event has been applied, so a late poll answer must not overwrite it. */
+    statusEventSeen: false,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
@@ -100,6 +103,7 @@ export const useVaultStore = defineStore("vault", {
     vaultOpened(opened: VaultOpened) {
       this.announced = true; // from now on, no poll may set the id, even after a failed open
       if (!opened.vault_id) return; // never adopt an empty id
+      if (opened.vault_id !== this.vaultId) this.refusedNames = null; // another vault: the old count is not its count
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
@@ -121,6 +125,7 @@ export const useVaultStore = defineStore("vault", {
      * the editor buffer: #80, the only caller, must do that on `choose_vault` Err BEFORE calling this. */
     openFailed() {
       this.vaultOpen = false;
+      this.refusedNames = null; // no vault, nothing to count
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -161,6 +166,16 @@ export const useVaultStore = defineStore("vault", {
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;
+    },
+    /** One entry for an `index://status` event and the late-subscriber poll alike (architecture 3.4): the state
+     * text and the refused-names count, which is `null` when the status omits it (`None`: not counting yet, or
+     * no vault open; never zero, FR-VLT-01). */
+    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">, source: "event" | "poll") {
+      // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
+      if (source === "poll" && this.statusEventSeen) return;
+      if (source === "event") this.statusEventSeen = true;
+      this.setIndexState(status.state);
+      this.setRefusedNames(status.refused_names ?? null);
     },
     setOpenBuffer(note: string | null, baseHash: string | null) {
       this.openNote = note;

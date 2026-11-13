@@ -134,8 +134,8 @@ body {
   white-space: nowrap;
 }
 
-/* Visually hidden, still announced: the status strip one-shot live region (index-state-copy.md). */
-.statusbar .sr-only {
+/* Visually hidden, still read by assistive technology (live-region text, "1000 or more"). */
+.sr-only {
   position: absolute;
   width: 1px;
   height: 1px;
