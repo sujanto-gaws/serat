@@ -217,6 +217,47 @@ jobs:
             exit 1
           fi
 
+  # Task #136 (NFR-MNT-01, NFR-PRF-08, NFR-SEC-01; ADR-0007, ADR-0017, C-06; F-470): the committed
+  # webview bundle is what `npm run build` produces from app/. `crates/serat-app/tauri.conf.json`
+  # has `frontendDist: "webview"` and no `beforeBuildCommand`, so the bundle is compiled into the
+  # binary and `cargo build` never runs vite: a bundle that has drifted from app/src fails nothing,
+  # and every front-end check (paint marks, CSP, any mutation of app/src) measures the old one and
+  # reports clean (F-470). Task #116 rebuilt it in production mode; this job keeps it so.
+  # vite builds straight into that directory, so a bundle in sync leaves the tree clean.
+  # The directory is deleted first, so if vite's outDir ever stops being the shipped directory the
+  # build writes elsewhere, the files are missing, and the check fails instead of passing vacuously
+  # (the old branch needed a separate Rust pin for that). `git status --porcelain` rather than
+  # `git diff` so a file the build adds, which is untracked, fails as well as one it changes.
+  frontend-bundle:
+    name: committed webview bundle matches app/ source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The minor is pinned: the bundle is compared byte for byte, so a new Node minor
+          # on the runner must not be able to change it silently. Bump with the lockfile.
+          node-version: "22.23"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install exactly what the lockfile says
+        run: npm ci
+        working-directory: app
+      - name: Rebuild the bundle over an empty directory and require no change
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf crates/serat-app/webview
+          (cd app && NODE_ENV=production npm run build)
+          changed=$(git status --porcelain -- crates/serat-app/webview)
+          if [ -n "$changed" ]; then
+            echo "the committed bundle in crates/serat-app/webview is not what app/ source builds:"
+            echo "$changed"
+            echo "rebuild and commit it: cd app && npm ci && NODE_ENV=production npm run build"
+            echo "until then the binary ships the OLD bundle and downstream front-end checks measure it (F-470)."
+            exit 1
+          fi
+
   # The member list, read from cargo rather than typed out, so the matrix below
   # cannot drift away from the workspace.
   members:
@@ -317,7 +358,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny]
+    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny, frontend-bundle]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -333,7 +374,8 @@ jobs:
           deny_result='${{ needs.deny.result }}'
           ipc_result="${{ needs['ipc-types'].result }}"
           npm_result="${{ needs['npm-deny'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result"
+          bundle_result="${{ needs['frontend-bundle'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result $bundle_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then
