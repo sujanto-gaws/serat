@@ -695,6 +695,59 @@ mod tests {
         assert!(parsed.links.is_empty(), "{:?}", parsed.links);
     }
 
+    /// Every tag and wikilink target `text` yields, in order (task #145).
+    fn tags_and_links(text: &str) -> Vec<(LinkKind, String)> {
+        parse(text)
+            .links
+            .into_iter()
+            .map(|link| (link.kind, link.target.note))
+            .collect()
+    }
+
+    #[test]
+    fn a_tag_right_after_a_closing_backtick_is_still_a_tag() {
+        // The span's range ends at the closing backtick, exclusive: `#b` follows it.
+        assert_eq!(
+            tags_and_links("`#a`#b\n"),
+            vec![(LinkKind::Tag, "b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_code_span_at_offset_zero_and_one_ending_at_eof_hold_no_tag() {
+        assert!(tags_and_links("`#a` text\n").is_empty());
+        assert!(
+            tags_and_links("text `#a`").is_empty(),
+            "no trailing newline"
+        );
+        assert!(tags_and_links("`#a`").is_empty(), "the whole file");
+        assert!(
+            tags_and_links("``#a ` b``\n").is_empty(),
+            "a double-backtick span"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_backtick_opens_no_span_so_the_tag_after_it_is_found() {
+        assert_eq!(
+            tags_and_links("a ` b #c\n"),
+            vec![(LinkKind::Tag, "c".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_code_span_in_a_heading_a_quote_a_list_item_and_a_table_holds_no_tag() {
+        for text in [
+            "# h `#a`\n",
+            "> q `#a`\n",
+            "- i `#a`\n",
+            "- [ ] t `#a`\n",
+            "| h |\n|---|\n| `#a` |\n",
+        ] {
+            assert!(tags_and_links(text).is_empty(), "{text:?}");
+        }
+    }
+
     #[test]
     fn a_markdown_link_is_recorded_with_its_display_text_as_alias() {
         let parsed = parse("See [the docs](https://example.com/docs).\n");

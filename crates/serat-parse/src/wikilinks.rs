@@ -11,7 +11,8 @@
 //! Scoped deliberately: `exclude` keeps this out of frontmatter, out of fenced code /
 //! HTML blocks and out of *inline* code spans (`` `#not a tag` ``), whose ranges the
 //! caller takes from comrak's inline tree (task #145; Obsidian indexes nothing inside
-//! a code span).
+//! a code span). The exclusion applies at a match's *start*: `[[a `b` c]]` still links,
+//! with the span inside the link text, because the link begins outside any span.
 
 use serat_core::{ByteRange, Link, LinkKind, LinkTarget};
 
@@ -261,6 +262,35 @@ mod tests {
         let links = scan("issue #1234 needs a #fix\n", &[]);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target.note, "fix");
+    }
+
+    fn range(start: usize, end: usize) -> ByteRange {
+        ByteRange::new(start, end)
+    }
+
+    #[test]
+    fn merged_sorts_and_joins_touching_and_overlapping_ranges_and_keeps_empty_ones_harmless() {
+        let out = merged(&[
+            range(20, 25),
+            range(0, 5),
+            range(5, 8),   // touches the first
+            range(22, 30), // overlaps the 20..25
+            range(40, 40), // zero-length
+            range(2, 3),   // inside the first
+        ]);
+        assert_eq!(out, vec![range(0, 8), range(20, 30), range(40, 40)]);
+        assert!(excluded(&out, 0) && excluded(&out, 7) && !excluded(&out, 8));
+        assert!(excluded(&out, 29) && !excluded(&out, 30));
+        assert!(!excluded(&out, 40), "a zero-length range excludes nothing");
+        assert!(merged(&[]).is_empty() && !excluded(&[], 0));
+    }
+
+    #[test]
+    fn a_wikilink_whose_text_holds_a_code_span_still_links() {
+        // The span excludes only matches that *start* inside it.
+        let links = scan("[[a `b` c]]", &[range(4, 7)]);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].target.note, "a `b` c");
     }
 
     #[test]
