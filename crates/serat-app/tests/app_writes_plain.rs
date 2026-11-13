@@ -245,6 +245,9 @@ fn what_serat_app_writes_is_plain_utf8_in_the_vaults_own_line_endings_and_nothin
             let text = std::str::from_utf8(bytes).unwrap_or_else(|_| panic!("{path} not UTF-8"));
             serde_json::from_str::<serde_json::Value>(text)
                 .unwrap_or_else(|e| panic!("{path} is not JSON: {e}"));
+        } else if path.ends_with("index.lock") {
+            // Task #154: the cross-process writer lock; it never holds a byte.
+            assert!(bytes.is_empty(), "{path} holds data");
         } else {
             assert!(
                 path.contains("index.db"),

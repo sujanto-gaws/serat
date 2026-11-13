@@ -22,6 +22,7 @@ pub mod external;
 pub mod history;
 pub mod identity;
 pub mod incremental;
+pub mod lock;
 pub mod open;
 pub mod read;
 pub mod rebuild;

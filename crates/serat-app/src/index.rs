@@ -587,6 +587,18 @@ impl IndexOpen for SeratIndexOpen {
                     path: index_dir.display().to_string(),
                 }),
             },
+            // Task #154: another Serat process (or a benchmark run) holds this vault's
+            // index writer lock. Its own sentence, because the user can act on it.
+            Err(serat_core::IndexError::HeldByAnotherProcess { .. }) => {
+                publish(IndexState::Unavailable {
+                    message: "another Serat window or process already has this vault's index \
+                              open. Search and queries are unavailable in this one; the vault \
+                              remains fully editable. Close the other one and reopen the vault \
+                              to use the index here."
+                        .to_owned(),
+                    path: index_dir.display().to_string(),
+                });
+            }
             Err(err) => publish(IndexState::Unavailable {
                 message: format!(
                     "the index could not be opened or rebuilt: {err}. Search and queries \
@@ -696,8 +708,10 @@ impl Drop for ExitFlag {
 ///
 /// **Limits.** The registry is per `AppState` (each owns one unless `with_detached` shares
 /// it), not per process, so a second `AppState` in the same process does not see what the
-/// first detached. Nothing stops a second *Serat process* from
-/// opening the same vault, and no single-instance lock exists. If a platform cannot give
+/// first detached. A second *Serat process* (or a second open in this one) is stopped by the cross-process
+/// writer lock, `serat_index::lock` (task #154), which refuses it with
+/// `IndexError::HeldByAnotherProcess`; this registry is what supplies the wait for a
+/// detached actor to finish. If a platform cannot give
 /// an identity, the actor is not recorded and a log line says so.
 #[derive(Debug, Default)]
 pub struct DetachedWriters {

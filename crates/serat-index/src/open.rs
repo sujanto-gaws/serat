@@ -13,6 +13,7 @@ use crate::identity::{self, Verdict};
 use crate::incremental::IndexHandle;
 use crate::rebuild::{self, RebuildReport};
 use crate::schema::{self, IndexState, UnusableReason};
+use crate::writer::DEFAULT_QUEUE_DEPTH;
 
 /// Why the index is being rebuilt.
 ///
@@ -136,6 +137,17 @@ pub fn open_or_rebuild(
 ) -> Result<(IndexHandle, Option<RebuildReport>), IndexError> {
     on_status(IndexStatus::Opening);
 
+    // Task #154: one writer per vault across processes. Taken before the check, the
+    // rebuild and the handle open, and kept by the handle. A holder elsewhere means
+    // this session has no index; the caller reports it unavailable.
+    let lock = match crate::lock::IndexLock::acquire(index_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            on_status(IndexStatus::Unavailable);
+            return Err(error);
+        }
+    };
+
     let path = rebuild::index_path(index_dir);
     // The resolved directory, not the bytes of the argument. `serat-app` reaches this
     // root through `Vault::open(..).root()` and the benchmark harness through a
@@ -158,17 +170,30 @@ pub fn open_or_rebuild(
 
     let Some(reason) = reason else {
         on_status(IndexStatus::Ready);
-        return Ok((IndexHandle::open(index_dir)?, None));
+        return Ok((
+            IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+            None,
+        ));
     };
 
     // Published before the rebuild starts. Everything below this line can take thirty
     // seconds; nothing above it may.
     on_status(IndexStatus::Rebuilding { reason });
 
-    match rebuild::rebuild(source, parser, vault_root, index_dir) {
+    match rebuild::rebuild_locked(
+        source,
+        parser,
+        vault_root,
+        index_dir,
+        DEFAULT_QUEUE_DEPTH,
+        &lock,
+    ) {
         Ok(report) => {
             on_status(IndexStatus::Ready);
-            Ok((IndexHandle::open(index_dir)?, Some(report)))
+            Ok((
+                IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+                Some(report),
+            ))
         }
         Err(error) => {
             on_status(IndexStatus::Unavailable);
