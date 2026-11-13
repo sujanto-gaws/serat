@@ -144,9 +144,30 @@ impl AsRef<std::path::Path> for TestDir {
 #[cfg(test)]
 impl Drop for TestDir {
     fn drop(&mut self) {
-        // A test may have replaced the directory with a file to force a write error.
-        if std::fs::remove_dir_all(&self.1).is_err() {
-            let _ = std::fs::remove_file(&self.1);
+        // An index opened in the fixture is closed by an actor thread that can outlive the
+        // test's `AppState` (a close is asynchronous, and a test may remove the directory
+        // itself before the state drops). That thread writes `.serat/index.db`, its WAL and the
+        // clean-close marker after the first removal and so recreates the directory: task #153
+        // found such leftovers in `/dev/shm`, which is RAM. The test may already have removed the
+        // directory, so there is nothing to look at to know an index was there: always keep removing
+        // until the path has stayed absent for 100 ms (at most 2 s).
+        let remove = |path: &std::path::Path| {
+            // A test may have replaced the directory with a file to force a write error.
+            if std::fs::remove_dir_all(path).is_err() {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        remove(&self.1);
+        let (mut quiet, mut waited) = (0, 0);
+        while quiet < 4 && waited < 80 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+            if self.1.exists() {
+                quiet = 0;
+                remove(&self.1);
+            } else {
+                quiet += 1;
+            }
         }
     }
 }

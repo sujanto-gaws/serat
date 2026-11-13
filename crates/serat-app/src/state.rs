@@ -2754,6 +2754,11 @@ mod tests {
             None,
             "a benchmark run took its note from per-machine state"
         );
+        // One open vault at a time. These states share one directory with no index yet, so
+        // each open rebuilds it; two live actors rebuilding the same `index.db` raced, and
+        // the loser died with SIGBUS in the `-shm` mapping (task #153: 3 of 60 runs of this
+        // test alone, on tmpfs). Closing waits for the actor.
+        bench.close_vault();
 
         // The same settings, the same vault, with the flag given: the run is defined
         // by its arguments and nothing else.
@@ -2775,6 +2780,7 @@ mod tests {
             flagged.note_to_open().as_deref(),
             Some("10-projects/serat.md")
         );
+        flagged.close_vault();
 
         // And an ordinary session still restores where the user left off, which is the
         // behaviour the guard must not have removed.
@@ -2794,6 +2800,7 @@ mod tests {
             "the guard removed the fallback from ordinary sessions too"
         );
 
+        session.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
