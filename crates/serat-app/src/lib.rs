@@ -985,6 +985,232 @@ mod tests {
         }
     }
 
+    /// Selectors whose rules may declare `content` or an image function. **None
+    /// qualify today**, and that is the point: this is an allowlist like the markup
+    /// half, so widening it is a decision for ADR-0014's table.
+    const PAINT_ALLOWED_SELECTORS: [&str; 0] = [];
+
+    /// Image-bearing CSS functions. `url(` covers `background`, `@font-face` and
+    /// `@import`; the others reach an image without it.
+    const IMAGE_FUNCTIONS: [&str; 4] = ["url(", "image-set(", "cross-fade(", "element("];
+
+    /// The first way `css` could paint contentful pixels before `boot.js` runs, or
+    /// `None`. **An allowlist, not a bounded reach**: any `content` property and any
+    /// image function anywhere in the sheet is refused unless the innermost selector is
+    /// in [`PAINT_ALLOWED_SELECTORS`]. The earlier form tried to decide which selectors
+    /// reach an element that exists before scripts (`html`, `body`, `#app`) and missed
+    /// `:root`, type selectors that match the mount point (`div:before`), rules nested
+    /// in `@media`, and `image-set()`; each is a route to a contentful paint, and
+    /// enumerating the reaching selectors is the same decay `declares_content_property`
+    /// exists to avoid.
+    fn stylesheet_paint_violation(css: &str) -> Option<String> {
+        for rule in css.split('}') {
+            // The innermost selector: `@media(...){body:after{content:"x"` splits at
+            // the LAST `{`, so a nested rule is judged by its own selector.
+            let Some((before, declarations)) = rule.rsplit_once('{') else {
+                // No block: a bare at-rule such as `@import url(x.css);`.
+                let lower = rule.to_ascii_lowercase();
+                if let Some(f) = IMAGE_FUNCTIONS.iter().find(|f| lower.contains(*f)) {
+                    return Some(format!("a bare at-rule uses `{f}`: {}", rule.trim()));
+                }
+                continue;
+            };
+            let selector = before.rsplit(['{', ';']).next().unwrap_or(before).trim();
+            if PAINT_ALLOWED_SELECTORS.contains(&selector) {
+                continue;
+            }
+            if declares_content_property(&format!("{{{declarations}")) {
+                return Some(format!(
+                    "`{selector}` declares CSS generated content. Anything in the sheet \
+                     applies before `boot.js` runs, so this can paint before Vue mounts and \
+                     `first-contentful-paint` would measure it rather than our content \
+                     (#128, F-396(b)). `content: none` and `content: normal` are inert and \
+                     are refused too: permitting them is a widening decision for \
+                     ADR-0014's table."
+                ));
+            }
+            let lower = declarations.to_ascii_lowercase();
+            if let Some(f) = IMAGE_FUNCTIONS.iter().find(|f| lower.contains(*f)) {
+                return Some(format!(
+                    "`{selector}` uses `{f}`. An image is contentful paint, unlike a \
+                     background *colour*, so it would make `first-contentful-paint` measure \
+                     the image rather than our content (#128, F-396(b))."
+                ));
+            }
+        }
+        None
+    }
+
+    /// Does `declarations` declare `content` as a **property**?
+    ///
+    /// code-reviewer's matcher, and the reason it is theirs: anchoring on start, `;`,
+    /// `{` or whitespace excludes `justify-content`, `align-content` and
+    /// `place-content` **without enumerating them**, so it does not decay as CSS gains
+    /// further `*-content` properties. A naive `content:` substring search returns 1
+    /// against the shipped file today and this returns 0 -- the trap has caught three
+    /// of us independently, which is why it is a named function and not an inline
+    /// pattern.
+    fn declares_content_property(declarations: &str) -> bool {
+        declarations.match_indices("content").any(|(i, _)| {
+            let anchored = declarations[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c == '{' || c == ';' || c.is_whitespace());
+            anchored
+                && declarations[i + "content".len()..]
+                    .trim_start()
+                    .starts_with(':')
+        })
+    }
+
+    #[test]
+    fn the_shipped_page_body_is_exactly_the_mount_point() {
+        // #128, first half. F-505 is why this family has exactly one workable member:
+        // nothing observable at `mark_first_paint` can discriminate a fabricated call
+        // from an honest one, because everything there is caller-supplied and the one
+        // thing that is not is still caller-*determined* -- the host stamps the arrival
+        // and the caller chooses when to arrive (F-507). This check is the exception
+        // because it is resolved **without observing the call at all**.
+        //
+        // SCOPE, in architect's words rather than paraphrased: this check does nothing
+        // about F-504 -- a fabricated call never consults the real paint entry, so no
+        // property of `index.html` can affect it. What it defends is F-396(b): that
+        // `first-contentful-paint`, *when honestly reported*, is measuring our content
+        // rather than a skeleton that painted before Vue mounted.
+        //
+        // NOT THE WHOLE PROPERTY, and this comment must not imply otherwise. "Renders
+        // nothing before scripts run" is not statically decidable. What is bounded is
+        // the set of ways a *contentful* paint can happen: text nodes, image-bearing
+        // elements, background images, and CSS generated content. This half covers the
+        // first two; `the_shipped_stylesheet_cannot_paint_before_scripts_run` covers
+        // the other two, and neither is the guarantee alone (F-510).
+        //
+        // THE FORM IS AN ALLOWLIST, deliberately stricter than the property, so that
+        // widening it is a decision somebody takes rather than a line somebody adds --
+        // ADR-0012's five-command grant is the model (F-509). The body's inner HTML
+        // must be *exactly* the mount point. There is no clause for `<script>`:
+        // architect had written one and code-reviewer found the body has none, because
+        // Vite emits the module script into `<head>`, so permitting it would be looser
+        // than the artefact for no benefit. Verified by parsing rather than grepping --
+        // one script in `<head>`, zero in `<body>`.
+        //
+        // The known cost, chosen rather than discovered: a legitimate `<noscript>`, or
+        // a Vite change injecting a preload into the body, goes red with nothing wrong.
+        // That is the intended behaviour -- red sends someone to the table.
+        //
+        // THE BUILT COPY, not `app/index.html`. `frontendDist` is `"webview"` with no
+        // `beforeBuildCommand`, so this is the file compiled into `serat.exe` and the
+        // source is one the binary never opens (F-470). They also differ *legitimately*
+        // -- the source carries the module script in its body and this does not -- so a
+        // source-side check would have to model Vite's transform to know which
+        // differences are real.
+        //
+        // A source-side twin is a **convenience, not the other half of an F-510 pair**,
+        // and the distinction is architect's correction to their own ruling. F-510's
+        // two call-site checks caught genuinely *different* attacks, each invisible to
+        // the other. This is not that shape: if the source gains a skeleton and nobody
+        // rebuilds, the shipped artefact is still contentless and the property still
+        // holds, because the binary embeds the built copy. So a source-side check
+        // catches the same markup **earlier**, not additionally, and its whole value is
+        // the length of the feedback loop. The real second half is
+        // `the_shipped_stylesheet_cannot_paint_before_scripts_run`, which closes a
+        // route this check structurally cannot see.
+        let index = webview_bundle().join("index.html");
+        let html = std::fs::read_to_string(&index).expect("index.html");
+        let open = html
+            .find("<body")
+            .and_then(|at| html[at..].find('>').map(|off| at + off + 1))
+            .expect("index.html has no <body>");
+        let close = html.find("</body>").expect("index.html has no </body>");
+
+        assert_eq!(
+            html[open..close].trim(),
+            "<div id=\"app\"></div>",
+            "the shipped page body is not exactly the mount point. It may contain \
+             `<div id=\"app\"></div>` and nothing else -- no text, no elements, not \
+             even a comment (#128, ADR-0014). Anything else here can produce a \
+             contentful paint before Vue mounts, which would make \
+             `first-contentful-paint` measure a skeleton rather than our content and \
+             silently degrade the paint guard to F-377's mutation B (F-396(b), \
+             F-482). The mount point must also stay *empty*: \
+             `<div id=\"app\">Loading...</div>` fails this and is meant to. If the \
+             addition is deliberate, widening this allowlist is a decision for \
+             ADR-0014's table, not a line to change here."
+        );
+    }
+
+    #[test]
+    fn the_shipped_stylesheet_cannot_paint_before_scripts_run() {
+        // #128, second half, and it is the half that would never have been observed
+        // failing: `shell.css` has no generated content today, so this lands green.
+        // Fifteen guards-that-cannot-fail are on record and four were found in one day,
+        // which is why its acceptance criterion is a mutation of its own --
+        // `body::after{content:"x"}`, built, run, red required.
+        //
+        // WHY IT IS NEEDED AT ALL, which is code-reviewer's contribution and neither
+        // architect nor I had it: the stylesheet is a `<link>` in `<head>` and the
+        // bundle is a **module** script, therefore deferred -- **so the stylesheet
+        // applies before `boot.js` executes**. A `body::before{content:"Loading..."}`
+        // paints contentful text before Vue mounts with the body still exactly the
+        // mount point, so the markup half alone cannot see it. That is the cheapest
+        // remaining route and the one a designer takes innocently.
+        //
+        // AN ALLOWLIST, like the markup half (see `stylesheet_paint_violation`): the
+        // stylesheet applies before scripts, so any `content` property or image
+        // function anywhere in it is refused. An earlier bounded-reach form ("only
+        // html, body, #app") missed four routes and was replaced.
+        //
+        // A background *colour* is First Paint, not First *Contentful* Paint, so
+        // `body{background:var(--paper)}` is correctly ignored: this looks for `url(`,
+        // not for `background`. That distinction corrected architect's own
+        // justification for the allowlist -- two of the three examples it cited as
+        // undecidable were First Paint -- and a check written against *any styling*
+        // would have been wrong rather than merely strict.
+        let sheet = webview_bundle().join("shell.css");
+        let css = std::fs::read_to_string(&sheet).expect("shell.css");
+
+        if let Some(why) = stylesheet_paint_violation(&css) {
+            panic!("{why}");
+        }
+    }
+
+    #[test]
+    fn the_stylesheet_check_refuses_every_known_paint_before_scripts_form() {
+        // The mutants, as standing cases rather than hand-run ones (code-reviewer's
+        // four, each demonstrated green against the earlier bounded-reach form, plus
+        // #128's original). Each is appended to a clean sheet; the clean sheet and a
+        // background *colour* must stay green, so a check that refuses everything
+        // cannot pass this.
+        let clean = "body{background:var(--paper);color:var(--ink)}\
+                     .row{display:flex;justify-content:space-between;align-content:start}";
+        assert_eq!(stylesheet_paint_violation(clean), None);
+        for (mutant, name) in [
+            (r#"body::after{content:"x"}"#, "body::after (#128's mutant)"),
+            (r#":root:after{content:"x"}"#, ":root:after"),
+            (
+                r#"@media(min-width:1px){body:after{content:"x"}}"#,
+                "content nested in @media",
+            ),
+            (
+                r#"div:before{content:"x"}"#,
+                "div:before (matches the mount point)",
+            ),
+            (
+                r#"body{background:image-set("a.png" 1x)}"#,
+                "image-set() background",
+            ),
+            (r#"body{background:url(a.png)}"#, "url() background"),
+            (r#"@import url(a.css);"#, "bare @import url()"),
+            ("body:before{content:none}", "content: none is refused too"),
+        ] {
+            let sheet = format!("{clean}{mutant}");
+            assert!(
+                stylesheet_paint_violation(&sheet).is_some(),
+                "the stylesheet check let `{name}` through: {mutant}"
+            );
+        }
+    }
+
     #[test]
     fn the_boot_info_is_json_the_page_can_read() {
         let json = serde_json::to_string(&BootInfo {
@@ -1010,6 +1236,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         let trace = startup.trace().expect("complete");
         write_trace(&trace, None).expect("stdout");
 
@@ -1042,6 +1269,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(startup::WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         let trace = startup.trace().expect("complete");
 
         let report = BenchmarkExitReport {

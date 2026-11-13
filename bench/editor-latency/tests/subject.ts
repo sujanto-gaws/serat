@@ -56,6 +56,17 @@ export function buildFixtureNote(lines: number = FIXTURE_NOTE_LINE_COUNT): strin
   return out.slice(0, lines).join("\n") + "\n";
 }
 
+/** The fixture's three on-disk shapes (ADR-0016: the 20k vault carries CRLF and BOM notes). The editor holds
+ * the same 5,000 lines in all three (CodeMirror splits on \r\n, and a BOM is one character of line 0), so
+ * these exercise the load path and the line model, not a different typing path. */
+export type FixtureVariant = "lf" | "crlf" | "bom+crlf";
+
+export function fixtureVariant(note: string, variant: FixtureVariant): string {
+  if (variant === "lf") return note;
+  const crlf = note.replace(/\n/g, "\r\n");
+  return variant === "crlf" ? crlf : "\uFEFF" + crlf;
+}
+
 function serve(dir: string): Promise<{ url: string; close: () => Promise<void> }> {
   const types: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
   const server = http.createServer((req, res) => {
@@ -84,9 +95,26 @@ const TAURI_STUB = `
       metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
       transformCallback: function () { return ++cbs; },
       unregisterCallback: function () {},
-      invoke: function (cmd) {
+      invoke: function (cmd, payload) {
         if (cmd === "plugin:event|listen") return Promise.resolve(++cbs);
+        // The real-IPC arm (task #61): forward every command to a real serat-app AppState over loopback.
+        if (window.__SERAT_IPC_BRIDGE__ && cmd.indexOf("plugin:") !== 0) {
+          return fetch(window.__SERAT_IPC_BRIDGE__ + "/invoke/" + cmd, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-serat-bridge-token": window.__SERAT_IPC_BRIDGE_TOKEN__ || "" },
+            body: JSON.stringify(payload || {}),
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (v) { return v && v.__error ? Promise.reject(v.__error) : v; });
+        }
+        // NOTE (task #61): without a bridge, save_patch answers a fake success, so subject-arm figures from before
+        // #61 (where it answered null) are not strictly comparable with figures from after it.
+        if (cmd === "save_patch") {
+          var a = (payload && payload.args) || {};
+          return Promise.resolve({ path: a.path || "", hash: "stub-hash-" + (++cbs), mtime_ms: 0, bytes: 0 });
+        }
         if (cmd === "index_status") return Promise.resolve({ state: "idle" });
+        if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);
       },
     };
@@ -99,8 +127,21 @@ export interface Subject {
   close: () => Promise<void>;
 }
 
+export interface OpenOptions {
+  /** The note to load (default: the LF fixture). */
+  text?: string;
+  /** What `get_ui_settings` answers; `{ live_preview: false }` selects the split-preview mode (FR-EDT-10). */
+  uiSettings?: { live_preview: boolean; keybindings: unknown[] };
+  /** Base URL of the editor_ipc_bridge example: every IPC command is answered by a real `serat-app`. */
+  ipcBridge?: string;
+  /** The per-run token the bridge printed on its READY line; sent as `x-serat-bridge-token`. */
+  ipcToken?: string;
+  /** With a bridge: the note's vault path and its real content hash (from `read_file`). */
+  note?: { path: string; hash: string };
+}
+
 /** Serves dist-bench, loads the fixture and returns the editable surface. */
-export async function openNoteForLatencyTest(page: Page): Promise<Subject> {
+export async function openNoteForLatencyTest(page: Page, options: OpenOptions = {}): Promise<Subject> {
   const dir = benchDistDir();
   if (!fs.existsSync(path.join(dir, "index.html"))) {
     throw new Error(
@@ -110,15 +151,24 @@ export async function openNoteForLatencyTest(page: Page): Promise<Subject> {
   const server = await serve(dir);
   const pageErrors: string[] = [];
   page.on("pageerror", (e) => pageErrors.push(String(e)));
+  if (options.uiSettings) {
+    await page.addInitScript({ content: `window.__SERAT_STUB_UI_SETTINGS__ = ${JSON.stringify(options.uiSettings)};` });
+  }
+  if (options.ipcBridge) {
+    await page.addInitScript({ content: `window.__SERAT_IPC_BRIDGE__ = ${JSON.stringify(options.ipcBridge)}; window.__SERAT_IPC_BRIDGE_TOKEN__ = ${JSON.stringify(options.ipcToken ?? "")};` });
+  }
   await page.addInitScript({ content: TAURI_STUB });
   await page.goto(server.url);
   await page.waitForFunction(() => typeof (window as any).__seratBenchOpenNote === "function", null, { timeout: 10_000 }).catch((e) => {
     throw new Error(`window.__seratBenchOpenNote never appeared (is this a --mode bench build?): ${e.message}; page errors: ${pageErrors.join(" | ")}`);
   });
-  const text = buildFixtureNote();
-  await page.evaluate((t) => (window as any).__seratBenchOpenNote(t), text);
+  const text = options.text ?? buildFixtureNote();
+  await page.evaluate(({ t, n }) => (window as any).__seratBenchOpenNote(t, n?.path, n?.hash), { t: text, n: options.note });
   const editor = page.locator('[data-testid="serat-editor"] .cm-content');
   await editor.waitFor({ state: "visible", timeout: 10_000 });
   await editor.getByText("Section 0").first().waitFor({ timeout: 10_000 });
+  if (options.uiSettings?.live_preview === false) {
+    await page.locator(".serat-editor-split-preview").waitFor({ state: "attached", timeout: 10_000 });
+  }
   return { editor, close: server.close };
 }

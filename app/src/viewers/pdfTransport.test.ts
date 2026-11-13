@@ -194,7 +194,18 @@ describe("loadPdf (pdf.js arguments)", () => {
     expect(handle.numPages).toBe(3);
     expect(pdfjs.getDocument).toHaveBeenCalledTimes(1);
     const args = (pdfjs.getDocument.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
-    expect(Object.keys(args).sort()).toEqual(["disableAutoFetch", "disableStream", "range", "rangeChunkSize", "useWasm"]);
+    expect(Object.keys(args).sort()).toEqual([
+      "cMapPacked",
+      "cMapUrl",
+      "disableAutoFetch",
+      "disableStream",
+      "range",
+      "rangeChunkSize",
+      "standardFontDataUrl",
+      "useWasm",
+    ]);
+    expect(args.cMapUrl).toBe("./cmaps/");
+    expect(args.standardFontDataUrl).toBe("./standard_fonts/");
     expect(args.url).toBeUndefined();
     expect(args.useWasm).toBe(false);
     expect(args.disableAutoFetch).toBe(true);

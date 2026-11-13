@@ -21,6 +21,10 @@ name = "doclint"
 path = "src/lib.rs"
 
 [[bin]]
+name = "check-conflict-markers"
+path = "src/bin/check-conflict-markers.rs"
+
+[[bin]]
 name = "check-count-over-list"
 path = "src/bin/check-count-over-list.rs"
 

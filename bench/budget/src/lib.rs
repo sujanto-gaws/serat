@@ -2878,15 +2878,19 @@ where
     let mut platform_term = Samples::new();
     let mut window_visible = Samples::new();
     let mut vault_usable = Samples::new();
+    let mut tree_first_screen = Samples::new();
     for t in &traces {
         let terms = t.terms();
+        if let Some(ms) = t.tree_first_screen_ms {
+            tree_first_screen.push(Duration::from_secs_f64(ms / 1000.0));
+        }
         serat_term.push(Duration::from_secs_f64(terms.serat_term_ms() / 1000.0));
         platform_term.push(Duration::from_secs_f64(terms.platform_term_ms() / 1000.0));
         window_visible.push(t.window_visible());
         vault_usable.push(t.vault_usable());
     }
 
-    Ok(Measurement::new(serat_term)
+    let measurement = Measurement::new(serat_term)
         .reporting(
             "platform-term",
             "P_load + P_builder + P_webview -- unbudgeted; no change confined to this \
@@ -2905,7 +2909,21 @@ where
             "The pre-split aggregate PRF01_VAULT_USABLE names. Reported, not gated here -- \
              same reason as window-visible, and the same #118 caveat.",
             vault_usable,
-        ))
+        );
+    // Task #141: the tree term of t_usable (ADR-0015 section 5), reported beside it. Only
+    // builds that declare a tree carry it; a build that declares one and omits the number
+    // never reaches here (the trace is refused at parse).
+    Ok(if tree_first_screen.is_empty() {
+        measurement
+    } else {
+        measurement.reporting(
+            "tree-first-screen",
+            "t0 to the root listing applied and painted (ADR-0015 section 3): the tree term \
+             of vault-usable, which is the latest of paint, tree first screen, index settled \
+             and watcher. Reported, not gated on its own (NFR-PRF-01 budgets the total).",
+            tree_first_screen,
+        )
+    })
 }
 
 /// Print an outcome and write its result file.
@@ -4501,7 +4519,31 @@ mod tests {
             last_open: String::new(),
             paint_evidence_ms: None,
             raf2_ms: None,
+            tree: false,
+            tree_first_screen_ms: None,
         }
+    }
+
+    #[test]
+    fn the_tree_first_screen_number_is_reported_in_the_row_when_the_build_declares_a_tree() {
+        // NFR-PRF-01, task #141. Mutant, run by hand: drop the `tree_first_screen`
+        // push in `measure_serat_term_with` and the series is absent.
+        let mut a = fake_trace(10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 70.0);
+        a.tree = true;
+        a.tree_first_screen_ms = Some(66.0);
+        let mut b = fake_trace(20.0, 30.0, 40.0, 60.0, 80.0, 100.0, 140.0);
+        b.tree = true;
+        b.tree_first_screen_ms = Some(131.0);
+        let m = measure_serat_term_with(&a_vault(), 2, |_, _| Ok(vec![a.clone(), b.clone()]))
+            .expect("accepted");
+        let series = m
+            .reported
+            .iter()
+            .find(|r| r.label == "tree-first-screen")
+            .expect("the tree series is reported");
+        assert_eq!(series.samples.values(), &[66.0, 131.0]);
+        // And the asserted series is untouched by it.
+        assert_eq!(m.samples.values(), &[45.0, 90.0]);
     }
 
     #[test]
