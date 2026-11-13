@@ -169,6 +169,12 @@ impl Drop for TestDir {
                 quiet += 1;
             }
         }
+        if quiet < 4 {
+            eprintln!(
+                "serat-app test fixture still being recreated after 2 s, left behind: {}",
+                self.1.display()
+            );
+        }
     }
 }
 

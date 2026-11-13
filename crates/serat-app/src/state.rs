@@ -2755,10 +2755,11 @@ mod tests {
             "a benchmark run took its note from per-machine state"
         );
         // One open vault at a time. These states share one directory with no index yet, so
-        // each open rebuilds it; two live actors rebuilding the same `index.db` raced, and
-        // the loser died with SIGBUS in the `-shm` mapping (task #153: 3 of 60 runs of this
-        // test alone, on tmpfs). Closing waits for the actor.
-        bench.close_vault();
+        // each open rebuilds; two live actors rebuilding the same `index.db` raced, and the
+        // loser died with SIGBUS in the `-shm` mapping (task #153: 3 of 60 runs of this test
+        // alone, on tmpfs). `close_vault` alone does not wait for a rebuilding actor, so wait
+        // for `Ready` first.
+        close_once_ready(&bench);
 
         // The same settings, the same vault, with the flag given: the run is defined
         // by its arguments and nothing else.
@@ -2780,7 +2781,7 @@ mod tests {
             flagged.note_to_open().as_deref(),
             Some("10-projects/serat.md")
         );
-        flagged.close_vault();
+        close_once_ready(&flagged);
 
         // And an ordinary session still restores where the user left off, which is the
         // behaviour the guard must not have removed.
@@ -2800,7 +2801,7 @@ mod tests {
             "the guard removed the fallback from ordinary sessions too"
         );
 
-        session.close_vault();
+        close_once_ready(&session);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2830,6 +2831,8 @@ mod tests {
             state.note_to_open().as_deref(),
             Some("10-projects/serat.md")
         );
+        // One open vault at a time (task #153, as in the benchmark-fallback test).
+        close_once_ready(&state);
 
         let flagged = AppState::with_settings(
             Arc::new(Startup::begin()),
@@ -2846,6 +2849,7 @@ mod tests {
             .expect("open");
         assert_eq!(flagged.note_to_open().as_deref(), Some("other.md"));
 
+        close_once_ready(&flagged);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3748,6 +3752,18 @@ mod tests {
             }),
             log,
         )
+    }
+
+    /// Close `state`'s vault once its index has finished opening. `close_vault` does not wait
+    /// for an actor that is still rebuilding: it detaches it into this `AppState`'s own
+    /// registry, which the next `AppState` never sees (task #153). Waiting for `Ready` is what
+    /// makes "one vault open at a time" true for tests that open one directory in several
+    /// states.
+    fn close_once_ready(state: &AppState) {
+        wait_until("the index to be Ready before closing", || {
+            matches!(state.index_status().state, IndexState::Ready { .. })
+        });
+        state.close_vault();
     }
 
     fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
