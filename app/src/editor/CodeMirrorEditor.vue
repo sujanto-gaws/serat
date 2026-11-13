@@ -802,6 +802,31 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
   return true;
 }
 
+/**
+ * Drops the buffer of a vault that is no longer open, WITHOUT flushing or telling the backend
+ * (#80's rule, #151): the switch's `app://closing` handshake has already flushed it, and the old
+ * path means nothing in the new vault, so a save here could only land in the wrong vault.
+ * The editor returns to its read-only placeholder. No-op without a buffer.
+ */
+function closeNote(): void {
+  if (!view || !buffer) return;
+  ++loadToken; // supersede any in-flight loadNote
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
+  buffer = null;
+  bufferVaultId = null;
+  held = [];
+  conflict.value = null;
+  deleted.value = false;
+  notice.value = null;
+  comparing.value = null;
+  blocked.value = false;
+  replaceState("");
+  markDirty();
+}
+
 /** Back-compat with the P0 shell's placeholder-content path (no note open
  * yet, or a read failure message) — does not touch the buffer, so it must
  * never be used for real note content; it is a no-op once a buffer exists, and the
@@ -855,6 +880,7 @@ defineExpose({
   insertAtCursor,
   revealOffset,
   loadNote,
+  closeNote,
   triggerSave,
   compareWithDisk,
   isDirty,
