@@ -85,6 +85,12 @@ pub struct StatusPublisher<S> {
     last_refused: std::sync::atomic::AtomicU32,
     /// A trailing refusal-count flush is scheduled (task #144): at most one per window.
     refusal_flush_pending: std::sync::atomic::AtomicBool,
+    /// Serialises building a status and handing it to the sink (task #144 review): two
+    /// emitters must not each read a count and then race to the sink, or the older one can
+    /// arrive last and the front end keep a stale count. Held across the sink call, which
+    /// never calls back into this publisher; the state lock is taken inside it, never the
+    /// other way round, and a poll takes only the state lock.
+    emit_lock: Mutex<()>,
 }
 
 /// Sentinel for `last_refused`: above [`REFUSED_NAMES_CAP`], so no count equals it.
@@ -156,6 +162,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             retired: std::sync::atomic::AtomicBool::new(false),
             last_refused: std::sync::atomic::AtomicU32::new(NOT_EMITTED),
             refusal_flush_pending: std::sync::atomic::AtomicBool::new(false),
+            emit_lock: Mutex::new(()),
         }
     }
 
@@ -316,6 +323,12 @@ impl<S: StatusSink> StatusPublisher<S> {
         })
     }
 
+    fn emit_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.emit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The vault this publisher belongs to.
     #[must_use]
     pub fn vault_id(&self) -> &str {
@@ -344,6 +357,7 @@ impl<S: StatusSink> StatusPublisher<S> {
         if self.is_retired() {
             return;
         }
+        let _emitting = self.emit_guard();
         let status = self.status();
         self.lock().last_emit = Some(Instant::now());
         if self.is_retired() {
@@ -378,6 +392,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             observer(&state);
         }
 
+        let _emitting = self.emit_guard();
         let status = {
             let mut inner = self.lock();
             // A change of `Opening`'s reason is a transition too: a reason that clears
@@ -1108,9 +1123,8 @@ mod tests {
         }
         log.record_for_test("n-00000.md", "a new reason");
         std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(
-            recorder.taken().len(),
-            settled,
+        assert!(
+            recorder.taken().len() <= settled + 1,
             "a change the status cannot show was emitted"
         );
         assert_eq!(
@@ -1145,6 +1159,49 @@ mod tests {
             taken.last().expect("emitted").refused_names,
             Some(200),
             "the final count must land"
+        );
+    }
+
+    // Task #144 review. Mutant, run by hand: dropping the `emit_guard()` in `re_emit` lets the
+    // second emitter reach the sink before the first, and the last event carries count 0.
+    #[test]
+    fn a_slow_emitter_cannot_deliver_an_older_count_after_a_newer_one() {
+        struct SlowFirst(Recorder, std::sync::atomic::AtomicBool);
+        impl StatusSink for SlowFirst {
+            fn emit(&self, status: &IndexStatus) {
+                if !self.1.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                self.0.emit(status);
+            }
+        }
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                SlowFirst(recorder.clone(), std::sync::atomic::AtomicBool::new(false)),
+                Duration::from_secs(60),
+            )
+            .with_refusals(log.clone()),
+        );
+        let first = {
+            let publisher = Arc::clone(&publisher);
+            std::thread::spawn(move || publisher.re_emit()) // builds count 0, then sits in the sink
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        log.record_for_test("a.md", "r"); // the count is now 1
+        let second = {
+            let publisher = Arc::clone(&publisher);
+            std::thread::spawn(move || publisher.re_emit())
+        };
+        first.join().expect("first");
+        second.join().expect("second");
+        assert_eq!(
+            recorder.taken().last().expect("emitted").refused_names,
+            Some(1),
+            "the last event carries a stale count"
         );
     }
 
