@@ -23,7 +23,8 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import type { SaveOutcome } from "@/editor/buffer";
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
-import { createFolder, indexStatus, isIpcError, onIndexStatus, onVaultOpened, writeFile } from "@/ipc/client";
+import type { VaultOpened } from "@/ipc/generated/VaultOpened";
+import { chooseVault, createFolder, indexStatus, isIpcError, onIndexStatus, onVaultOpened, writeFile } from "@/ipc/client";
 import { installNativeMenuPolicy } from "@/nativeMenu";
 import { describeCreateError, noteFileName, type CreateRequest } from "@/tree/createEntry";
 import { childPath } from "@/tree/treeModel";
@@ -290,9 +291,65 @@ function toggleLivePreview(): void {
   void setLivePreview({ enabled: livePreview.value }).catch(() => undefined);
 }
 
+/** True once the launch vault (or its absence) has been read, so the empty state never flashes at launch. */
+const bootRead = ref(false);
+/** US-01: no vault is open (launch without one, or after a failed open, #103). */
+const noVault = computed(() => bootRead.value && (store.vaultRoot === null || !store.vaultOpen));
+
+/** #80's rule: the editor closes any buffer of the previous vault BEFORE the new id is adopted. */
+function resetForNewVault(): void {
+  editorRef.value?.closeNote();
+  editorRef.value?.thaw(); // frozen since the closing ack; the new vault starts editable
+  store.setOpenBuffer(null, null);
+  viewing.value = null;
+  editorDirty.value = false;
+}
+
+/** The one adopt path, shared by `vault://opened` and `choose_vault`'s own answer (either may arrive first). */
+function adoptOpened(opened: VaultOpened): void {
+  if (opened.vault_id && opened.vault_id !== store.vaultId) resetForNewVault();
+  store.vaultOpened(opened);
+}
+
+let openingVault = false;
+/** `vault.open` (US-01, FR-VLT-01): the native folder dialog runs in the backend; the webview sends no path. */
+async function openVaultDialog(): Promise<void> {
+  if (openingVault) return;
+  openingVault = true;
+  const before = store.vaultId;
+  // The close flush cannot save a conflicted, deleted or unsaved buffer, and the switch discards it: refuse
+  // before the dialog opens, with the reason, rather than lose text (#151).
+  const unsafe = (await editorRef.value?.unsafeToClose()) ?? null;
+  if (unsafe !== null) {
+    store.setMark(`not switching vault: ${unsafe}. Resolve it first.`);
+    openingVault = false;
+    return;
+  }
+  try {
+    const opened = await chooseVault();
+    if (opened) {
+      adoptOpened(opened); // null = cancelled: nothing changes
+      treeRef.value?.reopen(); // from the ANSWER, when the new vault is installed; the event comes earlier
+    } else editorRef.value?.thaw();
+  } catch (e) {
+    editorRef.value?.thaw(); // a switch that failed before the close leaves the old buffer editable
+    // `Err` after `vault://opened` means the window has no vault open (#103): reset, then drop every event.
+    if (store.vaultId !== before) {
+      resetForNewVault();
+      store.openFailed();
+      treeRef.value?.clear(); // no vault: the old vault's rows must not sit under "No vault open"
+    }
+    store.setMark(`could not open the vault: ${JSON.stringify(e)}`);
+  } finally {
+    openingVault = false;
+  }
+}
+
 /** Global, view-less commands (`when` unset), in CodeMirror key notation. */
 function registerCommands(): Array<() => void> {
   return [
+    // No default chord; available with or without a vault open (no `unavailable`).
+    commands.register({ id: "vault.open", name: "Open vault…", exec: () => openVaultDialog() }),
     commands.register({ id: "switcher.open", name: "Open quick switcher", defaultBinding: "Mod-o", exec: openSwitcher }),
     commands.register({ id: "palette.open", name: "Open command palette", defaultBinding: "Mod-k", exec: openPalette }),
     commands.register({ id: "search.open", name: "Search vault", defaultBinding: "Mod-Shift-f", exec: openSearch }),
@@ -400,6 +457,7 @@ onMounted(async () => {
   const paintMark = schedulePaintMark(store);
   store.adoptBoot(window.__SERAT_BOOT__?.vault_id);
   store.setVaultRoot(window.__SERAT_BOOT__?.vault ?? null);
+  bootRead.value = true;
 
   // Installed next so the first transition the actor publishes is not lost — mirrors
   // `run`'s ordering in crates/serat-app/src/lib.rs. This IPC round trip runs
@@ -424,7 +482,7 @@ onMounted(async () => {
 
   // The vault id's sources (architecture 3.4): BootInfo at launch (read synchronously above),
   // `vault://opened` for every later open; index_status is a restricted fallback only.
-  void onVaultOpened((opened) => store.vaultOpened(opened))
+  void onVaultOpened((opened) => adoptOpened(opened))
     .then((unlisten) => (unlistenVaultOpened = unlisten))
     .catch(() => undefined);
 
@@ -543,6 +601,10 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       />
     </aside>
     <div class="editor-column">
+      <div v-if="noVault" class="no-vault" data-testid="no-vault">
+        <p>No vault open</p>
+        <button type="button" data-testid="no-vault-open" @click="openVaultDialog()">Open vault…</button>
+      </div>
       <ViewerHost
         v-if="viewing !== null"
         :path="viewing"
@@ -550,7 +612,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
         @reveal="treeRef?.focusTree()"
       />
       <CodeMirrorEditor
-        v-show="viewing === null"
+        v-show="viewing === null && !noVault"
         ref="editorRef"
         :vault-id="store.vaultId"
         :vault-open="store.vaultOpen"

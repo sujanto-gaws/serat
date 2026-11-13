@@ -356,6 +356,10 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         // (capabilities/default.json) to exactly http/https/mailto -- task
         // #37 -- rather than the plugin's own wider `tel:`-including default.
         .plugin(tauri_plugin_opener::init())
+        // #151: the native folder dialog, called from `choose_vault` only. No `dialog:*`
+        // permission is granted to the webview (capabilities/default.json), so the
+        // plugin's own commands are unreachable from it.
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::clone(&state))
         // The index is closed cleanly before the window is destroyed (architecture
         // 3.1.1 item 6): without it every session reads as unclean. The editor first
@@ -382,6 +386,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         })
         .invoke_handler(tauri::generate_handler![
             commands::open_vault,
+            commands::choose_vault,
             commands::read_file,
             commands::write_file,
             commands::index_status,
@@ -490,7 +495,14 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             //    expensive part of the main thread's own row.
             let mut vault_root = None;
             let mut vault_id = None;
-            if let Some(root) = state.boot.vault.clone() {
+            // `--vault`, else the remembered vault if it still exists (task #151); neither
+            // under a benchmark flag, and no vault is not an error.
+            let launch_vault = state
+                .boot
+                .vault
+                .clone()
+                .or_else(|| state.launch_last_vault());
+            if let Some(root) = launch_vault {
                 match state.open_vault(OpenVaultArgs {
                     root: root.display().to_string(),
                 }) {
@@ -670,6 +682,7 @@ pub(crate) fn on_close_requested(
                 // in progress finishes first (lock order: `opening`, then the close wait).
                 let _opening = state.lock_opening();
                 state.close_after_flush(&_opening, state::CLOSING_FLUSH_DEADLINE);
+                state.mark_closed_for_exit();
             }
             if state.claim_window_destroy() {
                 destroy();
@@ -696,6 +709,7 @@ fn close_with_deadline(state: &Arc<AppState>, deadline: std::time::Duration) {
             // vault it installs is the one closed (architecture 3.1.1 item 8).
             let _opening = closing.lock_opening();
             closing.close_vault();
+            closing.mark_closed_for_exit();
             let _ = done.send(());
         });
     match spawned {

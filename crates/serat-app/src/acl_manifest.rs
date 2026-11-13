@@ -198,6 +198,7 @@ mod tests {
         // not six" half of the decision, checked against the file that ships.
         let granted = granted_commands();
         let expected: BTreeSet<String> = [
+            "choose_vault",
             "read_file",
             "write_file",
             "index_status",

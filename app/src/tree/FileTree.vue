@@ -163,21 +163,54 @@ watch(filter, () => {
   scrollTop.value = 0;
 });
 
-onMounted(() => {
-  measure();
-  if (typeof ResizeObserver !== "undefined" && container.value) {
-    resizeObserver = new ResizeObserver(measure);
-    resizeObserver.observe(container.value);
-  }
+/** Bumped by every `open_tree`, so a stream of an earlier vault can no longer touch the model. */
+let treeGeneration = 0;
+
+function startOpenTree(): void {
   stopped.value = false; // a new open_tree starts afresh (contracts/ipc.rs `TreeStatus`)
+  const generation = ++treeGeneration;
   void props.ipc
     .openTree((message) => {
+      if (generation !== treeGeneration) return; // an earlier vault's stream
       model.apply(message); // strictly in arrival order, never dropped
       bump();
       if (message.kind === "remove") emit("removed", childPath(message.dir, message.name));
       else if (message.kind === "upsert") emit("added", childPath(message.dir, message.entry.name));
     })
     .catch(() => undefined);
+}
+
+/** A different vault was opened (#151): drop every row of the old one and open the tree again. Called by
+ * the host after `choose_vault` answers, when the new vault is installed (not on `vault://opened`). */
+function reopen(): void {
+  clear();
+  startOpenTree();
+}
+
+/** Forgets the old vault's rows without opening anything: a failed switch leaves no vault (#151, #103), and
+ * the empty state must not sit over the old vault's rows. An earlier stream is cut off too. */
+function clear(): void {
+  treeGeneration += 1;
+  model.clear();
+  filter.value = "";
+  scrollTop.value = 0;
+  firstScreenMarked = false;
+  completeMarked = false;
+  pendingSelected = null;
+  focusedPath.value = null;
+  prompt.value = null;
+  menu.value = null;
+  emit("pending-listing", null);
+  bump();
+}
+
+onMounted(() => {
+  measure();
+  if (typeof ResizeObserver !== "undefined" && container.value) {
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(container.value);
+  }
+  startOpenTree();
   // Registered after `open_tree` is on the wire.
   void props.ipc
     .onTreeStatus?.((status) => {
@@ -553,6 +586,8 @@ function onMenuSelect(id: string): void {
 
 defineExpose({
   model,
+  reopen,
+  clear,
   focusTree,
   focusFilter,
   insertLinkUnavailable,

@@ -29,7 +29,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
-import { ChangeSet, Compartment, EditorState, type Extension, Transaction } from "@codemirror/state";
+import { ChangeSet, Compartment, EditorState, type Extension, Prec, Transaction } from "@codemirror/state";
 import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
 
 import type { CommandRegistry } from "@/editor/commands";
@@ -523,6 +523,7 @@ async function onClosing(closing: AppClosing): Promise<void> {
   // Never removed: one close, one flush, one ack per vault id, literally (ids are unique per open).
   if (closingSeen.has(closing.vault_id)) return;
   closingSeen.add(closing.vault_id);
+  freeze(); // from here to the adoption nothing typed could be saved (#151)
 
   try {
     if (autosaveTimer) {
@@ -636,8 +637,48 @@ const unsubscribeRegistry = registry.subscribe(() => {
   }
 });
 
+/** True from the close ack of a vault switch until the new vault is adopted (or the switch is known not to
+ * have happened): typing then would be lost with the buffer (#151). */
+let frozen = false;
+const freezeCompartment = new Compartment();
+const FROZEN_EXTENSIONS: Extension = Prec.highest([EditorState.readOnly.of(true), EditorView.editable.of(false)]);
+
+/** Read-only until `thaw` or the buffer is closed. */
+function freeze(): void {
+  frozen = true;
+  view?.dispatch({ effects: freezeCompartment.reconfigure(FROZEN_EXTENSIONS) });
+}
+function thaw(): void {
+  frozen = false;
+  view?.dispatch({ effects: freezeCompartment.reconfigure([]) });
+}
+
+/** Why a vault switch must not start now, or `null` when nothing would be lost: the close flush cannot
+ * save a conflicted, deleted or unsaved buffer, and the switch then discards it (#151). */
+async function unsafeToClose(): Promise<string | null> {
+  if (!buffer) return null;
+  const refusal = (): string | null => {
+    if (conflict.value !== null) return "the open note has a conflict with the file on disk";
+    if (deleted.value) return "the open note was deleted on disk and has unsaved text";
+    if (blocked.value || (buffer?.isDirty ?? false)) return "the open note has changes that could not be saved yet";
+    return null;
+  };
+  if (conflict.value !== null || deleted.value) return refusal();
+  if (buffer.isDirty) {
+    // A pending autosave is not a reason to refuse: save now, refuse only if that fails.
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    await performSave().catch(() => null);
+    markDirty();
+  }
+  return refusal();
+}
+
 function buildExtensions(livePreview: boolean): Extension[] {
   return [
+    freezeCompartment.of(frozen ? FROZEN_EXTENSIONS : []),
     lineNumbers(),
     // Read-only until `loadNote` installs a buffer: text typed in any earlier
     // window would have no base to be a patch against (C-04, NFR-REL-01).
@@ -802,6 +843,32 @@ async function loadNote(text: string, path: string, baseHash: string): Promise<b
   return true;
 }
 
+/**
+ * Drops the buffer of a vault that is no longer open, WITHOUT flushing or telling the backend
+ * (#80's rule, #151): the switch's `app://closing` handshake has already flushed it, and the old
+ * path means nothing in the new vault, so a save here could only land in the wrong vault.
+ * The editor returns to its read-only placeholder. No-op without a buffer.
+ */
+function closeNote(): void {
+  if (!view || !buffer) return;
+  ++loadToken; // supersede any in-flight loadNote
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
+  buffer = null;
+  bufferVaultId = null;
+  frozen = false; // the placeholder is read-only anyway; the next loadNote starts editable
+  held = [];
+  conflict.value = null;
+  deleted.value = false;
+  notice.value = null;
+  comparing.value = null;
+  blocked.value = false;
+  replaceState("");
+  markDirty();
+}
+
 /** Back-compat with the P0 shell's placeholder-content path (no note open
  * yet, or a read failure message) — does not touch the buffer, so it must
  * never be used for real note content; it is a no-op once a buffer exists, and the
@@ -855,6 +922,9 @@ defineExpose({
   insertAtCursor,
   revealOffset,
   loadNote,
+  closeNote,
+  unsafeToClose,
+  thaw,
   triggerSave,
   compareWithDisk,
   isDirty,
