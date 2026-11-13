@@ -180,7 +180,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # The minor is pinned: the bundle is compared byte for byte, so a new Node minor
+          # on the runner must not be able to change it silently. Bump with the lockfile.
+          node-version: "22.23"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
       - name: Install exactly what the lockfile says
         run: npm ci
         working-directory: app
