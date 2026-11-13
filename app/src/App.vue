@@ -30,6 +30,7 @@ import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
 import { useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
+import RefusedNames from "@/refused/RefusedNames.vue";
 import { registerTreeInsertLink, TREE_INSERT_LINK_ID } from "@/tree/insertLinkCommand";
 import { detectPlatform } from "@/editor/codemirrorSetup";
 import { headingDocOffset } from "@/overlays/headingTarget";
@@ -61,6 +62,7 @@ function onExternalMerged(): void {
   }, 3000);
 }
 
+const refusedRef = ref<InstanceType<typeof RefusedNames> | null>(null);
 const treeRef = ref<InstanceType<typeof FileTree> | null>(null);
 const backlinksRef = ref<InstanceType<typeof BacklinksPane> | null>(null);
 const searchRef = ref<InstanceType<typeof SearchPanel> | null>(null);
@@ -307,10 +309,35 @@ function registerCommands(): Array<() => void> {
     commands.register({ id: "tree.newNote", name: "New note", defaultBinding: "Mod-n", exec: () => startCreate("note") }),
     commands.register({ id: "tree.newFolder", name: "New folder", defaultBinding: "Mod-Shift-n", exec: () => startCreate("folder") }),
     registerTreeInsertLink(commands, () => treeRef.value),
+    // No default chord (§9.3, components.md §7): reachable from the strip button and the palette.
+    commands.register({
+      id: "vault.refused-names",
+      name: "Show names not shown",
+      unavailable: () => (store.refusedNames === null ? "Open a vault first" : store.refusedNames === 0 ? "Every name can be shown" : null),
+      exec: () => void refusedRef.value?.open(),
+    }),
     commands.register({ id: "backlinks.focus", name: "Focus backlinks", defaultBinding: "Mod-3", exec: () => backlinksRef.value?.focus() }),
   ];
 }
 const disposeCommands = registerCommands();
+
+/** The panel's button is gone (the count fell to none): focus goes to the tree's selected row, or the editor when compact. */
+function focusAfterRefused(): void {
+  // the tree has no collapse control yet; below the compact breakpoint it is hidden unless its flyover is open
+  if (window.matchMedia?.("(max-width: 719px)").matches && !treeFlyover.value) editorRef.value?.focus();
+  else treeRef.value?.focusTree();
+  // Focus is never dropped to <body>: if the tree could not take it, the workspace itself can. It is made
+  // focusable only for this, so a click on blank workspace never lands on it (that would change the
+  // relatedTarget overlays see).
+  void nextTick(() => {
+    if (document.activeElement !== document.body && document.activeElement) return;
+    const main = document.querySelector<HTMLElement>("main.workspace");
+    if (!main) return;
+    main.setAttribute("tabindex", "-1");
+    main.focus();
+    main.addEventListener("blur", () => main.removeAttribute("tabindex"), { once: true });
+  });
+}
 
 function onInsertLink(payload: { path: string; text: string }): void {
   if (!editorRef.value?.insertAtCursor(payload.text)) store.setMark("Open a note first to insert a link.");
@@ -398,11 +425,8 @@ onMounted(async () => {
   unlistenIndexStatus = await onIndexStatus((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return; // another vault's, or "" between two vaults
-    store.setIndexState(status.state);
-    // The count of names the vault refused to list is one status fact (not a
-    // per-name error). It is read when the status carries it.
-    const refused = (status as { refused_names?: number }).refused_names;
-    if (typeof refused === "number") store.setRefusedNames(refused);
+    // The count of names the vault refused to list is one status fact (not a per-name error).
+    store.applyIndexStatus(status, "event");
   });
 
 
@@ -411,10 +435,8 @@ onMounted(async () => {
   indexStatus().then((status) => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
-    store.setIndexState(status.state);
-    // The poll carries the count like the event does (task #35).
-    const refused = (status as { refused_names?: number }).refused_names;
-    if (typeof refused === "number") store.setRefusedNames(refused);
+    // The poll carries the count like the event does (task #35); one store entry for both.
+    store.applyIndexStatus(status, "poll");
   });
 
   if (editorRef.value) {
@@ -554,9 +576,7 @@ function onSaveOutcome(outcome: SaveOutcome): void {
 
   <footer class="statusbar">
     <span class="index">{{ store.indexStatusText }}</span>
-    <span v-if="store.refusedNames" class="refused" data-testid="refused-names"
-      >{{ store.refusedNames }} {{ store.refusedNames === 1 ? "name" : "names" }} not shown (invalid on this platform)</span
-    >
+    <RefusedNames ref="refusedRef" :count="store.refusedNames" @focus-fallback="focusAfterRefused" />
     <span v-if="updatedExternally" class="updated-externally" data-testid="updated-externally">Updated externally</span>
     <span v-if="saveBlocked" class="save-blocked" data-testid="save-blocked">
       Not saved — file changed on disk
