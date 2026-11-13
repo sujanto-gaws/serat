@@ -380,6 +380,10 @@ pub(crate) struct OpenHooks {
     /// Make the deferred index-actor spawn fail (task #96 review SF-1).
     #[cfg(test)]
     pub(crate) fail_deferred_spawn: bool,
+    /// Judge names by another platform's rules (task #35), so Windows-only refusals are
+    /// testable end to end on any runner.
+    #[cfg(test)]
+    pub(crate) platform: Option<serat_core::Platform>,
     /// Mutant switch for task #96's test: ignore the detached-writer registry.
     #[cfg(test)]
     pub(crate) skip_registry_check: bool,
@@ -549,6 +553,9 @@ pub struct AppState {
     flush: Mutex<FlushState>,
     flush_cv: std::sync::Condvar,
     window_destroyed: std::sync::atomic::AtomicBool,
+    /// Test seam (task #49): a note whose `read_file` sleeps, standing for a slow disk.
+    #[cfg(test)]
+    pub(crate) slow_read: Mutex<Option<(String, std::time::Duration)>>,
 }
 
 /// The bound on the wait for `flush_ack` (`contracts/ipc.rs::CLOSING_FLUSH_DEADLINE_MS`).
@@ -618,6 +625,8 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_read: Mutex::new(None),
             boot,
             settings: Mutex::new(loaded.settings),
             settings_path: loaded.path,
@@ -646,6 +655,8 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_read: Mutex::new(None),
             boot,
             settings: Mutex::new(settings),
             settings_path: None,
@@ -764,9 +775,14 @@ impl AppState {
     ) -> Result<VaultOpened, IpcError> {
         let opening = self.lock_opening();
         let requested = PathBuf::from(&args.root);
-        let vault = Arc::new(
-            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?,
-        );
+        let opened =
+            Vault::open(&requested).map_err(|_| IpcError::VaultNotFound { path: args.root })?;
+        #[cfg(test)]
+        let opened = match self.hooks.platform {
+            Some(platform) => opened.with_platform(platform),
+            None => opened,
+        };
+        let vault = Arc::new(opened);
         let root = vault.root().to_path_buf();
 
         // The new root is valid; only now is the old vault closed, and *before* the new
@@ -784,10 +800,27 @@ impl AppState {
         // old vault is closed and the new id is minted, before anything that can carry
         // that id exists. The three steps below can still fail through `?`; the front end
         // then treats the window as having no vault open (see `VAULT_OPENED_EVENT`).
+        // ADR-0001 (task #96): if an actor detached by an earlier close still holds this
+        // root's index, the open is deferred and says why (task #117), from the first word
+        // the front end hears.
+        #[cfg(test)]
+        let skip_check = self.hooks.skip_registry_check;
+        #[cfg(not(test))]
+        let skip_check = false;
+        let blocker = if skip_check {
+            None
+        } else {
+            self.detached.live(vault.identity())
+        };
+        let opening_reason = blocker
+            .as_ref()
+            .map(|_| crate::ipc::OpeningReason::PreviousIndexStillClosing);
         self.events.emit_opened(&VaultOpened {
             root: root.display().to_string(),
             vault_id: vault_id.clone(),
-            index: IndexState::Opening { reason: None },
+            index: IndexState::Opening {
+                reason: opening_reason,
+            },
         });
         let publisher = Arc::new(
             Publisher::new(
@@ -795,10 +828,14 @@ impl AppState {
                 Arc::clone(&self.startup),
                 Arc::clone(&self.events),
             )
+            .with_opening_reason(opening_reason)
             // FR-VLT-01: a name the walk or the watcher refused is counted into every
             // status, so "N names not shown" is a fact of the status, not a second poll.
             .with_refusals(vault.refusals().clone()),
         );
+        // Task #35: a refusal after the open (the watcher's) reaches the front end now,
+        // not with the next state change.
+        publisher.watch_refusals();
         #[cfg(test)]
         if let Some(probe) = &self.hooks.publisher_probe {
             *probe.lock().expect("probe") = Some(Arc::clone(&publisher));
@@ -823,15 +860,6 @@ impl AppState {
         // the publisher stays at `Opening` -- and a thread starts it once that one has
         // exited. Nothing here waits, and `opening` is not held across the wait. The
         // catch-up gate's settle clock does not start until that actor exists.
-        #[cfg(test)]
-        let skip_check = self.hooks.skip_registry_check;
-        #[cfg(not(test))]
-        let skip_check = false;
-        let blocker = if skip_check {
-            None
-        } else {
-            self.detached.live(vault.identity())
-        };
         let catch_up_gate = Arc::new(if blocker.is_some() {
             OpenCatchUp::awaiting_actor(self.settle_bound, TREE_GRACE)
         } else {
@@ -886,6 +914,10 @@ impl AppState {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     let unavailable_path = dir.display().to_string();
+                    // The previous actor has exited: the reason no longer holds. Cleared
+                    // before the real actor exists, so its first state replaces a plain
+                    // `Opening` and the strip never keeps a reason past the wait.
+                    unavailable.publish(IndexState::Opening { reason: None });
                     let installed = cell.install(|| {
                         #[cfg(test)]
                         if fail_spawn {
@@ -1196,6 +1228,8 @@ impl AppState {
     pub fn read_file(&self, args: ReadFileArgs) -> Result<FileContents, IpcError> {
         let path = Self::vault_path(&args.path)?;
         let vault = self.vault()?;
+        #[cfg(test)]
+        self.slow_read_seam(path.as_str());
         let loaded = vault.read(&path).map_err(from_vault_error)?;
 
         let text = String::from_utf8(loaded.bytes).map_err(|_| IpcError::NotUtf8 {
@@ -1209,6 +1243,20 @@ impl AppState {
             mtime_ms: loaded.meta.mtime_ms,
             bytes: loaded.meta.size,
         })
+    }
+
+    #[cfg(test)]
+    fn slow_read_seam(&self, path: &str) {
+        let slow = self
+            .slow_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((slow_path, hold)) = slow
+            && slow_path == path
+        {
+            std::thread::sleep(hold);
+        }
     }
 
     /// `asset_info`. FR-BIN-01, FR-BIN-11, FR-BIN-12. A vault operation, not an
@@ -2193,9 +2241,9 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    fn fixture(name: &str) -> PathBuf {
+    fn fixture(name: &str) -> crate::TestDir {
         let dir =
-            std::env::temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
+            crate::test_temp_dir().join(format!("serat-app-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("10-projects")).expect("fixture");
         std::fs::write(
@@ -2205,7 +2253,7 @@ mod tests {
         .expect("fixture");
         std::fs::write(dir.join("contract.pdf"), [0x25, 0x50, 0x44, 0x46]).expect("fixture");
         std::fs::write(dir.join("broken.md"), [0xff, 0xfe, 0x00, 0x9f]).expect("fixture");
-        dir
+        crate::TestDir::new(dir)
     }
 
     fn state(dir: &Path) -> AppState {
@@ -2231,7 +2279,7 @@ mod tests {
         );
         let err = state
             .open_vault(OpenVaultArgs {
-                root: std::env::temp_dir()
+                root: crate::test_temp_dir()
                     .join("serat-no-such-vault")
                     .display()
                     .to_string(),
@@ -2825,7 +2873,7 @@ mod tests {
         // against a real symlink. F-58: a broken guard would make this return `Ok`
         // with the outside file's bytes, not merely error some other way.
         let dir = fixture("symlink-read");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-read-{}",
             std::process::id()
         ));
@@ -2876,7 +2924,7 @@ mod tests {
         // `write_atomic` -- isolating containment as the only thing standing between
         // the request and the bytes outside the vault.
         let dir = fixture("symlink-write");
-        let outside = std::env::temp_dir().join(format!(
+        let outside = crate::test_temp_dir().join(format!(
             "serat-app-state-symlink-outside-write-{}",
             std::process::id()
         ));
@@ -3535,8 +3583,9 @@ mod tests {
 
     // -- ui settings (FR-PLT-05, FR-EDT-10) ------------------------------------------
 
-    fn settings_state(name: &str) -> (AppState, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
+    fn settings_state(name: &str) -> (AppState, crate::TestDir) {
+        let dir =
+            crate::test_temp_dir().join(format!("serat-app-ui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.toml");
         let mut state = AppState::with_settings(
@@ -3545,7 +3594,7 @@ mod tests {
             Settings::default(),
         );
         state.settings_path = Some(path.clone());
-        (state, path)
+        (state, crate::TestDir::within(path, dir))
     }
 
     #[test]
@@ -3639,7 +3688,7 @@ mod tests {
         // A file where the directory should be makes the write fail.
         std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
         std::fs::write(path.parent().unwrap(), b"not a dir").unwrap();
-        state.settings_path = Some(path);
+        state.settings_path = Some(path.to_path_buf());
         let err = state
             .set_live_preview(SetLivePreviewArgs { enabled: false })
             .expect_err("unwritable");
@@ -4376,11 +4425,16 @@ mod tests {
             Settings::default(),
         )
         .with_walk_gate(Duration::ZERO);
-        let rebuilt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&rebuilt);
+        // The walk mark comes from the vault walker's thread and the `Rebuilding` event from
+        // the index actor's, so the mark can be taken before the event is delivered: reading
+        // a flag the moment the mark lands is a race (task #129, seen under load in the #115
+        // gate). The transition is awaited on a channel instead, with a deadline, so the
+        // test passes when the event is published at all and fails when it never is.
+        let (seen, rebuilding) = std::sync::mpsc::channel::<()>();
+        let seen = Mutex::new(seen);
         state.events.install(move |status| {
             if matches!(status.state, IndexState::Rebuilding { .. }) {
-                flag.store(true, Ordering::SeqCst);
+                let _ = seen.lock().expect("sender").send(());
             }
         });
         state.open_vault(open_args(&dir)).expect("open");
@@ -4391,8 +4445,8 @@ mod tests {
             "no walk mark"
         );
         assert!(
-            rebuilt.load(Ordering::SeqCst),
-            "this test is about the rebuilt-index case, so a Rebuilding must have been seen"
+            rebuilding.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "this test is about the rebuilt-index case, so a Rebuilding must be published"
         );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
@@ -5152,7 +5206,7 @@ mod tests {
         name: &str,
         hooks: impl FnOnce(&EventLog) -> OpenHooks,
         with_opened: bool,
-    ) -> (Arc<AppState>, EventLog, PathBuf, PathBuf) {
+    ) -> (Arc<AppState>, EventLog, crate::TestDir, crate::TestDir) {
         let (a, b) = (fixture(&format!("{name}-a")), fixture(&format!("{name}-b")));
         let log: EventLog = Arc::default();
         let state = Arc::new(
@@ -5228,6 +5282,14 @@ mod tests {
         wait_until("WalkSettled", || settled(&tree));
         std::fs::write(b.join("external.md"), "# other tool\n").expect("write");
         wait_for_row(&b, "external.md");
+        // The row being in the index is not the event being logged: `index://changed`
+        // is emitted from the change signal's own thread, throttled, after the commit
+        // (task #122: sampling the log here failed once in ten loaded runs with "no
+        // index://changed for B"). Wait on the event itself, bounded, before sampling;
+        // the negative assertions below still read the whole log.
+        wait_until("index://changed for B", || {
+            logged(&log, "index://changed", &b_id)
+        });
         open_note(&state);
         close_flush(&state, Duration::from_secs(10));
 
@@ -5457,10 +5519,25 @@ mod tests {
             .expect("the re-open succeeds");
         assert_eq!(
             opened.index,
-            IndexState::Opening { reason: None },
-            "no actor yet: it must wait"
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "no actor yet: it must wait, and say why"
+        );
+        // While deferred the polled status carries the same reason (task #117).
+        assert_eq!(
+            second.index_status().state,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "the 700 ms blocker is still running"
         );
         wait_ready(&second);
+        // Ready carries no reason; and a plain open never gets one.
+        assert!(matches!(
+            second.index_status().state,
+            IndexState::Ready { .. }
+        ));
         assert_eq!(
             slow.max.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -5556,7 +5633,13 @@ mod tests {
                 fast,
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         wait_ready(&second);
         wait_until("the catch-up walk", || {
             !walks.lock().expect("walks").is_empty()
@@ -5571,7 +5654,7 @@ mod tests {
         name: &str,
         hold_ms: u64,
         bound_ms: u64,
-    ) -> (AppState, AppState, PathBuf, Counting) {
+    ) -> (AppState, AppState, crate::TestDir, Counting) {
         let dir = fixture(name);
         let slow = counting(hold_ms);
         let first = plain_state(Duration::from_secs(5));
@@ -5607,7 +5690,13 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("re-open");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");
         wait_until("WalkSettled", || settled(&log));
@@ -5673,7 +5762,13 @@ mod tests {
                 SeratIndexOpen::default(),
             )
             .expect("the vault opens without an actor");
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         wait_until("Unavailable", || {
             matches!(second.index_status().state, IndexState::Unavailable { .. })
         });
@@ -5715,7 +5810,13 @@ mod tests {
 
         let second = plain_state(Duration::from_secs(5)).with_detached(detacher.detached_writers());
         let opened = open_dir_real(&second, &dir);
-        assert_eq!(opened.index, IndexState::Opening { reason: None });
+        assert_eq!(
+            opened.index,
+            IndexState::Opening {
+                reason: Some(crate::ipc::OpeningReason::PreviousIndexStillClosing)
+            },
+            "a deferred open says why (task #117)"
+        );
         // The tree's refused catch-up is owed as a rescan; the real actor runs it.
         let (send, log) = collecting_sender();
         second.open_tree(send).expect("open_tree");

@@ -39,8 +39,6 @@ function answers(overrides: Record<string, (args: unknown) => unknown> = {}) {
 beforeEach(() => {
   window.__SERAT_BOOT__ = { vault: "/vault", open: null, exit_after_ready: false };
   vi.stubGlobal("requestAnimationFrame", () => 0);
-  // jsdom has no execCommand, which CodeMirror's focus() reaches for.
-  (document as unknown as { execCommand: () => boolean }).execCommand = () => false;
 });
 afterEach(() => {
   vi.unstubAllGlobals();
