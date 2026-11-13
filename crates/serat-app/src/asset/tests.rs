@@ -31,7 +31,7 @@ struct Fx {
 impl Fx {
     fn new(name: &str) -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
-        let base = std::env::temp_dir().join(format!(
+        let base = crate::test_temp_dir().join(format!(
             "serat-asset-{name}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
