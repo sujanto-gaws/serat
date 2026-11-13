@@ -101,10 +101,12 @@ owner: lead
 | 147 | `[P1/test] Quiet-machine NFR-PRF-02 scenarios re-run; triage table-cell/split-preview and save_patch` | test-engineer | 61, runners | pending |
 | 149 | `[P5/release] Third-party notices for the shipped cMaps (Adobe), Foxit and Liberation fonts` (NFR-SEC-07) | release-engineer | 127 | pending |
 | 150 | `[P1/design] ADR-0018 describes the shipped locality API` | architect | 143 | **merged** d1356b4 (150b) |
-| 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | `task/p1-151-open-vault` @ d232e23, round 2 in re-review |
+| 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | **merged** 1ab859e (3 rounds) |
 | 152 | `[P1/design] Collapsed-callout glyph and aria-expanded` | frontend-designer | 146 | pending |
-| 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | `task/p1-153-shm-leak` @ a10d7d2, round 2 |
-| 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | `task/p1-154-cross-process-writer-guard` @ 85a7a1f, in review |
+| 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
+| 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
+| 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
+| 156 | `[P1/req] product-analyst ratifies the A-02 consequence sentence applied by the lead` | product-analyst | 154 | pending (no product-analyst agent live) |
 | 148 | `[P1/design] T-02 row states the CSP directive set once` | architect | 127 | **merged** with #127 (148c) |
 
 Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
