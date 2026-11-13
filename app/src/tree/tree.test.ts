@@ -582,3 +582,50 @@ describe("FileTree component", () => {
     wrapper.unmount();
   });
 });
+
+describe("FileTree.reopen (#151)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0) as unknown as number);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("an earlier stream's message after reopen() does not touch the model; the new stream does", async () => {
+    const callbacks: Array<(m: TreeMessage) => void> = [];
+    const { ipc } = fakeIpc();
+    ipc.openTree = vi.fn(async (onMessage) => void callbacks.push(onMessage));
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const vm = wrapper.vm as unknown as { reopen(): void; model: TreeModel };
+    callbacks[0](listing("", [note("old.md")]));
+    expect(vm.model.fileCount).toBe(1);
+    vm.reopen();
+    expect(callbacks).toHaveLength(2);
+    callbacks[0](listing("", [note("late-old.md"), note("late-old2.md")])); // the old vault's stream
+    expect(vm.model.fileCount).toBe(0);
+    expect(vm.model.applied).toBe(0);
+    callbacks[1](listing("", [note("new.md")]));
+    expect(vm.model.fileCount).toBe(1);
+    wrapper.unmount();
+  });
+
+  it("reopen() leaves no row of the old vault before the new stream arrives; clear() opens nothing", async () => {
+    const { ipc, push } = fakeIpc();
+    const wrapper = mount(FileTree, { props: { ipc }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    push(listing("", [note("old.md")]));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('[role="treeitem"]')).toHaveLength(1);
+    const vm = wrapper.vm as unknown as { reopen(): void; clear(): void };
+    vm.reopen();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('[role="treeitem"]')).toHaveLength(0);
+    expect(ipc.openTree).toHaveBeenCalledTimes(2);
+    vm.clear();
+    expect(ipc.openTree).toHaveBeenCalledTimes(2);
+    wrapper.unmount();
+  });
+});

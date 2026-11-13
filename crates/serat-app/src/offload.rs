@@ -98,6 +98,21 @@ impl AppState {
         blocking(move || state.open_vault(args)).await
     }
 
+    /// [`AppState::choose_vault_with`] on the blocking pool: the native dialog waits for the
+    /// user and the switch it starts waits for the editor's flush, neither on a thread IPC
+    /// shares.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::choose_vault_with`].
+    pub async fn choose_vault_off_thread(
+        self: &Arc<Self>,
+        pick: impl FnOnce() -> Option<std::path::PathBuf> + Send + 'static,
+    ) -> Result<Option<VaultOpened>, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.choose_vault_with(pick)).await
+    }
+
     /// [`AppState::read_file`] on the blocking pool.
     ///
     /// # Errors
