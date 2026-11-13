@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ipc::{IndexState, IndexStatus, REFUSED_NAMES_CAP, RebuildReason};
+use crate::ipc::{IndexState, IndexStatus, OpeningReason, REFUSED_NAMES_CAP, RebuildReason};
 use crate::startup::Startup;
 
 /// Minimum gap between two `index://status` emissions that do not change the kind of
@@ -477,6 +477,20 @@ pub trait IndexOpen: Send + 'static {
     /// thread is waiting for it.
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState));
 
+    /// [`IndexOpen::open`] for an opener that may wait (task #155): `cancelled` says the
+    /// publisher was retired, so a wait should end and publish nothing more. The actor
+    /// calls this one. Defaults to `open`, so every opener that never waits is unchanged.
+    fn open_cancellable(
+        &mut self,
+        vault_root: &Path,
+        index_dir: &Path,
+        publish: &dyn Fn(IndexState),
+        cancelled: &dyn Fn() -> bool,
+    ) {
+        let _ = cancelled;
+        self.open(vault_root, index_dir, publish);
+    }
+
     /// The incremental writer this opener produced, if `open` got far enough to build
     /// one. Called once, by [`IndexActor::spawn`]'s thread, immediately after `open`
     /// returns.
@@ -530,13 +544,57 @@ pub type HandleEpoch = Arc<std::sync::atomic::AtomicU64>;
 /// actor thread that owns this opener. Task #65 dropped it here deliberately, because
 /// nothing on that branch submitted incremental writes to it; task #89 is the writer,
 /// and holding the handle open is what makes submitting to it possible at all.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SeratIndexOpen {
     handle: Option<serat_index::IndexHandle>,
+    /// How long to wait between attempts while another process holds the writer lock.
+    retry_every: Duration,
+    /// How long to keep trying before reporting `Unavailable`.
+    retry_bound: Duration,
+}
+
+/// Between attempts while another process holds the index writer lock (task #155).
+pub const HELD_RETRY_EVERY: Duration = Duration::from_secs(2);
+
+/// The longest an open waits for another process's writer lock before giving up with
+/// `Unavailable` (task #155). Long enough for a crashed process's lock to be released by the
+/// operating system (Windows' `LockFileEx` delay is seconds) or a benchmark run to finish;
+/// short enough that a window that will never get the index says so within a minute.
+pub const HELD_RETRY_BOUND: Duration = Duration::from_secs(60);
+
+impl Default for SeratIndexOpen {
+    fn default() -> Self {
+        Self {
+            handle: None,
+            retry_every: HELD_RETRY_EVERY,
+            retry_bound: HELD_RETRY_BOUND,
+        }
+    }
+}
+
+impl SeratIndexOpen {
+    /// Shorter waits, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_retry(mut self, every: Duration, bound: Duration) -> Self {
+        self.retry_every = every;
+        self.retry_bound = bound;
+        self
+    }
 }
 
 impl IndexOpen for SeratIndexOpen {
     fn open(&mut self, vault_root: &Path, index_dir: &Path, publish: &dyn Fn(IndexState)) {
+        self.open_cancellable(vault_root, index_dir, publish, &|| false);
+    }
+
+    fn open_cancellable(
+        &mut self,
+        vault_root: &Path,
+        index_dir: &Path,
+        publish: &dyn Fn(IndexState),
+        cancelled: &dyn Fn() -> bool,
+    ) {
         let source = match serat_vault::Vault::open(vault_root) {
             Ok(vault) => vault,
             Err(err) => {
@@ -557,24 +615,72 @@ impl IndexOpen for SeratIndexOpen {
         };
         let parser = serat_parse::CommonMarkParser;
 
-        let result =
-            serat_index::open_or_rebuild(vault_root, index_dir, &source, &parser, &|status| {
-                // `Ready` is deliberately not published from here: `open_or_rebuild`
-                // reaches it before the `IndexHandle` it is about to return exists
-                // (see the function's own ordering guarantee), so there is nothing to
-                // read `note_count` from yet. The real `Ready` — carrying a real count
-                // — is published below, once the handle is in hand. Skipping it here
-                // does not reorder anything §3.4 depends on: the load-bearing ordering
-                // this task must preserve is `Rebuilding` before the rebuild starts,
-                // which this closure still forwards immediately, and untouched.
-                if let Some(state) = map_open_status(status, index_dir) {
-                    publish(state);
+        // Task #155: another process holding the writer lock is a wait, not an end. Each
+        // attempt publishes `Opening` first, so while waiting that plain `Opening` is
+        // dropped (the reason stays on screen), and the reason is cleared once, right before
+        // the first state the real open produces (the sequence architecture 3.4 states).
+        let started = Instant::now();
+        let waiting = std::cell::Cell::new(false);
+        let cleared = std::cell::Cell::new(false);
+        let clear_reason = || {
+            if waiting.get() && !cleared.get() {
+                cleared.set(true);
+                publish(IndexState::Opening { reason: None });
+            }
+        };
+        let result = loop {
+            let attempt =
+                serat_index::open_or_rebuild(vault_root, index_dir, &source, &parser, &|status| {
+                    // `Ready` is deliberately not published from here: `open_or_rebuild`
+                    // reaches it before the `IndexHandle` it is about to return exists
+                    // (see the function's own ordering guarantee), so there is nothing to
+                    // read `note_count` from yet. The real `Ready` — carrying a real count
+                    // — is published below, once the handle is in hand. Skipping it here
+                    // does not reorder anything §3.4 depends on: the load-bearing ordering
+                    // this task must preserve is `Rebuilding` before the rebuild starts,
+                    // which this closure still forwards immediately, and untouched.
+                    if let Some(state) = map_open_status(status, index_dir) {
+                        // `open_or_rebuild` reports `Unavailable` and then returns the error;
+                        // the error arms below publish the terminal state, and an attempt
+                        // that will be retried must not leave one behind.
+                        if matches!(state, IndexState::Unavailable { .. })
+                            || (waiting.get() && matches!(state, IndexState::Opening { .. }))
+                        {
+                            return;
+                        }
+                        clear_reason();
+                        publish(state);
+                    }
+                });
+            match attempt {
+                Err(serat_core::IndexError::HeldByAnotherProcess { .. })
+                    if started.elapsed() < self.retry_bound =>
+                {
+                    if !waiting.replace(true) {
+                        publish(IndexState::Opening {
+                            reason: Some(OpeningReason::IndexHeldByAnotherProcess),
+                        });
+                    }
+                    // In slices, so a retired publisher ends the wait promptly.
+                    let wake = Instant::now() + self.retry_every;
+                    while Instant::now() < wake {
+                        if cancelled() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(25).min(self.retry_every));
+                    }
+                    if cancelled() {
+                        return;
+                    }
                 }
-            });
+                other => break other,
+            }
+        };
 
         match result {
             Ok((handle, _report)) => match handle.note_count() {
                 Ok(note_count) => {
+                    clear_reason();
                     publish(IndexState::Ready { note_count });
                     // Kept, not dropped (task #89): this is the handle `write_file`
                     // will submit saves through, once `into_handle` hands it on.
@@ -590,12 +696,15 @@ impl IndexOpen for SeratIndexOpen {
             // Task #154: another Serat process (or a benchmark run) holds this vault's
             // index writer lock. Its own sentence, because the user can act on it.
             Err(serat_core::IndexError::HeldByAnotherProcess { .. }) => {
+                clear_reason();
                 publish(IndexState::Unavailable {
-                    message: "another Serat window or process already has this vault's index \
-                              open. Search and queries are unavailable in this one; the vault \
-                              remains fully editable. Close the other one and reopen the vault \
-                              to use the index here."
-                        .to_owned(),
+                    message: format!(
+                        "another Serat window or process still has this vault's index open \
+                         after waiting {} seconds. Search and queries are unavailable in \
+                         this one; the vault remains fully editable. Close the other one and \
+                         reopen the vault to use the index here.",
+                        self.retry_bound.as_secs()
+                    ),
                     path: index_dir.display().to_string(),
                 });
             }
@@ -880,16 +989,21 @@ impl IndexActor {
                 // bound, so it cannot leave this thread, and only `open` can call it.
                 let terminal: std::cell::RefCell<Option<IndexState>> =
                     std::cell::RefCell::new(None);
-                opener.open(&vault_root, &index_dir, &|state| {
-                    if is_terminal(&state) {
-                        // Last one wins. Nothing in this crate publishes two, but
-                        // keeping the latest is the only answer that cannot publish a
-                        // state the opener has already superseded.
-                        *terminal.borrow_mut() = Some(state);
-                    } else {
-                        publisher.publish(state);
-                    }
-                });
+                opener.open_cancellable(
+                    &vault_root,
+                    &index_dir,
+                    &|state| {
+                        if is_terminal(&state) {
+                            // Last one wins. Nothing in this crate publishes two, but
+                            // keeping the latest is the only answer that cannot publish a
+                            // state the opener has already superseded.
+                            *terminal.borrow_mut() = Some(state);
+                        } else {
+                            publisher.publish(state);
+                        }
+                    },
+                    &|| publisher.is_retired(),
+                );
                 if let Some(index_handle) = opener.into_handle() {
                     // The checkpointer lives with this handle (stopped when the slot's
                     // handle is dropped on vault close); the status carries its fact.

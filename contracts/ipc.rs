@@ -549,7 +549,8 @@ pub enum IndexState {
         /// Why the open check has not started yet. Absent is the ordinary
         /// case: the check is running and ends in milliseconds. Optional on
         /// the wire, so `{ "kind": "opening" }` stays valid in both
-        /// directions; filled by serat-app in P1 #117.
+        /// directions; filled by serat-app (#117: a deferred re-open; #155: another
+        /// process holds the index lock).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         reason: Option<OpeningReason>,
@@ -594,10 +595,8 @@ pub enum IndexState {
 /// Why [`IndexState::Opening`] is lasting longer than the open check does.
 ///
 /// A closed set, like [`RebuildReason`], so each member has copy the front end
-/// renders (`docs/03-design/ui/index-state-copy.md`). One member today; the
-/// enum exists so that a second cause (a single-instance lock held by another
-/// Serat process, which #96 records as a limit) is an added variant and not a
-/// change of shape.
+/// renders (`docs/03-design/ui/index-state-copy.md`). Two members today (#117, #155); the
+/// enum exists so that a further cause is an added variant and not a change of shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -609,6 +608,13 @@ pub enum OpeningReason {
     /// wait. The old actor's publisher is retired, so there is no progress
     /// count to show and none is promised.
     PreviousIndexStillClosing,
+    /// Another Serat process (a second window, or a benchmark run that is still finishing)
+    /// holds this vault's index writer lock (`.serat/index.lock`, task #154). This open
+    /// retries every 2 s, for at most 60 s, and then reports `Unavailable`. A lock a crashed
+    /// process left to the operating system (Windows releases `LockFileEx` locks after a
+    /// delay) clears on its own within that time. Editing works meanwhile; search,
+    /// backlinks and views wait. Task #155.
+    IndexHeldByAnotherProcess,
 }
 
 /// Why a rebuild is running.

@@ -4,9 +4,7 @@
  * Why [`IndexState::Opening`] is lasting longer than the open check does.
  *
  * A closed set, like [`RebuildReason`], so each member has copy the front end
- * renders (`docs/03-design/ui/index-state-copy.md`). One member today; the
- * enum exists so that a second cause (a single-instance lock held by another
- * Serat process, which #96 records as a limit) is an added variant and not a
- * change of shape.
+ * renders (`docs/03-design/ui/index-state-copy.md`). Two members today (#117, #155); the
+ * enum exists so that a further cause is an added variant and not a change of shape.
  */
-export type OpeningReason = "previous_index_still_closing";
+export type OpeningReason = "previous_index_still_closing" | "index_held_by_another_process";
