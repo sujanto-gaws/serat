@@ -493,7 +493,11 @@ fn the_allowlist_holds_no_stale_entry() {
     // An entry for a file that no longer matches would let the pattern come back unseen.
     let root = repo_root();
     for entry in allowlist() {
-        let (path, pattern) = entry.rsplit_once(':').expect("path:pattern");
+        // Split after the `.rs` that ends the path: a pattern may itself hold `::` (`std::net`), so
+        // splitting at the last colon would cut the pattern in half.
+        let (path, pattern) = entry.split_once(".rs:").expect("path.rs:pattern");
+        let path = format!("{path}.rs");
+        let path = path.as_str();
         let source = std::fs::read_to_string(root.join(path))
             .unwrap_or_else(|_| panic!("allow-listed file {path} is gone"));
         assert!(
