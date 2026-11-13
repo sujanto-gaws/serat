@@ -31,7 +31,7 @@ owner: lead
 | 9 | `[P1/test] Budget jobs for FR-VLT-01 tree ≤2 s and FR-VLT-04 ≤500 ms` | test-engineer | 2 | **merged** 9ce1c6c (reconciled as task/p1-09-budget-jobs: p1-tree-path, p1-external-change, p1-switcher jobs with --assert at 20k; old branch obsolete)4's p1-external-change bench |
 | 10 | `[P1/test] Budget jobs for the quick switcher (FR-NAV-01, NFR-PRF-06)` | test-engineer | 3 | **merged** 9ce1c6c (with #9; switcher gated at the binding 50 ms per mode, 20 ms allocation printed as a finding; old branch obsolete)'s p1-switcher bench |
 | 11 | `[P1/test] NFR-PRF-02 editor keystroke-latency harness` | test-engineer | 5 | **merged** 6521013 (3/8 scenarios; #60 CI, #61 scenarios follow) |
-| 12 | `[P1/test] Obsidian-compatibility corpus and write fault-injection suite` | test-engineer | 5 | **open** @ 1a081c7, WIP |
+| 12 | `[P1/test] Obsidian-compatibility corpus and write fault-injection suite` | test-engineer | 5 | **resumed** as #139 (`task/p1-139-link-corpus` @ 10821f4, review-ready); old branch superseded |
 | 13 | `[P1/impl] FR-VLT-01 tree path + F-12 walk fix (+F-33/F-34)` | rust-core-dev | 2, 9 | **merged** 1e15a3d |
 | 14 | `[P1/impl] Ignore file and external-change indexing` | rust-core-dev | 9 | **merged** db877e5 (+#58; INDEX_VERSION 10) |
 | 15 | `[P1/impl] Search, backlinks and frontmatter read paths` | rust-core-dev | 4 | **merged** |
@@ -39,30 +39,65 @@ owner: lead
 | 17 | `[P1/impl] Index assets and associate sidecars` | rust-core-dev | 6 | **merged** (approved at dbfa2b5) |
 | 18 | `[P1/impl] P1 IPC commands/events and generated TS types` | tauri-app-dev | 7, 13–17 | **merged** rounds 1–3; last 61c3054 (24b4073). Still blocked: resolve_links/note_anchors, choose_vault |
 | 19 | `[P1/impl] Contained asset serving + .serat/ gitignore offer` | tauri-app-dev | 6, 7 | **merged** fd7f9c6 (Windows by reading only) |
-| 20 | `[P1/test] Verify no outbound network requests` | tauri-app-dev | 18 | **open** task/p1-20-no-network @ de074d9, round 2 (NFR-SEC-01, T-01/T-05/T-09) |
+| 20 | `[P1/test] Verify no outbound network requests` | tauri-app-dev | 18 | **merged** 01d46a3 (3 rounds) |
 | 21 | `[P1/impl] Hybrid live-preview editor + split fallback` | vue-frontend-dev | 8, 11 | **merged** (via #42 lineage) |
 | 22 | `[P1/impl] Wikilink autocompletion and embeds` | vue-frontend-dev | 18, 21 | **merged** d6f32da (completion guards, app://closing → savePatch → flush_ack; follow-ups #82–#85) |
 | 23 | `[P1/impl] Reconcile external edits into the open note` | vue-frontend-dev | 12, 18, 21 | **merged** d6f32da (reconcile, Compare view, notice states; follow-ups #83/#84/#85) exist |
 | 24 | `[P1/impl] File tree, backlinks pane, search panel` | vue-frontend-dev | 8, 18 | **merged** 5695394 (three rounds; #43 enables create/rename; #79 fields pending) |
 | 25 | `[P1/impl] Quick switcher and command palette` | vue-frontend-dev | 8, 18 | **merged** 6a608b8 (one registry per §9.3; palette is FR-NAV-06) |
 | 26 | `[P1/impl] PDF and image viewers` | vue-frontend-dev | 8, 19 | **merged** c41d6cc (+#98 validator, #108 transport restart; cMaps/fonts gap recorded) |
-| 27 | `[P1/test] Test cases for every P1 ID + hostile suite` | test-engineer | 12–17, 22–26 | pending |
+| 27 | `[P1/test] Test cases for every P1 ID + hostile suite` | test-engineer | 12–17, 22–26 | **merged** a3f4b5f (carries #113) |
 | 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol merged; report last |
 | 30 | `[P1/design] Account for FR-NAV-08 in architecture.md so doclint passes` | architect | 1 | **merged** db1d967 |
-| 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | **open** @ d8e2547, CR + lead WIP; TREE_DELIVERED can flip |
+| 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | **resumed** as #141 (`task/p1-141-tree-first-screen` @ c2600f8, review-ready); old branch superseded |
 | 32 | `[P1/req] Amend FR-VLT-01 and NFR-PRF-02 to the owner-approved definitions` (PRD v1.6) | product-analyst | 2, 5 | **merged** 857af57 |
 | 33 | `[P1/impl] Implement ADR-0016 patch-set application and edit-script in serat-vault` | rust-core-dev | 5 | **merged** (with #55) |
 | 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | **merged** |
-| 35 | `[P1/impl] Report, never drop, vault files whose names Serat refuses` — Windows-only name rules apply on Windows only; refused names are reported with a count (FR-VLT-01, NFR-SEC-06) | rust-core-dev | 34 | in progress |
+| 35 | `[P1/impl] Report, never drop, vault files whose names Serat refuses` — Windows-only name rules apply on Windows only; refused names are reported with a count (FR-VLT-01, NFR-SEC-06) | rust-core-dev | 34 | **merged** 3ff7806 (3 rounds; throttle follow-up #144) |
 | 36 | `[P1/design] Correct ADR-0017's false remote-origin control claim` — real controls: (a) top-level navigation guard, (b) sandbox CSP on scheme responses, (c) app CSP `frame-src 'none'; object-src 'none'` + sanitiser | architect | 6 | **merged** |
 | 37 | `[P1/impl] Install the webview navigation guard, scope the opener to http/https/mailto, pin frame-src/object-src 'none', refuse downloads, disable release context menu` — implements controls (a) and (c) with tests (NFR-SEC-01, NFR-SEC-06, T-09, T-10) | tauri-app-dev | 5, 36 | **merged** (context-menu suppression is Linux-release only; WebView2/WKWebView follow-ups owed) |
 | 39 | `[P1/impl] Context-menu platform conventions (Windows / macOS / Linux)` (FR-NAV-06, NFR-USE-01, T-07) | vue-frontend-dev | 43 | **merged** b42de75 |
 | 41 | `[P1/test] cargo-deny: licences, advisories, duplicate crates, sources — in CI` (NFR-SEC-01, NFR-MNT-01) | test-engineer | — | **merged** bedf295; #113 adds the job to the gate after #112 |
 | 43 | `[P1/impl] Tree operations UI: create note/folder, context menu` (FR-VLT-11, US-41; rename/move are P3 FR-VLT-09) | vue-frontend-dev | 24 | **merged** 9db3d06 |
-| 49 | `[P1/impl] Read/write off the main thread in serat-app` (NFR-PRF-02, goal 2) | tauri-app-dev | 18 | pending |
-| 96 | `[P1/impl] Refuse a second index writer while a detached actor holds the same index.db` (FR-VLT-04, NFR-REL-01, ADR-0015 §2) | tauri-app-dev | 90 | **open** task/p1-96-detached-writer-registry @ 0dd138f, round 2 |
-| 112 | `[P1/impl] rusqlite 0.41 so libsqlite3-sys ≥ 0.39 (RUSTSEC-2026-0459, NFR-SEC-01)` | rust-core-dev | — | **open** task/p1-112-rusqlite-bump @ c36f07b, approved, round 2 |
-| 113 | `[P1/test] Add the cargo-deny job to the CI gate` (NFR-SEC-01, NFR-MNT-01) | test-engineer | 41, 112 | pending |
+| 49 | `[P1/impl] Read/write off the main thread in serat-app` (NFR-PRF-02, goal 2) | tauri-app-dev | 18 | **merged** c4590d9 (2 rounds; #133 carries the rest) |
+| 96 | `[P1/impl] Refuse a second index writer while a detached actor holds the same index.db` (FR-VLT-04, NFR-REL-01, ADR-0015 §2) | tauri-app-dev | 90 | **merged** a05418d (4 rounds) |
+| 112 | `[P1/impl] rusqlite 0.41 so libsqlite3-sys ≥ 0.39 (RUSTSEC-2026-0459, NFR-SEC-01)` | rust-core-dev | — | **merged** a126f7f |
+| 113 | `[P1/test] Add the cargo-deny job to the CI gate` (NFR-SEC-01, NFR-MNT-01) | test-engineer | 41, 112 | **merged** a3f4b5f (with #27) |
+| 114 | `[P1/impl] Register tree.insertLink in the CommandRegistry` (FR-NAV-06, NFR-USE-01, §9.3) | vue-frontend-dev | 25, 43 | **merged** ff48c99 |
+| 115 | `[P1/design] Review rulings: CSP form-action/base-uri, ADR-0017 item 6, Opening reason, FileIdentity on ReFS` | architect | 20, 96 | **merged** fdde549 (115b) |
+| 116 | `[P1/impl] Rebuild the committed webview bundle` | tauri-app-dev | — | **merged** 7654393; drifted again, rebuilt at integration after the vue set |
+| 117 | `[P1/impl] OpeningReason::previous_index_still_closing on a deferred re-open` (NFR-REL-01/02, FR-VLT-04) | tauri-app-dev + vue-frontend-dev | 115 | serat-app half **merged** 3f51229; vue half `task/p1-117b-opening-reason-ui` @ 27685ac review-ready |
+| 118 | `[P1/req] NFR-SEC-07 dependency hygiene + US-42` (PRD v1.10) | product-analyst | 41 | **merged** fdde549 |
+| 119 | `[P1/test] npm audit and licence job for app/` (NFR-SEC-07) | test-engineer | 118 | **merged** f4db5ec (4 rounds) |
+| 120 | `[P1/design] Record the cMaps/fonts gap; ADR-0017 Amendment 2 review` | architect | 94 | **merged** e87a944 (120b, with #123) |
+| 121 | `[P1/test] Every file serat-app writes itself is plain UTF-8` (NFR-CMP-02) | test-engineer | 19 | **merged** 092e897 |
+| 122 | `[P1/test] vault://opened ordering test waits on index://changed` | test-engineer | 90 | **merged** 9635974 |
+| 123 | `[P1/design] ADR-0007 records the ipc-types job` | architect | 27 | **merged** e87a944 |
+| 124 | `[P1/test] serat-app fixtures on tmpfs with a Drop guard` (SIGBUS, #105b) | test-engineer | 105 | **merged** 0dc8574 |
+| 125 | `[P1/design] Spec the refused-names count and list` | frontend-designer | 35 | **merged** 9b71715 + 3520e1d |
+| 126 | `[P1/impl] Refused-names count button and panel in app/` (FR-VLT-01, NFR-SEC-06, NFR-USE-01) | vue-frontend-dev | 125, 35 | `task/p1-126-refused-names-ui` @ b1a6f38 review-ready (final round) |
+| 127 | `[P1/impl] Ship pdf.js cMaps and standard fonts; connect-src 'self'` (FR-BIN-02, US-19, NFR-SEC-01) | vue-frontend-dev + tauri-app-dev | 120 | `task/p1-127-pdf-cmaps-fonts` @ 2a61d35 review-ready (+ #148b T-02 wording @ 430ddc5) |
+| 128 | `[P1/impl] vitest 5 (tinypool advisories out of the dev tree)` (NFR-SEC-07, US-42) | vue-frontend-dev | 119 | `task/p1-128-vitest-5` @ 495fb33 review-ready (round 2) |
+| 129 | `[P1/test] Bench-flag walk-complete test awaits Rebuilding` | test-engineer | — | **merged** 6f0bb60 |
+| 130 | `[P1/design] ADR-0007 count; §9.3 command inventory` | architect | 114 | **merged** bc3f01a (130b) |
+| 131 | `[P1/test] vitest worker RPC timeout under load` | test-engineer | 128 | `task/p1-131-vitest-worker-timeout` @ ba0aecc; re-check on vitest 5 after #128 |
+| 132 | `[P1/impl] seenKeys derived from the named commands' bindings` (NFR-USE-01) | vue-frontend-dev | 114 | `task/p1-132-seenkeys-derived` @ 25f7c25 review-ready (round 2) |
+| 133 | `[P1/impl] Remaining serat-app commands off the Tokio workers` (NFR-PRF-02, goal 2) | tauri-app-dev | 49 | `task/p1-133-reads-off-workers` @ 6761b54 review-ready |
+| 134 | `[P1/design] ADR-0018 online-only (cloud placeholder) files` | architect | — | **merged** 8d934b2 (134b); P2 Must, P1 RISK-015 |
+| 135 | `[P1/impl] One chord canonicaliser for the four call sites` (NFR-USE-01) | vue-frontend-dev | 132 | `task/p1-135-chord-canonicaliser` @ 7ab9ae9 review-ready |
+| 136 | `[P1/test] Bundle-drift CI job` (salvages task/110) | test-engineer | 116 | `task/p1-136-bundle-drift` @ 537c16a; merges last of the vue set with a fresh rebuild |
+| 137 | `[P1/test] Contentless page body tests` (salvages task/128) | test-engineer | 116 | `task/p1-137-contentless-body` @ b5cfaad review-ready |
+| 138 | `[P1/test] Fail CI on a committed merge-conflict marker` (NFR-MNT-01) | test-engineer | — | `task/p1-138-conflict-markers` @ b9ff637 review-ready |
+| 139 | `[P1/test] Obsidian link-syntax corpus` (NFR-CMP-01; resumes #12) | test-engineer | 12 | `task/p1-139-link-corpus` @ 10821f4 review-ready |
+| 140 | `[P1/test] Gate protocol: a no-ID reach counts as missing P1` (resumes #28b) | lead | 28 | **merged** 7ad1ac0 (140b) |
+| 141 | `[P1/test] tree_first_screen in the NFR-PRF-01 trace` (resumes #31) | tauri-app-dev + test-engineer | 31 | `task/p1-141-tree-first-screen` @ c2600f8 review-ready |
+| 142 | `[P1/req] PRD v1.11: FR-VLT-12/13, A-09, US-43` | product-analyst + architect | 134 | **merged** 44d1a61 (142c) |
+| 143 | `[P1/impl] serat_core::locality::is_local; a failed read is an error, never zero bytes` (ADR-0018 P1 pieces) | rust-core-dev | 134 | `task/p1-143-locality-and-no-zero-bytes` @ 9007f35 review-ready |
+| 144 | `[P1/impl] Refused-names re_emit through the throttle with a trailing flush` (NFR-PRF-04) | tauri-app-dev | 35 | `task/p1-144-refusal-throttle` @ 4eb3d19 review-ready |
+| 145 | `[P1/impl] No Tag links for #word inside inline code spans` (NFR-CMP-01) | rust-core-dev | 139 | pending |
+| 146 | `[P1/impl] Callout fold marker is a fold state, not title text` (NFR-CMP-01, C-04) | vue-frontend-dev | 139 | `task/p1-146-callout-fold-marker` @ 7774e32 review-ready |
+| 147 | `[P1/test] Quiet-machine NFR-PRF-02 scenarios re-run; triage table-cell/split-preview and save_patch` | test-engineer | 61, runners | pending |
+| 148 | `[P1/design] T-02 row states the CSP directive set once` | architect | 127 | `task/p1-148b-t02-wording` @ 430ddc5, merges with #127 |
 
 Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
 

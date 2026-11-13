@@ -67,5 +67,6 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     globals: false,
     include: ["src/**/*.test.ts"],
+    setupFiles: ["src/test/jsdom-shims.ts"],
   },
 }));
