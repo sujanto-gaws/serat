@@ -557,9 +557,11 @@ pub struct AppState {
     #[cfg(test)]
     pub(crate) slow_read: Mutex<Option<(String, std::time::Duration)>>,
     /// Test seam (task #133): how long `update_settings` holds the settings lock, standing
-    /// for a slow settings-file write.
+    /// for a slow settings-file write, and a channel it signals once the lock is taken so a
+    /// test waits on the fact rather than on a sleep.
     #[cfg(test)]
-    pub(crate) slow_settings_write: Mutex<Option<std::time::Duration>>,
+    pub(crate) slow_settings_write:
+        Mutex<Option<(std::time::Duration, std::sync::mpsc::Sender<()>)>>,
 }
 
 /// The bound on the wait for `flush_ack` (`contracts/ipc.rs::CLOSING_FLUSH_DEADLINE_MS`).
@@ -1481,12 +1483,17 @@ impl AppState {
     ) -> Result<(), IpcError> {
         let mut guard = self.lock_settings();
         #[cfg(test)]
-        if let Some(hold) = *self
-            .slow_settings_write
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            std::thread::sleep(hold);
+            // Copied out first: the seam's own mutex is not held through the sleep.
+            let seam = self
+                .slow_settings_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((hold, taken)) = seam {
+                let _ = taken.send(());
+                std::thread::sleep(hold);
+            }
         }
         let mut next = guard.clone();
         change(&mut next)?;

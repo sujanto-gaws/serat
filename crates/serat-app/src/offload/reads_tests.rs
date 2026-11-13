@@ -79,13 +79,17 @@ fn a_slow_backlinks_read_does_not_hold_the_caller_or_delay_an_unrelated_command(
 #[test]
 fn get_ui_settings_waiting_on_a_slow_settings_write_does_not_hold_the_caller() {
     let (state, _dir) = open_state(&[("fast.md", "fast\n")]);
-    *state.slow_settings_write.lock().expect("seam") = Some(Duration::from_millis(800));
+    let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+    *state.slow_settings_write.lock().expect("seam") = Some((Duration::from_millis(800), taken_tx));
 
     // A settings write that holds the settings lock for 800 ms, on the pool.
     let mut write =
         std::pin::pin!(state.set_live_preview_off_thread(SetLivePreviewArgs { enabled: false }));
     let _ = first_poll(write.as_mut());
-    std::thread::sleep(Duration::from_millis(100));
+    // Wait for the fact that the write holds the lock, not for a guess at how long it takes.
+    taken_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the write never took the settings lock");
 
     let started = Instant::now();
     let mut settings = std::pin::pin!(state.get_ui_settings_off_thread());
