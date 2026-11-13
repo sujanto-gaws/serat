@@ -600,6 +600,49 @@ fn only_pdf_and_images_are_served() {
     }
 }
 
+// Task #127 (ADR-0017 item 6): pdf.js's cMaps and standard fonts ship in the app bundle and are
+// fetched as `./cmaps/<name>.bcmap` and `./standard_fonts/<name>.pfb` from the app's own origin.
+// The vault scheme is not their path: a vault file with such a name is not viewable, so the
+// scheme, the info command and the span fallback all refuse it, with either platform spelling
+// and through an encoded traversal, and the bundle's bytes can never be had by naming them.
+#[test]
+fn bundle_cmaps_and_fonts_are_never_served_from_the_vault() {
+    let fx = Fx::new("bundle-names");
+    fx.put("cmaps/Adobe-Japan1-UCS2.bcmap", b"VAULT-CMAP");
+    fx.put("standard_fonts/FoxitSans.pfb", b"VAULT-FONT");
+    fx.put("a.pdf", b"%PDF");
+    for name in [
+        "cmaps/Adobe-Japan1-UCS2.bcmap",
+        "standard_fonts/FoxitSans.pfb",
+        "./cmaps/Adobe-Japan1-UCS2.bcmap",
+        "./standard_fonts/FoxitSans.pfb",
+        "..%2Fcmaps%2FAdobe-Japan1-UCS2.bcmap",
+        "x/..%2F..%2Fstandard_fonts%2FFoxitSans.pfb",
+    ] {
+        for platform in BOTH {
+            let reply = fx.get(platform, name);
+            assert_refused(&reply, name);
+            assert!(
+                !body_text(&reply).contains("VAULT-"),
+                "{name}: vault bytes reached the response"
+            );
+        }
+    }
+    for path in [
+        "cmaps/Adobe-Japan1-UCS2.bcmap",
+        "standard_fonts/FoxitSans.pfb",
+    ] {
+        let described = super::info(&fx.vault, &vp(path)).expect("info describes any vault file");
+        assert!(!described.viewable, "{path} must not be viewable");
+        assert!(
+            read_range(&fx.vault, &fx.budget, &vp(path), 0, 5, None).is_err(),
+            "{path}"
+        );
+    }
+    // A control: the scheme is not simply refusing everything in these directories' neighbourhood.
+    assert_eq!(fx.get(Platform::Other, "a.pdf").status, 200);
+}
+
 #[test]
 fn ignored_directories_are_refused_whatever_their_case() {
     let fx = Fx::new("ignored");
