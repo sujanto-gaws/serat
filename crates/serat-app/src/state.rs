@@ -1687,6 +1687,11 @@ impl AppState {
     pub fn mark_tree(&self, args: &MarkTreeArgs) {
         if let Ok(tree) = self.tree() {
             tree.mark(args, self.startup.elapsed_ms());
+            // The cold start's tree term is the stream's own recorded first screen, never
+            // a second clock reading (task #141, ADR-0015 section 5).
+            if let Some(ms) = tree.marks().first_screen_ms {
+                self.startup.mark_tree_first_screen(ms);
+            }
         }
     }
 
@@ -3166,6 +3171,7 @@ mod tests {
             .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let release = Arc::new(std::sync::Barrier::new(2));
         state
@@ -3910,6 +3916,50 @@ mod tests {
         assert!(marks.first_screen_ms.is_some() && marks.complete_ms.is_some());
         assert_eq!(marks.entries_in_model, Some(3));
         assert!(marks.empty_folders.is_some(), "WalkSummary is reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task #141. Mutant, run by hand: dropping the `mark_tree_first_screen` call in
+    // `AppState::mark_tree` leaves the trace without a tree and the final assertions fail.
+    #[test]
+    fn the_cold_start_trace_takes_its_tree_term_from_the_streams_first_screen_mark() {
+        let dir = fixture("tree-trace");
+        let state = gateless(&dir);
+        let first = MarkTreeArgs {
+            mark: crate::ipc::TreeMark::FirstScreen,
+            entries_in_model: 0,
+        };
+        // Everything but the tree.
+        state.startup.mark_window_created();
+        state
+            .startup
+            .mark_first_paint(42.0, 20.0)
+            .expect("valid paint evidence");
+        state.startup.mark_index_settled();
+        state.startup.mark_watcher(WatcherOutcome::Registered);
+        state.startup.mark_buffer_rendered();
+
+        // A mark the stream has not earned is rejected and gives the trace no tree.
+        state.mark_tree(&first);
+        let err = state.startup.trace().expect_err("no tree yet");
+        assert!(err.because.contains("tree"), "{err}");
+
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        state.mark_tree(&first);
+        let recorded = state
+            .tree_marks()
+            .expect("marks")
+            .first_screen_ms
+            .expect("first screen");
+        let trace = state.startup.trace().expect("complete");
+        assert!(trace.tree);
+        assert!(
+            (trace.t0_to_tree_first_screen_ms - recorded).abs() < f64::EPSILON,
+            "the trace says {} but the stream recorded {recorded}",
+            trace.t0_to_tree_first_screen_ms
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
