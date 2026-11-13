@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::index::{IndexActor, SeratIndexOpen, StatusPublisher, StatusSink};
+use crate::index::{IndexActor, SeratIndexOpen, StatusPublisher, StatusSink, held_gave_up_message};
 use crate::ipc::{IndexState, IndexStatus, OpeningReason};
 use crate::startup::Startup;
 
@@ -165,8 +165,9 @@ fn a_lock_held_past_the_bound_ends_in_unavailable_with_the_waited_text() {
     assert!(states.contains(&HELD), "{states:?}");
     match states.last().expect("a last state") {
         IndexState::Unavailable { message, .. } => {
+            assert_eq!(message, &held_gave_up_message(Duration::from_millis(300)));
             assert!(message.contains("after waiting"), "{message}");
-            assert!(message.contains("fully editable"), "{message}");
+            assert!(message.contains("You can keep editing."), "{message}");
         }
         other => panic!("expected Unavailable, got {other:?}"),
     }
@@ -199,4 +200,14 @@ fn retiring_during_the_wait_ends_it_and_emits_nothing_more() {
     other.close().expect("close");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(recorder.states().len(), emitted, "a retired wait emitted");
+}
+
+#[test]
+fn the_wording_past_the_default_bound_is_the_ratified_text_verbatim() {
+    assert_eq!(
+        held_gave_up_message(crate::index::HELD_RETRY_BOUND),
+        "Another Serat session still has this vault's index open after waiting 60 seconds. \
+         Search and queries are unavailable until you reopen the vault after that session \
+         ends. You can keep editing."
+    );
 }
