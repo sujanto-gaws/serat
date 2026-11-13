@@ -1692,3 +1692,6 @@ mod tests {
 mod opening_reason_tests;
 #[cfg(test)]
 mod refusal_wiring_tests;
+
+#[cfg(test)]
+mod held_lock_tests;

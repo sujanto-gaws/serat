@@ -103,3 +103,51 @@ describe("App status strip: Opening reason", () => {
     vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
   });
 });
+
+describe("App status strip: held by another process (#155)", () => {
+  it("renders text, title and describedby, then leaves through Opening{None} (not announced) to Ready (announced)", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((name: string, h: (e: { payload: unknown }) => void) => {
+      handlers.set(name, h);
+      return Promise.resolve(() => undefined);
+    }) as never);
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const send = async (state: unknown) => {
+      handlers.get("index://status")!({ payload: { vault_id: "A", state } });
+      await wrapper.vm.$nextTick();
+    };
+    const live = wrapper.find('[data-testid="index-live"]').element;
+    const announced: string[] = [];
+    const observer = new MutationObserver(() => {
+      if ((live.textContent ?? "") !== "") announced.push(live.textContent ?? "");
+    });
+    observer.observe(live, { childList: true, characterData: true, subtree: true });
+    const flush = async () => {
+      await new Promise<void>((r) => queueMicrotask(r));
+      await new Promise<void>((r) => queueMicrotask(r));
+    };
+    const held = { kind: "opening", reason: "index_held_by_another_process" };
+    await send(held);
+    await flush();
+    expect(announced).toEqual(["Another Serat session is using this vault's index — search will start when it's free"]);
+    const strip = wrapper.find('[data-testid="index-state"]');
+    expect(strip.attributes("title")).toContain("Only one Serat session can update a vault's index at a time.");
+    expect(wrapper.find(`#${strip.attributes("aria-describedby")!}`).text()).toContain("You can keep editing.");
+    for (let i = 0; i < 3; i++) await send(held);
+    await flush();
+    expect(announced).toHaveLength(1);
+    await send({ kind: "opening" });
+    await flush();
+    expect(announced).toHaveLength(1); // the plain Opening after a cleared reason is not announced
+    expect(wrapper.find('[data-testid="index-state"]').attributes("aria-describedby")).toBeUndefined();
+    await send({ kind: "ready", note_count: 4 }); // the state after it is
+    await flush();
+    expect(announced).toHaveLength(2);
+    expect(announced[1]).toBe("index: ready · 4 notes");
+    observer.disconnect();
+    wrapper.unmount();
+    vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
+  });
+});
