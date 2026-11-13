@@ -23,6 +23,7 @@ use crate::ipc::{
     SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage,
     UiSettings, VaultOpened, WriteFileArgs,
 };
+use crate::offload;
 use crate::startup;
 use crate::state::AppState;
 use crate::tree_stream::TreeSender;
@@ -32,16 +33,14 @@ use crate::tree_stream::TreeSender;
 /// # Errors
 ///
 /// As [`AppState::open_vault`].
-// Not a granted command (the ACL test pins that); `async` because opening closes the
-// previous vault, which must never block the webview's thread.
-// When `choose_vault` lands this must go through `spawn_blocking`: the switch now also
-// waits up to 2 s for the editor's flush ack (NFR-REL-01).
-#[tauri::command(async)]
-pub fn open_vault(
+// Not a granted command (the ACL test pins that). Opening closes the previous vault, which
+// waits up to 2 s for the editor's flush ack (NFR-REL-01), so it runs on the blocking pool.
+#[tauri::command]
+pub async fn open_vault(
     state: State<'_, Arc<AppState>>,
     args: OpenVaultArgs,
 ) -> Result<VaultOpened, IpcError> {
-    state.open_vault(args)
+    state.open_vault_off_thread(args).await
 }
 
 /// `read_file(args) -> Result<FileContents, IpcError>`
@@ -50,11 +49,11 @@ pub fn open_vault(
 ///
 /// As [`AppState::read_file`].
 #[tauri::command]
-pub fn read_file(
+pub async fn read_file(
     state: State<'_, Arc<AppState>>,
     args: ReadFileArgs,
 ) -> Result<FileContents, IpcError> {
-    state.read_file(args)
+    state.read_file_off_thread(args).await
 }
 
 /// `write_file(args) -> Result<FileWritten, IpcError>`
@@ -63,11 +62,11 @@ pub fn read_file(
 ///
 /// As [`AppState::write_file`].
 #[tauri::command]
-pub fn write_file(
+pub async fn write_file(
     state: State<'_, Arc<AppState>>,
     args: WriteFileArgs,
 ) -> Result<FileWritten, IpcError> {
-    state.write_file(args)
+    state.write_file_off_thread(args).await
 }
 
 /// `index_status() -> IndexStatus`
@@ -84,9 +83,11 @@ pub fn index_status(state: State<'_, Arc<AppState>>) -> IndexStatus {
 /// # Errors
 ///
 /// As [`AppState::gitignore_offer_status`].
-#[tauri::command(async)]
-pub fn gitignore_offer_status(state: State<'_, Arc<AppState>>) -> Result<GitignoreOffer, IpcError> {
-    state.gitignore_offer_status()
+#[tauri::command]
+pub async fn gitignore_offer_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GitignoreOffer, IpcError> {
+    state.gitignore_offer_status_off_thread().await
 }
 
 /// `append_gitignore_entry() -> Result<GitignoreAppended, IpcError>`. Takes no path.
@@ -94,11 +95,11 @@ pub fn gitignore_offer_status(state: State<'_, Arc<AppState>>) -> Result<Gitigno
 /// # Errors
 ///
 /// As [`AppState::append_gitignore_entry`].
-#[tauri::command(async)]
-pub fn append_gitignore_entry(
+#[tauri::command]
+pub async fn append_gitignore_entry(
     state: State<'_, Arc<AppState>>,
 ) -> Result<GitignoreAppended, IpcError> {
-    state.append_gitignore_entry()
+    state.append_gitignore_entry_off_thread().await
 }
 
 /// `decline_gitignore_offer() -> Result<(), IpcError>`
@@ -106,9 +107,9 @@ pub fn append_gitignore_entry(
 /// # Errors
 ///
 /// As [`AppState::decline_gitignore_offer`].
-#[tauri::command(async)]
-pub fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<(), IpcError> {
-    state.decline_gitignore_offer()
+#[tauri::command]
+pub async fn decline_gitignore_offer(state: State<'_, Arc<AppState>>) -> Result<(), IpcError> {
+    state.decline_gitignore_offer_off_thread().await
 }
 
 /// `get_ui_settings() -> UiSettings`
@@ -123,12 +124,12 @@ pub fn get_ui_settings(state: State<'_, Arc<AppState>>) -> UiSettings {
 /// # Errors
 ///
 /// As [`AppState::set_live_preview`].
-#[tauri::command(async)]
-pub fn set_live_preview(
+#[tauri::command]
+pub async fn set_live_preview(
     state: State<'_, Arc<AppState>>,
     args: SetLivePreviewArgs,
 ) -> Result<(), IpcError> {
-    state.set_live_preview(args)
+    state.set_live_preview_off_thread(args).await
 }
 
 /// `set_keybinding(args) -> Result<(), IpcError>`
@@ -136,12 +137,12 @@ pub fn set_live_preview(
 /// # Errors
 ///
 /// As [`AppState::set_keybinding`].
-#[tauri::command(async)]
-pub fn set_keybinding(
+#[tauri::command]
+pub async fn set_keybinding(
     state: State<'_, Arc<AppState>>,
     args: SetKeybindingArgs,
 ) -> Result<(), IpcError> {
-    state.set_keybinding(args)
+    state.set_keybinding_off_thread(args).await
 }
 
 /// `search(args) -> Result<IndexRead<SearchOutcome>, IpcError>`
@@ -160,12 +161,7 @@ pub async fn search(
     args: SearchArgs,
 ) -> Result<IndexRead<SearchOutcome>, IpcError> {
     let state = Arc::clone(&state);
-    tauri::async_runtime::spawn_blocking(move || state.search(args))
-        .await
-        .map_err(|err| IpcError::Io {
-            path: String::new(),
-            message: format!("the search thread failed: {err}"),
-        })?
+    offload::blocking(move || state.search(args)).await
 }
 
 /// `switcher_query(args) -> SwitcherResults`
@@ -179,14 +175,8 @@ pub async fn switcher_query(
     state: State<'_, Arc<AppState>>,
     args: SwitcherQueryArgs,
 ) -> Result<SwitcherResults, IpcError> {
-    let seq = args.seq;
     let state = Arc::clone(&state);
-    tauri::async_runtime::spawn_blocking(move || state.switcher_query(&args))
-        .await
-        .map_err(|err| IpcError::Io {
-            path: String::new(),
-            message: format!("the switcher thread failed (query {seq}): {err}"),
-        })
+    offload::blocking(move || Ok(state.switcher_query(&args))).await
 }
 
 /// `backlinks(args) -> Result<IndexRead<Vec<Backlink>>, IpcError>`
@@ -207,12 +197,12 @@ pub fn backlinks(
 /// # Errors
 ///
 /// As [`AppState::create_folder`].
-#[tauri::command(async)]
-pub fn create_folder(
+#[tauri::command]
+pub async fn create_folder(
     state: State<'_, Arc<AppState>>,
     args: CreateFolderArgs,
 ) -> Result<FolderCreated, IpcError> {
-    state.create_folder(args)
+    state.create_folder_off_thread(args).await
 }
 
 /// `open_tree(on_message: Channel<TreeMessage>) -> Result<(), IpcError>`
@@ -245,9 +235,12 @@ pub fn mark_tree(state: State<'_, Arc<AppState>>, args: MarkTreeArgs) {
 /// # Errors
 ///
 /// As [`AppState::note_opened`].
-#[tauri::command(async)]
-pub fn note_opened(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) -> Result<(), IpcError> {
-    state.note_opened(&args)
+#[tauri::command]
+pub async fn note_opened(
+    state: State<'_, Arc<AppState>>,
+    args: NoteBufferArgs,
+) -> Result<(), IpcError> {
+    state.note_opened_off_thread(args).await
 }
 
 /// `note_closed(args)`
@@ -261,12 +254,12 @@ pub fn note_closed(state: State<'_, Arc<AppState>>, args: NoteBufferArgs) {
 /// # Errors
 ///
 /// As [`AppState::save_patch`].
-#[tauri::command(async)]
-pub fn save_patch(
+#[tauri::command]
+pub async fn save_patch(
     state: State<'_, Arc<AppState>>,
     args: SavePatchArgs,
 ) -> Result<FileWritten, IpcError> {
-    state.save_patch(&args)
+    state.save_patch_off_thread(args).await
 }
 
 /// `flush_ack(args)`: the editor has submitted what it had pending; ends the bounded
@@ -281,12 +274,12 @@ pub fn flush_ack(state: State<'_, Arc<AppState>>, args: FlushAckArgs) {
 /// # Errors
 ///
 /// As [`AppState::request_external_diff`].
-#[tauri::command(async)]
-pub fn request_external_diff(
+#[tauri::command]
+pub async fn request_external_diff(
     state: State<'_, Arc<AppState>>,
     args: NoteBufferArgs,
 ) -> Result<Option<ExternalChange>, IpcError> {
-    state.request_external_diff(&args)
+    state.request_external_diff_off_thread(args).await
 }
 
 /// `rebase_buffer(args) -> Result<Vec<Patch>, IpcError>`: *Keep mine* (ADR-0016 §4).
@@ -294,12 +287,12 @@ pub fn request_external_diff(
 /// # Errors
 ///
 /// As [`AppState::rebase_buffer`].
-#[tauri::command(async)]
-pub fn rebase_buffer(
+#[tauri::command]
+pub async fn rebase_buffer(
     state: State<'_, Arc<AppState>>,
     args: RebaseBufferArgs,
 ) -> Result<Vec<Patch>, IpcError> {
-    state.rebase_buffer(&args)
+    state.rebase_buffer_off_thread(args).await
 }
 
 /// `refused_names() -> Vec<RefusedName>`
@@ -370,31 +363,31 @@ pub fn mark_first_paint(
 ///
 /// `note` is what was rendered, or `None` if nothing was — which is recorded in the
 /// trace so a fast number over an empty shell is legible as one.
+///
+/// The mark is taken first, on the calling thread (two atomic stores); remembering the
+/// note writes the settings file, so that runs on the blocking pool (task #49). Tauri
+/// requires an async command that borrows `State` to return a `Result`; this never fails.
 #[tauri::command]
-#[must_use]
-pub fn mark_vault_usable(state: State<'_, Arc<AppState>>, note: Option<String>) -> f64 {
+pub async fn mark_vault_usable(
+    state: State<'_, Arc<AppState>>,
+    note: Option<String>,
+) -> Result<f64, IpcError> {
     state.startup.set_last_open(note.clone());
     state.startup.mark_buffer_rendered();
-    if let Some(note) = note
-        && let Err(problem) = state.remember_open(&note)
-    {
-        eprintln!("serat: settings not saved: {problem}");
+    if let Some(note) = note {
+        let owned = Arc::clone(&state);
+        let saved = offload::blocking(move || {
+            owned.remember_open(&note).map_err(|message| IpcError::Io {
+                path: String::new(),
+                message,
+            })
+        })
+        .await;
+        if let Err(problem) = saved {
+            eprintln!("serat: settings not saved: {problem:?}");
+        }
     }
-    state.startup.elapsed_ms()
-}
-
-/// Runs `work` on the blocking pool. A sync `#[tauri::command]` runs on the main
-/// thread, which is for UI and nothing else (design goal 2); these file reads and
-/// writes never belong there.
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
-) -> Result<T, IpcError> {
-    tauri::async_runtime::spawn_blocking(work)
-        .await
-        .map_err(|err| IpcError::Io {
-            path: String::new(),
-            message: err.to_string(),
-        })?
+    Ok(state.startup.elapsed_ms())
 }
 
 /// `asset_info(args) -> Result<AssetInfo, IpcError>`
@@ -407,8 +400,7 @@ pub async fn asset_info(
     state: State<'_, Arc<AppState>>,
     args: AssetArgs,
 ) -> Result<AssetInfo, IpcError> {
-    let state = Arc::clone(&state);
-    blocking(move || state.asset_info(args)).await
+    state.asset_info_off_thread(args).await
 }
 
 /// `read_asset_range(args) -> Result<ArrayBuffer, IpcError>`: raw bytes, not JSON.
@@ -421,8 +413,8 @@ pub async fn read_asset_range(
     state: State<'_, Arc<AppState>>,
     args: ReadAssetRangeArgs,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let state = Arc::clone(&state);
-    blocking(move || state.read_asset_range(args))
+    state
+        .read_asset_range_off_thread(args)
         .await
         .map(tauri::ipc::Response::new)
 }
