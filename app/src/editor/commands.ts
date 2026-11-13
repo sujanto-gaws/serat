@@ -51,6 +51,11 @@ export interface Command {
   /** Context check (command-palette.md "unavailable in context"): `null` when
    * the command can run now, else a one-line reason shown instead of running. */
   unavailable?: (ctx: CommandContextInfo) => string | null;
+  /** One of CodeMirror's own keymap entries, re-registered: two such entries may share a chord once spellings
+   * are folded (the mac pair `Ctrl-A` and `Shift-Ctrl-a`), because CodeMirror tries them in order. `register`
+   * refuses it on any id outside `editor.cm.` / `editor.cm-history.`, so a named command cannot opt out of
+   * the one-binding rule (architecture §9.3). */
+  fallthrough?: boolean;
 }
 
 /** Where an action is being invoked from: the palette passes the element focused when it opened
@@ -61,11 +66,7 @@ export interface CommandContextInfo {
 
 /** Chords the tree owns outright, matched literally after lowercasing (normalise modifier order if a
  * multi-modifier chord is ever reserved) (file-tree.md keyboard map): a `when: "tree"` command may not take them. */
-const RESERVED_TREE_KEYS = new Set(
-  ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", "Mod-Enter", "F2", "F10", "Shift-F10", "ContextMenu", "Escape", "Mod-f"].map((k) =>
-    k.toLowerCase(),
-  ),
-);
+const RESERVED_TREE_KEYS = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Enter", "Mod-Enter", "F2", "F10", "Shift-F10", "ContextMenu", "Escape", "Mod-f"];
 const RESERVED = "(reserved key)";
 
 /**
@@ -79,6 +80,12 @@ export class CommandRegistry {
   private readonly runCounts = new Map<CommandId, number>();
   private readonly listeners = new Set<() => void>();
   private readonly refusedListeners = new Set<(ids: CommandId[]) => void>();
+  /** The platform `Mod` means Cmd or Ctrl on: every chord this registry compares goes through `normaliseChord`. */
+  private readonly reservedTree: ReadonlySet<string>;
+
+  constructor(readonly platform: EditorPlatform = detectPlatform()) {
+    this.reservedTree = new Set(RESERVED_TREE_KEYS.map((k) => normaliseChord(k, platform)));
+  }
 
   /** Hears overrides dropped at `register` time because they collide with a later command. */
   onOverrideRefused(listener: (ids: CommandId[]) => void): () => void {
@@ -107,6 +114,9 @@ export class CommandRegistry {
     }
     if (!command.run && !command.exec) {
       throw new Error(`CommandRegistry: command "${command.id}" has neither run nor exec`);
+    }
+    if (command.fallthrough && !/^editor\.cm(-history)?\./.test(command.id)) {
+      throw new Error(`CommandRegistry: command "${command.id}" may not be fallthrough (reserved for CodeMirror's own keymap entries)`);
     }
     this.commands.set(command.id, command);
     // An override already in force (settings are read before late commands register) must not
@@ -166,14 +176,16 @@ export class CommandRegistry {
     if (key === null) return null;
     const mine = this.commands.get(id);
     const bucket = mine?.when ?? "*";
-    if (bucket === "tree" && RESERVED_TREE_KEYS.has(key.toLowerCase())) return RESERVED;
+    const canonical = normaliseChord(key, this.platform);
+    if (bucket === "tree" && this.reservedTree.has(canonical)) return RESERVED;
     for (const other of this.commands.values()) {
       const otherBucket = other.when ?? "*";
       // A tree-scoped chord also shadows global chords (the tree's keydown would swallow them), and the
       // reverse; the live effective bindings are compared, so rebound globals are tracked.
       const clash = otherBucket === bucket || (bucket === "tree" && otherBucket === "*") || (bucket === "*" && otherBucket === "tree");
       if (other.id === id || !clash) continue;
-      if (this.effectiveBinding(other.id) === key) return other.id;
+      const theirs = this.effectiveBinding(other.id);
+      if (theirs !== null && normaliseChord(theirs, this.platform) === canonical) return other.id;
     }
     return null;
   }
@@ -259,7 +271,7 @@ export class CommandRegistry {
    * silently resolve).
    */
   buildKeymap(overrides: ReadonlyMap<CommandId, string | null> = this.overrides): KeyBinding[] {
-    const seen = new Map<string, { id: CommandId; overridden: boolean; binding: KeyBinding | null }>();
+    const seen = new Map<string, { id: CommandId; key: string; overridden: boolean; fallthrough: boolean; binding: KeyBinding | null }>();
     const dropped = new Set<KeyBinding>();
     const bindings: KeyBinding[] = [];
     for (const command of this.commands.values()) {
@@ -268,17 +280,19 @@ export class CommandRegistry {
       if (!key) {
         continue;
       }
-      const bucket = `${command.when ?? "*"}::${key}`;
+      const bucket = `${command.when ?? "*"}::${normaliseChord(key, this.platform)}`;
       const existing = seen.get(bucket);
       if (existing) {
         // A collision caused by the user's TOML never throws (that would strand a note load
         // inside the editor's state replacement): the overriding command simply loses the chord.
-        if (overridden) continue;
-        if (existing.overridden) {
+        if (command.fallthrough && existing.fallthrough) {
+          // CodeMirror's own entries for one chord: both stay, in order; the first to return true wins.
+        } else if (overridden) continue;
+        else if (existing.overridden) {
           if (existing.binding) dropped.add(existing.binding);
         } else {
           throw new Error(
-            `CommandRegistry: keybinding collision — "${key}" in context "${command.when ?? "*"}" is bound to both "${existing.id}" and "${command.id}"`,
+            `CommandRegistry: keybinding collision — "${existing.key}" (${existing.id}) and "${key}" (${command.id}) are both ${normaliseChord(key, this.platform)} in context "${command.when ?? "*"}"`,
           );
         }
       }
@@ -289,7 +303,7 @@ export class CommandRegistry {
         binding = { key, preventDefault: command.preventDefault ?? true, run: (view) => run(view) };
         bindings.push(binding);
       }
-      seen.set(bucket, { id: command.id, overridden, binding });
+      seen.set(bucket, { id: command.id, key, overridden, fallthrough: !!command.fallthrough, binding });
     }
     return bindings.filter((b) => !dropped.has(b));
   }
@@ -313,16 +327,66 @@ export function chordParts(binding: string): string[] {
   return binding.split(/-(?!$)/);
 }
 
-/** Does `event` press `binding` (CodeMirror notation, `Mod` = Cmd on mac, Ctrl elsewhere)? */
-export function chordMatches(binding: string, event: KeyboardEvent, mac: boolean): boolean {
+export type EditorPlatform = "mac" | "win" | "linux";
+
+/** The same sniff CodeMirror itself uses for its platform key choice. */
+export function detectPlatform(): EditorPlatform {
+  const platform = typeof navigator === "undefined" ? "" : navigator.platform ?? "";
+  if (/Mac|iPhone|iPad/.test(platform)) return "mac";
+  if (/Win/.test(platform)) return "win";
+  return "linux";
+}
+
+const MODIFIER_ALIASES: Record<string, string> = {
+  ctrl: "ctrl",
+  control: "ctrl",
+  c: "ctrl",
+  alt: "alt",
+  option: "alt",
+  a: "alt",
+  shift: "shift",
+  s: "shift",
+  meta: "meta",
+  cmd: "meta",
+  command: "meta",
+  m: "meta",
+};
+
+/**
+ * A chord in the one form every spelling CodeMirror treats as the same chord shares: `Mod` is the platform
+ * modifier (Cmd on mac, Ctrl elsewhere), `Cmd`/`Meta`/`Control`/`Option` and CodeMirror's one-letter
+ * modifier aliases fold to one name, modifier order is irrelevant, and a single uppercase letter means
+ * Shift (`Mod-Z` is `Mod-Shift-z`; `Ctrl-a` and `Ctrl-A` stay distinct, as in CodeMirror).
+ */
+export function normaliseChord(binding: string, platform: EditorPlatform): string {
   const parts = chordParts(binding);
-  const key = (parts.pop() ?? "").toLowerCase();
-  const wants = new Set(parts.map((p) => p.toLowerCase()));
-  const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
-  if (wants.has("mod") !== mod) return false;
-  if (wants.has("shift") !== event.shiftKey) return false;
-  if (wants.has("alt") !== event.altKey) return false;
-  return event.key.toLowerCase() === key;
+  let key = parts.pop() ?? "";
+  const mods = new Set(
+    parts.map((part) => {
+      const lower = part.toLowerCase();
+      return lower === "mod" ? (platform === "mac" ? "meta" : "ctrl") : (MODIFIER_ALIASES[lower] ?? lower);
+    }),
+  );
+  if (key.length === 1 && key !== key.toLowerCase()) {
+    mods.add("shift");
+    key = key.toLowerCase();
+  }
+  return [...[...mods].sort(), key].join("-");
+}
+
+/** Does `event` press `binding`? Both sides go through `normaliseChord`, so `Mod-k`, `Cmd-k`, `Meta-k` and
+ * (on a non-mac platform) `Ctrl-k` are one chord, and the modifiers must match exactly. */
+export function chordMatches(binding: string, event: KeyboardEvent, mac: boolean): boolean {
+  const parts = normaliseChord(binding, mac ? "mac" : "linux").split("-");
+  const key = parts.pop() ?? "";
+  const wants = new Set(parts);
+  return (
+    wants.has("ctrl") === event.ctrlKey &&
+    wants.has("meta") === event.metaKey &&
+    wants.has("shift") === event.shiftKey &&
+    wants.has("alt") === event.altKey &&
+    event.key.toLowerCase() === key.toLowerCase()
+  );
 }
 
 const GLYPHS: Record<string, [string, string]> = {

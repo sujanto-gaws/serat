@@ -96,8 +96,10 @@ fn turkish_dotted_capital_i_is_not_found_by_ascii_or_dotless_links() {
 }
 
 /// `Café` with the accent as U+0301 after a plain `e`: the NFD spelling.
+#[cfg(target_os = "linux")]
 const CAFE_NFD: &str = "Cafe\u{301}";
 /// The same word with the precomposed U+00E9: the NFC spelling.
+#[cfg(target_os = "linux")]
 const CAFE_NFC: &str = "Caf\u{e9}";
 
 /// Built at test time, not committed: APFS cannot hold both spellings side by side

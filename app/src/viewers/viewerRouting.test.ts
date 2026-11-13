@@ -46,8 +46,6 @@ beforeEach(() => {
   window.__SERAT_BOOT__ = { vault: "/vault", open: "a.md", exit_after_ready: false };
   vi.stubGlobal("requestAnimationFrame", () => 0);
   calls.length = 0;
-  // jsdom has no execCommand; CodeMirror calls it when focusing a selection.
-  (document as unknown as { execCommand: () => boolean }).execCommand = () => false;
 });
 afterEach(() => vi.unstubAllGlobals());
 

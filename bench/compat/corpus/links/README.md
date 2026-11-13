@@ -11,8 +11,5 @@ architecture §9.2).
 | heading-block-link.md | `crates/serat-index/tests/compat_links.rs`, `crates/serat-parse/tests/compat_links.rs` | `#Heading`, `#^block1`, `#A#B` resolve to the base note; only the block form fills `dst_block_ref` |
 | embeds.md, asset-image.png | the same two | `![[x.png]]`, `![[x.png\|300]]`, `![[note#Heading]]` resolve; width is display-only |
 | alias-link.md, aliases-target.md | `compat_links.rs` (index) | `[[Ali]]`, `[[Target Alias]]` stay unresolved; `[[aliases-target]]` resolves |
+| code-span-tag.md | `crates/serat-parse/tests/compat_links.rs` | a `#tag` or `[[link]]` inside an inline code span is not extracted (task #145); a real tag and link beside one still are |
 | callouts.md | `app/src/editor/calloutFold.test.ts` | `> [!tip]-` is a widget or source, never rewritten (C-01) |
-
-Avoid a backticked `#word` in prose here: the parser indexes tags inside inline
-code spans (a defect against Obsidian's behaviour, reported separately), which
-would add `Tag` links to the parser-side expectations.

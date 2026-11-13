@@ -10,14 +10,32 @@
 import { defineStore } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
+import type { IndexStatus } from "@/ipc/generated/IndexStatus";
 import type { VaultOpened } from "@/ipc/generated/VaultOpened";
 import type { RebuildReason } from "@/ipc/generated/RebuildReason";
+
+/** Copy brief index-state-copy.md: the only `reason` with its own copy. An absent, null or unknown
+ * (future) reason is NOT an error and renders as the plain opening text (goal 5); the field is the
+ * only source, never elapsed time. */
+function isWaitingOnPreviousIndex(state: Extract<IndexState, { kind: "opening" }>): boolean {
+  return state.reason === "previous_index_still_closing";
+}
+
+const WAITING_DETAIL =
+  "This vault was closed while its index was still being built. Serat finishes that first so two builds never write the same index. You can keep editing.";
+
+/** Tooltip / aria-description for the waiting state; `null` for every other state. */
+export function describeIndexDetail(state: IndexState): string | null {
+  return state.kind === "opening" && isWaitingOnPreviousIndex(state) ? WAITING_DETAIL : null;
+}
 
 /** §3.4: a rebuild is a status line, never a modal, never a blocking spinner. */
 export function describeIndexState(state: IndexState): string {
   switch (state.kind) {
     case "opening":
-      return "index: opening";
+      return isWaitingOnPreviousIndex(state)
+        ? "Finishing the previous session's index — search will start when it's done"
+        : "Opening index…";
     case "ready":
       return `index: ready · ${state.note_count} notes`;
     case "rebuilding":
@@ -41,7 +59,15 @@ export const useVaultStore = defineStore("vault", {
     /** Canonical vault root, for the title bar. `null` before `open_vault` returns. */
     vaultRoot: null as string | null,
     /** Rendered by `describeIndexState`, updated from the poll and the event both. */
-    indexStatusText: "index: opening",
+    indexStatusText: "Opening index…",
+    /** Tooltip / aria-description of the waiting Opening state; `null` otherwise. */
+    indexStatusDetail: null as string | null,
+    /** Live-region text: a snapshot, never bound to `indexStatusText` (Rebuilding's done/total would be
+     * re-announced on every event). Set once on entering the waiting state and once on leaving it;
+     * cleared at the next transition. */
+    indexAnnouncement: "",
+    /** `kind` of the state the snapshot was taken in; the snapshot is kept while the kind holds. */
+    indexAnnouncementKind: "" as string,
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -58,8 +84,10 @@ export const useVaultStore = defineStore("vault", {
     vaultIdFromBoot: false,
     /** `vault://opened` has been seen: the id is event-sourced and the poll can never change it. */
     announced: false,
-    /** Names the vault refused to list (invalid on this platform), as one status fact; `null` = unknown. */
+    /** Distinct names the vault could not turn into a vault path (FR-VLT-01), as one status fact; `null` = absent (never zero). */
     refusedNames: null as number | null,
+    /** An `index://status` event has been applied, so a late poll answer must not overwrite it. */
+    statusEventSeen: false,
     /** Diagnostic status-bar text: paint/usable/save timings. Not a product feature. */
     marksText: "",
   }),
@@ -75,9 +103,15 @@ export const useVaultStore = defineStore("vault", {
     vaultOpened(opened: VaultOpened) {
       this.announced = true; // from now on, no poll may set the id, even after a failed open
       if (!opened.vault_id) return; // never adopt an empty id
+      if (opened.vault_id !== this.vaultId) this.refusedNames = null; // another vault: the old count is not its count
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
+      // Seed the strip from the open itself: on the deferred re-open path the event stream never emits
+      // Opening{reason}; its first index://status is the clear (#117). The reason arrives only here and
+      // in the index_status poll. Only a reasoned Opening is seeded: every other state keeps arriving by
+      // event/poll exactly as before (the #91/#103 drop rules are probed through the status text).
+      if (opened.index?.kind === "opening" && opened.index.reason) this.setIndexState(opened.index);
     },
     /** `choose_vault` answered `Err` after `vault://opened`: the window has no vault open and no later
      * event carries the announced id. Task #103's rule (VAULT_OPENED_EVENT, rules 1-3): an `index://status`
@@ -91,6 +125,7 @@ export const useVaultStore = defineStore("vault", {
      * the editor buffer: #80, the only caller, must do that on `choose_vault` Err BEFORE calling this. */
     openFailed() {
       this.vaultOpen = false;
+      this.refusedNames = null; // no vault, nothing to count
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -114,10 +149,33 @@ export const useVaultStore = defineStore("vault", {
       this.vaultRoot = root;
     },
     setIndexState(state: IndexState) {
-      this.indexStatusText = describeIndexState(state);
+      const wasWaiting = this.indexStatusDetail !== null;
+      const text = describeIndexState(state);
+      const detail = describeIndexDetail(state);
+      if ((detail !== null && !wasWaiting) || (detail === null && wasWaiting)) {
+        this.indexAnnouncement = text; // entered or left: one snapshot
+        this.indexAnnouncementKind = state.kind;
+      } else if (detail === null && state.kind !== this.indexAnnouncementKind) {
+        // Cleared only on a change of kind, not on each progress event: a polite region can drop a
+        // snapshot that is wiped milliseconds after it is written (worst on WebKit).
+        this.indexAnnouncement = "";
+        this.indexAnnouncementKind = "";
+      }
+      this.indexStatusText = text;
+      this.indexStatusDetail = detail;
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;
+    },
+    /** One entry for an `index://status` event and the late-subscriber poll alike (architecture 3.4): the state
+     * text and the refused-names count, which is `null` when the status omits it (`None`: not counting yet, or
+     * no vault open; never zero, FR-VLT-01). */
+    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">, source: "event" | "poll") {
+      // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
+      if (source === "poll" && this.statusEventSeen) return;
+      if (source === "event") this.statusEventSeen = true;
+      this.setIndexState(status.state);
+      this.setRefusedNames(status.refused_names ?? null);
     },
     setOpenBuffer(note: string | null, baseHash: string | null) {
       this.openNote = note;

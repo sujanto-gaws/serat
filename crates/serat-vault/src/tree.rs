@@ -316,13 +316,20 @@ impl Inner {
             TreeOut::Complete { entries, source } => Some((*entries, *source)),
             _ => None,
         };
-        (self.sink)(out);
+        // Recorded BEFORE the sink runs, not after (task #141): the sink may write to the
+        // webview inline, the front end marks exactly once, and `mark_tree` rejects a mark
+        // whose `progress()` says the message was not sent yet. Recording after the sink
+        // returned left a window, however short, in which a mark for a batch the webview
+        // already holds was rejected and the cold start never got its trace. A mark can only
+        // come from a front end that received the message, which the sink hands over after
+        // this point, so recording first cannot accept a mark that was not earned.
         if root {
             self.progress.root_sent.store(true, Ordering::Release);
         }
         if let Some((entries, source)) = complete {
             self.progress.set_complete(entries, source);
         }
+        (self.sink)(out);
         if settled {
             self.progress.settled.store(true, Ordering::Release);
         }

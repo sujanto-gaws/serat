@@ -29,6 +29,7 @@
 //! having none, and the whole point of F-239 was a document disagreeing with
 //! itself undetected.
 
+pub mod conflict_markers;
 pub mod count_over_list;
 pub mod prd_join;
 pub mod table_structure;

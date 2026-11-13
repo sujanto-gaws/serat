@@ -1,8 +1,18 @@
 # Source files allowed to name a socket or network-client API (NFR-SEC-01, T-04).
 # One `workspace-relative/path.rs:pattern` per line, then a `#` reason on the line above it.
-# No file under crates/, bench/ or contracts/ uses a socket; the one entry below is a name in a deny-list. Adding an entry is a
+# No shipped file under crates/, bench/ or contracts/ uses a socket; the entries below are a name in a deny-list and one bench-only example. Adding an entry is a
 # decision for the architect and code-reviewer, not a way to make the test pass.
 
 # serat-core's dependency-rule test spells "reqwest" in its own deny-lists and in synthetic
 # fixtures for the rule it enforces (strings naming a crate, not a use of it).
 crates/serat-core/tests/dependency_rule.rs:reqwest
+
+# The NFR-PRF-02 real-IPC arm's bridge (task #61). A bench-only example binary: built only by
+# `cargo build --example editor_ipc_bridge -p serat-app`, never part of the release binary or the
+# bundle. It serves loopback only (127.0.0.1, an OS-chosen port), requires a per-run random token,
+# checks the Host header and a loopback Origin, and refuses a vault root outside the temp directory.
+# One entry per pattern the scan names in that file.
+crates/serat-app/examples/editor_ipc_bridge.rs:std::net
+crates/serat-app/examples/editor_ipc_bridge.rs:TcpStream
+crates/serat-app/examples/editor_ipc_bridge.rs:TcpListener
+crates/serat-app/examples/editor_ipc_bridge.rs:net (braced import)
