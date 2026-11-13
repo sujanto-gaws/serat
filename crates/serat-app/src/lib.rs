@@ -971,20 +971,60 @@ mod tests {
         }
     }
 
-    /// Does `selector` name `token` as a whole selector token rather than as part of
-    /// a longer name? `.body-x` does not name `body`.
-    fn selector_names(selector: &str, token: &str) -> bool {
-        selector.match_indices(token).any(|(i, _)| {
-            let before_ok = selector[..i]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '#')));
-            let after_ok = selector[i + token.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')));
-            before_ok && after_ok
-        })
+    /// Selectors whose rules may declare `content` or an image function. **None
+    /// qualify today**, and that is the point: this is an allowlist like the markup
+    /// half, so widening it is a decision for ADR-0014's table.
+    const PAINT_ALLOWED_SELECTORS: [&str; 0] = [];
+
+    /// Image-bearing CSS functions. `url(` covers `background`, `@font-face` and
+    /// `@import`; the others reach an image without it.
+    const IMAGE_FUNCTIONS: [&str; 4] = ["url(", "image-set(", "cross-fade(", "element("];
+
+    /// The first way `css` could paint contentful pixels before `boot.js` runs, or
+    /// `None`. **An allowlist, not a bounded reach**: any `content` property and any
+    /// image function anywhere in the sheet is refused unless the innermost selector is
+    /// in [`PAINT_ALLOWED_SELECTORS`]. The earlier form tried to decide which selectors
+    /// reach an element that exists before scripts (`html`, `body`, `#app`) and missed
+    /// `:root`, type selectors that match the mount point (`div:before`), rules nested
+    /// in `@media`, and `image-set()`; each is a route to a contentful paint, and
+    /// enumerating the reaching selectors is the same decay `declares_content_property`
+    /// exists to avoid.
+    fn stylesheet_paint_violation(css: &str) -> Option<String> {
+        for rule in css.split('}') {
+            // The innermost selector: `@media(...){body:after{content:"x"` splits at
+            // the LAST `{`, so a nested rule is judged by its own selector.
+            let Some((before, declarations)) = rule.rsplit_once('{') else {
+                // No block: a bare at-rule such as `@import url(x.css);`.
+                let lower = rule.to_ascii_lowercase();
+                if let Some(f) = IMAGE_FUNCTIONS.iter().find(|f| lower.contains(*f)) {
+                    return Some(format!("a bare at-rule uses `{f}`: {}", rule.trim()));
+                }
+                continue;
+            };
+            let selector = before.rsplit(['{', ';']).next().unwrap_or(before).trim();
+            if PAINT_ALLOWED_SELECTORS.contains(&selector) {
+                continue;
+            }
+            if declares_content_property(&format!("{{{declarations}")) {
+                return Some(format!(
+                    "`{selector}` declares CSS generated content. Anything in the sheet \
+                     applies before `boot.js` runs, so this can paint before Vue mounts and \
+                     `first-contentful-paint` would measure it rather than our content \
+                     (#128, F-396(b)). `content: none` and `content: normal` are inert and \
+                     are refused too: permitting them is a widening decision for \
+                     ADR-0014's table."
+                ));
+            }
+            let lower = declarations.to_ascii_lowercase();
+            if let Some(f) = IMAGE_FUNCTIONS.iter().find(|f| lower.contains(*f)) {
+                return Some(format!(
+                    "`{selector}` uses `{f}`. An image is contentful paint, unlike a \
+                     background *colour*, so it would make `first-contentful-paint` measure \
+                     the image rather than our content (#128, F-396(b))."
+                ));
+            }
+        }
+        None
     }
 
     /// Does `declarations` declare `content` as a **property**?
@@ -1101,10 +1141,10 @@ mod tests {
         // mount point, so the markup half alone cannot see it. That is the cheapest
         // remaining route and the one a designer takes innocently.
         //
-        // BOUNDED, not a CSS parser. Generated content or a background image can only
-        // paint pre-script on an element that *exists* pre-script, and there are three
-        // -- `html`, `body`, `#app` -- plus the universal selector. Rules touching
-        // anything else cannot paint until Vue has created what they select.
+        // AN ALLOWLIST, like the markup half (see `stylesheet_paint_violation`): the
+        // stylesheet applies before scripts, so any `content` property or image
+        // function anywhere in it is refused. An earlier bounded-reach form ("only
+        // html, body, #app") missed four routes and was replaced.
         //
         // A background *colour* is First Paint, not First *Contentful* Paint, so
         // `body{background:var(--paper)}` is correctly ignored: this looks for `url(`,
@@ -1115,35 +1155,44 @@ mod tests {
         let sheet = webview_bundle().join("shell.css");
         let css = std::fs::read_to_string(&sheet).expect("shell.css");
 
-        const PRE_SCRIPT: [&str; 3] = ["html", "body", "#app"];
-        for rule in css.split('}') {
-            let Some((selector, declarations)) = rule.split_once('{') else {
-                continue;
-            };
-            let reaches_pre_script = selector.contains('*')
-                || PRE_SCRIPT
-                    .iter()
-                    .any(|token| selector_names(selector, token));
-            if !reaches_pre_script {
-                continue;
-            }
+        if let Some(why) = stylesheet_paint_violation(&css) {
+            panic!("{why}");
+        }
+    }
+
+    #[test]
+    fn the_stylesheet_check_refuses_every_known_paint_before_scripts_form() {
+        // The mutants, as standing cases rather than hand-run ones (code-reviewer's
+        // four, each demonstrated green against the earlier bounded-reach form, plus
+        // #128's original). Each is appended to a clean sheet; the clean sheet and a
+        // background *colour* must stay green, so a check that refuses everything
+        // cannot pass this.
+        let clean = "body{background:var(--paper);color:var(--ink)}\
+                     .row{display:flex;justify-content:space-between;align-content:start}";
+        assert_eq!(stylesheet_paint_violation(clean), None);
+        for (mutant, name) in [
+            (r#"body::after{content:"x"}"#, "body::after (#128's mutant)"),
+            (r#":root:after{content:"x"}"#, ":root:after"),
+            (
+                r#"@media(min-width:1px){body:after{content:"x"}}"#,
+                "content nested in @media",
+            ),
+            (
+                r#"div:before{content:"x"}"#,
+                "div:before (matches the mount point)",
+            ),
+            (
+                r#"body{background:image-set("a.png" 1x)}"#,
+                "image-set() background",
+            ),
+            (r#"body{background:url(a.png)}"#, "url() background"),
+            (r#"@import url(a.css);"#, "bare @import url()"),
+            ("body:before{content:none}", "content: none is refused too"),
+        ] {
+            let sheet = format!("{clean}{mutant}");
             assert!(
-                !declares_content_property(declarations),
-                "`{}` declares CSS generated content on an element that exists \
-                 before `boot.js` runs, so it paints before Vue mounts and \
-                 `first-contentful-paint` would measure it rather than our content \
-                 (#128, F-396(b)). `content: none` and `content: normal` are inert \
-                 and are refused here anyway: permitting them is a widening decision \
-                 for ADR-0014's table, not one this test takes on its own.",
-                selector.trim()
-            );
-            assert!(
-                !declarations.contains("url("),
-                "`{}` sets a background image on an element that exists before \
-                 `boot.js` runs. An image is contentful paint, unlike a background \
-                 *colour*, so it would make `first-contentful-paint` measure the \
-                 image rather than our content (#128, F-396(b)).",
-                selector.trim()
+                stylesheet_paint_violation(&sheet).is_some(),
+                "the stylesheet check let `{name}` through: {mutant}"
             );
         }
     }
