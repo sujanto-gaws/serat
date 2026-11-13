@@ -137,16 +137,16 @@ describe("App: refused-names count", () => {
     await flushPromises();
     const main = wrapper.get("main.workspace");
     expect(main.attributes("tabindex")).toBeUndefined();
+    // Force the body-focus case: a tree that cannot take focus (no tabindex), so the fallback reaches the workspace.
+    wrapper.get('[role="tree"]').element.removeAttribute("tabindex");
     (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.activeElement).toBe(document.body);
     wrapper.findComponent({ name: "RefusedNames" }).vm.$emit("focus-fallback");
     await flushPromises();
-    // the tree takes focus when it can; force the body case to reach the workspace fallback
-    if (document.activeElement === main.element) {
-      expect(main.attributes("tabindex")).toBe("-1");
-      (main.element as HTMLElement).blur();
-      expect(main.attributes("tabindex")).toBeUndefined();
-    }
-    expect(main.attributes("tabindex") === undefined || document.activeElement === main.element).toBe(true);
+    expect(main.attributes("tabindex")).toBe("-1");
+    expect(document.activeElement).toBe(main.element);
+    (main.element as HTMLElement).blur();
+    expect(main.attributes("tabindex")).toBeUndefined();
     wrapper.unmount();
   });
 });
