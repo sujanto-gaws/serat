@@ -21,5 +21,10 @@ winapi-util = "0.1"
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[features]
+# Test seams other crates need (`Vault::with_platform`). Enabled only from
+# dev-dependencies; serat-app asserts it is absent from a release build.
+test-hooks = []
+
 [lints]
 workspace = true
