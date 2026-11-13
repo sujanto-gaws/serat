@@ -624,7 +624,7 @@ Cloud clients leave files on disk without their bytes: OneDrive placeholders (`R
 
 **P1 is an interim.** Background work may download, and RISK-015 records the consequences: a rebuild over an online-only vault is network-bound, and the watcher can re-download a file the user has freed. Two pieces ship in P1:
 - a failed or interrupted read is an error, never zero bytes;
-- the pure predicate `serat_core::locality::is_local`, with unit tests.
+- `serat_core::locality`: the pure predicates `is_local_attrs` (Windows) and `is_local_flags` (macOS), and `is_local(&Metadata) -> Option<bool>`, which is `None` on Linux (A-09), with unit tests.
 
 **P2 (Must) applies one rule: only an explicit open of one file by the user downloads it.**
 - **Detection reuses a stat a path already pays for.** FR-VLT-01's no-index tree arm takes no stat, so it reports `local` as unknown until the rebuild's walk reaches the file. `Vault::resolve` returns the final component's metadata for `read`, `stat` and the scheme to reuse.
