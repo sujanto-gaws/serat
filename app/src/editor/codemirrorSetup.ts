@@ -16,7 +16,11 @@ import { acceptCompletion, closeCompletion, moveCompletionSelection, startComple
 import type { Extension } from "@codemirror/state";
 import { EditorView, keymap, scrollPastEnd, type KeyBinding } from "@codemirror/view";
 
-import { chordParts, CommandRegistry, type CommandId } from "@/editor/commands";
+import { CommandRegistry, detectPlatform, normaliseChord, chordParts, type CommandId, type EditorPlatform } from "@/editor/commands";
+
+// Re-exported: the platform type, its sniff and the one chord canonicaliser live in commands.ts, next to the
+// registry that compares chords with them.
+export { detectPlatform, normaliseChord, type EditorPlatform };
 import { deleteMarkupBackward, insertNewlineContinueMarkup } from "@/editor/markdownLanguage";
 
 export interface EditorCommandHandlers {
@@ -114,43 +118,6 @@ export function passthroughName(key: string, platform: EditorPlatform, shift: bo
   return `${name} (extending selection)`;
 }
 
-const MODIFIER_ALIASES: Record<string, string> = {
-  ctrl: "ctrl",
-  control: "ctrl",
-  c: "ctrl",
-  alt: "alt",
-  option: "alt",
-  a: "alt",
-  shift: "shift",
-  s: "shift",
-  meta: "meta",
-  cmd: "meta",
-  command: "meta",
-  m: "meta",
-};
-
-/**
- * A chord in the one form every spelling CodeMirror treats as the same chord shares: `Mod` is the platform
- * modifier (Cmd on mac, Ctrl elsewhere), `Cmd`/`Meta`/`Control`/`Option` and CodeMirror's one-letter
- * modifier aliases fold to one name, modifier order is irrelevant, and a single uppercase letter means
- * Shift (`Mod-Z` is `Mod-Shift-z`; `Ctrl-a` and `Ctrl-A` stay distinct, as in CodeMirror).
- */
-export function normaliseChord(binding: string, platform: EditorPlatform): string {
-  const parts = chordParts(binding);
-  let key = parts.pop() ?? "";
-  const mods = new Set(
-    parts.map((part) => {
-      const lower = part.toLowerCase();
-      return lower === "mod" ? (platform === "mac" ? "meta" : "ctrl") : (MODIFIER_ALIASES[lower] ?? lower);
-    }),
-  );
-  if (key.length === 1 && key !== key.toLowerCase()) {
-    mods.add("shift");
-    key = key.toLowerCase();
-  }
-  return [...[...mods].sort(), key].join("-");
-}
-
 /** The literal spelling with modifiers lowercased and sorted and the key as written: how two CodeMirror
  * keymap entries are told apart from each other (the upstream mac pair `Ctrl-A` and `Shift-Ctrl-a` are
  * two registered commands today, and stay so). */
@@ -210,6 +177,7 @@ function registerPassthrough(
         name: passthroughName(key, platform, false),
         defaultBinding: key,
         when: "editor",
+        fallthrough: true,
         // CodeMirror's own default (false): a key the command declines
         // stays native.
         preventDefault: binding.preventDefault ?? false,
@@ -229,22 +197,13 @@ function registerPassthrough(
           name: passthroughName(key, platform, true),
           defaultBinding: shiftKey,
           when: "editor",
+          fallthrough: true,
           preventDefault: binding.preventDefault ?? false,
           run: (view) => shiftRun(view),
         });
       }
     }
   });
-}
-
-export type EditorPlatform = "mac" | "win" | "linux";
-
-/** The same sniff CodeMirror itself uses for its platform key choice. */
-export function detectPlatform(): EditorPlatform {
-  const platform = typeof navigator === "undefined" ? "" : navigator.platform ?? "";
-  if (/Mac|iPhone|iPad/.test(platform)) return "mac";
-  if (/Win/.test(platform)) return "win";
-  return "linux";
 }
 
 /**
@@ -256,12 +215,19 @@ export function detectPlatform(): EditorPlatform {
  */
 export function createEditorCommandRegistry(
   handlers: EditorCommandHandlers,
-  platform: EditorPlatform = detectPlatform(),
+  platformArg?: EditorPlatform,
   /** The app-wide registry to add to (the palette lists it); a fresh one when omitted. */
-  registry: CommandRegistry = new CommandRegistry(),
+  registryArg?: CommandRegistry,
   /** @internal test seam: replaces a named command's default binding, so the passthrough skip-set can be shown to follow it. */
   namedBindings: Readonly<Record<string, string>> = {},
 ): CommandRegistry {
+  // The registry compares chords on its own platform and this function chooses CodeMirror's keys for
+  // `platform`: they must be the same one. Omitted, each defaults to the other (then to the sniffed one).
+  const platform = platformArg ?? registryArg?.platform ?? detectPlatform();
+  const registry = registryArg ?? new CommandRegistry(platform);
+  if (registry.platform !== platform) {
+    throw new Error(`createEditorCommandRegistry: the registry's platform (${registry.platform}) is not ${platform}`);
+  }
   const bind = (id: string, fallback: string): string => namedBindings[id] ?? fallback;
   const preexisting = new Set(registry.list().map((c) => c.id));
 
