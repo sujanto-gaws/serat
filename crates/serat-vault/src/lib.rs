@@ -441,7 +441,9 @@ impl Vault {
     /// [`Vault::read_hooked`] reading through `wrap(file)`, so a test can hand the read
     /// a reader that fails part-way. Any read error is returned as [`VaultError::Io`],
     /// never as the bytes read so far (ADR-0018 §1: a prefix hashed and patched would
-    /// truncate the note).
+    /// truncate the note). A reader that hits EOF early (the file shrank after the stat)
+    /// returns fewer bytes than `stat.len()`; that is `Ok`, and the hash or mtime check
+    /// catches the change.
     fn read_via<R: std::io::Read>(
         &self,
         path: &VaultPath,

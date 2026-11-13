@@ -391,6 +391,9 @@ fn write_patch_returns_the_mtime_the_bytes_had_at_the_rename_not_a_later_rewrite
 
 /// A reader that yields `good` bytes of `inner` and then fails, as a dropped network
 /// mount or a cloud client that cannot finish a download does.
+///
+/// Deliberately never fails with `ErrorKind::Interrupted`: `read_to_end` retries that
+/// kind, so it would not surface as an error.
 struct FailsAfter {
     inner: fs::File,
     good: usize,
