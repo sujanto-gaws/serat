@@ -592,7 +592,11 @@ impl Startup {
         })?;
         let buffer = marks.buffer_rendered.ok_or(TraceIncomplete {
             missing: "vault_usable",
-            because: "the webview never reported the buffer rendered.",
+            because: "the webview never reported the buffer rendered. The buffer is no \
+                      longer a term of vault_usable (the tree's first screen replaced it, \
+                      ADR-0015 section 5), but the trace still records it and the shell \
+                      reports it through mark_vault_usable, so its absence means that \
+                      call never arrived.",
         })?;
         let tree_first_screen = marks.tree_first_screen.ok_or(TraceIncomplete {
             missing: "vault_usable",
