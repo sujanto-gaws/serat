@@ -177,6 +177,16 @@ pub struct OpenVaultArgs {
     pub root: String,
 }
 
+// `choose_vault() -> Result<Option<VaultOpened>, IpcError>` (task #151, US-01; takes no
+// arguments, so it has no type of its own).
+//
+// Shows the native folder dialog and opens the folder the user picks. **The webview never
+// sends a path**: the dialog is shown by `serat-app` and no `dialog:*` permission is granted
+// to the webview, which is what lets `open_vault` stay withheld (ADR-0012). `Ok(None)` is a
+// cancelled dialog and changes nothing. `Ok(Some(_))` is the same [`VaultOpened`] that
+// [`VAULT_OPENED_EVENT`] carries, after the previous vault was flushed and closed; `Err` is
+// as for `open_vault`, and the event can precede it (see [`VaultOpened::vault_id`]).
+
 /// A vault is open. Everything else is still arriving.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]

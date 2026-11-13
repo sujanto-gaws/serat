@@ -815,8 +815,12 @@ impl Drop for ExitFlag {
 /// rather than `.serat` because `.serat` may not exist yet when an actor is registered.
 /// Fired entries are pruned on every `register`, `live` and `live_count`.
 ///
-/// **Limits.** The registry is per process: nothing stops a second *Serat process* from
-/// opening the same vault, and no single-instance lock exists. If a platform cannot give
+/// **Limits.** The registry is per `AppState` (each owns one unless `with_detached` shares
+/// it), not per process, so a second `AppState` in the same process does not see what the
+/// first detached. A second *Serat process* (or a second open in this one) is stopped by the cross-process
+/// writer lock, `serat_index::lock` (task #154), which refuses it with
+/// `IndexError::HeldByAnotherProcess`; this registry is what supplies the wait for a
+/// detached actor to finish. If a platform cannot give
 /// an identity, the actor is not recorded and a log line says so.
 #[derive(Debug, Default)]
 pub struct DetachedWriters {

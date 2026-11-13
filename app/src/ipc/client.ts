@@ -142,6 +142,15 @@ export function declineGitignoreOffer(): Promise<void> {
   return invoke("decline_gitignore_offer");
 }
 
+/**
+ * `choose_vault`: shows the native folder dialog and opens what the user picks (US-01). The
+ * webview sends no path. `null` is a cancelled dialog and changes nothing; a chosen folder
+ * answers with the same `VaultOpened` that `vault://opened` carries.
+ */
+export function chooseVault(): Promise<VaultOpened | null> {
+  return invoke("choose_vault");
+}
+
 /** `asset_info`: MIME, size and sidecar of a vault file (FR-BIN-01; ADR-0017). */
 export function assetInfo(args: AssetArgs): Promise<AssetInfo> {
   return invoke("asset_info", { args });
