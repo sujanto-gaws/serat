@@ -71,6 +71,8 @@ describe("derived seenKeys", () => {
     // applied against the named set only
     const ids = createEditorCommandRegistry(handlers, "mac").list().map((c) => c.defaultBinding);
     expect(ids).toContain("Ctrl-a");
+    expect(ids).toContain("Ctrl-A");
+    expect(ids).toContain("Shift-Ctrl-a");
   });
 
   it.each(["mac", "win", "linux"] as const)("%s: the named set is exactly the 13 named defaults, and no passthrough shares a chord with one", (platform) => {
