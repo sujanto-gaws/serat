@@ -575,7 +575,18 @@ function onSaveOutcome(outcome: SaveOutcome): void {
   <CommandPalette v-if="paletteOpen" :registry="commands" @run="onPaletteRun" @close="paletteOpen = false" />
 
   <footer class="statusbar">
-    <span class="index">{{ store.indexStatusText }}</span>
+    <!-- title: hover (and the full text when the strip ellipsises). aria-describedby: the accessible description
+         (aria-description is ARIA 1.3 draft with uneven support, WebKitGTK worst; index-state-copy.md). -->
+    <span
+      class="index"
+      :title="store.indexStatusDetail ?? store.indexStatusText"
+      :aria-describedby="store.indexStatusDetail !== null ? 'index-state-detail' : undefined"
+      data-testid="index-state"
+      >{{ store.indexStatusText }}</span
+    >
+    <span v-if="store.indexStatusDetail !== null" id="index-state-detail" class="sr-only">{{ store.indexStatusDetail }}</span>
+    <!-- One-shot snapshot on entering and on leaving the waiting state (index-state-copy.md: announced once). -->
+    <span class="sr-only" role="status" aria-live="polite" data-testid="index-live">{{ store.indexAnnouncement }}</span>
     <RefusedNames ref="refusedRef" :count="store.refusedNames" @focus-fallback="focusAfterRefused" />
     <span v-if="updatedExternally" class="updated-externally" data-testid="updated-externally">Updated externally</span>
     <span v-if="saveBlocked" class="save-blocked" data-testid="save-blocked">
