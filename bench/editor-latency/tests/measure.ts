@@ -403,6 +403,15 @@ export interface RunOptions {
   checkTextGrowth?: boolean;
   /** The on-time bar the INDETERMINATE rule is judged against (default 0.99). */
   bar?: number;
+  /** The key pressed for every keystroke (default "x"). "Enter" and "Backspace" are handled by CodeMirror's own
+   * keydown keymap, which prevents the default action, so no native `input` event follows: pass
+   * `expectInputs: false` for them (the per-key invariants still demand the keydown entry). */
+  key?: string;
+  /** Require one trusted `input` event per keystroke (default true: typed characters). */
+  expectInputs?: boolean;
+  /** After every `every` keystrokes wait `ms` more (typing in bursts): the editor's debounced save then fires between
+   * bursts and its reply lands inside the next burst's keys, which are scored like any other. */
+  burst?: { every: number; ms: number };
 }
 
 /**
@@ -429,8 +438,9 @@ export async function runKeystrokes(
   const textBefore = opts.checkTextGrowth ? ((await target.textContent()) ?? "").length : 0;
   const R = await page.evaluate(() => (window as any).__seratCapture.R as number);
   for (let i = 0; i < count; i++) {
-    await page.keyboard.press("x");
+    await page.keyboard.press(opts.key ?? "x");
     await new Promise((r) => setTimeout(r, interval + next() * R));
+    if (opts.burst && (i + 1) % opts.burst.every === 0) await new Promise((r) => setTimeout(r, opts.burst!.ms));
   }
   // Let the last frames present and Event Timing deliver, then flush the observer.
   await new Promise((r) => setTimeout(r, 500));
@@ -451,7 +461,7 @@ export async function runKeystrokes(
     },
     { keys0: before.keys, inputs0: before.inputs, bar: opts.bar ?? 0.99 },
   );
-  if (result.keydowns !== count || result.inputs !== count) {
+  if (result.keydowns !== count || (opts.expectInputs !== false && result.inputs !== count)) {
     throw new Error(
       `${count} keystrokes were sent but the page saw ${result.keydowns} trusted keydown and ` +
         `${result.inputs} input events: the keystrokes did not all reach the editor, so the run measures nothing`,
