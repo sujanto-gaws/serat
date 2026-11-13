@@ -59,6 +59,9 @@ pub struct IndexHandle {
     actor: IndexActor,
     index_dir: PathBuf,
     after_unclean_shutdown: bool,
+    /// The cross-process writer lock (task #154). Declared last so it is released after
+    /// the actor has stopped and closed its connection.
+    _lock: crate::lock::IndexLock,
 }
 
 impl IndexHandle {
@@ -66,7 +69,8 @@ impl IndexHandle {
     ///
     /// # Errors
     ///
-    /// [`IndexError::Sqlite`] if the database cannot be opened or created.
+    /// [`IndexError::Sqlite`] if the database cannot be opened or created;
+    /// [`IndexError::HeldByAnotherProcess`] if another writer holds the index (task #154).
     pub fn open(index_dir: &Path) -> Result<Self, IndexError> {
         Self::with_queue_depth(index_dir, DEFAULT_QUEUE_DEPTH)
     }
@@ -77,6 +81,17 @@ impl IndexHandle {
     ///
     /// As [`IndexHandle::open`].
     pub fn with_queue_depth(index_dir: &Path, queue_depth: usize) -> Result<Self, IndexError> {
+        let lock = crate::lock::IndexLock::acquire(index_dir)?;
+        Self::open_locked(index_dir, queue_depth, lock)
+    }
+
+    /// Open with the writer lock already held, so `open_or_rebuild` and
+    /// `rebuild_in_place` keep one lock across their rebuild and this open.
+    pub(crate) fn open_locked(
+        index_dir: &Path,
+        queue_depth: usize,
+        lock: crate::lock::IndexLock,
+    ) -> Result<Self, IndexError> {
         let path = crate::index_path(index_dir);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| IndexError::Corrupt {
@@ -90,6 +105,7 @@ impl IndexHandle {
             actor: IndexActor::with_capacity(conn, queue_depth),
             index_dir: index_dir.to_path_buf(),
             after_unclean_shutdown,
+            _lock: lock,
         })
     }
 
@@ -304,12 +320,27 @@ impl IndexHandle {
         vault_root: &Path,
     ) -> Result<(Self, crate::RebuildReport), IndexError> {
         let Self {
-            actor, index_dir, ..
+            actor,
+            index_dir,
+            _lock: lock,
+            ..
         } = self;
         actor.shutdown()?;
         release();
-        let report = crate::rebuild(source, parser, vault_root, &index_dir)?;
-        Ok((Self::open(&index_dir)?, report))
+        // The lock this handle held is kept across the rebuild and passed to the new
+        // handle, so no other process can slip in between (task #154).
+        let report = crate::rebuild::rebuild_locked(
+            source,
+            parser,
+            vault_root,
+            &index_dir,
+            DEFAULT_QUEUE_DEPTH,
+            &lock,
+        )?;
+        Ok((
+            Self::open_locked(&index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+            report,
+        ))
     }
 
     /// Close the index cleanly: apply anything queued, checkpoint, and set the

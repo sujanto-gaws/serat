@@ -587,6 +587,18 @@ impl IndexOpen for SeratIndexOpen {
                     path: index_dir.display().to_string(),
                 }),
             },
+            // Task #154: another Serat process (or a benchmark run) holds this vault's
+            // index writer lock. Its own sentence, because the user can act on it.
+            Err(serat_core::IndexError::HeldByAnotherProcess { .. }) => {
+                publish(IndexState::Unavailable {
+                    message: "another Serat window or process already has this vault's index \
+                              open. Search and queries are unavailable in this one; the vault \
+                              remains fully editable. Close the other one and reopen the vault \
+                              to use the index here."
+                        .to_owned(),
+                    path: index_dir.display().to_string(),
+                });
+            }
             Err(err) => publish(IndexState::Unavailable {
                 message: format!(
                     "the index could not be opened or rebuilt: {err}. Search and queries \

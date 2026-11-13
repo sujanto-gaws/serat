@@ -128,6 +128,23 @@ pub fn rebuild_with_queue_depth(
     index_dir: &Path,
     queue_depth: usize,
 ) -> Result<RebuildReport, IndexError> {
+    // Task #154: the writer lock first, before any file is touched, so a rebuild can
+    // never delete the files a writer in another process has mapped.
+    let lock = crate::lock::IndexLock::acquire(index_dir)?;
+    rebuild_locked(source, parser, vault_root, index_dir, queue_depth, &lock)
+}
+
+/// [`rebuild_with_queue_depth`] for a caller that already holds the index's writer lock
+/// (`open_or_rebuild`, `IndexHandle::rebuild_in_place`), which keeps it across the
+/// rebuild and the open of the handle that follows.
+pub(crate) fn rebuild_locked(
+    source: &dyn NoteSource,
+    parser: &dyn NoteParser,
+    vault_root: &Path,
+    index_dir: &Path,
+    queue_depth: usize,
+    _lock: &crate::lock::IndexLock,
+) -> Result<RebuildReport, IndexError> {
     let path = index_path(index_dir);
 
     // ADR-0002: there is no repair, so an existing index is removed rather than

@@ -215,6 +215,19 @@ pub enum IndexError {
         message: String,
     },
 
+    /// Another process, or another open in this one, holds the index's writer lock.
+    ///
+    /// Task #154. One writer per vault (ADR-0001) is enforced across processes by an
+    /// advisory lock on `.serat/index.lock`; a second Serat instance, or a benchmark run
+    /// beside the app, is refused here rather than allowed to rebuild the files under
+    /// the first one's `-shm` mapping (a SIGBUS). The caller reports the index as
+    /// unavailable for this session; the vault itself stays editable.
+    #[error("another process holds the index writer lock ({path})")]
+    HeldByAnotherProcess {
+        /// The lock file.
+        path: String,
+    },
+
     /// The writer thread is gone, so no further writes can be accepted.
     ///
     /// Under ADR-0001 this is the only way a write fails for a reason that is not

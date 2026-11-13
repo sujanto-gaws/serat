@@ -11,6 +11,10 @@
 //! partially indexed vault and a passing budget. What runs is now what is
 //! tested, and this file has nothing left to get wrong.
 //!
+//! `rebuild()` takes the index's cross-process writer lock first (task #154: one `open`
+//! and one `flock` on `.serat/index.lock`), so this job must not run beside an app
+//! that has the same vault open: it is refused with `HeldByAnotherProcess`.
+//!
 //! ```text
 //! cargo run --release -p budget --bin prf04-full-rebuild -- --profile reference
 //! ```

@@ -55,7 +55,7 @@ Each budget carries an `interval` string saying exactly what is timed, printed i
 | NFR-PRF-01 window visible | process spawn to the first **composited frame** of the shell (architecture §3.4 row 1) |
 | NFR-PRF-01 vault usable | process spawn to the latest of: first paint, the tree's first screen (root listing applied and painted, ADR-0015 §3, from P1 task #141; P0 used the last-open buffer), index settled, watcher settled (§3.4 row 2) |
 | NFR-PRF-03 | `apply()` submitted through `flush()` returning — Serat's own save path, no watcher, no debounce |
-| NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run |
+| NFR-PRF-04 | entry to `rebuild()` until it returns, writer drained and `ANALYZE` run Since task #154 `rebuild()` first takes the index's cross-process writer lock (`.serat/index.lock`: one `open` and one `flock`, microseconds, once per rebuild), and every index open does the same (the open-time and catch-up benches). Inside the interval, below any measurable share; the lock is why a bench run beside a running app on the same vault is now refused with `HeldByAnotherProcess` rather than rebuilt under it. |
 
 **F-10 and NFR-PRF-04: the aggregate is asserted, the breakdown is recorded.** NFR-PRF-04 is a wall-clock requirement and the budget still asserts one number. But one number cannot answer architecture.md's **open design question 1** — *does the parse pool or the index writer dominate rebuild time?* — and §1.2 says the parse pool exists precisely because that assumption is unmeasured. Reported as a single figure, "the index writer dominates" and "reading 39.4 MiB off disk dominates" are indistinguishable, and they imply completely different fixes.
 
