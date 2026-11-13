@@ -101,12 +101,14 @@ const TAURI_STUB = `
         if (window.__SERAT_IPC_BRIDGE__ && cmd.indexOf("plugin:") !== 0) {
           return fetch(window.__SERAT_IPC_BRIDGE__ + "/invoke/" + cmd, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", "x-serat-bridge-token": window.__SERAT_IPC_BRIDGE_TOKEN__ || "" },
             body: JSON.stringify(payload || {}),
           })
             .then(function (r) { return r.json(); })
             .then(function (v) { return v && v.__error ? Promise.reject(v.__error) : v; });
         }
+        // NOTE (task #61): without a bridge, save_patch answers a fake success, so subject-arm figures from before
+        // #61 (where it answered null) are not strictly comparable with figures from after it.
         if (cmd === "save_patch") {
           var a = (payload && payload.args) || {};
           return Promise.resolve({ path: a.path || "", hash: "stub-hash-" + (++cbs), mtime_ms: 0, bytes: 0 });
@@ -132,6 +134,8 @@ export interface OpenOptions {
   uiSettings?: { live_preview: boolean; keybindings: unknown[] };
   /** Base URL of the editor_ipc_bridge example: every IPC command is answered by a real `serat-app`. */
   ipcBridge?: string;
+  /** The per-run token the bridge printed on its READY line; sent as `x-serat-bridge-token`. */
+  ipcToken?: string;
   /** With a bridge: the note's vault path and its real content hash (from `read_file`). */
   note?: { path: string; hash: string };
 }
@@ -151,7 +155,7 @@ export async function openNoteForLatencyTest(page: Page, options: OpenOptions = 
     await page.addInitScript({ content: `window.__SERAT_STUB_UI_SETTINGS__ = ${JSON.stringify(options.uiSettings)};` });
   }
   if (options.ipcBridge) {
-    await page.addInitScript({ content: `window.__SERAT_IPC_BRIDGE__ = ${JSON.stringify(options.ipcBridge)};` });
+    await page.addInitScript({ content: `window.__SERAT_IPC_BRIDGE__ = ${JSON.stringify(options.ipcBridge)}; window.__SERAT_IPC_BRIDGE_TOKEN__ = ${JSON.stringify(options.ipcToken ?? "")};` });
   }
   await page.addInitScript({ content: TAURI_STUB });
   await page.goto(server.url);

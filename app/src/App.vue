@@ -418,6 +418,9 @@ onMounted(async () => {
     store.adoptFromIndexStatus(status.vault_id);
     if (!store.statusBelongsHere(status.vault_id)) return;
     store.setIndexState(status.state);
+    // The poll carries the count like the event does (task #35).
+    const refused = (status as { refused_names?: number }).refused_names;
+    if (typeof refused === "number") store.setRefusedNames(refused);
   });
 
   if (editorRef.value) {

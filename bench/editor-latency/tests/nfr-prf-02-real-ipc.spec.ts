@@ -47,7 +47,7 @@ function bridgePath(): string {
   return process.env.SERAT_IPC_BRIDGE ?? path.join(target, "debug", "examples", "editor_ipc_bridge");
 }
 
-interface Bridge { url: string; vault: string; stop: () => Promise<void> }
+interface Bridge { url: string; token: string; vault: string; stop: () => Promise<void> }
 
 async function startBridge(): Promise<Bridge> {
   const exe = bridgePath();
@@ -57,18 +57,19 @@ async function startBridge(): Promise<Bridge> {
   const vault = fs.mkdtempSync(path.join(os.tmpdir(), "serat-prf02-vault-"));
   fs.writeFileSync(path.join(vault, NOTE), TEXT);
   const child: ChildProcess = spawn(exe, [vault], { stdio: ["pipe", "pipe", "inherit"] });
-  const port = await new Promise<number>((resolve, reject) => {
+  const ready = await new Promise<{ port: number; token: string }>((resolve, reject) => {
     let buf = "";
     const timer = setTimeout(() => reject(new Error("the IPC bridge did not print READY within 90 s")), 90_000);
     child.stdout!.on("data", (d) => {
       buf += String(d);
-      const m = /READY (\d+)/.exec(buf);
-      if (m) { clearTimeout(timer); resolve(Number(m[1])); }
+      const m = /READY (\d+) ([0-9a-f]+)/.exec(buf);
+      if (m) { clearTimeout(timer); resolve({ port: Number(m[1]), token: m[2] }); }
     });
     child.once("exit", (code) => reject(new Error(`the IPC bridge exited early (${code})`)));
   });
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://127.0.0.1:${ready.port}`,
+    token: ready.token,
     vault,
     stop: async () => {
       child.stdin!.end();
@@ -79,7 +80,7 @@ async function startBridge(): Promise<Bridge> {
 }
 
 async function invoke<T>(bridge: Bridge, command: string, args: unknown): Promise<T> {
-  const r = await fetch(`${bridge.url}/invoke/${command}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ args }) });
+  const r = await fetch(`${bridge.url}/invoke/${command}`, { method: "POST", headers: { "content-type": "application/json", "x-serat-bridge-token": bridge.token }, body: JSON.stringify({ args }) });
   const v = (await r.json()) as { __error?: unknown } & T;
   if (v && (v as { __error?: unknown }).__error) throw new Error(`${command}: ${JSON.stringify((v as { __error: unknown }).__error)}`);
   return v;
@@ -110,7 +111,7 @@ for (const arm of ["stub", "real"] as const) {
           note = { path: NOTE, hash: read.hash };
         }
         // One fresh document per cadence (the init scripts re-run on reload); the first cadence reuses the first load.
-        const subject = await openNoteForLatencyTest(page, { text: TEXT, ipcBridge: bridge?.url, note });
+        const subject = await openNoteForLatencyTest(page, { text: TEXT, ipcBridge: bridge?.url, ipcToken: bridge?.token, note });
         opened = true;
         const { refreshIntervalMs } = await installCapture(page);
         rs.push(refreshIntervalMs);
@@ -127,13 +128,17 @@ for (const arm of ["stub", "real"] as const) {
         let ipcNote = "IPC answered instantly by the stub";
         if (bridge) {
           // The real saves must have landed: the note on disk is the fixture plus exactly the typed characters.
-          let onDisk = -1;
-          for (let i = 0; i < 30 && onDisk !== TEXT.length + SUBJECT_KEYS; i++) {
+          // Content, not length: the fixture with exactly the typed characters inserted at the caret offset
+          // (the end of the chosen paragraph line, in UTF-16 units as the editor counts them).
+          const caretOffset = LINES.slice(0, at).reduce((n, l) => n + l.length + 1, 0) + LINES[at].length;
+          const expected = TEXT.slice(0, caretOffset) + "x".repeat(SUBJECT_KEYS) + TEXT.slice(caretOffset);
+          let onDisk = "";
+          for (let i = 0; i < 30 && onDisk !== expected; i++) {
             await new Promise((r) => setTimeout(r, 200));
-            onDisk = (await invoke<{ text: string }>(bridge, "read_file", { path: NOTE })).text.length;
+            onDisk = (await invoke<{ text: string }>(bridge, "read_file", { path: NOTE })).text;
           }
-          expect(onDisk, "the real save_patch calls left the note as the fixture plus the typed characters").toBe(TEXT.length + SUBJECT_KEYS);
-          const stats = (await (await fetch(`${bridge.url}/stats`)).json()) as Record<string, { count: number; p50_ms: number; p95_ms: number; max_ms: number }>;
+          expect(onDisk === expected, "the real save_patch calls left the note as the fixture with the typed characters inserted at the caret").toBe(true);
+          const stats = (await (await fetch(`${bridge.url}/stats`, { headers: { "x-serat-bridge-token": bridge.token } })).json()) as Record<string, { count: number; p50_ms: number; p95_ms: number; max_ms: number }>;
           const sp = stats["save_patch"];
           expect(sp?.count ?? 0, "saves went through the bridge during the run").toBeGreaterThanOrEqual(10);
           ipcNote = `REAL serat-app over loopback; bridge-side ms per command: ${Object.entries(stats).map(([c, s]) => `${c} n=${s.count} p50=${s.p50_ms.toFixed(1)} p95=${s.p95_ms.toFixed(1)} max=${s.max_ms.toFixed(1)}`).join(", ")}`;

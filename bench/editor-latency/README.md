@@ -27,6 +27,10 @@ Rule E0 (header of `tests/measure.ts`; selected empirically from `record/`): for
 
 **Coverage (task #61).** Subject: 3 of the 8 §9.3 scenarios (start, middle, end typing). Scenarios: the other five and the two fixture variants. Real-IPC: the save/index round trip through a real `serat-app`. **Still not covered:** the real Tauri transport between the webview and Rust (WebView2's message channel and the custom-protocol serialisation are not in any figure), WebView2 itself (headless Chromium is the same engine, not the same process or compositor), and the reference machine. A PASS here is not a PASS of NFR-PRF-02 until that run exists; every line says so.
 
+**Comparability.** The stub's `save_patch` now answers a plausible `FileWritten` (a fake success) instead of `null`, so subject-arm figures from before task #61 and after it are not strictly comparable: a save that fires while typing now takes the editor's success path.
+
+**The IPC bridge is a write-capable server and is locked down** (task #61 review): a per-run random token printed on its READY line and required in `x-serat-bridge-token`; the `Host` header must be `127.0.0.1:<port>`; CORS only for a loopback `http://127.0.0.1:<port>` origin, never `*`; and the vault root must be inside the system temp directory.
+
 **Known harness limits.** Keys that CodeMirror handles in its own `keydown` keymap (Enter, Backspace) raise no native `input` event, so those scenarios run with `expectInputs: false`; the per-key invariants still demand the keydown entry. The Backspace scenario grows a bold span to 520 characters first (unmeasured), steps over the closing `**`, and measures 500 Backspaces: the first two cross the delimiter, the rest delete inside what is then plain text. Re-opening the same note path through `__seratBenchOpenNote` does not reset the buffer, so a cadence that mutates the text reloads the page.
 
 ## Run it

@@ -6,7 +6,7 @@ Serat is a local-first, Obsidian-alternative knowledge app (Tauri v2 + Vue 3, pl
 |---|---|---|
 | 01 Planning | Project charter + risk register (restructured from the Serat Blueprint v0.1) | docs/01-planning/project-charter.md, docs/01-planning/risk-register.md |
 | 02 Requirements | PRD (140 FR/NFR, traceability, glossary, assumptions) + user stories (42) — restructured from Requirements Baseline 1.0 | docs/02-requirements/prd.md, docs/02-requirements/user-stories.md |
-| 03 Design | Architecture (SDD 1.0 restructured), threat model, seventeen ADRs from the decision register | docs/03-design/architecture.md, docs/03-design/threat-model.md, docs/03-design/adr/0001…0017 |
+| 03 Design | Architecture (SDD 1.0 restructured), threat model, eighteen ADRs from the decision register | docs/03-design/architecture.md, docs/03-design/threat-model.md, docs/03-design/adr/0001…0018 |
 | 03 Design / UI | Serat Identity — name, brand colours, typography | docs/03-design/ui/serat-identity.md |
 | 03 Design / UI | Index-state copy brief — what the status strip says while the index opens, waits or rebuilds (task #115) | docs/03-design/ui/index-state-copy.md |
 | 03 Design | Index DDL, runnable as delivered | schema/001_init.sql |

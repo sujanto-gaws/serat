@@ -58,6 +58,10 @@ Bridge-side time per command (cumulative over the two cadences of the real arm):
 
 **What the real arm does not include.** Tauri's own transport between the webview and the Rust process (WebView2's message channel, the custom-protocol serialisation). The bridge is a separate process on loopback. That cost is per call and small next to the 455 ms above, but it is not measured. It also cannot show what WebView2 does that headless Chromium does not.
 
+## Comparability note
+
+The stub's `save_patch` now returns a fake success (a plausible `FileWritten`) instead of `null`. Subject-arm figures taken before task #61 (#11, #60, #95) and after it are therefore not strictly comparable: a debounced save that fires during typing now takes the editor's success path. The bridge is additionally token-protected and temp-directory-only (review of #61), so a stray page cannot write through it.
+
 ## What would change these figures
 
 1. A quiet machine: the positive control at or above 99% in the same run, then the whole table re-taken (README: "do not read a red subject test as over budget unless the controls passed").

@@ -18,7 +18,14 @@
 //! `invoke(command, payload)` (`{"args": {...}}`); the answer is `200` with the command's
 //! result as JSON, or `200` with `{"__error": <IpcError>}`. `GET /stats` returns per-command
 //! counts and p50/p95/max milliseconds measured inside the bridge. On start the bridge prints
-//! one line, `READY <port>`, to stdout. It exits when stdin closes.
+//! one line, `READY <port> <token>`, to stdout. It exits when stdin closes.
+//!
+//! **It is a write-capable server and is locked down accordingly** (review of task #61):
+//! a random per-run token, printed only on the READY line, is required in the
+//! `x-serat-bridge-token` header of every request; the `Host` header must be the loopback
+//! address and port; CORS is answered only for a loopback `http://127.0.0.1:<port>` origin and
+//! never with `*`; and the vault root must be inside the system temp directory, so the bridge
+//! cannot be pointed at a real vault.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -128,10 +135,25 @@ fn stats_json(stats: &Stats) -> Value {
     Value::Object(out)
 }
 
-fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+/// A `http://127.0.0.1:<digits>` origin, the only kind the harness serves the bundle from.
+fn loopback_origin(origin: &str) -> bool {
+    origin
+        .strip_prefix("http://127.0.0.1:")
+        .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn respond(stream: &mut TcpStream, status: &str, body: &str, origin: Option<&str>) {
+    let cors = origin
+        .filter(|o| loopback_origin(o))
+        .map_or_else(String::new, |o| {
+            format!(
+                "Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n\
+             Access-Control-Allow-Headers: content-type, x-serat-bridge-token\r\n\
+             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            )
+        });
     let head = format!(
-        "HTTP/1.1 {status}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Type: application/json\r\n\
+        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
@@ -139,7 +161,7 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(body.as_bytes());
 }
 
-fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats) {
+fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats, token: &str, port: u16) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let Ok(clone) = stream.try_clone() else {
         return;
@@ -149,15 +171,30 @@ fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats) {
     if reader.read_line(&mut request_line).is_err() {
         return;
     }
-    let mut length = 0usize;
+    let (mut length, mut origin, mut host, mut presented) =
+        (0usize, None::<String>, String::new(), String::new());
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() || header == "\r\n" || header.is_empty() {
             break;
         }
-        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap_or(0);
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.parse().unwrap_or(0),
+            "origin" => origin = Some(value.to_owned()),
+            "host" => value.clone_into(&mut host),
+            "x-serat-bridge-token" => value.clone_into(&mut presented),
+            _ => {}
         }
+    }
+    let origin = origin.as_deref();
+    // DNS rebinding: a page on another name resolving to 127.0.0.1 still sends its own Host.
+    if host != format!("127.0.0.1:{port}") {
+        respond(&mut stream, "403 Forbidden", "{}", None);
+        return;
     }
     let mut body = vec![0u8; length];
     if reader.read_exact(&mut body).is_err() {
@@ -166,9 +203,21 @@ fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats) {
     let mut parts = request_line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     if method == "OPTIONS" {
-        respond(&mut stream, "204 No Content", "");
-    } else if method == "GET" && path == "/stats" {
-        respond(&mut stream, "200 OK", &stats_json(stats).to_string());
+        // The preflight carries no custom header by definition; it grants nothing but the origin check.
+        respond(&mut stream, "204 No Content", "", origin);
+        return;
+    }
+    if presented != token {
+        respond(&mut stream, "403 Forbidden", "{}", None);
+        return;
+    }
+    if method == "GET" && path == "/stats" {
+        respond(
+            &mut stream,
+            "200 OK",
+            &stats_json(stats).to_string(),
+            origin,
+        );
     } else if let (true, Some(command)) = (method == "POST", path.strip_prefix("/invoke/")) {
         let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let started = Instant::now();
@@ -180,16 +229,36 @@ fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats) {
             .entry(command.to_owned())
             .or_default()
             .push(ms);
-        respond(&mut stream, "200 OK", &result.to_string());
+        respond(&mut stream, "200 OK", &result.to_string(), origin);
     } else {
-        respond(&mut stream, "404 Not Found", "{}");
+        respond(&mut stream, "404 Not Found", "{}", origin);
     }
+}
+
+/// 128 random bits, hex: `RandomState` is keyed from the operating system's entropy per instance.
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let part = || {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    };
+    format!("{:016x}{:016x}", part(), part())
 }
 
 fn main() {
     let root = std::env::args()
         .nth(1)
-        .expect("usage: editor_ipc_bridge <vault directory>");
+        .expect("usage: editor_ipc_bridge <vault directory inside the temp directory>");
+    // A write-capable server must not be pointable at a real vault.
+    let canonical = std::fs::canonicalize(&root).expect("the vault directory exists");
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("the temp directory exists");
+    assert!(
+        canonical.starts_with(&temp) && canonical != temp,
+        "refusing {}: the bridge only opens a directory inside {}",
+        canonical.display(),
+        temp.display()
+    );
     let state = Arc::new(AppState::with_settings(
         Arc::new(Startup::begin()),
         Boot::default(),
@@ -205,7 +274,8 @@ fn main() {
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("addr").port();
-    println!("READY {port}");
+    let token = random_token();
+    println!("READY {port} {token}");
     let _ = std::io::stdout().flush();
 
     // Exit when the harness closes our stdin.
@@ -217,7 +287,7 @@ fn main() {
 
     let stats: Stats = Arc::default();
     for stream in listener.incoming().flatten() {
-        let (state, stats) = (Arc::clone(&state), Arc::clone(&stats));
-        std::thread::spawn(move || serve(stream, &state, &stats));
+        let (state, stats, token) = (Arc::clone(&state), Arc::clone(&stats), token.clone());
+        std::thread::spawn(move || serve(stream, &state, &stats, &token, port));
     }
 }
