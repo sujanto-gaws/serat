@@ -89,8 +89,9 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 }
 
 // Mutant, run by hand on this commit: making `open_cancellable` publish `Unavailable` at the
-// first `HeldByAnotherProcess` (the pre-#155 behaviour) fails the reason, the Ready and the
-// ordering assertions.
+// first `HeldByAnotherProcess` (the pre-#155 behaviour) fails three of the four tests in this
+// file (the wait-out, the bound and the retire test); the verbatim-wording test does not depend
+// on it.
 #[test]
 fn a_held_lock_is_waited_out_and_the_open_then_proceeds_in_the_stated_order() {
     let dir = vault();
@@ -183,7 +184,9 @@ fn retiring_during_the_wait_ends_it_and_emits_nothing_more() {
     let mut actor = spawn(
         dir.path(),
         &publisher,
-        Duration::from_millis(40),
+        // A 10 s interval: only the 25 ms slicing inside the sleep can end the wait within
+        // 500 ms. Dropping the in-sleep `cancelled()` check lets the 10 s sleep run out.
+        Duration::from_secs(10),
         Duration::from_secs(300),
     );
     wait_for("the reason to be published", || {
@@ -191,10 +194,9 @@ fn retiring_during_the_wait_ends_it_and_emits_nothing_more() {
     });
     publisher.retire();
     let emitted = recorder.states().len();
-    // Promptly, not at the 300 s bound.
     assert!(
-        actor.join_within(Duration::from_secs(5)),
-        "the wait did not end when the publisher was retired"
+        actor.join_within(Duration::from_millis(500)),
+        "the wait did not end promptly when the publisher was retired"
     );
     // Released after the retire: a still-waiting actor would now open and publish.
     other.close().expect("close");
