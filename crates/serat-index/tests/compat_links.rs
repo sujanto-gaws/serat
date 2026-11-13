@@ -122,6 +122,11 @@ fn corpus_vault() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp");
     for entry in fs::read_dir(fixtures()).expect("fixture dir") {
         let entry = entry.expect("entry");
+        // The README documents the corpus and quotes link syntax in backticks; both
+        // parsers would pull links from it, so it is not part of the vault.
+        if entry.file_name() == "README.md" {
+            continue;
+        }
         fs::copy(entry.path(), dir.path().join(entry.file_name())).expect("copy fixture");
     }
     dir

@@ -75,6 +75,19 @@ fn subpath_fixture_splits_heading_block_and_nested_heading() {
 }
 
 #[test]
+fn alias_fixtures_give_plain_wikilinks_and_the_alias_is_not_a_link_part() {
+    // The index test `an_alias_is_not_a_link_target_only_a_switcher_candidate` uses
+    // these two files; this pins what the real parser hands the index for them:
+    // plain wikilinks (no heading, block or alias part), so the stub cannot drift.
+    let plain = |note: &str| (LinkKind::Wikilink, s(note), None, None, None);
+    assert_eq!(
+        links_of("alias-link.md"),
+        vec![plain("Ali"), plain("Target Alias"), plain("aliases-target")]
+    );
+    assert_eq!(links_of("aliases-target.md"), vec![plain("alias-link")]);
+}
+
+#[test]
 fn embed_fixture_keeps_the_width_as_alias_and_the_heading_scope() {
     let t = s("heading-and-block-target");
     assert_eq!(

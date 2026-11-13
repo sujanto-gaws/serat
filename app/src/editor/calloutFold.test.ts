@@ -64,6 +64,9 @@ describe("foldable callout `[!tip]-` (C-01)", () => {
     expect(covering.length).toBeLessThanOrEqual(1);
     for (const w of covering) {
       expect(w.from).toBe(tipFrom);
+      // The tip callout is the last block of the fixture, so its blockquote ends where
+      // the text does (without the trailing newline).
+      expect(w.to).toBe(FIXTURE.trimEnd().length);
       const dom = (w.widget as { toDOM(): HTMLElement }).toDOM();
       expect(dom.getAttribute("data-callout")).toBe("tip");
     }
