@@ -52,7 +52,9 @@ export interface Command {
    * the command can run now, else a one-line reason shown instead of running. */
   unavailable?: (ctx: CommandContextInfo) => string | null;
   /** One of CodeMirror's own keymap entries, re-registered: two such entries may share a chord once spellings
-   * are folded (the mac pair `Ctrl-A` and `Shift-Ctrl-a`), because CodeMirror tries them in order. */
+   * are folded (the mac pair `Ctrl-A` and `Shift-Ctrl-a`), because CodeMirror tries them in order. `register`
+   * refuses it on any id outside `editor.cm.` / `editor.cm-history.`, so a named command cannot opt out of
+   * the one-binding rule (architecture §9.3). */
   fallthrough?: boolean;
 }
 
@@ -112,6 +114,9 @@ export class CommandRegistry {
     }
     if (!command.run && !command.exec) {
       throw new Error(`CommandRegistry: command "${command.id}" has neither run nor exec`);
+    }
+    if (command.fallthrough && !/^editor\.cm(-history)?\./.test(command.id)) {
+      throw new Error(`CommandRegistry: command "${command.id}" may not be fallthrough (reserved for CodeMirror's own keymap entries)`);
     }
     this.commands.set(command.id, command);
     // An override already in force (settings are read before late commands register) must not
@@ -266,7 +271,7 @@ export class CommandRegistry {
    * silently resolve).
    */
   buildKeymap(overrides: ReadonlyMap<CommandId, string | null> = this.overrides): KeyBinding[] {
-    const seen = new Map<string, { id: CommandId; overridden: boolean; fallthrough: boolean; binding: KeyBinding | null }>();
+    const seen = new Map<string, { id: CommandId; key: string; overridden: boolean; fallthrough: boolean; binding: KeyBinding | null }>();
     const dropped = new Set<KeyBinding>();
     const bindings: KeyBinding[] = [];
     for (const command of this.commands.values()) {
@@ -287,7 +292,7 @@ export class CommandRegistry {
           if (existing.binding) dropped.add(existing.binding);
         } else {
           throw new Error(
-            `CommandRegistry: keybinding collision — "${key}" in context "${command.when ?? "*"}" is bound to both "${existing.id}" and "${command.id}"`,
+            `CommandRegistry: keybinding collision — "${existing.key}" (${existing.id}) and "${key}" (${command.id}) are both ${normaliseChord(key, this.platform)} in context "${command.when ?? "*"}"`,
           );
         }
       }
@@ -298,7 +303,7 @@ export class CommandRegistry {
         binding = { key, preventDefault: command.preventDefault ?? true, run: (view) => run(view) };
         bindings.push(binding);
       }
-      seen.set(bucket, { id: command.id, overridden, fallthrough: !!command.fallthrough, binding });
+      seen.set(bucket, { id: command.id, key, overridden, fallthrough: !!command.fallthrough, binding });
     }
     return bindings.filter((b) => !dropped.has(b));
   }

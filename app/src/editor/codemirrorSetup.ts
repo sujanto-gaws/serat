@@ -215,12 +215,19 @@ function registerPassthrough(
  */
 export function createEditorCommandRegistry(
   handlers: EditorCommandHandlers,
-  platform: EditorPlatform = detectPlatform(),
+  platformArg?: EditorPlatform,
   /** The app-wide registry to add to (the palette lists it); a fresh one when omitted. */
-  registry: CommandRegistry = new CommandRegistry(platform),
+  registryArg?: CommandRegistry,
   /** @internal test seam: replaces a named command's default binding, so the passthrough skip-set can be shown to follow it. */
   namedBindings: Readonly<Record<string, string>> = {},
 ): CommandRegistry {
+  // The registry compares chords on its own platform and this function chooses CodeMirror's keys for
+  // `platform`: they must be the same one. Omitted, each defaults to the other (then to the sniffed one).
+  const platform = platformArg ?? registryArg?.platform ?? detectPlatform();
+  const registry = registryArg ?? new CommandRegistry(platform);
+  if (registry.platform !== platform) {
+    throw new Error(`createEditorCommandRegistry: the registry's platform (${registry.platform}) is not ${platform}`);
+  }
   const bind = (id: string, fallback: string): string => namedBindings[id] ?? fallback;
   const preexisting = new Set(registry.list().map((c) => c.id));
 

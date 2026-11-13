@@ -19,6 +19,8 @@ interface Group {
 }
 
 const TABLE: Group[] = [
+  { platform: "win", spellings: ["Mod-Shift-z", "Shift-Mod-z", "Ctrl-Shift-z", "Mod-Z"], canonical: "ctrl-shift-z", event: { key: "z", ctrlKey: true, shiftKey: true } },
+  { platform: "win", spellings: ["Mod-[", "Ctrl-["], canonical: "ctrl-[", event: { key: "[", ctrlKey: true }, inCodeMirror: true },
   { platform: "linux", spellings: ["Mod-k", "Ctrl-k", "Control-k", "c-k"], canonical: "ctrl-k", event: { key: "k", ctrlKey: true } },
   { platform: "win", spellings: ["Mod-k", "Ctrl-k", "Control-k"], canonical: "ctrl-k", event: { key: "k", ctrlKey: true } },
   { platform: "mac", spellings: ["Mod-k", "Cmd-k", "Meta-k", "m-k"], canonical: "meta-k", event: { key: "k", metaKey: true } },
@@ -100,5 +102,28 @@ describe("CodeMirror's own entries for one folded chord", () => {
     const keys = registry.buildKeymap().map((b) => b.key);
     expect(keys).toContain("Ctrl-A");
     expect(keys).toContain("Shift-Ctrl-a");
+  });
+});
+
+describe("the collision error and the fallthrough flag", () => {
+  it("the collision error names both raw bindings and the canonical form", () => {
+    const registry = new CommandRegistry("mac");
+    registry.register({ id: "a", name: "A", defaultBinding: "Mod-k", when: "editor", run: () => true });
+    registry.register({ id: "b", name: "B", defaultBinding: "Cmd-k", when: "editor", run: () => true });
+    expect(() => registry.buildKeymap()).toThrow('"Mod-k" (a) and "Cmd-k" (b) are both meta-k in context "editor"');
+  });
+
+  it("a named command cannot carry fallthrough, so it cannot dodge the one-binding rule", () => {
+    const registry = new CommandRegistry("linux");
+    expect(() =>
+      registry.register({ id: "editor.named", name: "N", defaultBinding: "Mod-a", when: "editor", run: () => true, fallthrough: true }),
+    ).toThrow(/may not be fallthrough/);
+    expect(() => registry.register({ id: "editor.cm.mod-a-1", name: "P", defaultBinding: "Mod-a", when: "editor", run: () => true, fallthrough: true })).not.toThrow();
+  });
+
+  it("createEditorCommandRegistry refuses a registry on another platform and defaults to the registry's", () => {
+    expect(() => createEditorCommandRegistry(handlers, "mac", new CommandRegistry("linux"))).toThrow(/platform/);
+    const registry = createEditorCommandRegistry(handlers, undefined, new CommandRegistry("mac"));
+    expect(registry.platform).toBe("mac");
   });
 });
