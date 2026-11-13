@@ -14,6 +14,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// A callback fired when the log changes; see [`RefusalLog::on_change`].
+type Notify = Arc<dyn Fn() + Send + Sync>;
+
 /// A vault-relative-ish path that could not become a [`VaultPath`], and why.
 ///
 /// `path` is the best available text for the offending entry -- the OS path
@@ -23,7 +26,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub struct Refusal {
     /// The path that was refused, in the least-lossy text available.
     pub path: String,
-    /// Why [`VaultPath::new`] or [`super::Vault::relativise`] refused it.
+    /// Why the vault's name rules (`VaultPath::new_for_platform`), reached through
+    /// [`super::Vault::relativise`] or the walk, refused it.
     pub reason: String,
 }
 
@@ -31,12 +35,61 @@ pub struct Refusal {
 /// paths are counted in [`RefusalLog::overflowed`] but not stored: a vault
 /// refusing this many names has a bigger problem than this list, and the count
 /// still says so (design goal 5: reported, not silent).
-const CAPACITY: usize = 1000;
+///
+/// Must equal `REFUSED_NAMES_CAP` in `contracts/ipc.rs`, which the status count
+/// saturates at; this crate cannot depend on the contract, so serat-app asserts it.
+pub const CAPACITY: usize = 1000;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Inner {
     by_path: BTreeMap<String, String>,
     overflowed: usize,
+    on_change: Option<Notify>,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("by_path", &self.by_path)
+            .field("overflowed", &self.overflowed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Inner {
+    /// Store one refusal, the log's bound enforced here. Returns whether the log
+    /// changed: a new path, a new reason, or one more refusal counted past the cap.
+    fn insert(&mut self, refusal: Refusal) -> bool {
+        if self.by_path.len() >= CAPACITY && !self.by_path.contains_key(&refusal.path) {
+            self.overflowed += 1;
+            return true;
+        }
+        self.by_path
+            .insert(refusal.path, refusal.reason.clone())
+            .as_ref()
+            != Some(&refusal.reason)
+    }
+
+    /// Remove every entry at or below `scope` and return them; no clone of the rest.
+    fn take_scope(&mut self, scope: &str) -> BTreeMap<String, String> {
+        if scope.is_empty() {
+            return std::mem::take(&mut self.by_path);
+        }
+        let below = format!("{scope}/");
+        let mut keys: Vec<String> = self
+            .by_path
+            .range(below.clone()..)
+            .map(|(path, _)| path)
+            .take_while(|path| path.starts_with(&below))
+            .cloned()
+            .collect();
+        if self.by_path.contains_key(scope) {
+            keys.push(scope.to_owned());
+        }
+        keys.into_iter()
+            .filter_map(|key| self.by_path.remove_entry(&key))
+            .collect()
+    }
 }
 
 /// A bounded, shareable record of refused paths, **one entry per file**.
@@ -61,14 +114,43 @@ impl RefusalLog {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Call `f` whenever the stored set or the overflow count changes (a path added,
+    /// removed or given a new reason; a refusal counted past the cap). Not called when
+    /// a walk finds exactly what the log already holds. `f` runs on the thread that
+    /// changed the log (a walk or the watcher), outside the log's lock; it must not
+    /// block. One callback: a second call replaces the first.
+    pub fn on_change(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.lock().on_change = Some(Arc::new(f));
+    }
+
+    /// Run `change` under the lock, which returns whether it altered what the log
+    /// holds, and fire the callback, after releasing the lock, if it did.
+    fn mutate(&self, change: impl FnOnce(&mut Inner) -> bool) {
+        let mut inner = self.lock();
+        let callback = if change(&mut inner) {
+            inner.on_change.clone()
+        } else {
+            None
+        };
+        drop(inner);
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
     /// Record a refusal, replacing any earlier one for the same path.
     pub(crate) fn record(&self, refusal: Refusal) {
-        let mut inner = self.lock();
-        if inner.by_path.len() >= CAPACITY && !inner.by_path.contains_key(&refusal.path) {
-            inner.overflowed += 1;
-            return;
-        }
-        inner.by_path.insert(refusal.path, refusal.reason);
+        self.mutate(|inner| inner.insert(refusal));
+    }
+
+    /// Record a refusal as the watcher would, so serat-app's tests can drive a storm
+    /// past the cap. Not for production use.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn record_for_test(&self, path: &str, reason: &str) {
+        self.record(Refusal {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        });
     }
 
     /// Replace every entry at or below `scope` (`""`: the whole vault) with `found`,
@@ -78,22 +160,28 @@ impl RefusalLog {
     /// never empty while a walk is still running (#13 N1; task #14).
     ///
     /// `overflowed` counts refusals past the capacity since the last whole-vault
-    /// walk; a walk of the whole vault resets it, a partial one leaves it.
+    /// walk; a walk of the whole vault resets it, a partial one leaves it. The
+    /// replacement is one change: the callback fires at most once.
     pub(crate) fn replace_scope(&self, scope: &str, found: Vec<Refusal>) {
-        let mut inner = self.lock();
-        if scope.is_empty() {
-            inner.by_path.clear();
-            inner.overflowed = 0;
-        } else {
-            let below = format!("{scope}/");
-            inner
-                .by_path
-                .retain(|path, _| path != scope && !path.starts_with(&below));
-        }
-        drop(inner);
-        for refusal in found {
-            self.record(refusal);
-        }
+        self.mutate(|inner| {
+            let overflowed = inner.overflowed;
+            let removed = inner.take_scope(scope);
+            if scope.is_empty() {
+                inner.overflowed = 0;
+            }
+            for refusal in found {
+                inner.insert(refusal);
+            }
+            // Changed unless the scope holds exactly what it held before.
+            let now = if scope.is_empty() {
+                std::mem::take(&mut inner.by_path)
+            } else {
+                inner.take_scope(scope)
+            };
+            let changed = now != removed || inner.overflowed != overflowed;
+            inner.by_path.extend(now);
+            changed
+        });
     }
 
     /// Every refused path, in path order.
@@ -202,6 +290,43 @@ mod tests {
         log.record(refusal("note-00000.md", "updated"));
         assert_eq!(log.len(), CAPACITY);
         assert_eq!(log.snapshot()[0].reason, "updated");
+    }
+
+    #[test]
+    fn on_change_fires_exactly_when_the_stored_set_or_overflow_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let log = RefusalLog::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&fired);
+        log.on_change(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let count = || fired.load(Ordering::SeqCst);
+
+        log.record(refusal("a.md", "r"));
+        assert_eq!(count(), 1, "a new path");
+        log.record(refusal("a.md", "r"));
+        assert_eq!(count(), 1, "the same path and reason is no change");
+        log.record(refusal("a.md", "r2"));
+        assert_eq!(count(), 2, "a new reason");
+
+        log.replace_scope("", vec![refusal("a.md", "r2")]);
+        assert_eq!(count(), 2, "a walk that finds what is held is no change");
+        log.replace_scope("", vec![refusal("b.md", "r"), refusal("c.md", "r")]);
+        assert_eq!(count(), 3, "a replacement is one change");
+        log.replace_scope("", Vec::new());
+        assert_eq!(count(), 4, "entries leaving");
+        log.replace_scope("", Vec::new());
+        assert_eq!(count(), 4, "an empty log walked empty");
+
+        for i in 0..CAPACITY {
+            log.record(refusal(&format!("n-{i:05}.md"), "r"));
+        }
+        let full = count();
+        log.record(refusal("one-more.md", "r"));
+        assert_eq!(count(), full + 1, "a refusal counted past the cap");
+        log.replace_scope("", Vec::new());
+        assert_eq!(count(), full + 2, "emptying a full, overflowed log");
     }
 
     #[test]

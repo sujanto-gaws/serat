@@ -10,9 +10,12 @@
 //     a Worker cannot be created the load fails loudly instead;
 //   * no annotation layer is built and the scripting sandbox bundle is never loaded, so a PDF's
 //     JavaScript and links cannot run;
-//   * known gap (ADR-0017 amendment, task #94): cMaps and standard fonts are not shipped.
+//   * cMaps and the standard fonts ship in the bundle (`src/build/pdfjsData.ts`; URLs in `pdfjsDataUrls.ts`, ADR-0017 Amendment 1
+//     item 6) and are fetched from `./cmaps/` and `./standard_fonts/`, same origin, relative URLs;
+//     `wasmUrl` and `iccUrl` stay unset (the CSP has no 'wasm-unsafe-eval'; `useWasm: false`).
 
 import { makeAssetTransport } from "./assetRangeTransport";
+import { PDFJS_CMAP_URL, PDFJS_STANDARD_FONT_URL } from "./pdfjsDataUrls";
 import { assetInfo, readAssetRange } from "@/ipc/client";
 
 export interface PdfPageSize {
@@ -79,6 +82,9 @@ export const loadPdf: PdfLoader = async (path, length, hooks, signal, etag) => {
     disableStream: true, // no effect with a range transport; kept to match the ADR-0017 amendment
     disableAutoFetch: true,
     useWasm: false,
+    cMapUrl: PDFJS_CMAP_URL,
+    cMapPacked: true,
+    standardFontDataUrl: PDFJS_STANDARD_FONT_URL,
   });
   const destroyTask = (): void => {
     lastDestroy = Promise.resolve(task.destroy()).catch(() => undefined);

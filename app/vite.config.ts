@@ -17,9 +17,11 @@ import { fileURLToPath, URL } from "node:url";
 import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vitest/config";
 
+import { pdfjsDataPlugin } from "./src/build/pdfjsData";
+
 export default defineConfig(({ mode }) => ({
   base: "./",
-  plugins: [vue()],
+  plugins: [vue(), pdfjsDataPlugin()],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
@@ -65,5 +67,17 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     globals: false,
     include: ["src/**/*.test.ts"],
+    // Task #131 (NFR-MNT-01, NFR-PRF-08): on a 4-core host under load, parallel workers starve
+    // the vitest main process. Under vitest 3 the main process's reply to a worker's RPC then
+    // missed a fixed 60 s window and the run exited 1 with `[vitest-worker]: Timeout calling
+    // "onTaskUpdate"` although every test passed (6 of 10 runs under 4 busy loops). vitest 5
+    // sets that window to none (`timeout: -1` in the worker RPC), so the failure's cause is
+    // gone; the cap stays because it costs nothing (60.7 s with one worker against 63.1 s
+    // with three, 561 tests) and keeps the workers off the main process's core. Note that
+    // vitest 4 removed `test.poolOptions`: `poolOptions.forks.maxForks` is now ignored with
+    // only a deprecation line, and the option is the top-level `maxWorkers`.
+    // See docs/05-testing/test-plan.md, "Flake log".
+    maxWorkers: 1,
+    setupFiles: ["src/test/jsdom-shims.ts"],
   },
 }));

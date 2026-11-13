@@ -8,16 +8,17 @@
 //! scanner produce byte-accurate `range`s for all of them without a second pass
 //! through comrak's inline tree to re-locate what it already saw.
 //!
-//! Scoped deliberately: `exclude` keeps this out of frontmatter and out of fenced
-//! code / HTML blocks. It does not keep it out of an *inline* code span (`` `#not
-//! a tag` ``) — comrak's inline tree would have to be walked to find those, and nothing
-//! in the corpus this lands with exercises the difference yet. Recorded here rather
-//! than left to be rediscovered: a documented gap is worth more than a hidden one.
+//! Scoped deliberately: `exclude` keeps this out of frontmatter, out of fenced code /
+//! HTML blocks and out of *inline* code spans (`` `#not a tag` ``), whose ranges the
+//! caller takes from comrak's inline tree (task #145; Obsidian indexes nothing inside
+//! a code span). The exclusion applies at a match's *start*: `[[a `b` c]]` still links,
+//! with the span inside the link text, because the link begins outside any span.
 
 use serat_core::{ByteRange, Link, LinkKind, LinkTarget};
 
 /// Every wikilink, embed and tag in `text`, outside of `exclude`d ranges.
 pub(crate) fn scan(text: &str, exclude: &[ByteRange]) -> Vec<Link> {
+    let exclude = &merged(exclude);
     let bytes = text.as_bytes();
     let mut links = Vec::new();
     let mut i = 0;
@@ -64,9 +65,26 @@ pub(crate) fn scan(text: &str, exclude: &[ByteRange]) -> Vec<Link> {
 }
 
 fn excluded(exclude: &[ByteRange], offset: usize) -> bool {
-    exclude
-        .iter()
-        .any(|range| range.start <= offset && offset < range.end)
+    // `exclude` is sorted and disjoint (see `merged`): the only candidate is the last
+    // range starting at or before `offset`.
+    let after = exclude.partition_point(|range| range.start <= offset);
+    after > 0 && offset < exclude[after - 1].end
+}
+
+/// `exclude` sorted by start with overlapping or touching ranges joined, so
+/// [`excluded`] is a binary search rather than a scan of every range per byte (a note
+/// with thousands of code spans would otherwise be quadratic).
+fn merged(exclude: &[ByteRange]) -> Vec<ByteRange> {
+    let mut sorted = exclude.to_vec();
+    sorted.sort_by_key(|range| range.start);
+    let mut out: Vec<ByteRange> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match out.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => out.push(range),
+        }
+    }
+    out
 }
 
 /// A tag starting at `text[start]` (which is `#`), or `None` if what follows is not
@@ -244,6 +262,35 @@ mod tests {
         let links = scan("issue #1234 needs a #fix\n", &[]);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target.note, "fix");
+    }
+
+    fn range(start: usize, end: usize) -> ByteRange {
+        ByteRange::new(start, end)
+    }
+
+    #[test]
+    fn merged_sorts_and_joins_touching_and_overlapping_ranges_and_keeps_empty_ones_harmless() {
+        let out = merged(&[
+            range(20, 25),
+            range(0, 5),
+            range(5, 8),   // touches the first
+            range(22, 30), // overlaps the 20..25
+            range(40, 40), // zero-length
+            range(2, 3),   // inside the first
+        ]);
+        assert_eq!(out, vec![range(0, 8), range(20, 30), range(40, 40)]);
+        assert!(excluded(&out, 0) && excluded(&out, 7) && !excluded(&out, 8));
+        assert!(excluded(&out, 29) && !excluded(&out, 30));
+        assert!(!excluded(&out, 40), "a zero-length range excludes nothing");
+        assert!(merged(&[]).is_empty() && !excluded(&[], 0));
+    }
+
+    #[test]
+    fn a_wikilink_whose_text_holds_a_code_span_still_links() {
+        // The span excludes only matches that *start* inside it.
+        let links = scan("[[a `b` c]]", &[range(4, 7)]);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].target.note, "a `b` c");
     }
 
     #[test]

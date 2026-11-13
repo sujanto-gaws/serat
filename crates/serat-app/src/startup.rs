@@ -85,7 +85,7 @@
 //! | §3.4 precondition | Here |
 //! |---|---|
 //! | the open check has finished, so the index state is known | [`Startup::mark_index_settled`], from the actor's first published state that is not `Opening` |
-//! | the file tree has been delivered | [`Startup::mark_buffer_rendered`] — P0 has no tree, so this is the last-open buffer; `list_notes` is P1 |
+//! | the file tree has been delivered | [`Startup::mark_tree_first_screen`] — the root listing applied and painted (ADR-0015 §3, §5), stamped from [`crate::tree_stream::TreeMarks::first_screen_ms`]. P0's stand-in, the last-open buffer ([`Startup::mark_buffer_rendered`]), is still recorded but is no longer a term |
 //! | the watcher is registered | [`Startup::mark_watcher`], on either outcome |
 //!
 //! Every one of them fails *invisibly* if it is left out. Nothing errors; the number
@@ -206,6 +206,9 @@ struct Marks {
     raf2_ms: Option<f64>,
     watcher: Option<(f64, WatcherOutcome)>,
     buffer_rendered: Option<f64>,
+    /// `tree_first_screen` (ADR-0015 §3), on the same `t0` clock, as the tree stream
+    /// recorded it. The tree term of `t_usable` from P1 (ADR-0015 §5).
+    tree_first_screen: Option<f64>,
     walk_complete: Option<f64>,
     notes_walked: Option<u32>,
     last_open: Option<String>,
@@ -221,10 +224,10 @@ impl Marks {
     /// precondition.
     fn vault_usable(&self) -> Option<f64> {
         let painted = self.window_visible?;
-        let rendered = self.buffer_rendered?;
+        let tree = self.tree_first_screen?;
         let index = self.index_settled?;
         let (watcher, _) = self.watcher?;
-        Some(painted.max(rendered).max(index).max(watcher))
+        Some(painted.max(tree).max(index).max(watcher))
     }
 }
 
@@ -482,6 +485,25 @@ impl Startup {
         true
     }
 
+    /// The file tree's first screen was applied and painted (ADR-0015 §3): §3.4's tree
+    /// precondition for `t_usable` from P1 (ADR-0015 §5), in place of
+    /// [`Startup::mark_buffer_rendered`].
+    ///
+    /// `ms` is [`crate::tree_stream::TreeMarks::first_screen_ms`] exactly as the stream
+    /// recorded it (a front-end mark the stream has earned, never one it merely claimed),
+    /// so the trace and the tree's own marks cannot disagree. Returns `false` if already
+    /// marked; the first vault's first screen is the cold start's.
+    pub fn mark_tree_first_screen(&self, ms: f64) -> bool {
+        let mut marks = self.lock();
+        if marks.tree_first_screen.is_some() {
+            return false;
+        }
+        marks.tree_first_screen = Some(ms);
+        drop(marks);
+        self.usable.notify_all();
+        true
+    }
+
     /// The vault walk finished, having found `entries` files.
     ///
     /// Unbudgeted and deliberately reported: §3.4 puts the walk *off* the critical
@@ -570,7 +592,16 @@ impl Startup {
         })?;
         let buffer = marks.buffer_rendered.ok_or(TraceIncomplete {
             missing: "vault_usable",
-            because: "the webview never reported the buffer rendered.",
+            because: "the webview never reported the buffer rendered. The buffer is no \
+                      longer a term of vault_usable (the tree's first screen replaced it, \
+                      ADR-0015 section 5), but the trace still records it and the shell \
+                      reports it through mark_vault_usable, so its absence means that \
+                      call never arrived.",
+        })?;
+        let tree_first_screen = marks.tree_first_screen.ok_or(TraceIncomplete {
+            missing: "vault_usable",
+            because: "the file tree's first screen was never reported (ADR-0015 section 5): \
+                      a vault with no tree on screen is not usable yet.",
         })?;
         let index_ms = marks.index_settled.ok_or(TraceIncomplete {
             missing: "vault_usable",
@@ -596,6 +627,8 @@ impl Startup {
             t0_to_setup_done_ms: marks.setup_done,
             t0_to_window_created_ms: marks.window_created,
             t0_to_buffer_rendered_ms: buffer,
+            tree: true,
+            t0_to_tree_first_screen_ms: tree_first_screen,
             t0_to_index_settled_ms: index_ms,
             t0_to_watcher_ms: watcher_ms,
             watcher,
@@ -620,12 +653,12 @@ impl Startup {
 /// What "vault usable" means in this build, carried in the trace so a gate report
 /// cannot quietly change its mind about it.
 ///
-/// P0 has no file tree: the only navigation command, `list_notes`, is P1
-/// (`contracts/ipc.rs`), so §3.4's "file tree delivered" precondition is satisfied here
-/// by the last-open buffer. The walk — which does run, on the vault thread — is
-/// reported separately and is not waited on.
+/// From P1 (ADR-0015 §5, task #141) §3.4's "file tree delivered" precondition is the
+/// tree's first screen: the root listing applied and painted. P0's stand-in, the
+/// last-open buffer, is still recorded in the trace but no longer a term. The walk, which
+/// runs on the vault thread, is reported separately and is not waited on.
 pub const USABLE_DEFINITION: &str =
-    "painted_and_index_settled_and_buffer_rendered_and_watcher_settled";
+    "painted_and_index_settled_and_tree_first_screen_and_watcher_settled";
 
 /// One cold start, as the budget harness reads it.
 ///
@@ -651,8 +684,8 @@ pub struct Trace {
     /// wired this through, or on a platform with no Paint Timing API to validate
     /// against in the first place.
     pub raf2_ms: Option<f64>,
-    /// t0 to the vault being usable. NFR-PRF-01's 1 s. The later of
-    /// `t0_to_buffer_rendered_ms` and `t0_to_watcher_ms`.
+    /// t0 to the vault being usable. NFR-PRF-01's 1 s. The latest of the paint, the index
+    /// settling, `t0_to_tree_first_screen_ms` and `t0_to_watcher_ms`.
     pub t0_to_vault_usable_ms: f64,
     /// t0 to the first line of `main`: the loader's share. `0.0` when `t0_source` is
     /// `in_process`, by construction.
@@ -667,8 +700,15 @@ pub struct Trace {
     /// t0 to the window object existing. The budget job fails a run where
     /// `window_visible - window_created < 5 ms`.
     pub t0_to_window_created_ms: Option<f64>,
-    /// t0 to the last-open buffer rendering.
+    /// t0 to the last-open buffer rendering. Recorded, but not a term of
+    /// `t0_to_vault_usable_ms` from task #141.
     pub t0_to_buffer_rendered_ms: f64,
+    /// Whether this build renders a tree. Always `true` here: a trace exists only once
+    /// the tree's first screen was reported, so the budget harness requires
+    /// `t0_to_tree_first_screen_ms` whenever it reads this.
+    pub tree: bool,
+    /// t0 to the root listing applied and painted (ADR-0015 §3): `t_usable`'s tree term.
+    pub t0_to_tree_first_screen_ms: f64,
     /// t0 to the index open check finishing. §3.4's first `t_usable` precondition.
     pub t0_to_index_settled_ms: f64,
     /// t0 to the filesystem watcher settling.
@@ -971,6 +1011,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
     }
 
     #[test]
@@ -984,6 +1025,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let err = startup
             .trace()
@@ -1019,6 +1061,7 @@ mod tests {
             .expect("valid paint evidence");
         startup.mark_index_settled();
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let err = startup.trace().expect_err("the watcher never settled");
         assert_eq!(err.missing, "vault_usable");
@@ -1045,6 +1088,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         assert!(
             !startup.wait_for_usable(Duration::from_millis(30)),
             "a shell that has not painted was reported usable"
@@ -1075,6 +1119,7 @@ mod tests {
             .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let err = startup.trace().expect_err("the open check never finished");
         assert_eq!(err.missing, "vault_usable");
@@ -1100,6 +1145,7 @@ mod tests {
             .expect("valid paint evidence");
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         startup.mark_index_settled();
         assert!(startup.trace().is_ok());
     }
@@ -1115,6 +1161,7 @@ mod tests {
         watcher_last.mark_index_settled();
         std::thread::sleep(Duration::from_millis(2));
         watcher_last.mark_buffer_rendered();
+        watcher_last.mark_tree_first_screen(watcher_last.elapsed_ms());
         std::thread::sleep(Duration::from_millis(5));
         watcher_last.mark_watcher(WatcherOutcome::Registered);
         let trace = watcher_last.trace().expect("complete");
@@ -1125,22 +1172,73 @@ mod tests {
             trace.t0_to_watcher_ms
         );
 
-        let buffer_last = in_process();
-        buffer_last
+        let tree_last = in_process();
+        tree_last
             .mark_first_paint(FCP_MS, RAF2_MS)
             .expect("valid paint evidence");
-        buffer_last.mark_index_settled();
+        tree_last.mark_index_settled();
+        tree_last.mark_buffer_rendered();
         std::thread::sleep(Duration::from_millis(2));
-        buffer_last.mark_watcher(WatcherOutcome::Registered);
+        tree_last.mark_watcher(WatcherOutcome::Registered);
         std::thread::sleep(Duration::from_millis(5));
-        buffer_last.mark_buffer_rendered();
-        let trace = buffer_last.trace().expect("complete");
+        tree_last.mark_tree_first_screen(tree_last.elapsed_ms());
+        let trace = tree_last.trace().expect("complete");
         assert!(
-            (trace.t0_to_vault_usable_ms - trace.t0_to_buffer_rendered_ms).abs() < f64::EPSILON,
-            "usable {} should be the buffer mark {}",
+            (trace.t0_to_vault_usable_ms - trace.t0_to_tree_first_screen_ms).abs() < f64::EPSILON,
+            "usable {} should be the tree mark {}",
+            trace.t0_to_vault_usable_ms,
+            trace.t0_to_tree_first_screen_ms
+        );
+        assert!(trace.tree, "a trace that exists declares a tree");
+    }
+
+    #[test]
+    fn a_vault_with_no_tree_on_screen_is_not_usable_and_the_buffer_is_not_a_term() {
+        // ADR-0015 section 5 (task #141): the tree's first screen replaced the buffer as
+        // `t_usable`'s tree term. Put `buffer_rendered` back into `Marks::vault_usable`
+        // in place of `tree_first_screen` and the first two assertions fail; leave it in
+        // as well and the last one fails.
+        let startup = in_process();
+        startup
+            .mark_first_paint(FCP_MS, RAF2_MS)
+            .expect("valid paint evidence");
+        startup.mark_index_settled();
+        startup.mark_watcher(WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+        let err = startup.trace().expect_err("no tree was reported");
+        assert_eq!(err.missing, "vault_usable");
+        assert!(err.because.contains("tree"), "{err}");
+        assert!(
+            !startup.wait_for_usable(Duration::from_millis(30)),
+            "usable was reported with no tree on screen"
+        );
+
+        let early = startup.elapsed_ms();
+        assert!(startup.mark_tree_first_screen(early));
+        assert!(!startup.mark_tree_first_screen(early + 1.0), "set once");
+        // A buffer that renders after everything else does not move usable.
+        let late = in_process();
+        late.mark_first_paint(FCP_MS, RAF2_MS)
+            .expect("valid paint evidence");
+        late.mark_index_settled();
+        late.mark_watcher(WatcherOutcome::Registered);
+        late.mark_tree_first_screen(late.elapsed_ms());
+        assert!(late.wait_for_usable(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(5));
+        late.mark_buffer_rendered();
+        let trace = late.trace().expect("complete");
+        assert!(
+            trace.t0_to_vault_usable_ms < trace.t0_to_buffer_rendered_ms,
+            "usable {} was moved by the buffer mark {}",
             trace.t0_to_vault_usable_ms,
             trace.t0_to_buffer_rendered_ms
         );
+        let line = trace.to_line().expect("json");
+        assert!(line.contains("\"tree\":true"), "{line}");
+        assert!(line.contains("\"t0_to_tree_first_screen_ms\":"), "{line}");
+        assert_eq!(trace.usable_definition, USABLE_DEFINITION);
+        assert!(USABLE_DEFINITION.contains("tree_first_screen"));
+        assert!(!USABLE_DEFINITION.contains("buffer_rendered"));
     }
 
     #[test]
@@ -1154,6 +1252,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Failed);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
         let trace = startup.trace().expect("complete");
         assert_eq!(trace.watcher, WatcherOutcome::Failed);
         assert!(
@@ -1179,6 +1278,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let trace = startup.trace().expect("complete");
         let created = trace.t0_to_window_created_ms.expect("created was marked");
@@ -1208,6 +1308,7 @@ mod tests {
         startup.mark_index_settled();
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
 
         let trace = startup.trace().expect("complete");
         let ours = trace.serat_main_thread_ms().expect("both brackets marked");
@@ -1252,6 +1353,8 @@ mod tests {
             t0_to_setup_done_ms: Some(90.5),
             t0_to_window_created_ms: Some(700.0),
             t0_to_buffer_rendered_ms: 805.0,
+            tree: true,
+            t0_to_tree_first_screen_ms: 805.0,
             t0_to_index_settled_ms: 91.0,
             t0_to_watcher_ms: 92.0,
             watcher: WatcherOutcome::Registered,
@@ -1611,7 +1714,7 @@ mod tests {
                 .mark_first_paint(FCP_MS, RAF2_MS)
                 .expect("valid paint evidence");
             std::thread::sleep(Duration::from_millis(10));
-            signaller.mark_buffer_rendered();
+            signaller.mark_tree_first_screen(signaller.elapsed_ms());
         });
         assert!(startup.wait_for_usable(Duration::from_secs(5)));
     }

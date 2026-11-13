@@ -80,7 +80,21 @@ pub struct StatusPublisher<S> {
     /// Set when the open that created this publisher failed after `vault://opened` had
     /// announced its id (task #90): nothing may carry that id afterwards.
     retired: std::sync::atomic::AtomicBool,
+    /// The refused-name count the refusal callback last acted on, [`NOT_EMITTED`]
+    /// before the first change. Lets it re-emit only when the count moved.
+    last_refused: std::sync::atomic::AtomicU32,
+    /// A trailing refusal-count flush is scheduled (task #144): at most one per window.
+    refusal_flush_pending: std::sync::atomic::AtomicBool,
+    /// Serialises building a status and handing it to the sink (task #144 review): two
+    /// emitters must not each read a count and then race to the sink, or the older one can
+    /// arrive last and the front end keep a stale count. Held across the sink call, which
+    /// never calls back into this publisher; the state lock is taken inside it, never the
+    /// other way round, and a poll takes only the state lock.
+    emit_lock: Mutex<()>,
 }
+
+/// Sentinel for `last_refused`: above [`REFUSED_NAMES_CAP`], so no count equals it.
+const NOT_EMITTED: u32 = u32::MAX;
 
 #[derive(Debug)]
 struct Published {
@@ -146,6 +160,9 @@ impl<S: StatusSink> StatusPublisher<S> {
             refusals: None,
             wal: Mutex::new(None),
             retired: std::sync::atomic::AtomicBool::new(false),
+            last_refused: std::sync::atomic::AtomicU32::new(NOT_EMITTED),
+            refusal_flush_pending: std::sync::atomic::AtomicBool::new(false),
+            emit_lock: Mutex::new(()),
         }
     }
 
@@ -166,6 +183,73 @@ impl<S: StatusSink> StatusPublisher<S> {
     pub fn with_refusals(mut self, refusals: serat_vault::RefusalLog) -> Self {
         self.refusals = Some(refusals);
         self
+    }
+
+    /// Re-emit the status whenever the refusal log changes (task #35): a name refused by
+    /// the watcher after the open changes the count while the state stays `Ready`, and
+    /// would otherwise reach a listening front end only with the next state change.
+    ///
+    /// Call once, right after the publisher is in its `Arc`; a no-op with no log. The
+    /// callback holds the publisher weakly: the log is owned by the vault, and a reference
+    /// back would make a cycle. It runs on the walk's or the watcher's thread and only
+    /// builds a status and hands it to the sink, so it does not block.
+    pub fn watch_refusals(self: &Arc<Self>) {
+        let Some(refusals) = &self.refusals else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        refusals.on_change(move || {
+            if let Some(publisher) = weak.upgrade() {
+                // The count saturates at the cap and the status carries nothing else
+                // of the log, so a change that leaves it as it was (a watcher storm
+                // past the cap, a changed reason) would stream identical statuses.
+                let now = publisher.refused_count().unwrap_or(NOT_EMITTED);
+                if publisher.last_refused.swap(now, Ordering::SeqCst) != now {
+                    publisher.re_emit_throttled();
+                }
+            }
+        });
+    }
+
+    /// [`StatusPublisher::re_emit`] through the throttle (task #144): the first change in a
+    /// window emits at once; later ones in the same window schedule one trailing flush at
+    /// the window's end, which emits the count as it is then, so a burst of distinct
+    /// refused names (a sync tool rewriting a folder) is at most two events and the final
+    /// count always lands. A retired publisher emits nothing, pending flush included.
+    fn re_emit_throttled(self: &Arc<Self>) {
+        let wait = {
+            let inner = self.lock();
+            match inner.last_emit {
+                Some(last) if last.elapsed() < self.throttle => self.throttle - last.elapsed(),
+                _ => Duration::ZERO,
+            }
+        };
+        if wait.is_zero() {
+            self.re_emit();
+            return;
+        }
+        if self.refusal_flush_pending.swap(true, Ordering::SeqCst) {
+            return; // a flush is already scheduled and will read the latest count
+        }
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("serat-refusal-flush".to_owned())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                if let Some(publisher) = weak.upgrade() {
+                    // Cleared before the status is built: a change after this point
+                    // schedules the next flush, one before it is in the count read below.
+                    publisher
+                        .refusal_flush_pending
+                        .store(false, Ordering::SeqCst);
+                    publisher.re_emit();
+                }
+            });
+        if spawned.is_err() {
+            // No thread: emit now rather than lose the count (goal 5).
+            self.refusal_flush_pending.store(false, Ordering::SeqCst);
+            self.re_emit();
+        }
     }
 
     /// Carry the checkpointer's pinned-WAL fact into every status this publisher builds
@@ -239,6 +323,12 @@ impl<S: StatusSink> StatusPublisher<S> {
         })
     }
 
+    fn emit_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.emit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The vault this publisher belongs to.
     #[must_use]
     pub fn vault_id(&self) -> &str {
@@ -267,8 +357,12 @@ impl<S: StatusSink> StatusPublisher<S> {
         if self.is_retired() {
             return;
         }
+        let _emitting = self.emit_guard();
         let status = self.status();
         self.lock().last_emit = Some(Instant::now());
+        if self.is_retired() {
+            return;
+        }
         self.sink.emit(&status);
     }
 
@@ -298,6 +392,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             observer(&state);
         }
 
+        let _emitting = self.emit_guard();
         let status = {
             let mut inner = self.lock();
             // A change of `Opening`'s reason is a transition too: a reason that clears
@@ -996,6 +1091,139 @@ mod tests {
         assert_eq!(publisher.status().wal_pinned_bytes, None);
         assert_eq!(recorder.taken().len(), 2);
         assert_eq!(recorder.taken()[1].wal_pinned_bytes, None);
+    }
+
+    #[test]
+    fn a_refusal_storm_past_the_cap_emits_only_while_the_count_moves() {
+        // Task #35 S1'. The log counts overflowed refusals as changes, the status does
+        // not carry them: identical statuses must not stream to the webview.
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                recorder.clone(),
+                Duration::from_millis(150),
+            )
+            .with_refusals(log.clone()),
+        );
+        publisher.watch_refusals();
+
+        for i in 0..REFUSED_NAMES_CAP {
+            log.record_for_test(&format!("n-{i:05}.md"), "r");
+        }
+        // The burst is collapsed by the throttle (task #144); the trailing flush lands the
+        // final count once the window ends.
+        std::thread::sleep(Duration::from_millis(400));
+        let settled = recorder.taken().len();
+        assert!(settled <= 2, "{settled} events for one burst");
+        for _ in 0..50 {
+            log.record_for_test("overflow.md", "r");
+        }
+        log.record_for_test("n-00000.md", "a new reason");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            recorder.taken().len() <= settled + 1,
+            "a change the status cannot show was emitted"
+        );
+        assert_eq!(
+            recorder.taken().last().expect("emitted").refused_names,
+            Some(REFUSED_NAMES_CAP)
+        );
+    }
+
+    // Task #144. Mutant, run by hand: calling `re_emit()` instead of `re_emit_throttled()` in
+    // `watch_refusals` makes the first test see 200 events.
+    #[test]
+    fn a_burst_of_refusals_inside_one_window_is_at_most_two_events_and_the_last_has_the_count() {
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                recorder.clone(),
+                Duration::from_millis(200),
+            )
+            .with_refusals(log.clone()),
+        );
+        publisher.watch_refusals();
+        for i in 0..200 {
+            log.record_for_test(&format!("aux-{i:03}.md"), "r");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let taken = recorder.taken();
+        assert!(taken.len() <= 2, "{} events for one burst", taken.len());
+        assert_eq!(
+            taken.last().expect("emitted").refused_names,
+            Some(200),
+            "the final count must land"
+        );
+    }
+
+    // Task #144 review. Mutant, run by hand: dropping the `emit_guard()` in `re_emit` lets the
+    // second emitter reach the sink before the first, and the last event carries count 0.
+    #[test]
+    fn a_slow_emitter_cannot_deliver_an_older_count_after_a_newer_one() {
+        struct SlowFirst(Recorder, std::sync::atomic::AtomicBool);
+        impl StatusSink for SlowFirst {
+            fn emit(&self, status: &IndexStatus) {
+                if !self.1.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                self.0.emit(status);
+            }
+        }
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                SlowFirst(recorder.clone(), std::sync::atomic::AtomicBool::new(false)),
+                Duration::from_secs(60),
+            )
+            .with_refusals(log.clone()),
+        );
+        let first = {
+            let publisher = Arc::clone(&publisher);
+            std::thread::spawn(move || publisher.re_emit()) // builds count 0, then sits in the sink
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        log.record_for_test("a.md", "r"); // the count is now 1
+        let second = {
+            let publisher = Arc::clone(&publisher);
+            std::thread::spawn(move || publisher.re_emit())
+        };
+        first.join().expect("first");
+        second.join().expect("second");
+        assert_eq!(
+            recorder.taken().last().expect("emitted").refused_names,
+            Some(1),
+            "the last event carries a stale count"
+        );
+    }
+
+    #[test]
+    fn retiring_during_a_pending_refusal_flush_emits_nothing() {
+        let recorder = Recorder::default();
+        let log = serat_vault::RefusalLog::new();
+        let publisher = Arc::new(
+            StatusPublisher::with_throttle(
+                "vault-1",
+                Arc::new(Startup::begin()),
+                recorder.clone(),
+                Duration::from_millis(200),
+            )
+            .with_refusals(log.clone()),
+        );
+        publisher.watch_refusals();
+        log.record_for_test("a.md", "r"); // leading edge: one event
+        log.record_for_test("b.md", "r"); // schedules the trailing flush
+        publisher.retire();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(recorder.taken().len(), 1, "a retired publisher emitted");
     }
 
     #[test]

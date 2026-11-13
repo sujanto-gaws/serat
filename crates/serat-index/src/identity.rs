@@ -64,9 +64,12 @@ pub(crate) enum Verdict {
 
 /// The identity to record and to compare against: the resolved directory.
 ///
-/// A mapped drive, a junction, a UNC form, a differently-cased root and a trailing
-/// separator are five spellings of one directory, and every one of them used to buy a
-/// full rebuild (F-459). `canonicalize` collapses them.
+/// A `subst`-mapped drive, a junction, a verbatim `\\?\` spelling, a differently-cased root and a
+/// trailing separator are spellings of one directory, and every one of them used to buy a
+/// full rebuild (F-459). `canonicalize` collapses them onto the real local path. A UNC share
+/// is **not** collapsed: through the SMB redirector `canonicalize` returns
+/// `\\?\UNC\host\share\...`, which stays a different root from the local `C:\...` path of the
+/// same directory and is recorded, and adopted, as its own.
 ///
 /// Falls back to the path as given when it cannot be resolved — a root that has just
 /// become unreadable is the caller's problem to report, not a reason for this to fail

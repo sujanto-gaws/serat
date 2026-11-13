@@ -20,7 +20,7 @@ declare global {
      * for why this exists and what it does. Not present outside a page
      * that mounted `App.vue`, and only ever defined in a `--mode bench` build
      * (`npm run build:bench`); a release build has no such global. */
-    __seratBenchOpenNote?: (text: string) => void;
+    __seratBenchOpenNote?: (text: string, path?: string, hash?: string) => void;
   }
 }
 

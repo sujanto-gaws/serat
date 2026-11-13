@@ -117,6 +117,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      # Task #77: the Windows-only checks, listed by name so a runner's log shows each one
+      # (`--nocapture` prints the SKIPPED lines of the tests that skip themselves: no
+      # administrative share, no `subst`, no symlink privilege, 8.3 names off). They are
+      # `cfg(windows)` and do not exist on Linux, which is the documented skip. Ready,
+      # awaiting a runner (F-384): written by reading the APIs, never executed.
+      #   crates/serat-app/tests/windows_vault.rs
+      #     a_verbatim_root_opens_as_the_plain_form_with_one_identity
+      #     a_unc_root_opens_as_a_unc_form_not_the_mangled_one
+      #     a_mapped_drive_root_is_the_same_vault_as_the_directory_behind_it
+      #     a_drive_relative_root_that_names_nothing_is_an_error
+      #     the_walk_lists_what_ntfs_allows_and_reports_what_win32_would_refuse
+      #     relativise_refuses_what_ntfs_stores_and_win32_would_not_create
+      #     (ignored, need OneDrive: stat_paths_do_not_hydrate_a_placeholder,
+      #      reading_a_placeholder_is_reported_not_silent)
+      #   crates/serat-app/src/asset/tests.rs, module windows_only
+      #     a_junctioned_directory_component_is_refused
+      #     the_handle_check_alone_catches_a_component_swapped_for_a_junction
+      #     a_directory_swapped_for_a_junction_into_serat_is_refused_by_step_7
+      #     an_8_3_short_name_for_dot_serat_is_refused_by_step_7
+      #     a_final_component_symlink_to_outside_is_refused_by_the_handle_check
+      #     an_alternate_data_stream_name_is_refused
+      #     a_file_inside_the_root_opens_although_the_handle_path_is_verbatim
+      - name: Windows-only checks (vault roots, NTFS names, asset handle checks)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          # A test that cannot run on this runner (no administrative share, no `subst`, no
+          # symlink privilege, 8.3 names off) fails instead of printing SKIPPED and passing.
+          SERAT_WINDOWS_STRICT: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p serat-app --test windows_vault -- --nocapture
+          cargo test -p serat-app --lib asset::tests::windows_only -- --nocapture
+
+  # Task #77: the Windows-only code compiles, from Linux, under the same `-D warnings`. A
+  # `cfg(windows)` body is otherwise first compiled on the Windows runner; this found two
+  # dead-code errors that would have failed that leg. NOT in gate.needs yet: the apt
+  # packages and the `windows-gnu` target are unverified on a runner (the check was run
+  # locally with a stub C compiler and resource compiler), so a red here must not block
+  # every PR. Promote it to the gate after its first green run.
+  windows-compile:
+    name: windows code compiles (x86_64-pc-windows-gnu, check only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install a MinGW toolchain (C compiler and windres for build scripts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target x86_64-pc-windows-gnu --workspace --tests
 
   # Task #119: the npm half of NFR-SEC-07 (US-42, NFR-PRF-08): app/'s dependencies are audited,
   # licence-checked and registry-only, per /npm-deny.json (the npm counterpart of deny.toml).

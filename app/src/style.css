@@ -133,3 +133,21 @@ body {
   color: var(--brass);
   white-space: nowrap;
 }
+
+/* Visually hidden, still read by assistive technology (live-region text, "1000 or more"). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The index text must not change the strip's height when it wraps on narrow windows. */
+.statusbar .index {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
