@@ -18,13 +18,14 @@
 //!
 //! **The class needs no judgement at all** — less than F-496's, which needed
 //! three rules and a measurement to reach usable precision. A line beginning
-//! `<<<<<<< `, `=======` or `>>>>>>> ` is either a conflict or a document
+//! `<<<<<<< `, `||||||| ` (the diff3 base), `=======` or `>>>>>>> ` is either a conflict or a document
 //! *about* conflicts, and the second is excluded structurally: fenced code
 //! blocks and indented blocks are skipped, which is where an example would
 //! live.
 //!
-//! **What it does not cover.** Only the files this crate already scans, which
-//! is `docs/**` plus `CLAUDE.md`. A conflict marker committed into Rust would
+//! **What it does not cover.** Only Markdown that agents and people read as
+//! instructions: `docs/**`, `CLAUDE.md`, `.claude/agents/*.md` and
+//! `bench/**/README.md`. A conflict marker committed into Rust would
 //! not compile and into a workflow would not parse, so those fail loudly on
 //! their own; Markdown is the format where a marker is *invisible until
 //! someone reads that paragraph*, which is exactly what happened both times.
@@ -81,6 +82,9 @@ pub fn check_text(file: &Path, text: &str) -> Vec<MarkerProblem> {
         }
         let marker = if line.starts_with("<<<<<<< ") || line.trim_end() == "<<<<<<<" {
             "<<<<<<<"
+        } else if line.starts_with("||||||| ") || line.trim_end() == "|||||||" {
+            // The diff3 / zdiff3 base marker (`merge.conflictStyle`).
+            "|||||||"
         } else if line.trim_end() == "=======" {
             "======="
         } else if line.starts_with(">>>>>>> ") || line.trim_end() == ">>>>>>>" {
@@ -108,6 +112,19 @@ pub fn check_repo_docs(repo_root: &Path) -> Result<(usize, Vec<MarkerProblem>), 
     let mut files = vec![repo_root.join("CLAUDE.md")];
     collect_markdown(&repo_root.join("docs"), &mut files)
         .map_err(|e| format!("walking docs: {e}"))?;
+    // `.claude/agents/*.md` and `bench/**/README.md`: read as instructions too. Absent
+    // directories are not an error (a temp repo in a test has neither).
+    let agents = repo_root.join(".claude/agents");
+    if agents.is_dir() {
+        let mut found = Vec::new();
+        collect_markdown(&agents, &mut found)
+            .map_err(|e| format!("walking .claude/agents: {e}"))?;
+        files.extend(found);
+    }
+    let bench = repo_root.join("bench");
+    if bench.is_dir() {
+        collect_readmes(&bench, &mut files).map_err(|e| format!("walking bench: {e}"))?;
+    }
     files.sort();
     let scanned = files.len();
     let mut problems = Vec::new();
@@ -119,6 +136,25 @@ pub fn check_repo_docs(repo_root: &Path) -> Result<(usize, Vec<MarkerProblem>), 
         problems.extend(check_text(&rel, &text));
     }
     Ok((scanned, problems))
+}
+
+/// `README.md` files under `bench/`, skipping generated and vendored trees (the
+/// benchmark vaults hold tens of thousands of generated notes; `node_modules` and
+/// `target` are not ours).
+fn collect_readmes(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(name, "vaults" | "node_modules" | "target") || name.starts_with('.') {
+                continue;
+            }
+            collect_readmes(&path, out)?;
+        } else if path.file_name().is_some_and(|n| n == "README.md") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -164,6 +200,18 @@ mod tests {
                 .describe()
                 .contains("does not read the way its source suggests")
         );
+    }
+
+    #[test]
+    fn the_diff3_base_marker_is_caught_too() {
+        // `merge.conflictStyle = diff3`/`zdiff3` adds a `||||||| base` line between
+        // ours and `=======`; a half-resolved diff3 conflict can leave only that.
+        let text = "p\n<<<<<<< HEAD\nours\n||||||| merged common ancestors\nbase\n=======\ntheirs\n>>>>>>> x\n";
+        let markers: Vec<String> = check(text).into_iter().map(|p| p.marker).collect();
+        assert_eq!(markers, ["<<<<<<<", "|||||||", "=======", ">>>>>>>"]);
+        assert_eq!(check("a\n|||||||\n").len(), 1, "bare base marker");
+        // A table row that merely starts with a pipe is not one.
+        assert!(check("| a | b |\n|---|---|\n").is_empty());
     }
 
     #[test]
@@ -214,8 +262,17 @@ mod tests {
             "a\nb\n=======\n>>>>>>> x\n",
         )
         .unwrap();
+        // The two other scanned places: agent definitions and bench READMEs. A non-README
+        // file under bench/ and a README under bench/vaults/ are not scanned.
+        std::fs::create_dir_all(r.join(".claude/agents")).unwrap();
+        std::fs::write(r.join(".claude/agents/a.md"), "x\n<<<<<<< HEAD\n").unwrap();
+        std::fs::create_dir_all(r.join("bench/sub")).unwrap();
+        std::fs::write(r.join("bench/sub/README.md"), "x\n>>>>>>> t\n").unwrap();
+        std::fs::write(r.join("bench/sub/NOTES.md"), "<<<<<<< HEAD\n").unwrap();
+        std::fs::create_dir_all(r.join("bench/vaults/v")).unwrap();
+        std::fs::write(r.join("bench/vaults/v/README.md"), "<<<<<<< HEAD\n").unwrap();
         let (scanned, problems) = check_repo_docs(r).expect("temp tree reads");
-        assert_eq!(scanned, 3);
+        assert_eq!(scanned, 5);
         let found: Vec<(String, usize)> = problems
             .iter()
             .map(|p| (p.file.display().to_string(), p.line))
@@ -223,7 +280,9 @@ mod tests {
         assert_eq!(
             found,
             vec![
+                (".claude/agents/a.md".to_string(), 2),
                 ("CLAUDE.md".to_string(), 2),
+                ("bench/sub/README.md".to_string(), 2),
                 ("docs/03-design/planted.md".to_string(), 3),
                 ("docs/03-design/planted.md".to_string(), 4),
             ]

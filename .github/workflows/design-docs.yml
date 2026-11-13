@@ -4,7 +4,7 @@
 # A citation to a file that is not there reads as complete and stops anyone
 # from looking, and so does a table whose claim depends on a file it does not
 # live in, and so does a table that no longer renders as a table at all. All
-# three jobs are mechanical for that reason: `cargo test -p doclint` covers
+# five jobs are mechanical for that reason: `cargo test -p doclint` covers
 # all of them (they are one crate), and each job also prints its own report so
 # a failure names which check failed without anyone reading a log. Plain
 # `cargo test`, not release-profile timed work, so this runs on every push and
