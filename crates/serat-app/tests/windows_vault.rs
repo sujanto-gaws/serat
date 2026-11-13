@@ -237,8 +237,11 @@ fn a_drive_relative_root_that_names_nothing_is_an_error() {
 
 // -- 2. NTFS names ----------------------------------------------------------------
 
-/// Win32 refuses these names; NTFS stores them, and a vault synced from another system
-/// (or written by a `\\?\` tool) holds them. #34's rule is that the walk neither lists nor
+/// Win32 historically refuses these names (a reserved device name like `aux`, a trailing dot); NTFS
+/// stores them, and a vault synced from another system (or written by a `\\?\` tool) holds them.
+/// **Build-dependent:** from Windows 11 and Server 2025 Win32 no longer reserves `aux.md`, so on such an
+/// image `aux.md` is creatable the ordinary way; the test still creates it through `\\?\`, which works on
+/// every build, and asserts what Serat's own rule (#34, `VaultPath`) does with it, not what Win32 does. #34's rule is that the walk neither lists nor
 /// silently drops them: each is reported, with a count, and the rest of the vault is intact.
 const NTFS_ONLY: [&str; 3] = ["aux.md", "Misc./n.md", "trailing.md."];
 
@@ -342,16 +345,19 @@ fn relativise_refuses_what_ntfs_stores_and_win32_would_not_create() {
 // file, which on a metered or absent connection blocks, fails or costs money, and which a
 // walk, a rebuild or a catch-up would do to *every* file in an online-only vault.
 //
-// Two properties, one of which is believed to hold today and one of which is known not to:
+// ADR-0018 rules this. P2 rule: online-only files are listed, linkable and findable by name,
+// indexed by path only; background work never reads them; an explicit open downloads that one
+// file. **P1 interim (RISK-015): background work may download**; nothing of the P2 rule is
+// implemented in P1. Two tests follow from that:
 //
-// * stat-only paths (`walk`, `stat`, the tree) never hydrate. Believed true: they call
-//   `symlink_metadata` and `read_dir` only. Tested by `stat_paths_do_not_hydrate_a_placeholder`.
-// * `Vault::read` of a placeholder must not hydrate *silently*. It does today
-//   (`fs::read`); `asset::open_verified` documents that it deliberately follows reparse
-//   points so that placeholders still open. No ADR rules on what the correct behaviour
-//   is, so `reading_a_placeholder_is_reported_not_silent` states the weakest requirement
-//   that satisfies "not silent" (an error, or a refusal entry naming the file) and is
-//   EXPECTED TO FAIL until an architect ruling and an implementation exist.
+// * `stat_paths_do_not_hydrate_a_placeholder`: stat-only paths (`walk`, `stat`, the tree) never
+//   hydrate. Believed true today (they call `symlink_metadata` and `read_dir` only); it must stay
+//   true in P1 and P2.
+// * `reading_a_placeholder_is_reported_not_silent` is ADR-0018 section P2 rule item 4: `Vault::read`
+//   refuses a not-local file with `VaultError::NotLocal`. It is EXPECTED TO FAIL until P2 lands that;
+//   the P1 interim allows the silent download, so a failure here today is the recorded RISK-015, not a
+//   defect. When it starts to pass, the P2 rule has been implemented and this test's assertion should
+//   be tightened to `matches!(outcome, Err(VaultError::NotLocal { .. }))`.
 //
 // Both need a folder that OneDrive has synced and whose `placeholder.md` is "online only".
 // Point SERAT_ONEDRIVE_PLACEHOLDER_VAULT at that folder and run with `--ignored`.
@@ -398,7 +404,7 @@ fn stat_paths_do_not_hydrate_a_placeholder() {
 }
 
 #[test]
-#[ignore = "needs a OneDrive placeholder (SERAT_ONEDRIVE_PLACEHOLDER_VAULT) and an architect ruling on placeholder policy; EXPECTED TO FAIL today"]
+#[ignore = "needs a OneDrive placeholder (SERAT_ONEDRIVE_PLACEHOLDER_VAULT); ADR-0018 P2 rule item 4 (VaultError::NotLocal), EXPECTED TO FAIL until P2 (P1 interim, RISK-015)"]
 fn reading_a_placeholder_is_reported_not_silent() {
     let Some((root, note)) = placeholder() else {
         panic!("SERAT_ONEDRIVE_PLACEHOLDER_VAULT is not set");
