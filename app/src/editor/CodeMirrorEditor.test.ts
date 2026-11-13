@@ -290,10 +290,6 @@ describe("CodeMirrorEditor links", () => {
 });
 
 describe("CodeMirrorEditor pane hooks", () => {
-  // jsdom has no execCommand; CodeMirror calls it when focusing a selection.
-  beforeEach(() => {
-    (document as unknown as { execCommand: () => boolean }).execCommand = () => false;
-  });
   it("insertAtCursor is an ordinary tracked edit; it refuses (false) when no note is open", async () => {
     const savePatch = vi.fn().mockResolvedValue(written("h1"));
     const { wrapper, api } = mountEditor(mockIpc(savePatch));

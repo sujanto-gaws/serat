@@ -66,15 +66,16 @@ export default defineConfig(({ mode }) => ({
     globals: false,
     include: ["src/**/*.test.ts"],
     // Task #131 (NFR-MNT-01, NFR-PRF-08): on a 4-core host under load, parallel workers starve
-    // the vitest main process, whose reply to a worker's RPC then misses vitest's fixed 60 s
-    // window (not configurable in 3.2.7) and the run exits 1 with `[vitest-worker]: Timeout
-    // calling "onTaskUpdate"` although every test passed. One worker at a time: 10 of 10 runs
-    // clean under 4 busy loops, against 6 of 10 failing with the default (2 workers: 3 of 3
-    // failing). See docs/05-testing/test-plan.md, "Flake log". The longer per-test limit
-    // covers a starved worker breaching the 5 s default. Re-check after a vitest major bump.
-    pool: "forks",
-    poolOptions: { forks: { maxForks: 1, minForks: 1 } },
-    testTimeout: 20000,
-    hookTimeout: 20000,
+    // the vitest main process. Under vitest 3 the main process's reply to a worker's RPC then
+    // missed a fixed 60 s window and the run exited 1 with `[vitest-worker]: Timeout calling
+    // "onTaskUpdate"` although every test passed (6 of 10 runs under 4 busy loops). vitest 5
+    // sets that window to none (`timeout: -1` in the worker RPC), so the failure's cause is
+    // gone; the cap stays because it costs nothing (60.7 s with one worker against 63.1 s
+    // with three, 561 tests) and keeps the workers off the main process's core. Note that
+    // vitest 4 removed `test.poolOptions`: `poolOptions.forks.maxForks` is now ignored with
+    // only a deprecation line, and the option is the top-level `maxWorkers`.
+    // See docs/05-testing/test-plan.md, "Flake log".
+    maxWorkers: 1,
+    setupFiles: ["src/test/jsdom-shims.ts"],
   },
 }));

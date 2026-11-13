@@ -544,6 +544,36 @@ mod tests {
         watcher.stop();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_name_only_windows_refuses_is_recorded_with_a_reason_under_the_windows_rules() {
+        // The watcher's conversion (`Vault::relativise`) judges by the vault's
+        // platform, not the host's: mutant `Platform::current()` there queues it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(dir.path())
+            .expect("open")
+            .with_platform(serat_core::Platform::Windows);
+        let queue = Arc::new(WorkQueue::new());
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::write(dir.path().join("aux.md"), b"# Aux\n").expect("write");
+
+        assert!(
+            eventually(|| !vault.refusals().is_empty()),
+            "the watcher never recorded the refusal"
+        );
+        let found = vault.refusals().snapshot();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "aux.md");
+        assert!(
+            found[0].reason.contains("reserved Windows device"),
+            "{found:?}"
+        );
+        assert_eq!(queue.depth(), 0, "a refused name was queued");
+        watcher.stop();
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn a_name_only_windows_would_refuse_reaches_the_queue_on_this_platform() {
