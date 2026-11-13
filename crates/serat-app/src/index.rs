@@ -553,6 +553,18 @@ pub struct SeratIndexOpen {
     retry_bound: Duration,
 }
 
+/// The `Unavailable` text once the wait for another holder of the index writer lock is over
+/// (task #155; wording ratified by the architect). "Session", not "window": the holder can be a
+/// benchmark run, another open in this process, or a lock the operating system has not released.
+pub(crate) fn held_gave_up_message(bound: Duration) -> String {
+    format!(
+        "Another Serat session still has this vault's index open after waiting {} seconds. \
+         Search and queries are unavailable until you reopen the vault after that session \
+         ends. You can keep editing.",
+        bound.as_secs()
+    )
+}
+
 /// Between attempts while another process holds the index writer lock (task #155).
 pub const HELD_RETRY_EVERY: Duration = Duration::from_secs(2);
 
@@ -698,13 +710,7 @@ impl IndexOpen for SeratIndexOpen {
             Err(serat_core::IndexError::HeldByAnotherProcess { .. }) => {
                 clear_reason();
                 publish(IndexState::Unavailable {
-                    message: format!(
-                        "another Serat window or process still has this vault's index open \
-                         after waiting {} seconds. Search and queries are unavailable in \
-                         this one; the vault remains fully editable. Close the other one and \
-                         reopen the vault to use the index here.",
-                        self.retry_bound.as_secs()
-                    ),
+                    message: held_gave_up_message(self.retry_bound),
                     path: index_dir.display().to_string(),
                 });
             }
