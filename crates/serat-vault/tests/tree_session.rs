@@ -503,3 +503,202 @@ fn the_metadata_walk_streams_the_same_messages_and_taps_each_listing_with_metada
         [(String::new(), 2, true), ("sub".to_owned(), 1, true)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// replay_to (task #68; FR-VLT-01, NFR-PRF-01; ADR-0015 §1)
+// ---------------------------------------------------------------------------
+
+fn front_of(log: &Arc<Mutex<Vec<TreeOut>>>) -> BTreeMap<String, Vec<String>> {
+    let mut front = Front::default();
+    front.apply(&log.lock().expect("log"));
+    front.dirs
+}
+
+fn markers(log: &Arc<Mutex<Vec<TreeOut>>>) -> Vec<TreeOut> {
+    log.lock()
+        .expect("log")
+        .iter()
+        .filter(|o| !matches!(o, TreeOut::Op(_)))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_replay_after_complete_yields_the_same_tree_and_marks_without_a_second_walk() {
+    let (dir, vault) = fixture();
+    let (session, first) = session();
+    let mut reads = 0u32;
+    session
+        .populate_from_walk_with_metadata(&vault, &mut |_, _| reads += 1)
+        .expect("walk");
+    assert!(reads > 0);
+
+    // The vault is gone: whatever the replay sends cannot have come from a directory read.
+    drop(vault);
+    fs::remove_dir_all(dir.path()).expect("rm");
+
+    let second = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&second);
+    session
+        .replay_to(move |out| sink.lock().expect("log").push(out))
+        .expect("replay");
+
+    assert_eq!(front_of(&second), front_of(&first), "a different tree");
+    assert_eq!(
+        markers(&second),
+        markers(&first),
+        "different Complete/Settled"
+    );
+    // Root first, parents before children.
+    let order: Vec<String> = second
+        .lock()
+        .expect("log")
+        .iter()
+        .filter_map(|o| match o {
+            TreeOut::Op(TreeOp::Listing { dir, .. }) => Some(dir.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order[0], "");
+    for (i, d) in order.iter().enumerate() {
+        if let Some((parent, _)) = d.rsplit_once('/') {
+            assert!(
+                order[..i].iter().any(|p| p == parent),
+                "{d} before {parent}"
+            );
+        }
+    }
+    let progress = session.progress();
+    assert!(progress.root_sent && progress.complete.is_some() && progress.settled);
+}
+
+#[test]
+fn a_replay_mid_walk_carries_what_was_sent_and_the_rest_follows_on_the_new_channel() {
+    let (_dir, vault) = fixture();
+    let (session, first) = session();
+    // A subtree rescan lists some directories and sends no Complete: a walk part-way.
+    session.rescan(&vault, "10-projects").expect("rescan");
+    assert!(markers(&first).is_empty());
+    let sent_so_far = front_of(&first);
+    assert!(!sent_so_far.is_empty());
+
+    let second = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&second);
+    session
+        .replay_to(move |out| sink.lock().expect("log").push(out))
+        .expect("replay");
+    assert_eq!(front_of(&second), sent_so_far);
+    assert!(markers(&second).is_empty(), "no Complete was sent yet");
+
+    // The walk finishing now reaches the new channel only.
+    let first_len = first.lock().expect("log").len();
+    session.populate_from_walk(&vault).expect("walk");
+    assert_eq!(
+        first.lock().expect("log").len(),
+        first_len,
+        "old channel kept writing"
+    );
+    let (_d2, vault2) = fixture();
+    let (reference, reference_log) = session_pair();
+    reference.populate_from_walk(&vault2).expect("walk");
+    assert_eq!(front_of(&second), front_of(&reference_log));
+    assert_eq!(markers(&second), markers(&reference_log));
+}
+
+fn session_pair() -> (TreeSession, Arc<Mutex<Vec<TreeOut>>>) {
+    session()
+}
+
+#[test]
+fn a_replay_racing_live_updates_never_drops_or_duplicates_an_entry() {
+    const N: usize = 400;
+    let (_dir, vault) = fixture();
+    let (session, _first) = session();
+    session.populate_from_walk(&vault).expect("walk");
+    let session = Arc::new(session);
+
+    let producer = {
+        let session = Arc::clone(&session);
+        thread::spawn(move || {
+            for i in 0..N {
+                let _ = session.created(&format!("f{i:04}.md"), TreeKind::Note);
+            }
+        })
+    };
+    let mut logs = Vec::new();
+    while !producer.is_finished() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        session
+            .replay_to(move |out| sink.lock().expect("log").push(out))
+            .expect("replay");
+        logs.push(log);
+        thread::yield_now();
+    }
+    producer.join().expect("producer");
+    assert!(logs.len() > 1, "the replays never overlapped the updates");
+
+    let mut longest = 0;
+    for (n, log) in logs.iter().enumerate() {
+        // Every f-name the log carries, in the snapshot or as a later upsert.
+        let mut names = Vec::new();
+        for out in log.lock().expect("log").iter() {
+            match out {
+                TreeOut::Op(TreeOp::Listing { dir, entries }) if dir.is_empty() => {
+                    names.extend(
+                        entries
+                            .iter()
+                            .filter(|e| e.name.starts_with('f'))
+                            .map(|e| e.name.clone()),
+                    );
+                }
+                TreeOut::Op(TreeOp::Upsert { dir, entry, .. }) if dir.is_empty() => {
+                    names.push(entry.name.clone());
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            log.lock().expect("log").iter().any(|o| matches!(
+                o,
+                TreeOut::Op(TreeOp::Listing { dir, .. }) if dir.is_empty()
+            )),
+            "log {n} never got the snapshot"
+        );
+        longest = longest.max(names.len());
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "log {n}: an entry arrived twice");
+        let expected: Vec<String> = (0..names.len()).map(|i| format!("f{i:04}.md")).collect();
+        assert_eq!(sorted, expected, "log {n}: an entry was dropped");
+    }
+    assert!(longest > 0, "no replay carried a created entry");
+}
+
+#[test]
+fn a_replay_after_the_session_ended_or_died_is_a_typed_error() {
+    let (_dir, vault) = fixture();
+    let (session, _first) = session();
+    session.populate_from_walk(&vault).expect("walk");
+    session.close();
+    let late = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&late);
+    let result = session.replay_to(move |out| sink.lock().expect("log").push(out));
+    assert_eq!(result, Err(serat_vault::ReplayError::Closed));
+    assert!(late.lock().expect("log").is_empty());
+
+    // A dead session (a sink panic) is the other way a session ends.
+    let doomed = Arc::new(TreeSession::new(|_| panic!("sink failure")));
+    let d = Arc::clone(&doomed);
+    let _ = thread::spawn(move || {
+        let _ = d.created("a.md", TreeKind::Note);
+        let _ = d.populate_from_walk(&vault);
+    })
+    .join();
+    assert!(doomed.is_poisoned());
+    assert_eq!(
+        doomed.replay_to(|_| {}),
+        Err(serat_vault::ReplayError::Poisoned)
+    );
+}

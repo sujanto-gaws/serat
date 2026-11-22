@@ -248,6 +248,26 @@ impl Vault {
     }
 }
 
+/// Why [`TreeSession::replay_to`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The session was ended with [`TreeSession::close`].
+    Closed,
+    /// A panic in the session's sink killed it; start a new session.
+    Poisoned,
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => f.write_str("the tree session has ended"),
+            Self::Poisoned => f.write_str("the tree session was poisoned by a panic in its sink"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
 /// What the session has delivered, for a caller validating a front-end mark against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeProgress {
@@ -306,12 +326,22 @@ struct Inner {
     sink: Box<dyn FnMut(TreeOut) + Send>,
     progress: Arc<ProgressCell>,
     walk_sent: bool,
+    /// `WalkSettled`'s count, kept so a replay says what the first channel was told.
+    settled_empty_folders: u32,
+    /// [`TreeSession::close`] was called: the session has ended.
+    closed: bool,
 }
 
 impl Inner {
     fn emit(&mut self, out: TreeOut) {
         let root = matches!(&out, TreeOut::Op(TreeOp::Listing { dir, .. }) if dir.is_empty());
         let settled = matches!(&out, TreeOut::WalkSettled { .. });
+        if let TreeOut::WalkSettled { empty_folders } = &out {
+            self.settled_empty_folders = *empty_folders;
+        }
+        if self.closed {
+            return;
+        }
         let complete = match &out {
             TreeOut::Complete { entries, source } => Some((*entries, *source)),
             _ => None,
@@ -409,6 +439,8 @@ impl TreeSession {
                 sink: Box::new(sink),
                 progress: Arc::clone(&progress),
                 walk_sent: false,
+                settled_empty_folders: 0,
+                closed: false,
             }),
             progress,
         }
@@ -427,6 +459,62 @@ impl TreeSession {
                 "the tree session was poisoned by a panic in its sink; restart the stream",
             ),
         )
+    }
+
+    /// End the session: the sink is no longer called, further walk and live methods change
+    /// the model but send nothing, and [`Self::replay_to`] is refused with
+    /// [`ReplayError::Closed`]. For a vault switch or exit, where the stream is over.
+    pub fn close(&self) {
+        self.with(|inner| inner.closed = true);
+    }
+
+    /// Attach a new receiver to this session: a reloaded webview's new channel (task #68;
+    /// ADR-0015 §1). It receives, in order and as one consistent snapshot taken under the
+    /// session lock:
+    ///
+    /// 1. every directory listing sent so far, root first, then by depth (a parent before
+    ///    its children), exactly the state the first receiver holds;
+    /// 2. [`TreeOut::Complete`] with the entry count and source it first carried, if the
+    ///    initial population finished;
+    /// 3. [`TreeOut::WalkSettled`] with its original count, if the walk settled.
+    ///
+    /// then every later message, live or from a walk still running, in the one order. The
+    /// swap and the snapshot happen under the same lock as every send, so a live update
+    /// racing the replay is either inside the snapshot or after it, never dropped and never
+    /// sent twice. **Nothing is enumerated again**: there is no [`Vault`] argument, so
+    /// the walk is not repeated and no catch-up is owed.
+    ///
+    /// The previous sink is dropped: the new receiver supersedes it. The progress marks
+    /// ([`Self::progress`]) are stored before each message reaches `sink`, as for any
+    /// send (#141); they already read as sent, since the first receiver was sent the
+    /// same messages. An index read or walk in flight keeps its snapshot bookkeeping, so
+    /// listings it has yet to offer still respect removes already made.
+    ///
+    /// A panic in `sink` poisons the session, as for any sink.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayError::Closed`] after [`Self::close`]; [`ReplayError::Poisoned`] if the
+    /// session died of a sink panic. In both, `sink` is dropped unused.
+    pub fn replay_to(&self, sink: impl FnMut(TreeOut) + Send + 'static) -> Result<(), ReplayError> {
+        let mut guard = self.inner.lock().map_err(|_| ReplayError::Poisoned)?;
+        let inner = &mut *guard;
+        if inner.closed {
+            return Err(ReplayError::Closed);
+        }
+        inner.sink = Box::new(sink);
+        let listings = inner.model.replay();
+        let complete = inner.progress.complete();
+        let settled = inner.progress.settled.load(Ordering::Acquire);
+        let empty_folders = inner.settled_empty_folders;
+        inner.emit_all(listings);
+        if let Some((entries, source)) = complete {
+            inner.emit(TreeOut::Complete { entries, source });
+        }
+        if settled {
+            inner.emit(TreeOut::WalkSettled { empty_folders });
+        }
+        Ok(())
     }
 
     /// Whether the session died (a panic in its sink). Restart the stream.

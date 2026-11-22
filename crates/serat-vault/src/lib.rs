@@ -72,7 +72,9 @@ pub use patch::Edit;
 pub use position::Position;
 pub use queue::{QueueStats, WorkQueue};
 pub use refusal::{Refusal, RefusalLog};
-pub use tree::{RescanNeeded, TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary};
+pub use tree::{
+    ReplayError, RescanNeeded, TreeOut, TreeProgress, TreeSession, TreeSource, WalkSummary,
+};
 
 pub use watch::{VaultEvent, Watcher, WatcherConfig};
 
