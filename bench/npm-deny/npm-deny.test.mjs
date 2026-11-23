@@ -137,3 +137,19 @@ test("sources: git, file, link, http, another host and a missing resolved are re
   assert.deepEqual(bad, ["f", "g", "h", "l", "n", "o"]);
   assert.deepEqual(sourceBreaches({ packages: { "node_modules/ok": { resolved: `${reg}ok.tgz` } } }, reg), []);
 });
+
+// OFL-1.1 is allow-listed globally (npm-deny.json), but only for the three bundled font packages (task #162):
+// a new OFL package, or a font package losing its licence, must be a deliberate change to this list.
+test("the lockfile's OFL-1.1 packages are exactly the three bundled font packages", async () => {
+  const { readFileSync } = await import("node:fs");
+  const lock = JSON.parse(readFileSync(new URL("../../app/package-lock.json", import.meta.url), "utf8"));
+  const ofl = Object.entries(lock.packages)
+    .filter(([key, pkg]) => key && /(^|[ (])OFL-1\.1($|[ )])/.test(String(pkg.license)))
+    .map(([key]) => key.replace(/^node_modules\//, ""))
+    .sort();
+  assert.deepEqual(ofl, [
+    "@fontsource-variable/bricolage-grotesque",
+    "@fontsource-variable/jetbrains-mono",
+    "@fontsource-variable/source-serif-4",
+  ]);
+});

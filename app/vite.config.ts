@@ -17,11 +17,12 @@ import { fileURLToPath, URL } from "node:url";
 import vue from "@vitejs/plugin-vue";
 import { defineConfig } from "vitest/config";
 
+import { fontLicensesPlugin } from "./src/build/fontLicenses";
 import { pdfjsDataPlugin } from "./src/build/pdfjsData";
 
 export default defineConfig(({ mode }) => ({
   base: "./",
-  plugins: [vue(), pdfjsDataPlugin()],
+  plugins: [vue(), pdfjsDataPlugin(), fontLicensesPlugin()],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),

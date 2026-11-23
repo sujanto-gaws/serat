@@ -3,7 +3,7 @@
 // through Vite, nothing points off-origin, and the licence text of each font package is on disk.
 
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const CSS = readFileSync(join(__dirname, "fonts.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -23,6 +23,13 @@ const PACKAGES: Record<string, string> = {
   "Bricolage Grotesque": "bricolage-grotesque",
   "JetBrains Mono": "jetbrains-mono",
 };
+
+const WOFF2 = [
+  "source-serif-4-latin-wght-normal.woff2",
+  "source-serif-4-latin-wght-italic.woff2",
+  "bricolage-grotesque-latin-wght-normal.woff2",
+  "jetbrains-mono-latin-wght-normal.woff2",
+];
 
 describe("bundled fonts (NFR-SEC-01)", () => {
   it("declares all three families", () => {
@@ -47,17 +54,23 @@ describe("bundled fonts (NFR-SEC-01)", () => {
     const dir = join(APP, "node_modules", "@fontsource-variable", name);
     expect(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).license).toBe("OFL-1.1");
     expect(readFileSync(join(dir, "LICENSE"), "utf8")).toMatch(/SIL OPEN FONT LICENSE/i);
-    expect(dirname(join(dir, "LICENSE"))).toBe(dir);
+  });
+
+  it.each(Object.values(PACKAGES))("the committed bundle ships %s's licence text beside the fonts (OFL-1.1 section 2)", (name) => {
+    const shipped = join(APP, "..", "crates", "serat-app", "webview", "assets", `LICENSE_${name}`);
+    const source = join(APP, "node_modules", "@fontsource-variable", name, "LICENSE");
+    expect(existsSync(shipped)).toBe(true);
+    expect(readFileSync(shipped, "utf8")).toBe(readFileSync(source, "utf8"));
+  });
+
+  it("the committed shell.css references each woff2 under assets/", () => {
+    const shell = readFileSync(resolve(APP, "..", "crates", "serat-app", "webview", "shell.css"), "utf8");
+    for (const f of WOFF2) expect(shell).toContain(`url(./assets/${f})`);
   });
 
   it("the committed bundle carries the four woff2 files", () => {
     const assets = resolve(APP, "..", "crates", "serat-app", "webview", "assets");
-    for (const f of [
-      "source-serif-4-latin-wght-normal.woff2",
-      "source-serif-4-latin-wght-italic.woff2",
-      "bricolage-grotesque-latin-wght-normal.woff2",
-      "jetbrains-mono-latin-wght-normal.woff2",
-    ]) {
+    for (const f of WOFF2) {
       expect(existsSync(join(assets, f)), f).toBe(true);
     }
   });
