@@ -1058,12 +1058,59 @@ mod tests {
                 ));
             }
             let lower = declarations.to_ascii_lowercase();
+            if selector.eq_ignore_ascii_case("@font-face") {
+                if let Some(why) = font_face_violation(&lower) {
+                    return Some(why);
+                }
+                continue;
+            }
             if let Some(f) = IMAGE_FUNCTIONS.iter().find(|f| lower.contains(*f)) {
                 return Some(format!(
                     "`{selector}` uses `{f}`. An image is contentful paint, unlike a \
                      background *colour*, so it would make `first-contentful-paint` measure \
                      the image rather than our content (#128, F-396(b))."
                 ));
+            }
+        }
+        None
+    }
+
+    /// The `@font-face` exception (#162). A font resource is not contentful paint: the
+    /// declaration paints nothing, it only changes the face of text the markup half
+    /// already guarantees is absent before boot. Kept narrow: only a `src` descriptor
+    /// may carry `url(`, and only with a bundled relative path such as `./assets/x.woff2`
+    /// (remote, `data:`, absolute and protocol-relative sources are refused, NFR-SEC-01); any
+    /// other image function, or `url(` in any other descriptor, is still refused.
+    /// `declarations` is lower-cased by the caller.
+    fn font_face_violation(declarations: &str) -> Option<String> {
+        for decl in declarations.split(';') {
+            let (prop, value) = decl.split_once(':').unwrap_or(("", decl));
+            let prop = prop.trim();
+            if let Some(f) = IMAGE_FUNCTIONS
+                .iter()
+                .filter(|f| **f != "url(")
+                .find(|f| value.contains(*f))
+            {
+                return Some(format!("`@font-face` `{prop}` uses `{f}`."));
+            }
+            for (i, _) in value.match_indices("url(") {
+                if prop != "src" {
+                    return Some(format!(
+                        "`@font-face` descriptor `{prop}` uses `url(`; only `src` may."
+                    ));
+                }
+                let arg = value[i + 4..].split(')').next().unwrap_or("");
+                let arg = arg.trim().trim_matches(['"', '\'']);
+                let relative = !arg.is_empty()
+                    && !arg.contains(':')
+                    && !arg.starts_with(['/', '\\'])
+                    && !arg.contains("..");
+                if !relative {
+                    return Some(format!(
+                        "`@font-face` `src` loads `{arg}`; only a bundled relative \
+                         path (no scheme, no leading slash, no `..`) or `local()` is allowed (NFR-SEC-01)."
+                    ));
+                }
             }
         }
         None
@@ -1188,6 +1235,12 @@ mod tests {
         // function anywhere in it is refused. An earlier bounded-reach form ("only
         // html, body, #app") missed four routes and was replaced.
         //
+        // ONE EXCEPTION (#162): `url(` in the `src` of an `@font-face` pointing at a
+        // bundled relative file such as `./assets/x.woff2`. A font resource is neither generated content nor
+        // an image; the rule paints nothing and only changes the face of text that the
+        // markup half guarantees is absent before boot. `content` there, remote or
+        // `data:` sources, and `url(` in any other descriptor are still refused.
+        //
         // A background *colour* is First Paint, not First *Contentful* Paint, so
         // `body{background:var(--paper)}` is correctly ignored: this looks for `url(`,
         // not for `background`. That distinction corrected architect's own
@@ -1230,13 +1283,59 @@ mod tests {
             (r#"body{background:url(a.png)}"#, "url() background"),
             (r#"@import url(a.css);"#, "bare @import url()"),
             ("body:before{content:none}", "content: none is refused too"),
+            (
+                r#"@font-face{font-family:x;src:url(a.woff2);content:"x"}"#,
+                "content inside @font-face",
+            ),
+            (
+                ".x{background:url(a.png)}",
+                "url() background in an ordinary rule",
+            ),
+            (
+                "@font-face{font-family:x;src:url(http://evil/a.woff2)}",
+                "remote @font-face source (NFR-SEC-01)",
+            ),
+            (
+                "@font-face{font-family:x;src:url(//evil/a.woff2)}",
+                "protocol-relative @font-face source",
+            ),
+            (
+                "@font-face{font-family:x;unicode-range:url(./assets/a.woff2)}",
+                "url() in a non-src @font-face descriptor",
+            ),
         ] {
             let sheet = format!("{clean}{mutant}");
             assert!(
                 stylesheet_paint_violation(&sheet).is_some(),
-                "the stylesheet check let `{name}` through: {mutant}"
+                "the stylesheet check let `{name}` through: {mutant} (the only url() \
+                 allowed is a bundled relative font in an @font-face src; content and \
+                 remote or non-src url() are refused there too)"
             );
         }
+        // The one exception: a bundled font resource paints nothing by itself.
+        let font =
+            r#"@font-face{font-family:x;src:local("x"),url(./assets/a.woff2) format("woff2")}"#;
+        assert_eq!(stylesheet_paint_violation(&format!("{clean}{font}")), None);
+        assert_eq!(
+            stylesheet_paint_violation(
+                r#"@font-face{font-family:x;src:url(./assets/a.woff2) format("woff2")}"#
+            ),
+            None
+        );
+        assert_eq!(
+            stylesheet_paint_violation(
+                r#"@font-face{font-family:x;src:url(a.woff2) format("woff2")}"#
+            ),
+            None
+        );
+        // `@media{@font-face{` is judged by its own innermost selector.
+        assert_eq!(
+            stylesheet_paint_violation(
+                "@media(min-width:1px){@font-face{font-family:x;src:url(./assets/a.woff2)}}"
+            ),
+            None
+        );
+        assert!(stylesheet_paint_violation("@import url(x.css);").is_some());
     }
 
     #[test]
