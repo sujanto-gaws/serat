@@ -5,10 +5,11 @@
    the real screens (live preview, lens switcher, file tree). */
 
 :root {
-  --indigo: #24457e;
-  --brass: #c08a47;
-  --ink: #16191b;
-  --paper: #f3f4f1;
+  /* The P0 names, now aliases of the brand tokens (styles/tokens.css, imported first in main.ts). */
+  --indigo: var(--serat-brand-indigo);
+  --brass: var(--serat-brand-brass);
+  --ink: var(--serat-brand-ink);
+  --paper: var(--serat-brand-paper);
 }
 
 * {

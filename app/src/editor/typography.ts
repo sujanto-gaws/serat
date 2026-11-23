@@ -12,7 +12,7 @@
 
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, lineNumbers } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 
 import { seratTags } from "@/editor/mdExtensions";
@@ -39,7 +39,12 @@ export const seratHighlightStyle = HighlightStyle.define([
 /** `serat-live` or `serat-source` on `.cm-editor`. Reconfigured (not rebuilt) when `editor.live_preview`
  * toggles. */
 export function modeClass(mode: EditorMode): Extension {
-  return EditorView.editorAttributes.of({ class: mode === "live" ? "serat-live" : "serat-source" });
+  return [
+    EditorView.editorAttributes.of({ class: mode === "live" ? "serat-live" : "serat-source" }),
+    // No gutter in live mode: the reveal rule is the only line-level signal (editor.md, column and rhythm).
+    // Source mode is the faithful view of the bytes, so it keeps line numbers.
+    mode === "source" ? lineNumbers() : [],
+  ];
 }
 
 /** The highlighter: installed in both modes (source mode is "plain syntax-highlighted Markdown"). */

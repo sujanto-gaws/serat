@@ -30,7 +30,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
 import { ChangeSet, Compartment, EditorState, type Extension, Prec, Transaction } from "@codemirror/state";
-import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
+import { EditorView, placeholder } from "@codemirror/view";
 
 import type { CommandRegistry } from "@/editor/commands";
 import { buildEditorExtensions, createEditorCommandRegistry, editorScrollExtensions } from "@/editor/codemirrorSetup";
@@ -115,6 +115,10 @@ const liveExtensions: Extension[] = [revealMarkersPlugin, blockWidgetsExtension(
 /** `serat-live` or `serat-source` on `.cm-editor`: the switch the design CSS keys on (serif prose and
  * headings vs mono-source throughout). Reconfigured with `revealCompartment`, never rebuilt. */
 const modeCompartment = new Compartment();
+let unlistenFonts: (() => void) | null = null;
+function onFontsLoaded(): void {
+  view?.requestMeasure();
+}
 const dirty = ref(false);
 const previewSource = ref("");
 /** True only while `loadNote`/`setText` replace the whole state — that must
@@ -684,7 +688,6 @@ async function unsafeToClose(): Promise<string | null> {
 function buildExtensions(livePreview: boolean): Extension[] {
   return [
     freezeCompartment.of(frozen ? FROZEN_EXTENSIONS : []),
-    lineNumbers(),
     // Read-only until `loadNote` installs a buffer: text typed in any earlier
     // window would have no base to be a patch against (C-04, NFR-REL-01).
     EditorState.readOnly.of(!buffer),
@@ -725,6 +728,11 @@ onMounted(() => {
   }
   const shadowRoot = host.value.attachShadow({ mode: "open" });
   adoptEditorStyles(shadowRoot); // the design CSS reaches `.cm-editor` only inside this root
+  // CodeMirror measures line heights once; a face that finishes loading afterwards changes them (editor.md, Fonts).
+  if (typeof document !== "undefined" && document.fonts?.addEventListener) {
+    document.fonts.addEventListener("loadingdone", onFontsLoaded);
+    unlistenFonts = () => document.fonts.removeEventListener("loadingdone", onFontsLoaded);
+  }
   // `index://changed` is invalidation only (§3.4): drop cached resolutions and
   // ask the links plugin to rescan the viewport.
   props.linkIpc
@@ -777,6 +785,8 @@ onBeforeUnmount(() => {
   unlistenClosing = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
+  unlistenFonts?.();
+  unlistenFonts = null;
   view?.destroy();
   view = null;
 });

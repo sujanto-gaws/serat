@@ -24,11 +24,11 @@
 }
 
 /* Always-visible machine syntax (components.md section 3): block ids and inline fields, mono-source in
-   text-tertiary, never hidden. Same face in source mode. */
+   text-secondary, never hidden. Same face in source mode. */
 .cm-editor .serat-machine {
   font-family: var(--serat-font-mono);
   font-size: var(--serat-type-mono-source-size);
-  color: var(--serat-text-tertiary);
+  color: var(--serat-text-secondary); /* text-tertiary is 3.25:1 on surface; these are always visible */
 }
 
 /* A footnote reference reads as a raised number; its brackets are markers and hide off-line. */
@@ -42,4 +42,38 @@
 /* The editor fills its pane; the pane, not CodeMirror, draws the surface. */
 .cm-editor {
   background: var(--serat-surface);
+}
+
+/* The whitespace before a list marker on a revealed line: kept in the document, taken out of the layout so the
+   hanging indent is the same revealed or not. (Off the selected line the whitespace is hidden outright.) */
+.cm-editor.serat-live .serat-indent-raw {
+  font-size: 0;
+}
+
+/* The properties block is raw text: whatever the Markdown parse found inside it (a `[a, b]` link, emphasis) takes
+   the block's face, not the rendered one. */
+.cm-editor.serat-live .serat-frontmatter :is(.serat-md-link, .serat-strong, .serat-em, .serat-strike, .serat-code, .serat-highlight, .serat-url) {
+  color: inherit;
+  font: inherit;
+  text-decoration: none;
+  background: none;
+  padding: 0;
+}
+
+/* Source mode keeps a line-number gutter: quiet, mono, in the same colour as markers. */
+.cm-editor.serat-source .cm-gutters {
+  background: transparent;
+  border: 0;
+  color: var(--serat-text-secondary);
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-micro-size);
+}
+
+/* The caret keeps a 24px margin from the top edge (EDITOR_SCROLL_MARGINS, a measured exception: do not change it
+   here), measured to the caret's own top, which sits about 6px inside a 34/40 H1 line. CodeMirror scrolls until the
+   caret is 24px from the edge, so any column padding above 18px leaves Control+Home short of scrollTop 0 (the
+   reference's 24px left it at 6, and at 32px it is 14), which breaks the NFR-PRF-02 harness's "scrolled to the top"
+   check and means the top of the note can never be reached flush. space-5 (16px) clears it. */
+.cm-editor.serat-live .cm-content {
+  padding-top: var(--serat-space-5);
 }

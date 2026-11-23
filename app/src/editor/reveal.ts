@@ -11,12 +11,15 @@
 // Two kinds of marker are hidden:
 //   1. Standard `@lezer/markdown` delimiter nodes, whose names all end in
 //      "Mark" (`HeaderMark`, `EmphasisMark`, `StrikethroughMark`,
-//      `CodeMark`, `QuoteMark`, `ListMark`, `LinkMark`) — the whole node is
+//      `CodeMark`, `QuoteMark`, `LinkMark`) — the whole node is
 //      the marker, so it is hidden verbatim.
 //   2. This codebase's own constructs from `mdExtensions.ts`
 //      (`SeratWikiLink`, `SeratEmbed`, `SeratHighlight`,
 //      `SeratFootnoteRef`), whose marker sub-ranges (`[[`/`]]`, `==`/`==`,
 //      `[^`/`]`) are computed from the node's own fixed shape.
+//
+// `ListMark` is not hidden: a bullet becomes a glyph widget off the selected line and an ordered numeral stays
+// visible (editor.md, Block level). `scanReveal` also returns the per-line classes the design CSS keys on.
 //
 // `SeratBlockRef` and `SeratField` are excluded on purpose — components.md
 // §3: "always visible (never hidden by the reveal rule — they are
@@ -24,7 +27,7 @@
 
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Range, Text } from "@codemirror/state";
-import { Decoration, ViewPlugin, type DecorationSet, type EditorView, type ViewUpdate } from "@codemirror/view";
+import { Decoration, ViewPlugin, WidgetType, type DecorationSet, type EditorView, type ViewUpdate } from "@codemirror/view";
 
 import { SERAT_REVEALABLE_NODE_TYPES } from "@/editor/mdExtensions";
 
@@ -93,9 +96,11 @@ export interface RevealScan {
   /** The custom-syntax markers (`[[`, `==`, `[^`) left showing on a selected line. They take the
    * `serat-marker` class (mono, text-secondary); the standard markers get it from the highlighter. */
   revealedMarkers: Span[];
-  /** List markers, which stay visible on every line (a list with no bullets is not a list): the class
-   * is `serat-bullet` or `serat-list-number`. */
-  listMarks: Array<Span & { ordered: boolean }>;
+  /** List markers (editor.md, Block level). A bullet off the selected line is replaced by a glyph widget
+   * (`widget: true`, the span includes the space after the mark); on a revealed line, and for every ordered
+   * numeral, the raw marker stays and takes the class (`serat-bullet` / `serat-list-number`). `indent` is
+   * the whitespace before the marker, hidden so it does not double the hanging padding. */
+  listMarks: Array<Span & { ordered: boolean; widget: boolean; indent: Span | null }>;
   /** Line classes by line start offset (one `Decoration.line` per line): headings, quotes, code, list
    * items, rules and the YAML properties block. */
   lines: Map<number, string>;
@@ -125,7 +130,7 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
   const { doc } = state;
   const hidden: Span[] = [];
   const revealedMarkers: Span[] = [];
-  const listMarks: Array<Span & { ordered: boolean }> = [];
+  const listMarks: RevealScan["listMarks"] = [];
   const lines = new Map<number, string>();
   const addClass = (lineFrom: number, cls: string) => {
     const have = lines.get(lineFrom);
@@ -157,11 +162,25 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
         else if (name === "ListItem") {
           classLines(node.from, node.from, from, to, `serat-li serat-depth-${Math.min(listDepth - 1, MAX_LIST_DEPTH)}`);
         } else if (name === "ListMark") {
-          listMarks.push({ from: node.from, to: node.to, ordered: node.node.parent?.parent?.name === "OrderedList" });
+          const line = doc.lineAt(node.from);
+          const ordered = node.node.parent?.parent?.name === "OrderedList";
+          const revealed = selectedLines.has(line.number);
+          const lead = state.sliceDoc(line.from, node.from);
+          const indent = lead.length > 0 && /^[ \t]+$/.test(lead) ? { from: line.from, to: node.from } : null;
+          const spaced = state.sliceDoc(node.to, node.to + 1) === " ";
+          listMarks.push({
+            from: node.from,
+            to: spaced ? node.to + 1 : node.to,
+            ordered,
+            widget: !ordered && !revealed,
+            indent,
+          });
           return;
         }
         const isCustom = SERAT_REVEALABLE_NODE_TYPES.has(name);
-        const isStandard = isStandardMarkNode(name);
+        // The `(url)` of `[text](url)` is syntax too: it shows only on a revealed line (editor.md, Inline).
+        const isLinkUrl = name === "URL" && node.node.parent?.name === "Link";
+        const isStandard = isStandardMarkNode(name) || isLinkUrl;
         if (!isCustom && !isStandard) {
           return;
         }
@@ -177,7 +196,14 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
         }
         if (isStandard) {
           if (node.from < node.to) {
-            hidden.push({ from: node.from, to: node.to });
+            // The space after `#` / `>` is part of the marker as far as the reader goes: left behind it
+            // would indent the first word by a space's width.
+            let end = node.to;
+            if (name === "HeaderMark" || name === "QuoteMark") {
+              const lineEnd = doc.lineAt(node.to).to;
+              while (end < lineEnd && /[ \t]/.test(state.sliceDoc(end, end + 1))) end++;
+            }
+            hidden.push({ from: node.from, to: end });
           }
         } else {
           const text = state.sliceDoc(node.from, node.to);
@@ -223,12 +249,34 @@ export function collectHiddenMarkerSpans(
 const lineDecorations = new Map<string, Decoration>();
 function lineDecoration(cls: string): Decoration {
   let deco = lineDecorations.get(cls);
-  if (!deco) lineDecorations.set(cls, (deco = Decoration.line({ class: cls })));
+  if (!deco) {
+    // Rendered headings carry heading semantics mirrored from the Markdown level (editor.md, Accessibility).
+    const level = /\bserat-h([1-6])\b/.exec(cls)?.[1];
+    const attributes = level ? { role: "heading", "aria-level": level } : undefined;
+    lineDecorations.set(cls, (deco = Decoration.line({ class: cls, attributes })));
+  }
   return deco;
 }
 const markerDeco = Decoration.mark({ class: "serat-marker" });
 const bulletDeco = Decoration.mark({ class: "serat-bullet" });
 const numberDeco = Decoration.mark({ class: "serat-list-number" });
+const indentRawDeco = Decoration.mark({ class: "serat-indent-raw" });
+
+/** The glyph a bullet marker (`-`, `*`, `+`) renders as when its line is not revealed. */
+class BulletWidget extends WidgetType {
+  eq(): boolean {
+    return true;
+  }
+  toDOM(): HTMLElement {
+    const span = document.createElement("span");
+    span.className = "serat-bullet";
+    span.setAttribute("aria-hidden", "true");
+    span.textContent = "\u2022";
+    return span;
+  }
+}
+const bulletWidgetDeco = Decoration.replace({ widget: new BulletWidget() });
+const hideDeco = Decoration.replace({});
 
 function buildDecorations(view: EditorView): DecorationSet {
   const selectedLines = selectedLineNumbers(
@@ -242,7 +290,11 @@ function buildDecorations(view: EditorView): DecorationSet {
     .map((span) => Decoration.replace({}).range(span.from, span.to));
   for (const [from, cls] of scan.lines) decorations.push(lineDecoration(cls).range(from));
   for (const span of scan.revealedMarkers) decorations.push(markerDeco.range(span.from, span.to));
-  for (const mark of scan.listMarks) decorations.push((mark.ordered ? numberDeco : bulletDeco).range(mark.from, mark.to));
+  for (const mark of scan.listMarks) {
+    if (mark.widget) decorations.push(bulletWidgetDeco.range(mark.from, mark.to));
+    else decorations.push((mark.ordered ? numberDeco : bulletDeco).range(mark.from, mark.to));
+    if (mark.indent) decorations.push((mark.widget || mark.ordered ? hideDeco : indentRawDeco).range(mark.indent.from, mark.indent.to));
+  }
   return Decoration.set(decorations, true);
 }
 
