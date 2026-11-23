@@ -14,6 +14,7 @@ Serat is a local-first, Obsidian-alternative knowledge app (Tauri v2 + Vue 3, pl
 | 05 Testing | Test plan (TC-nnn), benchmark vault shape and invocation, the reference machine budgets are measured on | docs/05-testing/test-plan.md, docs/05-testing/benchmark-vault.md, docs/05-testing/reference-machine.md |
 | 05 Testing | Benchmark vault generator — `cargo run --release -p vaultgen -- --preset 20k` | bench/vaultgen/, bench/README.md |
 | 01 Planning | P0 spike task list and status | docs/01-planning/tasks-p0-spike.md |
+| 06 Release | Runbook, rollback plan, release-note template, third-party notices for the shipped cMaps, fonts and dependencies (task #149) | docs/06-release/runbook.md, docs/06-release/rollback.md, docs/06-release/THIRD-PARTY-NOTICES.md |
 
 Originals (styled HTML with embedded diagrams) are in docs/_source/. The Markdown copies are pandoc conversions: tables and headings are intact; the six inline diagrams in the design description are marked *(embedded image)* — open the HTML original for those.
 
