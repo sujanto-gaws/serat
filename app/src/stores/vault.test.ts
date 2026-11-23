@@ -187,7 +187,7 @@ describe("index check found problems (P1 #157)", () => {
     store.applyIndexStatus({ state: { kind: "unavailable", message: "x", path: "/p" } }, "event");
     expect(store.indexCheckProblems).toBeNull();
     expect(store.indexStatusText).toBe("index: unavailable — x");
-    expect(store.indexAnnouncement).not.toBe(INDEX_CHECK_ANNOUNCEMENT);
+    expect(store.indexAnnouncement).toBe("index: unavailable — x"); // announced once, visible text
   });
 
   it("a status without the field, or with 0, shows nothing", () => {
@@ -205,5 +205,41 @@ describe("index check found problems (P1 #157)", () => {
     const store = useVaultStore();
     store.applyIndexStatus({ state: rebuilding(0), index_check_problems: 1 }, "poll");
     expect(store.indexCheckProblems).toBe(1);
+  });
+});
+
+describe("index check fact: scope and ending (P1 #157 review)", () => {
+  it("another vault's open clears the previous vault's fact", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened({ root: "/a", vault_id: "A", index: { kind: "opening" } } as never);
+    store.applyIndexStatus(
+      { state: { kind: "rebuilding", reason: "corrupt", done: 0, total: 1, walk_complete: false }, index_check_problems: 2 },
+      "event",
+    );
+    expect(store.indexCheckProblems).toBe(2);
+    store.vaultOpened({ root: "/b", vault_id: "B", index: { kind: "opening" } } as never);
+    expect(store.indexCheckProblems).toBeNull();
+  });
+
+  it("the fact is rendered and announced only beside Rebuilding", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 1 }, index_check_problems: 4 }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+    expect(store.indexAnnouncement).toBe("");
+  });
+
+  it("the Ready that ends the rebuild is announced once, with its visible text, then nothing more", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus(
+      { state: { kind: "rebuilding", reason: "corrupt", done: 0, total: 1, walk_complete: false }, index_check_problems: 2 },
+      "event",
+    );
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
+    expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
+    expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
   });
 });

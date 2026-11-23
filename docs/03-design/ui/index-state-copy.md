@@ -38,7 +38,7 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 
 - **Visible text** (no number, no second "rebuilding": the `Rebuilding` line beside it already says so): `Index check found problems`
 - **Tooltip / accessible description** (the count appears only here; `problem` when N is 1): `When Serat last closed unexpectedly, its check of the search index found N problems, so it is rebuilding the index from your notes. Your notes are not affected. You can keep editing.`
-- **Announcement:** once, politely, in the same update that moves the strip to `Rebuilding`, as **one** utterance that replaces the `Rebuilding` announcement that update would otherwise queue: `Index check found problems. Rebuilding the index from your notes. You can keep editing.` Not repeated on progress events; nothing when the fact clears; the `Ready` or `Unavailable` that follows is announced as usual.
+- **Announcement:** once, politely, in the same update that moves the strip to `Rebuilding`, as **one** utterance that replaces the `Rebuilding` announcement that update would otherwise queue: `Index check found problems. Rebuilding the index from your notes. You can keep editing.` Not repeated on progress events; nothing when the fact clears; the `Ready` or `Unavailable` that ends the rebuild is announced once, with its visible text.
 - Neutral colour (`text-secondary`), no icon alarm, no modal, no action: the rebuild is already running and there is nothing for the user to do.
 
 ## What the front end must not do

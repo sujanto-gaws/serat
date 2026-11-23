@@ -195,6 +195,8 @@ describe("App status strip: index check found problems (#157)", () => {
     await send({ kind: "ready", note_count: 4 });
     await flush();
     expect(wrapper.find('[data-testid="index-check-problems"]').exists()).toBe(false);
+    expect(announced).toHaveLength(2); // then Ready: exactly one more utterance
+    expect(announced[1]).toBe("index: ready · 4 notes");
     observer.disconnect();
     wrapper.unmount();
     vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
