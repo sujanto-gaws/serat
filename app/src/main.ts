@@ -2,7 +2,8 @@ import { createPinia } from "pinia";
 import { createApp } from "vue";
 
 import App from "./App.vue";
-import "./tokens.css";
+import "./styles/tokens.css";
+import "./styles/prose.css";
 import "./style.css";
 
 createApp(App).use(createPinia()).mount("#app");

@@ -47,6 +47,7 @@ import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
 import { refreshLinks } from "@/editor/linkState";
 import { revealMarkersPlugin } from "@/editor/reveal";
+import { adoptEditorStyles } from "@/editor/editorStyles";
 import { modeClass, typographyExtensions } from "@/editor/typography";
 import { syntaxTree } from "@codemirror/language";
 import { defaultLinkIpc, type LinkIpcAdapter } from "@/ipc/linkAdapter";
@@ -111,7 +112,7 @@ const revealCompartment = new Compartment();
 /** Live-preview-only extensions: the inline reveal rule and block widgets. Split
  * mode (FR-EDT-10) drops both together. */
 const liveExtensions: Extension[] = [revealMarkersPlugin, blockWidgetsExtension()];
-/** `serat-live` or `serat-source` on `.cm-content`: the switch typography.ts keys on (serif prose and
+/** `serat-live` or `serat-source` on `.cm-editor`: the switch the design CSS keys on (serif prose and
  * headings vs mono-source throughout). Reconfigured with `revealCompartment`, never rebuilt. */
 const modeCompartment = new Compartment();
 const dirty = ref(false);
@@ -723,6 +724,7 @@ onMounted(() => {
     return;
   }
   const shadowRoot = host.value.attachShadow({ mode: "open" });
+  adoptEditorStyles(shadowRoot); // the design CSS reaches `.cm-editor` only inside this root
   // `index://changed` is invalidation only (§3.4): drop cached resolutions and
   // ask the links plugin to rescan the viewport.
   props.linkIpc

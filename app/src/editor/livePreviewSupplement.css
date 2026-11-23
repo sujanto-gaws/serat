@@ -1,0 +1,45 @@
+/* What the reference stylesheet (livePreview.css) does not cover but the parser and the decorations produce.
+   Tokens only, no new value. Concatenated after livePreview.css and adopted into the editor's shadow root
+   by editorStyles.ts. */
+
+/* List nesting is a class, not a style attribute: the app's CSP (style-src 'self') refuses inline style
+   attributes, and a line decoration can only set attributes. serat-li reads --serat-depth. */
+.cm-editor.serat-live .serat-depth-0 { --serat-depth: 0; }
+.cm-editor.serat-live .serat-depth-1 { --serat-depth: 1; }
+.cm-editor.serat-live .serat-depth-2 { --serat-depth: 2; }
+.cm-editor.serat-live .serat-depth-3 { --serat-depth: 3; }
+.cm-editor.serat-live .serat-depth-4 { --serat-depth: 4; }
+.cm-editor.serat-live .serat-depth-5 { --serat-depth: 5; }
+.cm-editor.serat-live .serat-depth-6 { --serat-depth: 6; }
+.cm-editor.serat-live .serat-depth-7 { --serat-depth: 7; }
+.cm-editor.serat-live .serat-depth-8 { --serat-depth: 8; }
+
+/* Fence text is tagged as code by the highlighter; inside a fenced block it takes the block's band, not the
+   inline-code chip. */
+.cm-editor .serat-code-line .serat-code {
+  background: transparent;
+  border-radius: 0;
+  padding-inline: 0;
+  font-size: inherit;
+}
+
+/* Always-visible machine syntax (components.md section 3): block ids and inline fields, mono-source in
+   text-tertiary, never hidden. Same face in source mode. */
+.cm-editor .serat-machine {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-mono-source-size);
+  color: var(--serat-text-tertiary);
+}
+
+/* A footnote reference reads as a raised number; its brackets are markers and hide off-line. */
+.cm-editor.serat-live .serat-footnote {
+  font-size: 0.8em;
+  vertical-align: super;
+  line-height: 0;
+  color: var(--serat-text-link);
+}
+
+/* The editor fills its pane; the pane, not CodeMirror, draws the surface. */
+.cm-editor {
+  background: var(--serat-surface);
+}

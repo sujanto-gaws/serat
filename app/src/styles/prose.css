@@ -1,0 +1,43 @@
+/* Split-preview pane and embeds: rendered, sanitised HTML (not CodeMirror), so this is document-level CSS.
+   Source: docs/03-design/ui/live-preview.css, "Split preview and embeds". */
+
+/* ---- Split preview and embeds: rendered, sanitised HTML ------------------------- */
+
+.serat-prose {
+  max-width: var(--serat-measure-editor);
+  padding: var(--serat-space-7) var(--serat-lp-gutter);
+  font-family: var(--serat-font-prose);
+  font-size: var(--serat-type-body-serif-size);
+  line-height: var(--serat-type-body-serif-line);
+  color: var(--serat-text-primary);
+  font-optical-sizing: auto;
+}
+.serat-prose :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--serat-font-ui);
+  font-weight: 700;
+  text-wrap: balance;
+  margin: 0;
+}
+.serat-prose h1 { font-size: var(--serat-type-display-size); line-height: var(--serat-type-display-line); letter-spacing: var(--serat-type-display-tracking); padding-top: var(--serat-lp-h1-pt); padding-bottom: var(--serat-lp-h1-pb); }
+.serat-prose h2 { font-size: var(--serat-type-heading-lg-size); line-height: var(--serat-type-heading-lg-line); letter-spacing: var(--serat-type-heading-lg-tracking); padding-top: var(--serat-lp-h2-pt); padding-bottom: var(--serat-lp-h2-pb); }
+.serat-prose h3 { font-size: var(--serat-type-heading-md-size); line-height: var(--serat-type-heading-md-line); letter-spacing: var(--serat-type-heading-md-tracking); padding-top: var(--serat-lp-h3-pt); }
+.serat-prose h4 { font-size: var(--serat-type-heading-sm-size); line-height: var(--serat-type-heading-sm-line); letter-spacing: var(--serat-type-heading-sm-tracking); }
+.serat-prose :is(h5, h6) { font-size: var(--serat-type-heading-xs-size); line-height: var(--serat-type-heading-xs-line); letter-spacing: var(--serat-type-heading-xs-tracking); }
+.serat-prose h6 { font-weight: 600; color: var(--serat-text-secondary); }
+.serat-prose > :first-child { margin-top: 0; padding-top: 0; }
+.serat-prose :is(p, ul, ol, blockquote, pre, table, figure) { margin: 0 0 var(--serat-type-body-serif-line); } /* one blank line, as in the editor */
+.serat-prose :is(ul, ol) { padding-left: calc(var(--serat-lp-list-indent) * 1); }
+.serat-prose li::marker { color: var(--serat-text-secondary); font-variant-numeric: tabular-nums; }
+.serat-prose blockquote { padding-left: var(--serat-lp-quote-indent); border-left: var(--serat-lp-quote-rule-width) solid var(--serat-rule-quote); color: var(--serat-text-secondary); }
+.serat-prose :not(pre) > code { font-family: var(--serat-font-mono); font-size: var(--serat-lp-code-inline-size); background: var(--serat-surface-sunken); border-radius: var(--serat-radius-sm); padding-inline: 0.3em; }
+.serat-prose pre { font-family: var(--serat-font-mono); font-size: var(--serat-type-mono-source-size); line-height: var(--serat-type-mono-source-line); background: var(--serat-surface-sunken); padding: var(--serat-space-5); overflow-x: auto; }
+.serat-prose a { color: var(--serat-text-link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.2em; text-decoration-color: color-mix(in srgb, var(--serat-text-link) var(--serat-lp-link-underline-alpha), transparent); }
+.serat-prose a:hover, .serat-prose a:focus-visible { text-decoration-color: currentColor; }
+.serat-prose a:focus-visible { outline: var(--serat-focus-ring); outline-offset: var(--serat-focus-ring-offset); }
+.serat-prose mark { background: var(--serat-surface-highlight); color: var(--serat-text-primary); border-radius: var(--serat-radius-sm); padding-inline: 0.15em; }
+.serat-prose hr { border: 0; border-top: 1px solid var(--serat-border-hairline); margin: var(--serat-space-7) 0; }
+.serat-prose img { display: block; max-width: 100%; height: auto; }
+.serat-prose table { border-collapse: collapse; font-size: var(--serat-type-body-serif-sm-size); line-height: var(--serat-type-body-serif-sm-line); }
+.serat-prose th { font-family: var(--serat-font-ui); font-weight: 600; text-align: left; border-bottom: 1px solid var(--serat-border-strong); }
+.serat-prose :is(th, td) { padding: var(--serat-space-2) var(--serat-space-4) var(--serat-space-2) 0; }
+.serat-prose td { border-bottom: 1px solid var(--serat-border-hairline); }

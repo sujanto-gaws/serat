@@ -108,5 +108,5 @@ defineExpose({ renderNow: () => renderNow(props.source) });
 </script>
 
 <template>
-  <div ref="container" class="serat-preview" data-testid="serat-preview" @click="onContainerClick" @auxclick="onContainerClick"></div>
+  <div ref="container" class="serat-preview serat-prose" data-testid="serat-preview" @click="onContainerClick" @auxclick="onContainerClick"></div>
 </template>
