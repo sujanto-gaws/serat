@@ -310,8 +310,14 @@ jobs:
   # FR-VLT-04 (architecture 3.1.2): an external change visible in the index within
   # 500 ms at p95 over 100 single-note changes (PRD v1.9, #81). --assert gates that only;
   # the max and the 100-note batch are printed as "reported, not gated".
+  # REPORT-ONLY ON A HOSTED RUNNER (task #165, ruled in #166): on hosted windows-latest
+  # (2 cores, gate_eligible false) the p95 went 376-615 ms between runs 3 minutes apart with
+  # an unchanged 177 ms median, so the bin, still run with --assert, prints REPORT-ONLY and
+  # exits 0 there; it exits 1 on a breach where the environment is gate eligible and on any
+  # failure to measure. The assertion is the reference machine's
+  # (docs/05-testing/reports/fr-vlt-04-windows-tail-triage.md).
   p1-external-change:
-    name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes (PRD v1.9; max and 100-file batch reported)"
+    name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes (report-only on hosted windows; asserted on the reference machine; PRD v1.9; max and 100-file batch reported)"
     needs: vault
     runs-on: windows-latest
     steps:

@@ -9,7 +9,7 @@ cites: ADR-0001, ADR-0011, ADR-0015, RISK-013
 
 # FR-VLT-04 on windows-latest: triage (task #165)
 
-**Date:** 2026-11-23 · **Run by:** rust-core-dev · **Status:** triaged, Windows confirmation pending (no runner, RISK-013)
+**Date:** 2026-11-23 · **Run by:** rust-core-dev · **Status:** triaged; attribution on Windows open until the instrumented re-run (task #167; no runner, RISK-013); FR-VLT-04 is report-only on hosted Windows (ruled in #166)
 
 ## Summary
 
@@ -21,53 +21,72 @@ FR-VLT-04 (external change visible in the index, 500 ms p95 over 100 single-note
 | 315 (`cf93c32`, job 129357719989) | 376.1 / 1261.2 ms | 173.6 ms | 6.2 / 204.9 / 1095.5 ms | 7712.2 ms | 2 cores, cpu load 6%, 0 build processes |
 | 316 (`6a608b8`, job 129359023563) FAIL | 615.3 / 792.0 ms | 172.9 ms | 9.3 / 450.5 / 626.4 ms | 7017.1 ms | 2 cores, cpu load 7%, 0 build processes |
 
-The environment line is taken before the benchmark starts; it cannot see a neighbour that starts during the 3 minutes of the run.
+The environment line is taken before the benchmark starts; it cannot see a neighbour that starts during the 3 minutes of the run. Run 311 (`9ce1c6c`, p95 422.1 ms) is quoted from the status record; its log was not kept. The three logged runs are the same image and job; runs 315 and 316 started 3 minutes apart and 312 about 35 minutes before them. Whether `crates/` or `bench/budget` changed between `c24943a`, `cf93c32` and `6a608b8` was not diffed here.
 
 ## Latency budget (architecture 3.1.2, the watcher path)
 
 | Stage | Where | Fixed or variable | Measured |
 |---|---|---|---|
-| notify delivery | `notify` backend (inotify, ReadDirectoryChangesW) | variable, sub-millisecond when scheduled | inside the window figure |
-| coalescing window | `COALESCE_WINDOW` 150 ms, `crates/serat-vault/src/watch.rs` | fixed by design | watcher delay median 151 ms Linux, 166 ms Windows |
-| window tick | `TICK` 30 ms, same file | fixed granularity | included; Windows adds the 15.6 ms timer resolution |
+| notify delivery | `notify` backend (inotify, ReadDirectoryChangesW) | variable | inside the window figure |
+| coalescing window | `COALESCE_WINDOW` 150 ms, `crates/serat-vault/src/watch.rs` (kept at 150 ms) | fixed by design | watcher delay median 151 ms Linux, 166 ms Windows |
+| window tick | `TICK` 30 ms, same file | fixed granularity | included; Windows adds its 15.6 ms timer resolution |
 | read, hash gate | `Reconciler::index_paths`, ADR-0015 stat before read | variable | sub-millisecond |
 | parse | `CommonMarkParser` on the consumer thread | variable | 0.1-0.2 ms (p1-save-tail) |
-| reader open | `Reconciler::reader()` opens one connection per call | variable | milliseconds |
-| index transaction | writer thread, `synchronous = NORMAL`, no fsync on commit | variable | 4-5 ms median |
+| reader open | `Reconciler::reader()` (`crates/serat-index/src/external.rs:163`): one new connection per drain, four connection PRAGMAs plus `query_only`, cold page cache | variable | not measured in the product; the bench approximates it (new read-only connection, the same PRAGMAs, first row lookup): median 0.9 ms, p95 1.2-1.3 ms on Linux. Windows not measured: a credible (c) contributor (file open, `-shm` mapping, locks), to read from the next Windows log |
+| index transaction | writer thread, `synchronous = NORMAL`, no fsync on commit; FTS5 merges run inside it | variable | 4-5 ms median; FTS5 merge adds about 6 ms mean when one coincides |
 | flush barrier | consumer waits for the writer to commit | variable | included |
-| event emit | serat-app `THROTTLE` 100 ms, not in this measurement (the bench stops at "committed") | fixed, outside the 500 ms interval measured here | not measured |
+| event emit | serat-app `THROTTLE` 100 ms, outside the interval this bench measures | fixed | not measured |
 
-There is no fixed delay beyond the 150 ms window and the 30 ms tick, and the window is the design's coalescing (the 100-file batch collapses into one round because of it). Median on Windows is 177 ms in all three runs: the 500 ms budget leaves about 320 ms for the processing tail, and 5 to 8 of 100 iterations spend 200-600 ms there.
+The fixed part is the 150 ms window and the 30 ms tick. The CI median is 177 ms in all three runs, so about 320 ms is left for processing, and 5 or more of 100 iterations spend 200-600 ms there (processing p95 205-450 ms).
+
+## What the CI logs say about the shape
+
+Watcher delay p95 is 172.9 / 173.6 / 172.9 ms and max at most 180.6 ms in all three runs, **including the failing one**, while processing reached 626 ms (run 316) and 1095 ms (run 315). The thread that takes the path off the queue was never late; the stall is inside the processing path (file or `-shm` I/O, a Windows lock, an FTS5 merge, the writer thread's scheduling), not a starved timer. That is not the shape CPU contention produces on Linux (below), so the reading "runner noise" is not the best fit by itself: I/O-side stall on the runner's volume ranks at least equal to CPU noise, and the logs cannot separate them.
 
 ## Local reproduction (Linux container, 4 cores, release, `p1-external-change --vault 20k --single 100`)
 
-Another agent's build or test run shared the container; the load average and the top foreign process are recorded with each figure. `taskset -c 0,1` mimics 2 cores.
+The container is shared with other agents. Each row is one run; the foreign CPU is measured during the single series by the bench (everything busy except the process, in cores of the host's, as `p1-save-tail` does). `taskset -c 0,1` pins the bench to 2 cores. Controlled loaded rows add two `yes > /dev/null` loops pinned one per core.
 
-| Condition | Load avg at start | Single p95 / max | Processing median / p95 / max |
+| Condition | Foreign CPU (cores) | Single p95 / max | Processing median / p95 / max |
 |---|---|---|---|
-| 4 cores, quiet | 0.60 | 180.5 / 350.2 ms | 4.4 / 24.6 / 198.7 ms |
-| 2 cores pinned, quiet | 0.90 to 1.3 | 176.2 / 375.7 ms and 177.1 / 311.1 ms | 4.4-4.6 / 22-25 / 159-224 ms |
-| 2 cores pinned, foreign process at 125% CPU | 1.9 | 276.4 / 731.0 ms | 5.2 / 31.6 / 579.8 ms |
-| 2 cores pinned, settle 1500 ms, foreign process 11-125% | 1.7 to 3.0 | 581.3 / 1914.7 ms and 637.5 / 935.7 ms | 6.9 / 332.7 / 1691.1 ms and 30.4 / 297.9 / 519.9 ms |
-| 2 cores pinned, settle 1500 ms, foreign process 74% (quiet after) | 1.7 | 183.1 / 499.5 ms | 5.1 / 26.8 / 327.9 ms |
+| 4 cores, no pinning (first run, load avg 0.6) | not measured then | 180.5 / 350.2 ms | 4.4 / 24.6 / 198.7 ms |
+| pinned 2, settle 300 ms | 0.03 | 176.9 / 310.8 ms | 4.7 / 25.9 / 159.7 ms |
+| pinned 2, settle 1500 ms | 0.61 | 179.7 / 326.6 ms | 5.4 / 28.2 / 175.7 ms |
+| pinned 2, settle 300 ms, two `yes` loops | 2.51 | 200.3 / 485.7 ms | 8.1 / 37.7 / 334.9 ms |
+| pinned 2, settle 1500 ms, two `yes` loops | 2.52 | 208.9 / 675.8 ms | 9.4 / 57.3 / 502.1 ms |
+| pinned 2, settle 300 ms (instrumented bench; other load not controlled) | 1.21 | 210.3 / 357.5 ms | 4.8 / 27.7 / 206.6 ms |
+| pinned 2, settle 300 ms (instrumented bench; other load not controlled) | 2.01 | 199.8 / 411.5 ms | 5.3 / 31.2 / 260.3 ms |
 
-Quiet, the Linux figure is the 150 ms window plus about 5 ms: p95 about 180 ms, the 190 ms of the status table. Under foreign CPU load on the same two cores the processing tail appears in the way CI shows (median unchanged near 5 ms, p95 tens to hundreds of ms, max over a second) and the watcher delay itself grows (p95 262 ms in one contended run), which is a starved thread, not a longer window.
+The earlier uncontrolled table (a foreign process at 125% CPU, p95 276-638 ms) is withdrawn as evidence: settle and load changed together there and it was one or two runs per cell. In the controlled rows saturating both pinned cores moves p95 by 25-30 ms and the max to 0.5-0.7 s, and the quiet-to-quiet differences (settle 300 against 1500) are within noise. CPU saturation alone reproduces the max seen in CI, not the CI p95 of 376-615 ms. No fully quiet window was available for the instrumented runs (foreign 1.2 and 2.0 cores from other tenants of the host), so the quiet claim rests on the first four rows.
+
+## FTS5 merge and checkpoint coincidence (instrumented, two runs, pinned to 2 cores)
+
+`p1-external-change` now reads the FTS5 segment count (the structure-record parser of `p1-save-tail`) before the write and after the commit and flags a merge when the count fell, and flags a checkpoint when one was running at either end or a PASSIVE or RESTART started or finished in between.
+
+| Run | Iterations with a merge | Over 100 ms | Of those with a merge | Mean processing with / without merge | Iterations with a checkpoint | Of the over-100 ms with a checkpoint | Mean with / without checkpoint |
+|---|---|---|---|---|---|---|---|
+| foreign 1.21 cores | 43 of 100 | 1 | 1 | 11.7 / 8.8 ms | 15 | 0 of 1 | 8.1 / 10.4 ms |
+| foreign 2.01 cores | 43 of 100 | 2 | 2 | 15.9 / 9.8 ms | 13 | 1 of 2 | 16.4 / 11.8 ms |
+
+Shown: on Linux every iteration over 100 ms (3 of 3) coincided with a merge, which is what `p1-save-tail` found (45 of the 50 slowest saves); a merge costs about 3-6 ms on average; a checkpoint overlap does not predict the slow ones (1 of 3). Not shown: that either explains the Windows tail. With 43 of 100 iterations merging, a merge coincides with most slow iterations by chance as well as by cost (3 of 3 is weak evidence at this n), and the Windows 200-600 ms stalls are larger than any merge cost seen here (at most 15.9 ms mean, 260 ms max under load). The earlier claim that a merge costs "8-130 ms, not 200-600" is withdrawn: `p1-save-tail` reports 148.9 ms quiet and 257.6 ms loaded for its worst saves.
 
 ## Candidates
 
-- **(a) A fixed delay dominates: rejected.** Window 150 ms and tick 30 ms only; watcher delay p95 is 173 ms in all three CI runs, passing and failing alike. Shortening the window would buy headroom (each 50 ms is 50 ms) but changes the coalescing the window exists for (a 100-file `git checkout` becomes several rounds); that is a design ruling, not a fix, and the tail it would not remove is 200-450 ms.
-- **(b) Checkpoint or FTS merge coincidence: not supported.** The bench now reports checkpoint overlap per iteration. Quiet, 12-14 of 100 iterations overlap a checkpoint (the bench's 300 ms settle just exceeds the 250 ms idle gate, so a checkpoint starts about 50 ms before the next write every 2 s) and those cost about 2x more on average (22-24 ms against 8-9 ms), but with a quiet machine at most two iterations exceed 100 ms, and in the contended and settle-1500 runs most slow iterations (14 of 18, 26 of 32) had no checkpoint overlapping and the mean with overlap was lower than without in two runs. A PASSIVE checkpoint takes no lock the writer needs; no RESTART ran (0 of 28 to 87 runs). FTS merges are real tail on the save path (`docs/05-testing/p1-save-tail-2026-11.md`, 45 of 50 slowest saves) but a one-note commit costs 8-130 ms there, not 200-600 ms, and CI max of 1.1 s is beyond it. Not the cause of the runs seen; it is a quantified contributor to the 20-30 ms Linux p95.
-- **(c) Windows-only cost not showable on Linux: cannot be excluded.** The batch-of-100 costs 3-5 s median on Windows against 0.2 s on Linux (10-30 ms per note against 2), so file I/O on the runner's volume is an order of magnitude slower per commit; the single-note tail is plausibly the same cost arriving unevenly. Windows-only branches in the path (ReadDirectoryChangesW, mandatory file locking on `-shm` and the WAL, Defender) cannot be exercised here.
-- **(d) Runner noise: the best fit.** Same head family, same image, same 2 cores, and the result moves from 376 to 615 ms between runs 3 minutes apart (jobs started 18:40 and 18:43) with an unchanged median. Linux reproduces the shape with foreign CPU load and does not without it. The pre-run environment line (cpu load 6-8%, 0 build processes) shows a quiet start, not a quiet run.
+- **(a) A fixed delay dominates: rejected.** A fixed delay explains the passes and the failure equally: window and tick give watcher delay p95 173 ms in all three runs. Shortening the window would buy headroom (50 ms per 50 ms) but changes the coalescing the window exists for (a 100-file `git checkout` becomes several rounds); that is a design ruling, and it was decided to keep 150 ms.
+- **(b) Checkpoint or FTS merge coincidence: checkpoint not implicated on Linux; merge implicated on Linux as a small, frequent cost; Windows attribution pending the instrumented re-run.**
+- **(c) Windows-only cost: cannot be excluded and ranks at least equal to (d).** The batch of 100 costs 2874 / 3247 / 4772 ms median on Windows (about 29-48 ms per note) against about 0.2 s on Linux (about 2 ms per note), so per-commit file work on the runner is an order of magnitude slower; the single-note tail is plausibly the same cost arriving unevenly. Unmeasured candidates: per-drain `reader()` open, `-shm` mapping and locking, the 15.6 ms scheduler quantum for handoffs between four threads. Defender's real-time scanner was reported OFF in all three runs, which removes the scanner but not other filter drivers.
+- **(d) Runner noise: possible, not demonstrated.** The 376 to 615 ms movement between runs 3 minutes apart with an unchanged median fits shared-host variance. CPU contention reproduces the max but not the CI p95 and, by the unchanged watcher delay, did not starve the timer thread in CI.
 
 ## Verdict
 
-(d) with (c) not excluded. No code path was found to fix: no fixed delay to shorten, no checkpoint or merge dependence, nothing the product does that the quiet figure fails to explain. No product code changed.
+Not a fixed delay; not the checkpointer on Linux; the CI shape is a processing-path stall whose cause (I/O on the runner volume, Windows locking, merge, or neighbour noise) the logs cannot separate. No product code changed and the window stays at 150 ms. The decision on what CI does with the number was taken in #166: FR-VLT-04 is report-only on hosted Windows under the NFR-PRF-04 rule; best-of-three was rejected.
 
 ## Change made
 
-`bench/budget/src/bin/p1-external-change.rs`, report-only, gating unchanged: per iteration set a "checkpoint overlap" line (iterations overlapped, iterations over 100 ms and how many of those overlapped, mean processing with and without overlap), a "checkpointer" line (PASSIVE runs, incomplete, RESTART, longest, mean), and `--settle-ms` (default 300, the CI job does not pass it). The next Windows run answers (b) against (c) and (d) from its own log.
+- `bench/budget/src/bin/p1-external-change.rs`: report-only instrumentation (checkpoint overlap including RESTART, FTS5 merge, reader-open approximation, foreign CPU during the single series, checkpointer counters), `--settle-ms` (default 300, above 0; the CI job does not pass it). Under `--assert` the bin prints `REPORT-ONLY` and exits 0 when `Environment::detect().gate_eligible()` is false and the measurement succeeded; it still exits 1 on a breach where the runner is eligible and on any failure to measure (exit 2). FR-VLT-04 is a bin-level `--assert`, not a `Budget`, so `CiAssertion::WhenGateEligible` is expressed as `budget::gate::report_only` / `passes_when_eligible`.
+- `bench/budget/src/gate.rs`: those two functions and a test.
+- `.github/workflows/budgets.yml`: the job name now says "report-only on hosted windows; asserted on the reference machine"; `bench/budget/src/lib.rs`: `P1_REPORT_ONLY_ON_HOSTED` and a two-way job-name test.
 
 ## Pending on Windows (closing step)
 
-Re-run `budgets.yml` `p1-external-change` on windows-latest when a runner is available (RISK-013) at least three times and read the new overlap and checkpointer lines. If every slow iteration is outside a checkpoint and the median stays near 177 ms, the tail is the runner (record as (d); the options are then a rerun-best-of-three rule or report-only on the hosted Windows runner as for NFR-PRF-04, a lead and architect decision, not taken here). If slow iterations coincide with checkpoints, the idle spacing (2 s, architect ruling #59) is the lever, to be raised with the architect with the Windows numbers. The reference-machine run (`docs/05-testing/reference-machine.md`) remains the binding measurement.
+The best-of-three against report-only question is closed (#166 ruled report-only; best-of-three rejected). The Windows re-runs are task #167 (RISK-013): at least three runs of `p1-external-change` on windows-latest, read for the checkpoint overlap, FTS5 merge, reader-open and checkpointer lines. If slow iterations coincide with checkpoints, the idle spacing (2 s, architect ruling #59) is the lever; if with merges, the merge policy; if with neither and the reader-open approximation is small, the cause is the volume or the host. The reference-machine run (`docs/05-testing/reference-machine.md`) is where FR-VLT-04 is asserted.
