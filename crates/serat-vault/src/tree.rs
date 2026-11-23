@@ -465,7 +465,14 @@ impl TreeSession {
     /// the model but send nothing, and [`Self::replay_to`] is refused with
     /// [`ReplayError::Closed`]. For a vault switch or exit, where the stream is over.
     pub fn close(&self) {
-        self.with(|inner| inner.closed = true);
+        // The old sink (in the application a channel with its batcher) is dropped after
+        // the lock is released: its `Drop` may block or call back, and must not hold up
+        // every other update.
+        let old = self.with(|inner| {
+            inner.closed = true;
+            std::mem::replace(&mut inner.sink, Box::new(|_| {}))
+        });
+        drop(old);
     }
 
     /// Attach a new receiver to this session: a reloaded webview's new channel (task #68;
@@ -490,6 +497,11 @@ impl TreeSession {
     /// same messages. An index read or walk in flight keeps its snapshot bookkeeping, so
     /// listings it has yet to offer still respect removes already made.
     ///
+    /// `sink` runs under the session lock, like every sink, so it must not call back into
+    /// the session and must not block. The previous sink is dropped **outside** the lock,
+    /// after the replay, because its `Drop` (a channel and its batcher, ADR-0015 §2) may
+    /// block or call back.
+    ///
     /// A panic in `sink` poisons the session, as for any sink.
     ///
     /// # Errors
@@ -502,7 +514,7 @@ impl TreeSession {
         if inner.closed {
             return Err(ReplayError::Closed);
         }
-        inner.sink = Box::new(sink);
+        let old = std::mem::replace(&mut inner.sink, Box::new(sink));
         let listings = inner.model.replay();
         let complete = inner.progress.complete();
         let settled = inner.progress.settled.load(Ordering::Acquire);
@@ -514,6 +526,8 @@ impl TreeSession {
         if settled {
             inner.emit(TreeOut::WalkSettled { empty_folders });
         }
+        drop(guard);
+        drop(old);
         Ok(())
     }
 

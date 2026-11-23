@@ -611,22 +611,37 @@ fn session_pair() -> (TreeSession, Arc<Mutex<Vec<TreeOut>>>) {
 
 #[test]
 fn a_replay_racing_live_updates_never_drops_or_duplicates_an_entry() {
-    const N: usize = 400;
+    // Three producers and the replayer start behind a barrier and contend for the session
+    // lock, so a replay that swapped the sink and took its snapshot under two separate lock
+    // acquisitions loses the race to a waiting producer in between and duplicates its
+    // create. The replays loop until every producer is done.
+    const PRODUCERS: usize = 3;
+    const N: usize = 500;
+    const MIN_REPLAYS: usize = 50;
     let (_dir, vault) = fixture();
     let (session, _first) = session();
     session.populate_from_walk(&vault).expect("walk");
     let session = Arc::new(session);
+    let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(PRODUCERS));
 
-    let producer = {
-        let session = Arc::clone(&session);
-        thread::spawn(move || {
-            for i in 0..N {
-                let _ = session.created(&format!("f{i:04}.md"), TreeKind::Note);
-            }
+    let producers: Vec<_> = (0..PRODUCERS)
+        .map(|t| {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                barrier.wait();
+                for i in 0..N {
+                    let _ = session.created(&format!("p{t}-{i:04}.md"), TreeKind::Note);
+                }
+                running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            })
         })
-    };
+        .collect();
     let mut logs = Vec::new();
-    while !producer.is_finished() {
+    barrier.wait();
+    while logs.len() < MIN_REPLAYS || running.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&log);
         session
@@ -635,12 +650,13 @@ fn a_replay_racing_live_updates_never_drops_or_duplicates_an_entry() {
         logs.push(log);
         thread::yield_now();
     }
-    producer.join().expect("producer");
-    assert!(logs.len() > 1, "the replays never overlapped the updates");
+    for p in producers {
+        p.join().expect("producer");
+    }
 
     let mut longest = 0;
     for (n, log) in logs.iter().enumerate() {
-        // Every f-name the log carries, in the snapshot or as a later upsert.
+        // Every created name the log carries, in the snapshot or as a later upsert.
         let mut names = Vec::new();
         for out in log.lock().expect("log").iter() {
             match out {
@@ -648,7 +664,7 @@ fn a_replay_racing_live_updates_never_drops_or_duplicates_an_entry() {
                     names.extend(
                         entries
                             .iter()
-                            .filter(|e| e.name.starts_with('f'))
+                            .filter(|e| e.name.starts_with('p'))
                             .map(|e| e.name.clone()),
                     );
                 }
@@ -670,8 +686,21 @@ fn a_replay_racing_live_updates_never_drops_or_duplicates_an_entry() {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "log {n}: an entry arrived twice");
-        let expected: Vec<String> = (0..names.len()).map(|i| format!("f{i:04}.md")).collect();
-        assert_eq!(sorted, expected, "log {n}: an entry was dropped");
+        // Each producer's names are a gap-free prefix of what it created.
+        for t in 0..PRODUCERS {
+            let mine: Vec<&str> = sorted
+                .iter()
+                .filter(|name| name.starts_with(&format!("p{t}-")))
+                .map(String::as_str)
+                .collect();
+            let expected: Vec<String> =
+                (0..mine.len()).map(|i| format!("p{t}-{i:04}.md")).collect();
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            assert_eq!(
+                mine, expected,
+                "log {n}: an entry of producer {t} was dropped"
+            );
+        }
     }
     assert!(longest > 0, "no replay carried a created entry");
 }
@@ -700,5 +729,77 @@ fn a_replay_after_the_session_ended_or_died_is_a_typed_error() {
     assert_eq!(
         doomed.replay_to(|_| {}),
         Err(serat_vault::ReplayError::Poisoned)
+    );
+}
+
+#[test]
+fn a_replay_inside_a_running_walk_between_directories_joins_the_stream() {
+    // Task #68 N2: not a sequential subtree rescan but a replay while `walk_tree` is
+    // between directories. The tap runs under the session lock, so it only signals (and
+    // lingers) and the replay thread takes the lock when the directory's closure returns.
+    let dir = tempfile::tempdir().expect("temp");
+    for d in 0..40 {
+        write(dir.path(), &format!("d{d:02}/a/note.md"));
+    }
+    let vault = Vault::open(dir.path()).expect("open");
+    let (session, first) = session();
+    let session = Arc::new(session);
+    let second = Arc::new(Mutex::new(Vec::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    let replayer = {
+        let session = Arc::clone(&session);
+        let second = Arc::clone(&second);
+        thread::spawn(move || {
+            rx.recv().expect("signal");
+            let sink = Arc::clone(&second);
+            session
+                .replay_to(move |out| sink.lock().expect("log").push(out))
+                .expect("replay");
+        })
+    };
+    let mut seen = 0;
+    session
+        .populate_from_walk_with_metadata(&vault, &mut |_, _| {
+            seen += 1;
+            if seen == 5 {
+                tx.send(()).expect("signal");
+            }
+            if seen >= 5 {
+                thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+        .expect("walk");
+    replayer.join().expect("replayer");
+
+    // The new channel holds the whole tree and the marks, each directory exactly once.
+    let (_d2, reference_vault) = (dir, vault);
+    let (reference, reference_log) = session_pair();
+    reference
+        .populate_from_walk(&reference_vault)
+        .expect("walk");
+    assert_eq!(front_of(&second), front_of(&reference_log));
+    assert_eq!(markers(&second), markers(&reference_log));
+    let mut listed: Vec<String> = second
+        .lock()
+        .expect("log")
+        .iter()
+        .filter_map(|o| match o {
+            TreeOut::Op(TreeOp::Listing { dir, .. }) => Some(dir.clone()),
+            _ => None,
+        })
+        .collect();
+    let total = listed.len();
+    listed.sort();
+    listed.dedup();
+    assert_eq!(listed.len(), total, "a directory was listed twice");
+    // And the first channel stopped at the replay: it did not see the end of the walk.
+    assert!(
+        !first
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|o| matches!(o, TreeOut::Complete { .. })),
+        "the old channel kept receiving after the replay"
     );
 }
