@@ -34,7 +34,7 @@
   width: 100%;
   max-width: var(--serat-lp-measure);
   margin-inline: auto;
-  padding: var(--serat-space-7) var(--serat-lp-gutter);
+  padding: var(--serat-space-5) var(--serat-lp-gutter) var(--serat-space-7); /* 16px top: see editor.md, Column and rhythm */
   caret-color: var(--serat-accent-interactive);
 }
 

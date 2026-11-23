@@ -53,16 +53,13 @@ describe("editor text contrast (>= 4.5:1)", () => {
   });
 });
 
-describe("non-text contrast (target >= 3:1), measured on surface", () => {
-  // FINDING for the designer (#103): both fall short of 3:1 as specified. The values are pinned so a token change
-  // moves this test with it; the spec's acceptance 10 is not met until they do. At alpha 60% the underline reaches 3.27.
-  it("the quote rule (neutral.300)", () => {
-    expect(ratio(hex("--serat-rule-quote"), hex("--serat-surface"))).toBeCloseTo(2.03, 1);
+describe("non-text contrast (>= 3:1), measured on surface", () => {
+  it("the quote rule", () => {
+    expect(ratio(hex("--serat-rule-quote"), hex("--serat-surface"))).toBeGreaterThanOrEqual(3);
   });
   it("the link underline at the specified alpha", () => {
     const alpha = parseInt(defs.get("--serat-lp-link-underline-alpha")!, 10) / 100;
     const line = over(hex("--serat-text-link"), hex("--serat-surface"), alpha);
-    expect(ratio(line, hex("--serat-surface"))).toBeCloseTo(1.88, 1);
-    expect(ratio(over(hex("--serat-text-link"), hex("--serat-surface"), 0.6), hex("--serat-surface"))).toBeGreaterThanOrEqual(3);
+    expect(ratio(line, hex("--serat-surface"))).toBeGreaterThanOrEqual(3);
   });
 });
