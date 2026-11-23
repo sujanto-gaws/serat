@@ -4,16 +4,14 @@
 # regression shall fail the build." One job per budget, so a failure names the
 # requirement it broke instead of saying "benchmarks failed".
 #
-# These jobs cannot currently run at all, and it is not the reason this header
-# used to give. Rebuild (I4), the incremental save path (I5) and the application
-# (D2, S1) all exist on main now — the blocker is F-384: ci.yml and budgets.yml
-# stopped being scheduled runner-side on 2026-09-06 (every run since completes in
-# 1-4s with zero steps, consistent with exhausted included Actions minutes on this
-# private repo), and that needs the repository owner, not a code change. A budget
-# job that skips when the thing it measures is absent is worse than no job at
-# all: the build goes green and nobody notices the budget is unasserted. Each job
-# still prints exactly which task unblocks it, for whichever failure mode is live
-# when it next actually runs.
+# Runner-side scheduling has been unavailable since 2026-09-06 (F-384, RISK-013: every
+# run completes in 1-4s with zero steps, consistent with exhausted included Actions
+# minutes), which needs the repository owner, not a code change. A budget job that
+# skips when the thing it measures is absent is worse than no job at all: the build
+# goes green and nobody notices the budget is unasserted. So the three jobs that
+# drive the application need the `build-app` job (the release serat-app, built once
+# and downloaded); a bin that still finds no binary exits 3 with one line and no
+# verdict (task #164), and `budgets-gate` below turns any skipped or failed job red.
 #
 # Owner: test-engineer. Thresholds live in bench/budget/src/lib.rs next to the
 # requirement they come from, and are never weakened to make a build pass — a
@@ -119,7 +117,7 @@ jobs:
           name: serat-app-release
           path: target/release/serat.exe
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   prf04-full-rebuild:
     name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s"
@@ -531,3 +529,46 @@ jobs:
           name: editor-latency-real-ipc
           path: bench/editor-latency/out/
           if-no-files-found: ignore
+
+  # A job skipped because a `needs` failed (build-app failing skips the three
+  # app-driving jobs) is reported as skipped, and branch protection treats a skipped
+  # required check as passing. This job runs always and is red unless every gating job
+  # succeeded, so there is one check to require and it cannot be skipped green. Named
+  # `needs.<job>.result` references, as ci.yml's "definition of done" does (F-354: the
+  # `needs.*` filter is a schema violation). editor-latency* are report-only and excluded.
+  budgets-gate:
+    name: "budgets · every gating job succeeded"
+    if: always()
+    needs:
+      - serat-app-release-guard
+      - vault
+      - build-app
+      - prf04-full-rebuild
+      - prf03-save-to-index
+      - prf01-cold-start
+      - prf01-serat-term
+      - p1-read-paths
+      - p1-tree-path
+      - p1-external-change
+      - p1-switcher
+      - every-budget-has-a-job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every gating job succeeded
+        shell: bash
+        run: |
+          ok=true
+          check() { if [ "$2" != "success" ]; then echo "::error::$1 finished as '$2', not 'success'"; ok=false; fi; }
+          check serat-app-release-guard "${{ needs.serat-app-release-guard.result }}"
+          check vault "${{ needs.vault.result }}"
+          check build-app "${{ needs.build-app.result }}"
+          check prf04-full-rebuild "${{ needs.prf04-full-rebuild.result }}"
+          check prf03-save-to-index "${{ needs.prf03-save-to-index.result }}"
+          check prf01-cold-start "${{ needs.prf01-cold-start.result }}"
+          check prf01-serat-term "${{ needs.prf01-serat-term.result }}"
+          check p1-read-paths "${{ needs.p1-read-paths.result }}"
+          check p1-tree-path "${{ needs.p1-tree-path.result }}"
+          check p1-external-change "${{ needs.p1-external-change.result }}"
+          check p1-switcher "${{ needs.p1-switcher.result }}"
+          check every-budget-has-a-job "${{ needs.every-budget-has-a-job.result }}"
+          $ok

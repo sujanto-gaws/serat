@@ -319,7 +319,9 @@ fn evenly_spaced(from: &[String], n: usize) -> Vec<String> {
     (0..n).map(|i| from[i * from.len() / n].clone()).collect()
 }
 
-/// What the harness needs before NFR-PRF-01 is measurable.
+/// What the harness needed before NFR-PRF-01 was measurable. Kept as history, like
+/// [`REBUILD_ENTRY_POINT`]: the application exists now (tasks S1, D2 landed) and
+/// nothing reports this text; a missing build reports [`APP_ABSENT_TAG`] instead.
 pub const COLD_START_ENTRY_POINT: &str = "\
 NFR-PRF-01 needs, from serat-app (task S1) and a decision from D2:
 
@@ -611,7 +613,7 @@ fn prewarm_index(vault: &Path) -> Result<(), String> {
 /// `SERAT_STARTUP_TRACE`.
 ///
 /// # Errors
-/// The application binary is absent (task S1's message), the vault cannot
+/// The application binary is absent (the serat-app-absent message), the vault cannot
 /// supply `iterations` distinct notes, pre-warming the index fails, the run
 /// exits non-zero (the process's own contract: abort rather than report a
 /// shorter series than was asked for), or the exit report cannot be parsed.
@@ -722,7 +724,7 @@ pub fn app_binary() -> Result<PathBuf, String> {
 pub fn app_binary_in(explicit: Option<&str>, repo_root: &Path) -> Result<PathBuf, String> {
     if let Some(explicit) = explicit {
         let path = PathBuf::from(explicit);
-        return if path.exists() {
+        return if path.is_file() {
             Ok(path)
         } else {
             Err(format!(
@@ -733,7 +735,7 @@ pub fn app_binary_in(explicit: Option<&str>, repo_root: &Path) -> Result<PathBuf
     }
     let name = if cfg!(windows) { "serat.exe" } else { "serat" };
     let candidate = repo_root.join("target/release").join(name);
-    if candidate.exists() {
+    if candidate.is_file() {
         Ok(candidate)
     } else {
         Err(format!(
@@ -1016,8 +1018,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let name = if cfg!(windows) { "serat.exe" } else { "serat" };
         std::fs::write(dir.join(name), b"").unwrap();
-        assert_eq!(app_binary_in(None, &root).unwrap(), dir.join(name));
+        let found = app_binary_in(None, &root);
         let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.unwrap(), dir.join(name));
     }
 
     #[test]
@@ -1071,7 +1074,7 @@ mod tests {
         // `save_to_index_via_app` is now in the same category as `cold_start`
         // below, not `full_rebuild` above: it drives a SEPARATELY BUILT BINARY
         // (task #94, following #111), so its refusal names either the absent
-        // binary (S1, on a clean checkout) or the absent vault (once a binary
+        // binary (the serat-app-absent message, on a clean checkout) or the absent vault (once a binary
         // exists) -- both correct, and which one you get depends on build
         // state, not on this seam's own correctness.
         let e = save_to_index_via_app(vault, 10).expect_err("must not silently pass");
@@ -1087,16 +1090,16 @@ mod tests {
         // reports depends on whether `target/release/serat.exe` happens to
         // exist at this moment: with it present the app launches and refuses
         // the missing vault; without it the entry-point check fires first and
-        // names S1. Both are correct refusals of the same call, and which one
+        // names the absent binary. Both are correct refusals of the same call, and which one
         // you get is decided by whether anyone has run `cargo build --release`
         // -- `cargo clippy --all-targets` and a debug test build churn the
         // same directory, so it changes between invocations of the very suite
         // this test lives in.
         //
         // Asserting either message specifically therefore asserts build state,
-        // not behaviour. An earlier version of this comment asserted the S1
+        // not behaviour. An earlier version of this comment asserted the serat-app-absent
         // message was now stale; that was wrong, because on a clean checkout
-        // and in CI the binary genuinely is absent and S1 is the right answer.
+        // and in CI the binary genuinely is absent and the absent-binary message is the right answer.
         // What must hold in every case is that the call REFUSES and says
         // something actionable -- never a number over nothing.
         let e = cold_start(vault, 20).expect_err("must not silently pass");

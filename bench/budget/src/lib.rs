@@ -1959,18 +1959,14 @@ pub fn cold_start_job(args: &[String]) -> std::process::ExitCode {
 pub fn cold_start_job_with<R, S>(args: &[String], reported: R, scale: S) -> std::process::ExitCode
 where
     R: FnOnce(&[String]) -> std::process::ExitCode,
-    S: FnOnce(usize) -> bool,
+    S: FnOnce(usize) -> std::process::ExitCode,
 {
     let skip_scale = args.iter().any(|a| a == "--skip-scale");
     let reported = reported(args);
     if reported != std::process::ExitCode::SUCCESS || skip_scale {
         return reported;
     }
-    if scale(PRF01_WINDOW_VISIBLE.iterations) {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    }
+    scale(PRF01_WINDOW_VISIBLE.iterations)
 }
 
 /// **The one place a measured outcome becomes a build result.**
@@ -2775,8 +2771,9 @@ where
 
 /// Architecture §3.4's load-bearing claim, measured and judged.
 ///
-/// Returns whether it held, having printed the verdict either way.
-pub fn run_scale_check(iterations: usize) -> bool {
+/// Returns SUCCESS if it held (having printed the verdict either way), FAILURE if it
+/// did not, or `EXIT_APP_ABSENT` if the application is not built (no verdict printed).
+pub fn run_scale_check(iterations: usize) -> std::process::ExitCode {
     // F-401: this check calls `cold_start_once` directly, spawn by spawn,
     // interleaved across both vaults (the doc comment on `cold_start_once`
     // explains why) -- so no single call is "the batch" the way it is inside
@@ -2821,13 +2818,15 @@ pub fn run_scale_check(iterations: usize) -> bool {
     match verdict {
         Ok(line) => {
             println!("{line}");
-            true
+            std::process::ExitCode::SUCCESS
         }
         Err(e) => {
-            if subject::absent_app_exit(&e).is_none() {
-                println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
+            // An unbuilt application passes through as its own exit code (3).
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
             }
-            false
+            println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -3319,6 +3318,31 @@ mod tests {
                 .map_or(rest.len(), |(i, _)| i);
             rest[..end].to_string()
         };
+        // A skipped required check counts as passing under branch protection, so a
+        // failed build-app (which skips the three) must still turn the PR red: the
+        // `budgets-gate` job runs always and fails unless every gating job succeeded.
+        let gate = job_text("budgets-gate");
+        assert!(gate.contains("if: always()"), "{gate}");
+        for job in [
+            "serat-app-release-guard",
+            "vault",
+            "build-app",
+            "prf04-full-rebuild",
+            "prf03-save-to-index",
+            "prf01-cold-start",
+            "prf01-serat-term",
+            "p1-read-paths",
+            "p1-tree-path",
+            "p1-external-change",
+            "p1-switcher",
+            "every-budget-has-a-job",
+        ] {
+            assert!(
+                gate.contains(&format!("needs.{job}.result")),
+                "budgets-gate does not check {job}"
+            );
+            assert!(gate.contains(job), "budgets-gate does not need {job}");
+        }
         let build = job_text("build-app");
         assert!(
             build.contains("cargo build --release -p serat-app"),
@@ -3369,6 +3393,9 @@ mod tests {
             |_| panic!("the scale check must not run when the app is absent"),
         );
         assert_eq!(code, want, "the cold-start composition keeps the code");
+        // And the scale check's own absent code is not flattened to 1.
+        let code = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| want);
+        assert_eq!(code, want, "a scale check that finds no app exits 3, not 1");
     }
 
     #[test]
@@ -3392,7 +3419,7 @@ mod tests {
                     iterations, PRF01_WINDOW_VISIBLE.iterations,
                     "the scale check must run the same number of pairs the budget names"
                 );
-                false
+                ExitCode::FAILURE
             },
         );
         assert!(
@@ -3406,7 +3433,7 @@ mod tests {
         );
 
         // 2. And its success is the job's success.
-        let ok = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| true);
+        let ok = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| ExitCode::SUCCESS);
         assert_eq!(ok, ExitCode::SUCCESS);
 
         // 3. `--skip-scale` skips it, which is what makes that flag honest --
@@ -3417,7 +3444,7 @@ mod tests {
             |_| ExitCode::SUCCESS,
             |_| {
                 skipped.set(true);
-                false
+                ExitCode::FAILURE
             },
         );
         assert!(!skipped.get(), "--skip-scale must not run the scale check");
@@ -3432,7 +3459,7 @@ mod tests {
             |_| ExitCode::FAILURE,
             |_| {
                 reached.set(true);
-                true
+                ExitCode::SUCCESS
             },
         );
         assert!(
