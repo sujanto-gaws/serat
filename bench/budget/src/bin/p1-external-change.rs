@@ -138,43 +138,31 @@ struct Measured {
     /// The FTS5 segment count fell between the write and the commit: a merge ran in
     /// the writer's transaction (the criterion of `p1-save-tail`).
     fts_merge: bool,
-    /// Approximation of `Reconciler::reader()` plus the first row lookup, measured on a
-    /// fresh connection just before the write (not part of the interval).
+    /// Read-only approximation of `Reconciler::reader()` plus a first row lookup (a new
+    /// connection, the connection PRAGMAs, `query_only`, one `notes` row), measured
+    /// AFTER the commit, on a row already written, so it warms nothing the next write
+    /// touches and is not part of the interval. The product's `schema::open` is not
+    /// public, hence an approximation.
     reader_open_ms: f64,
 }
 
 impl Run<'_> {
-    /// Time what `Reconciler::reader()` does (a new connection, the four connection
-    /// pragmas, `query_only`) plus the first row lookup on its cold cache, and read the
-    /// FTS5 segment count. An approximation: the product's `schema::open` is not public.
-    fn probe_reader(&self) -> Result<(f64, u32), String> {
-        let t = Instant::now();
+    /// The FTS5 segment count, on a fresh read-only connection, read just before the
+    /// write. It looks up no `notes` row, so it does not warm the row the write targets.
+    fn segments_now(&self) -> Result<u32, String> {
         let conn = Connection::open_with_flags(
             serat_index::index_path(self.index),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|e| e.to_string())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \
-             PRAGMA busy_timeout = 5000; PRAGMA query_only = 1;",
-        )
-        .map_err(|e| e.to_string())?;
-        if let Some(path) = self.candidates.get(self.next) {
-            let _: Option<String> = conn
-                .query_row("SELECT hash FROM notes WHERE path = ?1", [path], |r| {
-                    r.get(0)
-                })
-                .ok();
-        }
-        let elapsed = ms(t.elapsed());
-        Ok((elapsed, fts_levels(&conn)?.iter().sum()))
+        Ok(fts_levels(&conn)?.iter().sum())
     }
 
     /// Edit the next `count` notes, wait until all are indexed, and verify the index.
     fn iteration(&mut self, count: usize) -> Result<Measured, String> {
         self.sequence += 1;
         let mut written = Vec::with_capacity(count);
-        let (reader_open_ms, segments_before) = self.probe_reader()?;
+        let segments_before = self.segments_now()?;
         let stats_before = self.health.stats();
         let runs_before = stats_before.passive_runs + stats_before.restart_runs;
         let running_at_write = self.health.checkpoint_in_progress();
@@ -229,6 +217,29 @@ impl Run<'_> {
                 ));
             }
         }
+        let reader_open_ms = {
+            let t = Instant::now();
+            let probe = Connection::open_with_flags(
+                serat_index::index_path(self.index),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| e.to_string())?;
+            probe
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; \
+                     PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; \
+                     PRAGMA query_only = 1;",
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some((relative, _)) = written.first() {
+                let _: Option<String> = probe
+                    .query_row("SELECT hash FROM notes WHERE path = ?1", [relative], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+            }
+            ms(t.elapsed())
+        };
         let fts_merge = fts_levels(&conn)?.iter().sum::<u32>() < segments_before;
         drop(conn);
 
@@ -530,6 +541,9 @@ fn run(args: &[String]) -> Result<bool, String> {
          window 150 ms, budget {BUDGET_MS} ms",
         pinned.notes
     );
+    let environment = budget::env::Environment::detect();
+    let eligible = environment.gate_eligible();
+    let report_only = budget::gate::report_only(assert, eligible);
     let mut rows = Vec::new();
     for (label, runs, size) in [("single", &single, 1), ("batch", &batch, batch_size)] {
         let series = |f: fn(&Measured) -> f64| {
@@ -550,7 +564,9 @@ fn run(args: &[String]) -> Result<bool, String> {
             total.percentile(0.95),
             total.max(),
             if within { "within" } else { "OVER" },
-            if label == "single" {
+            if label == "single" && report_only {
+                " (report-only here: not gate eligible; max reported, not gated)"
+            } else if label == "single" {
                 " (gated on p95, PRD v1.9 FR-VLT-04; max reported, not gated)"
             } else {
                 " (reported, not gated)"
@@ -598,7 +614,10 @@ fn run(args: &[String]) -> Result<bool, String> {
         for m in runs.iter() {
             opens.push(Duration::from_secs_f64(m.reader_open_ms / 1000.0));
         }
-        line("  reader open + row lookup (approx.)", &opens);
+        line(
+            "  reader open + row lookup (read-only approximation)",
+            &opens,
+        );
         if label == "single" {
             rows.push(("single note".to_owned(), total.percentile(0.95)));
         }
@@ -614,12 +633,10 @@ fn run(args: &[String]) -> Result<bool, String> {
     );
     let breaches = budget::gate::breaches(BUDGET_MS, &rows);
     // Task #166: FR-VLT-04's 500 ms is the reference machine's number. On a runner that
-    // cannot produce a gate number (hosted windows-latest, 2 cores) the figure is
+    // cannot produce a gate number (hosted windows-latest: the real-time scanner is off) the figure is
     // measured, printed and cannot fail the build; a failure to measure still does (the
     // `?` and the REJECTED paths above), and an eligible runner still fails on a breach.
-    let environment = budget::env::Environment::detect();
-    let eligible = environment.gate_eligible();
-    if budget::gate::report_only(assert, eligible) {
+    if report_only {
         println!(
             "FR-VLT-04: REPORT-ONLY, not asserted: {} (asserted on the reference machine, \
              and on any gate-eligible runner); single note p95 {}",
