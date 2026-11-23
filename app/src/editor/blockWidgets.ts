@@ -30,7 +30,7 @@
 // tables cost.
 
 import { syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
-import { EditorState, RangeSetBuilder, StateEffect, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
+import { EditorState, MapMode, RangeSetBuilder, StateEffect, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
@@ -240,7 +240,11 @@ export const calloutFoldField = StateField.define<ReadonlyMap<number, CalloutFol
     let next: Map<number, CalloutFold> | null = null;
     if (tr.docChanged && value.size > 0) {
       next = new Map();
-      for (const [pos, fold] of value) next.set(tr.changes.mapPos(pos, 1), fold);
+      for (const [pos, fold] of value) {
+        // TrackAfter: the callout's first character is after its start; if it was deleted the entry is dropped, not handed to whatever now starts at the deletion point.
+        const mapped = tr.changes.mapPos(pos, 1, MapMode.TrackAfter);
+        if (mapped !== null) next.set(mapped, fold);
+      }
     }
     for (const effect of tr.effects) {
       if (effect.is(foldToggled)) {
@@ -253,10 +257,12 @@ export const calloutFoldField = StateField.define<ReadonlyMap<number, CalloutFol
 });
 
 /** The block starts a transaction toggled (their widgets must be rebuilt). */
-function toggledStarts(tr: Transaction): number[] {
-  const out: number[] = [];
-  for (const effect of tr.effects) if (effect.is(foldToggled)) out.push(effect.value.from);
-  return out;
+const NO_STARTS: readonly number[] = [];
+function toggledStarts(tr: Transaction): readonly number[] {
+  if (tr.effects.length === 0) return NO_STARTS; // every keystroke: no allocation
+  let out: number[] | null = null;
+  for (const effect of tr.effects) if (effect.is(foldToggled)) (out ??= []).push(effect.value.from);
+  return out ?? NO_STARTS;
 }
 
 /** Non-blank source lines of a callout body: the number the collapsed title reports. */
@@ -264,7 +270,6 @@ export function countBodyLines(body: string): number {
   return body.split("\n").filter((line) => line.trim() !== "").length;
 }
 
-let calloutBodySeq = 0;
 const GLYPH_CLASS = "serat-callout-glyph";
 
 class CalloutWidget extends WidgetType {
@@ -277,6 +282,8 @@ class CalloutWidget extends WidgetType {
     private readonly bodyText: string,
     /** The effective state: a toggle in this session, else the marker's. `null` for a non-foldable callout. */
     private readonly fold: CalloutFold | null,
+    /** The block start at build time: only seeds a stable DOM id (not part of `eq`). */
+    private readonly from: number = 0,
   ) {
     super();
     this.lines = countBodyLines(bodyText);
@@ -336,7 +343,11 @@ class CalloutWidget extends WidgetType {
     if (this.lines > 0) {
       body = document.createElement("div");
       body.className = "serat-callout-body";
-      body.id = `serat-callout-body-${++calloutBodySeq}`;
+      // Stable across rebuilds (derived from the block start, not a counter); a suffix only if a live widget
+      // already holds it (a widget kept through edits can carry a stale start).
+      let id = `serat-callout-body-${this.from}`;
+      for (let n = 2; document.getElementById(id); n++) id = `serat-callout-body-${this.from}-${n}`;
+      body.id = id;
       // Text nodes and <br>, no HTML parsing at all: full inline-Markdown
       // rendering inside a callout body is split-preview's job for now, the
       // same trade-off `readTableModel` documents for table cells.
@@ -495,7 +506,7 @@ function decorationForNode(state: EditorState, node: SyntaxNode): BlockDecoratio
     return {
       from: node.from,
       to: node.to,
-      decoration: Decoration.replace({ widget: new CalloutWidget(header, body, state.field(calloutFoldField, false)?.get(node.from) ?? null), block: true }),
+      decoration: Decoration.replace({ widget: new CalloutWidget(header, body, state.field(calloutFoldField, false)?.get(node.from) ?? null, node.from), block: true }),
     };
   }
   return null;
@@ -879,7 +890,7 @@ const widgetTheme = EditorView.baseTheme({
     borderRight: "1.5px solid currentColor",
     borderBottom: "1.5px solid currentColor",
     transform: "rotate(-45deg)", // collapsed: points right
-    transition: "transform var(--serat-duration-micro, 120ms) var(--serat-easing-enter, cubic-bezier(0, 0, 0.2, 1))",
+    transition: "transform var(--serat-duration-micro, 120ms) var(--serat-easing-enter, cubic-bezier(0.2, 0, 0, 1))",
   },
   '.serat-callout[data-fold="expanded"] .serat-callout-chevron': { transform: "rotate(45deg)" }, // points down
   ".serat-callout-count": {

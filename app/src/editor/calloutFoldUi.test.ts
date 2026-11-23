@@ -144,6 +144,26 @@ describe("4. the toggled state survives edits and reveal, and resets on reopen",
     expect(callout(v)?.getAttribute("data-fold")).toBe("expanded");
   });
 
+  it("deleting a toggled callout does not hand its state to the next callout", () => {
+    const second = "> [!tip]- Second one\n> hidden body\n\nend\n";
+    const doc = `${FOLDED}${second}`;
+    const v = mountView(doc, doc.length);
+    glyph(v).dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); // the first callout
+    expect(callout(v)?.getAttribute("data-fold")).toBe("expanded");
+    v.dispatch({ changes: { from: 0, to: FOLDED.indexOf("after\n") + "after\n".length } }); // delete the first block
+    v.dispatch({ selection: { anchor: v.state.doc.length } });
+    expect(v.state.doc.toString().startsWith("> [!tip]- Second one")).toBe(true);
+    expect(callout(v)?.getAttribute("data-fold")).toBe("collapsed"); // follows its own marker
+  });
+
+  it("the body id is derived from the block start, so a rebuild keeps it", () => {
+    const v = mountView(FOLDED);
+    const id = body(v)!.id;
+    expect(id).toMatch(/^serat-callout-body-\d+$/);
+    v.dispatch({ changes: { from: v.state.doc.length, insert: "x" } });
+    expect(body(v)!.id).toBe(id);
+  });
+
   it("a fresh state (reopening the note) takes the marker's state again", () => {
     const v = mountView(FOLDED);
     glyph(v).dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
