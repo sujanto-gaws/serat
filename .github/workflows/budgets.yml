@@ -119,11 +119,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # REPORT-ONLY ON A HOSTED RUNNER (task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
+  # REPORT-ONLY ON A HOSTED RUNNER (ADR-0019, task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
   # NFR-PRF-04's 30 s is the reference machine's number and this budget has no CI regression
-  # ceiling. A hosted windows-latest runner is 2 cores with the real-time scanner OFF in all
-  # 36 runs on record (279-316), so the harness's own `gate_eligible` is false there and it
-  # prints NOT A GATE NUMBER. The bin declares the budget `CiAssertion::WhenGateEligible`:
+  # ceiling. A hosted windows-latest runner has the real-time scanner OFF in all 36 runs on
+  # record (279-316; 2 cores is context, the criterion is the scanner), so the harness's own
+  # `gate_eligible` is false there and it prints NOT A GATE NUMBER. If GitHub ever turns
+  # Defender on for this image the job silently starts asserting 30 s on 2 cores: re-read
+  # nfr-prf-04-gate-quality.md first. The bin declares the budget `CiAssertion::WhenGateEligible`:
   # under `--profile ci` on such a runner it measures, prints `REPORT-ONLY`, uploads the
   # JSON and exits 0; on an eligible runner (Linux, or Windows with the scanner on) the same
   # command asserts 30 s and exits 1 on a breach. A measurement that cannot be taken still
@@ -560,6 +562,7 @@ jobs:
   # succeeded, so there is one check to require and it cannot be skipped green. Named
   # `needs.<job>.result` references, as ci.yml's "definition of done" does (F-354: the
   # `needs.*` filter is a schema violation). editor-latency* are report-only and excluded.
+  # prf04-full-rebuild IS included but is a report-only job (ADR-0019): green means it measured.
   budgets-gate:
     name: "budgets · every gating job succeeded"
     if: always()
