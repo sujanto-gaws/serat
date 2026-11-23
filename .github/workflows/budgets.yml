@@ -87,6 +87,40 @@ jobs:
       - name: Generator tests
         run: cargo test --release -p vaultgen
 
+  # Task #164 (NFR-PRF-01, NFR-PRF-03, NFR-PRF-08, C-06). The three jobs that DRIVE the
+  # application (prf01-serat-term, prf01-cold-start, prf03-save-to-index) spawn
+  # target/release/serat.exe; `cargo run -p budget` builds the harness, never the app, so
+  # until this job existed all three failed with "there is no application to start" and
+  # measured nothing (runs 279-316). It is built ONCE here and handed to the three as an
+  # artifact: one compile of the Tauri crate instead of three, and all three budgets measure
+  # the byte-identical binary (NFR-PRF-08: the numbers are comparable). The cost is one
+  # upload/download of ~25 MB and a serial step before the three start; a per-job build
+  # would have run in parallel but paid the Tauri compile three times on a cold cache.
+  #
+  # `-p serat-app` and nothing else, per the RULE in `env:` above: no test-hooks, so this is
+  # the same graph serat-app-release-guard checks, and the const assert in
+  # crates/serat-app/src/lib.rs would refuse the build if that ever changed. A budget bin
+  # that finds no binary exits 3 and prints no verdict (bench/budget, EXIT_APP_ABSENT), so
+  # a skipped or failed download can never read as a measurement.
+  build-app:
+    name: "serat-app release binary for the app-driving budgets (no test-hooks)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build serat-app (release, no test-hooks)
+        run: cargo build --release -p serat-app
+      - name: The binary exists where the budget bins look for it
+        shell: bash
+        run: test -s target/release/serat.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release/serat.exe
+          if-no-files-found: error
+          retention-days: 1
+
   prf04-full-rebuild:
     name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s"
     needs: vault
@@ -105,12 +139,19 @@ jobs:
 
   prf03-save-to-index:
     name: "NFR-PRF-03 · save to index < 50 ms p95 over 1000 saves"
-    needs: vault
+    needs: [vault, build-app]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release
+      - name: The application binary is in place
+        shell: bash
+        run: test -s target/release/serat.exe
       - run: cargo run --release -p budget --bin prf03-save-to-index -- --profile ci
       - uses: actions/upload-artifact@v4
         if: always()
@@ -137,12 +178,19 @@ jobs:
     # is a second measurement -- two vaults, interleaved, with the 50,000-note
     # fixture in it (F-446). Removing this job would silently delete the only
     # assertion that vault size does not move the critical path.
-    needs: vault
+    needs: [vault, build-app]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release
+      - name: The application binary is in place
+        shell: bash
+        run: test -s target/release/serat.exe
       - run: cargo run --release -p budget --bin prf01-cold-start -- --profile ci
       - uses: actions/upload-artifact@v4
         if: always()
@@ -153,12 +201,19 @@ jobs:
 
   prf01-serat-term:
     name: "NFR-PRF-01 · Serat term < 350 ms p95 (task #104's binding gate)"
-    needs: vault
+    needs: [vault, build-app]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release
+      - name: The application binary is in place
+        shell: bash
+        run: test -s target/release/serat.exe
       - run: cargo run --release -p budget --bin prf01-serat-term -- --profile ci
       - uses: actions/upload-artifact@v4
         if: always()

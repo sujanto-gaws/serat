@@ -58,6 +58,9 @@ fn main() -> ExitCode {
     let traces = match budget::subject::cold_start_traces(&vault.path, iterations) {
         Ok(t) => t,
         Err(e) => {
+            if let Some(code) = budget::subject::absent_app_exit(&e) {
+                return code;
+            }
             eprintln!("prf01-cold-start-terms: {e}");
             return ExitCode::FAILURE;
         }

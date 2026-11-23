@@ -1907,6 +1907,11 @@ pub fn job_exit(budget: &Budget, result: Result<Outcome, String>) -> std::proces
             }
         }
         Err(e) => {
+            // Task #164: an unbuilt application is its own exit code and prints
+            // no verdict-shaped line (nothing was measured).
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
+            }
             eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
             std::process::ExitCode::FAILURE
         }
@@ -2144,6 +2149,9 @@ where
     let (a, b) = match measure(&vault, parsed.iterations) {
         Ok(pair) => pair,
         Err(e) => {
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
+            }
             eprintln!(
                 "FAIL  {} · {} and {}\n  {e}",
                 first.requirement, first.id, second.id
@@ -2816,7 +2824,9 @@ pub fn run_scale_check(iterations: usize) -> bool {
             true
         }
         Err(e) => {
-            println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
+            if subject::absent_app_exit(&e).is_none() {
+                println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
+            }
             false
         }
     }
@@ -3281,6 +3291,84 @@ mod tests {
             std::process::ExitCode::FAILURE,
             "reported means a number is not asserted, not that its absence is acceptable"
         );
+    }
+
+    #[test]
+    fn the_app_driving_jobs_build_or_fetch_the_binary_before_they_measure() {
+        // Task #164 (NFR-PRF-01, NFR-PRF-03, NFR-PRF-08, C-06): runs 279-316 failed
+        // three jobs with "no application to start" because nothing built
+        // target/release/serat.exe. Pin the wiring: each job that drives the app
+        // needs `build-app`, downloads its artifact BEFORE the measure step, and
+        // build-app builds `-p serat-app` (never --workspace: test-hooks).
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let job_text = |id: &str| -> String {
+            let start = text
+                .find(&format!("\n  {id}:\n"))
+                .unwrap_or_else(|| panic!("job {id} missing from budgets.yml"));
+            let rest = &text[start + 1..];
+            let end = rest
+                .match_indices("\n  ")
+                .find(|(i, _)| {
+                    rest[i + 3..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic())
+                })
+                .map_or(rest.len(), |(i, _)| i);
+            rest[..end].to_string()
+        };
+        let build = job_text("build-app");
+        assert!(
+            build.contains("cargo build --release -p serat-app"),
+            "{build}"
+        );
+        assert!(!build.contains("--workspace"), "{build}");
+        assert!(!build.contains("--features"), "{build}");
+        for (job, bin) in [
+            ("prf03-save-to-index", "prf03-save-to-index"),
+            ("prf01-cold-start", "prf01-cold-start"),
+            ("prf01-serat-term", "prf01-serat-term"),
+        ] {
+            let body = job_text(job);
+            assert!(body.contains("build-app"), "{job} does not need build-app");
+            let download = body
+                .find("download-artifact")
+                .unwrap_or_else(|| panic!("{job} never downloads the app binary"));
+            let measure = body
+                .find(&format!("--bin {bin} "))
+                .unwrap_or_else(|| panic!("{job} does not run {bin}"));
+            assert!(
+                download < measure,
+                "{job} measures before it has the binary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_application_exits_with_its_own_code_through_every_job_shape() {
+        // Task #164, NFR-PRF-08: an unbuilt app is neither a pass nor a breach.
+        use std::process::ExitCode;
+        let absent = format!("{}looked for target/release/serat", subject::APP_ABSENT_TAG);
+        let want = ExitCode::from(subject::EXIT_APP_ABSENT);
+        assert_eq!(
+            job_exit(&PRF03_SAVE_TO_INDEX, Err(absent.clone())),
+            want,
+            "run_job's path (prf03, prf01-serat-term)"
+        );
+        assert_eq!(
+            job_exit(&PRF03_SAVE_TO_INDEX, Err("spawning x: denied".into())),
+            ExitCode::FAILURE,
+            "any other measurement error stays 1"
+        );
+        let a = absent.clone();
+        let code = cold_start_job_with(
+            &[],
+            |_| job_exit(&PRF01_SERAT_TERM, Err(a)),
+            |_| panic!("the scale check must not run when the app is absent"),
+        );
+        assert_eq!(code, want, "the cold-start composition keeps the code");
     }
 
     #[test]

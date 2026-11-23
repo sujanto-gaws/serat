@@ -673,37 +673,73 @@ pub fn save_to_index_via_app(
     crate::trace::SaveBenchmarkTrace::parse(line.trim())
 }
 
-/// Locate the application binary the cold-start job drives.
+/// Exit code of a budget bin that could not start because the application it
+/// drives is not built (task #164, NFR-PRF-08, C-06). Distinct from 1 (a breach,
+/// or a measurement that failed after starting) so a missing build is told apart
+/// from a slow one by the exit status alone, and from clap-style usage errors.
+pub const EXIT_APP_ABSENT: u8 = 3;
+
+/// Every "the application binary is not there" error starts with this. It is
+/// the one tag [`absent_app_exit`] recognises, so the message and the exit code
+/// cannot drift apart.
+pub const APP_ABSENT_TAG: &str = "serat-app binary absent: ";
+
+/// If `error` is the absent-binary error, print its one-line message and return
+/// [`EXIT_APP_ABSENT`]. Prints no `PASS`/`FAIL` verdict line: nothing was
+/// measured, and a verdict-shaped line would let a missing build read as a
+/// measurement.
+#[must_use]
+pub fn absent_app_exit(error: &str) -> Option<std::process::ExitCode> {
+    if error.starts_with(APP_ABSENT_TAG) {
+        eprintln!("budget: {}", error.lines().next().unwrap_or(error));
+        Some(std::process::ExitCode::from(EXIT_APP_ABSENT))
+    } else {
+        None
+    }
+}
+
+/// Locate the application binary the cold-start and save-to-index jobs drive.
 ///
 /// `SERAT_BIN` overrides; otherwise the release build beside this crate's
-/// target directory. Returns an error naming task S1 rather than a path that
-/// does not exist, because "file not found" is not a useful CI log line.
+/// target directory (`target/release/serat[.exe]`, i.e. what
+/// `cargo build --release -p serat-app` produces). The error is ONE line,
+/// starts with [`APP_ABSENT_TAG`], and names the build command.
 ///
 /// # Errors
 /// When the binary is absent.
 pub fn app_binary() -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("SERAT_BIN") {
+    app_binary_in(
+        std::env::var("SERAT_BIN").ok().as_deref(),
+        &crate::repo_root(),
+    )
+}
+
+/// [`app_binary`] with its two inputs injected, so the absent path is testable
+/// without touching the process environment or a real target directory.
+///
+/// # Errors
+/// When the binary is absent.
+pub fn app_binary_in(explicit: Option<&str>, repo_root: &Path) -> Result<PathBuf, String> {
+    if let Some(explicit) = explicit {
         let path = PathBuf::from(explicit);
         return if path.exists() {
             Ok(path)
         } else {
             Err(format!(
-                "SERAT_BIN points at {}, which does not exist",
+                "{APP_ABSENT_TAG}SERAT_BIN points at {}, which does not exist",
                 path.display()
             ))
         };
     }
     let name = if cfg!(windows) { "serat.exe" } else { "serat" };
-    let candidate = crate::repo_root().join("target/release").join(name);
+    let candidate = repo_root.join("target/release").join(name);
     if candidate.exists() {
         Ok(candidate)
     } else {
         Err(format!(
-            "there is no application to start yet -- tasks D2 and S1. Looked for {}.
-
-{}",
-            candidate.display(),
-            COLD_START_ENTRY_POINT
+            "{APP_ABSENT_TAG}looked for {}; build it first with `cargo build --release -p serat-app` \
+             (or set SERAT_BIN)",
+            candidate.display()
         ))
     }
 }
@@ -958,6 +994,44 @@ pub fn measure_resolve_overhead(vault_path: &Path) -> Result<ResolveOverhead, St
 mod tests {
     use super::*;
 
+    /// NFR-PRF-01, NFR-PRF-03, NFR-PRF-08, C-06, task #164: a missing
+    /// application is a build problem, reported as one, never as a measurement.
+    #[test]
+    fn an_absent_app_binary_is_one_tagged_line_naming_the_build_command() {
+        let empty = std::env::temp_dir().join(format!("serat-164-empty-{}", std::process::id()));
+        let err = app_binary_in(None, &empty).unwrap_err();
+        assert!(err.starts_with(APP_ABSENT_TAG), "{err}");
+        assert_eq!(err.lines().count(), 1, "one line, not a block: {err}");
+        assert!(err.contains("cargo build --release -p serat-app"), "{err}");
+        // SERAT_BIN pointing nowhere is the same class of failure.
+        let err = app_binary_in(Some("/nonexistent/serat"), &empty).unwrap_err();
+        assert!(err.starts_with(APP_ABSENT_TAG), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+    }
+
+    #[test]
+    fn a_present_app_binary_is_found_in_target_release() {
+        let root = std::env::temp_dir().join(format!("serat-164-root-{}", std::process::id()));
+        let dir = root.join("target/release");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = if cfg!(windows) { "serat.exe" } else { "serat" };
+        std::fs::write(dir.join(name), b"").unwrap();
+        assert_eq!(app_binary_in(None, &root).unwrap(), dir.join(name));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_absent_exit_code_is_distinct_and_only_for_the_absent_error() {
+        use std::process::ExitCode;
+        assert_ne!(EXIT_APP_ABSENT, 0);
+        assert_ne!(EXIT_APP_ABSENT, 1, "1 is a breach or a failed measurement");
+        assert_eq!(
+            absent_app_exit(&format!("{APP_ABSENT_TAG}looked for x")),
+            Some(ExitCode::from(EXIT_APP_ABSENT))
+        );
+        assert_eq!(absent_app_exit("spawning x: denied"), None);
+    }
+
     #[test]
     fn the_remaining_seams_fail_loudly_and_say_what_is_missing() {
         // The point of these assertions is that a red job is legible: whoever
@@ -1002,7 +1076,7 @@ mod tests {
         // state, not on this seam's own correctness.
         let e = save_to_index_via_app(vault, 10).expect_err("must not silently pass");
         assert!(
-            e.contains("S1") || e.contains("opening") || e.contains("vault"),
+            e.contains("binary absent") || e.contains("opening") || e.contains("vault"),
             "save_to_index_via_app must refuse and name either the absent binary or the \
              absent vault, not fail opaquely: {e}"
         );
@@ -1027,7 +1101,7 @@ mod tests {
         // something actionable -- never a number over nothing.
         let e = cold_start(vault, 20).expect_err("must not silently pass");
         assert!(
-            e.contains("S1") || e.contains("exit code") || e.contains("vault"),
+            e.contains("binary absent") || e.contains("exit code") || e.contains("vault"),
             "cold_start must refuse and name either the absent binary or the \
              absent vault, not fail opaquely: {e}"
         );
