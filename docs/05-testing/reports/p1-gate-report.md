@@ -16,7 +16,7 @@ cites: ADR-0011, ADR-0015, ADR-0016, ADR-0017, F-384, RISK-013, RISK-015
 
 ## Read this first
 
-1. **Nothing in P1 was CI-asserted.** GitHub Actions has never produced a job on this repository (F-384, RISK-013; `docs/05-testing/reports/t2-p0-gate-report.md` §NFR-PRF-08: every run since `abc71409`, 2026-09-06, completed in 1-4 s with zero steps and no runner). Every budget job and every gating check named below was therefore run **locally or not at all**. NFR-PRF-08 (budgets enforced in CI) is **not satisfied**, as it was not at P0. RISK-013's wording requires this report to say which budgets were CI-asserted: **none**.
+1. **Nothing in P1 was CI-asserted.** Jobs are created on every push but no hosted runner is ever assigned (F-384, RISK-013; correction of 2026-11-23, checked against GitHub Actions directly; see CI jobs below). Every budget job and every gating check named below was therefore run **locally** by the lead's gate or not at all. NFR-PRF-08 (budgets enforced in CI) is **not satisfied**, as it was not at P0. RISK-013's wording requires this report to say which budgets were CI-asserted: **none**.
 2. **One P1 budget is attested; the rest are not.** NFR-PRF-03 is attested (17.01 ms p95, `attested 0`). Every other figure was taken on a shared 4-CPU container under load, or at P0 on a different machine, and is reported as such.
 3. **No figure here comes from the reference machine** (`docs/05-testing/reference-machine.md`, RM-1, Windows 11 / WebView2). NFR-PRF-02 is gate-eligible only there (PRD v1.6, architecture §9.3). That run has not been done.
 4. **The Demo and Inspect IDs (12 of the 33) cannot be witnessed by this document at all.** Only the owner's week witnesses them (protocol §Demo/Inspect). They are listed as pending, with automated proxies named, and are not counted as witnessed.
@@ -86,7 +86,7 @@ Columns: **Verify** is the PRD method. **Witness** names the test case, bench re
 | NFR-CMP-03 | Test | `crates/serat-index/tests/open_or_rebuild.rs`, `crates/serat-index/tests/rebuild_equivalence.rs` | tested |
 | NFR-CMP-04 | Demo | proxy: `crates/serat-app/src/gitignore.rs`, `crates/serat-vault/src/gitignore.rs` | pending the week |
 | NFR-USE-01 | Inspect | proxy: `app/src/editor/commands.test.ts`, `app/src/overlays/overlays.test.ts`, `app/src/tree/contextMenuPlatforms.test.ts` | pending the week |
-| NFR-MNT-01 | Inspect | `ipc-types` job in `.github/workflows/ci.yml` (regeneration diff; ran locally at #27, 57 files, no difference; **never ran on a runner**); not re-run for this draft | pending the week (two dated local logs required by the protocol) |
+| NFR-MNT-01 | Inspect | `ipc-types` job in `.github/workflows/ci.yml` (regeneration diff; ran locally at #27, 57 files, no difference; **has not run on a runner**); not re-run for this draft | pending the week (two dated local logs required by the protocol) |
 
 **Tally (33 P1 IDs).**
 
@@ -113,7 +113,7 @@ Caveats on the 16: the front-end tests are jsdom/vitest, not a real webview; FR-
 | NFR-PRF-05 query latency | P2 scope | **not run** | PRD Phase column |
 | **NFR-PRF-06** switcher keystroke, 50 ms | 20k default 12 to 13 ms, heading mode 16 to 18 ms (loaded); 50k 46 to 48 ms (reported, not gated, PRD v1.9). The 20 ms allocation of §9.2 is a printed finding | **unattested** (loaded; no attested run, no report file) | `status-p1-editor.md`; job `p1-switcher` |
 | NFR-PRF-07 memory ceiling | P4 scope | **not run** | PRD Phase column |
-| **NFR-PRF-08** budgets enforced in CI | Jobs exist in `.github/workflows/budgets.yml` (`prf01-cold-start`, `prf01-serat-term`, `prf03-save-to-index`, `prf04-full-rebuild`, `p1-read-paths`, `p1-tree-path`, `p1-external-change`, `p1-switcher`, `every-budget-has-a-job`, the report-only `editor-latency` and `editor-latency-real-ipc`). **None has ever run** | **not satisfied** (F-384, RISK-013). Needs the repository owner; nothing under `bench/` or `docs/` can fix it | `t2-p0-gate-report.md` §NFR-PRF-08; `docs/01-planning/risk-register.md` |
+| **NFR-PRF-08** budgets enforced in CI | Jobs exist in `.github/workflows/budgets.yml` (`prf01-cold-start`, `prf01-serat-term`, `prf03-save-to-index`, `prf04-full-rebuild`, `p1-read-paths`, `p1-tree-path`, `p1-external-change`, `p1-switcher`, `every-budget-has-a-job`, the report-only `editor-latency` and `editor-latency-real-ipc`). **None has executed since 2026-09-08 at the latest** (see CI jobs) | **not satisfied** (F-384, RISK-013). Needs the repository owner; nothing under `bench/` or `docs/` can fix it | `t2-p0-gate-report.md` §NFR-PRF-08; `docs/01-planning/risk-register.md` |
 | NFR-PRF-09 extraction budget | P2 scope; TC-035 planned | **not run** | `docs/05-testing/test-plan.md` |
 
 NFR-PRF-10 (scale ceiling, P5) is outside the 01..09 range and is not run.
@@ -135,11 +135,15 @@ This draft does not message them; the lead relays (`status-p1-editor.md` §Proce
 
 ## CI jobs
 
-| Workflow | Jobs relevant to P1 | Ran on a runner? |
+| Workflow | Jobs relevant to P1 | Executed on a runner? |
 |---|---|---|
 | `.github/workflows/budgets.yml` | the nine budget jobs and two report-only editor-latency jobs listed under NFR-PRF-08 | **No** |
-| `.github/workflows/ci.yml` | `fmt`, `deny`, `clippy`, `workspace`, `windows-compile`, `npm-deny`, `ipc-types`, `frontend-bundle`, `members`, `crate`, `location-independence`, `gate` | **No** |
-| `.github/workflows/design-docs.yml`, `serat-app-tests.yml` | doclint (path, PRD-join, table-structure, count-over-list, conflict-marker checks) and serat-app tests | **No** |
+| `.github/workflows/ci.yml` | `fmt`, `deny`, `clippy`, `workspace`, `windows-compile`, `npm-deny`, `ipc-types`, `frontend-bundle`, `members`, `crate`, `location-independence`, `gate` | **No since 2026-09-08 at the latest**; it did run for real on 2026-09-06 |
+| `.github/workflows/design-docs.yml`, `serat-app-tests.yml` | doclint checks and serat-app tests | **No** (same pattern) |
+
+**What GitHub shows (checked directly by the lead, 2026-11-23; test-engineer did not query the API).** The repository is private and has 1,595 workflow runs. `ci.yml` ran for real on 2026-09-06: runs 72 and 80 succeeded (733 s and 840 s) and runs 82 to 85 ran 9 to 13 minutes and failed on content. From 2026-09-08 at the latest, every run of `ci`, `budgets`, `design-docs` and `serat-app-linux` completes with conclusion failure within 2 to 7 s; every job shows `runner_id` 0 and no log (the API returns 404 for job logs). That includes the latest run on `main` at `e82eb01`: ci run 428, 12 jobs failed in 2 to 3 s, 1 skipped (https://github.com/sujanto-gaws/serat/actions/runs/45197269660). So jobs are created and no hosted runner is ever assigned. All jobs use plain `ubuntu-latest` or `windows-latest`, so this is the billing / spending-limit / payment pattern for private repositories, not a workflow or runner-label defect. This replaces the earlier wording "CI produces no jobs" and "has never run"; the verdict does not change.
+
+**Owner remedy:** check the account's Actions billing (minutes, spending limit, payment method) in GitHub Settings, Billing, then re-run `ci.yml` on `main`. Until then the lead's local gate is the only executed evidence.
 
 Everything the jobs would assert has been run locally by the lead's per-merge gate; that is the substitute, and it is not CI.
 
@@ -147,7 +151,7 @@ Everything the jobs would assert has been run locally by the lead's per-merge ga
 
 1. **#147 pending, needs CI runners.** Quiet-machine NFR-PRF-02 scenarios, triage of table-cell and split-preview, and of the bridge `save_patch` figure.
 2. **Reference-machine run not done.** NFR-PRF-02 must be tested on WebView2 with and without scroll margins (`status-p1-editor.md` §Open risks; `docs/05-testing/reference-machine.md`).
-3. **GitHub Actions has never run (F-384, RISK-013).** NFR-PRF-08 unmet; Windows runner tests (`crates/serat-app/tests/windows_vault.rs`, 17 runner-only assumptions in `test-plan.md`) have never run; the `ipc-types` and `frontend-bundle` jobs have never run on a runner.
+3. **No CI job has executed since 2026-09-08 at the latest (F-384, RISK-013).** Jobs are created but never get a runner; see CI jobs for the facts and the owner remedy. NFR-PRF-08 unmet; Windows runner tests (`crates/serat-app/tests/windows_vault.rs`, 17 runner-only assumptions in `test-plan.md`) have never run on a runner; the `ipc-types` and `frontend-bundle` jobs have not run on a runner.
 4. **Table-cell and split-preview typing are the weakest NFR-PRF-02 scenarios under load** (strict 93.6% and 93.2%, p95 2 frames). Recorded without a task of their own; #147 re-measures both first.
 5. **Bridge-side `save_patch` p95 723 ms under load** (p50 455 ms, max 976 ms, n=40, load average 10 to 30 on 4 CPUs). Off the keystroke path; #147 re-measures it. Contrast the attested 17.01 ms for the in-process hub-note save: they are different harnesses and are not comparable.
 6. **MISSING-E2E-1.** No real-webview test of PDF page navigation, text selection or image zoom (FR-BIN-11/12). Falls to the manual week.

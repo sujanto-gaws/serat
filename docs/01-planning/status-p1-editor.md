@@ -186,7 +186,7 @@ The week-in-vault report · the reference-machine NFR-PRF-02 run · #62 attested
 
 - **No Windows or macOS build in this environment.** #19's Windows paths, #72's UNC handling and #34/#35's name rules are verified by reading only. A Windows CI run is owed before any release claim.
 - **NFR-PRF-02 is not gateable headless.** The reference-machine run (WebView2) must test the editor with and without scroll margins.
-- **RISK-013 / F-384:** CI still produces no jobs; #60 cannot gate until it does.
+- **RISK-013 / F-384:** jobs are created but no hosted runner is ever assigned (1,595 runs; `ci.yml` ran for real on 2026-09-06, runs 72 and 80 green; since 2026-09-08 at the latest every run fails in 2-7 s with `runner_id` 0 and no log, latest ci run 428 on `e82eb01`, https://github.com/sujanto-gaws/serat/actions/runs/45197269660): the billing / spending-limit pattern for a private repository, not a workflow defect. Owner: check Actions billing (minutes, spending limit, payment method) in GitHub Settings, then re-run `ci.yml` on `main`. #60 cannot gate until then.
 - **Shared target directory:** a TaskCompleted hook or any second cargo in the integration checkout relinks test binaries under the lead's gate (SIGBUS, F-234's shape). The lead now completes tasks only while no gate runs. The three load-sensitive tests are deterministic since #67.
 - **RUSTSEC-2026-0459** closed by #112 (libsqlite3-sys 0.39.1); the `deny` job is in the gate (#113) and green.
 - **RISK-015 (ADR-0018):** on a cloud-synced vault a read can hydrate an online-only file silently; the P1 gate vault is local only (owner), the locality predicate ships with #143, the gate is P2 (FR-VLT-12).
