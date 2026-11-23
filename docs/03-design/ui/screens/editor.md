@@ -24,12 +24,12 @@ Two editor modes, one document, one command registry (architecture.md §9.3: "ed
 ## Mode 1 — Hybrid live preview (default, `editor.live_preview = true`)
 
 - Formatting renders inline: `**bold**` shows as **bold** text with the `**` markers hidden, `# Heading` shows as a styled heading with the `#` hidden, wikilinks render as styled link text, tables render as a `StateField` block widget.
-- **Reveal rule** (FR-EDT-02): a line is shown "raw" — markers visible and editable, `mono-source` styling — only while the selection intersects it. Leaving the line hides the markers again **within one frame** (the acceptance criterion, literally: architecture.md §9.3's frame-budget discipline applies here too — no debounce on reveal/hide).
-- Cursor entering a bold span: `**` fades in over `motion.duration.micro` (120ms) — a state change the user caused, so a short transition is earned (frontend-design skill: "motion that answers a person's action is welcome").
+- **Reveal rule** (FR-EDT-02): a line is shown "raw" — markers visible and editable — only while the selection intersects it. Raw means the markers: they take `mono-source` styling in `text-secondary`, and the text between them keeps its rendered face, so the caret never sees a line change typeface under it (Live-preview typography, below). Leaving the line hides the markers again **within one frame** (the acceptance criterion, literally: architecture.md §9.3's frame-budget discipline applies here too — no debounce on reveal/hide).
+- Cursor entering a bold span: `**` appears in the same frame, with no fade. This replaces an earlier 120ms fade: FR-EDT-02's criterion is one frame, and CodeMirror recreates the marker spans on edits, so an entry animation would replay on every keystroke typed on the line.
 - Block widgets (tables, embeds, callouts) are inert until clicked/selected; clicking one line inside a table reveals that line's raw `|` syntax the same way, the rest of the table stays rendered.
 - **Image embeds** (`![[image.png]]`, `![[image.png|300]]`) render as a plain `<img>` element whose `src` is the `serat-asset://` URL for that path (ADR-0017), and nothing else: never `<object>`, `<iframe>`, inline SVG markup, or the sanitised HTML string inserted via `v-html`/`innerHTML`. This applies identically to the split-preview pane and to any embed nested inside another note's render — see components.md §3/§4 for the rendering rule stated once, generally, so it doesn't need re-deriving per surface.
 - Obsidian syntax Serat doesn't render (Dataview blocks, plugin fences) shows as plain `mono-source` text with a thin left rule in `text-tertiary` and a small inline label "not rendered by Serat" the first time it's seen per session (dismissible), never rewritten (C-01).
-- **External `http(s)://` links** render the same as a resolved wikilink visually (`text-link`, underline on hover/focus) but never navigate the app window on click, hover or hover-adjacent movement. Hovering shows the full URL in a tooltip (so the destination is known before committing to it — the same reasoning as a normal browser's status-bar preview). Only an explicit click, or `↵`/`Space` when the link has keyboard focus, opens it — and it opens in the **system default browser**, via the shell-open command, never inside the webview. Nothing about an external link is prefetched, resolved or fetched by Serat at render time (NFR-SEC-01: the app makes no network request the user didn't directly cause) — this holds identically in live preview, split preview and inside embeds.
+- **External `http(s)://` links** render the same as a resolved wikilink visually (`text-link`, a quiet underline at rest that goes solid on hover/focus, as Live-preview typography specifies) but never navigate the app window on click, hover or hover-adjacent movement. Hovering shows the full URL in a tooltip (so the destination is known before committing to it — the same reasoning as a normal browser's status-bar preview). Only an explicit click, or `↵`/`Space` when the link has keyboard focus, opens it — and it opens in the **system default browser**, via the shell-open command, never inside the webview. Nothing about an external link is prefetched, resolved or fetched by Serat at render time (NFR-SEC-01: the app makes no network request the user didn't directly cause) — this holds identically in live preview, split preview and inside embeds.
 
 ### Callouts and the fold marker (#152; FR-EDT-01, FR-EDT-02, NFR-USE-01)
 
@@ -53,6 +53,94 @@ A callout whose first line carries Obsidian's fold marker (`> [!tip]- Title` col
 6. Glyph and count use only the tokens named above; under `prefers-reduced-motion: reduce` the turn takes 1 ms; the hit target is 24 x 24 px.
 7. A collapsed title's accessible name is the title plus the count, and the glyph is hidden from assistive technology.
 8. The keystroke path is unchanged: no layout measurement is added to a transaction with no callout in range (NFR-PRF-02).
+
+### Live-preview typography (#103; FR-EDT-01, FR-EDT-02, FR-EDT-10, NFR-USE-01, NFR-PRF-02)
+
+Until now the reveal rule hid the Markdown markers and nothing styled what was left, so a note read as unstyled text. This section is the whole typographic contract for Mode 1, the Mode 2 source pane and the Mode 2 preview pane. It adds no new decision about behaviour; every size is a step on the `tokens.json` scale.
+
+**Files.** `tokens.css` is every `--serat-*` custom property, generated from `tokens.json` (the app defines none today; the widgets in `app/src/editor` already reference eighteen of them, with fallbacks). `live-preview.css` is the reference stylesheet for the classes below. Both live in `docs/03-design/ui/` and are installed into `app/` by copying (`app/src/styles/tokens.css`, `app/src/editor/livePreview.css`), because the design folder is not importable from the app.
+
+**The idea.** Two voices on one page. The note is Source Serif 4, the vault's voice, set at 17/28 on a measure tuned for reading. Structure is Bricolage Grotesque, the app's voice: headings are the app's structure laid over the prose, so they change typeface as well as size. Mono appears only where the machine speaks: revealed markers, code, properties. Nothing is decorated; hierarchy comes from size, weight, one rule on quotes and one fill on code.
+
+#### Column and rhythm
+
+| Property | Value | Why |
+|---|---|---|
+| Body | `body-serif`: Source Serif 4, 17px / 28px, `text-primary` | 28px is the baseline; every block is a whole number of 28px lines except heading padding. |
+| Column | `max-width: 64ch` (`typography.measure.editor`), centred, 24px side gutter (`space.7`) | Starting value. Tune it until an average full line of English prose holds 66 to 80 characters; serif body may run to the long end. `measure.prose-max` (72ch) stays the ceiling elsewhere. |
+| Paragraph gap | One blank line (28px). Blank lines are never shrunk | A shortened blank line would grow to 28px on the first character typed into it, a jump under the caret. |
+| Heading space | Padding on the heading line: H1 16 above and 4 below, H2 12 above and 2 below, H3 8 above, H4 to H6 none; none for a heading that opens the note | CodeMirror measures lines, not margins. The blank line before a heading is still there; the padding adds to it. |
+| Caret | 2px `accent-interactive` | The same indigo as every interactive thing; ink would be invisible against the text. |
+| Selection | `bg-selection` (`indigo.200`), ink text 12:1 | `bg-selected` (`indigo.100`) is too faint on `bg-surface` to see a selection. |
+| Active line | No wash | The reveal rule is the only line-level signal. |
+
+#### Headings
+
+| Level | Scale step | Size / line | Weight | Notes |
+|---|---|---|---|---|
+| H1 | `display` | 34 / 40, -0.025em | 700 | The note title when the author writes one. |
+| H2 | `heading-lg` | 28 / 34, -0.02em | 700 | |
+| H3 | `heading-md` | 23 / 29, -0.015em | 700 | |
+| H4 | `heading-sm` | 19 / 26, -0.01em | 700 | |
+| H5 | `heading-xs` | 17 / 28, -0.005em | 700 | Same size as the body, told apart by face and weight. |
+| H6 | `heading-xs` | 17 / 28, -0.005em | 600 | `text-secondary` (8.3:1). |
+
+All in the `ui` family, `text-primary` unless stated, `text-wrap: balance`. The ratio between steps is about 1.2, so five sizes stay distinguishable without a heading outweighing the page. This replaces the three-step mapping in `components.md` section 3. Each heading line carries `role="heading"` and `aria-level` (Accessibility, below).
+
+#### Inline
+
+| Markdown | Rendered | Class |
+|---|---|---|
+| `**bold**` | Source Serif 4 weight 700 | `serat-strong` |
+| `*italic*` | Italic face (bundled; never synthesised oblique) | `serat-em` |
+| `~~strike~~` | Line-through 1px, `text-secondary` | `serat-strike` |
+| `==highlight==` | `bg-highlight` (`brass.100`) fill, ink text, `radius.sm`, 0.15em side padding. Ink on brass.100 is 14.4:1; brass is never a text colour (brass-600 on white is 4.0:1) | `serat-highlight` |
+| `` `code` `` | Mono at 0.85em (14.5px in body), `bg-surface-sunken`, `radius.sm`, 0.3em side padding, no border | `serat-code` |
+| `[[Note]]`, resolved | `text-link`, 1px underline at 35% alpha, solid on hover | `serat-link-resolved` |
+| `[[Note#Missing]]` | As resolved, with a dashed brass underline | `serat-link-subpath-missing` |
+| `[[Nothing]]`, unresolved | `unresolved-link` (rust), dotted underline | `serat-link-unresolved` |
+| `[text](https://...)` | As a resolved wikilink; the `(url)` shows only when the line is revealed, mono, `text-secondary` | `serat-md-link`, `serat-url` |
+
+Links keep a quiet underline at rest. This amends `components.md` section 3 and the external-link bullet above, which said "no underline at rest": indigo on ink body text measures 1.9:1, so colour alone cannot mark a link (WCAG 1.4.1; the accessibility baseline already says colour is never the only carrier).
+
+#### Revealed markers
+
+On a line the selection touches, the hidden characters come back as `serat-marker`: JetBrains Mono at 0.85em of the surrounding size, weight 400, `text-secondary` (`text-marker`, 8.3:1). Inside a heading the marker scales to the heading (H1 0.5em, H2 0.55, H3 0.65, H4 0.8, H5 and H6 0.85), so a revealed `#` is not 34px mono. Same frame, no transition. Standard markers get the class from the highlighter (`processingInstruction`); the custom ones (`[[`, `]]`, `![[`, `==`, `[^`) get it from the reveal plugin when it declines to hide them.
+
+#### Block level
+
+| Block | Treatment | Class |
+|---|---|---|
+| Blockquote | 2px `rule-quote` (`neutral.300`) left rule, 16px (`space.5`) indent, `text-secondary`; not italic, because italic is reserved for emphasis. `>` hidden unless revealed. Nesting beyond one level looks the same in P1 | `serat-quote` |
+| Bullet list | Marker `-`, `*` or `+` renders as a bullet glyph in `text-secondary` in a 1.5em column; one 1.5em indent per level; wrapped lines hang under the item text. The raw leading indent is hidden when not revealed, otherwise it would double the padding. Today `ListMark` is hidden outright, which makes bullets vanish: the reveal plugin must replace it with the glyph instead | `serat-li`, `--serat-depth`, `serat-bullet` |
+| Ordered list | The numeral stays visible (it is information; the reveal plugin must not hide it), `text-secondary`, tabular figures, same column and indent | `serat-li`, `serat-list-number` |
+| Fenced code | `mono-source` (14.5 / 24) on `bg-surface-sunken`, full column width, 16px side padding, no border. The fence lines stay as empty bands and are the block's top and bottom padding; the language shows in `micro` mono, `text-secondary` | `serat-code-line`, `serat-code-info` |
+| Properties (YAML) | Raw, `mono-source`, `text-secondary` on `bg-surface-sunken`; never rendered, never hidden | `serat-frontmatter` |
+| Thematic break | Stays raw in P1: `---` in mono, `text-secondary`, letter-spaced. A drawn rule is a P2 widget | `serat-hr` |
+| Tables, callouts, embeds | Block widgets own their markup. Table text is `body-serif-sm` (15 / 24); header cells are `ui` 600 with a `border-strong` underline, body rows a `border-hairline` underline, no vertical rules, no zebra. Callout title `ui-medium`, body `body-serif`. Images: `max-width: 100%`, `height: auto`, no radius | (widget) |
+
+Block refs and inline fields (`^id`, `key:: value`) are `mono-source` in `text-secondary`, not `text-tertiary` as `components.md` said: `text-tertiary` is 3.25:1 on `bg-surface`, and these are always visible because they are load-bearing.
+
+#### Mode 2
+
+Source pane: one monospace size (`mono-source`, 14.5 / 24), nothing hidden, nothing resized. Headings and `**bold**` weight 700, `*italic*` italic, markers and URLs `text-secondary`, links `text-link`, unresolved links `unresolved-link` dotted, code and highlights on their fills. No column limit; lines soft-wrap at the pane edge. The preview pane and embeds use `.serat-prose` in `live-preview.css`: the same scale, so a note reads the same in all three places.
+
+#### Fonts
+
+The three families are bundled with the app as self-hosted variable `woff2` (Source Serif 4 roman and italic, Bricolage Grotesque, JetBrains Mono), all under the SIL Open Font License. Nothing loads from a network (NFR-SEC-01). The editor mounts after the body and mono faces have loaded, because CodeMirror measures line heights once; when a face loads later it calls `view.requestMeasure()`. Fallbacks are the stacks in `tokens.json`.
+
+**Acceptance (one vue-frontend-dev task, #104):**
+1. `tokens.css` is installed and imported first; `grep -rn "var(--serat-" app/src` finds no name that `tokens.css` does not define; the P0 variables in `app/src/style.css` are replaced by `--serat-brand-*` or aliased to them. A unit test parses `tokens.json` and fails if a colour ramp or role value differs from `tokens.css`.
+2. In the Mode 1 editor, H1 to H6 lines render at the sizes, family and weight in the heading table; body text is Source Serif 4 17 / 28; the average full line on the fixture note holds 66 to 80 characters, measured and recorded in the PR (adjust `measure.editor` if not).
+3. Bold, italic, strike, highlight, inline code, resolved, subpath-missing and unresolved links, quotes, bullet and ordered lists, fenced code and properties each match their table row. A fixture note containing every one is committed and screenshotted in the PR.
+4. Revealed markers use `serat-marker` and appear in the same frame as the selection change, with no transition and no change to the line's text typeface.
+5. List lines hang correctly: a wrapped continuation aligns with the item text within 1px at depth 0 to 3, revealed and not; bullets are visible when not revealed and ordered numerals are never hidden.
+6. Links keep the underline at rest; unresolved links are dotted; no link state is carried by colour alone.
+7. The three font families are bundled and loaded locally; with the network blocked the editor renders identically (NFR-SEC-01); `requestMeasure` runs on late font load.
+8. The Mode 2 source pane and `.serat-prose` preview follow the Mode 2 paragraph; the editor root carries `serat-live` or `serat-source`, never both.
+9. The new decorations are built from `view.visibleRanges` and not from the selection, except what the reveal plugin already does; the end-of-document keystroke scenario (architecture.md section 9.3) and the NFR-PRF-02 budget job still pass.
+10. Contrast: every text and fill pair above measures at least 4.5:1 for text and 3:1 for the quote rule and link underline, checked once with a script and recorded in the PR; `text-tertiary` appears on no text needed to understand the note.
+11. The inline themes in `links.ts` and `blockWidgets.ts` that duplicate these colours are removed or yield to `livePreview.css`; their fallback hex values are not edited to match.
 
 ### States
 | State | Presentation |
