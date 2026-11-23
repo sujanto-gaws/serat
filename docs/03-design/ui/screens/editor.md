@@ -67,7 +67,7 @@ Until now the reveal rule hid the Markdown markers and nothing styled what was l
 | Property | Value | Why |
 |---|---|---|
 | Body | `body-serif`: Source Serif 4, 17px / 28px, `text-primary` | 28px is the baseline; every block is a whole number of 28px lines except heading padding. |
-| Column | `max-width: 64ch` (`typography.measure.editor`), centred, 24px side gutter (`space.7`) | Starting value. Tune it until an average full line of English prose holds 66 to 80 characters; serif body may run to the long end. `measure.prose-max` (72ch) stays the ceiling elsewhere. |
+| Column | `max-width: 72ch` (`typography.measure.editor`, equal to `measure.prose-max`), centred, 24px side gutter (`space.7`) | Measured with the real Source Serif 4 at 17 / 28 on six full lines at 1400px: 64ch gave 61.8 characters on average, 68ch 67.8, 72ch 72.4 (71 to 74), 76ch 75.0 (73 to 80). 72ch is the smallest value inside the 66 to 80 target with margin on both sides. |
 | Content padding | `.cm-content` padding-top 16px (`space.5`), bottom 24px (`space.7`) | Not 24px on top. With CodeMirror's 24px scroll margin and a 34 / 40 H1, a 24px top padding left Control+Home 6px short of scrollTop 0. |
 | Paragraph gap | One blank line (28px). Blank lines are never shrunk | A shortened blank line would grow to 28px on the first character typed into it, a jump under the caret. |
 | Heading space | Padding on the heading line: H1 16 above and 4 below, H2 12 above and 2 below, H3 8 above, H4 to H6 none; none for a heading that opens the note | CodeMirror measures lines, not margins. The blank line before a heading is still there; the padding adds to it. |
