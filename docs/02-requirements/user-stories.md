@@ -427,7 +427,7 @@ As a long-term user, I want the app to feel the same at 50,000 notes as at 500, 
 
 **Acceptance criteria**
 
-- Given the synthetic vault, when CI runs, then every performance budget is asserted and a regression fails the build.
+- Given the synthetic vault, when CI runs on a runner the budget harness rates gate eligible, then every performance budget is asserted there and a regression fails the build; where a hosted runner is not gate eligible, the budget is measured and reported by a report-only job (failing if the measurement cannot be taken) and asserted on the reference machine at each phase gate (ADR-0019, NFR-PRF-08).
 
 ### US-36 — Install it like a normal app  (serves FR-PLT-01, FR-PLT-02, FR-PLT-03, NFR-USE-02)
 **Phase:** P5 · **Size:** M
