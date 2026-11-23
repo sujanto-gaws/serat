@@ -138,19 +138,19 @@ describe("App drops index status from another vault (#91, IndexStatus.vault_id)"
     const send = (vault_id: string, note_count: number) =>
       handlers.get("index://status")!({ payload: { vault_id, state: { kind: "ready", note_count } } });
     send("A", 1);
-    expect(store.indexStatusText).toContain("1 notes");
+    expect(store.indexStatusText).toContain("· 1 note");
     send("OTHER", 2);
     send("", 3);
-    expect(store.indexStatusText).toContain("1 notes");
+    expect(store.indexStatusText).toContain("· 1 note");
     handlers.get("vault://opened")!({ payload: { root: "/b", vault_id: "B", index: { kind: "opening" } } });
     store.openFailed();
     send("A", 4); // the old vault's late status after the failed open
     send("B", 5); // the announced id's own status, emitted before the Err and delivered after (#103)
-    expect(store.indexStatusText).toContain("1 notes");
+    expect(store.indexStatusText).toContain("· 1 note");
     expect(store.vaultRoot).toBeNull();
     handlers.get("vault://opened")!({ payload: { root: "/c", vault_id: "C", index: { kind: "opening" } } });
     send("B", 6);
-    expect(store.indexStatusText).toContain("1 notes");
+    expect(store.indexStatusText).toContain("· 1 note");
     send("C", 7);
     expect(store.indexStatusText).toContain("7 notes");
     wrapper.unmount();

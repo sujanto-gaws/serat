@@ -3,12 +3,15 @@ import { describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
+import type { RebuildReason } from "@/ipc/generated/RebuildReason";
 
 import {
   describeIndexCheckDetail,
   describeIndexDetail,
   describeIndexState,
   INDEX_CHECK_ANNOUNCEMENT,
+  describeRebuildAnnouncement,
+  describeRebuildDetail,
   INDEX_CHECK_TEXT,
   useVaultStore,
 } from "./vault";
@@ -37,7 +40,7 @@ describe("describeIndexState", () => {
       total: 4_000,
       walk_complete: false,
     });
-    expect(text).toContain("Rebuilding index (no_index)");
+    expect(text).toContain("Building the index");
     expect(text).toContain("120");
     expect(text).not.toContain("120/4000");
   });
@@ -132,7 +135,7 @@ describe("opening reason: index held by another process (P1 #155)", () => {
     }
   });
 
-  it("announces on entering, skips the plain Opening{None}, announces the state after it, then Ready clears", () => {
+  it("announces on entering, skips the plain Opening{None}, announces the state after it, then the Ready that ends it", () => {
     setActivePinia(createPinia());
     const store = useVaultStore();
     store.setIndexState(held);
@@ -145,11 +148,11 @@ describe("opening reason: index held by another process (P1 #155)", () => {
     store.setIndexState({ kind: "opening" });
     expect(store.indexAnnouncement).toBe("");
     store.setIndexState({ kind: "rebuilding", reason: "no_index", done: 0, total: 5, walk_complete: false });
-    expect(store.indexAnnouncement).toContain("Rebuilding index"); // the state after it is
+    expect(store.indexAnnouncement).toContain("Building the index"); // the state after it is
     store.setIndexState({ kind: "rebuilding", reason: "no_index", done: 1, total: 5, walk_complete: false });
-    expect(store.indexAnnouncement).toContain("Rebuilding index");
+    expect(store.indexAnnouncement).toContain("Building the index");
     store.setIndexState({ kind: "ready", note_count: 2 });
-    expect(store.indexAnnouncement).toBe("");
+    expect(store.indexAnnouncement).toBe("index: ready · 2 notes"); // ends an announced Rebuilding
   });
 });
 
@@ -197,7 +200,7 @@ describe("index check found problems (P1 #157)", () => {
     expect(store.indexCheckProblems).toBeNull();
     store.applyIndexStatus({ state: rebuilding(1), index_check_problems: 0 }, "event");
     expect(store.indexCheckProblems).toBeNull();
-    expect(store.indexAnnouncement).toBe("");
+    expect(store.indexAnnouncement).not.toBe(INDEX_CHECK_ANNOUNCEMENT);
   });
 
   it("the late-subscriber poll supplies it too, until an event has spoken", () => {
@@ -241,5 +244,125 @@ describe("index check fact: scope and ending (P1 #157 review)", () => {
     expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
     store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
     expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
+  });
+});
+
+// P1 #158: one line per RebuildReason. The test iterates the contract's members, so a member added without a
+// row fails it (the generated type is the list; `Record<RebuildReason, ...>` in the store fails vue-tsc too).
+describe("rebuild reason copy (P1 #158)", () => {
+  const PHRASES: Record<RebuildReason, string> = {
+    no_index: "Building the index",
+    index_version: "Updating the index for this version of Serat",
+    interrupted: "Completing an unfinished index rebuild",
+    vault_moved: "Rebuilding the index for this vault",
+    corrupt: "Repairing the index",
+    user_requested: "Rebuilding the index, as you asked",
+  };
+  const rebuilding = (reason: string, done = 3): IndexState =>
+    ({ kind: "rebuilding", reason, done, total: 10, walk_complete: true }) as IndexState;
+
+  for (const reason of Object.keys(PHRASES) as RebuildReason[]) {
+    it(`${reason}: the line starts with its phrase and no visible string or tooltip carries a wire value`, () => {
+      const text = describeIndexState(rebuilding(reason));
+      expect(text.startsWith(`${PHRASES[reason]} — search and queries are incomplete until this finishes · 3/10`)).toBe(true);
+      const detail = describeRebuildDetail(rebuilding(reason)) ?? "";
+      const announcement = describeRebuildAnnouncement(reason);
+      for (const wire of Object.keys(PHRASES)) {
+        for (const visible of [text, detail, announcement]) expect(visible).not.toContain(wire);
+      }
+      expect(detail).toMatch(/You can keep editing\.$/);
+      expect(announcement).toBe(`${PHRASES[reason]}. Search and queries are incomplete until it finishes. You can keep editing.`);
+    });
+  }
+
+  it("an unknown reason renders the generic line and tooltip without throwing", () => {
+    for (const reason of ["something_new", "constructor", "__proto__"]) {
+      expect(describeIndexState(rebuilding(reason)).startsWith("Rebuilding index — search")).toBe(true);
+      expect(describeRebuildDetail(rebuilding(reason))).toContain("Serat is rebuilding the search index from your notes.");
+    }
+  });
+
+  it("entering announces once, progress is silent, a reason change announces once", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.setIndexState(rebuilding("no_index", 0));
+    expect(store.indexAnnouncement).toBe(describeRebuildAnnouncement("no_index"));
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState(rebuilding("no_index", 4));
+    expect(store.indexAnnouncement).toBe("sentinel"); // progress did not write
+    store.setIndexState(rebuilding("interrupted", 0));
+    expect(store.indexAnnouncement).toBe(describeRebuildAnnouncement("interrupted"));
+  });
+
+  it("the Ready or Unavailable that ends an announced Rebuilding is announced once; after an unannounced one, silence", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.setIndexState(rebuilding("no_index", 0));
+    store.setIndexState({ kind: "ready", note_count: 5 });
+    expect(store.indexAnnouncement).toBe("index: ready · 5 notes");
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState({ kind: "ready", note_count: 5 });
+    expect(store.indexAnnouncement).toBe("sentinel"); // a repeat is not re-announced
+
+    store.setIndexState(rebuilding("corrupt", 0));
+    store.setIndexState({ kind: "unavailable", message: "gone", path: "/p" });
+    expect(store.indexAnnouncement).toBe("index: unavailable — gone");
+
+    setActivePinia(createPinia());
+    const fresh = useVaultStore();
+    fresh.setIndexState({ kind: "ready", note_count: 1 }); // no Rebuilding before it
+    expect(fresh.indexAnnouncement).toBe("");
+  });
+
+  it("the check fact's utterance replaces the Rebuilding one in the same update", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: rebuilding("corrupt", 0), index_check_problems: 2 }, "event");
+    expect(store.indexAnnouncement).toBe(INDEX_CHECK_ANNOUNCEMENT);
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 1 } }, "event");
+    expect(store.indexAnnouncement).toBe("index: ready · 1 note");
+  });
+});
+
+describe("index session reset (P1 #158 review)", () => {
+  const rebuilding = { kind: "rebuilding", reason: "no_index", done: 0, total: 3, walk_complete: false } as const;
+  const OPENED = { root: "/a", vault_id: "A", index: { kind: "opening" } } as never;
+
+  it("a failed open then a same-id reopen: Rebuilding is announced once, as an entry", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.setIndexState(rebuilding);
+    store.openFailed();
+    store.vaultOpened(OPENED);
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState(rebuilding);
+    expect(store.indexAnnouncement).toBe(describeRebuildAnnouncement("no_index"));
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState({ ...rebuilding, done: 2 });
+    expect(store.indexAnnouncement).toBe("sentinel"); // progress silent
+  });
+
+  it("a failed open then a Ready alone is silent (no announced Rebuilding ended)", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.setIndexState(rebuilding);
+    store.openFailed();
+    store.vaultOpened(OPENED);
+    store.indexAnnouncement = "";
+    store.setIndexState({ kind: "ready", note_count: 2 });
+    expect(store.indexAnnouncement).toBe("");
+  });
+
+  it("every open, same id or not, starts a new session", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.applyIndexStatus({ state: rebuilding, index_check_problems: 1 }, "event");
+    store.vaultOpened(OPENED);
+    expect(store.indexCheckProblems).toBeNull();
+    store.setIndexState({ kind: "ready", note_count: 2 });
+    expect(store.indexAnnouncement).not.toBe("index: ready · 2 notes");
   });
 });
