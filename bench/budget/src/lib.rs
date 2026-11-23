@@ -96,6 +96,32 @@ impl Profile {
     }
 }
 
+/// Whether a `--profile ci` run asserts a budget on a runner that cannot produce a gate
+/// number (task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
+///
+/// C-06 says a budget is enforced in CI. A hosted `windows-latest` runner is 2 cores with
+/// the real-time scanner off in every one of the 36 runs on record, so
+/// [`env::Environment::gate_eligible`] is false there by construction and the figure it
+/// produces is printed `NOT A GATE NUMBER`. For a budget whose product limit is the
+/// reference machine's number and which has no regression ceiling (`ci_limit_ms: None`),
+/// asserting that limit on such a runner asserts nothing about the product: 36 runs of
+/// `prf04-full-rebuild` read medians of 15.9 s to 131.8 s (a code step at #56 explains
+/// most of that), and one run's own three samples, same binary, same minutes, spanned
+/// 20.6 s to 60.1 s (docs/05-testing/nfr-prf-04-gate-quality.md, "Task #166"). Failing a
+/// PR on that is a red nobody can act on, and a green would not mean the budget held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiAssertion {
+    /// `--profile ci` asserts whatever the environment says. The default, and the only
+    /// value for a budget that has a `ci_limit_ms` regression ceiling.
+    Always,
+    /// `--profile ci` asserts only when the environment is gate eligible; on any other
+    /// runner the figure is measured, printed and written as `REPORT-ONLY` and cannot
+    /// fail the build. `--profile reference` is unaffected: a person chose that machine,
+    /// so it always asserts. The assertion lives on the reference machine, and the job
+    /// name says so (pinned by `a_report_only_budget_says_so_in_its_job_name`).
+    WhenGateEligible,
+}
+
 /// One budget from NFR-PRF.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
@@ -148,6 +174,9 @@ pub struct Budget {
     /// assertion, and only because F-407 measured the aggregate moving ~19%
     /// batch-to-batch, which cannot decide a pass at any threshold.
     pub gated: bool,
+    /// Whether a `--profile ci` run on a runner that is not gate eligible asserts this
+    /// budget or only reports it (task #166). See [`CiAssertion`].
+    pub ci_assertion: CiAssertion,
 }
 
 impl Budget {
@@ -172,6 +201,7 @@ pub const PRF01_WINDOW_VISIBLE: Budget = Budget {
     vault: "20k",
     interval: "process spawn to the first painted frame",
     gated: false,
+    ci_assertion: CiAssertion::Always,
 };
 
 /// NFR-PRF-01, the second mark.
@@ -186,6 +216,7 @@ pub const PRF01_VAULT_USABLE: Budget = Budget {
     vault: "20k",
     interval: "process spawn to the vault-usable mark, as task D2 defines it",
     gated: false,
+    ci_assertion: CiAssertion::Always,
 };
 
 /// NFR-PRF-01, re-baselined (task #104, ADR-0014 §Decision 3): the binding
@@ -219,6 +250,7 @@ pub const PRF01_SERAT_TERM: Budget = Budget {
                partition, Decision 3's binding sum) -- the platform term and the two legacy \
                marks are reported beside it, never asserted (F-407)",
     gated: true,
+    ci_assertion: CiAssertion::Always,
 };
 
 /// NFR-PRF-03.
@@ -235,6 +267,7 @@ pub const PRF03_SAVE_TO_INDEX: Budget = Budget {
                own save path, no watcher, no debounce (architecture §3.1.1; \
                see check_save_completeness)",
     gated: true,
+    ci_assertion: CiAssertion::Always,
 };
 
 /// NFR-PRF-04.
@@ -249,6 +282,10 @@ pub const PRF04_FULL_REBUILD: Budget = Budget {
     vault: "20k",
     interval: "entry to rebuild() until it returns, writer drained and ANALYZE run",
     gated: true,
+    // Task #166: hosted windows-latest is never gate eligible, and one run's three
+    // samples spanned 20.6 s to 60.1 s; the assertion is the reference machine's and CI
+    // reports (docs/05-testing/nfr-prf-04-gate-quality.md).
+    ci_assertion: CiAssertion::WhenGateEligible,
 };
 
 /// The share by which the window-painted mark may grow between the 20k and the
@@ -603,6 +640,25 @@ impl Outcome {
         self.budget.gated
     }
 
+    /// Whether a breach of this figure fails the build **in this run** (task #166).
+    ///
+    /// [`Outcome::gates`] says what the PRD gates; this says whether this run, on this
+    /// machine, is one that may assert it. They differ for exactly one case: a budget
+    /// declared [`CiAssertion::WhenGateEligible`], run under `--profile ci` on an
+    /// environment that is not gate eligible. The reference profile always asserts.
+    pub fn asserted(&self) -> bool {
+        self.gates() && !self.report_only_here()
+    }
+
+    /// A gated budget that this run only reports, because the runner cannot produce a
+    /// gate number (task #166). The one place that rule is written.
+    pub fn report_only_here(&self) -> bool {
+        self.gates()
+            && self.profile == Profile::Ci
+            && self.budget.ci_assertion == CiAssertion::WhenGateEligible
+            && !self.gate_eligible()
+    }
+
     /// Whether the budget held.
     ///
     /// `degraded` gates this before the timing comparison runs: a run that
@@ -707,6 +763,9 @@ impl Outcome {
         // beside a green build learns to ignore the word.
         let verdict = match (self.gates(), self.determinate(), self.passed()) {
             (false, _, _) => "REPORTED",
+            // Task #166: gated by the PRD, not assertable on this runner. Never PASS or
+            // FAIL: a verdict on a figure nothing asserts is F-443's untruth again.
+            (true, _, _) if self.report_only_here() => "REPORT-ONLY",
             (true, false, _) => "INDETERMINATE",
             (true, true, true) => "PASS",
             (true, true, false) => "FAIL",
@@ -734,6 +793,19 @@ impl Outcome {
                 PRF01_SERAT_TERM.id
             );
         }
+        if self.report_only_here() {
+            let _ = writeln!(
+                s,
+                "  not asserted  this runner cannot produce a gate number ({}) and the CI profile \
+                 has no regression ceiling, so the {:.1} ms product limit is compared and printed \
+                 but cannot fail the build (task #166). It is asserted on the reference machine \
+                 (--profile reference); a breach there is a NO-GO.",
+                self.environment
+                    .ineligibility_reason()
+                    .unwrap_or("not gate eligible"),
+                self.limit_ms()
+            );
+        }
         let _ = writeln!(
             s,
             "  samples     n={}  min {:.1}  mean {:.1}  max {:.1} ms  spread {:.1}%",
@@ -743,7 +815,7 @@ impl Outcome {
             self.samples.max(),
             self.spread_pct(),
         );
-        if !self.determinate() {
+        if !self.determinate() && !self.report_only_here() {
             let _ = writeln!(
                 s,
                 "  undecided   the samples straddle the {:.1} ms limit -- this run observed \
@@ -822,7 +894,10 @@ impl Outcome {
         if let Some(reason) = self.environment.ineligibility_reason() {
             let _ = writeln!(s, "  NOT A GATE NUMBER: {reason}");
         }
-        if self.budget.ci_limit_ms.is_none() && self.profile == Profile::Ci {
+        if self.budget.ci_limit_ms.is_none()
+            && self.profile == Profile::Ci
+            && !self.report_only_here()
+        {
             let _ = writeln!(
                 s,
                 "  note        no CI regression ceiling is set yet, so the product limit is \
@@ -858,6 +933,9 @@ impl Outcome {
         // it. A trend reader joining these files needs to know which rows were
         // gates when they were written, because that changes.
         let _ = writeln!(s, "  \"gated\": {},", self.gates());
+        // Task #166: whether THIS run could fail a build. `gated` is the budget's flag and
+        // does not change with the runner; a trend reader needs both.
+        let _ = writeln!(s, "  \"asserted\": {},", self.asserted());
         let _ = writeln!(s, "  \"samples_n\": {},", self.samples.len());
         let _ = writeln!(s, "  \"min_ms\": {:.3},", self.samples.min());
         let _ = writeln!(s, "  \"mean_ms\": {:.3},", self.samples.mean());
@@ -1999,7 +2077,10 @@ where
 /// number is not asserted, not that its absence is acceptable.
 #[must_use]
 pub fn enforce(outcome: &Outcome) -> bool {
-    if !outcome.gates() {
+    // `asserted()`, not `gates()`: task #166 added the one runner-dependent case, and it
+    // is derived from the budget's own `ci_assertion` field and the environment, so this
+    // stays one decision in one place (F-485).
+    if !outcome.asserted() {
         return true;
     }
     outcome.passed() && outcome.determinate()
@@ -3533,6 +3614,245 @@ mod tests {
         // code could say different things.
         assert!(reported_breach.to_report().starts_with("REPORTED"));
         assert!(gated_breach.to_report().starts_with("FAIL"));
+    }
+
+    /// An outcome of `budget` under `profile` on `environment`, for the runner-class tests.
+    fn outcome_on(
+        budget: Budget,
+        profile: Profile,
+        environment: env::Environment,
+        values: &[f64],
+    ) -> Outcome {
+        Outcome {
+            budget,
+            profile,
+            vault: a_vault(),
+            environment,
+            samples: samples(values),
+            reported: Vec::new(),
+            phases: None,
+            degraded: None,
+            save_census: None,
+        }
+    }
+
+    /// What the hosted `windows-latest` runner reported in all 36 runs on record
+    /// (runs 279-316): 2 cores, real-time scanner OFF, High performance.
+    fn hosted_windows() -> env::Environment {
+        env::Environment {
+            os: env::Os::Windows,
+            cores: 2,
+            realtime_scanner: Some(false),
+            power_plan: Some("High performance".into()),
+            cpu_load_percent: Some(9),
+            concurrent_build_processes: Some(0),
+        }
+    }
+
+    fn linux() -> env::Environment {
+        env::Environment {
+            os: env::Os::Linux,
+            cores: 4,
+            realtime_scanner: None,
+            power_plan: None,
+            cpu_load_percent: None,
+            concurrent_build_processes: None,
+        }
+    }
+
+    #[test]
+    fn a_ci_run_on_a_runner_that_cannot_produce_a_gate_number_reports_a_ci_only_budget() {
+        // Task #166 (NFR-PRF-04, NFR-PRF-08, C-06, RISK-012). Run 298's median, 55,224.6 ms,
+        // is over the 30 s limit; on the hosted runner it is printed and cannot fail.
+        let slow = [52_403.7, 55_224.6, 101_426.5];
+        let hosted = outcome_on(PRF04_FULL_REBUILD, Profile::Ci, hosted_windows(), &slow);
+        assert!(hosted.gates(), "the PRD still gates NFR-PRF-04");
+        assert!(!hosted.gate_eligible());
+        assert!(hosted.report_only_here() && !hosted.asserted());
+        assert!(
+            enforce(&hosted),
+            "a breach on a non-eligible runner must not fail CI"
+        );
+        let report = hosted.to_report();
+        assert!(report.starts_with("REPORT-ONLY"), "{report}");
+        assert!(report.contains("NOT A GATE NUMBER"), "{report}");
+        assert!(report.contains("not asserted"), "{report}");
+        assert!(
+            !report.contains("no CI regression ceiling is set yet"),
+            "{report}"
+        );
+        assert!(hosted.to_json().contains("\"asserted\": false"));
+        assert!(hosted.to_json().contains("\"gated\": true"));
+        // A straddle is not "undecided" when nothing is asserted either.
+        let straddle = outcome_on(
+            PRF04_FULL_REBUILD,
+            Profile::Ci,
+            hosted_windows(),
+            &[20_596.8, 28_394.0, 60_147.4],
+        );
+        assert!(enforce(&straddle));
+        assert!(!straddle.to_report().contains("undecided"));
+        assert!(straddle.to_report().starts_with("REPORT-ONLY"));
+    }
+
+    #[test]
+    fn the_same_budget_is_still_asserted_wherever_a_gate_number_can_be_produced() {
+        // The rule removes the assertion from one runner class and nowhere else. Each row
+        // is a different way "gate only when eligible" could be over-applied.
+        let breach = [40_000.0, 41_000.0, 42_000.0];
+        // An eligible CI runner (Linux has no scanner question) asserts and fails.
+        let on_linux = outcome_on(PRF04_FULL_REBUILD, Profile::Ci, linux(), &breach);
+        assert!(on_linux.asserted() && !enforce(&on_linux));
+        assert!(on_linux.to_report().starts_with("FAIL"));
+        assert!(on_linux.to_json().contains("\"asserted\": true"));
+        // Windows with the scanner ON is eligible: asserts.
+        let scanner_on = env::Environment {
+            realtime_scanner: Some(true),
+            ..hosted_windows()
+        };
+        let on_win = outcome_on(PRF04_FULL_REBUILD, Profile::Ci, scanner_on, &breach);
+        assert!(on_win.asserted() && !enforce(&on_win));
+        // The reference profile asserts on a scanner-off machine: RM-1 is that machine, and
+        // a person chose it. (Its figure is still labelled NOT A GATE NUMBER; that is the
+        // separate RISK-012 label and is unchanged.)
+        let on_rm1 = outcome_on(
+            PRF04_FULL_REBUILD,
+            Profile::Reference,
+            hosted_windows(),
+            &breach,
+        );
+        assert!(on_rm1.asserted() && !enforce(&on_rm1));
+        // An undetermined platform is not eligible, so it reports under ci rather than
+        // asserting on a number nobody can attribute.
+        let unknown = outcome_on(
+            PRF04_FULL_REBUILD,
+            Profile::Ci,
+            env::Environment::default(),
+            &breach,
+        );
+        assert!(!unknown.asserted() && enforce(&unknown));
+        // A budget that did not opt in is untouched on the hosted runner.
+        let prf03 = outcome_on(PRF03_SAVE_TO_INDEX, Profile::Ci, hosted_windows(), &[80.0]);
+        assert_eq!(prf03.budget.ci_assertion, CiAssertion::Always);
+        assert!(prf03.asserted() && !enforce(&prf03));
+        // A degraded or unmeasurable run is a failure in the asserting case and is not
+        // converted into a pass by being report-only: an Err still reaches job_exit.
+        assert_eq!(
+            job_exit(&PRF04_FULL_REBUILD, Err("the vault would not open".into())),
+            std::process::ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn a_report_only_outcome_exits_zero_and_an_asserted_breach_exits_one() {
+        // `job_exit` is the real exit decision (F-500). Both rows go through it so the exit
+        // code cannot disagree with the verdict word.
+        let breach = [52_403.7, 55_224.6, 101_426.5];
+        let reported = outcome_on(PRF04_FULL_REBUILD, Profile::Ci, hosted_windows(), &breach);
+        assert_eq!(
+            job_exit(&PRF04_FULL_REBUILD, Ok(reported)),
+            std::process::ExitCode::SUCCESS
+        );
+        let asserted = outcome_on(PRF04_FULL_REBUILD, Profile::Ci, linux(), &breach);
+        assert_eq!(
+            job_exit(&PRF04_FULL_REBUILD, Ok(asserted)),
+            std::process::ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn a_when_gate_eligible_budget_has_no_ceiling_and_a_ceiling_means_always() {
+        // The two thresholds are one design (budget-harness.md, "Two thresholds, not
+        // one"): a regression ceiling is what CI asserts on a runner that is not the
+        // reference machine, so a budget that has one asserts it wherever it runs. Setting
+        // `ci_limit_ms` without flipping this field would leave a ceiling nothing asserts.
+        for b in P0_BUDGETS.iter().chain(PRF01_REPORTED) {
+            if b.ci_limit_ms.is_some() {
+                assert_eq!(
+                    b.ci_assertion,
+                    CiAssertion::Always,
+                    "{} has a CI ceiling, so CI must assert it",
+                    b.id
+                );
+            }
+        }
+    }
+
+    /// The text of job `id` in workflow `text`: from its two-space key to the next one.
+    fn workflow_job(text: &str, id: &str) -> String {
+        let head = format!("\n  {id}:\n");
+        let start = text
+            .find(&head)
+            .unwrap_or_else(|| panic!("job {id} missing from budgets.yml"));
+        let rest = &text[start + 1..];
+        let end = rest
+            .match_indices("\n  ")
+            .find(|(i, _)| {
+                rest[i + 3..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+            })
+            .map_or(rest.len(), |(i, _)| i);
+        rest[..end].to_string()
+    }
+
+    /// The `name:` of a job, as the PR's check list shows it.
+    fn workflow_job_name(job: &str) -> String {
+        job.lines()
+            .find_map(|l| l.trim_start().strip_prefix("name:"))
+            .map(|n| n.trim().trim_matches('"').to_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_report_only_budget_says_so_in_its_job_name() {
+        // NFR-PRF-08's acceptance criterion is "each budget has an asserting job". For a
+        // budget declared `WhenGateEligible` the job reports on a hosted runner and the
+        // assertion is the reference machine's (task #166). That is a different category,
+        // and it must be visible where a reviewer reads it: in the name of the check on the
+        // PR. Both directions, so a job cannot claim to report while the harness asserts,
+        // or assert while its name says it reports.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let mut report_only = 0;
+        for b in P0_BUDGETS {
+            let job = workflow_job(&text, b.id);
+            let name = workflow_job_name(&job);
+            let says = name.contains("report-only");
+            assert_eq!(
+                says,
+                b.ci_assertion == CiAssertion::WhenGateEligible,
+                "{}: job name {name:?} and Budget::ci_assertion disagree about whether CI \
+                 asserts this budget (task #166)",
+                b.id
+            );
+            if b.ci_assertion == CiAssertion::WhenGateEligible {
+                report_only += 1;
+                assert!(
+                    name.contains("reference machine"),
+                    "{}: a report-only job must name where the budget IS asserted: {name:?}",
+                    b.id
+                );
+                // Still measured on every run, under the CI profile (the one that reports),
+                // never masked: a failed measurement must still fail the job.
+                assert!(
+                    job.contains(&format!("--bin {} -- --profile ci", b.id)),
+                    "{}: the report-only job must run the bin under --profile ci:\n{job}",
+                    b.id
+                );
+                assert!(
+                    !job.contains("continue-on-error") && !job.contains("|| true"),
+                    "{}: report-only is the harness's decision, not a swallowed exit code",
+                    b.id
+                );
+            }
+        }
+        assert!(
+            report_only >= 1,
+            "no budget is declared WhenGateEligible: this test would pass vacuously"
+        );
     }
 
     #[test]

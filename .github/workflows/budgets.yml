@@ -119,8 +119,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # REPORT-ONLY ON A HOSTED RUNNER (task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
+  # NFR-PRF-04's 30 s is the reference machine's number and this budget has no CI regression
+  # ceiling. A hosted windows-latest runner is 2 cores with the real-time scanner OFF in all
+  # 36 runs on record (279-316), so the harness's own `gate_eligible` is false there and it
+  # prints NOT A GATE NUMBER. The bin declares the budget `CiAssertion::WhenGateEligible`:
+  # under `--profile ci` on such a runner it measures, prints `REPORT-ONLY`, uploads the
+  # JSON and exits 0; on an eligible runner (Linux, or Windows with the scanner on) the same
+  # command asserts 30 s and exits 1 on a breach. A measurement that cannot be taken still
+  # exits non-zero here (no `continue-on-error`, no `|| true`), so this job is red when the
+  # rebuild breaks, not when the runner is slow. The assertion is on the reference machine:
+  # `cargo run --release -p budget --bin prf04-full-rebuild -- --profile reference`, at each
+  # gate (docs/05-testing/nfr-prf-04-gate-quality.md, "Task #166"). `every-budget-has-a-job`
+  # pins that this job's name says so.
   prf04-full-rebuild:
-    name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s"
+    name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s (report-only on hosted windows; asserted on the reference machine)"
     needs: vault
     runs-on: windows-latest
     steps:
@@ -360,6 +373,11 @@ jobs:
   # confirms each budget has an asserting job". This job is that review, run
   # automatically, so a budget added to the PRD without a job fails the build
   # rather than waiting for someone to notice.
+  #
+  # A budget declared `CiAssertion::WhenGateEligible` (NFR-PRF-04, task #166) has a job that
+  # reports on a hosted runner and is asserted on the reference machine; the same test
+  # requires that job's name to say "report-only" and to name the reference machine, so the
+  # category is visible and cannot be entered by accident.
   #
   # It used to be a shell loop over `grep -o 'id: "..."'`, and P0 finding F-30
   # is what that was worth: reformat the field to `id:"x"` and the grep matches

@@ -111,7 +111,7 @@ The same caveat applies to the proportionality comparison, and the scale-check r
 
 CI runners are not RM-1 and never will be. NFR-PRF-08 requires every budget to be asserted in CI and a regression to fail the build; that is a *regression gate*, and its thresholds are a property of the runner. The product budgets in NFR-PRF-01/03/04 are the numbers RM-1 must meet. Both are real, they are not the same number, and B2 keeps them in separate columns.
 
-A GitHub-hosted Windows runner does have real-time protection enabled, so a CI number is gate eligible in the sense this document means — it is simply measured on the wrong machine, which the `ci` profile's separate threshold accounts for.
+A GitHub-hosted Windows runner does **not** have real-time protection enabled: all 36 `budgets.yml` runs on record (279-316) report `realtime scanner OFF` on 2 cores, so a hosted number is never gate eligible in the sense this document means (this paragraph said the opposite until task #166 read the logs). Where a budget has no regression ceiling it is report-only on that runner and asserted here, on the reference machine; see `nfr-prf-04-gate-quality.md`, "Task #166".
 
 ## Traceability
 

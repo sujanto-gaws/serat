@@ -46,6 +46,10 @@ The product budget belongs to the reference machine (`reference-machine.md`). A 
 - `product_limit_ms` — the number in the PRD, asserted under `--profile reference`.
 - `ci_limit_ms` — a regression ceiling, asserted under `--profile ci`. Its job is to catch a change that made things worse, not to certify the product.
 
+### Runner class: which CI run may assert (task #166)
+
+`Budget::ci_assertion` is `Always` or `WhenGateEligible`. `WhenGateEligible` means: under `--profile ci`, assert only if `Environment::gate_eligible()`; otherwise measure, print `REPORT-ONLY`, write `"asserted": false` and exit 0. `--profile reference` always asserts. Only NFR-PRF-04 is `WhenGateEligible` today, on the evidence in `nfr-prf-04-gate-quality.md` ("Task #166"): hosted `windows-latest` reported 2 cores and the scanner OFF in 36 of 36 runs, so it is never gate eligible, and the 36 medians spread 15.9 to 131.8 s. A budget with a `ci_limit_ms` ceiling must be `Always` (test `a_when_gate_eligible_budget_has_no_ceiling_and_a_ceiling_means_always`). NFR-PRF-08's "every budget has an asserting job" has a second category for these: the job exists, reports, and its name says "report-only" and names the reference machine where the assertion lives (test `a_report_only_budget_says_so_in_its_job_name`, both directions). A report-only budget is **not CI-asserted** and a gate report must say so. The `--assert` P1 bins (FR-VLT-01, FR-VLT-04, NFR-PRF-06) still fail a breach on any runner; for FR-VLT-04 see the ruling in `nfr-prf-04-gate-quality.md`.
+
 `ci_limit_ms` is `None` for every budget in the table above, because there has been no CI run to set it from and a placeholder invented at a desk is worse than an honest red. Until it is set, the CI job asserts the product limit. **The ceilings are set from the first green CI run and recorded here with the run they came from** — not by lowering a bar to make a build pass.
 
 ### Every budget names the interval it times
@@ -315,6 +319,7 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-121 | #118, §3.4's ruling — the moved check reports its own spread and the index state both arms started from | `…::the_scale_check_reports_its_own_spread_and_the_index_state_both_arms_started_from` | pass |
 | TC-122 | #118, §3.4's precondition — arms starting in different index states are refused, not caveated | `…::a_scale_check_whose_arms_start_in_different_index_states_is_refused` | pass |
 | TC-123 | #118 — the demoted aggregates are still measured by a job CI runs | `…::the_demoted_aggregates_are_still_measured_by_a_job_that_ci_runs` | pass |
+| TC-151 | NFR-PRF-04, NFR-PRF-08, C-06, RISK-012, task #166 — a budget declared `WhenGateEligible` reports (`REPORT-ONLY`, exit 0, `"asserted": false`) under `--profile ci` on a non-gate-eligible runner and asserts everywhere else | `bench/budget/src/lib.rs::a_ci_run_on_a_runner_that_cannot_produce_a_gate_number_reports_a_ci_only_budget`, `…::the_same_budget_is_still_asserted_wherever_a_gate_number_can_be_produced`, `…::a_report_only_outcome_exits_zero_and_an_asserted_breach_exits_one`, `…::a_when_gate_eligible_budget_has_no_ceiling_and_a_ceiling_means_always`, `…::a_report_only_budget_says_so_in_its_job_name` | pass |
 | TC-111 | S1, task #52 — an empty `last_open` is the normal case (no note is a precondition) and parses fine | `bench/budget/src/trace.rs::an_empty_last_open_is_the_normal_case_now_and_parses_fine` | pass |
 
 ## `quick_check` on the 20k index (task #69; NFR-REL-01, NFR-REL-02)
