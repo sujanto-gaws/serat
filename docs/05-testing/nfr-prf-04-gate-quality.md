@@ -154,15 +154,15 @@ far under the 30,000 ms limit. An attested re-run belongs with the next quiet wi
 
 ## Task #166: runner class and gate eligibility on hosted Windows (2026-11-23)
 
-**Ruling (home: ADR-0019; the evidence is here).** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
+**Ruling (home: ADR-0019; the evidence is here; evidence maps to ADR-0019 point 2, all under section (b) below: (a) scanner OFF in 36 of 36, (b) the spread and file-I/O bullets, (c) the no-derivable-ceiling bullet).** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
 measures, prints `REPORT-ONLY`, uploads the JSON and cannot fail the PR for a slow number. The
-assertion is the reference machine's (`--profile reference`, at each gate). A budget is
+assertion is the reference machine's (`--profile reference`, at each gate) and, once #168 lands, ubuntu-latest's. A budget is
 "enforced in CI" (C-06) only on a runner that can produce a gate number; this one cannot, so
 the report says NFR-PRF-04 is **not CI-asserted** rather than counting a red job as enforcement.
 It is mechanical, not a convention: `Budget::ci_assertion = CiAssertion::WhenGateEligible`
 (`bench/budget/src/lib.rs`); under `--profile ci` the bin asserts only when
 `Environment::gate_eligible()` is true (Linux, or Windows with the scanner on) and exits 0
-with `REPORT-ONLY` otherwise. `--profile reference` always asserts. A measurement that cannot be
+with `REPORT-ONLY` otherwise. `--profile reference` always asserts, and so does a degraded run or a budget that has a `ci_limit_ms` (always asserted, never report-only). A measurement that cannot be
 taken still exits 1; exit 3 (app absent) is unchanged; no new exit code was needed because
 "report-only" is a verdict, not an error.
 
@@ -205,8 +205,7 @@ logs say `realtime scanner OFF` (and 2 cores). The harness never toggles the sca
 way, which is the prior fact `reference-machine.md` had wrong (it said hosted runners have
 real-time protection enabled; corrected in this task). Eligibility is also not the only gap:
 
-- The 30 s is the reference machine's figure (7.9 to 10.8 s on the 4-core Linux container, which is not the
-  reference machine; 27.7 s P0 on RM-1 with the scanner off, the only RM-1 figure). The hosted band after #56 is 15.9 to 30.2 s on 2 cores, i.e. the
+- The 30 s is the product limit; RM-1's only figure is 27.7 s (P0, scanner off); 7.9 to 10.8 s is the 4-core Linux container's. The hosted band after #56 is 15.9 to 30.2 s on 2 cores, i.e. the
   budget's margin on this runner is smaller than the runner's own run-to-run spread.
 - Hosted file I/O is far slower per note (the #165 triage: batch-of-100 medians 2.9 to 4.8 s,
   about 29 to 48 ms per note against about 2 ms on Linux, with the watcher timer unstarved: delay
@@ -264,8 +263,7 @@ prints a `REPORT-ONLY` line and exits 0, the job name says "report-only" and nam
 machine, and `P1_GATED` gains the same two-way name check. The other `--assert` bins
 (`p1-tree-path` 36 to 106 ms against 2 s, `p1-switcher` 5 to 12 ms against 50 ms) have 10x or more
 margin and stable figures on the runner; they keep failing a breach there until a hosted figure says otherwise.
-PRD v1.9's "gated in CI" for FR-VLT-04 then reads "asserted on the reference machine; CI reports"
-(an open question for the architect and product-analyst, raised in the #166 report).
+PRD v1.9's "gated in CI" for FR-VLT-04 reads "asserted on RM-1 at the gate and on ubuntu-latest in CI (#168); report-only on hosted Windows (ADR-0019)", applied in PRD v1.12.
 
 **The three Windows re-runs #165 needs** (overlap and checkpointer lines; this task's PRF-04
 `REPORT-ONLY` lines) are owned by test-engineer as `[P1/test] Windows re-runs of the report-only
