@@ -152,3 +152,116 @@ under load, so **no change is distinguishable from noise**. The reviewer's earli
 50,000 code spans parses in 124 ms, so the new exclusion is not quadratic. All six readings are
 far under the 30,000 ms limit. An attested re-run belongs with the next quiet window.
 
+## Task #166: runner class and gate eligibility on hosted Windows (2026-11-23)
+
+**Ruling.** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
+measures, prints `REPORT-ONLY`, uploads the JSON and cannot fail the PR for a slow number. The
+assertion is the reference machine's (`--profile reference`, at each gate). A budget is
+"enforced in CI" (C-06) only on a runner that can produce a gate number; this one cannot, so
+the report says NFR-PRF-04 is **not CI-asserted** rather than counting a red job as enforcement.
+It is mechanical, not a convention: `Budget::ci_assertion = CiAssertion::WhenGateEligible`
+(`bench/budget/src/lib.rs`); under `--profile ci` the bin asserts only when
+`Environment::gate_eligible()` is true (Linux, or Windows with the scanner on) and exits 0
+with `REPORT-ONLY` otherwise. `--profile reference` always asserts. A measurement that cannot be
+taken still exits 1; exit 3 (app absent) is unchanged; no new exit code was needed because
+"report-only" is a verdict, not an error.
+
+### (a) Regression or variance? Neither: a step down, at one merge
+
+Every `prf04-full-rebuild` job log for runs 279 to 316 (36 jobs; runs 313 and 314 had no
+PRF-04 job), fetched and tabulated by run, head, start time, region, runner image and phase:
+
+| Group | Runs | Median of 3 | Producer waited on the writer | Verdicts |
+|---|---|---|---|---|
+| before `1ec7a9e` (#56 WAL checkpointer, page-cache sizes, merged 2026-11-09 13:46 UTC) | 279-298, 20 runs, 2026-10-20 18:00 to 2026-11-09 13:34 | 51.3 to 131.8 s | 38.2 to 101.8 s | 20 FAIL |
+| from `1ec7a9e` | 299-316, 16 runs, 2026-11-09 13:55 to 18:43 | 15.9 to 30.2 s (median of medians 21.1 s) | 1.2 to 2.4 s | 14 PASS, 2 INDETERMINATE (299: one sample 33.9 s; 306: samples 20.6 / 28.4 / 60.1 s) |
+
+- **It clusters by head, not by time.** Run 298 (13:34, 7b06763, image `20261103.298.1`, 55.2 s)
+  and run 299 (13:55, 1ec7a9e, same image, 30.2 s, producer wait 1.6 s) are 21 minutes apart on the
+  same image; all 19 runs of 2026-10-20/21 across seven regions and two image versions are slow. A
+  runner-day effect would not line up with one merge, a region-independent step, and a phase
+  that collapses.
+- **The phase that moved is the writer's.** In the slow runs `read+hash` 1.4 to 3.9 s and `parse`
+  2.1 to 4.2 s are the same as in the fast runs (parse 2.4 to 4.6 s); what differs is
+  `producer waited` (the producer blocked on the writer): 38 to 102 s before, about 1.2 to 2.4 s after.
+  #56 turned automatic WAL checkpointing off on the writer and set page-cache sizes. The
+  coincidence is exact and the mechanism fits; it is **not an A/B** (a Linux A/B cannot reproduce
+  the runner's file I/O), so it is attribution by merge boundary, stated as such.
+- **No regression between `80123ce` (51.3 s) and `6a608b8` (17.8 s): the direction is an
+  improvement of about 2.5 to 6x**, and 17.8 s is the faster end of a 15.9 to 30.2 s band.
+- **Concurrency does not explain it:** `concurrent rustc/link processes 0` in 36 of 36; cpu load
+  1 to 10% at start in 33 of 36 (71%, 41%, 24% in runs 283, 296, 311, two of them slow, one fast).
+  The environment line is taken before the benchmark starts and cannot see a neighbour that
+  starts later.
+- **Noise is still there after the step, and large:** within one run on one binary, run 306's samples
+  span 20.6 to 60.1 s (192%), run 316's 17.7 to 26.7 s (51%), run 299's 26.8 to 33.9 s. Post-#56
+  spread: 0.6 to 192%. So the 30 s limit is decided at the edge of the runner's own noise.
+
+### (b) Can a 2-core hosted Windows runner ever be gate eligible? No, by the harness's own rule
+
+`Environment::gate_eligible()` on Windows requires the real-time scanner to be **on**. All 36
+logs say `realtime scanner OFF` (and 2 cores). The harness never toggles the scanner
+(RISK-012; budget-harness.md), so the hosted runner is ineligible for as long as it ships that
+way, which is the prior fact `reference-machine.md` had wrong (it said hosted runners have
+real-time protection enabled; corrected in this task). Eligibility is also not the only gap:
+
+- The 30 s is the reference machine's figure (7.9 to 10.8 s on 16 cores; 27.7 s P0 on RM-1 with
+  the scanner off). The hosted band after #56 is 15.9 to 30.2 s on 2 cores, i.e. the
+  budget's margin on this runner is smaller than the runner's own run-to-run spread.
+- Hosted file I/O is far slower per note (the #165 triage: batch-of-100 medians 2.9 to 4.8 s,
+  about 29 to 48 ms per note against about 2 ms on Linux, with the watcher timer unstarved: delay
+  p95 172.9 to 173.6 ms in all three runs while processing p95 went 205 to 450 ms). A rebuild
+  writes 20,000 notes; the runner's disk, not the code, is the term that moves. "Scanner off is
+  a best case, so a breach there is a real breach" (the old reading of `gate_eligible`) holds
+  only if the runner is otherwise no slower than the reference machine; the logs and #165 refute that for
+  I/O-bound budgets.
+- **No ceiling is derivable now.** A `ci_limit_ms` regression ceiling (the harness's two-thresholds
+  design) must exceed the largest sample under the harness's straddle rule, 60.1 s in the
+  post-#56 band, which is 2x the product limit and above the pre-#56 minimum sample (48.7 s): it
+  would catch nothing the 51 to 132 s step did not already show. A median-only rule at about 45 s
+  would separate the two groups cleanly (post max median 30.2 s, pre min median 51.3 s) but
+  changes the harness's no-tunable `determinate()` rule and rests on one day and one image
+  (`20261103`) of post-step data. Not invented here.
+
+### What the job still does, and what is pending
+
+- The hosted job still runs on every PR and push, uploads the JSON (it now carries
+  `"asserted": false` beside `"gated": true`), and is red when the rebuild cannot be measured
+  (note-count guard, phase-sum check, vault digest). It is useful as a **large-effect detector**:
+  it showed the #56 step.
+- Not CI-asserted: NFR-PRF-04 on the current head. Asserted on the reference machine only: the
+  P0 figure is 27,693.5 ms (scanner off, gate-quality), the P1 figure is unattested (p1-gate-report.md).
+- **To promote to asserting in CI (flip to `CiAssertion::Always` with a `ci_limit_ms`)** one of:
+  (1) a runner class that is gate eligible and steady: a self-hosted reference runner, or a larger hosted
+  Windows runner label if the account can use one, with the scanner on, taking at least 10 runs whose
+  `determinate()` is true; or (2) at least 30 post-#56 runs on hosted Windows over at least 3 days and 2 image versions,
+  from which a ceiling is set at 1.5x the 95th percentile of medians, recorded here with the runs it came from.
+  Both need runners to be scheduled at all (RISK-013); neither can be done from this repository.
+- The same rule applies to NFR-PRF-01 (Serat term) and NFR-PRF-03 on hosted Windows if their first hosted numbers show the
+  same shape; they have no hosted figure yet (the app was not built until #164), so
+  they stay `CiAssertion::Always` and are decided on evidence.
+
+### FR-VLT-04 on the same runner class (for #165; decided here, wired there)
+
+The harness's criteria say the same about `p1-external-change` as about NFR-PRF-04: hosted
+`windows-latest` is never gate eligible, and the #165 triage shows the term that moves is the
+runner's file I/O, not Serat's timer (watcher delay p95 172.9 to 173.6 ms in all three runs while
+processing p95 went 205 to 450 ms and max to 1,095 ms; batch-of-100 medians 2.9 to 4.8 s, 15 to 25x
+Linux per note). **Ruling: FR-VLT-04's 500 ms p95 is report-only on hosted Windows and asserted on
+the reference machine and on any gate-eligible runner**, the same rule and mechanism. **Best-of-three
+is rejected:** a p95 budget re-run until one attempt passes asserts the runner's best minute, a
+retry is exactly the coin toss `determinate()` exists to refuse, and it still would not make the
+runner eligible. Wiring is in #165's revision, not this branch, because both edit the same bin
+and `P1_GATED` test: when `!Environment::detect().gate_eligible()`, `p1-external-change --assert`
+prints a `REPORT-ONLY` line and exits 0, the job name says "report-only" and names the reference
+machine, and `P1_GATED` gains the same two-way name check. The other `--assert` bins
+(`p1-tree-path` 36 to 106 ms against 2 s, `p1-switcher` 5 to 12 ms against 50 ms) have 10x or more
+margin and stable figures on the runner; they keep failing a breach there until a hosted figure says otherwise.
+PRD v1.9's "gated in CI" for FR-VLT-04 then reads "asserted on the reference machine; CI reports"
+(an open question for the architect and product-analyst, raised in the #166 report).
+
+**The three Windows re-runs #165 needs** (overlap and checkpointer lines; this task's PRF-04
+`REPORT-ONLY` lines) are owned by test-engineer as `[P1/test] Windows re-runs of the report-only
+jobs when a runner is available` (task to be created by the lead) and are RISK-013's
+named action: first runner window after the owner restores scheduling, dispatch `budgets.yml` three
+times on the head, record the PRF-04 and FR-VLT-04 lines in this file.
