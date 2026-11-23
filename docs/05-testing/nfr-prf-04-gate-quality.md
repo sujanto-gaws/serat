@@ -154,7 +154,7 @@ far under the 30,000 ms limit. An attested re-run belongs with the next quiet wi
 
 ## Task #166: runner class and gate eligibility on hosted Windows (2026-11-23)
 
-**Ruling.** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
+**Ruling (home: ADR-0019; the evidence is here).** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
 measures, prints `REPORT-ONLY`, uploads the JSON and cannot fail the PR for a slow number. The
 assertion is the reference machine's (`--profile reference`, at each gate). A budget is
 "enforced in CI" (C-06) only on a runner that can produce a gate number; this one cannot, so
@@ -205,8 +205,8 @@ logs say `realtime scanner OFF` (and 2 cores). The harness never toggles the sca
 way, which is the prior fact `reference-machine.md` had wrong (it said hosted runners have
 real-time protection enabled; corrected in this task). Eligibility is also not the only gap:
 
-- The 30 s is the reference machine's figure (7.9 to 10.8 s on 16 cores; 27.7 s P0 on RM-1 with
-  the scanner off). The hosted band after #56 is 15.9 to 30.2 s on 2 cores, i.e. the
+- The 30 s is the reference machine's figure (7.9 to 10.8 s on the 4-core Linux container, which is not the
+  reference machine; 27.7 s P0 on RM-1 with the scanner off, the only RM-1 figure). The hosted band after #56 is 15.9 to 30.2 s on 2 cores, i.e. the
   budget's margin on this runner is smaller than the runner's own run-to-run spread.
 - Hosted file I/O is far slower per note (the #165 triage: batch-of-100 medians 2.9 to 4.8 s,
   about 29 to 48 ms per note against about 2 ms on Linux, with the watcher timer unstarved: delay
@@ -223,6 +223,12 @@ real-time protection enabled; corrected in this task). Eligibility is also not t
   changes the harness's no-tunable `determinate()` rule and rests on one day and one image
   (`20261103`) of post-step data. Not invented here.
 
+### RM-1 is not a gate number either
+
+RM-1 also runs with the scanner off, so the reference-machine assertion is itself a
+`gate_eligible: false` figure (the P0 27,693.5 ms is the only RM-1 NFR-PRF-04 reading). **No gate
+figure for NFR-PRF-04 exists anywhere today;** a Defender-on RM-1 run is owed (RISK-012).
+
 ### What the job still does, and what is pending
 
 - The hosted job still runs on every PR and push, uploads the JSON (it now carries
@@ -237,6 +243,7 @@ real-time protection enabled; corrected in this task). Eligibility is also not t
   `determinate()` is true; or (2) at least 30 post-#56 runs on hosted Windows over at least 3 days and 2 image versions,
   from which a ceiling is set at 1.5x the 95th percentile of medians, recorded here with the runs it came from.
   Both need runners to be scheduled at all (RISK-013); neither can be done from this repository.
+- ADR-0019 also gives a `WhenGateEligible` budget an asserting job on ubuntu-latest (task #168, not part of this change).
 - The same rule applies to NFR-PRF-01 (Serat term) and NFR-PRF-03 on hosted Windows if their first hosted numbers show the
   same shape; they have no hosted figure yet (the app was not built until #164), so
   they stay `CiAssertion::Always` and are decided on evidence.
@@ -247,7 +254,7 @@ The harness's criteria say the same about `p1-external-change` as about NFR-PRF-
 `windows-latest` is never gate eligible, and the #165 triage shows the term that moves is the
 runner's file I/O, not Serat's timer (watcher delay p95 172.9 to 173.6 ms in all three runs while
 processing p95 went 205 to 450 ms and max to 1,095 ms; batch-of-100 medians 2.9 to 4.8 s, 15 to 25x
-Linux per note). **Ruling: FR-VLT-04's 500 ms p95 is report-only on hosted Windows and asserted on
+Linux per note). **Ruling (ADR-0019 is its home; evidence here): FR-VLT-04's 500 ms p95 is report-only on hosted Windows and asserted on
 the reference machine and on any gate-eligible runner**, the same rule and mechanism. **Best-of-three
 is rejected:** a p95 budget re-run until one attempt passes asserts the runner's best minute, a
 retry is exactly the coin toss `determinate()` exists to refuse, and it still would not make the

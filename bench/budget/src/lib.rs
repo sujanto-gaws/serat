@@ -97,7 +97,7 @@ impl Profile {
 }
 
 /// Whether a `--profile ci` run asserts a budget on a runner that cannot produce a gate
-/// number (task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
+/// number (ADR-0019, task #166, NFR-PRF-04, NFR-PRF-08, C-06, RISK-012).
 ///
 /// C-06 says a budget is enforced in CI. A hosted `windows-latest` runner is 2 cores with
 /// the real-time scanner off in every one of the 36 runs on record, so
@@ -656,6 +656,11 @@ impl Outcome {
         self.gates()
             && self.profile == Profile::Ci
             && self.budget.ci_assertion == CiAssertion::WhenGateEligible
+            // A budget with a regression ceiling is always asserted (ADR-0019).
+            && self.budget.ci_limit_ms.is_none()
+            // A degraded run (backpressure, indicative iterations) fails the number even
+            // here: report-only waives the runner's slowness, not a defective measurement.
+            && self.degraded.is_none()
             && !self.gate_eligible()
     }
 
@@ -3735,8 +3740,18 @@ mod tests {
         let prf03 = outcome_on(PRF03_SAVE_TO_INDEX, Profile::Ci, hosted_windows(), &[80.0]);
         assert_eq!(prf03.budget.ci_assertion, CiAssertion::Always);
         assert!(prf03.asserted() && !enforce(&prf03));
-        // A degraded or unmeasurable run is a failure in the asserting case and is not
-        // converted into a pass by being report-only: an Err still reaches job_exit.
+        // Report-only waives the runner's slowness and nothing else. An unmeasurable run
+        // (Err) reaches job_exit and fails; a degraded Ok outcome is NOT report-only (it
+        // falls into the asserted path and fails), so it cannot hide behind the runner.
+        let mut degraded = outcome_on(
+            PRF04_FULL_REBUILD,
+            Profile::Ci,
+            hosted_windows(),
+            &[10_000.0],
+        );
+        degraded.degraded = Some("backpressure".into());
+        assert!(!degraded.report_only_here() && !enforce(&degraded));
+        assert!(degraded.to_report().contains("DEGRADED"));
         assert_eq!(
             job_exit(&PRF04_FULL_REBUILD, Err("the vault would not open".into())),
             std::process::ExitCode::FAILURE
@@ -3776,6 +3791,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_ceiling_is_asserted_even_on_a_report_only_budget() {
+        // ADR-0019: report_only_here must not survive a future ci_limit_ms.
+        let mut b = PRF04_FULL_REBUILD;
+        b.ci_limit_ms = Some(60_000.0);
+        let o = outcome_on(b, Profile::Ci, hosted_windows(), &[70_000.0, 71_000.0]);
+        assert!(!o.report_only_here() && o.asserted() && !enforce(&o));
     }
 
     /// The text of job `id` in workflow `text`: from its two-space key to the next one.
