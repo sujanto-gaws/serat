@@ -105,6 +105,9 @@ owner: lead
 | 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | **merged** 1ab859e (3 rounds) |
 | 152 | `[P1/design] Collapsed-callout glyph and aria-expanded` | frontend-designer | 146 | **merged** 485c368 (+152b a7b1be6) |
 | 159 | `[P1/impl] Build the collapsed-callout fold marker per the #152 spec` (FR-EDT-01/02, NFR-USE-01) | vue-frontend-dev | 152 | **merged** 0b50a7c |
+| 160 | `[P1/design] Specify live-preview typography and export --serat-* tokens as CSS` (FR-EDT-02, US-02; C-01, C-07; ADR-0006) | frontend-designer | 159 | **merged** c32b48e (+ rulings in 1d7e69d) |
+| 161 | `[P1/impl] Style the hybrid live preview (HighlightStyle, mono-source, --serat-* tokens)` (FR-EDT-01/02, US-02, NFR-PRF-01/02; C-04) | vue-frontend-dev | 160 | **merged** c32b48e |
+| 162 | `[P1/impl] Bundle the three OFL font families locally and re-measure measure.editor` (FR-EDT-02, NFR-SEC-01, NFR-SEC-07, NFR-USE-01) | vue-frontend-dev + tauri-app-dev | 161 | **merged** 1d7e69d |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
