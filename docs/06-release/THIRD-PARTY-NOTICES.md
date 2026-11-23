@@ -8,7 +8,7 @@ Holders and terms below are read from the licence files themselves, not from mem
 
 | Asset | Version / source | Licence | Copyright holder (as stated) | Licence text ships at |
 |---|---|---|---|---|
-| pdf.js (`boot-chunk-pdf.js`, `assets/pdf.worker.min.js`) | pdfjs-dist 6.5.438 (`app/package.json`, `app/package-lock.json`) | Apache-2.0 | Mozilla Foundation (source header of `build/pdf.mjs`: "Copyright 2024 Mozilla Foundation"; the package `LICENSE` is the unmodified Apache text and names no holder) | NOT in the webview bundle. The text is `node_modules/pdfjs-dist/LICENSE`. See the open items below. |
+| pdf.js (`boot-chunk-pdf.js`, `assets/pdf.worker.min.js`) | pdfjs-dist 6.5.438 (`app/package.json`, `app/package-lock.json`) | Apache-2.0 | Mozilla Foundation (source header of `build/pdf.mjs`: "Copyright 2024 Mozilla Foundation"; the package `LICENSE` is the unmodified Apache text and names no holder) | `crates/serat-app/webview/assets/LICENSE_pdfjs` (the unmodified `pdfjs-dist/LICENSE`, emitted beside `assets/pdf.worker.min.js` by `app/src/build/fontLicenses.ts`) |
 | pdf.js CMaps (`cmaps/*.bcmap`, 168 files) | pdfjs-dist 6.5.438, copied by `app/src/build/pdfjsData.ts` | BSD-3-Clause-style (Adobe's CMap licence: source and binary redistribution with notice, no endorsement; the file does not name an SPDX id) | Adobe Systems Incorporated ("Copyright 1990-2009 Adobe Systems Incorporated. All rights reserved.") | `crates/serat-app/webview/cmaps/LICENSE` |
 | Foxit standard fonts (`standard_fonts/Foxit*.pfb`, 10 files) | pdfjs-dist 6.5.438 | BSD-3-Clause-style (three clauses as written; the file does not name an SPDX id) | PDFium Authors ("Copyright 2014 PDFium Authors. All rights reserved."); the neutral-name clause names Google Inc. | `crates/serat-app/webview/standard_fonts/LICENSE_FOXIT` |
 | Liberation fonts (`standard_fonts/LiberationSans-*.ttf`, 4 files) | pdfjs-dist 6.5.438 | GNU GPL v2 with the Liberation font exceptions (NOT OFL-1.1; the shipped file is the Red Hat Liberation 1.x agreement and carries the GPL-2.0 text) | Red Hat, Inc. ("Copyright © 2007-2011 Red Hat, Inc. All rights reserved."; "LIBERATION" is a Red Hat trademark) | `crates/serat-app/webview/standard_fonts/LICENSE_LIBERATION` |
@@ -16,7 +16,7 @@ Holders and terms below are read from the licence files themselves, not from mem
 | Bricolage Grotesque (`assets/bricolage-grotesque-latin-wght-normal.woff2`) | `@fontsource-variable/bricolage-grotesque` 5.3.0 | OFL-1.1 | "Copyright 2022 The Bricolage Grotesque Project Authors (https://github.com/ateliertriay/bricolage)" | `crates/serat-app/webview/assets/LICENSE_bricolage-grotesque` |
 | JetBrains Mono (`assets/jetbrains-mono-latin-wght-normal.woff2`) | `@fontsource-variable/jetbrains-mono` 5.3.0 | OFL-1.1 | "Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)" | `crates/serat-app/webview/assets/LICENSE_jetbrains-mono` |
 
-The three OFL licence files are emitted by `app/src/build/fontLicenses.ts` from each package's `LICENSE`; the CMap and standard-font files are emitted by `app/src/build/pdfjsData.ts`. OFL-1.1 section 2 requires the licence to travel with each redistributed copy of the fonts, and the BSD notices require the same for binary redistribution; the bundle does that for the six files above.
+The three OFL licence files are emitted by `app/src/build/fontLicenses.ts` from each package's `LICENSE`; the CMap and standard-font files are emitted by `app/src/build/pdfjsData.ts`. OFL-1.1 section 2 requires the licence to travel with each redistributed copy of the fonts, and the BSD notices require the same for binary redistribution; the bundle does that for the seven licence files above.
 
 Terms worth knowing before release (read from the files):
 
@@ -25,10 +25,9 @@ Terms worth knowing before release (read from the files):
 
 ## 2. Open items (not satisfied by the bundle today)
 
-1. **The pdf.js Apache-2.0 text is not shipped.** Apache-2.0 section 4(a) asks that recipients of the Work in object form receive a copy of the licence. `boot-chunk-pdf.js` and `assets/pdf.worker.min.js` carry no licence banner (the worker has no "Copyright" string at all). Fix: add a `LICENSE_pdfjs` emit beside `fontLicenses.ts`, rebuild the bundle in its own commit, and the notices test then lists it automatically.
-2. **Bundled npm code ships without notices.** Vue, Pinia, CodeMirror, Lezer, markdown-it and its dependencies (MIT, BSD-2-Clause, PSF-2.0 for argparse) are compiled into `boot.js` and `boot-chunk-markdown-it.js`, which carry no licence banners. Section 3 lists them by licence family, but the licence texts of those packages ship nowhere in the app. MIT, BSD and PSF-2.0 each ask for the notice to accompany copies.
-3. **Rust crates**: the same applies to the 426 crates compiled into the Tauri binary (section 3). A generated all-crates notices file (for example `cargo about`) is not in the repository.
-4. **Source Serif 4 holder** is whatever Fontsource's `LICENSE` says ("Google Inc."), which is not an upstream copyright line. It is reported as shipped.
+1. **Bundled npm code ships without notices.** Vue, Pinia, CodeMirror, Lezer, markdown-it and its dependencies (MIT, BSD-2-Clause, PSF-2.0 for argparse) are compiled into `boot.js` and `boot-chunk-markdown-it.js`, which carry no licence banners. Section 3 lists them by licence family, but the licence texts of those packages ship nowhere in the app. P5 follow-up (banners or a generated notice for bundled npm code). MIT, BSD and PSF-2.0 each ask for the notice to accompany copies.
+2. **Rust crates**: the same applies to the 426 crates compiled into the Tauri binary (section 3). A generated all-crates notices file (for example `cargo about`) is not in the repository. P5 follow-up.
+3. **Source Serif 4 holder** is whatever Fontsource's `LICENSE` says ("Google Inc."), which is not an upstream copyright line. It is reported as shipped.
 
 ## 3. Dependency licence summaries
 

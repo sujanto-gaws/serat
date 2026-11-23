@@ -34,6 +34,7 @@ describe("third-party notices", () => {
         "crates/serat-app/webview/assets/LICENSE_source-serif-4",
         "crates/serat-app/webview/assets/LICENSE_bricolage-grotesque",
         "crates/serat-app/webview/assets/LICENSE_jetbrains-mono",
+        "crates/serat-app/webview/assets/LICENSE_pdfjs",
       ]),
     );
   });
