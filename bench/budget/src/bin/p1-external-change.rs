@@ -53,7 +53,7 @@ use budget::{Samples, ensure_vault};
 use rusqlite::{Connection, OpenFlags};
 use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
-use serat_index::{IndexHandle, rebuild};
+use serat_index::{IndexHandle, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
 use serat_vault::{Vault, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
@@ -64,6 +64,11 @@ const ITERATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Quiet time between iterations, so stragglers (a second event for a path already
 /// indexed) belong to the iteration that caused them and not to the next one.
 const SETTLE: Duration = Duration::from_millis(300);
+// Diagnostic (task #165): `--settle-ms` changes the quiet time between iterations.
+// The CI job never passes it; the default stays 300 ms. A settle longer than the
+// checkpointer's idle gate (250 ms) plus a checkpoint lets each checkpoint finish
+// before the next write, which separates "the checkpointer overlaps the write" from
+// "the watcher path is slow".
 
 /// What the consumer did with one drain of the queue.
 struct Round {
@@ -119,12 +124,17 @@ struct Run<'a> {
     candidates: Vec<String>,
     next: usize,
     sequence: usize,
+    settle: Duration,
+    health: Arc<WalHealth>,
 }
 
 struct Measured {
     total_ms: f64,
     watcher_ms: f64,
     processing_ms: f64,
+    /// A WAL checkpoint was running at the write, at the commit, or started or ended
+    /// in between (task #165: is the processing tail the checkpointer?).
+    checkpoint_overlap: bool,
 }
 
 impl Run<'_> {
@@ -132,6 +142,8 @@ impl Run<'_> {
     fn iteration(&mut self, count: usize) -> Result<Measured, String> {
         self.sequence += 1;
         let mut written = Vec::with_capacity(count);
+        let runs_before = self.health.stats().passive_runs;
+        let running_at_write = self.health.checkpoint_in_progress();
         let t0 = Instant::now();
         for _ in 0..count {
             let relative = self
@@ -161,6 +173,9 @@ impl Run<'_> {
             last_commit = round.committed;
         }
         let first_taken = first_taken.unwrap_or(last_commit);
+        let checkpoint_overlap = running_at_write
+            || self.health.checkpoint_in_progress()
+            || self.health.stats().passive_runs != runs_before;
 
         let conn = Connection::open_with_flags(
             serat_index::index_path(self.index),
@@ -181,15 +196,21 @@ impl Run<'_> {
         }
         drop(conn);
 
-        std::thread::sleep(SETTLE);
+        std::thread::sleep(self.settle);
         while self.rounds.try_recv().is_ok() {}
 
         Ok(Measured {
             total_ms: ms(last_commit.duration_since(t0)),
             watcher_ms: ms(first_taken.duration_since(t0)),
             processing_ms: ms(last_commit.duration_since(first_taken)),
+            checkpoint_overlap,
         })
     }
+}
+
+fn mean(values: impl Iterator<Item = f64>) -> f64 {
+    let (sum, n) = values.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+    if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
 fn ms(d: Duration) -> f64 {
@@ -199,6 +220,7 @@ fn ms(d: Duration) -> f64 {
 fn run(args: &[String]) -> Result<bool, String> {
     let (mut vault_name, mut singles, mut batches, mut batch_size, mut assert) =
         ("20k".to_owned(), 100usize, 20usize, 100usize, false);
+    let mut settle = SETTLE;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut number = |what: &str| -> Result<usize, String> {
@@ -212,6 +234,9 @@ fn run(args: &[String]) -> Result<bool, String> {
             "--single" => singles = number("--single")?,
             "--batches" => batches = number("--batches")?,
             "--batch-size" => batch_size = number("--batch-size")?,
+            "--settle-ms" => {
+                settle = Duration::from_millis(number("--settle-ms")? as u64);
+            }
             "--assert" => assert = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -315,6 +340,8 @@ fn run(args: &[String]) -> Result<bool, String> {
         candidates,
         next: 0,
         sequence: 0,
+        settle,
+        health: handle.wal_health(),
     };
 
     let result = (|| -> Result<(Vec<Measured>, Vec<Measured>), String> {
@@ -332,6 +359,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     stop.store(true, Ordering::Relaxed);
     let _ = consumer.join();
     watcher.stop();
+    let handle_stats = handle.wal_health().stats();
     let _ = handle.close();
     let _ = std::fs::remove_dir_all(&work);
     if let Some(message) = failure.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -371,10 +399,39 @@ fn run(args: &[String]) -> Result<bool, String> {
                 " (reported, not gated)"
             }
         );
+        // Report-only: split the iterations by whether a checkpoint overlapped them.
+        let slow = runs.iter().filter(|m| m.processing_ms > 100.0).count();
+        let slow_overlapped = runs
+            .iter()
+            .filter(|m| m.processing_ms > 100.0 && m.checkpoint_overlap)
+            .count();
+        let overlapped: Vec<&Measured> = runs.iter().filter(|m| m.checkpoint_overlap).collect();
+        println!(
+            "  checkpoint overlap: {} of {} iterations overlapped one; processing over 100 ms: \
+             {slow}, of which with a checkpoint overlapping: {slow_overlapped}; mean processing \
+             with / without overlap: {:.1} / {:.1} ms",
+            overlapped.len(),
+            runs.len(),
+            mean(overlapped.iter().map(|m| m.processing_ms)),
+            mean(
+                runs.iter()
+                    .filter(|m| !m.checkpoint_overlap)
+                    .map(|m| m.processing_ms)
+            ),
+        );
         if label == "single" {
             rows.push(("single note".to_owned(), total.percentile(0.95)));
         }
     }
+    let stats = handle_stats;
+    println!(
+        "checkpointer: {} PASSIVE runs, {} incomplete, {} RESTART, longest {:.1} ms, mean {:.1} ms",
+        stats.passive_runs,
+        stats.incomplete,
+        stats.restart_runs,
+        stats.passive_max_micros as f64 / 1000.0,
+        stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
+    );
     let breaches = budget::gate::breaches(BUDGET_MS, &rows);
     if assert {
         for b in &breaches {
