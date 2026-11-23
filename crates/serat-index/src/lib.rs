@@ -12,6 +12,7 @@
 //! in I6.
 
 mod apply;
+pub mod check;
 pub mod checkpoint;
 /// Whether the `test-hooks` feature is compiled in. serat-app asserts it is not in a
 /// release build, because the feature exposes `SearchConn::set_progress_handler`,
@@ -32,6 +33,7 @@ pub mod switcher;
 pub mod tree;
 pub mod writer;
 
+pub use check::{QuickCheck, quick_check};
 pub use checkpoint::{Bounds, CheckpointStats, WalHealth};
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};

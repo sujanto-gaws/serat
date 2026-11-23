@@ -314,3 +314,17 @@ The rebuild signature is shaped by the same rule. A rebuild walks, parses and wr
 | TC-122 | #118, §3.4's precondition — arms starting in different index states are refused, not caveated | `…::a_scale_check_whose_arms_start_in_different_index_states_is_refused` | pass |
 | TC-123 | #118 — the demoted aggregates are still measured by a job CI runs | `…::the_demoted_aggregates_are_still_measured_by_a_job_that_ci_runs` | pass |
 | TC-111 | S1, task #52 — an empty `last_open` is the normal case (no note is a precondition) and parses fine | `bench/budget/src/trace.rs::an_empty_last_open_is_the_normal_case_now_and_parses_fine` | pass |
+
+## `quick_check` on the 20k index (task #69; NFR-REL-01, NFR-REL-02)
+
+`serat_index::quick_check(index_dir)` runs `PRAGMA quick_check` over its own read-only
+connection, off the open path (architecture §3.4 recorded 1,150 ms for the pragma on this
+fixture). Measured by `subject::tests::measure_quick_check_on_the_20k_index_with_the_checkpointer_running`
+(`cargo test -p budget --lib measure_quick_check -- --ignored --nocapture`): the 20k index
+built by `open_or_rebuild`, then a live `IndexHandle` open (writer and WAL checkpointer
+running), five checks in a row, warm OS cache, host load about 1 on 4 cores, 2026-11-22:
+**922, 955, 957, 967, 1,006 ms (median 957 ms)**. Indicative, not an attested gate run, and
+nothing gates on it: the check is background and on demand, so it never sits on the
+NFR-PRF-01 window. It takes no writer lock (task #154) and holds no read transaction
+beyond the one call.
+
