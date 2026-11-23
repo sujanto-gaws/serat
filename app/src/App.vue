@@ -647,12 +647,14 @@ function onSaveOutcome(outcome: SaveOutcome): void {
          (aria-description is ARIA 1.3 draft with uneven support, WebKitGTK worst; index-state-copy.md). -->
     <span
       class="index"
-      :title="store.indexStatusDetail ?? store.indexStatusText"
-      :aria-describedby="store.indexStatusDetail !== null ? 'index-state-detail' : undefined"
+      :title="store.indexStatusDetail ?? store.indexRebuildDetail ?? store.indexStatusText"
+      :aria-describedby="(store.indexStatusDetail ?? store.indexRebuildDetail) !== null ? 'index-state-detail' : undefined"
       data-testid="index-state"
       >{{ store.indexStatusText }}</span
     >
-    <span v-if="store.indexStatusDetail !== null" id="index-state-detail" class="sr-only">{{ store.indexStatusDetail }}</span>
+    <span v-if="(store.indexStatusDetail ?? store.indexRebuildDetail) !== null" id="index-state-detail" class="sr-only">{{
+      store.indexStatusDetail ?? store.indexRebuildDetail
+    }}</span>
     <!-- #157: one quiet fact beside the Rebuilding text; no number in the text, the count is in the description. -->
     <template v-if="store.indexCheckProblems !== null">
       <span

@@ -76,8 +76,65 @@ export function describeIndexState(state: IndexState): string {
   }
 }
 
+/** Copy brief index-state-copy.md, "Rebuilding: one line per reason" (#158): what is happening, never a wire
+ * value. A member without a row (added to the contract after this build) renders the generic line. */
+const REBUILD_COPY: Record<RebuildReason, { phrase: string; detail: string }> = {
+  no_index: {
+    phrase: "Building the index",
+    detail:
+      "This vault has no search index yet, so Serat is building one from your notes. Your notes are not changed. You can keep editing.",
+  },
+  index_version: {
+    phrase: "Updating the index for this version of Serat",
+    detail:
+      "This version of Serat reads notes differently from the one that built the search index, so it is rebuilding the index from your notes. Your notes are not changed. You can keep editing.",
+  },
+  interrupted: {
+    phrase: "Completing an unfinished index rebuild",
+    detail:
+      "The last rebuild of the search index did not finish, so Serat is building it again from your notes. Your notes are not changed. You can keep editing.",
+  },
+  vault_moved: {
+    phrase: "Rebuilding the index for this vault",
+    detail:
+      "The search index was made for this vault at another location, or copied from a different vault, so Serat is rebuilding it from your notes. Your notes are not changed. You can keep editing.",
+  },
+  corrupt: {
+    phrase: "Repairing the index",
+    detail:
+      "Serat found a problem in its search index, so it is rebuilding it from your notes. Your notes are not affected. You can keep editing.",
+  },
+  user_requested: {
+    phrase: "Rebuilding the index, as you asked",
+    detail:
+      "Serat is rebuilding the search index from your notes, as you asked. Your notes are not changed. You can keep editing.",
+  },
+};
+
+const REBUILD_GENERIC = {
+  phrase: "Rebuilding index",
+  detail:
+    "Serat is rebuilding the search index from your notes. Your notes are not changed. You can keep editing.",
+};
+
+function rebuildCopy(reason: unknown): { phrase: string; detail: string } {
+  return typeof reason === "string" && Object.hasOwn(REBUILD_COPY, reason)
+    ? REBUILD_COPY[reason as RebuildReason]
+    : REBUILD_GENERIC;
+}
+
 function describeRebuildReason(reason: RebuildReason): string {
-  return `Rebuilding index (${reason})`;
+  return rebuildCopy(reason).phrase;
+}
+
+/** Tooltip / accessible description of a `Rebuilding` line; `null` for every other state. */
+export function describeRebuildDetail(state: IndexState): string | null {
+  return state.kind === "rebuilding" ? rebuildCopy(state.reason).detail : null;
+}
+
+/** The single utterance for entering `Rebuilding` (or changing its reason). */
+export function describeRebuildAnnouncement(reason: RebuildReason): string {
+  return `${describeRebuildReason(reason)}. Search and queries are incomplete until it finishes. You can keep editing.`;
 }
 
 export const useVaultStore = defineStore("vault", {
@@ -97,9 +154,13 @@ export const useVaultStore = defineStore("vault", {
     /** A cleared reason just left the strip at a plain Opening: that state is not announced (it lasts until
      * the open check's first state and would be noise); the state after it is. */
     indexAfterWaiting: false,
-    /** The check announcement was made: the Ready or Unavailable that ends the rebuild is announced once,
-     * with its visible text (#157, the same gap as #117b SF1). */
-    indexAfterCheck: false,
+    /** An announced `Rebuilding` is in progress: the Ready or Unavailable that ends it is announced once. */
+    indexRebuildAnnounced: false,
+    /** Last state kind and rebuild reason seen: entering and a reason change are told from progress by these. */
+    indexLastKind: "" as string,
+    indexLastReason: "" as string,
+    /** Tooltip / accessible description of the `Rebuilding` line (the waiting states use `indexStatusDetail`). */
+    indexRebuildDetail: null as string | null,
     /** `IndexStatus.index_check_problems` (#69, #157): the post-unclean-open check found this many problems and
      * a rebuild is running. `null` = absent (never zero). The visible fact carries no number; the count is
      * only in the tooltip. */
@@ -142,7 +203,9 @@ export const useVaultStore = defineStore("vault", {
       if (opened.vault_id !== this.vaultId) {
         this.refusedNames = null; // another vault: the old count is not its count
         this.indexCheckProblems = null; // nor its check fact
-        this.indexAfterCheck = false;
+        this.indexRebuildAnnounced = false;
+        this.indexLastKind = "";
+        this.indexLastReason = "";
       }
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
@@ -167,7 +230,6 @@ export const useVaultStore = defineStore("vault", {
       this.vaultOpen = false;
       this.refusedNames = null; // no vault, nothing to count
       this.indexCheckProblems = null;
-      this.indexAfterCheck = false;
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -195,7 +257,22 @@ export const useVaultStore = defineStore("vault", {
       const text = describeIndexState(state);
       const detail = describeIndexDetail(state);
       const plainOpening = state.kind === "opening" && detail === null;
-      if (detail !== null && (!wasWaiting || text !== this.indexStatusText)) {
+      const reasonNow = state.kind === "rebuilding" ? state.reason : "";
+      if (state.kind === "rebuilding") {
+        if (this.indexLastKind !== "rebuilding" || this.indexLastReason !== reasonNow) {
+          // Entering Rebuilding, or a new rebuild (reason change): one utterance. Progress events are silent.
+          this.indexAnnouncement = describeRebuildAnnouncement(state.reason);
+          this.indexAnnouncementKind = "rebuilding";
+          this.indexAfterWaiting = false;
+          this.indexRebuildAnnounced = true;
+        }
+      } else if (this.indexRebuildAnnounced && (state.kind === "ready" || state.kind === "unavailable")) {
+        // The Ready or Unavailable that ends an announced Rebuilding: once, with its visible text.
+        this.indexAnnouncement = text;
+        this.indexAnnouncementKind = state.kind;
+        this.indexRebuildAnnounced = false;
+        this.indexAfterWaiting = false;
+      } else if (detail !== null && (!wasWaiting || text !== this.indexStatusText)) {
         this.indexAnnouncement = text; // entered (or the reason changed): one snapshot
         this.indexAnnouncementKind = state.kind;
         this.indexAfterWaiting = false;
@@ -215,10 +292,6 @@ export const useVaultStore = defineStore("vault", {
           this.indexAnnouncementKind = state.kind;
           this.indexAfterWaiting = false;
         }
-      } else if (detail === null && this.indexAfterCheck && state.kind !== "rebuilding") {
-        this.indexAnnouncement = text; // the Ready or Unavailable that ends the rebuild: once, visible text
-        this.indexAnnouncementKind = state.kind;
-        this.indexAfterCheck = false;
       } else if (detail === null && state.kind !== this.indexAnnouncementKind) {
         // Cleared only on a change of kind, not on each progress event: a polite region can drop a
         // snapshot that is wiped milliseconds after it is written (worst on WebKit).
@@ -227,6 +300,9 @@ export const useVaultStore = defineStore("vault", {
       }
       this.indexStatusText = text;
       this.indexStatusDetail = detail;
+      this.indexRebuildDetail = describeRebuildDetail(state);
+      this.indexLastKind = state.kind;
+      this.indexLastReason = reasonNow;
     },
     setRefusedNames(count: number | null) {
       this.refusedNames = count;
@@ -252,7 +328,7 @@ export const useVaultStore = defineStore("vault", {
         this.indexAnnouncement = INDEX_CHECK_ANNOUNCEMENT;
         this.indexAnnouncementKind = stateKind;
         this.indexAfterWaiting = false;
-        this.indexAfterCheck = true;
+        this.indexRebuildAnnounced = true; // its ending is announced too
       }
       this.indexCheckProblems = next;
     },

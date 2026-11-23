@@ -80,8 +80,9 @@ describe("App status strip: Opening reason", () => {
     await send({ kind: "rebuilding", reason: "no_index", done: 1, total: 10, walk_complete: false });
     await flush();
     expect(announced).toHaveLength(1);
-    expect(announced[0]).toContain("Rebuilding index");
-    expect(wrapper.find('[data-testid="index-state"]').attributes("aria-describedby")).toBeUndefined();
+    expect(announced[0]).toContain("Building the index. Search and queries are incomplete until it finishes.");
+    const rebuildDescribedBy = wrapper.find('[data-testid="index-state"]').attributes("aria-describedby")!;
+    expect(wrapper.find(`#${rebuildDescribedBy}`).text()).toContain("This vault has no search index yet");
 
     announced = [];
     for (let done = 2; done < 7; done++) {
@@ -90,13 +91,13 @@ describe("App status strip: Opening reason", () => {
     await flush();
     expect(announced).toEqual([]);
     // The leave snapshot survives the progress events (same kind); only a change of kind clears it.
-    expect(live.textContent).toContain("Rebuilding index");
+    expect(live.textContent).toContain("Building the index.");
     // Non-waiting states carry their full text as the title.
-    expect(wrapper.find('[data-testid="index-state"]').attributes("title")).toContain("Rebuilding index");
+    expect(wrapper.find('[data-testid="index-state"]').attributes("title")).toContain("This vault has no search index yet");
     await send({ kind: "ready", note_count: 3 });
     await flush();
-    expect(announced).toEqual([]);
-    expect(live.textContent).toBe("");
+    expect(announced).toEqual(["index: ready · 3 notes"]); // the Ready that ends an announced Rebuilding: once
+    expect(live.textContent).toBe("index: ready · 3 notes");
 
     observer.disconnect();
     wrapper.unmount();
@@ -197,6 +198,57 @@ describe("App status strip: index check found problems (#157)", () => {
     expect(wrapper.find('[data-testid="index-check-problems"]').exists()).toBe(false);
     expect(announced).toHaveLength(2); // then Ready: exactly one more utterance
     expect(announced[1]).toBe("index: ready · 4 notes");
+    observer.disconnect();
+    wrapper.unmount();
+    vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
+  });
+});
+
+describe("App status strip: one line per rebuild reason (#158)", () => {
+  it("entering announces once, progress is silent, a reason change announces once, the ending Ready announces once", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((name: string, h: (e: { payload: unknown }) => void) => {
+      handlers.set(name, h);
+      return Promise.resolve(() => undefined);
+    }) as never);
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const send = async (state: unknown) => {
+      handlers.get("index://status")!({ payload: { vault_id: "A", state } });
+      await wrapper.vm.$nextTick();
+    };
+    const live = wrapper.find('[data-testid="index-live"]').element;
+    const announced: string[] = [];
+    const observer = new MutationObserver(() => {
+      if ((live.textContent ?? "") !== "") announced.push(live.textContent ?? "");
+    });
+    observer.observe(live, { childList: true, characterData: true, subtree: true });
+    const flush = async () => {
+      await new Promise<void>((r) => queueMicrotask(r));
+      await new Promise<void>((r) => queueMicrotask(r));
+    };
+    const rebuilding = (reason: string, done: number) => ({ kind: "rebuilding", reason, done, total: 10, walk_complete: true });
+
+    await send(rebuilding("vault_moved", 0));
+    await flush();
+    expect(wrapper.get('[data-testid="index-state"]').text()).toBe(
+      "Rebuilding the index for this vault — search and queries are incomplete until this finishes · 0/10",
+    );
+    expect(announced).toEqual([
+      "Rebuilding the index for this vault. Search and queries are incomplete until it finishes. You can keep editing.",
+    ]);
+    for (let done = 1; done < 5; done++) await send(rebuilding("vault_moved", done));
+    await flush();
+    expect(announced).toHaveLength(1);
+    await send(rebuilding("user_requested", 0));
+    await flush();
+    expect(announced).toHaveLength(2);
+    expect(announced[1]).toContain("Rebuilding the index, as you asked.");
+    await send({ kind: "ready", note_count: 9 });
+    await flush();
+    expect(announced).toHaveLength(3);
+    expect(announced[2]).toBe("index: ready · 9 notes");
     observer.disconnect();
     wrapper.unmount();
     vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
