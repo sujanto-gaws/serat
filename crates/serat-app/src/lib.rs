@@ -67,6 +67,7 @@ pub mod gitignore;
 pub mod index;
 mod nav_guard;
 pub mod offload;
+pub mod quick_check;
 pub mod reads;
 mod security_config;
 pub mod settings;

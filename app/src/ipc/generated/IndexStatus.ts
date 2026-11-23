@@ -61,4 +61,17 @@ refused_names?: number,
  * `None` (absent on the wire) means the WAL is not pinned, or no vault is open.
  * It is a fact about a defect, so it is never `Some(0)`.
  */
-wal_pinned_bytes?: number, };
+wal_pinned_bytes?: number, 
+/**
+ * The background index check found this many problems and the index is being rebuilt
+ * (task #69; NFR-REL-01, NFR-REL-02, ADR-0002). After an unclean shutdown, once the
+ * writer has been idle, serat-app runs SQLite's `PRAGMA quick_check` on the index; a
+ * damaged page the open-time checks do not read ends in a rebuild, as every broken index
+ * does. The front end renders it as one quiet status fact, **"index check found
+ * problems, rebuilding"**, beside the `Rebuilding` state it accompanies, never as an
+ * error or a modal. It is cleared when the rebuild finishes. Present only while true,
+ * never `Some(0)`; `None` (absent on the wire) means no check has found anything, or none
+ * ran. There is no command to request a check (none exists in this contract, and this
+ * task adds none).
+ */
+index_check_problems?: number, };

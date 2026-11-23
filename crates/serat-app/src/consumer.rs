@@ -491,6 +491,9 @@ impl Drop for UnwindGuard<'_> {
     }
 }
 
+/// What runs once the open's catch-up has finished (see [`Indexer::on_caught_up`]).
+type CaughtUpHook = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Brings the index into agreement with the disk, for one open vault.
 pub struct Indexer {
     vault: Arc<Vault>,
@@ -506,6 +509,15 @@ pub struct Indexer {
     /// been called, which makes the next catch-up hash every file: conservative, never
     /// wrong.
     window_start_ms: AtomicI64,
+    /// When the index writer was last given work (task #69: the background check waits for
+    /// it to be idle).
+    activity: Arc<crate::quick_check::Activity>,
+    /// Called once the open's catch-up has finished, with whether the previous session ended
+    /// uncleanly (task #69).
+    after_catch_up: Mutex<Option<CaughtUpHook>>,
+    /// The catch-up found no index handle yet and owes a rescan; the hook runs once that
+    /// rescan has run (task #69), so an unclean open cannot skip its background check.
+    hook_owed: AtomicBool,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -526,7 +538,25 @@ impl Indexer {
             journal: Mutex::new(None),
             stop: AtomicBool::new(false),
             window_start_ms: AtomicI64::new(0),
+            activity: Arc::new(crate::quick_check::Activity::new()),
+            after_catch_up: Mutex::new(None),
+            hook_owed: AtomicBool::new(false),
         }
+    }
+
+    /// The writer's activity clock, shared with the save path.
+    #[must_use]
+    pub fn activity(&self) -> &Arc<crate::quick_check::Activity> {
+        &self.activity
+    }
+
+    /// Run `f` when the open's catch-up has finished, with whether the previous session
+    /// ended uncleanly. One hook; a second call replaces the first.
+    pub fn on_caught_up(&self, f: impl Fn(bool) + Send + Sync + 'static) {
+        *self
+            .after_catch_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
     }
 
     /// The vault is closing: abandon work in progress, including the detached catch-up
@@ -595,6 +625,7 @@ impl Indexer {
         if paths.is_empty() || self.stopped() {
             return;
         }
+        self.activity.touch();
         if let Some(journal) = self.journal().as_mut() {
             journal.add_paths(paths);
         }
@@ -617,6 +648,7 @@ impl Indexer {
         if self.stopped() {
             return;
         }
+        self.activity.touch();
         if let Some(journal) = self.journal().as_mut() {
             journal.add_dir(dir);
         }
@@ -715,6 +747,11 @@ impl Indexer {
             let paths: Vec<VaultPath> = paths.into_iter().collect();
             self.index_paths(&paths);
         }
+        // The catch-up that found no handle owed this rescan; now the handle is here, so the
+        // background check it would have started is started (task #69).
+        if self.hook_owed.swap(false, Ordering::SeqCst) {
+            self.run_caught_up_hook(self.unclean());
+        }
     }
 
     /// Records the open-time window start: the time taken immediately before the
@@ -764,16 +801,19 @@ impl Indexer {
             // rescan is it. (The open's own rebuild never gets here: it is not claimed.)
             *self.journal() = None;
             self.deferred().rescan = true;
+            self.hook_owed.store(true, Ordering::SeqCst);
             return;
         };
         // A panic below (the reconciler, the replay) must not leave the journal open for
         // the rest of the session, which would swallow every `RescanRequired`.
         let _unwind = UnwindGuard(self);
+        self.activity.touch();
         let parser = CommonMarkParser::new();
         // The architect's ruling (ADR-0015 section 2): the open compares mtimes whatever
-        // the last shutdown was. The marker only schedules the background quick_check,
-        // which this crate does not run yet; it is reported so the fact is not lost.
-        if self.unclean() {
+        // the last shutdown was. The marker only schedules the background quick_check (task
+        // #69, `crate::quick_check`), started from the hook below once this catch-up is done.
+        let unclean = self.unclean();
+        if unclean {
             eprintln!("serat: the previous session did not close cleanly; comparing mtimes");
         }
         self.settle(reconciler.catch_up(
@@ -784,6 +824,19 @@ impl Indexer {
             Some(self.window_start_ms.load(Ordering::SeqCst)),
         ));
         self.replay_journal(&reconciler);
+        self.activity.touch();
+        self.run_caught_up_hook(unclean);
+    }
+
+    fn run_caught_up_hook(&self, unclean: bool) {
+        let hook = self
+            .after_catch_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(unclean);
+        }
     }
 
     /// Replays what the consumer journaled while the walk and catch-up ran. A catch-up
@@ -1069,6 +1122,39 @@ mod tests {
             indexer.journal().is_none(),
             "the journal ends with the catch-up"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task #69 review. Mutant, run by hand: dropping the `hook_owed` store leaves the hook
+    // uncalled after the owed rescan, so an unclean open whose catch-up found no handle skips
+    // its check.
+    #[test]
+    fn an_unclean_open_whose_catch_up_found_no_handle_still_starts_its_check_after_the_rescan() {
+        let dir = vault_dir("owed-check");
+        let index_dir = dir.join(".serat");
+        // A session that ended uncleanly: opened and dropped without close().
+        drop(IndexHandle::open(&index_dir).expect("index"));
+        let empty: IndexHandleSlot = Arc::new(Mutex::new(None));
+        let (indexer, _) = indexer(&dir, Arc::clone(&empty));
+        let calls: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        indexer.on_caught_up(move |unclean| seen.lock().expect("calls").push(unclean));
+
+        // `Ready` before the handle reaches the slot: the catch-up cannot run.
+        indexer.catch_up(&walk(&indexer));
+        assert!(indexer.rescan_owed());
+        assert!(
+            calls.lock().expect("calls").is_empty(),
+            "no handle, no verdict"
+        );
+
+        // The handle arrives; the owed rescan runs and the check is started, as unclean.
+        *empty.lock().expect("slot") = Some(IndexHandle::open(&index_dir).expect("index"));
+        indexer.retry_deferred();
+        assert_eq!(*calls.lock().expect("calls"), vec![true]);
+        // Once: another tick owes nothing.
+        indexer.retry_deferred();
+        assert_eq!(calls.lock().expect("calls").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

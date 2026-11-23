@@ -399,6 +399,16 @@ pub struct Reader {
     search: Option<Arc<SearchConn>>,
 }
 
+/// How every read connection of the index is opened: read-only, no per-connection mutex.
+/// Shared by [`Reader`], the search connection and [`crate::check::quick_check`], so the
+/// three cannot drift apart.
+pub(crate) const READ_FLAGS: OpenFlags =
+    OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
+
+/// The pragmas every read connection starts with: it cannot write, and it waits up to five
+/// seconds on a lock.
+pub(crate) const READ_PRAGMAS: &str = "PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;";
+
 impl Reader {
     /// Open the index database at `db_path` read-only.
     ///
@@ -406,14 +416,9 @@ impl Reader {
     ///
     /// [`IndexError::Sqlite`] if it cannot be opened.
     pub fn open(db_path: &Path) -> Result<Self, IndexError> {
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(sqlite)?;
+        let conn = Connection::open_with_flags(db_path, READ_FLAGS).map_err(sqlite)?;
         conn.set_prepared_statement_cache_capacity(16);
-        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
-            .map_err(sqlite)?;
+        conn.execute_batch(READ_PRAGMAS).map_err(sqlite)?;
         Ok(Self {
             conn,
             rejections: Cell::new(0),

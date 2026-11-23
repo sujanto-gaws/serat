@@ -253,6 +253,8 @@ struct OpenVault {
     index_handle: IndexHandleSlot,
     /// The vault's one full-text search connection (§4.5 obligation 2).
     search: Arc<crate::reads::SearchSlot>,
+    /// Serialises the background index check against rebuilds (task #69).
+    checks: Arc<crate::quick_check::QuickCheckRunner>,
     /// The file tree's stream and the threads that feed it (ADR-0015).
     tree: Arc<TreeFeed>,
     /// The base registry and the buffer commands (ADR-0016).
@@ -555,6 +557,9 @@ pub struct AppState {
     flush: Mutex<FlushState>,
     flush_cv: std::sync::Condvar,
     window_destroyed: std::sync::atomic::AtomicBool,
+    /// How long the writer must be idle before the background index check, and the least
+    /// spacing between two (task #69). Tests shorten both.
+    check_timing: (std::time::Duration, std::time::Duration),
     /// The exit's close has run (task #151 review): a folder picked after it must not open
     /// a vault nothing will close. Set under `opening`, so a pick either opens first (and
     /// the close that follows takes it down) or finds this set.
@@ -637,6 +642,10 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            check_timing: (
+                crate::quick_check::IDLE_BEFORE_CHECK,
+                crate::quick_check::MIN_SPACING,
+            ),
             closed_for_exit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
@@ -670,6 +679,10 @@ impl AppState {
             flush: Mutex::new(FlushState::default()),
             flush_cv: std::sync::Condvar::new(),
             window_destroyed: std::sync::atomic::AtomicBool::new(false),
+            check_timing: (
+                crate::quick_check::IDLE_BEFORE_CHECK,
+                crate::quick_check::MIN_SPACING,
+            ),
             closed_for_exit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             slow_read: Mutex::new(None),
@@ -698,6 +711,18 @@ impl AppState {
     #[must_use]
     pub fn with_walk_gate(mut self, gate: std::time::Duration) -> Self {
         self.walk_gate = gate;
+        self
+    }
+
+    /// Shorter idle and spacing for the background index check, for tests (task #69).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_check_timing(
+        mut self,
+        idle: std::time::Duration,
+        spacing: std::time::Duration,
+    ) -> Self {
+        self.check_timing = (idle, spacing);
         self
     }
 
@@ -1034,6 +1059,38 @@ impl AppState {
             Arc::clone(&index_handle),
             notifier,
         ));
+        let search = Arc::new(crate::reads::SearchSlot::new(Arc::clone(&epoch)));
+        let checks = Arc::new(crate::quick_check::QuickCheckRunner::new(Arc::clone(
+            indexer.activity(),
+        )));
+        // Task #69: after an unclean shutdown, once the open's catch-up is done, check the
+        // index in the background and rebuild it if SQLite finds damage.
+        // The hook lives in the indexer, and the check thread waits seconds for the writer to be
+        // idle, so neither holds the vault's parts strongly: the publisher's observer reaches the
+        // catch-up gate, whose callback holds the indexer, and a strong reference kept for the
+        // wait would keep the index handle (and its writer lock) alive after the vault was
+        // dropped. Everything is upgraded only while it is being used.
+        let weak_parts = WeakParts {
+            vault: Arc::downgrade(&vault),
+            publisher: Arc::downgrade(&publisher),
+            slot: Arc::downgrade(&index_handle),
+            search: Arc::downgrade(&search),
+            indexer: Arc::downgrade(&indexer),
+        };
+        let hook_checks = Arc::clone(&checks);
+        let timing = self.check_timing;
+        indexer.on_caught_up(move |unclean| {
+            if !unclean {
+                return;
+            }
+            let (weak, checks) = (weak_parts.clone(), Arc::clone(&hook_checks));
+            let spawned = std::thread::Builder::new()
+                .name("serat-quick-check".to_owned())
+                .spawn(move || background_index_check(&weak, &checks, timing));
+            if let Err(err) = spawned {
+                eprintln!("serat: the background index check could not start: {err}");
+            }
+        });
         // A claim that gives up because the index never settled owes a rescan rather than
         // dropping the open's catch-up (task #96 review B1).
         let owing = Arc::clone(&indexer);
@@ -1225,7 +1282,8 @@ impl AppState {
             indexer,
             switcher,
             index_handle,
-            search: Arc::new(crate::reads::SearchSlot::new(epoch)),
+            search,
+            checks,
             tree,
             editor,
             catch_up: catch_up_gate,
@@ -1418,6 +1476,7 @@ impl AppState {
                 since_process_start_ms: self.startup.elapsed_ms() as u64,
                 refused_names: None,
                 wal_pinned_bytes: None,
+                index_check_problems: None,
             },
         }
     }
@@ -2070,6 +2129,8 @@ impl AppState {
     /// `serat-index` today. Cloning a `WriterHandle` out of the slot once, under the
     /// lock, and dropping the lock before parsing is the fix once that seam exists.
     fn submit_to_index(&self, open: &OpenVault, path: &VaultPath) {
+        // A save is writer activity: the background index check waits for quiet (task #69).
+        open.indexer.activity().touch();
         let vault = &*open.vault;
         let outcome = {
             let guard = open
@@ -2142,61 +2203,19 @@ impl AppState {
         // nothing and a re-open can remove the db under it. Before it is wired to a
         // command it must run on the actor, or hold an exit flag in `DetachedWriters`
         // under this root for its whole duration.
-        let (vault, publisher, slot, search, indexer) = {
+        let parts = {
             let guard = self.open_lock();
             let open = guard.as_ref().ok_or_else(Self::not_open)?;
-            (
-                Arc::clone(&open.vault),
-                Arc::clone(&open.publisher),
-                Arc::clone(&open.index_handle),
-                Arc::clone(&open.search),
-                Arc::clone(&open.indexer),
-            )
+            RebuildParts {
+                vault: Arc::clone(&open.vault),
+                publisher: Arc::clone(&open.publisher),
+                slot: Arc::clone(&open.index_handle),
+                search: Arc::clone(&open.search),
+                indexer: Arc::clone(&open.indexer),
+                checks: Arc::clone(&open.checks),
+            }
         };
-        let index_dir = index_dir_for(vault.root());
-        let handle = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or_else(|| IpcError::Io {
-                path: index_dir.display().to_string(),
-                message: "there is no open index to rebuild".to_owned(),
-            })?;
-        publisher.publish(IndexState::Rebuilding {
-            reason: crate::ipc::RebuildReason::UserRequested,
-            done: 0,
-            total: 0,
-            walk_complete: false,
-        });
-        search.suspend();
-        let parser = CommonMarkParser::new();
-        let rebuilt = handle.rebuild_in_place(&|| search.close(), &*vault, &parser, vault.root());
-        match rebuilt {
-            Ok((handle, _report)) => {
-                let note_count = handle.note_count().unwrap_or(0);
-                *slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
-                search.epoch.fetch_add(1, Ordering::SeqCst);
-                search.resume();
-                publisher.publish(IndexState::Ready { note_count });
-                indexer.notifier().changed();
-                Ok(())
-            }
-            Err(err) => {
-                // No handle is left (rebuild_in_place's contract): the index is
-                // unavailable for the rest of the session and the vault stays editable.
-                search.resume();
-                publisher.publish(IndexState::Unavailable {
-                    message: format!("the index could not be rebuilt: {err}"),
-                    path: index_dir.display().to_string(),
-                });
-                Err(IpcError::Io {
-                    path: index_dir.display().to_string(),
-                    message: err.to_string(),
-                })
-            }
-        }
+        rebuild_open_index(&parts, crate::ipc::RebuildReason::UserRequested)
     }
 
     /// Close the open vault, if any: the consumer stops, the index is closed cleanly
@@ -2361,6 +2380,171 @@ impl AppState {
         self.open
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Everything a rebuild of the open vault's index needs, so it can run from a thread that
+/// holds no `AppState` (task #69).
+#[derive(Clone)]
+struct RebuildParts {
+    vault: Arc<Vault>,
+    publisher: Arc<Publisher>,
+    slot: IndexHandleSlot,
+    search: Arc<crate::reads::SearchSlot>,
+    indexer: Arc<Indexer>,
+    checks: Arc<crate::quick_check::QuickCheckRunner>,
+}
+
+/// `AppState::rebuild_index`'s work, for `reason`. Holds the check runner's guard for its whole
+/// duration, so it waits for a background index check that is running and none starts under it.
+fn rebuild_open_index(
+    parts: &RebuildParts,
+    reason: crate::ipc::RebuildReason,
+) -> Result<(), IpcError> {
+    let _exclusive = parts.checks.exclusive();
+    let (vault, publisher, slot, search, indexer) = (
+        &parts.vault,
+        &parts.publisher,
+        &parts.slot,
+        &parts.search,
+        &parts.indexer,
+    );
+    let index_dir = index_dir_for(vault.root());
+    let handle = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .ok_or_else(|| IpcError::Io {
+            path: index_dir.display().to_string(),
+            message: "there is no open index to rebuild".to_owned(),
+        })?;
+    publisher.publish(IndexState::Rebuilding {
+        reason,
+        done: 0,
+        total: 0,
+        walk_complete: false,
+    });
+    search.suspend();
+    let parser = CommonMarkParser::new();
+    let rebuilt = handle.rebuild_in_place(&|| search.close(), &**vault, &parser, vault.root());
+    match rebuilt {
+        Ok((handle, _report)) => {
+            if publisher.is_retired() {
+                // The vault closed while this ran: nothing will look in the slot again.
+                let _ = handle.close();
+                return Ok(());
+            }
+            let note_count = handle.note_count().unwrap_or(0);
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+            search.epoch.fetch_add(1, Ordering::SeqCst);
+            search.resume();
+            publisher.publish(IndexState::Ready { note_count });
+            indexer.notifier().changed();
+            Ok(())
+        }
+        Err(err) => {
+            // No handle is left (rebuild_in_place's contract): the index is
+            // unavailable for the rest of the session and the vault stays editable.
+            search.resume();
+            publisher.publish(IndexState::Unavailable {
+                message: format!("the index could not be rebuilt: {err}"),
+                path: index_dir.display().to_string(),
+            });
+            Err(IpcError::Io {
+                path: index_dir.display().to_string(),
+                message: err.to_string(),
+            })
+        }
+    }
+}
+
+/// [`RebuildParts`] held weakly, for the background index check's long wait.
+#[derive(Clone)]
+struct WeakParts {
+    vault: std::sync::Weak<Vault>,
+    publisher: std::sync::Weak<Publisher>,
+    slot: std::sync::Weak<Mutex<Option<serat_index::IndexHandle>>>,
+    search: std::sync::Weak<crate::reads::SearchSlot>,
+    indexer: std::sync::Weak<Indexer>,
+}
+
+impl WeakParts {
+    /// The parts, if the vault is still alive and not closing.
+    fn live(&self, checks: &Arc<crate::quick_check::QuickCheckRunner>) -> Option<RebuildParts> {
+        let parts = RebuildParts {
+            vault: self.vault.upgrade()?,
+            publisher: self.publisher.upgrade()?,
+            slot: self.slot.upgrade()?,
+            search: self.search.upgrade()?,
+            indexer: self.indexer.upgrade()?,
+            checks: Arc::clone(checks),
+        };
+        (!parts.indexer.stopped() && !parts.publisher.is_retired()).then_some(parts)
+    }
+}
+
+/// The background index check of an unclean open (task #69; see [`crate::quick_check`]): wait
+/// for the writer to be idle, run `PRAGMA quick_check` once, and on damage say so on the status
+/// and rebuild. Runs on its own thread.
+fn background_index_check(
+    weak: &WeakParts,
+    checks: &Arc<crate::quick_check::QuickCheckRunner>,
+    timing: (std::time::Duration, std::time::Duration),
+) {
+    let (idle, spacing) = timing;
+    let Some(index_dir) = weak
+        .vault
+        .upgrade()
+        .map(|vault| index_dir_for(vault.root()))
+    else {
+        return;
+    };
+    let poll = crate::quick_check::POLL
+        .min(idle / 4)
+        .max(std::time::Duration::from_millis(5));
+    let ran = checks.run_when_idle(
+        idle,
+        spacing,
+        poll,
+        &|| weak.live(checks).is_none(),
+        &|| {
+            weak.live(checks).is_some_and(|parts| {
+                matches!(parts.publisher.status().state, IndexState::Ready { .. })
+                    && parts
+                        .slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+            })
+        },
+        &|| serat_index::quick_check(&index_dir),
+    );
+    match ran {
+        crate::quick_check::Ran::Checked(Ok(serat_index::QuickCheck::Problems(found))) => {
+            eprintln!(
+                "serat: the index check found {} problem(s) ({}); rebuilding",
+                found.len(),
+                found.first().map_or("", String::as_str)
+            );
+            let Some(parts) = weak.live(checks) else {
+                return;
+            };
+            parts
+                .publisher
+                .set_check_problems(Some(u32::try_from(found.len()).unwrap_or(u32::MAX)));
+            // The fact stays while the rebuild runs, and goes with it.
+            let rebuilt = rebuild_open_index(&parts, crate::ipc::RebuildReason::Corrupt);
+            if rebuilt.is_ok() {
+                parts.publisher.set_check_problems(None);
+            }
+        }
+        crate::quick_check::Ran::Checked(Ok(serat_index::QuickCheck::Clean)) => {}
+        crate::quick_check::Ran::Checked(Err(err)) => {
+            eprintln!("serat: the background index check could not run: {err}");
+        }
+        crate::quick_check::Ran::Skipped(_) => {}
     }
 }
 
@@ -4405,6 +4589,236 @@ mod tests {
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    // -- task #69: the background index check. (A rebuild waiting for a running check is
+    // pinned in `quick_check::tests`; the save-path touch is redundant with the watcher's
+    // reconciliation touch, so removing it alone does not fail the test below.) ------
+
+    fn checking_state(dir: &Path) -> AppState {
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO)
+        .with_check_timing(Duration::from_millis(100), Duration::from_millis(100));
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        state
+    }
+
+    fn check_runs(state: &AppState) -> u64 {
+        state
+            .open_lock()
+            .as_ref()
+            .map_or(0, |open| open.checks.runs())
+    }
+
+    /// A vault whose previous session ended uncleanly: closed (so no writer or lock is left in
+    /// this process) and then its clean-close marker cleared, which is what a crash leaves.
+    fn unclean_vault(name: &str) -> crate::TestDir {
+        let dir = fixture(name);
+        let state = gateless(&dir);
+        wait_ready(&state);
+        std::thread::sleep(Duration::from_millis(50));
+        state.close_vault();
+        drop(state);
+        let conn =
+            rusqlite::Connection::open(dir.join(".serat").join("index.db")).expect("open index");
+        conn.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
+            .expect("clear the marker");
+        drop(conn);
+        dir
+    }
+
+    #[test]
+    fn an_unclean_open_runs_the_index_check_exactly_once_and_a_clean_one_never() {
+        let dir = unclean_vault("check-once");
+        let state = checking_state(&dir);
+        wait_until("the check", || check_runs(&state) == 1);
+        // Idle, spaced and long past both: it does not run again.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(check_runs(&state), 1);
+        assert_eq!(
+            state.index_status().index_check_problems,
+            None,
+            "a clean index"
+        );
+        state.close_vault();
+
+        // The close above was clean: the next open schedules nothing.
+        let state = checking_state(&dir);
+        wait_ready(&state);
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(check_runs(&state), 0, "a clean open ran the check");
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Mutant, run by hand: dropping the `Problems` arm's `rebuild_open_index` call leaves the
+    // problems fact set and the index unrebuilt, so the Ready-and-cleared wait times out.
+    #[test]
+    fn a_damaged_page_is_found_after_an_unclean_open_and_the_index_is_rebuilt() {
+        let dir = unclean_vault("check-corrupt");
+        let index_db = dir.join(".serat").join("index.db");
+        {
+            let conn = rusqlite::Connection::open(&index_db).expect("open");
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .expect("checkpoint");
+            let (root, page): (i64, i64) = (
+                conn.query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'links'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("rootpage"),
+                conn.query_row("PRAGMA page_size", [], |r| r.get(0))
+                    .expect("page size"),
+            );
+            drop(conn);
+            let mut bytes = std::fs::read(&index_db).expect("read");
+            let start = usize::try_from((root - 1) * page).expect("offset");
+            for byte in &mut bytes[start..start + usize::try_from(page).expect("size")] {
+                *byte = 0xFF;
+            }
+            std::fs::write(&index_db, bytes).expect("damage");
+        }
+        assert!(matches!(
+            serat_index::quick_check(&dir.join(".serat")),
+            Ok(serat_index::QuickCheck::Problems(_))
+        ));
+
+        let seen: Arc<Mutex<Vec<crate::ipc::IndexStatus>>> = Arc::default();
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO)
+        .with_check_timing(Duration::from_millis(100), Duration::from_millis(100));
+        let sink = Arc::clone(&seen);
+        state
+            .events
+            .install(move |status| sink.lock().expect("seen").push(status.clone()));
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+
+        wait_until("the check to find the damage", || {
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .any(|s| s.index_check_problems.is_some())
+        });
+        wait_until(
+            "the rebuilt index to be Ready with the fact cleared",
+            || {
+                let status = state.index_status();
+                matches!(status.state, IndexState::Ready { .. })
+                    && status.index_check_problems.is_none()
+            },
+        );
+        // The rebuild's reason names the damage, and the index is whole again.
+        assert!(seen.lock().expect("seen").iter().any(|s| matches!(
+            s.state,
+            IndexState::Rebuilding {
+                reason: crate::ipc::RebuildReason::Corrupt,
+                ..
+            }
+        )));
+        assert!(matches!(
+            serat_index::quick_check(&dir.join(".serat")),
+            Ok(serat_index::QuickCheck::Clean)
+        ));
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Task #69 review. Mutant, run by hand: removing the touch in `submit_to_index` leaves
+    // `idle_for` large right after the save, because the watcher's reconciliation (which also
+    // touches) only runs about 150 ms later.
+    #[test]
+    fn a_save_touches_the_writer_activity_clock_at_once() {
+        let dir = fixture("activity-touch");
+        let state = gateless(&dir);
+        wait_ready(&state);
+        std::thread::sleep(Duration::from_millis(1500));
+        let idle = |state: &AppState| {
+            state
+                .open_lock()
+                .as_ref()
+                .map(|open| open.indexer.activity().idle_for())
+                .expect("open")
+        };
+        assert!(
+            idle(&state) >= Duration::from_millis(500),
+            "the clock was not idle before the save: {:?}",
+            idle(&state)
+        );
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        state
+            .write_file(WriteFileArgs {
+                path: "10-projects/serat.md".into(),
+                text: format!("{}\n", read.text.trim_end()),
+                base_hash: Some(read.hash),
+            })
+            .expect("save");
+        assert!(
+            idle(&state) < Duration::from_millis(100),
+            "a save did not touch the activity clock: idle {:?}",
+            idle(&state)
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_postpone_the_index_check_until_the_writer_is_idle() {
+        let dir = unclean_vault("check-save");
+        let state = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        )
+        .with_walk_gate(Duration::ZERO)
+        .with_check_timing(Duration::from_millis(1500), Duration::from_millis(100));
+        state
+            .open_vault(OpenVaultArgs {
+                root: dir.display().to_string(),
+            })
+            .expect("open");
+        wait_ready(&state);
+        // Saves every 100 ms for 2.5 s: the check (1.5 s idle) cannot start meanwhile.
+        let until = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < until {
+            let read = state
+                .read_file(ReadFileArgs {
+                    path: "10-projects/serat.md".into(),
+                })
+                .expect("read");
+            state
+                .write_file(WriteFileArgs {
+                    path: "10-projects/serat.md".into(),
+                    text: format!("{}\n", read.text.trim_end()),
+                    base_hash: Some(read.hash),
+                })
+                .expect("save");
+            assert_eq!(check_runs(&state), 0, "the check ran during a save");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        wait_until("the check once it was quiet", || check_runs(&state) == 1);
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

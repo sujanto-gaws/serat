@@ -1389,6 +1389,31 @@ mod tests {
     // -------------------------------------------------------- open / task #68
 
     #[test]
+    #[ignore = "measurement, task #69: run with --ignored --nocapture"]
+    fn measure_quick_check_on_the_20k_index_with_the_checkpointer_running() {
+        // Task #69. architecture.md section 3.4 recorded quick_check at 1150 ms on this
+        // fixture; this is the shipped `serat_index::quick_check` (its own read-only
+        // connection) with a live writer handle open, so the WAL checkpointer thread is
+        // running, as it is when the app calls it.
+        let vault = crate::ensure_vault("20k").expect("the 20k vault is available");
+        let scratch =
+            std::env::temp_dir().join(format!("serat-bench-quick-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _built = measure_open_check(&vault.path, &scratch).expect("build the 20k index");
+        let handle = serat_index::IndexHandle::open(&scratch).expect("writer and checkpointer");
+        let mut ms = Vec::new();
+        for _ in 0..5 {
+            let started = Instant::now();
+            let verdict = serat_index::quick_check(&scratch).expect("check");
+            ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(verdict, serat_index::QuickCheck::Clean);
+        }
+        eprintln!("quick_check on the 20k index, checkpointer running, ms: {ms:.0?}");
+        handle.close().expect("close");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
     fn measure_the_open_check_on_the_20k_vault() {
         // Task #68, following #61: architecture.md §3.4's four-candidate table
         // has real numbers for the three rejected checks and none for the six
