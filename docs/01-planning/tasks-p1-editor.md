@@ -107,6 +107,9 @@ owner: lead
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
 | 156 | `[P1/req] product-analyst ratifies the A-02 consequence sentence applied by the lead` | product-analyst | 154 | pending (no product-analyst agent live) |
+| 68 | `[P1/impl] TreeSession replay to a new channel on webview reload` (FR-VLT-01, NFR-PRF-01; ADR-0015) | rust-core-dev + tauri-app-dev | 18 | **merged** (gate68, 2026-11-23) |
+| 69 | `[P1/impl] Background quick_check after an unclean open` (NFR-REL-01/02, C-02; ADR-0002, ADR-0011) | rust-core-dev + tauri-app-dev | 18 | **merged** 8c6d21b |
+| 157 | `[P1/impl] Strip renders index_check_problems` (NFR-REL-01/02, US-07) | vue-frontend-dev | 69 | in progress |
 | 148 | `[P1/design] T-02 row states the CSP directive set once` | architect | 127 | **merged** with #127 (148c) |
 
 Task 29 was folded into 15. Every branch is reviewed by code-reviewer before merge.
