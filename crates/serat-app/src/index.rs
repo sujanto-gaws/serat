@@ -85,6 +85,8 @@ pub struct StatusPublisher<S> {
     last_refused: std::sync::atomic::AtomicU32,
     /// A trailing refusal-count flush is scheduled (task #144): at most one per window.
     refusal_flush_pending: std::sync::atomic::AtomicBool,
+    /// How many problems the background index check found (0: none), task #69.
+    check_problems: std::sync::atomic::AtomicU32,
     /// Serialises building a status and handing it to the sink (task #144 review): two
     /// emitters must not each read a count and then race to the sink, or the older one can
     /// arrive last and the front end keep a stale count. Held across the sink call, which
@@ -162,6 +164,7 @@ impl<S: StatusSink> StatusPublisher<S> {
             retired: std::sync::atomic::AtomicBool::new(false),
             last_refused: std::sync::atomic::AtomicU32::new(NOT_EMITTED),
             refusal_flush_pending: std::sync::atomic::AtomicBool::new(false),
+            check_problems: std::sync::atomic::AtomicU32::new(0),
             emit_lock: Mutex::new(()),
         }
     }
@@ -304,7 +307,25 @@ impl<S: StatusSink> StatusPublisher<S> {
             since_process_start_ms: inner.since_process_start_ms,
             refused_names: self.refused_count(),
             wal_pinned_bytes: self.wal_pinned_bytes(),
+            index_check_problems: self.check_problems(),
         }
+    }
+
+    fn check_problems(&self) -> Option<u32> {
+        match self.check_problems.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Record that the background index check found `problems` (or, with `None`, that the
+    /// rebuild it led to has finished), and re-emit the status: the fact is not part of the
+    /// state and would otherwise reach a listening front end only with the next state change
+    /// (task #69). Zero is "none".
+    pub fn set_check_problems(&self, problems: Option<u32>) {
+        self.check_problems
+            .store(problems.unwrap_or(0), Ordering::Relaxed);
+        self.re_emit();
     }
 
     /// `RefusalLog::len()`, saturating at [`REFUSED_NAMES_CAP`]; `None` with no log.
@@ -419,6 +440,7 @@ impl<S: StatusSink> StatusPublisher<S> {
                 since_process_start_ms: inner.since_process_start_ms,
                 refused_names: self.refused_count(),
                 wal_pinned_bytes: self.wal_pinned_bytes(),
+                index_check_problems: self.check_problems(),
             }
         };
 

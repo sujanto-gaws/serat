@@ -491,6 +491,9 @@ impl Drop for UnwindGuard<'_> {
     }
 }
 
+/// What runs once the open's catch-up has finished (see [`Indexer::on_caught_up`]).
+type CaughtUpHook = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Brings the index into agreement with the disk, for one open vault.
 pub struct Indexer {
     vault: Arc<Vault>,
@@ -506,6 +509,12 @@ pub struct Indexer {
     /// been called, which makes the next catch-up hash every file: conservative, never
     /// wrong.
     window_start_ms: AtomicI64,
+    /// When the index writer was last given work (task #69: the background check waits for
+    /// it to be idle).
+    activity: Arc<crate::quick_check::Activity>,
+    /// Called once the open's catch-up has finished, with whether the previous session ended
+    /// uncleanly (task #69).
+    after_catch_up: Mutex<Option<CaughtUpHook>>,
 }
 
 impl std::fmt::Debug for Indexer {
@@ -526,7 +535,24 @@ impl Indexer {
             journal: Mutex::new(None),
             stop: AtomicBool::new(false),
             window_start_ms: AtomicI64::new(0),
+            activity: Arc::new(crate::quick_check::Activity::new()),
+            after_catch_up: Mutex::new(None),
         }
+    }
+
+    /// The writer's activity clock, shared with the save path.
+    #[must_use]
+    pub fn activity(&self) -> &Arc<crate::quick_check::Activity> {
+        &self.activity
+    }
+
+    /// Run `f` when the open's catch-up has finished, with whether the previous session
+    /// ended uncleanly. One hook; a second call replaces the first.
+    pub fn on_caught_up(&self, f: impl Fn(bool) + Send + Sync + 'static) {
+        *self
+            .after_catch_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
     }
 
     /// The vault is closing: abandon work in progress, including the detached catch-up
@@ -595,6 +621,7 @@ impl Indexer {
         if paths.is_empty() || self.stopped() {
             return;
         }
+        self.activity.touch();
         if let Some(journal) = self.journal().as_mut() {
             journal.add_paths(paths);
         }
@@ -617,6 +644,7 @@ impl Indexer {
         if self.stopped() {
             return;
         }
+        self.activity.touch();
         if let Some(journal) = self.journal().as_mut() {
             journal.add_dir(dir);
         }
@@ -769,11 +797,13 @@ impl Indexer {
         // A panic below (the reconciler, the replay) must not leave the journal open for
         // the rest of the session, which would swallow every `RescanRequired`.
         let _unwind = UnwindGuard(self);
+        self.activity.touch();
         let parser = CommonMarkParser::new();
         // The architect's ruling (ADR-0015 section 2): the open compares mtimes whatever
-        // the last shutdown was. The marker only schedules the background quick_check,
-        // which this crate does not run yet; it is reported so the fact is not lost.
-        if self.unclean() {
+        // the last shutdown was. The marker only schedules the background quick_check (task
+        // #69, `crate::quick_check`), started from the hook below once this catch-up is done.
+        let unclean = self.unclean();
+        if unclean {
             eprintln!("serat: the previous session did not close cleanly; comparing mtimes");
         }
         self.settle(reconciler.catch_up(
@@ -784,6 +814,15 @@ impl Indexer {
             Some(self.window_start_ms.load(Ordering::SeqCst)),
         ));
         self.replay_journal(&reconciler);
+        self.activity.touch();
+        let hook = self
+            .after_catch_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(unclean);
+        }
     }
 
     /// Replays what the consumer journaled while the walk and catch-up ran. A catch-up
