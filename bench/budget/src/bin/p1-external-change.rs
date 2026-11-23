@@ -53,7 +53,7 @@ use budget::{Samples, ensure_vault};
 use rusqlite::{Connection, OpenFlags};
 use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
-use serat_index::{IndexHandle, rebuild};
+use serat_index::{IndexHandle, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
 use serat_vault::{Vault, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
@@ -64,6 +64,11 @@ const ITERATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Quiet time between iterations, so stragglers (a second event for a path already
 /// indexed) belong to the iteration that caused them and not to the next one.
 const SETTLE: Duration = Duration::from_millis(300);
+// Diagnostic (task #165): `--settle-ms` changes the quiet time between iterations.
+// The CI job never passes it; the default stays 300 ms. A settle longer than the
+// checkpointer's idle gate (250 ms) plus a checkpoint makes an overlap rarer (each
+// checkpoint usually finishes before the next write) but does not remove it: the
+// checkpointer also runs on the 2 s idle spacing and the 4,000-frame bound.
 
 /// What the consumer did with one drain of the queue.
 struct Round {
@@ -119,19 +124,48 @@ struct Run<'a> {
     candidates: Vec<String>,
     next: usize,
     sequence: usize,
+    settle: Duration,
+    health: Arc<WalHealth>,
 }
 
 struct Measured {
     total_ms: f64,
     watcher_ms: f64,
     processing_ms: f64,
+    /// A WAL checkpoint was running at the write, at the commit, or started or ended
+    /// in between (task #165: is the processing tail the checkpointer?).
+    checkpoint_overlap: bool,
+    /// The FTS5 segment count fell between the write and the commit: a merge ran in
+    /// the writer's transaction (the criterion of `p1-save-tail`).
+    fts_merge: bool,
+    /// Read-only approximation of `Reconciler::reader()` plus a first row lookup (a new
+    /// connection, the connection PRAGMAs, `query_only`, one `notes` row), measured
+    /// AFTER the commit, on a row already written, so it warms nothing the next write
+    /// touches and is not part of the interval. The product's `schema::open` is not
+    /// public, hence an approximation.
+    reader_open_ms: f64,
 }
 
 impl Run<'_> {
+    /// The FTS5 segment count, on a fresh read-only connection, read just before the
+    /// write. It looks up no `notes` row, so it does not warm the row the write targets.
+    fn segments_now(&self) -> Result<u32, String> {
+        let conn = Connection::open_with_flags(
+            serat_index::index_path(self.index),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(fts_levels(&conn)?.iter().sum())
+    }
+
     /// Edit the next `count` notes, wait until all are indexed, and verify the index.
     fn iteration(&mut self, count: usize) -> Result<Measured, String> {
         self.sequence += 1;
         let mut written = Vec::with_capacity(count);
+        let segments_before = self.segments_now()?;
+        let stats_before = self.health.stats();
+        let runs_before = stats_before.passive_runs + stats_before.restart_runs;
+        let running_at_write = self.health.checkpoint_in_progress();
         let t0 = Instant::now();
         for _ in 0..count {
             let relative = self
@@ -161,6 +195,10 @@ impl Run<'_> {
             last_commit = round.committed;
         }
         let first_taken = first_taken.unwrap_or(last_commit);
+        let checkpoint_overlap = running_at_write || self.health.checkpoint_in_progress() || {
+            let now = self.health.stats();
+            now.passive_runs + now.restart_runs != runs_before
+        };
 
         let conn = Connection::open_with_flags(
             serat_index::index_path(self.index),
@@ -179,17 +217,138 @@ impl Run<'_> {
                 ));
             }
         }
+        let reader_open_ms = {
+            let t = Instant::now();
+            let probe = Connection::open_with_flags(
+                serat_index::index_path(self.index),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| e.to_string())?;
+            probe
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; \
+                     PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; \
+                     PRAGMA query_only = 1;",
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some((relative, _)) = written.first() {
+                let _: Option<String> = probe
+                    .query_row("SELECT hash FROM notes WHERE path = ?1", [relative], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+            }
+            ms(t.elapsed())
+        };
+        let fts_merge = fts_levels(&conn)?.iter().sum::<u32>() < segments_before;
         drop(conn);
 
-        std::thread::sleep(SETTLE);
+        std::thread::sleep(self.settle);
         while self.rounds.try_recv().is_ok() {}
 
         Ok(Measured {
             total_ms: ms(last_commit.duration_since(t0)),
             watcher_ms: ms(first_taken.duration_since(t0)),
             processing_ms: ms(last_commit.duration_since(first_taken)),
+            checkpoint_overlap,
+            fts_merge,
+            reader_open_ms,
         })
     }
+}
+
+fn varint(b: &[u8], i: &mut usize) -> u64 {
+    let mut v = 0u64;
+    for n in 0..9 {
+        let byte = b[*i];
+        *i += 1;
+        if n == 8 {
+            return (v << 8) | u64::from(byte);
+        }
+        v = (v << 7) | u64::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    v
+}
+
+/// The shape of `blocks_fts`'s structure record: segments per level.
+fn fts_levels(conn: &Connection) -> Result<Vec<u32>, String> {
+    let blob: Vec<u8> = conn
+        .query_row("SELECT block FROM blocks_fts_data WHERE id = 10", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("blocks_fts_data structure record: {e}"))?;
+    // fts5StructureDecode: 4-byte cookie, optional 4-byte V2 marker, varints nLevel,
+    // nSegment, nWriteCounter, then per level nMerge, nSeg and nSeg segment records.
+    let mut i = 4;
+    let v2 = blob[i..i + 4] == [0xFF, 0, 0, 1];
+    if v2 {
+        i += 4;
+    }
+    let n_level = varint(&blob, &mut i);
+    let _n_segment = varint(&blob, &mut i);
+    let _counter = varint(&blob, &mut i);
+    let mut levels = Vec::new();
+    for _ in 0..n_level {
+        let _n_merge = varint(&blob, &mut i);
+        let n_seg = varint(&blob, &mut i);
+        for _ in 0..n_seg {
+            for _ in 0..3 {
+                varint(&blob, &mut i);
+            }
+            if v2 {
+                for _ in 0..5 {
+                    varint(&blob, &mut i);
+                }
+            }
+        }
+        levels.push(u32::try_from(n_seg).unwrap_or(u32::MAX));
+    }
+    Ok(levels)
+}
+
+/// Cumulative CPU jiffies from /proc/stat: (busy, total), and this process's own.
+fn cpu_jiffies() -> Option<(u64, u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?;
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    if v.len() < 5 {
+        return None;
+    }
+    // user nice system idle iowait irq softirq steal
+    let idle = v[3] + v[4];
+    let total: u64 = v.iter().take(8).sum();
+    let me = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after = me.rsplit_once(')')?.1;
+    let f: Vec<&str> = after.split_whitespace().collect();
+    // After ")": state is field 3, so utime (14) and stime (15) are at 11 and 12.
+    let own = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+    Some((total - idle, total, own))
+}
+
+/// Foreign CPU between two `cpu_jiffies` samples, in cores' worth of the whole host
+/// (everything busy but this process). Linux only; `None` elsewhere.
+fn foreign_cores(before: Option<(u64, u64, u64)>, after: Option<(u64, u64, u64)>) -> Option<f64> {
+    let ((b0, t0, o0), (b1, t1, o1)) = (before?, after?);
+    let cpus = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+        .count();
+    let total = t1.checked_sub(t0).filter(|t| *t > 0)? as f64;
+    let foreign = (b1 - b0).saturating_sub(o1 - o0) as f64;
+    Some(foreign / total * cpus as f64)
+}
+
+fn mean(values: impl Iterator<Item = f64>) -> f64 {
+    let (sum, n) = values.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+    if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
 fn ms(d: Duration) -> f64 {
@@ -199,6 +358,8 @@ fn ms(d: Duration) -> f64 {
 fn run(args: &[String]) -> Result<bool, String> {
     let (mut vault_name, mut singles, mut batches, mut batch_size, mut assert) =
         ("20k".to_owned(), 100usize, 20usize, 100usize, false);
+    let mut settle = SETTLE;
+    let mut quiesce = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut number = |what: &str| -> Result<usize, String> {
@@ -212,6 +373,17 @@ fn run(args: &[String]) -> Result<bool, String> {
             "--single" => singles = number("--single")?,
             "--batches" => batches = number("--batches")?,
             "--batch-size" => batch_size = number("--batch-size")?,
+            // Diagnostic negative control (task #165): wait until the checkpointer has
+            // been silent for 3 s (longer than its 2 s idle spacing) before the series,
+            // so a short series with a small `--settle-ms` has no checkpoint to overlap.
+            "--quiesce-checkpointer" => quiesce = true,
+            "--settle-ms" => {
+                let millis = number("--settle-ms")?;
+                if millis == 0 {
+                    return Err("--settle-ms must be above 0".to_owned());
+                }
+                settle = Duration::from_millis(millis as u64);
+            }
             "--assert" => assert = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -308,6 +480,20 @@ fn run(args: &[String]) -> Result<bool, String> {
     std::thread::sleep(Duration::from_secs(1));
     while rx.try_recv().is_ok() {}
 
+    if quiesce {
+        let mut quiet_since = Instant::now();
+        let mut seen = handle.wal_health().stats().passive_runs;
+        while quiet_since.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = handle.wal_health().stats().passive_runs;
+            if now != seen || handle.wal_health().checkpoint_in_progress() {
+                seen = now;
+                quiet_since = Instant::now();
+            }
+        }
+        while rx.try_recv().is_ok() {}
+    }
+
     let mut run = Run {
         root: &root,
         index: &index_dir,
@@ -315,12 +501,21 @@ fn run(args: &[String]) -> Result<bool, String> {
         candidates,
         next: 0,
         sequence: 0,
+        settle,
+        health: handle.wal_health(),
     };
 
     let result = (|| -> Result<(Vec<Measured>, Vec<Measured>), String> {
         let mut single = Vec::new();
+        let cpu_before = cpu_jiffies();
         for _ in 0..singles {
             single.push(run.iteration(1)?);
+        }
+        if let Some(cores) = foreign_cores(cpu_before, cpu_jiffies()) {
+            println!(
+                "foreign CPU during the single series: {cores:.2} cores of the host's \
+                 (everything busy except this process; the machine is quiet at about 0)"
+            );
         }
         let mut batch = Vec::new();
         for _ in 0..batches {
@@ -332,6 +527,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     stop.store(true, Ordering::Relaxed);
     let _ = consumer.join();
     watcher.stop();
+    let handle_stats = handle.wal_health().stats();
     let _ = handle.close();
     let _ = std::fs::remove_dir_all(&work);
     if let Some(message) = failure.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -345,6 +541,9 @@ fn run(args: &[String]) -> Result<bool, String> {
          window 150 ms, budget {BUDGET_MS} ms",
         pinned.notes
     );
+    let environment = budget::env::Environment::detect();
+    let eligible = environment.gate_eligible();
+    let report_only = budget::gate::report_only(assert, eligible);
     let mut rows = Vec::new();
     for (label, runs, size) in [("single", &single, 1), ("batch", &batch, batch_size)] {
         let series = |f: fn(&Measured) -> f64| {
@@ -365,23 +564,97 @@ fn run(args: &[String]) -> Result<bool, String> {
             total.percentile(0.95),
             total.max(),
             if within { "within" } else { "OVER" },
-            if label == "single" {
+            if label == "single" && report_only {
+                " (report-only here: not gate eligible; max reported, not gated)"
+            } else if label == "single" {
                 " (gated on p95, PRD v1.9 FR-VLT-04; max reported, not gated)"
             } else {
                 " (reported, not gated)"
             }
         );
+        // Report-only: split the iterations by whether a checkpoint overlapped them.
+        let slow = runs.iter().filter(|m| m.processing_ms > 100.0).count();
+        let slow_overlapped = runs
+            .iter()
+            .filter(|m| m.processing_ms > 100.0 && m.checkpoint_overlap)
+            .count();
+        let overlapped: Vec<&Measured> = runs.iter().filter(|m| m.checkpoint_overlap).collect();
+        println!(
+            "  checkpoint overlap: {} of {} iterations overlapped one; processing over 100 ms: \
+             {slow}, of which with a checkpoint overlapping: {slow_overlapped}; mean processing \
+             with / without overlap: {:.1} / {:.1} ms",
+            overlapped.len(),
+            runs.len(),
+            mean(overlapped.iter().map(|m| m.processing_ms)),
+            mean(
+                runs.iter()
+                    .filter(|m| !m.checkpoint_overlap)
+                    .map(|m| m.processing_ms)
+            ),
+        );
+        let merged: Vec<&Measured> = runs.iter().filter(|m| m.fts_merge).collect();
+        let slow_merged = runs
+            .iter()
+            .filter(|m| m.processing_ms > 100.0 && m.fts_merge)
+            .count();
+        println!(
+            "  FTS5 merge: {} of {} iterations saw the segment count fall; processing over 100 ms: \
+             {slow}, of which with a merge: {slow_merged}; mean processing with / without a \
+             merge: {:.1} / {:.1} ms",
+            merged.len(),
+            runs.len(),
+            mean(merged.iter().map(|m| m.processing_ms)),
+            mean(
+                runs.iter()
+                    .filter(|m| !m.fts_merge)
+                    .map(|m| m.processing_ms)
+            ),
+        );
+        let mut opens = Samples::new();
+        for m in runs.iter() {
+            opens.push(Duration::from_secs_f64(m.reader_open_ms / 1000.0));
+        }
+        line(
+            "  reader open + row lookup (read-only approximation)",
+            &opens,
+        );
         if label == "single" {
             rows.push(("single note".to_owned(), total.percentile(0.95)));
         }
     }
+    let stats = handle_stats;
+    println!(
+        "checkpointer: {} PASSIVE runs, {} incomplete, {} RESTART, longest {:.1} ms, mean {:.1} ms",
+        stats.passive_runs,
+        stats.incomplete,
+        stats.restart_runs,
+        stats.passive_max_micros as f64 / 1000.0,
+        stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
+    );
     let breaches = budget::gate::breaches(BUDGET_MS, &rows);
-    if assert {
+    // Task #166: FR-VLT-04's 500 ms is the reference machine's number. On a runner that
+    // cannot produce a gate number (hosted windows-latest: the real-time scanner is off) the figure is
+    // measured, printed and cannot fail the build; a failure to measure still does (the
+    // `?` and the REJECTED paths above), and an eligible runner still fails on a breach.
+    if report_only {
+        println!(
+            "FR-VLT-04: REPORT-ONLY, not asserted: {} (asserted on the reference machine, \
+             and on any gate-eligible runner); single note p95 {}",
+            environment
+                .ineligibility_reason()
+                .unwrap_or("not gate eligible"),
+            rows.first().map_or_else(String::new, |(_, ms)| format!(
+                "{ms:.1} ms against {BUDGET_MS} ms"
+            )),
+        );
+    } else if assert {
         for b in &breaches {
             eprintln!("FR-VLT-04: over budget (--assert): {b}");
         }
     }
-    Ok(budget::gate::passes(assert, &breaches))
+    Ok(budget::gate::passes_when_eligible(
+        assert, eligible, &breaches,
+    ))
 }
 
 fn main() -> ExitCode {

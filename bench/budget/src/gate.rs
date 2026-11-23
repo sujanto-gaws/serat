@@ -39,6 +39,18 @@ pub fn passes(assert: bool, breaches: &[String]) -> bool {
     !assert || breaches.is_empty()
 }
 
+/// Whether `--assert` is only reporting on this runner (task #166): the bin was asked
+/// to assert, and the environment cannot produce a gate number.
+pub fn report_only(assert: bool, gate_eligible: bool) -> bool {
+    assert && !gate_eligible
+}
+
+/// [`passes`] for a bin whose budget is asserted only where the environment is gate
+/// eligible. A failure to measure never reaches here: the bin returns an error first.
+pub fn passes_when_eligible(assert: bool, gate_eligible: bool, breaches: &[String]) -> bool {
+    passes(assert && !report_only(assert, gate_eligible), breaches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +89,17 @@ mod tests {
         assert!(require_only_20k(true, "50k").is_err());
         assert!(require_only_20k(true, "20k").is_ok());
         assert!(require_only_20k(false, "50k").is_ok());
+    }
+
+    #[test]
+    fn a_breach_fails_where_the_runner_is_eligible_and_only_reports_where_it_is_not() {
+        let b = breaches(500.0, &rows(&[("single note", 615.3)]));
+        assert!(!passes_when_eligible(true, true, &b));
+        assert!(passes_when_eligible(true, false, &b));
+        assert!(report_only(true, false));
+        assert!(!report_only(true, true));
+        assert!(!report_only(false, false));
+        // No breach passes either way; the eligible runner with a breach still fails.
+        assert!(passes_when_eligible(true, true, &[]));
     }
 }

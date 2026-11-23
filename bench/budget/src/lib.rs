@@ -5760,6 +5760,11 @@ mod tests {
         ("p1-switcher", "p1-switcher", "NFR-PRF-06"),
     ];
 
+    /// The P1 jobs whose bin prints REPORT-ONLY and exits 0 on a runner that is not gate
+    /// eligible (task #165, ruled in #166). Their job name must say so and name the
+    /// reference machine; every other P1 job's name must not claim it.
+    const P1_REPORT_ONLY_ON_HOSTED: &[&str] = &["FR-VLT-04"];
+
     /// Whether workflow `text` has a job `job` that really gates on `bin`: a run line
     /// invoking `--bin <bin> ` with `--assert` before any `#`, no `||` on that line (it
     /// would swallow the exit code), and no `continue-on-error:` anywhere in the job.
@@ -5801,6 +5806,31 @@ mod tests {
                 "{requirement}: job {job} has no un-swallowed run line invoking `--bin {bin}` with --assert (NFR-PRF-08)"
             );
         }
+    }
+
+    #[test]
+    fn a_p1_job_says_report_only_in_its_name_exactly_when_its_bin_does() {
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let mut report_only = 0;
+        for (job, _bin, requirement) in P1_GATED {
+            let name = workflow_job_name(&workflow_job(&text, job));
+            let declared = P1_REPORT_ONLY_ON_HOSTED.contains(requirement);
+            assert_eq!(
+                name.contains("report-only"),
+                declared,
+                "{requirement}: job name {name:?} and P1_REPORT_ONLY_ON_HOSTED disagree (task #166)"
+            );
+            if declared {
+                report_only += 1;
+                assert!(
+                    name.contains("reference machine"),
+                    "{requirement}: a report-only job must name where it is asserted: {name:?}"
+                );
+            }
+        }
+        assert!(report_only >= 1, "no P1 job is report-only: vacuous");
     }
 
     #[test]
