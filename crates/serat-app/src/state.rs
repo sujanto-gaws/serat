@@ -4084,6 +4084,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Task #68 with #141: a reloaded webview joins the tree session, its first-screen mark is
+    // accepted for the new channel, and the cold-start trace keeps the first channel's figure.
+    #[test]
+    fn a_second_open_tree_replays_and_its_mark_does_not_move_the_cold_start_trace() {
+        let dir = fixture("tree-reload");
+        let state = gateless(&dir);
+        let first = MarkTreeArgs {
+            mark: crate::ipc::TreeMark::FirstScreen,
+            entries_in_model: 0,
+        };
+        state.startup.mark_window_created();
+        state
+            .startup
+            .mark_first_paint(42.0, 20.0)
+            .expect("valid paint evidence");
+        state.startup.mark_index_settled();
+        state.startup.mark_watcher(WatcherOutcome::Registered);
+        state.startup.mark_buffer_rendered();
+
+        let (send, log) = collecting_sender();
+        state.open_tree(send).expect("open_tree");
+        wait_until("WalkSettled", || settled(&log));
+        state.mark_tree(&first);
+        let cold_start = state
+            .startup
+            .trace()
+            .expect("complete")
+            .t0_to_tree_first_screen_ms;
+
+        // The webview reloads: a second channel for the same vault.
+        std::thread::sleep(Duration::from_millis(20));
+        let (send, reloaded) = collecting_sender();
+        state.open_tree(send).expect("reload");
+        wait_until("the replayed WalkSettled", || settled(&reloaded));
+        assert_eq!(
+            log.lock().expect("log").len(),
+            reloaded.lock().expect("log").len(),
+            "the replay is the same stream, not a second walk's"
+        );
+        state.mark_tree(&first);
+        assert!(
+            state.tree_marks().expect("marks").first_screen_ms.is_some(),
+            "the first_screen mark after a replay is accepted"
+        );
+        let after = state
+            .startup
+            .trace()
+            .expect("complete")
+            .t0_to_tree_first_screen_ms;
+        assert!(
+            (after - cold_start).abs() < f64::EPSILON,
+            "the replayed mark moved the cold-start term: {cold_start} -> {after}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_patch_save_is_submitted_to_the_index_like_any_other_write() {
         let dir = fixture("save-patch");
