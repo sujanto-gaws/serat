@@ -1907,6 +1907,11 @@ pub fn job_exit(budget: &Budget, result: Result<Outcome, String>) -> std::proces
             }
         }
         Err(e) => {
+            // Task #164: an unbuilt application is its own exit code and prints
+            // no verdict-shaped line (nothing was measured).
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
+            }
             eprintln!("FAIL  {} · {}\n  {e}", budget.requirement, budget.id);
             std::process::ExitCode::FAILURE
         }
@@ -1954,18 +1959,14 @@ pub fn cold_start_job(args: &[String]) -> std::process::ExitCode {
 pub fn cold_start_job_with<R, S>(args: &[String], reported: R, scale: S) -> std::process::ExitCode
 where
     R: FnOnce(&[String]) -> std::process::ExitCode,
-    S: FnOnce(usize) -> bool,
+    S: FnOnce(usize) -> std::process::ExitCode,
 {
     let skip_scale = args.iter().any(|a| a == "--skip-scale");
     let reported = reported(args);
     if reported != std::process::ExitCode::SUCCESS || skip_scale {
         return reported;
     }
-    if scale(PRF01_WINDOW_VISIBLE.iterations) {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    }
+    scale(PRF01_WINDOW_VISIBLE.iterations)
 }
 
 /// **The one place a measured outcome becomes a build result.**
@@ -2144,6 +2145,9 @@ where
     let (a, b) = match measure(&vault, parsed.iterations) {
         Ok(pair) => pair,
         Err(e) => {
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
+            }
             eprintln!(
                 "FAIL  {} · {} and {}\n  {e}",
                 first.requirement, first.id, second.id
@@ -2767,8 +2771,9 @@ where
 
 /// Architecture §3.4's load-bearing claim, measured and judged.
 ///
-/// Returns whether it held, having printed the verdict either way.
-pub fn run_scale_check(iterations: usize) -> bool {
+/// Returns SUCCESS if it held (having printed the verdict either way), FAILURE if it
+/// did not, or `EXIT_APP_ABSENT` if the application is not built (no verdict printed).
+pub fn run_scale_check(iterations: usize) -> std::process::ExitCode {
     // F-401: this check calls `cold_start_once` directly, spawn by spawn,
     // interleaved across both vaults (the doc comment on `cold_start_once`
     // explains why) -- so no single call is "the batch" the way it is inside
@@ -2813,11 +2818,15 @@ pub fn run_scale_check(iterations: usize) -> bool {
     match verdict {
         Ok(line) => {
             println!("{line}");
-            true
+            std::process::ExitCode::SUCCESS
         }
         Err(e) => {
+            // An unbuilt application passes through as its own exit code (3).
+            if let Some(code) = subject::absent_app_exit(&e) {
+                return code;
+            }
             println!("FAIL  NFR-PRF-01 · scale independence\n  {e}");
-            false
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -3284,6 +3293,112 @@ mod tests {
     }
 
     #[test]
+    fn the_app_driving_jobs_build_or_fetch_the_binary_before_they_measure() {
+        // Task #164 (NFR-PRF-01, NFR-PRF-03, NFR-PRF-08, C-06): runs 279-316 failed
+        // three jobs with "no application to start" because nothing built
+        // target/release/serat.exe. Pin the wiring: each job that drives the app
+        // needs `build-app`, downloads its artifact BEFORE the measure step, and
+        // build-app builds `-p serat-app` (never --workspace: test-hooks).
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let job_text = |id: &str| -> String {
+            let start = text
+                .find(&format!("\n  {id}:\n"))
+                .unwrap_or_else(|| panic!("job {id} missing from budgets.yml"));
+            let rest = &text[start + 1..];
+            let end = rest
+                .match_indices("\n  ")
+                .find(|(i, _)| {
+                    rest[i + 3..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic())
+                })
+                .map_or(rest.len(), |(i, _)| i);
+            rest[..end].to_string()
+        };
+        // A skipped required check counts as passing under branch protection, so a
+        // failed build-app (which skips the three) must still turn the PR red: the
+        // `budgets-gate` job runs always and fails unless every gating job succeeded.
+        let gate = job_text("budgets-gate");
+        assert!(gate.contains("if: always()"), "{gate}");
+        for job in [
+            "serat-app-release-guard",
+            "vault",
+            "build-app",
+            "prf04-full-rebuild",
+            "prf03-save-to-index",
+            "prf01-cold-start",
+            "prf01-serat-term",
+            "p1-read-paths",
+            "p1-tree-path",
+            "p1-external-change",
+            "p1-switcher",
+            "every-budget-has-a-job",
+        ] {
+            assert!(
+                gate.contains(&format!("needs.{job}.result")),
+                "budgets-gate does not check {job}"
+            );
+            assert!(gate.contains(job), "budgets-gate does not need {job}");
+        }
+        let build = job_text("build-app");
+        assert!(
+            build.contains("cargo build --release -p serat-app"),
+            "{build}"
+        );
+        assert!(!build.contains("--workspace"), "{build}");
+        assert!(!build.contains("--features"), "{build}");
+        for (job, bin) in [
+            ("prf03-save-to-index", "prf03-save-to-index"),
+            ("prf01-cold-start", "prf01-cold-start"),
+            ("prf01-serat-term", "prf01-serat-term"),
+        ] {
+            let body = job_text(job);
+            assert!(body.contains("build-app"), "{job} does not need build-app");
+            let download = body
+                .find("download-artifact")
+                .unwrap_or_else(|| panic!("{job} never downloads the app binary"));
+            let measure = body
+                .find(&format!("--bin {bin} "))
+                .unwrap_or_else(|| panic!("{job} does not run {bin}"));
+            assert!(
+                download < measure,
+                "{job} measures before it has the binary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_application_exits_with_its_own_code_through_every_job_shape() {
+        // Task #164, NFR-PRF-08: an unbuilt app is neither a pass nor a breach.
+        use std::process::ExitCode;
+        let absent = format!("{}looked for target/release/serat", subject::APP_ABSENT_TAG);
+        let want = ExitCode::from(subject::EXIT_APP_ABSENT);
+        assert_eq!(
+            job_exit(&PRF03_SAVE_TO_INDEX, Err(absent.clone())),
+            want,
+            "run_job's path (prf03, prf01-serat-term)"
+        );
+        assert_eq!(
+            job_exit(&PRF03_SAVE_TO_INDEX, Err("spawning x: denied".into())),
+            ExitCode::FAILURE,
+            "any other measurement error stays 1"
+        );
+        let a = absent.clone();
+        let code = cold_start_job_with(
+            &[],
+            |_| job_exit(&PRF01_SERAT_TERM, Err(a)),
+            |_| panic!("the scale check must not run when the app is absent"),
+        );
+        assert_eq!(code, want, "the cold-start composition keeps the code");
+        // And the scale check's own absent code is not flattened to 1.
+        let code = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| want);
+        assert_eq!(code, want, "a scale check that finds no app exits 3, not 1");
+    }
+
+    #[test]
     fn the_cold_start_job_runs_the_scale_check_and_fails_when_it_fails() {
         // **Task #124, F-501: F-81 reopened one level further out.** Deleting
         // `run_scale_check` from the binary's `main` left every test green,
@@ -3304,7 +3419,7 @@ mod tests {
                     iterations, PRF01_WINDOW_VISIBLE.iterations,
                     "the scale check must run the same number of pairs the budget names"
                 );
-                false
+                ExitCode::FAILURE
             },
         );
         assert!(
@@ -3318,7 +3433,7 @@ mod tests {
         );
 
         // 2. And its success is the job's success.
-        let ok = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| true);
+        let ok = cold_start_job_with(&[], |_| ExitCode::SUCCESS, |_| ExitCode::SUCCESS);
         assert_eq!(ok, ExitCode::SUCCESS);
 
         // 3. `--skip-scale` skips it, which is what makes that flag honest --
@@ -3329,7 +3444,7 @@ mod tests {
             |_| ExitCode::SUCCESS,
             |_| {
                 skipped.set(true);
-                false
+                ExitCode::FAILURE
             },
         );
         assert!(!skipped.get(), "--skip-scale must not run the scale check");
@@ -3344,7 +3459,7 @@ mod tests {
             |_| ExitCode::FAILURE,
             |_| {
                 reached.set(true);
-                true
+                ExitCode::SUCCESS
             },
         );
         assert!(
