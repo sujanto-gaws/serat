@@ -100,7 +100,7 @@ export interface RevealScan {
    * (`widget: true`, the span includes the space after the mark); on a revealed line, and for every ordered
    * numeral, the raw marker stays and takes the class (`serat-bullet` / `serat-list-number`). `indent` is
    * the whitespace before the marker, hidden so it does not double the hanging padding. */
-  listMarks: Array<Span & { ordered: boolean; widget: boolean; indent: Span | null }>;
+  listMarks: Array<Span & { ordered: boolean; widget: boolean; revealed: boolean; indent: Span | null }>;
   /** Line classes by line start offset (one `Decoration.line` per line): headings, quotes, code, list
    * items, rules and the YAML properties block. */
   lines: Map<number, string>;
@@ -110,14 +110,15 @@ export interface RevealScan {
  * attribute under the app's CSP, so the depth is a class). */
 export const MAX_LIST_DEPTH = 8;
 
-/** The last line of a leading `---` YAML properties block, or 0 when the note has none. Bounded: a
- * note that opens with a rule and never closes it is scanned for 200 lines at most. */
+/** The last line of a leading `---` YAML properties block, or 0 when the note has none. The rule is the
+ * index's (crates/serat-parse/src/frontmatter.rs): the opener and the closer are exactly `---` (CodeMirror
+ * has already split off any `\r`), and there is no `...` closer. Bounded: a note that opens with a rule and
+ * never closes it is scanned for 200 lines at most. */
 export function frontmatterEndLine(doc: Text): number {
-  if (doc.lines < 2 || doc.line(1).text.trimEnd() !== "---") return 0;
+  if (doc.lines < 2 || doc.line(1).text !== "---") return 0;
   const last = Math.min(doc.lines, 200);
   for (let n = 2; n <= last; n++) {
-    const text = doc.line(n).text.trimEnd();
-    if (text === "---" || text === "...") return n;
+    if (doc.line(n).text === "---") return n;
   }
   return 0;
 }
@@ -154,7 +155,8 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
       enter: (node) => {
         const name = node.type.name;
         const level = /^(?:ATX|Setext)Heading([1-6])$/.exec(name);
-        if (level) classLines(node.from, node.to, from, to, `serat-h${level[1]}`);
+        // First line only: a Setext underline (`====`, `----`) is the heading's marker, not a second heading line.
+        if (level) classLines(node.from, node.from, from, to, `serat-h${level[1]}`);
         else if (name === "Blockquote") classLines(node.from, node.to, from, to, "serat-quote");
         else if (name === "FencedCode" || name === "CodeBlock") classLines(node.from, node.to, from, to, "serat-code-line");
         else if (name === "HorizontalRule") classLines(node.from, node.to, from, to, "serat-hr");
@@ -167,19 +169,21 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
           const revealed = selectedLines.has(line.number);
           const lead = state.sliceDoc(line.from, node.from);
           const indent = lead.length > 0 && /^[ \t]+$/.test(lead) ? { from: line.from, to: node.from } : null;
-          const spaced = state.sliceDoc(node.to, node.to + 1) === " ";
+          const spaced = /[ \t]/.test(state.sliceDoc(node.to, node.to + 1));
           listMarks.push({
             from: node.from,
             to: spaced ? node.to + 1 : node.to,
             ordered,
             widget: !ordered && !revealed,
+            revealed,
             indent,
           });
           return;
         }
         const isCustom = SERAT_REVEALABLE_NODE_TYPES.has(name);
         // The `(url)` of `[text](url)` is syntax too: it shows only on a revealed line (editor.md, Inline).
-        const isLinkUrl = name === "URL" && node.node.parent?.name === "Link";
+        const linkParent = node.node.parent?.name === "Link" || node.node.parent?.name === "Image";
+        const isLinkUrl = (name === "URL" || name === "LinkTitle") && linkParent;
         const isStandard = isStandardMarkNode(name) || isLinkUrl;
         if (!isCustom && !isStandard) {
           return;
@@ -199,11 +203,17 @@ export function scanReveal(state: EditorState, ranges: readonly Span[], selected
             // The space after `#` / `>` is part of the marker as far as the reader goes: left behind it
             // would indent the first word by a space's width.
             let end = node.to;
+            let start = node.from;
+            // A title's leading space goes with it: `[a](u "t")` must not leave a stray space behind the text.
+            if (name === "LinkTitle") {
+              const before = node.node.prevSibling;
+              if (before && before.to < node.from && /^\s+$/.test(state.sliceDoc(before.to, node.from))) start = before.to;
+            }
             if (name === "HeaderMark" || name === "QuoteMark") {
               const lineEnd = doc.lineAt(node.to).to;
               while (end < lineEnd && /[ \t]/.test(state.sliceDoc(end, end + 1))) end++;
             }
-            hidden.push({ from: node.from, to: end });
+            hidden.push({ from: start, to: end });
           }
         } else {
           const text = state.sliceDoc(node.from, node.to);
@@ -293,7 +303,7 @@ function buildDecorations(view: EditorView): DecorationSet {
   for (const mark of scan.listMarks) {
     if (mark.widget) decorations.push(bulletWidgetDeco.range(mark.from, mark.to));
     else decorations.push((mark.ordered ? numberDeco : bulletDeco).range(mark.from, mark.to));
-    if (mark.indent) decorations.push((mark.widget || mark.ordered ? hideDeco : indentRawDeco).range(mark.indent.from, mark.indent.to));
+    if (mark.indent) decorations.push((mark.revealed ? indentRawDeco : hideDeco).range(mark.indent.from, mark.indent.to));
   }
   return Decoration.set(decorations, true);
 }
@@ -307,7 +317,14 @@ export const revealMarkersPlugin = ViewPlugin.fromClass(
       this.decorations = buildDecorations(view);
     }
     update(update: ViewUpdate): void {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
+      // A background parse that advances the tree changes what the headings, quotes and code lines are, with no
+      // doc, selection or viewport change to say so (the end-of-document case, architecture.md section 9.3).
+      if (
+        update.docChanged ||
+        update.selectionSet ||
+        update.viewportChanged ||
+        syntaxTree(update.startState) !== syntaxTree(update.state)
+      ) {
         this.decorations = buildDecorations(update.view);
       }
     }

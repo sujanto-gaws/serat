@@ -6,12 +6,13 @@
 import { mount } from "@vue/test-utils";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { forceParsing, syntaxTree } from "@codemirror/language";
 import { highlightingFor } from "@codemirror/language";
 import { describe, expect, it, vi } from "vitest";
 
 import CodeMirrorEditor from "@/editor/CodeMirrorEditor.vue";
 import { seratMarkdown } from "@/editor/markdownLanguage";
-import { frontmatterEndLine, scanReveal, selectedLineNumbers } from "@/editor/reveal";
+import { frontmatterEndLine, revealMarkersPlugin, scanReveal, selectedLineNumbers } from "@/editor/reveal";
 import { seratTags } from "@/editor/mdExtensions";
 import { seratHighlightStyle, typographyExtensions } from "@/editor/typography";
 import { readFileSync } from "node:fs";
@@ -217,5 +218,67 @@ describe("the mounted editor", () => {
     expect(editor.classList.contains("serat-live")).toBe(true);
     expect(editor.classList.contains("serat-source")).toBe(false);
     wrapper.unmount();
+  });
+});
+
+describe("reveal plugin and the parser", () => {
+  it("restyles when a background parse advances the tree, with no doc, selection or viewport change", () => {
+    const doc = "word ".repeat(40).trimEnd() + "\n\n";
+    const big = doc.repeat(6000) + "# Late heading\n";
+    const view = new EditorView({
+      parent: document.body,
+      state: EditorState.create({ doc: big, selection: { anchor: big.length - 3 }, extensions: [seratMarkdown(), revealMarkersPlugin] }),
+    });
+    view.dispatch({ selection: { anchor: big.length - 3 }, effects: EditorView.scrollIntoView(big.length - 3) });
+    const heading = () => view.dom.querySelector(".cm-line.serat-h1");
+    if (heading()) return view.destroy(); // jsdom parsed it all in the first slice: nothing to advance
+    expect(syntaxTree(view.state).length).toBeLessThan(big.length);
+    forceParsing(view, big.length, 10_000);
+    view.dispatch({}); // let the plugin see the new tree
+    expect(heading()).not.toBeNull();
+    view.destroy();
+  });
+});
+
+describe("markdown corner cases in the reveal scan", () => {
+  const scanDoc = (doc: string, anchor = doc.length) => {
+    const st = EditorState.create({ doc, selection: { anchor }, extensions: [seratMarkdown()] });
+    return { st, scan: scanReveal(st, [{ from: 0, to: st.doc.length }], selectedLineNumbers(st.doc, [{ from: anchor, to: anchor }])) };
+  };
+
+  it("a Setext heading gives its first line the heading class and its underline none", () => {
+    const { st, scan } = scanDoc("Title\n=====\n\nbody", 15);
+    expect(scan.lines.get(st.doc.line(1).from)).toBe("serat-h1");
+    expect(scan.lines.has(st.doc.line(2).from)).toBe(false);
+  });
+
+  it("frontmatter follows the index's rule: a --- pair is a block, a ... closer is not", () => {
+    expect(frontmatterEndLine(EditorState.create({ doc: "---\n---\nbody" }).doc)).toBe(2); // an empty block, as comrak and Obsidian read it
+    expect(frontmatterEndLine(EditorState.create({ doc: "---\na: 1\n...\nbody" }).doc)).toBe(0);
+    expect(frontmatterEndLine(EditorState.create({ doc: "--- \na: 1\n---\n" }).doc)).toBe(0); // the opener is exactly ---
+  });
+
+  it("the (url) and the title of a link, and the url of an image, hide off the selected line", () => {
+    const doc = 'a [t](u.md "ti") and ![img](p.png) end';
+    const { st, scan } = scanDoc(doc + "\n\nx", doc.length + 2);
+    const hiddenText = scan.hidden.map((s) => st.sliceDoc(s.from, s.to)).join("|");
+    expect(hiddenText).toContain("u.md");
+    expect(hiddenText).toContain(' "ti"'); // with its leading space
+    expect(hiddenText).toContain("p.png");
+    const shown = scanDoc(doc, 3).scan.hidden;
+    expect(shown.length).toBe(0); // revealed: nothing hidden
+  });
+
+  it("a bullet followed by a tab is still a glyph widget", () => {
+    const { scan } = scanDoc("-\titem\n\nx", 9);
+    expect(scan.listMarks[0].to - scan.listMarks[0].from).toBe(2);
+  });
+
+  it("a revealed nested ordered item keeps its indent in the layout class instead of replacing it", () => {
+    const doc = "1. a\n   1. b\n";
+    const on = scanDoc(doc, doc.indexOf("b")).scan.listMarks.find((m) => m.indent)!;
+    expect(on.revealed).toBe(true);
+    const off = scanDoc(doc + "\nz", doc.length + 1).scan.listMarks.find((m) => m.indent)!;
+    expect(off.revealed).toBe(false);
   });
 });
