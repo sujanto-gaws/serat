@@ -10,7 +10,9 @@ serves: NFR-PRF-08, NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, US-35, C-06
 
 NFR-PRF-08: *"Every performance budget shall be asserted in continuous integration; a regression shall fail the build."* This is how. One job per budget, each measured against the benchmark vault, each recording the conditions the number was taken under.
 
-**The harness is red today, deliberately.** `serat-index` has no rebuild entry point (task I4), no incremental save path (I5), and there is no application to start (D2, S1). Every job fails with a message naming the task that unblocks it. A budget job that *skips* when its subject is missing is worse than no job: the build goes green and the budget silently stops being asserted.
+**A budget that cannot be measured fails; it never skips.** A budget job that skips when its subject is missing is worse than no job: the build goes green and the budget silently stops being asserted.
+
+**Prerequisite for the three app-driving jobs (`prf01-serat-term`, `prf01-cold-start`, `prf03-save-to-index`, plus `prf01-cold-start-terms` locally):** the release application, built first with `cargo build --release -p serat-app` (per package, never `--workspace`: no `test-hooks`, ADR-0011). `cargo run -p budget` builds the harness only; it does not build the app. The bins look for `target/release/serat` (`serat.exe` on Windows) beside the workspace, or `$SERAT_BIN`. If it is absent the bin exits with code **3** (`EXIT_APP_ABSENT`) and one line, `budget: serat-app binary absent: looked for <path>; build it first ...`, and prints no verdict line. Exit 1 remains "breached, undecided, or a measurement failed after it started". In CI the `build-app` job builds it once and the three jobs download it into `target/release/` (task #164); on a reference machine build it before the run. A `budgets-gate` job (`if: always()`) is red unless every gating job succeeded, because a job skipped after `build-app` fails would otherwise count as a passing required check. Under a custom `CARGO_TARGET_DIR` set `SERAT_BIN`. On a headless Linux box the app needs a display (`xvfb-run`); Windows runners do not.
 
 ## Running one
 
