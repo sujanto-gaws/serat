@@ -320,6 +320,49 @@ describe("rebuild reason copy (P1 #158)", () => {
     store.applyIndexStatus({ state: rebuilding("corrupt", 0), index_check_problems: 2 }, "event");
     expect(store.indexAnnouncement).toBe(INDEX_CHECK_ANNOUNCEMENT);
     store.applyIndexStatus({ state: { kind: "ready", note_count: 1 } }, "event");
-    expect(store.indexAnnouncement).toBe("index: ready · 1 notes");
+    expect(store.indexAnnouncement).toBe("index: ready · 1 note");
+  });
+});
+
+describe("index session reset (P1 #158 review)", () => {
+  const rebuilding = { kind: "rebuilding", reason: "no_index", done: 0, total: 3, walk_complete: false } as const;
+  const OPENED = { root: "/a", vault_id: "A", index: { kind: "opening" } } as never;
+
+  it("a failed open then a same-id reopen: Rebuilding is announced once, as an entry", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.setIndexState(rebuilding);
+    store.openFailed();
+    store.vaultOpened(OPENED);
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState(rebuilding);
+    expect(store.indexAnnouncement).toBe(describeRebuildAnnouncement("no_index"));
+    store.indexAnnouncement = "sentinel";
+    store.setIndexState({ ...rebuilding, done: 2 });
+    expect(store.indexAnnouncement).toBe("sentinel"); // progress silent
+  });
+
+  it("a failed open then a Ready alone is silent (no announced Rebuilding ended)", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.setIndexState(rebuilding);
+    store.openFailed();
+    store.vaultOpened(OPENED);
+    store.indexAnnouncement = "";
+    store.setIndexState({ kind: "ready", note_count: 2 });
+    expect(store.indexAnnouncement).toBe("");
+  });
+
+  it("every open, same id or not, starts a new session", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened(OPENED);
+    store.applyIndexStatus({ state: rebuilding, index_check_problems: 1 }, "event");
+    store.vaultOpened(OPENED);
+    expect(store.indexCheckProblems).toBeNull();
+    store.setIndexState({ kind: "ready", note_count: 2 });
+    expect(store.indexAnnouncement).not.toBe("index: ready · 2 notes");
   });
 });

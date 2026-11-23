@@ -63,7 +63,7 @@ export function describeIndexState(state: IndexState): string {
     case "opening":
       return openingCopy(state)?.text ?? "Opening index…";
     case "ready":
-      return `index: ready · ${state.note_count} notes`;
+      return `index: ready · ${state.note_count} ${state.note_count === 1 ? "note" : "notes"}`;
     case "rebuilding":
       return `${describeRebuildReason(state.reason)} — search and queries are incomplete until this finishes · ${
         state.walk_complete ? `${state.done}/${state.total}` : `${state.done}`
@@ -200,13 +200,8 @@ export const useVaultStore = defineStore("vault", {
     vaultOpened(opened: VaultOpened) {
       this.announced = true; // from now on, no poll may set the id, even after a failed open
       if (!opened.vault_id) return; // never adopt an empty id
-      if (opened.vault_id !== this.vaultId) {
-        this.refusedNames = null; // another vault: the old count is not its count
-        this.indexCheckProblems = null; // nor its check fact
-        this.indexRebuildAnnounced = false;
-        this.indexLastKind = "";
-        this.indexLastReason = "";
-      }
+      if (opened.vault_id !== this.vaultId) this.refusedNames = null; // another vault: the old count is not its count
+      this.resetIndexSession(); // every open is a new session: its Rebuilding is an entry, its Ready is not an ending
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
@@ -229,10 +224,17 @@ export const useVaultStore = defineStore("vault", {
     openFailed() {
       this.vaultOpen = false;
       this.refusedNames = null; // no vault, nothing to count
-      this.indexCheckProblems = null;
+      this.resetIndexSession();
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
+    },
+    /** What the strip remembers about one index session: the check fact and what has been announced. */
+    resetIndexSession() {
+      this.indexCheckProblems = null;
+      this.indexRebuildAnnounced = false;
+      this.indexLastKind = "";
+      this.indexLastReason = "";
     },
     /** True when an `index_status` answer/event belongs to the current vault: never while no vault is open
      * (after a failed open, even for the announced id), never an empty id (a poll computed between a close
