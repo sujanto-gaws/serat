@@ -29,7 +29,7 @@ import { installNativeMenuPolicy } from "@/nativeMenu";
 import { describeCreateError, noteFileName, type CreateRequest } from "@/tree/createEntry";
 import { childPath } from "@/tree/treeModel";
 import { hydrateBuffer, schedulePaintMark } from "@/startup";
-import { useVaultStore } from "@/stores/vault";
+import { describeIndexCheckDetail, INDEX_CHECK_TEXT, useVaultStore } from "@/stores/vault";
 import { CommandRegistry, COMMANDS_KEY } from "@/editor/commands";
 import RefusedNames from "@/refused/RefusedNames.vue";
 import { registerTreeInsertLink, TREE_INSERT_LINK_ID } from "@/tree/insertLinkCommand";
@@ -653,6 +653,17 @@ function onSaveOutcome(outcome: SaveOutcome): void {
       >{{ store.indexStatusText }}</span
     >
     <span v-if="store.indexStatusDetail !== null" id="index-state-detail" class="sr-only">{{ store.indexStatusDetail }}</span>
+    <!-- #157: one quiet fact beside the Rebuilding text; no number in the text, the count is in the description. -->
+    <template v-if="store.indexCheckProblems !== null">
+      <span
+        class="index-check"
+        :title="describeIndexCheckDetail(store.indexCheckProblems)"
+        aria-describedby="index-check-detail"
+        data-testid="index-check-problems"
+        >{{ INDEX_CHECK_TEXT }}</span
+      >
+      <span id="index-check-detail" class="sr-only">{{ describeIndexCheckDetail(store.indexCheckProblems) }}</span>
+    </template>
     <!-- One-shot snapshot on entering and on leaving the waiting state (index-state-copy.md: announced once). -->
     <span class="sr-only" role="status" aria-live="polite" data-testid="index-live">{{ store.indexAnnouncement }}</span>
     <RefusedNames ref="refusedRef" :count="store.refusedNames" @focus-fallback="focusAfterRefused" />

@@ -32,6 +32,15 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 
 **Announcement.** The strip's live region announces each waiting state once, politely, when it is entered. It also announces the following `Rebuilding`, `Ready` or `Unavailable` as usual. It does not re-announce while a state holds, and it does not announce the plain `Opening` that follows a cleared reason: that state lasts only until the open check's first state and would be noise.
 
+## Index check found problems (ratified, #157)
+
+`IndexStatus.index_check_problems` is present only while a rebuild that the post-unclean-open integrity check started (#69, reason `corrupt`) is running, and is never zero. The strip shows **one quiet fact beside the `Rebuilding` text** while it is present and removes it when the field goes absent.
+
+- **Visible text** (no number, no second "rebuilding": the `Rebuilding` line beside it already says so): `Index check found problems`
+- **Tooltip / accessible description** (the count appears only here; `problem` when N is 1): `When Serat last closed unexpectedly, its check of the search index found N problems, so it is rebuilding the index from your notes. Your notes are not affected. You can keep editing.`
+- **Announcement:** once, politely, in the same update that moves the strip to `Rebuilding`, as **one** utterance that replaces the `Rebuilding` announcement that update would otherwise queue: `Index check found problems. Rebuilding the index from your notes. You can keep editing.` Not repeated on progress events; nothing when the fact clears; the `Ready` or `Unavailable` that ends the rebuild is announced once, with its visible text.
+- Neutral colour (`text-secondary`), no icon alarm, no modal, no action: the rebuild is already running and there is nothing for the user to do.
+
 ## What the front end must not do
 
 - Treat an unknown `reason` as an error. `OpeningReason` may gain members. Render an unknown reason as the plain `Opening index…`.
@@ -44,3 +53,4 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 - An `IndexState` with an unrecognised `reason` string renders as the plain opening text and does not throw.
 - The transition from the waiting state to `Rebuilding` replaces the text without a modal or a layout shift.
 - `describeIndexState({ kind: "opening", reason: "index_held_by_another_process" })` returns text different from both other opening states, and names neither an internal term nor a number.
+- `index_check_problems` present renders `Index check found problems` beside the `Rebuilding` text, with no digit and no second "rebuilding", and the count only in the tooltip; absent (or 0) renders nothing (#157). The update that brings the fact makes exactly one live-region announcement.

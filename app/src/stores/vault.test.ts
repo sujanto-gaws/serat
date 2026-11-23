@@ -4,7 +4,14 @@ import { createPinia, setActivePinia } from "pinia";
 
 import type { IndexState } from "@/ipc/generated/IndexState";
 
-import { describeIndexDetail, describeIndexState, useVaultStore } from "./vault";
+import {
+  describeIndexCheckDetail,
+  describeIndexDetail,
+  describeIndexState,
+  INDEX_CHECK_ANNOUNCEMENT,
+  INDEX_CHECK_TEXT,
+  useVaultStore,
+} from "./vault";
 
 // Serves NFR-REL-01, NFR-REL-02, FR-VLT-04, US-01, US-07.
 // Exhaustive over IndexState's four variants (contracts/ipc.rs). §3.4: every one of
@@ -143,5 +150,96 @@ describe("opening reason: index held by another process (P1 #155)", () => {
     expect(store.indexAnnouncement).toContain("Rebuilding index");
     store.setIndexState({ kind: "ready", note_count: 2 });
     expect(store.indexAnnouncement).toBe("");
+  });
+});
+
+describe("index check found problems (P1 #157)", () => {
+  const rebuilding = (done: number) =>
+    ({ kind: "rebuilding", reason: "corrupt", done, total: 10, walk_complete: false }) as const;
+
+  it("the visible text has no digit; the count is only in the description", () => {
+    expect(INDEX_CHECK_TEXT).toBe("Index check found problems");
+    expect(INDEX_CHECK_TEXT).not.toMatch(/rebuilding/i); // the Rebuilding line beside it says so
+    expect(INDEX_CHECK_TEXT).not.toMatch(/\d/);
+    expect(describeIndexCheckDetail(3)).toContain("found 3 problems, so it is rebuilding the index from your notes");
+    expect(describeIndexCheckDetail(3)).toContain("When Serat last closed unexpectedly");
+    expect(describeIndexCheckDetail(1)).toContain("1 problem,");
+  });
+
+  it("shows while the field is present, announces once, and clears when it goes absent", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: rebuilding(0), index_check_problems: 2 }, "event");
+    expect(store.indexCheckProblems).toBe(2);
+    expect(store.indexAnnouncement).toBe(INDEX_CHECK_ANNOUNCEMENT);
+    for (let done = 1; done < 5; done++) {
+      store.applyIndexStatus({ state: rebuilding(done), index_check_problems: 2 }, "event");
+    }
+    expect(store.indexAnnouncement).toBe(INDEX_CHECK_ANNOUNCEMENT); // held, not re-announced
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+  });
+
+  it("the Unavailable that follows clears the fact and does not repeat its announcement", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: rebuilding(0), index_check_problems: 2 }, "event");
+    store.applyIndexStatus({ state: { kind: "unavailable", message: "x", path: "/p" } }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+    expect(store.indexStatusText).toBe("index: unavailable — x");
+    expect(store.indexAnnouncement).toBe("index: unavailable — x"); // announced once, visible text
+  });
+
+  it("a status without the field, or with 0, shows nothing", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: rebuilding(0) }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+    store.applyIndexStatus({ state: rebuilding(1), index_check_problems: 0 }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+    expect(store.indexAnnouncement).toBe("");
+  });
+
+  it("the late-subscriber poll supplies it too, until an event has spoken", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: rebuilding(0), index_check_problems: 1 }, "poll");
+    expect(store.indexCheckProblems).toBe(1);
+  });
+});
+
+describe("index check fact: scope and ending (P1 #157 review)", () => {
+  it("another vault's open clears the previous vault's fact", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.vaultOpened({ root: "/a", vault_id: "A", index: { kind: "opening" } } as never);
+    store.applyIndexStatus(
+      { state: { kind: "rebuilding", reason: "corrupt", done: 0, total: 1, walk_complete: false }, index_check_problems: 2 },
+      "event",
+    );
+    expect(store.indexCheckProblems).toBe(2);
+    store.vaultOpened({ root: "/b", vault_id: "B", index: { kind: "opening" } } as never);
+    expect(store.indexCheckProblems).toBeNull();
+  });
+
+  it("the fact is rendered and announced only beside Rebuilding", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 1 }, index_check_problems: 4 }, "event");
+    expect(store.indexCheckProblems).toBeNull();
+    expect(store.indexAnnouncement).toBe("");
+  });
+
+  it("the Ready that ends the rebuild is announced once, with its visible text, then nothing more", () => {
+    setActivePinia(createPinia());
+    const store = useVaultStore();
+    store.applyIndexStatus(
+      { state: { kind: "rebuilding", reason: "corrupt", done: 0, total: 1, walk_complete: false }, index_check_problems: 2 },
+      "event",
+    );
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
+    expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
+    store.applyIndexStatus({ state: { kind: "ready", note_count: 4 } }, "event");
+    expect(store.indexAnnouncement).toBe("index: ready · 4 notes");
   });
 });
