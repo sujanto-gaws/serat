@@ -530,6 +530,10 @@ impl TreeFeed {
     /// set once from the first channel's mark, so a later mark cannot move the trace
     /// (task #141).
     fn reattach(self: &Arc<Self>, send: &TreeSender) -> bool {
+        // Not repeated here, on purpose: `config.attach` told the application once that this
+        // vault has a tree stream (and `detach` undoes it only if a thread cannot start), and
+        // `stopped` is only ever set by an exhausted restart budget, which leaves no healthy
+        // session to join, so this path is never reached with it set.
         let session = {
             let state = self.state();
             match state.active.as_ref() {
@@ -654,6 +658,17 @@ impl TreeFeed {
             && std::ptr::eq(Arc::as_ptr(&active.session), session)
         {
             active.restarts = 0;
+        }
+    }
+
+    /// The vault is closing: end the stream. The session stops calling its sink and releases
+    /// it, the channel's sink is cancelled, and a later `open` starts afresh (task #68; this is
+    /// the call site of [`TreeSession::close`]).
+    pub fn close(&self) {
+        let active = self.state().active.take();
+        if let Some(active) = active {
+            active.cancelled.store(true, Ordering::Relaxed);
+            active.session.close();
         }
     }
 
@@ -1319,6 +1334,34 @@ mod tests {
             .collect();
         rows.sort();
         rows
+    }
+
+    // Task #68 review: `TreeFeed::close` is what `OpenVault::shut_down` calls (one line there,
+    // not separately pinned); this shows it ends the stream and a reload starts afresh.
+    #[test]
+    fn closing_the_feed_ends_the_stream_and_a_later_reload_starts_afresh() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let (feed, walks) = counting_feed(dir.path(), None);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        feed.close();
+        let before = log.lock().expect("log").len();
+        write(dir.path(), "late.md");
+        feed.path_changed(&VaultPath::new("late.md").expect("path"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            log.lock().expect("log").len(),
+            before,
+            "a closed stream kept sending"
+        );
+        assert!(feed.progress().is_none(), "a closed feed has no session");
+        // A reload after the close walks afresh rather than joining a dead session.
+        let (second, second_log) = collecting();
+        feed.open(second).expect("open again");
+        wait_for("settled", || settled(&second_log));
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
     }
 
     // Task #68. Mutant, run by hand: dropping the `reattach` call in `open` makes the second

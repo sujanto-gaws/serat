@@ -416,6 +416,8 @@ impl OpenVault {
         self.indexer.stop();
         self.catch_up.cancel();
         self.walk.stop_within(CLOSE_DEADLINE);
+        // The tree stream is over: its session releases its sink now (task #68).
+        self.tree.close();
         // The actor was never joined here, so one still inside an open or a rebuild
         // outlived its vault with nothing recording it (task #96). It is registered so
         // a re-open of this root waits for it; nothing here waits for it.
