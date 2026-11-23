@@ -116,3 +116,19 @@ describe("tokens.css agrees with tokens.json", () => {
     expect(resolved("--serat-lp-link-underline-alpha")).toBe(TOKENS["live-preview"]["link-underline-alpha"]);
   });
 });
+
+describe("the installed copies are the designer's files", () => {
+  const ui = resolve(SRC, "../../docs/03-design/ui");
+  it("styles/tokens.css is docs/03-design/ui/tokens.css, byte for byte", () => {
+    expect(CSS).toBe(readFileSync(join(ui, "tokens.css"), "utf8"));
+  });
+  it("editor/livePreview.css is live-preview.css up to the split-preview section", () => {
+    const ref = readFileSync(join(ui, "live-preview.css"), "utf8");
+    const editorPart = ref.slice(0, ref.indexOf("/* ---- Split preview and embeds")).trimEnd() + "\n";
+    expect(readFileSync(join(SRC, "editor/livePreview.css"), "utf8")).toBe(editorPart);
+  });
+  it("styles/prose.css carries the rest of live-preview.css", () => {
+    const ref = readFileSync(join(ui, "live-preview.css"), "utf8");
+    expect(readFileSync(join(SRC, "styles/prose.css"), "utf8")).toContain(ref.slice(ref.indexOf("/* ---- Split preview and embeds")));
+  });
+});

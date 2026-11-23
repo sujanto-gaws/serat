@@ -1016,7 +1016,8 @@ defineExpose({
   align-items: center;
   padding: 4px 10px;
   border: 1px solid var(--serat-border-hairline, #ddd);
-  background: var(--serat-surface-raised, #fff);
+  background: var(--serat-surface-overlay, #fff);
+  box-shadow: var(--serat-elevation-overlay, none);
   font-size: 0.9em;
 }
 .serat-external-dot {
