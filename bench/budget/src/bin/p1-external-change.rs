@@ -348,6 +348,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     let (mut vault_name, mut singles, mut batches, mut batch_size, mut assert) =
         ("20k".to_owned(), 100usize, 20usize, 100usize, false);
     let mut settle = SETTLE;
+    let mut quiesce = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut number = |what: &str| -> Result<usize, String> {
@@ -361,6 +362,10 @@ fn run(args: &[String]) -> Result<bool, String> {
             "--single" => singles = number("--single")?,
             "--batches" => batches = number("--batches")?,
             "--batch-size" => batch_size = number("--batch-size")?,
+            // Diagnostic negative control (task #165): wait until the checkpointer has
+            // been silent for 3 s (longer than its 2 s idle spacing) before the series,
+            // so a short series with a small `--settle-ms` has no checkpoint to overlap.
+            "--quiesce-checkpointer" => quiesce = true,
             "--settle-ms" => {
                 let millis = number("--settle-ms")?;
                 if millis == 0 {
@@ -463,6 +468,20 @@ fn run(args: &[String]) -> Result<bool, String> {
     // Let the watcher settle after registration and the copy's own events.
     std::thread::sleep(Duration::from_secs(1));
     while rx.try_recv().is_ok() {}
+
+    if quiesce {
+        let mut quiet_since = Instant::now();
+        let mut seen = handle.wal_health().stats().passive_runs;
+        while quiet_since.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = handle.wal_health().stats().passive_runs;
+            if now != seen || handle.wal_health().checkpoint_in_progress() {
+                seen = now;
+                quiet_since = Instant::now();
+            }
+        }
+        while rx.try_recv().is_ok() {}
+    }
 
     let mut run = Run {
         root: &root,

@@ -21,7 +21,7 @@ FR-VLT-04 (external change visible in the index, 500 ms p95 over 100 single-note
 | 315 (`cf93c32`, job 129357719989) | 376.1 / 1261.2 ms | 173.6 ms | 6.2 / 204.9 / 1095.5 ms | 7712.2 ms | 2 cores, cpu load 6%, 0 build processes |
 | 316 (`6a608b8`, job 129359023563) FAIL | 615.3 / 792.0 ms | 172.9 ms | 9.3 / 450.5 / 626.4 ms | 7017.1 ms | 2 cores, cpu load 7%, 0 build processes |
 
-The environment line is taken before the benchmark starts; it cannot see a neighbour that starts during the 3 minutes of the run. Run 311 (`9ce1c6c`, p95 422.1 ms) is quoted from the status record; its log was not kept. The three logged runs are the same image and job; runs 315 and 316 started 3 minutes apart and 312 about 35 minutes before them. Whether `crates/` or `bench/budget` changed between `c24943a`, `cf93c32` and `6a608b8` was not diffed here.
+The environment line is taken before the benchmark starts; it cannot see a neighbour that starts during the 3 minutes of the run. Run 311 (`9ce1c6c`, p95 422.1 ms) is quoted from the status record; its log was not kept. The three logged runs are the same image and job; runs 315 and 316 started 3 minutes apart and 312 about 35 minutes before them. `git diff --stat` over `crates/` and `bench/budget` is empty for `c24943a..6a608b8`, `cf93c32..6a608b8` and `c24943a..cf93c32`: the product code and the bench were identical in all three runs, so the 376 to 615 ms movement is not a code change.
 
 ## Latency budget (architecture 3.1.2, the watcher path)
 
@@ -69,6 +69,12 @@ The earlier uncontrolled table (a foreign process at 125% CPU, p95 276-638 ms) i
 | foreign 2.01 cores | 43 of 100 | 2 | 2 | 15.9 / 9.8 ms | 13 | 1 of 2 | 16.4 / 11.8 ms |
 
 Shown: on Linux every iteration over 100 ms (3 of 3) coincided with a merge, which is what `p1-save-tail` found (45 of the 50 slowest saves); a merge costs about 3-6 ms on average; a checkpoint overlap does not predict the slow ones (1 of 3). Not shown: that either explains the Windows tail. With 43 of 100 iterations merging, a merge coincides with most slow iterations by chance as well as by cost (3 of 3 is weak evidence at this n), and the Windows 200-600 ms stalls are larger than any merge cost seen here (at most 15.9 ms mean, 260 ms max under load). The earlier claim that a merge costs "8-130 ms, not 200-600" is withdrawn: `p1-save-tail` reports 148.9 ms quiet and 257.6 ms loaded for its worst saves.
+
+### Negative control and mutant for the overlap instrument
+
+- **Control (checkpointer cannot fire).** `--quiesce-checkpointer` waits until no PASSIVE has run for 3 s (above the 2 s idle spacing), then `--single 8 --settle-ms 20` runs about 1.4 s of writes, shorter than the spacing, with commits closer together than the 250 ms idle gate. Two runs: the checkpointer line reads 0 PASSIVE runs, **checkpoint overlap 0 of 8**, while the FTS5 merge line still reports **2 of 8** iterations with a merge in both. The instrument reads 0 when there is nothing to overlap and still sees the merges.
+- **Mutant (delta dropped).** With the `passive_runs + restart_runs` delta replaced by `false`, so only the in-progress flag at the write and at the commit remains, the default series (settle 300 ms, 100 iterations, 23 PASSIVE runs each) reads **3 and 1** iterations overlapped; restored, the same command reads **12 and 12** (23 runs each). The delta is what catches a 20-100 ms checkpoint that starts and ends inside one 175 ms iteration; without it the instrument misses 75-90% of the overlaps. It is not a total zero because a checkpoint caught live at a sample instant still counts. The mutant was restored and the restored binary re-run before commit.
+- Side finding: with settle 20 ms and no quiescing, the first iteration of a short series overlapped a checkpoint twice in two runs and cost 182-190 ms processing against 8 ms; the same bench shape, a write landing on a checkpoint, is the only 100 ms-plus case a checkpoint explained in these runs.
 
 ## Candidates
 
