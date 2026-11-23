@@ -1,0 +1,378 @@
+/* Live-preview, source-mode and split-preview typography for the editor.
+ *
+ * Reference stylesheet for screens/editor.md, section "Live-preview typography".
+ * Install as app/src/editor/livePreview.css, imported after tokens.css. It reads only
+ * --serat-* tokens (docs/03-design/ui/tokens.css) and invents no value; a number that
+ * is not a token is a defect here, not a local choice.
+ *
+ * Scopes (one class on the editor root each, never both):
+ *   .serat-live    Mode 1, hybrid live preview
+ *   .serat-source  Mode 2 source pane, plain syntax-highlighted Markdown
+ *   .serat-prose   Mode 2 preview pane and embeds (rendered HTML, not CodeMirror)
+ *
+ * Specificity: every editor rule starts `.cm-editor.serat-live`, three classes, so it
+ * beats CodeMirror's generated base theme (two classes) regardless of load order, and
+ * beats the inline themes in links.ts and blockWidgets.ts, which are two classes.
+ * Spacing on headings is padding, never margin: CodeMirror measures lines, not margins.
+ */
+
+/* ---- Mode 1: column, voice, caret, selection ------------------------------------ */
+
+.cm-editor.serat-live .cm-scroller {
+  font-family: var(--serat-font-prose);
+  font-size: var(--serat-type-body-serif-size);
+  line-height: var(--serat-type-body-serif-line);
+  color: var(--serat-text-primary);
+  /* Source Serif 4 is an optical-size variable font; let the engine pick the master
+     for the size. Do not set text-rendering: optimizeLegibility (slow on long notes). */
+  font-optical-sizing: auto;
+  font-kerning: normal;
+}
+
+.cm-editor.serat-live .cm-content {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--serat-lp-measure);
+  margin-inline: auto;
+  padding: var(--serat-space-5) var(--serat-lp-gutter) var(--serat-space-7); /* 16px top: see editor.md, Column and rhythm */
+  caret-color: var(--serat-accent-interactive);
+}
+
+/* CodeMirror gives every line 6px of left padding. The column gutter replaces it. */
+.cm-editor.serat-live .cm-line {
+  padding-inline: 0;
+}
+
+.cm-editor.serat-live .cm-cursor,
+.cm-editor.serat-live .cm-dropCursor {
+  border-left: 2px solid var(--serat-accent-interactive);
+}
+
+.cm-editor.serat-live .cm-selectionBackground,
+.cm-editor.serat-live.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: var(--serat-surface-selection);
+}
+
+/* No active-line wash, no gutter: the reveal rule is the only line-level signal. */
+.cm-editor.serat-live .cm-activeLine {
+  background: transparent;
+}
+
+.cm-editor.serat-live.cm-focused {
+  outline: none; /* the pane carries the focus ring (components.md, accessibility) */
+}
+
+/* ---- Mode 1: headings (line decorations serat-h1 .. serat-h6) ------------------- */
+
+.cm-editor.serat-live .serat-h1 {
+  --lp-size: var(--serat-type-display-size);
+  --lp-line: var(--serat-type-display-line);
+  --lp-tracking: var(--serat-type-display-tracking);
+  --lp-pt: var(--serat-lp-h1-pt);
+  --lp-pb: var(--serat-lp-h1-pb);
+  --lp-marker: var(--serat-lp-h1-marker-scale);
+}
+.cm-editor.serat-live .serat-h2 {
+  --lp-size: var(--serat-type-heading-lg-size);
+  --lp-line: var(--serat-type-heading-lg-line);
+  --lp-tracking: var(--serat-type-heading-lg-tracking);
+  --lp-pt: var(--serat-lp-h2-pt);
+  --lp-pb: var(--serat-lp-h2-pb);
+  --lp-marker: var(--serat-lp-h2-marker-scale);
+}
+.cm-editor.serat-live .serat-h3 {
+  --lp-size: var(--serat-type-heading-md-size);
+  --lp-line: var(--serat-type-heading-md-line);
+  --lp-tracking: var(--serat-type-heading-md-tracking);
+  --lp-pt: var(--serat-lp-h3-pt);
+  --lp-pb: var(--serat-lp-h3-pb);
+  --lp-marker: var(--serat-lp-h3-marker-scale);
+}
+.cm-editor.serat-live .serat-h4 {
+  --lp-size: var(--serat-type-heading-sm-size);
+  --lp-line: var(--serat-type-heading-sm-line);
+  --lp-tracking: var(--serat-type-heading-sm-tracking);
+  --lp-pt: var(--serat-lp-h4-pt);
+  --lp-pb: var(--serat-lp-h4-pb);
+  --lp-marker: var(--serat-lp-h4-marker-scale);
+}
+.cm-editor.serat-live .serat-h5,
+.cm-editor.serat-live .serat-h6 {
+  --lp-size: var(--serat-type-heading-xs-size);
+  --lp-line: var(--serat-type-heading-xs-line);
+  --lp-tracking: var(--serat-type-heading-xs-tracking);
+  --lp-pt: var(--serat-lp-h5-pt);
+  --lp-pb: var(--serat-lp-h5-pb);
+  --lp-marker: var(--serat-lp-h5-marker-scale);
+}
+
+.cm-editor.serat-live .serat-h1,
+.cm-editor.serat-live .serat-h2,
+.cm-editor.serat-live .serat-h3,
+.cm-editor.serat-live .serat-h4,
+.cm-editor.serat-live .serat-h5,
+.cm-editor.serat-live .serat-h6 {
+  font-family: var(--serat-font-ui);
+  font-size: var(--lp-size);
+  line-height: var(--lp-line);
+  letter-spacing: var(--lp-tracking);
+  font-weight: 700;
+  padding-top: var(--lp-pt);
+  padding-bottom: var(--lp-pb);
+  text-wrap: balance; /* progressive: ignored where unsupported */
+}
+
+.cm-editor.serat-live .serat-h6 {
+  font-weight: 600;
+  color: var(--serat-text-secondary);
+}
+
+/* A heading that opens the note owns no space above it. */
+.cm-editor.serat-live .cm-content > .cm-line:first-child {
+  padding-top: 0;
+}
+
+/* ---- Mode 1: inline marks (tagHighlighter classes) ------------------------------ */
+
+.cm-editor.serat-live .serat-strong {
+  font-weight: 700;
+}
+.cm-editor.serat-live .serat-em {
+  font-style: italic; /* requires the Source Serif 4 italic face to be bundled */
+}
+.cm-editor.serat-live .serat-strike {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  color: var(--serat-text-secondary);
+}
+
+.cm-editor.serat-live .serat-highlight {
+  background: var(--serat-surface-highlight);
+  color: var(--serat-text-primary); /* ink on brass.100 is 14.4:1; never brass text */
+  border-radius: var(--serat-radius-sm);
+  padding-inline: 0.15em;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.cm-editor.serat-live .serat-code {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-lp-code-inline-size);
+  background: var(--serat-surface-sunken);
+  border-radius: var(--serat-radius-sm);
+  padding-inline: 0.3em;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* Revealed markers: the characters the reveal rule shows on the active line. They go
+   mono and secondary so structure reads apart from content. The text between them keeps
+   its rendered face, so the caret never sees the line change typeface under it. No
+   transition: the reveal must land in the frame of the selection change (FR-EDT-02), and
+   CodeMirror recreates spans on edits, so an entry animation would replay per keystroke. */
+.cm-editor.serat-live .serat-marker {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-lp-marker-size);
+  font-weight: 400;
+  font-style: normal;
+  letter-spacing: 0;
+  color: var(--serat-text-marker);
+}
+.cm-editor.serat-live .serat-h1 .serat-marker,
+.cm-editor.serat-live .serat-h2 .serat-marker,
+.cm-editor.serat-live .serat-h3 .serat-marker,
+.cm-editor.serat-live .serat-h4 .serat-marker,
+.cm-editor.serat-live .serat-h5 .serat-marker,
+.cm-editor.serat-live .serat-h6 .serat-marker {
+  font-size: calc(1em * var(--lp-marker));
+}
+
+/* ---- Mode 1: links --------------------------------------------------------------
+   Indigo on ink body text is 1.9:1, so colour cannot be the only signal (WCAG 1.4.1).
+   Links carry a quiet underline at rest that goes solid on hover and focus. */
+
+.cm-editor.serat-live .serat-link-resolved,
+.cm-editor.serat-live .serat-md-link {
+  color: var(--serat-text-link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  text-decoration-color: color-mix(in srgb, var(--serat-text-link) var(--serat-lp-link-underline-alpha), transparent);
+}
+.cm-editor.serat-live .serat-link-resolved:hover,
+.cm-editor.serat-live .serat-md-link:hover {
+  text-decoration-color: currentColor;
+}
+
+/* Resolved note, missing heading or block: still a link, flagged with the brass signal. */
+.cm-editor.serat-live .serat-link-resolved.serat-link-subpath-missing {
+  text-decoration-style: dashed;
+  text-decoration-color: var(--serat-accent-secondary);
+}
+
+.cm-editor.serat-live .serat-link-unresolved {
+  color: var(--serat-unresolved-link);
+  text-decoration: underline dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+/* The (url) half of [text](url): shown only when its line is revealed. */
+.cm-editor.serat-live .serat-url {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-lp-marker-size);
+  color: var(--serat-text-secondary);
+}
+
+/* ---- Mode 1: block-level line decorations --------------------------------------- */
+
+.cm-editor.serat-live .serat-quote {
+  padding-left: var(--serat-lp-quote-indent);
+  border-left: var(--serat-lp-quote-rule-width) solid var(--serat-rule-quote);
+  color: var(--serat-text-secondary); /* 8.3:1; not italic, italic is reserved for emphasis */
+}
+
+/* Fenced code. The fence lines stay as empty bands and serve as the block's top and
+   bottom padding; do not collapse them. */
+.cm-editor.serat-live .serat-code-line {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-mono-source-size);
+  line-height: var(--serat-type-mono-source-line);
+  background: var(--serat-surface-sunken);
+  padding-inline: var(--serat-space-5);
+}
+.cm-editor.serat-live .serat-code-line .serat-code-info {
+  font-size: var(--serat-type-micro-size);
+  color: var(--serat-text-secondary);
+}
+
+/* YAML properties block at the top of the note: raw, quiet, never rendered. */
+.cm-editor.serat-live .serat-frontmatter {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-mono-source-size);
+  line-height: var(--serat-type-mono-source-line);
+  color: var(--serat-text-secondary);
+  background: var(--serat-surface-sunken);
+  padding-inline: var(--serat-space-5);
+}
+
+/* Thematic break stays raw in P1 (a widget is P2). */
+.cm-editor.serat-live .serat-hr {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-lp-marker-size);
+  letter-spacing: 0.2em;
+  color: var(--serat-text-secondary);
+}
+
+/* Lists. --serat-depth is set by the line decoration (0 for top level). One indent step
+   per level; wrapped lines hang under the item text, not under the bullet. */
+.cm-editor.serat-live .serat-li {
+  padding-left: calc((var(--serat-depth, 0) + 1) * var(--serat-lp-list-indent));
+  text-indent: calc(-1 * var(--serat-lp-list-indent));
+}
+.cm-editor.serat-live .serat-bullet,
+.cm-editor.serat-live .serat-list-number {
+  display: inline-block;
+  width: var(--serat-lp-list-indent);
+  text-indent: 0;
+  color: var(--serat-text-secondary);
+}
+.cm-editor.serat-live .serat-list-number {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Mode 2: source pane --------------------------------------------------------
+   Nothing hidden, nothing resized: one monospace size so the pane is a faithful view of
+   the bytes. Colour is the only syntax cue, and never the only one: bold stays bold,
+   italic stays italic. */
+
+.cm-editor.serat-source .cm-scroller {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-mono-source-size);
+  line-height: var(--serat-type-mono-source-line);
+  color: var(--serat-text-primary);
+}
+.cm-editor.serat-source .cm-content {
+  padding: var(--serat-space-5);
+  caret-color: var(--serat-accent-interactive);
+}
+.cm-editor.serat-source .cm-cursor {
+  border-left: 2px solid var(--serat-accent-interactive);
+}
+.cm-editor.serat-source .cm-selectionBackground,
+.cm-editor.serat-source.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: var(--serat-surface-selection);
+}
+.cm-editor.serat-source .serat-h1,
+.cm-editor.serat-source .serat-h2,
+.cm-editor.serat-source .serat-h3,
+.cm-editor.serat-source .serat-h4,
+.cm-editor.serat-source .serat-h5,
+.cm-editor.serat-source .serat-h6,
+.cm-editor.serat-source .serat-strong {
+  font-weight: 700;
+}
+.cm-editor.serat-source .serat-em {
+  font-style: italic;
+}
+.cm-editor.serat-source .serat-marker,
+.cm-editor.serat-source .serat-url,
+.cm-editor.serat-source .serat-quote {
+  color: var(--serat-text-secondary);
+}
+.cm-editor.serat-source .serat-link-resolved,
+.cm-editor.serat-source .serat-md-link {
+  color: var(--serat-text-link);
+}
+.cm-editor.serat-source .serat-link-unresolved {
+  color: var(--serat-unresolved-link);
+  text-decoration: underline dotted;
+}
+.cm-editor.serat-source .serat-code,
+.cm-editor.serat-source .serat-code-line {
+  background: var(--serat-surface-sunken);
+}
+.cm-editor.serat-source .serat-highlight {
+  background: var(--serat-surface-highlight);
+}
+
+/* ---- Split preview and embeds: rendered, sanitised HTML ------------------------- */
+
+.serat-prose {
+  max-width: var(--serat-measure-editor);
+  padding: var(--serat-space-7) var(--serat-lp-gutter);
+  font-family: var(--serat-font-prose);
+  font-size: var(--serat-type-body-serif-size);
+  line-height: var(--serat-type-body-serif-line);
+  color: var(--serat-text-primary);
+  font-optical-sizing: auto;
+}
+.serat-prose :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--serat-font-ui);
+  font-weight: 700;
+  text-wrap: balance;
+  margin: 0;
+}
+.serat-prose h1 { font-size: var(--serat-type-display-size); line-height: var(--serat-type-display-line); letter-spacing: var(--serat-type-display-tracking); padding-top: var(--serat-lp-h1-pt); padding-bottom: var(--serat-lp-h1-pb); }
+.serat-prose h2 { font-size: var(--serat-type-heading-lg-size); line-height: var(--serat-type-heading-lg-line); letter-spacing: var(--serat-type-heading-lg-tracking); padding-top: var(--serat-lp-h2-pt); padding-bottom: var(--serat-lp-h2-pb); }
+.serat-prose h3 { font-size: var(--serat-type-heading-md-size); line-height: var(--serat-type-heading-md-line); letter-spacing: var(--serat-type-heading-md-tracking); padding-top: var(--serat-lp-h3-pt); }
+.serat-prose h4 { font-size: var(--serat-type-heading-sm-size); line-height: var(--serat-type-heading-sm-line); letter-spacing: var(--serat-type-heading-sm-tracking); }
+.serat-prose :is(h5, h6) { font-size: var(--serat-type-heading-xs-size); line-height: var(--serat-type-heading-xs-line); letter-spacing: var(--serat-type-heading-xs-tracking); }
+.serat-prose h6 { font-weight: 600; color: var(--serat-text-secondary); }
+.serat-prose > :first-child { margin-top: 0; padding-top: 0; }
+.serat-prose :is(p, ul, ol, blockquote, pre, table, figure) { margin: 0 0 var(--serat-type-body-serif-line); } /* one blank line, as in the editor */
+.serat-prose :is(ul, ol) { padding-left: calc(var(--serat-lp-list-indent) * 1); }
+.serat-prose li::marker { color: var(--serat-text-secondary); font-variant-numeric: tabular-nums; }
+.serat-prose blockquote { padding-left: var(--serat-lp-quote-indent); border-left: var(--serat-lp-quote-rule-width) solid var(--serat-rule-quote); color: var(--serat-text-secondary); }
+.serat-prose :not(pre) > code { font-family: var(--serat-font-mono); font-size: var(--serat-lp-code-inline-size); background: var(--serat-surface-sunken); border-radius: var(--serat-radius-sm); padding-inline: 0.3em; }
+.serat-prose pre { font-family: var(--serat-font-mono); font-size: var(--serat-type-mono-source-size); line-height: var(--serat-type-mono-source-line); background: var(--serat-surface-sunken); padding: var(--serat-space-5); overflow-x: auto; }
+.serat-prose a { color: var(--serat-text-link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.2em; text-decoration-color: color-mix(in srgb, var(--serat-text-link) var(--serat-lp-link-underline-alpha), transparent); }
+.serat-prose a:hover, .serat-prose a:focus-visible { text-decoration-color: currentColor; }
+.serat-prose a:focus-visible { outline: var(--serat-focus-ring); outline-offset: var(--serat-focus-ring-offset); }
+.serat-prose mark { background: var(--serat-surface-highlight); color: var(--serat-text-primary); border-radius: var(--serat-radius-sm); padding-inline: 0.15em; }
+.serat-prose hr { border: 0; border-top: 1px solid var(--serat-border-hairline); margin: var(--serat-space-7) 0; }
+.serat-prose img { display: block; max-width: 100%; height: auto; }
+.serat-prose table { border-collapse: collapse; font-size: var(--serat-type-body-serif-sm-size); line-height: var(--serat-type-body-serif-sm-line); }
+.serat-prose th { font-family: var(--serat-font-ui); font-weight: 600; text-align: left; border-bottom: 1px solid var(--serat-border-strong); }
+.serat-prose :is(th, td) { padding: var(--serat-space-2) var(--serat-space-4) var(--serat-space-2) 0; }
+.serat-prose td { border-bottom: 1px solid var(--serat-border-hairline); }

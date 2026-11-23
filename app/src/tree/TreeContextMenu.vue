@@ -115,7 +115,8 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside, true)
   min-width: 12rem;
   padding: 4px 0;
   outline: none;
-  background: var(--serat-surface-raised, #fff);
+  background: var(--serat-surface-overlay, #fff);
+  box-shadow: var(--serat-elevation-overlay, none);
   border: 1px solid var(--serat-border-hairline, #bbb);
 }
 .serat-tree-menu-item {

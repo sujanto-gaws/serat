@@ -30,7 +30,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
 import { ChangeSet, Compartment, EditorState, type Extension, Prec, Transaction } from "@codemirror/state";
-import { EditorView, lineNumbers, placeholder } from "@codemirror/view";
+import { EditorView, placeholder } from "@codemirror/view";
 
 import type { CommandRegistry } from "@/editor/commands";
 import { buildEditorExtensions, createEditorCommandRegistry, editorScrollExtensions } from "@/editor/codemirrorSetup";
@@ -47,6 +47,8 @@ import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
 import { refreshLinks } from "@/editor/linkState";
 import { revealMarkersPlugin } from "@/editor/reveal";
+import { adoptEditorStyles } from "@/editor/editorStyles";
+import { modeClass, typographyExtensions } from "@/editor/typography";
 import { syntaxTree } from "@codemirror/language";
 import { defaultLinkIpc, type LinkIpcAdapter } from "@/ipc/linkAdapter";
 import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
@@ -110,6 +112,13 @@ const revealCompartment = new Compartment();
 /** Live-preview-only extensions: the inline reveal rule and block widgets. Split
  * mode (FR-EDT-10) drops both together. */
 const liveExtensions: Extension[] = [revealMarkersPlugin, blockWidgetsExtension()];
+/** `serat-live` or `serat-source` on `.cm-editor`: the switch the design CSS keys on (serif prose and
+ * headings vs mono-source throughout). Reconfigured with `revealCompartment`, never rebuilt. */
+const modeCompartment = new Compartment();
+let unlistenFonts: (() => void) | null = null;
+function onFontsLoaded(): void {
+  view?.requestMeasure();
+}
 const dirty = ref(false);
 const previewSource = ref("");
 /** True only while `loadNote`/`setText` replace the whole state — that must
@@ -679,13 +688,14 @@ async function unsafeToClose(): Promise<string | null> {
 function buildExtensions(livePreview: boolean): Extension[] {
   return [
     freezeCompartment.of(frozen ? FROZEN_EXTENSIONS : []),
-    lineNumbers(),
     // Read-only until `loadNote` installs a buffer: text typed in any earlier
     // window would have no base to be a patch against (C-04, NFR-REL-01).
     EditorState.readOnly.of(!buffer),
     EditorView.editable.of(!!buffer),
     seratMarkdown(),
     revealCompartment.of(livePreview ? liveExtensions : []),
+    modeCompartment.of(modeClass(livePreview ? "live" : "source")),
+    ...typographyExtensions(),
     ...linkExtensions({ ipc: props.linkIpc, resolver, getSourcePath: () => buffer?.path ?? null }),
     keymapCompartment.of(buildEditorExtensions(registry)),
     EditorView.lineWrapping,
@@ -717,6 +727,12 @@ onMounted(() => {
     return;
   }
   const shadowRoot = host.value.attachShadow({ mode: "open" });
+  adoptEditorStyles(shadowRoot); // the design CSS reaches `.cm-editor` only inside this root
+  // CodeMirror measures line heights once; a face that finishes loading afterwards changes them (editor.md, Fonts).
+  if (typeof document !== "undefined" && document.fonts?.addEventListener) {
+    document.fonts.addEventListener("loadingdone", onFontsLoaded);
+    unlistenFonts = () => document.fonts.removeEventListener("loadingdone", onFontsLoaded);
+  }
   // `index://changed` is invalidation only (§3.4): drop cached resolutions and
   // ask the links plugin to rescan the viewport.
   props.linkIpc
@@ -769,6 +785,8 @@ onBeforeUnmount(() => {
   unlistenClosing = null;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   void performSave();
+  unlistenFonts?.();
+  unlistenFonts = null;
   view?.destroy();
   view = null;
 });
@@ -776,7 +794,12 @@ onBeforeUnmount(() => {
 watch(
   () => props.livePreview,
   (enabled) => {
-    view?.dispatch({ effects: revealCompartment.reconfigure(enabled ? liveExtensions : []) });
+    view?.dispatch({
+      effects: [
+        revealCompartment.reconfigure(enabled ? liveExtensions : []),
+        modeCompartment.reconfigure(modeClass(enabled ? "live" : "source")),
+      ],
+    });
   },
 );
 
@@ -993,7 +1016,8 @@ defineExpose({
   align-items: center;
   padding: 4px 10px;
   border: 1px solid var(--serat-border-hairline, #ddd);
-  background: var(--serat-surface-raised, #fff);
+  background: var(--serat-surface-overlay, #fff);
+  box-shadow: var(--serat-elevation-overlay, none);
   font-size: 0.9em;
 }
 .serat-external-dot {

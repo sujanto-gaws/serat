@@ -1,0 +1,242 @@
+/* Serat design tokens as CSS custom properties (light theme only; dark is P2, NFR-USE-03).
+ *
+ * Source of truth: docs/03-design/ui/tokens.json. Every value below is that file's
+ * value, with references resolved to var(--serat-*) so a ramp change flows through
+ * the roles. Do not hand-tune a value here: change tokens.json, then this file. App
+ * code reads roles (--serat-text-secondary), not ramps (--serat-neutral-600), except
+ * where a ramp step is the point.
+ *
+ * Install: copy to app/src/styles/tokens.css and import it first in main.ts. The
+ * existing P0 variables in app/src/style.css (--indigo, --brass, --ink, --paper) are
+ * superseded by --serat-brand-*.
+ *
+ * Naming: tokens.json role bg-X is --serat-surface-X (bg-surface is --serat-surface;
+ * bg-app is --serat-surface-app). Every other role keeps its tokens.json name.
+ */
+
+:root {
+  /* Colour ramps */
+  --serat-brand-indigo: #24457E;
+  --serat-brand-brass: #C08A47;
+  --serat-brand-ink: #16191B;
+  --serat-brand-paper: #F3F4F1;
+  --serat-indigo-50: #EFF2F8;
+  --serat-indigo-100: #E4E9F2;
+  --serat-indigo-200: #CBD6EA;
+  --serat-indigo-500: #2F569B;
+  --serat-indigo-600: #24457E;
+  --serat-indigo-700: #1B3660;
+  --serat-brass-100: #F3E6D2;
+  --serat-brass-500: #C08A47;
+  --serat-brass-600: #A5763A;
+  --serat-rust-100: #F1DAD3;
+  --serat-rust-500: #9C4A3A;
+  --serat-rust-600: #7E3A2C;
+  --serat-neutral-50: #F3F4F1;
+  --serat-neutral-100: #E7E8E4;
+  --serat-neutral-200: #D3D5CE;
+  --serat-neutral-300: #B4B7AE;
+  --serat-neutral-400: #8C9088;
+  --serat-neutral-500: #6B6F67;
+  --serat-neutral-600: #4C4F49;
+  --serat-neutral-700: #33352F;
+  --serat-neutral-900: #16191B;
+
+  /* Colour roles (names follow tokens.json; bg-* roles are surface-*) */
+  --serat-surface-app: var(--serat-neutral-50);
+  --serat-surface: #FFFFFE;
+  --serat-surface-sunken: var(--serat-neutral-100);
+  --serat-surface-overlay: #FFFFFE;
+  --serat-surface-selected: var(--serat-indigo-100);
+  --serat-surface-selected-weak: var(--serat-indigo-50);
+  --serat-surface-selection: var(--serat-indigo-200);
+  --serat-surface-raised: var(--serat-neutral-50);
+  --serat-surface-highlight: var(--serat-brass-100);
+  --serat-surface-pending-stripe: var(--serat-neutral-100);
+  --serat-border-hairline: var(--serat-neutral-200);
+  --serat-border-strong: var(--serat-neutral-300);
+  --serat-border-focus: var(--serat-indigo-600);
+  --serat-text-primary: var(--serat-neutral-900);
+  --serat-text-secondary: var(--serat-neutral-600);
+  --serat-text-tertiary: var(--serat-neutral-400);
+  --serat-text-marker: var(--serat-neutral-600);
+  --serat-rule-quote: var(--serat-neutral-400);
+  --serat-text-on-indigo: var(--serat-brand-paper);
+  --serat-text-link: var(--serat-indigo-600);
+  --serat-accent-interactive: var(--serat-indigo-600);
+  --serat-accent-interactive-hover: var(--serat-indigo-700);
+  --serat-accent-secondary: var(--serat-brass-500);
+  --serat-accent-secondary-hover: var(--serat-brass-600);
+  --serat-accent-secondary-bg: var(--serat-brass-100);
+  --serat-accent-error: var(--serat-rust-500);
+  --serat-accent-error-hover: var(--serat-rust-600);
+  --serat-accent-error-bg: var(--serat-rust-100);
+  --serat-unsaved-dot: var(--serat-brass-500);
+  --serat-unresolved-link: var(--serat-rust-500);
+  --serat-conflict-bg: var(--serat-brass-100);
+  --serat-conflict-border: var(--serat-brass-500);
+
+  /* Type families */
+  --serat-font-ui: 'Bricolage Grotesque', system-ui, sans-serif;
+  --serat-font-prose: 'Source Serif 4', Georgia, serif;
+  --serat-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* Type scale (size / line / tracking / weight per step) */
+  --serat-type-micro-size: 11px;
+  --serat-type-micro-line: 14px;
+  --serat-type-micro-tracking: 0;
+  --serat-type-micro-weight: 400;
+  --serat-type-small-size: 12px;
+  --serat-type-small-line: 16px;
+  --serat-type-small-tracking: 0;
+  --serat-type-small-weight: 400;
+  --serat-type-ui-size: 13px;
+  --serat-type-ui-line: 18px;
+  --serat-type-ui-tracking: 0;
+  --serat-type-ui-weight: 400;
+  --serat-type-ui-medium-size: 13px;
+  --serat-type-ui-medium-line: 18px;
+  --serat-type-ui-medium-tracking: 0;
+  --serat-type-ui-medium-weight: 500;
+  --serat-type-input-size: 15px;
+  --serat-type-input-line: 20px;
+  --serat-type-input-tracking: 0;
+  --serat-type-input-weight: 400;
+  --serat-type-mono-source-size: 14.5px;
+  --serat-type-mono-source-line: 24px;
+  --serat-type-mono-source-tracking: 0;
+  --serat-type-mono-source-weight: 400;
+  --serat-type-body-serif-size: 17px;
+  --serat-type-body-serif-line: 28px;
+  --serat-type-body-serif-tracking: 0;
+  --serat-type-body-serif-weight: 400;
+  --serat-type-body-serif-lg-size: 19px;
+  --serat-type-body-serif-lg-line: 31px;
+  --serat-type-body-serif-lg-tracking: 0;
+  --serat-type-body-serif-lg-weight: 400;
+  --serat-type-body-serif-sm-size: 15px;
+  --serat-type-body-serif-sm-line: 24px;
+  --serat-type-body-serif-sm-tracking: 0;
+  --serat-type-body-serif-sm-weight: 400;
+  --serat-type-heading-xs-size: 17px;
+  --serat-type-heading-xs-line: 28px;
+  --serat-type-heading-xs-tracking: -0.005em;
+  --serat-type-heading-xs-weight: 700;
+  --serat-type-heading-sm-size: 19px;
+  --serat-type-heading-sm-line: 26px;
+  --serat-type-heading-sm-tracking: -0.01em;
+  --serat-type-heading-sm-weight: 700;
+  --serat-type-heading-md-size: 23px;
+  --serat-type-heading-md-line: 29px;
+  --serat-type-heading-md-tracking: -0.015em;
+  --serat-type-heading-md-weight: 700;
+  --serat-type-heading-lg-size: 28px;
+  --serat-type-heading-lg-line: 34px;
+  --serat-type-heading-lg-tracking: -0.02em;
+  --serat-type-heading-lg-weight: 700;
+  --serat-type-display-size: 34px;
+  --serat-type-display-line: 40px;
+  --serat-type-display-tracking: -0.025em;
+  --serat-type-display-weight: 700;
+
+  /* Space */
+  --serat-space-0: 0;
+  --serat-space-1: 2px;
+  --serat-space-2: 4px;
+  --serat-space-3: 8px;
+  --serat-space-4: 12px;
+  --serat-space-5: 16px;
+  --serat-space-6: 20px;
+  --serat-space-7: 24px;
+  --serat-space-8: 32px;
+  --serat-space-9: 40px;
+  --serat-space-10: 56px;
+  --serat-space-11: 72px;
+
+  /* Measure */
+  --serat-measure-prose-max: 72ch;
+  --serat-measure-prose-min-comfortable: 52ch;
+  --serat-measure-editor: 64ch;
+
+  /* Radius */
+  --serat-radius-none: 0;
+  --serat-radius-sm: 3px;
+  --serat-radius-md: 6px;
+  --serat-radius-chip: 3px;
+  --serat-radius-note: 0;
+
+  /* Elevation (floating layers only) */
+  --serat-elevation-overlay: 0 4px 16px rgba(22,25,27,0.16), 0 1px 2px rgba(22,25,27,0.08);
+  --serat-elevation-flat: none;
+
+  /* Motion */
+  --serat-duration-micro: 120ms;
+  --serat-duration-panel: 160ms;
+  --serat-duration-overlay: 220ms;
+  --serat-easing-enter: cubic-bezier(0.2,0,0,1);
+  --serat-easing-exit: cubic-bezier(0.4,0,1,1);
+
+  /* Layout */
+  --serat-titlebar-height: 40px;
+  --serat-tree-pane-width-default: 260px;
+  --serat-tree-pane-width-min: 180px;
+  --serat-tree-pane-width-max: 420px;
+  --serat-context-pane-width-default: 300px;
+  --serat-context-pane-width-min: 220px;
+  --serat-row-height-tree: 26px;
+  --serat-row-height-list: 28px;
+  --serat-breakpoint-narrow: 960px;
+  --serat-breakpoint-compact: 720px;
+
+  /* Focus ring */
+  --serat-focus-ring: 2px solid var(--serat-border-focus);
+  --serat-focus-ring-offset: 1px;
+
+  /* Editor */
+  --serat-editor-scroll-margin-top: var(--serat-space-7);
+  --serat-editor-scroll-margin-bottom: 48px;
+
+  /* Live-preview typography (screens/editor.md) */
+  --serat-lp-measure: var(--serat-measure-editor);
+  --serat-lp-gutter: var(--serat-space-7);
+  --serat-lp-h1-pt: var(--serat-space-5);
+  --serat-lp-h1-pb: var(--serat-space-2);
+  --serat-lp-h1-marker-scale: 0.5;
+  --serat-lp-h2-pt: var(--serat-space-4);
+  --serat-lp-h2-pb: var(--serat-space-1);
+  --serat-lp-h2-marker-scale: 0.55;
+  --serat-lp-h3-pt: var(--serat-space-3);
+  --serat-lp-h3-pb: 0;
+  --serat-lp-h3-marker-scale: 0.65;
+  --serat-lp-h4-pt: 0;
+  --serat-lp-h4-pb: 0;
+  --serat-lp-h4-marker-scale: 0.8;
+  --serat-lp-h5-pt: 0;
+  --serat-lp-h5-pb: 0;
+  --serat-lp-h5-marker-scale: 0.85;
+  --serat-lp-h6-pt: 0;
+  --serat-lp-h6-pb: 0;
+  --serat-lp-h6-marker-scale: 0.85;
+  --serat-lp-code-inline-size: 0.85em;
+  --serat-lp-marker-size: 0.85em;
+  --serat-lp-list-indent: 1.5em;
+  --serat-lp-quote-rule-width: 2px;
+  --serat-lp-quote-indent: var(--serat-space-5);
+  --serat-lp-link-underline-alpha: 60%;
+
+  /* Aliases for names app/src already references (blockWidgets.ts, links.ts,
+     CodeMirrorEditor.vue, overlay.css). They are not new roles. Retire each
+     alias when its caller moves to the canonical name above. */
+  --serat-accent: var(--serat-accent-interactive);
+  --serat-link: var(--serat-text-link);
+  --serat-rust: var(--serat-accent-error);
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --serat-duration-micro: 1ms;
+    --serat-duration-panel: 1ms;
+    --serat-duration-overlay: 1ms;
+  }
+}

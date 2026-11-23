@@ -1,0 +1,70 @@
+/* What the reference stylesheet (livePreview.css) does not cover but the parser and the decorations produce.
+   Tokens only, no new value. Concatenated after livePreview.css and adopted into the editor's shadow root
+   by editorStyles.ts. */
+
+/* List nesting is a class, not a style attribute: the app's CSP (style-src 'self') refuses inline style
+   attributes, and a line decoration can only set attributes. serat-li reads --serat-depth. */
+.cm-editor.serat-live .serat-depth-0 { --serat-depth: 0; }
+.cm-editor.serat-live .serat-depth-1 { --serat-depth: 1; }
+.cm-editor.serat-live .serat-depth-2 { --serat-depth: 2; }
+.cm-editor.serat-live .serat-depth-3 { --serat-depth: 3; }
+.cm-editor.serat-live .serat-depth-4 { --serat-depth: 4; }
+.cm-editor.serat-live .serat-depth-5 { --serat-depth: 5; }
+.cm-editor.serat-live .serat-depth-6 { --serat-depth: 6; }
+.cm-editor.serat-live .serat-depth-7 { --serat-depth: 7; }
+.cm-editor.serat-live .serat-depth-8 { --serat-depth: 8; }
+
+/* Fence text is tagged as code by the highlighter; inside a fenced block it takes the block's band, not the
+   inline-code chip. */
+.cm-editor .serat-code-line .serat-code {
+  background: transparent;
+  border-radius: 0;
+  padding-inline: 0;
+  font-size: inherit;
+}
+
+/* Always-visible machine syntax (components.md section 3): block ids and inline fields, mono-source in
+   text-secondary, never hidden. Same face in source mode. */
+.cm-editor .serat-machine {
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-mono-source-size);
+  color: var(--serat-text-secondary); /* text-tertiary is 3.25:1 on surface; these are always visible */
+}
+
+/* A footnote reference reads as a raised number; its brackets are markers and hide off-line. */
+.cm-editor.serat-live .serat-footnote {
+  font-size: 0.8em;
+  vertical-align: super;
+  line-height: 0;
+  color: var(--serat-text-link);
+}
+
+/* The editor fills its pane; the pane, not CodeMirror, draws the surface. */
+.cm-editor {
+  background: var(--serat-surface);
+}
+
+/* The whitespace before a list marker on a revealed line: kept in the document, taken out of the layout so the
+   hanging indent is the same revealed or not. (Off the selected line the whitespace is hidden outright.) */
+.cm-editor.serat-live .serat-indent-raw {
+  font-size: 0;
+}
+
+/* The properties block is raw text: whatever the Markdown parse found inside it (a `[a, b]` link, emphasis) takes
+   the block's face, not the rendered one. */
+.cm-editor.serat-live .serat-frontmatter :is(.serat-md-link, .serat-strong, .serat-em, .serat-strike, .serat-code, .serat-highlight, .serat-url) {
+  color: inherit;
+  font: inherit;
+  text-decoration: none;
+  background: none;
+  padding: 0;
+}
+
+/* Source mode keeps a line-number gutter: quiet, mono, in the same colour as markers. */
+.cm-editor.serat-source .cm-gutters {
+  background: transparent;
+  border: 0;
+  color: var(--serat-text-secondary);
+  font-family: var(--serat-font-mono);
+  font-size: var(--serat-type-micro-size);
+}
