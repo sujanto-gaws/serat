@@ -60,7 +60,7 @@
   --serat-text-secondary: var(--serat-neutral-600);
   --serat-text-tertiary: var(--serat-neutral-400);
   --serat-text-marker: var(--serat-neutral-600);
-  --serat-rule-quote: var(--serat-neutral-300);
+  --serat-rule-quote: var(--serat-neutral-400);
   --serat-text-on-indigo: var(--serat-brand-paper);
   --serat-text-link: var(--serat-indigo-600);
   --serat-accent-interactive: var(--serat-indigo-600);
@@ -222,7 +222,7 @@
   --serat-lp-list-indent: 1.5em;
   --serat-lp-quote-rule-width: 2px;
   --serat-lp-quote-indent: var(--serat-space-5);
-  --serat-lp-link-underline-alpha: 35%;
+  --serat-lp-link-underline-alpha: 60%;
 
   /* Aliases for names app/src already references (blockWidgets.ts, links.ts,
      CodeMirrorEditor.vue, overlay.css). They are not new roles. Retire each

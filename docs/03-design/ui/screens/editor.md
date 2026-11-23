@@ -68,6 +68,7 @@ Until now the reveal rule hid the Markdown markers and nothing styled what was l
 |---|---|---|
 | Body | `body-serif`: Source Serif 4, 17px / 28px, `text-primary` | 28px is the baseline; every block is a whole number of 28px lines except heading padding. |
 | Column | `max-width: 64ch` (`typography.measure.editor`), centred, 24px side gutter (`space.7`) | Starting value. Tune it until an average full line of English prose holds 66 to 80 characters; serif body may run to the long end. `measure.prose-max` (72ch) stays the ceiling elsewhere. |
+| Content padding | `.cm-content` padding-top 16px (`space.5`), bottom 24px (`space.7`) | Not 24px on top. With CodeMirror's 24px scroll margin and a 34 / 40 H1, a 24px top padding left Control+Home 6px short of scrollTop 0. |
 | Paragraph gap | One blank line (28px). Blank lines are never shrunk | A shortened blank line would grow to 28px on the first character typed into it, a jump under the caret. |
 | Heading space | Padding on the heading line: H1 16 above and 4 below, H2 12 above and 2 below, H3 8 above, H4 to H6 none; none for a heading that opens the note | CodeMirror measures lines, not margins. The blank line before a heading is still there; the padding adds to it. |
 | Caret | 2px `accent-interactive` | The same indigo as every interactive thing; ink would be invisible against the text. |
@@ -96,12 +97,12 @@ All in the `ui` family, `text-primary` unless stated, `text-wrap: balance`. The 
 | `~~strike~~` | Line-through 1px, `text-secondary` | `serat-strike` |
 | `==highlight==` | `bg-highlight` (`brass.100`) fill, ink text, `radius.sm`, 0.15em side padding. Ink on brass.100 is 14.4:1; brass is never a text colour (brass-600 on white is 4.0:1) | `serat-highlight` |
 | `` `code` `` | Mono at 0.85em (14.5px in body), `bg-surface-sunken`, `radius.sm`, 0.3em side padding, no border | `serat-code` |
-| `[[Note]]`, resolved | `text-link`, 1px underline at 35% alpha, solid on hover | `serat-link-resolved` |
+| `[[Note]]`, resolved | `text-link`, 1px underline at 60% alpha, solid on hover | `serat-link-resolved` |
 | `[[Note#Missing]]` | As resolved, with a dashed brass underline | `serat-link-subpath-missing` |
 | `[[Nothing]]`, unresolved | `unresolved-link` (rust), dotted underline | `serat-link-unresolved` |
 | `[text](https://...)` | As a resolved wikilink; the `(url)` shows only when the line is revealed, mono, `text-secondary` | `serat-md-link`, `serat-url` |
 
-Links keep a quiet underline at rest. This amends `components.md` section 3 and the external-link bullet above, which said "no underline at rest": indigo on ink body text measures 1.9:1, so colour alone cannot mark a link (WCAG 1.4.1; the accessibility baseline already says colour is never the only carrier).
+The underline measures 3.27:1 on `bg-surface` at 60% alpha (35% measured 1.88:1 and failed the 3:1 rule). The quote rule is `neutral.400` (3.25:1); `neutral.300` measured 2.03:1. There is no dark ramp yet (NFR-USE-03, P2): re-pick both steps against the dark surface when it lands. Links keep a quiet underline at rest. This amends `components.md` section 3 and the external-link bullet above, which said "no underline at rest": indigo on ink body text measures 1.9:1, so colour alone cannot mark a link (WCAG 1.4.1; the accessibility baseline already says colour is never the only carrier).
 
 #### Revealed markers
 
@@ -111,7 +112,7 @@ On a line the selection touches, the hidden characters come back as `serat-marke
 
 | Block | Treatment | Class |
 |---|---|---|
-| Blockquote | 2px `rule-quote` (`neutral.300`) left rule, 16px (`space.5`) indent, `text-secondary`; not italic, because italic is reserved for emphasis. `>` hidden unless revealed. Nesting beyond one level looks the same in P1 | `serat-quote` |
+| Blockquote | 2px `rule-quote` (`neutral.400`, 3.25:1 on `bg-surface`) left rule, 16px (`space.5`) indent, `text-secondary`; not italic, because italic is reserved for emphasis. `>` hidden unless revealed. Nesting beyond one level looks the same in P1 | `serat-quote` |
 | Bullet list | Marker `-`, `*` or `+` renders as a bullet glyph in `text-secondary` in a 1.5em column; one 1.5em indent per level; wrapped lines hang under the item text. The raw leading indent is hidden when not revealed, otherwise it would double the padding. Today `ListMark` is hidden outright, which makes bullets vanish: the reveal plugin must replace it with the glyph instead | `serat-li`, `--serat-depth`, `serat-bullet` |
 | Ordered list | The numeral stays visible (it is information; the reveal plugin must not hide it), `text-secondary`, tabular figures, same column and indent | `serat-li`, `serat-list-number` |
 | Fenced code | `mono-source` (14.5 / 24) on `bg-surface-sunken`, full column width, 16px side padding, no border. The fence lines stay as empty bands and are the block's top and bottom padding; the language shows in `micro` mono, `text-secondary` | `serat-code-line`, `serat-code-info` |
