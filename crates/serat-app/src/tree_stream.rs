@@ -497,6 +497,11 @@ impl TreeFeed {
     ///
     /// Only if the operating system refuses to create the populate thread.
     pub fn open(self: &Arc<Self>, send: TreeSender) -> std::io::Result<()> {
+        // A reloaded webview, or a second `open_tree` for the same vault, joins the session
+        // that already exists instead of walking the vault again (task #68, ADR-0015 §1).
+        if self.reattach(&send) {
+            return Ok(());
+        }
         // Before the thread exists, so the application's trigger cannot claim between
         // the two; undone if the thread cannot be had.
         (self.config.attach)();
@@ -507,6 +512,61 @@ impl TreeFeed {
             (self.config.detach)();
         }
         started
+    }
+
+    /// Attach `send` to the live session through [`TreeSession::replay_to`]: the new channel
+    /// receives every listing sent so far (root first), then `Complete` and `WalkSettled` if
+    /// they were sent, then the rest of a running walk and every live update, and the old
+    /// channel is cancelled. Nothing is enumerated again: the walk (and the open's one
+    /// authoritative walk, its catch-up and its journal) belongs to the first `open`.
+    ///
+    /// Returns `false` when there is no healthy session to join (none yet, or it was
+    /// poisoned or closed), and the caller starts a fresh one. A poisoned session cannot be
+    /// replayed (its model died with the panic), so that case walks again by necessity.
+    ///
+    /// The `tree_first_screen` and `tree_complete` marks are reset for the new channel
+    /// (the front end marks again after painting what it replayed) but `empty_folders`,
+    /// which the finished walk recorded, is kept. `Startup`'s cold-start tree term is
+    /// set once from the first channel's mark, so a later mark cannot move the trace
+    /// (task #141).
+    fn reattach(self: &Arc<Self>, send: &TreeSender) -> bool {
+        // Not repeated here, on purpose: `config.attach` told the application once that this
+        // vault has a tree stream (and `detach` undoes it only if a thread cannot start), and
+        // `stopped` is only ever set by an exhausted restart budget, which leaves no healthy
+        // session to join, so this path is never reached with it set.
+        let session = {
+            let state = self.state();
+            match state.active.as_ref() {
+                Some(active) if !active.session.is_poisoned() => Arc::clone(&active.session),
+                _ => return false,
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sink = CoalescingSink::new(Arc::clone(send), Arc::clone(&cancelled));
+        let paths = Arc::clone(&self.config.paths);
+        let attached = session.replay_to(move |out| {
+            paths.apply(&out);
+            sink.push(out);
+        });
+        if attached.is_err() {
+            return false;
+        }
+        {
+            let mut state = self.state();
+            if let Some(active) = state.active.as_mut()
+                && Arc::ptr_eq(&active.session, &session)
+            {
+                active.cancelled.store(true, Ordering::Relaxed);
+                active.cancelled = cancelled;
+                active.send = Arc::clone(send);
+            }
+        }
+        let mut marks = self.marks_lock();
+        *marks = TreeMarks {
+            empty_folders: marks.empty_folders,
+            ..TreeMarks::default()
+        };
+        true
     }
 
     fn start(self: &Arc<Self>, send: TreeSender, restarts: u32) -> std::io::Result<()> {
@@ -598,6 +658,17 @@ impl TreeFeed {
             && std::ptr::eq(Arc::as_ptr(&active.session), session)
         {
             active.restarts = 0;
+        }
+    }
+
+    /// The vault is closing: end the stream. The session stops calling its sink and releases
+    /// it, the channel's sink is cancelled, and a later `open` starts afresh (task #68; this is
+    /// the call site of [`TreeSession::close`]).
+    pub fn close(&self) {
+        let active = self.state().active.take();
+        if let Some(active) = active {
+            active.cancelled.store(true, Ordering::Relaxed);
+            active.session.close();
         }
     }
 
@@ -1211,6 +1282,256 @@ mod tests {
         assert_eq!(log.len(), 3);
         assert!(matches!(&log[1], TreeMessage::Listing { dir, .. } if dir == "a"));
         assert!(matches!(&log[2], TreeMessage::Listing { dir, .. } if dir == "b"));
+    }
+
+    /// A feed whose gate counts the walks it is asked to run (one gate call per populate) and
+    /// can hold the first one until released.
+    fn counting_feed(
+        dir: &Path,
+        hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+    ) -> (Arc<TreeFeed>, Arc<AtomicU32>) {
+        let walks = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&walks);
+        let feed = TreeFeed::new(FeedConfig {
+            vault: Arc::new(Vault::open(dir).expect("open")),
+            index_db: dir.join(".serat/none.db"),
+            index_ready: Box::new(|| false),
+            gate: Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(hold) = &hold {
+                    let (lock, cv) = &**hold;
+                    let mut open = lock.lock().expect("hold");
+                    while !*open {
+                        open = cv.wait(open).expect("hold");
+                    }
+                }
+            }),
+            paths: Arc::default(),
+            attach: Box::new(|| {}),
+            detach: Box::new(|| {}),
+            claim: Box::new(|| false),
+            on_walk_failed: Box::new(|| {}),
+            on_walk_start: Box::new(|| {}),
+            on_walked: Box::new(|_| {}),
+            on_walk_complete: Box::new(|_| {}),
+            on_stopped: Box::new(|| {}),
+        });
+        (feed, walks)
+    }
+
+    fn listings(log: &Log) -> Vec<(String, Vec<String>)> {
+        let mut rows: Vec<(String, Vec<String>)> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .filter_map(|m| match m {
+                TreeMessage::Listing { dir, entries } => Some((
+                    dir.clone(),
+                    entries.iter().map(|e| e.name.clone()).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    // Task #68 review: `TreeFeed::close` is what `OpenVault::shut_down` calls (one line there,
+    // not separately pinned); this shows it ends the stream and a reload starts afresh.
+    #[test]
+    fn closing_the_feed_ends_the_stream_and_a_later_reload_starts_afresh() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let (feed, walks) = counting_feed(dir.path(), None);
+        let (send, log) = collecting();
+        feed.open(send).expect("open");
+        wait_for("settled", || settled(&log));
+        feed.close();
+        let before = log.lock().expect("log").len();
+        write(dir.path(), "late.md");
+        feed.path_changed(&VaultPath::new("late.md").expect("path"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            log.lock().expect("log").len(),
+            before,
+            "a closed stream kept sending"
+        );
+        assert!(feed.progress().is_none(), "a closed feed has no session");
+        // A reload after the close walks afresh rather than joining a dead session.
+        let (second, second_log) = collecting();
+        feed.open(second).expect("open again");
+        wait_for("settled", || settled(&second_log));
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+    }
+
+    // Task #68. Mutant, run by hand: dropping the `reattach` call in `open` makes the second
+    // open walk again (gate count 2) and the channels' rows are still equal, so the count is
+    // what fails it.
+    #[test]
+    fn a_reload_after_complete_replays_the_same_rows_with_no_second_walk() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        write(dir.path(), "sub/b.md");
+        fs::create_dir_all(dir.path().join("empty")).expect("mkdir");
+        let (feed, walks) = counting_feed(dir.path(), None);
+        let (first, first_log) = collecting();
+        feed.open(first).expect("open");
+        wait_for("settled", || settled(&first_log));
+
+        let (second, second_log) = collecting();
+        feed.open(second).expect("the reloaded webview attaches");
+        wait_for("the replay's settle", || settled(&second_log));
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "the vault was walked again"
+        );
+        assert_eq!(listings(&first_log), listings(&second_log));
+        let second = second_log.lock().expect("log");
+        assert!(
+            matches!(&second[0], TreeMessage::Listing { dir, .. } if dir.is_empty()),
+            "the replay starts at the root: {:?}",
+            second[0]
+        );
+        assert!(second.iter().any(|m| matches!(
+            m,
+            TreeMessage::Complete {
+                entries: 2,
+                source: ipc::TreeSource::Walk
+            }
+        )));
+        drop(second);
+
+        // The old channel is cancelled: a live change reaches only the new one.
+        let before = first_log.lock().expect("log").len();
+        write(dir.path(), "late.md");
+        feed.path_changed(&VaultPath::new("late.md").expect("path"));
+        wait_for("the live upsert", || {
+            second_log
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|m| matches!(m, TreeMessage::Upsert { entry, .. } if entry.name == "late.md"))
+        });
+        assert_eq!(
+            first_log.lock().expect("log").len(),
+            before,
+            "the old channel kept receiving"
+        );
+    }
+
+    #[test]
+    fn a_reload_before_the_walk_has_sent_anything_receives_the_whole_stream_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        write(dir.path(), "sub/b.md");
+        let hold = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (feed, walks) = counting_feed(dir.path(), Some(Arc::clone(&hold)));
+        let (first, first_log) = collecting();
+        feed.open(first).expect("open");
+        wait_for("the walk to be at its gate", || {
+            walks.load(Ordering::SeqCst) == 1
+        });
+
+        let (second, second_log) = collecting();
+        feed.open(second)
+            .expect("the reloaded webview attaches mid-open");
+        {
+            let (lock, cv) = &*hold;
+            *lock.lock().expect("hold") = true;
+            cv.notify_all();
+        }
+        wait_for("the walk to settle on the new channel", || {
+            settled(&second_log)
+        });
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "the vault was walked twice"
+        );
+        assert!(has_complete(&second_log));
+        assert!(
+            first_log.lock().expect("log").is_empty(),
+            "the superseded channel received part of the stream"
+        );
+        assert!(listing(&second_log.lock().expect("log"), "sub").is_some());
+    }
+
+    #[test]
+    fn a_reload_replays_the_first_screen_mark_semantics_and_keeps_empty_folders() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        fs::create_dir_all(dir.path().join("empty")).expect("mkdir");
+        let (feed, _walks) = counting_feed(dir.path(), None);
+        let (first, first_log) = collecting();
+        feed.open(first).expect("open");
+        wait_for("settled", || settled(&first_log));
+        wait_for("empty folders recorded", || {
+            feed.marks().empty_folders.is_some()
+        });
+        let mark = ipc::MarkTreeArgs {
+            mark: ipc::TreeMark::FirstScreen,
+            entries_in_model: 0,
+        };
+        feed.mark(&mark, 10.0);
+        assert_eq!(feed.marks().first_screen_ms, Some(10.0));
+        let empty = feed.marks().empty_folders;
+
+        let (second, second_log) = collecting();
+        feed.open(second).expect("reload");
+        wait_for("settled", || settled(&second_log));
+        // Reset for the new channel, empty folders kept, and the mark is accepted again.
+        assert_eq!(feed.marks().first_screen_ms, None);
+        assert_eq!(feed.marks().empty_folders, empty);
+        feed.mark(&mark, 25.0);
+        assert_eq!(feed.marks().first_screen_ms, Some(25.0));
+        assert_eq!(feed.marks().rejected, 0, "the replayed root counts as sent");
+    }
+
+    #[test]
+    fn a_poisoned_session_cannot_be_joined_and_a_reload_after_it_walks_afresh() {
+        let dir = tempfile::tempdir().expect("dir");
+        write(dir.path(), "a.md");
+        let (feed, walks) = counting_feed(dir.path(), None);
+        let calls = Arc::new(AtomicU32::new(0));
+        let (inner, first_log) = collecting();
+        let counter = Arc::clone(&calls);
+        let send: TreeSender = Arc::new(move |m| {
+            assert!(
+                counter.fetch_add(1, Ordering::SeqCst) != 0,
+                "sink failure (test)"
+            );
+            inner(m)
+        });
+        feed.open(send).expect("open");
+        wait_for("the restarted stream", || has_complete(&first_log));
+        // One walk for the poisoned session, one for its replacement.
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+        // The replacement is healthy: a reload joins it without a third walk.
+        let (second, second_log) = collecting();
+        feed.open(second).expect("reload");
+        wait_for("the replay", || has_complete(&second_log));
+        assert_eq!(walks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_different_vault_has_its_own_feed_and_walks() {
+        let (a, b) = (
+            tempfile::tempdir().expect("a"),
+            tempfile::tempdir().expect("b"),
+        );
+        write(a.path(), "a.md");
+        write(b.path(), "b.md");
+        let ((feed_a, walks_a), (feed_b, walks_b)) =
+            (counting_feed(a.path(), None), counting_feed(b.path(), None));
+        let (send_a, log_a) = collecting();
+        let (send_b, log_b) = collecting();
+        feed_a.open(send_a).expect("open a");
+        feed_b.open(send_b).expect("open b");
+        wait_for("both", || has_complete(&log_a) && has_complete(&log_b));
+        assert_eq!(walks_a.load(Ordering::SeqCst), 1);
+        assert_eq!(walks_b.load(Ordering::SeqCst), 1);
+        assert_ne!(listings(&log_a), listings(&log_b));
     }
 
     #[test]

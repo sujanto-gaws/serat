@@ -307,6 +307,31 @@ impl TreeModel {
         }
     }
 
+    /// The listing of every directory sent so far, as the messages a new receiver needs
+    /// to hold the same tree: the root first, then by depth, then by path, so a parent
+    /// always precedes its children (task #68; ADR-0015 §1, breadth-first). Pure: it
+    /// does not change the model, and the in-flight snapshot bookkeeping (`overlay`,
+    /// `removed`) stays where it is, so a walk still running keeps applying it to the
+    /// listings it has yet to offer.
+    #[must_use]
+    pub fn replay(&self) -> Vec<TreeOp> {
+        let depth = |dir: &str| {
+            if dir.is_empty() {
+                0
+            } else {
+                dir.matches('/').count() + 1
+            }
+        };
+        let mut dirs: Vec<&String> = self.dirs.keys().collect();
+        dirs.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
+        dirs.into_iter()
+            .map(|dir| TreeOp::Listing {
+                dir: dir.clone(),
+                entries: self.dirs[dir].entries(),
+            })
+            .collect()
+    }
+
     /// Whether a listing for `dir` has been produced.
     #[must_use]
     pub fn is_listed(&self, dir: &str) -> bool {
