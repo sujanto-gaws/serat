@@ -90,6 +90,72 @@ fn a_damaged_page_is_reported_as_problems_and_never_panics() {
     }
 }
 
+/// `PRAGMA quick_check` straight on the file: `Ok(rows)` if it answers, `Err` if it raises.
+fn raw_quick_check(index_dir: &Path) -> Result<Vec<String>, rusqlite::Error> {
+    let conn = rusqlite::Connection::open_with_flags(
+        index_path(index_dir),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut stmt = conn.prepare("PRAGMA quick_check")?;
+    stmt.query_map([], |row| row.get::<_, String>(0))?.collect()
+}
+
+/// Zero the cell-pointer array of one table-leaf page, keeping its header: the cells then
+/// point at offset 0 and SQLite describes the damage as rows instead of raising.
+fn zero_cell_pointers(index_dir: &Path, page: usize) {
+    let path = index_path(index_dir);
+    let mut bytes = std::fs::read(&path).expect("read");
+    let size = 4096;
+    let base = page * size;
+    let cells = usize::from(u16::from_be_bytes([bytes[base + 3], bytes[base + 4]]));
+    for byte in &mut bytes[base + 8..base + 8 + 2 * cells] {
+        *byte = 0;
+    }
+    std::fs::write(&path, bytes).expect("write");
+}
+
+#[test]
+fn damage_that_quick_check_describes_as_rows_is_problems_with_those_rows() {
+    // The other way SQLite says corrupt (architecture §3.4): no error, a first row that is
+    // not `ok`. A leaf page of a big table, header kept, pointers zeroed.
+    let (dir, index_dir) = built(400);
+    let size = 4096;
+    let pages = std::fs::metadata(index_path(&index_dir))
+        .expect("meta")
+        .len() as usize
+        / size;
+    let mut checked = 0;
+    for page in 1..pages {
+        let leaf = {
+            let bytes = std::fs::read(index_path(&index_dir)).expect("read");
+            bytes[page * size] == 0x0D && bytes[page * size + 4] != 0
+        };
+        if !leaf {
+            continue;
+        }
+        let copy = dir.path().join(format!("copy-{page}"));
+        std::fs::create_dir_all(&copy).expect("mkdir");
+        std::fs::copy(index_path(&index_dir), index_path(&copy)).expect("copy");
+        zero_cell_pointers(&copy, page);
+        let Ok(rows) = raw_quick_check(&copy) else {
+            continue; // this page makes SQLite raise; the other tests cover that path
+        };
+        if rows.first().map(String::as_str) == Some("ok") {
+            continue;
+        }
+        assert_eq!(
+            quick_check(&copy).expect("verdict"),
+            QuickCheck::Problems(rows),
+            "page {page}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no leaf page produced findings as rows; the fixture proves nothing"
+    );
+}
+
 #[test]
 fn a_file_that_is_not_a_database_is_problems() {
     let (_dir, index_dir) = built(5);
