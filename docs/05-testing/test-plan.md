@@ -352,3 +352,5 @@ I did not run the uncapped default (three workers) 10 times on vitest 5, so whet
 ## Reports
 
 One report per gate, in `reports/`, from `reports/TEMPLATE-test-report.md`. Every report records the reference machine, the benchmark vault's `tree_digest_sha256`, the generator's `VAULT_FORMAT_VERSION`, the measurement environment (real-time scanner state and power plan), and the raw numbers — not just the pass/fail. P0 numbers replace the blueprint targets before P1 starts (charter §Milestones, working agreement 6), so they are reported to product-analyst and architect explicitly rather than left in a file for someone to find.
+
+Reports on the tree: `reports/t2-p0-gate-report.md` (P0 gate) and `reports/p1-gate-report.md` (P1 gate; status half drafted 2026-11-23 under task #163, week-in-vault half and verdict pending the owner's week).
