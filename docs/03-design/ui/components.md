@@ -63,6 +63,7 @@ Cited requirement IDs are the ones a component exists to satisfy; screen specs i
 ## 5. Overlays (palette, switcher, dialogs, tooltips)
 
 Shared chrome for `command-palette.md` and `quick-switcher.md`:
+- **Every floating layer takes this recipe**: the tree context menu, the external-edit notice, tooltips and the editor's floating bars use `--serat-surface-overlay` (#FFFFFE, light only until the dark ramp lands), `--serat-elevation-overlay` and a 1px `--serat-border-hairline`. They never use `--serat-surface-raised` (#F3F4F1, equal to the app background), which is for in-flow tints such as the callout body.
 - Card: `bg-overlay`, `radius.md`, `elevation.overlay`, 1px `border-hairline`. Centred horizontally, upper-third vertically (never true centre — true centre reads as a modal that owns the whole window; upper-third reads as a tool you summon and dismiss).
 - Input row: `typography.input`, `ui` family, no visible border once the card itself has the hairline — the input is the card, not a box inside it.
 - Result rows: `typography.ui`, icon + label + right-aligned metadata (mono, `small`/`micro`) + keybinding chip where relevant.
