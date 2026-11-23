@@ -20,14 +20,14 @@ The three OFL licence files are emitted by `app/src/build/fontLicenses.ts` from 
 
 Terms worth knowing before release (read from the files):
 
-- **Liberation** is GPL-2.0 with two exceptions: a document embedding the font is not covered by the GPL (exception (a)), and a physical product distributing the object code must give the user the right to access and modify the Software's source and reinstall it (exception (b)). The fonts are data files that pdf.js loads only to substitute for unembedded standard fonts. Serat does not modify them. Whether shipping them GPL-2.0 alongside a differently licensed app needs any further ruling is the lead's call; deny.toml and npm-deny.json do not see them, because they arrive as data inside `pdfjs-dist`, whose own `license` field is Apache-2.0.
+- **Liberation** is GPL-2.0 with two exceptions: a document embedding the font is not covered by the GPL (exception (a)), and a physical product distributing the object code must give the user the right to access and modify the Software's source and reinstall it (exception (b)). The fonts are data files that pdf.js loads only to substitute for unembedded standard fonts. Serat does not modify them. **Ruling (lead, closed):** shipping these fonts under GPL-2.0 with the Red Hat font exceptions is compliant, provided the full licence text ships with them, as it does here (`LICENSE_LIBERATION`, the way pdf.js itself ships it). deny.toml and npm-deny.json do not see them, because they arrive as data inside `pdfjs-dist`, whose own `license` field is Apache-2.0.
 - **OFL-1.1** fonts may be bundled and redistributed with software but not sold on their own, and a modified font may not use a Reserved Font Name. Serat ships them unmodified (woff2 subsets produced by the fontsource packages).
 
 ## 2. Open items (not satisfied by the bundle today)
 
 1. **Bundled npm code ships without notices.** Vue, Pinia, CodeMirror, Lezer, markdown-it and its dependencies (MIT, BSD-2-Clause, PSF-2.0 for argparse) are compiled into `boot.js` and `boot-chunk-markdown-it.js`, which carry no licence banners. Section 3 lists them by licence family, but the licence texts of those packages ship nowhere in the app. P5 follow-up (banners or a generated notice for bundled npm code). MIT, BSD and PSF-2.0 each ask for the notice to accompany copies.
 2. **Rust crates**: the same applies to the 426 crates compiled into the Tauri binary (section 3). A generated all-crates notices file (for example `cargo about`) is not in the repository. P5 follow-up.
-3. **Source Serif 4 holder** is whatever Fontsource's `LICENSE` says ("Google Inc."), which is not an upstream copyright line. It is reported as shipped.
+3. **Source Serif 4 holder** is whatever Fontsource's `LICENSE` says ("Google Inc."), which is not an upstream copyright line. Action, owner release-engineer: confirm the upstream copyright line (Adobe / Source Serif 4 Project Authors) at P5 release prep and add the attribution line if the OFL file lacks it.
 
 ## 3. Dependency licence summaries
 
@@ -55,11 +55,11 @@ The counts below were NOT produced by cargo-deny, which was not installed in the
 | Apache-2.0 only (tao) / Apache-2.0 WITH LLVM-exception (target-lexicon) | 2 |
 | Total third-party crates | 426 |
 
-MPL-2.0 is file-level copyleft: the five crates are used unmodified from crates.io, and their source is public at the registry. LGPL-2.1-or-later appears only as one arm of `r-efi`'s OR expression, which the MIT arm satisfies (`deny.toml`).
+MPL-2.0 is file-level copyleft: the five crates are used unmodified from crates.io, and their source is public at the registry. `r-efi` (UEFI targets only) is in `Cargo.lock` but is not among the 426; `deny.toml` records why its LGPL-2.1-or-later arm is harmless (one arm of an OR expression, satisfied by the MIT arm).
 
 ### 3.2 npm production dependencies (`app/`)
 
-Policy: `/npm-deny.json` `licenses.allow`, enforced by the `npm-deny` CI job (`bench/npm-deny/README.md`).
+Policy: `npm-deny.json` `licenses.allow`, enforced by the `npm-deny` CI job (`bench/npm-deny/README.md`).
 
 Regenerate: `node bench/npm-deny/npm-deny.mjs licenses` (pass/fail against the allow-list, the same check CI runs), and for this table, group `license` over the entries of `app/package-lock.json` whose `dev` flag is not set:
 
@@ -72,7 +72,7 @@ The 2026-11-23 run of both commands on this tree: `licenses` passed; 83 non-dev 
 | Licence | Entries | Notes |
 |---|---|---|
 | MIT | 71 | Vue, Pinia, CodeMirror 6, Lezer, markdown-it and the rest of the tree |
-| Apache-2.0 | 2 | pdfjs-dist (section 1) and typescript (listed non-dev in the lockfile; build tooling, not in the bundle) |
+| Apache-2.0 | 2 | pdfjs-dist (section 1) and typescript (`devOptional` in the lockfile, counted because the one-liner filters on `dev` only; build tooling, not in the bundle) |
 | BSD-3-Clause | 2 | source-map-js, speakingurl |
 | BSD-2-Clause | 2 | entities (two versions) |
 | OFL-1.1 | 3 | the three font packages (section 1) |

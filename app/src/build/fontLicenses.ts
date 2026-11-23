@@ -1,7 +1,8 @@
-// Also ships pdfjs-dist's LICENSE (Apache-2.0) as assets/LICENSE_pdfjs.
 // Ships the SIL OFL 1.1 licence text of each bundled font package beside the fonts (OFL-1.1 section 2: the
 // licence travels with every redistributed copy). Emits node_modules/@fontsource-variable/<pkg>/LICENSE as
 // assets/LICENSE_<pkg>, the way pdfjsData.ts ships LICENSE_FOXIT / LICENSE_LIBERATION (task #162, NFR-SEC-07).
+// It also ships pdfjs-dist's LICENSE (Apache-2.0) as assets/LICENSE_pdfjs (task #149); the plugin keeps its
+// "font" name though that one licence is not a font's.
 
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";

@@ -20,7 +20,7 @@ function walk(dir: string): string[] {
 }
 
 const licenceFiles = walk(webview)
-  .filter((p) => /^LICENSE/.test(p.split(sep).pop() as string))
+  .filter((p) => /^(LICEN[CS]E|COPYING|NOTICE|OFL)/i.test(p.split(sep).pop() as string))
   .map((p) => `crates/serat-app/webview/${relative(webview, p).split(sep).join("/")}`)
   .sort();
 
@@ -39,13 +39,13 @@ describe("third-party notices", () => {
     );
   });
 
-  it("names every LICENSE* file shipped under the webview directory", () => {
+  it("names every licence file (LICENSE*, LICENCE*, COPYING*, NOTICE*, OFL*) shipped under the webview directory", () => {
     const unlisted = licenceFiles.filter((f) => !notices.includes(`\`${f}\``));
     expect(unlisted, `add these to docs/06-release/THIRD-PARTY-NOTICES.md: ${unlisted.join(", ")}`).toEqual([]);
   });
 
   it("names no webview licence path that is not shipped", () => {
-    const named = [...notices.matchAll(/`(crates\/serat-app\/webview\/[^`]*LICENSE[^`]*)`/g)].map((m) => m[1]);
+    const named = [...notices.matchAll(/`(crates\/serat-app\/webview\/[^`]*\/(?:LICEN[CS]E|COPYING|NOTICE|OFL)[^`\/]*)`/gi)].map((m) => m[1]);
     expect(named.length).toBeGreaterThan(0);
     expect(named.filter((n) => !licenceFiles.includes(n))).toEqual([]);
   });
@@ -54,5 +54,13 @@ describe("third-party notices", () => {
     const lock = JSON.parse(readFileSync(join(repo, "app", "package-lock.json"), "utf8"));
     const version: string = lock.packages["node_modules/pdfjs-dist"].version;
     expect(notices).toContain(`pdfjs-dist ${version}`);
+  });
+
+  it("states the @fontsource-variable versions the lockfile pins", () => {
+    const lock = JSON.parse(readFileSync(join(repo, "app", "package-lock.json"), "utf8"));
+    for (const name of ["source-serif-4", "bricolage-grotesque", "jetbrains-mono"]) {
+      const version: string = lock.packages[`node_modules/@fontsource-variable/${name}`].version;
+      expect(notices, name).toContain(`\`@fontsource-variable/${name}\` ${version}`);
+    }
   });
 });
