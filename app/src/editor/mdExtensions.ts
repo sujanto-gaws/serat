@@ -15,6 +15,7 @@
 // nesting more structure than the reveal rule needs would only be overhead
 // here.
 
+import { Tag, tags } from "@lezer/highlight";
 import type { InlineContext, InlineParser, MarkdownConfig } from "@lezer/markdown";
 
 const CH_BANG = 33; // '!'
@@ -142,11 +143,31 @@ const footnoteRef: InlineParser = {
   },
 };
 
+/** Highlight tags for the Serat nodes, so `typography.ts`'s `HighlightStyle` can style them. The link-like
+ * ones are sub-tags of `tags.link`: a style written for plain links applies to them too, and a more
+ * specific rule can still tell them apart. `blockRef` and `field` are plain tags with no parent (they
+ * are always-visible machine syntax, components.md section 3), so no generic style leaks onto them. */
+export const seratTags = {
+  wikiLink: Tag.define("wikiLink", tags.link),
+  embed: Tag.define("embed", tags.link),
+  highlight: Tag.define("highlight"),
+  blockRef: Tag.define("blockRef"),
+  field: Tag.define("field"),
+  footnoteRef: Tag.define("footnoteRef", tags.link),
+};
+
 /** The one `MarkdownExtension` this module exports — pass it to
  * `markdown({ extensions: [gfmAndSeratInline] })` alongside `@lezer/markdown`'s
  * `GFM` bundle. */
 export const seratInlineSyntax: MarkdownConfig = {
-  defineNodes: ["SeratWikiLink", "SeratEmbed", "SeratHighlight", "SeratBlockRef", "SeratField", "SeratFootnoteRef"],
+  defineNodes: [
+    { name: "SeratWikiLink", style: seratTags.wikiLink },
+    { name: "SeratEmbed", style: seratTags.embed },
+    { name: "SeratHighlight", style: seratTags.highlight },
+    { name: "SeratBlockRef", style: seratTags.blockRef },
+    { name: "SeratField", style: seratTags.field },
+    { name: "SeratFootnoteRef", style: seratTags.footnoteRef },
+  ],
   parseInline: [wikiLinkAndEmbed, highlight, blockRef, inlineField, footnoteRef],
 };
 

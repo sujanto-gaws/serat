@@ -1,0 +1,80 @@
+/* Serat design tokens, light theme (docs/03-design/ui/tokens.json is the source; the token-coverage
+   test in src/tokens.test.ts fails when a `var(--serat-*)` under src/ has no definition here, or when
+   a colour here is not one tokens.json names). Custom properties inherit through shadow roots, so the
+   editor (which lives in one, for the CSP: see CodeMirrorEditor.vue) reads the same block as the shell.
+   Dark theme is P2 (NFR-USE-03): roles are named, not hard-coded, so a dark ramp adds a block and
+   renames nothing. */
+
+:root {
+  /* colour: brand */
+  --serat-indigo-50: #eff2f8;
+  --serat-indigo-100: #e4e9f2;
+  --serat-indigo-500: #2f569b;
+  --serat-indigo-600: #24457e;
+  --serat-indigo-700: #1b3660;
+  --serat-brass-100: #f3e6d2;
+  --serat-brass-500: #c08a47;
+  --serat-brass-600: #a5763a;
+  --serat-rust-100: #f1dad3;
+  --serat-rust-500: #9c4a3a;
+  --serat-rust-600: #7e3a2c;
+
+  /* colour: roles */
+  --serat-bg-app: #f3f4f1;
+  --serat-surface: #fffffe;
+  --serat-surface-raised: #fffffe;
+  --serat-surface-sunken: #e7e8e4;
+  --serat-surface-selected: #e4e9f2;
+  --serat-surface-selected-weak: #eff2f8;
+  --serat-border-hairline: #d3d5ce;
+  --serat-border-strong: #b4b7ae;
+  --serat-border-focus: #24457e;
+  --serat-text-primary: #16191b;
+  --serat-text-secondary: #4c4f49;
+  --serat-text-tertiary: #8c9088;
+  --serat-text-on-indigo: #f3f4f1;
+  --serat-link: #24457e;
+  --serat-accent: #24457e;
+  --serat-accent-interactive: #24457e;
+  --serat-accent-interactive-hover: #1b3660;
+  --serat-accent-secondary: #c08a47;
+  --serat-accent-secondary-hover: #a5763a;
+  --serat-accent-secondary-bg: #f3e6d2;
+  --serat-rust: #9c4a3a;
+  --serat-accent-error: #9c4a3a;
+  --serat-accent-error-bg: #f1dad3;
+
+  /* type: families (no webfonts are bundled yet; the stacks fall back to the system faces) */
+  --serat-font-ui: "Bricolage Grotesque", system-ui, sans-serif;
+  --serat-font-prose: "Source Serif 4", Georgia, serif;
+  --serat-font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* type: scale (size / line height) */
+  --serat-size-mono-source: 14.5px;
+  --serat-line-mono-source: 24px;
+  --serat-size-body-serif: 17px;
+  --serat-line-body-serif: 28px;
+  --serat-size-heading-sm: 19px;
+  --serat-line-heading-sm: 26px;
+  --serat-size-heading-md: 23px;
+  --serat-line-heading-md: 29px;
+  --serat-size-heading-lg: 28px;
+  --serat-line-heading-lg: 34px;
+  --serat-size-small: 12px;
+  --serat-line-small: 16px;
+  --serat-size-micro: 11px;
+  --serat-line-micro: 14px;
+  --serat-measure-prose: 72ch;
+
+  /* shape and motion */
+  --serat-radius-sm: 3px;
+  --serat-radius-md: 6px;
+  --serat-duration-micro: 120ms;
+  --serat-easing-enter: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --serat-duration-micro: 1ms;
+  }
+}

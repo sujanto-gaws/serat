@@ -23,10 +23,11 @@
 // structurally load-bearing, not typographic decoration)".
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Text } from "@codemirror/state";
+import type { EditorState, Range, Text } from "@codemirror/state";
 import { Decoration, ViewPlugin, type DecorationSet, type EditorView, type ViewUpdate } from "@codemirror/view";
 
 import { SERAT_REVEALABLE_NODE_TYPES } from "@/editor/mdExtensions";
+import { CODE_BLOCK_LINE, MONO_SOURCE_LINE } from "@/editor/typography";
 
 export interface Span {
   from: number;
@@ -87,16 +88,25 @@ function isStandardMarkNode(typeName: string): boolean {
   return typeName.endsWith("Mark");
 }
 
-/** Walks the syntax tree over `ranges` and returns every marker span that
- * should be hidden given `selectedLines` — pure and DOM-free, so it is unit
- * tested directly against a plain `EditorState` rather than only through a
- * mounted `EditorView`. */
-export function collectHiddenMarkerSpans(
-  state: EditorState,
-  ranges: readonly Span[],
-  selectedLines: ReadonlySet<number>,
-): Span[] {
-  const spans: Span[] = [];
+export interface RevealScan {
+  /** Marker spans to hide: every marker not on a selected line. */
+  hidden: Span[];
+  /** `from` of every selected line that carries at least one marker, i.e. a line showing raw syntax.
+   * Those lines take the `mono-source` class (components.md section 3). A selected line with no syntax
+   * on it stays in the prose face: switching a plain paragraph to mono because the caret entered it
+   * would be a font change with nothing revealed. */
+  revealedLines: Set<number>;
+  /** `from` of every line inside a fenced or indented code block in `ranges`. */
+  codeLines: Set<number>;
+}
+
+/** One walk of the syntax tree over `ranges`: the marker spans to hide, which selected lines are showing
+ * raw syntax, and which lines are code. Pure and DOM-free, so it is unit tested directly against a plain
+ * `EditorState` rather than only through a mounted `EditorView`. */
+export function scanReveal(state: EditorState, ranges: readonly Span[], selectedLines: ReadonlySet<number>): RevealScan {
+  const hidden: Span[] = [];
+  const revealedLines = new Set<number>();
+  const codeLines = new Set<number>();
   const tree = syntaxTree(state);
   for (const { from, to } of ranges) {
     tree.iterate({
@@ -104,45 +114,65 @@ export function collectHiddenMarkerSpans(
       to,
       enter: (node) => {
         const name = node.type.name;
+        if (name === "FencedCode" || name === "CodeBlock") {
+          const last = state.doc.lineAt(Math.min(node.to, state.doc.length)).number;
+          for (let n = state.doc.lineAt(node.from).number; n <= last; n++) codeLines.add(state.doc.line(n).from);
+          // fall through: a fence's `CodeMark`s are still markers
+        }
         const isCustom = SERAT_REVEALABLE_NODE_TYPES.has(name);
         const isStandard = isStandardMarkNode(name);
         if (!isCustom && !isStandard) {
           return;
         }
-        const lineNumber = state.doc.lineAt(node.from).number;
-        if (selectedLines.has(lineNumber)) {
-          return; // this line is revealed: leave the raw syntax alone
+        const line = state.doc.lineAt(node.from);
+        if (selectedLines.has(line.number)) {
+          // this line is revealed: leave the raw syntax alone
+          if (isStandard ? node.from < node.to : true) revealedLines.add(line.from);
+          return;
         }
         if (isStandard) {
           if (node.from < node.to) {
-            spans.push({ from: node.from, to: node.to });
+            hidden.push({ from: node.from, to: node.to });
           }
         } else {
           const text = state.sliceDoc(node.from, node.to);
           for (const span of customMarkerSpans(name, node.from, node.to, text)) {
             if (span.from < span.to) {
-              spans.push(span);
+              hidden.push(span);
             }
           }
         }
       },
     });
   }
-  return spans;
+  return { hidden, revealedLines, codeLines };
 }
+
+/** The marker spans `scanReveal` would hide (the original FR-EDT-02 entry point). */
+export function collectHiddenMarkerSpans(
+  state: EditorState,
+  ranges: readonly Span[],
+  selectedLines: ReadonlySet<number>,
+): Span[] {
+  return scanReveal(state, ranges, selectedLines).hidden;
+}
+
+const monoLine = Decoration.line({ class: MONO_SOURCE_LINE });
+const codeLine = Decoration.line({ class: `${MONO_SOURCE_LINE} ${CODE_BLOCK_LINE}` });
 
 function buildDecorations(view: EditorView): DecorationSet {
   const selectedLines = selectedLineNumbers(
     view.state.doc,
     view.state.selection.ranges.map((r) => ({ from: r.from, to: r.to })),
   );
-  const spans = collectHiddenMarkerSpans(view.state, view.visibleRanges, selectedLines).sort(
-    (a, b) => a.from - b.from || a.to - b.to,
-  );
-  const decorations = spans
+  const scan = scanReveal(view.state, view.visibleRanges, selectedLines);
+  const spans = scan.hidden.sort((a, b) => a.from - b.from || a.to - b.to);
+  const decorations: Range<Decoration>[] = spans
     .filter((span, index) => index === 0 || span.from >= spans[index - 1].to) // never overlap
     .map((span) => Decoration.replace({}).range(span.from, span.to));
-  return Decoration.set(decorations);
+  for (const from of scan.codeLines) decorations.push(codeLine.range(from));
+  for (const from of scan.revealedLines) if (!scan.codeLines.has(from)) decorations.push(monoLine.range(from));
+  return Decoration.set(decorations, true);
 }
 
 /** The reveal-rule `ViewPlugin` (FR-EDT-02). Mounted once, in

@@ -47,6 +47,7 @@ import { LinkResolver } from "@/editor/linkResolver";
 import { linkExtensions, linkNodeAt } from "@/editor/links";
 import { refreshLinks } from "@/editor/linkState";
 import { revealMarkersPlugin } from "@/editor/reveal";
+import { modeClass, typographyExtensions } from "@/editor/typography";
 import { syntaxTree } from "@codemirror/language";
 import { defaultLinkIpc, type LinkIpcAdapter } from "@/ipc/linkAdapter";
 import { defaultEditorIpc, type EditorIpcAdapter } from "@/ipc/editorAdapter";
@@ -110,6 +111,9 @@ const revealCompartment = new Compartment();
 /** Live-preview-only extensions: the inline reveal rule and block widgets. Split
  * mode (FR-EDT-10) drops both together. */
 const liveExtensions: Extension[] = [revealMarkersPlugin, blockWidgetsExtension()];
+/** `serat-live` or `serat-source` on `.cm-content`: the switch typography.ts keys on (serif prose and
+ * headings vs mono-source throughout). Reconfigured with `revealCompartment`, never rebuilt. */
+const modeCompartment = new Compartment();
 const dirty = ref(false);
 const previewSource = ref("");
 /** True only while `loadNote`/`setText` replace the whole state — that must
@@ -686,6 +690,8 @@ function buildExtensions(livePreview: boolean): Extension[] {
     EditorView.editable.of(!!buffer),
     seratMarkdown(),
     revealCompartment.of(livePreview ? liveExtensions : []),
+    modeCompartment.of(modeClass(livePreview ? "live" : "source")),
+    ...typographyExtensions(),
     ...linkExtensions({ ipc: props.linkIpc, resolver, getSourcePath: () => buffer?.path ?? null }),
     keymapCompartment.of(buildEditorExtensions(registry)),
     EditorView.lineWrapping,
@@ -776,7 +782,12 @@ onBeforeUnmount(() => {
 watch(
   () => props.livePreview,
   (enabled) => {
-    view?.dispatch({ effects: revealCompartment.reconfigure(enabled ? liveExtensions : []) });
+    view?.dispatch({
+      effects: [
+        revealCompartment.reconfigure(enabled ? liveExtensions : []),
+        modeCompartment.reconfigure(modeClass(enabled ? "live" : "source")),
+      ],
+    });
   },
 );
 
