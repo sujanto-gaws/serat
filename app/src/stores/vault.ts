@@ -42,6 +42,21 @@ export function describeIndexDetail(state: IndexState): string | null {
   return state.kind === "opening" ? (openingCopy(state)?.detail ?? null) : null;
 }
 
+/** Copy brief index-state-copy.md, "Index check found problems". No number in the visible text. */
+export const INDEX_CHECK_TEXT = "Index check found problems";
+
+/** The ONE utterance for the update that brings the fact: it replaces the Rebuilding announcement that
+ * update would otherwise queue. */
+export const INDEX_CHECK_ANNOUNCEMENT =
+  "Index check found problems. Rebuilding the index from your notes. You can keep editing.";
+
+/** Tooltip / accessible description of that fact: the count lives only here. */
+export function describeIndexCheckDetail(count: number): string {
+  return `When Serat last closed unexpectedly, its check of the search index found ${count} ${
+    count === 1 ? "problem" : "problems"
+  }, so it is rebuilding the index from your notes. Your notes are not affected. You can keep editing.`;
+}
+
 /** §3.4: a rebuild is a status line, never a modal, never a blocking spinner. */
 export function describeIndexState(state: IndexState): string {
   switch (state.kind) {
@@ -82,6 +97,13 @@ export const useVaultStore = defineStore("vault", {
     /** A cleared reason just left the strip at a plain Opening: that state is not announced (it lasts until
      * the open check's first state and would be noise); the state after it is. */
     indexAfterWaiting: false,
+    /** The check announcement was made: the Ready or Unavailable that ends the rebuild is announced once,
+     * with its visible text (#157, the same gap as #117b SF1). */
+    indexAfterCheck: false,
+    /** `IndexStatus.index_check_problems` (#69, #157): the post-unclean-open check found this many problems and
+     * a rebuild is running. `null` = absent (never zero). The visible fact carries no number; the count is
+     * only in the tooltip. */
+    indexCheckProblems: null as number | null,
     /** The note the open buffer holds, vault-relative. `null` when nothing is open. */
     openNote: null as string | null,
     /** The hash the buffer was read at — the optimistic lock of architecture §6.1. */
@@ -117,7 +139,11 @@ export const useVaultStore = defineStore("vault", {
     vaultOpened(opened: VaultOpened) {
       this.announced = true; // from now on, no poll may set the id, even after a failed open
       if (!opened.vault_id) return; // never adopt an empty id
-      if (opened.vault_id !== this.vaultId) this.refusedNames = null; // another vault: the old count is not its count
+      if (opened.vault_id !== this.vaultId) {
+        this.refusedNames = null; // another vault: the old count is not its count
+        this.indexCheckProblems = null; // nor its check fact
+        this.indexAfterCheck = false;
+      }
       this.vaultId = opened.vault_id;
       this.vaultOpen = true;
       this.vaultRoot = opened.root;
@@ -140,6 +166,8 @@ export const useVaultStore = defineStore("vault", {
     openFailed() {
       this.vaultOpen = false;
       this.refusedNames = null; // no vault, nothing to count
+      this.indexCheckProblems = null;
+      this.indexAfterCheck = false;
       this.vaultRoot = null;
       this.openNote = null;
       this.baseHash = null;
@@ -187,6 +215,10 @@ export const useVaultStore = defineStore("vault", {
           this.indexAnnouncementKind = state.kind;
           this.indexAfterWaiting = false;
         }
+      } else if (detail === null && this.indexAfterCheck && state.kind !== "rebuilding") {
+        this.indexAnnouncement = text; // the Ready or Unavailable that ends the rebuild: once, visible text
+        this.indexAnnouncementKind = state.kind;
+        this.indexAfterCheck = false;
       } else if (detail === null && state.kind !== this.indexAnnouncementKind) {
         // Cleared only on a change of kind, not on each progress event: a polite region can drop a
         // snapshot that is wiped milliseconds after it is written (worst on WebKit).
@@ -202,12 +234,27 @@ export const useVaultStore = defineStore("vault", {
     /** One entry for an `index://status` event and the late-subscriber poll alike (architecture 3.4): the state
      * text and the refused-names count, which is `null` when the status omits it (`None`: not counting yet, or
      * no vault open; never zero, FR-VLT-01). */
-    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names">, source: "event" | "poll") {
+    applyIndexStatus(status: Pick<IndexStatus, "state" | "refused_names" | "index_check_problems">, source: "event" | "poll") {
       // The poll is not ordered against events: once an event has spoken, its (newer) facts win.
       if (source === "poll" && this.statusEventSeen) return;
       if (source === "event") this.statusEventSeen = true;
       this.setIndexState(status.state);
       this.setRefusedNames(status.refused_names ?? null);
+      this.setIndexCheckProblems(status.index_check_problems ?? null, status.state.kind);
+    },
+    /** The quiet "index check found problems" fact. Announced once when it appears (it replaces whatever the
+     * state change just queued: it is the more specific news), never again on progress events; cleared when
+     * the field goes absent. A count of 0 is treated as absent (the contract never sends it). */
+    setIndexCheckProblems(count: number | null, stateKind: IndexState["kind"]) {
+      // Only beside Rebuilding (goal 5): a Ready carrying the field would be a backend bug, not news.
+      const next = stateKind === "rebuilding" && count !== null && count > 0 ? count : null;
+      if (next !== null && this.indexCheckProblems === null) {
+        this.indexAnnouncement = INDEX_CHECK_ANNOUNCEMENT;
+        this.indexAnnouncementKind = stateKind;
+        this.indexAfterWaiting = false;
+        this.indexAfterCheck = true;
+      }
+      this.indexCheckProblems = next;
     },
     setOpenBuffer(note: string | null, baseHash: string | null) {
       this.openNote = note;

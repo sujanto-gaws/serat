@@ -151,3 +151,54 @@ describe("App status strip: held by another process (#155)", () => {
     vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
   });
 });
+
+describe("App status strip: index check found problems (#157)", () => {
+  it("renders one quiet fact beside Rebuilding, announced once, cleared when the field goes absent", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((name: string, h: (e: { payload: unknown }) => void) => {
+      handlers.set(name, h);
+      return Promise.resolve(() => undefined);
+    }) as never);
+    const wrapper = mount(App, { global: { plugins: [createPinia()] }, attachTo: document.body });
+    await vi.advanceTimersByTimeAsync(0);
+    const send = async (state: unknown, extra: object = {}) => {
+      handlers.get("index://status")!({ payload: { vault_id: "A", state, ...extra } });
+      await wrapper.vm.$nextTick();
+    };
+    const live = wrapper.find('[data-testid="index-live"]').element;
+    const announced: string[] = [];
+    const observer = new MutationObserver(() => {
+      if ((live.textContent ?? "") !== "") announced.push(live.textContent ?? "");
+    });
+    observer.observe(live, { childList: true, characterData: true, subtree: true });
+    const flush = async () => {
+      await new Promise<void>((r) => queueMicrotask(r));
+      await new Promise<void>((r) => queueMicrotask(r));
+    };
+    const rebuilding = (done: number) => ({ kind: "rebuilding", reason: "corrupt", done, total: 10, walk_complete: false });
+    expect(wrapper.find('[data-testid="index-check-problems"]').exists()).toBe(false);
+
+    await send(rebuilding(0), { index_check_problems: 3 });
+    await flush();
+    const fact = wrapper.get('[data-testid="index-check-problems"]');
+    expect(fact.text()).toBe("Index check found problems");
+    expect(fact.text()).not.toMatch(/\d/);
+    expect(fact.attributes("title")).toContain("found 3 problems");
+    expect(wrapper.get(`#${fact.attributes("aria-describedby")!}`).text()).toContain("3 problems");
+    expect(announced).toEqual(["Index check found problems. Rebuilding the index from your notes. You can keep editing."]); // exactly one utterance
+
+    for (let done = 1; done < 6; done++) await send(rebuilding(done), { index_check_problems: 3 });
+    await flush();
+    expect(announced).toHaveLength(1);
+
+    await send({ kind: "ready", note_count: 4 });
+    await flush();
+    expect(wrapper.find('[data-testid="index-check-problems"]').exists()).toBe(false);
+    expect(announced).toHaveLength(2); // then Ready: exactly one more utterance
+    expect(announced[1]).toBe("index: ready · 4 notes");
+    observer.disconnect();
+    wrapper.unmount();
+    vi.mocked(listen).mockImplementation(() => new Promise(() => {}));
+  });
+});

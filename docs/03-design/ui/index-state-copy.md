@@ -59,7 +59,16 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 - **Progress events** (`done`/`total` moving) are silent.
 - **A change of reason within `Rebuilding`** (one rebuild ends and another starts) is announced once, as an entry.
 - **When #157's fact arrives in the same update**, the fact's utterance replaces this one, as #157's section rules, so that update makes exactly one announcement.
-- **The `Ready` or `Unavailable` that follows** is announced as usual.
+- **The `Ready` or `Unavailable` that ends an announced `Rebuilding`** is announced once, with its visible text, so a screen-reader user hears that the rebuild finished. A `Ready` that follows a `Rebuilding` that was never announced stays silent.
+
+## Index check found problems (ratified, #157)
+
+`IndexStatus.index_check_problems` is present only while a rebuild that the post-unclean-open integrity check started (#69, reason `corrupt`) is running, and is never zero. The strip shows **one quiet fact beside the `Rebuilding` text** while it is present and removes it when the field goes absent.
+
+- **Visible text** (no number, no second "rebuilding": the `Rebuilding` line beside it already says so): `Index check found problems`
+- **Tooltip / accessible description** (the count appears only here; `problem` when N is 1): `When Serat last closed unexpectedly, its check of the search index found N problems, so it is rebuilding the index from your notes. Your notes are not affected. You can keep editing.`
+- **Announcement:** once, politely, in the same update that moves the strip to `Rebuilding`, as **one** utterance that replaces the `Rebuilding` announcement that update would otherwise queue: `Index check found problems. Rebuilding the index from your notes. You can keep editing.` Not repeated on progress events; nothing when the fact clears; the `Ready` or `Unavailable` that ends the rebuild is announced once, with its visible text.
+- Neutral colour (`text-secondary`), no icon alarm, no modal, no action: the rebuild is already running and there is nothing for the user to do.
 
 ## What the front end must not do
 
@@ -78,4 +87,5 @@ Until #96, `Opening` lasted only the open check, 5–8 ms on a warm index, so "i
 
 - For every `RebuildReason` member in `contracts/ipc.rs`, `describeIndexState({ kind: "rebuilding", reason, done, total, walk_complete })` starts with that row's reason phrase. **No visible string, and no tooltip, contains any raw `RebuildReason` wire value** (`no_index`, `index_version`, `interrupted`, `vault_moved`, `corrupt`, `user_requested`). The test iterates the members, so a member added to the contract without a row fails it.
 - An unrecognised `reason` renders `Rebuilding index` with the generic tooltip and does not throw.
-- Entering `Rebuilding` makes one announcement with the reason phrase; progress events make none; a change of reason makes one.
+- Entering `Rebuilding` makes one announcement with the reason phrase; progress events make none; a change of reason makes one. The `Ready` or `Unavailable` that ends an announced `Rebuilding` makes one more, with its visible text; after an unannounced `Rebuilding` a `Ready` makes none.
+- `index_check_problems` present renders `Index check found problems` beside the `Rebuilding` text, with no digit and no second "rebuilding", and the count only in the tooltip; absent (or 0) renders nothing (#157). The update that brings the fact makes exactly one live-region announcement.
