@@ -50,6 +50,7 @@ owner: lead
 | 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol merged; report last |
 | 30 | `[P1/design] Account for FR-NAV-08 in architecture.md so doclint passes` | architect | 1 | **merged** db1d967 |
 | 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | **merged** as #141; old branch superseded |
+| 75 | `[P1/design] Ratify or re-token the editor's 48 px bottom scroll margin` (NFR-PRF-02, FR-EDT-01, US-35) | frontend-designer | 42 | **merged** 28ab56a (kept as named token exception) |
 | 32 | `[P1/req] Amend FR-VLT-01 and NFR-PRF-02 to the owner-approved definitions` (PRD v1.6) | product-analyst | 2, 5 | **merged** 857af57 |
 | 33 | `[P1/impl] Implement ADR-0016 patch-set application and edit-script in serat-vault` | rust-core-dev | 5 | **merged** (with #55) |
 | 34 | `[P1/impl] Close the Windows drive-relative path escape in VaultPath and Vault::resolve` — **live security defect** (NFR-SEC-06, T-07, T-10). Scope: reject `:` in any segment; reject Windows device names and trailing dot/space; `starts_with(root)` after resolve; case-fold the ignored-dir check. ADR-0017 relies on all four. | rust-core-dev | — | **merged** |
@@ -102,11 +103,12 @@ owner: lead
 | 149 | `[P5/release] Third-party notices for the shipped cMaps (Adobe), Foxit and Liberation fonts` (NFR-SEC-07) | release-engineer | 127 | pending |
 | 150 | `[P1/design] ADR-0018 describes the shipped locality API` | architect | 143 | **merged** d1356b4 (150b) |
 | 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | **merged** 1ab859e (3 rounds) |
-| 152 | `[P1/design] Collapsed-callout glyph and aria-expanded` | frontend-designer | 146 | pending |
+| 152 | `[P1/design] Collapsed-callout glyph and aria-expanded` | frontend-designer | 146 | **merged** 485c368 (+152b a7b1be6) |
+| 159 | `[P1/impl] Build the collapsed-callout fold marker per the #152 spec` (FR-EDT-01/02, NFR-USE-01) | vue-frontend-dev | 152 | **merged** 0b50a7c |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
-| 156 | `[P1/req] product-analyst ratifies the A-02 consequence sentence applied by the lead` | product-analyst | 154 | pending (no product-analyst agent live) |
+| 156 | `[P1/req] product-analyst ratifies the A-02 consequence sentence applied by the lead` | product-analyst | 154 | **merged** 3db6644 |
 | 68 | `[P1/impl] TreeSession replay to a new channel on webview reload` (FR-VLT-01, NFR-PRF-01; ADR-0015) | rust-core-dev + tauri-app-dev | 18 | **merged** (gate68, 2026-11-23) |
 | 69 | `[P1/impl] Background quick_check after an unclean open` (NFR-REL-01/02, C-02; ADR-0002, ADR-0011) | rust-core-dev + tauri-app-dev | 18 | **merged** 8c6d21b |
 | 157 | `[P1/impl] Strip renders index_check_problems` (NFR-REL-01/02, US-07) | vue-frontend-dev | 69 | **merged** 8145f26 |
