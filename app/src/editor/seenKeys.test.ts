@@ -75,10 +75,10 @@ describe("derived seenKeys", () => {
     expect(ids).toContain("Shift-Ctrl-a");
   });
 
-  it.each(["mac", "win", "linux"] as const)("%s: the named set is exactly the 13 named defaults, and no passthrough shares a chord with one", (platform) => {
+  it.each(["mac", "win", "linux"] as const)("%s: the named set is exactly the 13 bound named defaults (Toggle callout fold has no chord), and no passthrough shares a chord with one", (platform) => {
     const list = createEditorCommandRegistry(handlers, platform).list();
     const named = list.filter((c) => !c.id.startsWith("editor.cm"));
-    expect(named.map((c) => c.defaultBinding).sort()).toEqual(
+    expect(named.map((c) => c.defaultBinding).filter((b) => b !== undefined).sort()).toEqual(
       ["Mod-s", "Mod-Shift-m", "Mod-Enter", "Mod-z", "Mod-y", "Enter", "Backspace", "ArrowDown", "ArrowUp", "PageDown", "PageUp", "Escape", "Ctrl-Space"].sort(),
     );
     const folded = new Set(named.map((c) => normaliseChord(c.defaultBinding ?? "", platform)));

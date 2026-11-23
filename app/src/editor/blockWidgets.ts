@@ -30,7 +30,7 @@
 // tables cost.
 
 import { syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
-import { EditorState, RangeSetBuilder, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
+import { EditorState, RangeSetBuilder, StateEffect, StateField, Text, type Extension, type Transaction } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
@@ -214,12 +214,73 @@ class ImageEmbedWidget extends WidgetType {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Callout fold state (#159; editor.md "Callouts and the fold marker"). VIEW state only: toggling dispatches
+// an effect and never a document change, so nothing is patched or saved, the unsaved dot does not appear, the
+// undo stack is untouched and the `-` / `+` marker stays as written (C-01, C-04).
+// ---------------------------------------------------------------------------
+
+export type CalloutFold = "collapsed" | "expanded";
+
+interface FoldToggle {
+  /** The callout's block start (the widget's range start, `view.posAtDOM`). */
+  from: number;
+  fold: CalloutFold;
+}
+
+const foldToggled = StateEffect.define<FoldToggle>();
+
+/** Toggled states, keyed by the callout's start position mapped through edits (assoc 1: a line inserted
+ * above carries the callout's state with it). Survives edits elsewhere and the caret revealing and
+ * re-hiding the source; a fresh editor state (reopening a note) starts empty, so the marker decides again.
+ * Not written to the file, the index or the vault. */
+export const calloutFoldField = StateField.define<ReadonlyMap<number, CalloutFold>>({
+  create: () => new Map(),
+  update(value, tr) {
+    let next: Map<number, CalloutFold> | null = null;
+    if (tr.docChanged && value.size > 0) {
+      next = new Map();
+      for (const [pos, fold] of value) next.set(tr.changes.mapPos(pos, 1), fold);
+    }
+    for (const effect of tr.effects) {
+      if (effect.is(foldToggled)) {
+        next = new Map(next ?? value);
+        next.set(effect.value.from, effect.value.fold);
+      }
+    }
+    return next ?? value;
+  },
+});
+
+/** The block starts a transaction toggled (their widgets must be rebuilt). */
+function toggledStarts(tr: Transaction): number[] {
+  const out: number[] = [];
+  for (const effect of tr.effects) if (effect.is(foldToggled)) out.push(effect.value.from);
+  return out;
+}
+
+/** Non-blank source lines of a callout body: the number the collapsed title reports. */
+export function countBodyLines(body: string): number {
+  return body.split("\n").filter((line) => line.trim() !== "").length;
+}
+
+let calloutBodySeq = 0;
+const GLYPH_CLASS = "serat-callout-glyph";
+
 class CalloutWidget extends WidgetType {
+  /** Foldable = has a `-`/`+` marker AND a non-empty body (editor.md). */
+  private readonly lines: number;
+  private readonly foldable: boolean;
+
   constructor(
     private readonly header: CalloutHeader,
     private readonly bodyText: string,
+    /** The effective state: a toggle in this session, else the marker's. `null` for a non-foldable callout. */
+    private readonly fold: CalloutFold | null,
   ) {
     super();
+    this.lines = countBodyLines(bodyText);
+    this.foldable = header.fold !== null && this.lines > 0;
   }
 
   eq(other: CalloutWidget): boolean {
@@ -227,24 +288,55 @@ class CalloutWidget extends WidgetType {
       this.header.type === other.header.type &&
       this.header.title === other.header.title &&
       this.header.fold === other.header.fold &&
+      this.foldState() === other.foldState() &&
       this.bodyText === other.bodyText
     );
   }
 
-  toDOM(): HTMLElement {
+  private foldState(): CalloutFold | null {
+    return this.foldable ? (this.fold ?? this.header.fold) : null;
+  }
+
+  /** Everything except the fold state: if it differs the DOM is rebuilt, if not it is patched in place so the
+   * glyph's turn can transition. */
+  private signature(): string {
+    return JSON.stringify([this.header.type, this.header.title, this.header.fold, this.bodyText]);
+  }
+
+  private countText(): string {
+    return `${this.lines} ${this.lines === 1 ? "line" : "lines"} hidden`;
+  }
+
+  private applyFold(dom: HTMLElement): void {
+    const state = this.foldState();
+    if (state === null) return;
+    const collapsed = state === "collapsed";
+    dom.setAttribute("data-fold", state);
+    const row = dom.querySelector<HTMLElement>(".serat-callout-title");
+    row?.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const body = dom.querySelector<HTMLElement>(".serat-callout-body");
+    if (body) body.hidden = collapsed; // never animated: a height transition would run layout in the frame
+    const count = dom.querySelector<HTMLElement>(".serat-callout-count");
+    if (count) count.hidden = !collapsed;
+  }
+
+  toDOM(view?: EditorView): HTMLElement {
     const container = document.createElement("div");
     container.className = `serat-callout serat-callout-${this.header.type}`;
     container.setAttribute("data-callout", this.header.type);
-    if (this.header.fold !== null) container.setAttribute("data-fold", this.header.fold);
+    container.setAttribute("data-sig", this.signature());
+    if (this.foldable) container.classList.add("serat-callout-foldable");
     const title = document.createElement("div");
     title.className = "serat-callout-title";
-    title.textContent = this.header.title;
-    container.appendChild(title);
-    if (this.bodyText.trim()) {
-      const body = document.createElement("div");
+    const titleText = document.createElement("span");
+    titleText.className = "serat-callout-title-text";
+    titleText.textContent = this.header.title;
+
+    let body: HTMLElement | null = null;
+    if (this.lines > 0) {
+      body = document.createElement("div");
       body.className = "serat-callout-body";
-      // Initial fold state from the `-` marker; display only, no document change.
-      if (this.header.fold === "collapsed") body.hidden = true;
+      body.id = `serat-callout-body-${++calloutBodySeq}`;
       // Text nodes and <br>, no HTML parsing at all: full inline-Markdown
       // rendering inside a callout body is split-preview's job for now, the
       // same trade-off `readTableModel` documents for table cells.
@@ -252,17 +344,105 @@ class CalloutWidget extends WidgetType {
         .trim()
         .split("\n")
         .forEach((line, index) => {
-          if (index > 0) body.appendChild(document.createElement("br"));
-          body.appendChild(document.createTextNode(line));
+          if (index > 0) body!.appendChild(document.createElement("br"));
+          body!.appendChild(document.createTextNode(line));
         });
-      container.appendChild(body);
     }
+
+    if (this.foldable && body) {
+      title.setAttribute("role", "button");
+      title.tabIndex = 0;
+      title.setAttribute("aria-controls", body.id);
+      const glyph = document.createElement("span");
+      glyph.className = GLYPH_CLASS;
+      glyph.setAttribute("aria-hidden", "true");
+      const chevron = document.createElement("span");
+      chevron.className = "serat-callout-chevron";
+      glyph.appendChild(chevron);
+      title.appendChild(glyph);
+      title.appendChild(titleText);
+      // The accessible name is the title plus the count while collapsed ("Remember to rebase, 3 lines
+      // hidden"): the separator is visually hidden text, so no aria-label overrides the content.
+      const count = document.createElement("span");
+      count.className = "serat-callout-count";
+      const sep = document.createElement("span");
+      sep.className = "serat-callout-sep";
+      sep.textContent = ", ";
+      count.appendChild(sep);
+      count.appendChild(document.createTextNode(this.countText()));
+      title.appendChild(count);
+
+      const toggle = (): void => {
+        if (!view) return;
+        const current = container.getAttribute("data-fold") === "collapsed" ? "collapsed" : "expanded";
+        view.dispatch({
+          effects: foldToggled.of({ from: view.posAtDOM(container), fold: current === "collapsed" ? "expanded" : "collapsed" }),
+        });
+      };
+      // The glyph box toggles the fold in the preview and does nothing else: the mousedown default (focus,
+      // caret placement) is cancelled, and `ignoreEvent` keeps CodeMirror from turning the click into a selection.
+      glyph.addEventListener("mousedown", (event) => event.preventDefault());
+      glyph.addEventListener("click", (event) => {
+        event.preventDefault();
+        toggle();
+      });
+      title.addEventListener("keydown", (event) => {
+        if (event.target !== title) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          toggle();
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          view?.focus();
+        }
+      });
+    } else {
+      title.appendChild(titleText);
+    }
+    container.appendChild(title);
+    if (body) container.appendChild(body);
+    this.applyFold(container);
     return container;
   }
 
-  ignoreEvent(): boolean {
+  updateDOM(dom: HTMLElement): boolean {
+    if (dom.getAttribute("data-sig") !== this.signature()) return false;
+    this.applyFold(dom);
+    return true;
+  }
+
+  ignoreEvent(event: Event): boolean {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return false;
+    // Inside the glyph box the widget owns the event; everywhere else the caret lands in the block and the
+    // source is revealed (FR-EDT-02).
+    if (target.closest(`.${GLYPH_CLASS}`)) return true;
+    if (event instanceof KeyboardEvent && target.matches(".serat-callout-title[role=button]")) {
+      return event.key === "Enter" || event.key === " " || event.key === "Tab" || event.key === "Escape";
+    }
     return false;
   }
+}
+
+/** The palette command "Toggle callout fold": toggles the foldable callout containing the caret, rendered
+ * or revealed, with no focus change. `false` when the caret is in no foldable callout. */
+export function toggleCalloutFoldAtCaret(view: EditorView): boolean {
+  const state = view.state;
+  const folds = state.field(calloutFoldField, false);
+  if (!folds) return false;
+  const head = state.selection.main.head;
+  for (const span of touchedTopLevelBlocks(state, head)) {
+    const block = state.doc.sliceString(span.from, span.to);
+    const firstLine = block.split("\n", 1)[0];
+    const header = parseCalloutHeader(firstLine);
+    if (!header || header.fold === null) continue;
+    const body = stripBlockquoteMarkers(block.slice(firstLine.length).replace(/^\n/, ""));
+    if (countBodyLines(body) === 0) continue;
+    const current = folds.get(span.from) ?? header.fold;
+    view.dispatch({ effects: foldToggled.of({ from: span.from, fold: current === "collapsed" ? "expanded" : "collapsed" }) });
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +495,7 @@ function decorationForNode(state: EditorState, node: SyntaxNode): BlockDecoratio
     return {
       from: node.from,
       to: node.to,
-      decoration: Decoration.replace({ widget: new CalloutWidget(header, body), block: true }),
+      decoration: Decoration.replace({ widget: new CalloutWidget(header, body, state.field(calloutFoldField, false)?.get(node.from) ?? null), block: true }),
     };
   }
   return null;
@@ -589,11 +769,28 @@ function computeDirtyRegions(tr: Transaction, examined: number, reliable: number
  * on/off per `livePreview` the same way `reveal.ts`'s plugin is toggled —
  * `CodeMirrorEditor.vue` wraps both in the same `Compartment` so split mode
  * (no hide/reveal at all, per FR-EDT-10) drops both together. */
-export const blockWidgetsField = StateField.define<BlockWidgetState>({
+export const blockWidgetsField: StateField<BlockWidgetState> = StateField.define<BlockWidgetState>({
   create(state) {
     return buildAll(state);
   },
   update(value, tr) {
+    const result = updateBlockWidgets(value, tr);
+    // A toggled callout's widget is rebuilt (its effective fold state changed); nothing else is.
+    const toggled = toggledStarts(tr);
+    if (toggled.length === 0) return result;
+    const selectedLines = selectedLineNumbers(
+      tr.state.doc,
+      tr.state.selection.ranges.map((r) => ({ from: r.from, to: r.to })),
+    );
+    let deco = result.deco;
+    for (const from of toggled) deco = replaceRegion(deco, tr.state, { from, to: from + 1 }, selectedLines);
+    return { deco, examined: result.examined };
+  },
+  provide: (field) => EditorView.decorations.from(field, (value) => value.deco),
+});
+
+function updateBlockWidgets(value: BlockWidgetState, tr: Transaction): BlockWidgetState {
+  {
     // Resolved paths arrived (or were refreshed): embed widgets depend on them
     // and the answer can touch any embed in view, so rebuild once. This is an
     // IPC-arrival event, not a keystroke.
@@ -631,9 +828,8 @@ export const blockWidgetsField = StateField.define<BlockWidgetState>({
       next = replaceRegion(next, tr.state, region, selectedLines);
     }
     return { deco: next, examined: nextExamined };
-  },
-  provide: (field) => EditorView.decorations.from(field, (value) => value.deco),
-});
+  }
+}
 
 /** Minimal widget styling (serat-identity.md tokens, with fallbacks). Injected
  * by CodeMirror into the editor's shadow root, so it needs no CSP exception. */
@@ -653,8 +849,59 @@ const widgetTheme = EditorView.baseTheme({
     margin: "0.4em 0",
   },
   ".serat-callout-title": { fontWeight: "600" },
+  // Fold glyph, count, focus (editor.md "Callouts and the fold marker"): tokens with fallbacks.
+  ".serat-callout-foldable .serat-callout-title": { display: "flex", alignItems: "center", cursor: "default" },
+  ".serat-callout-foldable .serat-callout-title:focus-visible": {
+    outline: "2px solid var(--serat-border-focus, #24457e)",
+    outlineOffset: "1px",
+  },
+  ".serat-callout-glyph": {
+    flex: "0 0 auto",
+    boxSizing: "border-box",
+    width: "24px",
+    height: "24px",
+    margin: "-4px 0 -4px -10px", // the box reaches into the title row's leading padding: the text does not move
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
+    color: "var(--serat-text-secondary, rgba(22, 25, 27, 0.7))",
+    borderRadius: "var(--serat-radius-sm, 3px)",
+  },
+  ".serat-callout-glyph:hover, .serat-callout-title:focus-visible .serat-callout-glyph": {
+    color: "var(--serat-accent-interactive, #24457e)",
+  },
+  ".serat-callout-glyph:hover": { background: "var(--serat-surface-sunken, rgba(22, 25, 27, 0.06))" },
+  ".serat-callout-chevron": {
+    display: "block",
+    width: "7px",
+    height: "7px",
+    borderRight: "1.5px solid currentColor",
+    borderBottom: "1.5px solid currentColor",
+    transform: "rotate(-45deg)", // collapsed: points right
+    transition: "transform var(--serat-duration-micro, 120ms) var(--serat-easing-enter, cubic-bezier(0, 0, 0.2, 1))",
+  },
+  '.serat-callout[data-fold="expanded"] .serat-callout-chevron': { transform: "rotate(45deg)" }, // points down
+  ".serat-callout-count": {
+    marginLeft: "auto",
+    paddingLeft: "12px",
+    fontSize: "12px",
+    fontWeight: "400",
+    color: "var(--serat-text-secondary, rgba(22, 25, 27, 0.7))",
+  },
+  ".serat-callout-sep": {
+    position: "absolute",
+    width: "1px",
+    height: "1px",
+    overflow: "hidden",
+    clip: "rect(0 0 0 0)",
+    whiteSpace: "nowrap",
+  },
+  "@media (prefers-reduced-motion: reduce)": {
+    ".serat-callout-chevron": { transitionDuration: "1ms" },
+  },
 });
 
 export function blockWidgetsExtension(): Extension {
-  return [resolutionsField, blockWidgetsField, widgetTheme];
+  return [resolutionsField, calloutFoldField, blockWidgetsField, widgetTheme];
 }
