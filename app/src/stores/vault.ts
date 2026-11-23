@@ -43,11 +43,16 @@ export function describeIndexDetail(state: IndexState): string | null {
 }
 
 /** Copy brief index-state-copy.md, "Index check found problems". No number in the visible text. */
-export const INDEX_CHECK_TEXT = "Index check found problems — rebuilding";
+export const INDEX_CHECK_TEXT = "Index check found problems";
+
+/** The ONE utterance for the update that brings the fact: it replaces the Rebuilding announcement that
+ * update would otherwise queue. */
+export const INDEX_CHECK_ANNOUNCEMENT =
+  "Index check found problems. Rebuilding the index from your notes. You can keep editing.";
 
 /** Tooltip / accessible description of that fact: the count lives only here. */
 export function describeIndexCheckDetail(count: number): string {
-  return `Serat's check of the index after an unclean shutdown found ${count} ${
+  return `When Serat last closed unexpectedly, its check of the search index found ${count} ${
     count === 1 ? "problem" : "problems"
   }, so it is rebuilding the index from your notes. Your notes are not affected. You can keep editing.`;
 }
@@ -231,7 +236,7 @@ export const useVaultStore = defineStore("vault", {
     setIndexCheckProblems(count: number | null) {
       const next = count !== null && count > 0 ? count : null;
       if (next !== null && this.indexCheckProblems === null) {
-        this.indexAnnouncement = INDEX_CHECK_TEXT;
+        this.indexAnnouncement = INDEX_CHECK_ANNOUNCEMENT;
         this.indexAnnouncementKind = this.indexAnnouncementKind || "rebuilding";
         this.indexAfterWaiting = false;
       }

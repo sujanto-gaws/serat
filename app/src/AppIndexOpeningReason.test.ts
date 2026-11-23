@@ -182,11 +182,11 @@ describe("App status strip: index check found problems (#157)", () => {
     await send(rebuilding(0), { index_check_problems: 3 });
     await flush();
     const fact = wrapper.get('[data-testid="index-check-problems"]');
-    expect(fact.text()).toBe("Index check found problems — rebuilding");
+    expect(fact.text()).toBe("Index check found problems");
     expect(fact.text()).not.toMatch(/\d/);
-    expect(fact.attributes("title")).toContain("3 problems");
+    expect(fact.attributes("title")).toContain("found 3 problems");
     expect(wrapper.get(`#${fact.attributes("aria-describedby")!}`).text()).toContain("3 problems");
-    expect(announced).toEqual(["Index check found problems — rebuilding"]);
+    expect(announced).toEqual(["Index check found problems. Rebuilding the index from your notes. You can keep editing."]); // exactly one utterance
 
     for (let done = 1; done < 6; done++) await send(rebuilding(done), { index_check_problems: 3 });
     await flush();
