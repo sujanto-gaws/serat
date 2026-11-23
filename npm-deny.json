@@ -7,7 +7,7 @@
     "_doc": "Production dependencies (--omit=dev) are judged at production_level with NO exceptions; the whole tree at all_level, where exceptions apply. An exception needs a GHSA id, the package, a reason (20+ characters), an owner and an ISO date, and must match an advisory in the current report or the job fails (remove it when the fix lands)."
   },
   "licenses": {
-    "_doc": "SPDX identifiers. Same names as deny.toml's [licenses].allow where they coincide, including 'Apache-2.0 WITH LLVM-exception' for parity with deny.toml. Two npm-only additions, both permissive and ACCEPTED by lead ruling on 2026-11-12: PSF-2.0 (argparse, a production dependency through markdown-it; listed for the third-party notices) and BlueOak-1.0.0 (dev dependencies only: glob, lru-cache, minimatch, minipass, path-scurry). An 'A OR B' expression passes if any arm is allowed; 'A AND B' needs both; parentheses and WITH are parsed, and an expression that does not parse fails.",
+    "_doc": "SPDX identifiers. Same names as deny.toml's [licenses].allow where they coincide, including 'Apache-2.0 WITH LLVM-exception' for parity with deny.toml. Two npm-only additions, both permissive and ACCEPTED by lead ruling on 2026-11-12: PSF-2.0 (argparse, a production dependency through markdown-it; listed for the third-party notices) and BlueOak-1.0.0 (dev dependencies only: glob, lru-cache, minimatch, minipass, path-scurry). OFL-1.1 (SIL Open Font License) covers only the three @fontsource-variable font packages bundled for task #162 (source-serif-4, bricolage-grotesque, jetbrains-mono; licence text in each package's LICENSE under app/node_modules); fonts are data, not linked code, and the OFL permits bundling and redistribution. An 'A OR B' expression passes if any arm is allowed; 'A AND B' needs both; parentheses and WITH are parsed, and an expression that does not parse fails.",
     "allow": [
       "MIT",
       "MIT-0",
@@ -24,7 +24,8 @@
       "Unicode-3.0",
       "Unicode-DFS-2016",
       "PSF-2.0",
-      "BlueOak-1.0.0"
+      "BlueOak-1.0.0",
+      "OFL-1.1"
     ]
   },
   "sources": {
