@@ -4682,6 +4682,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Task #69 review. Mutant, run by hand: removing the touch in `submit_to_index` leaves
+    // `idle_for` large right after the save, because the watcher's reconciliation (which also
+    // touches) only runs about 150 ms later.
+    #[test]
+    fn a_save_touches_the_writer_activity_clock_at_once() {
+        let dir = fixture("activity-touch");
+        let state = gateless(&dir);
+        wait_ready(&state);
+        std::thread::sleep(Duration::from_millis(1500));
+        let idle = |state: &AppState| {
+            state
+                .open_lock()
+                .as_ref()
+                .map(|open| open.indexer.activity().idle_for())
+                .expect("open")
+        };
+        assert!(
+            idle(&state) >= Duration::from_millis(500),
+            "the clock was not idle before the save: {:?}",
+            idle(&state)
+        );
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        state
+            .write_file(WriteFileArgs {
+                path: "10-projects/serat.md".into(),
+                text: format!("{}\n", read.text.trim_end()),
+                base_hash: Some(read.hash),
+            })
+            .expect("save");
+        assert!(
+            idle(&state) < Duration::from_millis(100),
+            "a save did not touch the activity clock: idle {:?}",
+            idle(&state)
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saves_postpone_the_index_check_until_the_writer_is_idle() {
         let dir = unclean_vault("check-save");
