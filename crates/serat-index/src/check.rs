@@ -20,11 +20,26 @@
 //!   contents (it is missing, locked) is an `Err`.
 //!
 //! What a caller does with `Problems` is ADR-0002's one answer: rebuild.
+//!
+//! # Constraints on the caller
+//!
+//! * **Never concurrently with a rebuild or `rebuild_in_place` in this process.** The
+//!   check holds the file it opened; a rebuild unlinks and re-creates `index.db`, `-wal`
+//!   and `-shm`, and a check that opened the old inode and then reaches the new `-shm` by
+//!   path takes SQLite's shared-memory lock in-process (POSIX locks are per process) and
+//!   can truncate the mapping the new writer has: the SIGBUS mechanism of task #153. It
+//!   takes no writer lock, so nothing here stops it. **serat-app runs it only while the
+//!   index is `Ready` and the handle slot is held**, so no rebuild can start under it.
+//! * **Space checks at least two seconds apart.** A check is one read transaction of about
+//!   a second on the 20k index, which holds back one passive checkpoint cycle; back-to-back
+//!   checks would keep the WAL pinned (architecture §2.2).
 
 use std::path::Path;
 
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode};
 use serat_core::IndexError;
+
+use crate::read::{READ_FLAGS, READ_PRAGMAS};
 
 /// The outcome of [`quick_check`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +60,7 @@ pub enum QuickCheck {
 /// timeout). A malformed database is `Ok(Problems)`, not an error.
 pub fn quick_check(index_dir: &Path) -> Result<QuickCheck, IndexError> {
     let path = crate::rebuild::index_path(index_dir);
-    let conn = match Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
+    let conn = match Connection::open_with_flags(&path, READ_FLAGS) {
         Ok(conn) => conn,
         Err(err) if corrupt(&err) => return Ok(QuickCheck::Problems(vec![err.to_string()])),
         Err(err) => return Err(crate::schema::sqlite(err)),
@@ -57,7 +69,7 @@ pub fn quick_check(index_dir: &Path) -> Result<QuickCheck, IndexError> {
 }
 
 fn run(conn: &Connection) -> Result<QuickCheck, IndexError> {
-    if let Err(err) = conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;") {
+    if let Err(err) = conn.execute_batch(READ_PRAGMAS) {
         return if corrupt(&err) {
             Ok(QuickCheck::Problems(vec![err.to_string()]))
         } else {
