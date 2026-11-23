@@ -81,7 +81,7 @@ describe("foldable callout `[!tip]-` (C-01)", () => {
       return (w.widget as { toDOM(): HTMLElement }).toDOM();
     };
     const collapsed = render("> [!tip]- Title");
-    expect(collapsed.querySelector(".serat-callout-title")?.textContent).toBe("Title");
+    expect(collapsed.querySelector(".serat-callout-title-text")?.textContent).toBe("Title");
     expect((collapsed.querySelector(".serat-callout-body") as HTMLElement).hidden).toBe(true);
     expect(collapsed.getAttribute("data-fold")).toBe("collapsed");
     const expanded = render("> [!tip]+ Title");

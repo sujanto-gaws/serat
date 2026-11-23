@@ -16,6 +16,7 @@ import { acceptCompletion, closeCompletion, moveCompletionSelection, startComple
 import type { Extension } from "@codemirror/state";
 import { EditorView, keymap, scrollPastEnd, type KeyBinding } from "@codemirror/view";
 
+import { toggleCalloutFoldAtCaret } from "@/editor/blockWidgets";
 import { CommandRegistry, detectPlatform, normaliseChord, chordParts, type CommandId, type EditorPlatform } from "@/editor/commands";
 
 // Re-exported: the platform type, its sniff and the one chord canonicaliser live in commands.ts, next to the
@@ -252,6 +253,13 @@ export function createEditorCommandRegistry(
     defaultBinding: bind("editor.follow-link", "Mod-Enter"),
     when: "editor",
     run: handlers.followLink,
+  });
+  // No default chord (#159, components.md §7): a user can bind one (FR-NAV-06). View state only.
+  registry.register({
+    id: "editor.toggle-callout-fold",
+    name: "Toggle callout fold",
+    when: "editor",
+    run: (view) => toggleCalloutFoldAtCaret(view),
   });
   registry.register({
     id: "editor.undo",
