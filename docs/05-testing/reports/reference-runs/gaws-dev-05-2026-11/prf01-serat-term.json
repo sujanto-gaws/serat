@@ -1,0 +1,32 @@
+{
+  "budget_id": "prf01-serat-term",
+  "requirement": "NFR-PRF-01",
+  "interval": "S_pre + S_setup + S_shell + S_settle (ADR-0014 Decision 1's seven-mark partition, Decision 3's binding sum) -- the platform term and the two legacy marks are reported beside it, never asserted (F-407)",
+  "profile": "reference",
+  "statistic": "p95",
+  "value_ms": 1310.429,
+  "limit_ms": 350.000,
+  "passed": false,
+  "degraded": null,
+  "gated": true,
+  "asserted": true,
+  "samples_n": 20,
+  "min_ms": 1046.636,
+  "mean_ms": 1167.405,
+  "max_ms": 1419.093,
+  "vault_digest_sha256": "35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e",
+  "vault_format_version": 1,
+  "vault_notes": 20000,
+  "os": "linux",
+  "cores": 4,
+  "realtime_scanner": null,
+  "power_plan": "unknown",
+  "gate_eligible": true,
+  "reported_not_asserted": {
+    "platform-term": { "p95_ms": 503.086, "samples_n": 20 },
+    "window-visible (legacy total)": { "p95_ms": 1556.105, "samples_n": 20 },
+    "vault-usable (legacy total)": { "p95_ms": 1796.493, "samples_n": 20 },
+    "tree-first-screen": { "p95_ms": 1796.493, "samples_n": 20 }
+  },
+  "samples_ms": [1173.453, 1115.975, 1058.806, 1173.590, 1179.898, 1172.049, 1055.213, 1085.628, 1046.636, 1195.233, 1234.280, 1141.462, 1227.704, 1310.429, 1222.815, 1129.189, 1198.478, 1065.980, 1142.193, 1419.093]
+}
