@@ -99,7 +99,7 @@ owner: lead
 | 144 | `[P1/impl] Refused-names re_emit through the throttle with a trailing flush` (NFR-PRF-04) | tauri-app-dev | 35 | **merged** 4e72e08 |
 | 145 | `[P1/impl] No Tag links for #word inside inline code spans` (NFR-CMP-01) | rust-core-dev | 139 | **merged** 20b2562 |
 | 146 | `[P1/impl] Callout fold marker is a fold state, not title text` (NFR-CMP-01, C-04) | vue-frontend-dev | 139 | **merged** f88331f (glyph: #152) |
-| 147 | `[P1/test] Quiet-machine NFR-PRF-02 scenarios re-run; triage table-cell/split-preview and save_patch` | test-engineer | 61, runners | pending |
+| 147 | `[P1/test] Quiet-machine NFR-PRF-02 scenarios re-run; triage table-cell/split-preview and save_patch` | test-engineer | 61, runners | merged (container re-run done 2026-11-24; reference-machine run owed) |
 | 149 | `[P5/release] Third-party notices for every shipped asset: pdf.js, Adobe cMaps, Foxit, Liberation (GPL-2.0 with font exception), three OFL-1.1 families` (NFR-SEC-07) | release-engineer | 127 | **merged** 6fd6f4e |
 | 150 | `[P1/design] ADR-0018 describes the shipped locality API` | architect | 143 | **merged** d1356b4 (150b) |
 | 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | **merged** 1ab859e (3 rounds) |
