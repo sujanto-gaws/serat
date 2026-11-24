@@ -93,6 +93,7 @@ const TAURI_STUB = `
     var cbs = 0;
     // Task #147: since the vault chooser (#151) the shell shows "No vault open" and hides the editor (v-show) unless
     // the launch boot info names a vault. The harness stubs one, so the editor is mounted and visible as before.
+    // vault and vault_id are fake in bridge mode too: the bridge's own vault is a temp directory the shell never sees.
     window.__SERAT_BOOT__ = { vault: "/bench/vault", vault_id: "bench-vault-id", open: null, exit_after_ready: false };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },

@@ -59,7 +59,6 @@ Do not read a red subject test as "the editor is over budget" unless the control
 
 Quiet re-run 2026-11-24 (task #147): `docs/05-testing/reports/nfr-prf-02-quiet-rerun-2026-11.md`. The Tauri stub in `tests/subject.ts` now supplies `window.__SERAT_BOOT__` (a vault), because the shell hides the editor behind "No vault open" without one, and answers `mark_first_paint`, `mark_vault_usable` and `resolve_links` with a number, a number and an array; figures from before this change are not strictly comparable. The IPC bridge example cannot be built with `--release` (serat-app's `TEST_HOOKS` const assertions); `CARGO_PROFILE_DEV_OPT_LEVEL=3` gives an optimised build with debug assertions.
 
-
 See `docs/05-testing/` reports and the task #11 hand-off; headless Chromium in the development container, R = 16.70 ms. Not gate-eligible until reproduced on the reference machine.
 
 ## History
