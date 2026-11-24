@@ -26,10 +26,10 @@
   load-bearing, and task #98/#102's history for the CSP finding.
 -->
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 
 import { isolateHistory, redo, undo } from "@codemirror/commands";
-import { ChangeSet, Compartment, EditorState, type Extension, Prec, Transaction } from "@codemirror/state";
+import { ChangeSet, Compartment, EditorState, type Extension, Prec, type Text, Transaction } from "@codemirror/state";
 import { EditorView, placeholder } from "@codemirror/view";
 
 import type { CommandRegistry } from "@/editor/commands";
@@ -120,7 +120,9 @@ function onFontsLoaded(): void {
   view?.requestMeasure();
 }
 const dirty = ref(false);
-const previewSource = ref("");
+/** The split-preview pane's input. Holds the immutable `Text` snapshot (shallow: never proxied), not a string:
+ * stringifying per keystroke cost O(doc) in every mode (#171, NFR-PRF-02). `Preview` stringifies after its debounce. */
+const previewSource = shallowRef<string | Text>("");
 /** True only while `loadNote`/`setText` replace the whole state — that must
  * not be recorded as a pending edit against the fresh buffer it accompanies,
  * or the note would be "dirty" the instant it opens. */
@@ -715,7 +717,7 @@ function buildExtensions(livePreview: boolean): Extension[] {
           markDirty();
           scheduleAutosave();
         }
-        previewSource.value = update.state.doc.toString();
+        previewSource.value = update.state.doc;
       }
     }),
     ...(props.placeholder ? [placeholder(props.placeholder)] : []),
@@ -824,7 +826,7 @@ function replaceState(text: string): void {
   } finally {
     suppressChangeTracking = false;
   }
-  previewSource.value = text;
+  previewSource.value = view.state.doc;
 }
 
 /**
@@ -1048,6 +1050,10 @@ defineExpose({
   flex: 1 1 50%;
   min-width: 0;
   overflow: auto;
+  /* #170, NFR-PRF-02: the pane is sized by the flex row (explicit basis, stretched height), never by its ~10k
+   * rendered descendants, so strict containment is safe and keeps hit-test/layout/paint of the editor keystroke
+   * from walking the preview subtree. Its own scrolling is unaffected (overflow:auto clips to the same box). */
+  contain: strict;
   border-left: 1px solid var(--serat-border-hairline, #ddd);
 }
 </style>
