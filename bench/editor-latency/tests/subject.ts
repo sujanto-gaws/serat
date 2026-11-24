@@ -91,6 +91,9 @@ function serve(dir: string): Promise<{ url: string; close: () => Promise<void> }
 const TAURI_STUB = `
   (function () {
     var cbs = 0;
+    // Task #147: since the vault chooser (#151) the shell shows "No vault open" and hides the editor (v-show) unless
+    // the launch boot info names a vault. The harness stubs one, so the editor is mounted and visible as before.
+    window.__SERAT_BOOT__ = { vault: "/bench/vault", vault_id: "bench-vault-id", open: null, exit_after_ready: false };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } },
       transformCallback: function () { return ++cbs; },
@@ -114,6 +117,9 @@ const TAURI_STUB = `
           return Promise.resolve({ path: a.path || "", hash: "stub-hash-" + (++cbs), mtime_ms: 0, bytes: 0 });
         }
         if (cmd === "index_status") return Promise.resolve({ state: "idle" });
+        // Task #147: both used to be answered with null, which threw in the app (null.toFixed, null.map) on every run.
+        if (cmd === "mark_first_paint" || cmd === "mark_vault_usable") return Promise.resolve(1);
+        if (cmd === "resolve_links") return Promise.resolve([]);
         if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);
       },
