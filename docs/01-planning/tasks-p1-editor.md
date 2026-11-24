@@ -116,6 +116,13 @@ owner: lead
 | 167 | `[P1/test] Windows re-runs of the report-only budget jobs when a runner is available` (NFR-PRF-04, FR-VLT-04; ADR-0019) | test-engineer | 165, 166, runners | pending |
 | 168 | `[P1/test] ubuntu-latest asserting jobs for NFR-PRF-04 and FR-VLT-04; two-column C-06 position in the gate report` (NFR-PRF-08; ADR-0019) | test-engineer | 166 | **merged** 410b378 (2 rounds) |
 | 169 | `[P1/req] PRD v1.12: NFR-PRF-08, FR-VLT-04, NFR-PRF-03 note, open question and US-35 restated for ADR-0019` | product-analyst | 166 | **merged** 13eec23 |
+| 170 | `[P1/impl] Contain the split-preview pane so typing does not pay for 10,000 preview elements` (NFR-PRF-02, US-01; ADR-0019, C-06) | vue-frontend-dev | 147 | **merged** a27de35 |
+| 171 | `[P1/impl] Do not flatten the whole note on every keystroke for a preview that is not showing` (NFR-PRF-02, US-01; ADR-0019, C-06) | vue-frontend-dev | 147 | **merged** a27de35 |
+| 172 | `[P1/test] Make the IPC bridge buildable in release so save_patch can be timed as shipped` (NFR-PRF-03, NFR-PRF-02, US-01; ADR-0019, ADR-0008) | tauri-app-dev + test-engineer | 147 | **merged** 70bec0a (2 rounds) |
+| 173 | `[P1/design] Rule whether save_patch parses the note after the save returns, off the command thread` → ADR-0020 (NFR-PRF-03, FR-VLT-04, US-01; ADR-0008, ADR-0015, ADR-0016, ADR-0019) | architect | 172 | **merged** ecef8ec (2 rounds; re-authored branch) |
+| 174 | `[P1/req] PRD v1.13: NFR-PRF-03 names the note class it binds; 5,000-line scenario reported, not gating` (NFR-PRF-03, US-01; ADR-0019) | product-analyst | 172 | **merged** 08f193f |
+| 175 | `[P1/impl] Report each non-bulk committed batch from the index writer to an installed observer` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0001, ADR-0020) | rust-core-dev | 173 | pending |
+| 176 | `[P1/impl] Announce index://changed from the writer's commit observer only, and drop the slot lock before the parse` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0016, ADR-0011, ADR-0020) | tauri-app-dev | 175 | pending |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
