@@ -1834,8 +1834,10 @@ impl AppState {
         // Shared for the write and the submit; see `write_file`.
         let guard = self.open_lock();
         let open = guard.as_ref().ok_or_else(Self::not_open)?;
+        serat_vault::phases::mark("app.open_lock");
         let (path, written) = open.editor.save_patch(args)?;
         self.submit_to_index(open, &path);
+        serat_vault::phases::mark("app.submit_to_index");
         Ok(written)
     }
 

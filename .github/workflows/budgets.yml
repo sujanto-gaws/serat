@@ -67,6 +67,24 @@ jobs:
             echo "::error::the build failed, but not on the test-hooks guard"
             exit 1
           }
+      # Task #172: the one named exception. `bench-bridge` lets the IPC-bridge example build in
+      # release so save_patch can be timed as shipped; it is safe only because the `serat`
+      # binary refuses to compile with it. If this passes, the exception can ship.
+      - name: The serat binary refuses bench-bridge
+        shell: bash
+        run: |
+          if out=$(cargo check -p serat-app --release --bin serat --features bench-bridge 2>&1); then
+            echo "$out"
+            echo "::error::the serat binary built with bench-bridge; the exception could ship"
+            exit 1
+          fi
+          echo "$out" | grep -q "must not be built with the .bench-bridge. feature" || {
+            echo "$out"
+            echo "::error::the build failed, but not on the binary's own refusal"
+            exit 1
+          }
+      - name: The bridge example builds in release with test-hooks unified in
+        run: cargo check -p serat-app --release --lib --features "bench-bridge,serat-index/test-hooks,serat-vault/test-hooks"
 
   # NFR-MNT-02: the vault is generated from one command and is byte-identical.
   # Everything below is measured against it, so if this fails the other jobs

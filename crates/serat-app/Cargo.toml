@@ -79,7 +79,7 @@ tauri-build = { version = "2.6.3", features = [] }
 serat-index = { path = "../serat-index", features = ["test-hooks"] }
 # task #35: the end-to-end refusal test judges names by another platform's rules
 # (`Vault::with_platform`). Dev-only, and asserted absent from a release build in lib.rs.
-serat-vault = { path = "../serat-vault", features = ["test-hooks"] }
+serat-vault = { path = "../serat-vault", features = ["test-hooks", "phase-timing"] }
 rusqlite = { workspace = true }
 # Test fixtures that clean up after themselves.
 tempfile = { workspace = true }
@@ -92,6 +92,16 @@ tempfile = { workspace = true }
 # compile the mock runtime in at all.
 [target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2.11.5", features = ["custom-protocol", "test"] }
+
+[features]
+# Task #172: lets the IPC-bridge example (`examples/editor_ipc_bridge.rs`) be built with
+# `--release`, so `save_patch` can be timed as shipped (NFR-PRF-03 evidence, ADR-0019).
+# The example's dev-dependencies switch `test-hooks` on for serat-index and serat-vault,
+# and the const assertions in lib.rs refuse that in a release build; this feature is the
+# one named exception, and it is for the example only: the `serat` binary refuses to
+# compile with it (src/main.rs), so no shipped artifact can carry it. It also turns on
+# serat-vault's per-phase timing, which is inert unless a collection is begun.
+bench-bridge = ["serat-vault/phase-timing"]
 
 [lints]
 workspace = true

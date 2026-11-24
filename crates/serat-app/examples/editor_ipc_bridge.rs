@@ -220,15 +220,35 @@ fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats, token: &str, po
         );
     } else if let (true, Some(command)) = (method == "POST", path.strip_prefix("/invoke/")) {
         let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        // Task #172: with `serat-vault`'s `phase-timing` (on in a debug build and with
+        // `--features bench-bridge`) a `save_patch` also reports the time spent in each phase
+        // of the call, as `save_patch.phase.NN.<name>` entries in `/stats`. Off, `finish`
+        // returns nothing and no entry appears.
+        if command == "save_patch" {
+            serat_vault::phases::begin();
+        }
         let started = Instant::now();
         let result = dispatch(state, command, &payload);
         let ms = started.elapsed().as_secs_f64() * 1000.0;
-        stats
+        let phases = if command == "save_patch" {
+            serat_vault::phases::finish()
+        } else {
+            Vec::new()
+        };
+        let mut guard = stats
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(command.to_owned())
-            .or_default()
-            .push(ms);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entry(command.to_owned()).or_default().push(ms);
+        // A refused save stops part-way; its partial phases would skew the table.
+        if result.get("__error").is_none() {
+            for (index, phase) in phases.iter().enumerate() {
+                guard
+                    .entry(format!("save_patch.phase.{index:02}.{}", phase.name))
+                    .or_default()
+                    .push(phase.elapsed.as_secs_f64() * 1000.0);
+            }
+        }
+        drop(guard);
         respond(&mut stream, "200 OK", &result.to_string(), origin);
     } else {
         respond(&mut stream, "404 Not Found", "{}", origin);
