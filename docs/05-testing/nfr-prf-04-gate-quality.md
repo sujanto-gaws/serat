@@ -156,7 +156,7 @@ far under the 30,000 ms limit. An attested re-run belongs with the next quiet wi
 
 **Ruling (home: ADR-0019; the evidence is here; evidence maps to ADR-0019 point 2, all under section (b) below: (a) scanner OFF in 36 of 36, (b) the spread and file-I/O bullets, (c) the no-derivable-ceiling bullet).** On a GitHub-hosted `windows-latest` runner NFR-PRF-04 is **report-only**: the job
 measures, prints `REPORT-ONLY`, uploads the JSON and cannot fail the PR for a slow number. The
-assertion is the reference machine's (`--profile reference`, at each gate) and, once #168 lands, ubuntu-latest's. A budget is
+assertion is the reference machine's (`--profile reference`, at each gate) and ubuntu-latest's (`prf04-full-rebuild-linux`, task #168). A budget is
 "enforced in CI" (C-06) only on a runner that can produce a gate number; this one cannot, so
 the report says NFR-PRF-04 is **not CI-asserted** rather than counting a red job as enforcement.
 It is mechanical, not a convention: `Budget::ci_assertion = CiAssertion::WhenGateEligible`
@@ -242,7 +242,13 @@ figure for NFR-PRF-04 exists anywhere today;** a Defender-on RM-1 run is owed (R
   `determinate()` is true; or (2) at least 30 post-#56 runs on hosted Windows over at least 3 days and 2 image versions,
   from which a ceiling is set at 1.5x the 95th percentile of medians, recorded here with the runs it came from.
   Both need runners to be scheduled at all (RISK-013); neither can be done from this repository.
-- ADR-0019 also gives a `WhenGateEligible` budget an asserting job on ubuntu-latest (task #168, not part of this change).
+- ADR-0019 §3 gives a `WhenGateEligible` budget an asserting job on ubuntu-latest: **done in task #168** (`prf04-full-rebuild-linux`,
+  and `p1-external-change-linux` for FR-VLT-04), `--profile ci`, which asserts the product limit because the budget has no
+  `ci_limit_ms`. They are `Always`-style regression gates on Serat's code, not gate figures. Feasibility on the 4-core container
+  (same shape as hosted ubuntu-latest): 20k vault generation 5.3 s, `prf04-full-rebuild --profile ci` median 9.16 s (3 runs,
+  28 s for the step), `p1-external-change --assert` 75 s (single p95 181.0 ms of 500); hosted I/O is slower, but the 360 min
+  limit is not the question and a cold `rust-cache` build is about 2 minutes. Whether hosted Linux is quiet enough is for its
+  first runs to say (ADR-0019 point 2 applies to that runner too); no runner has scheduled (RISK-013), so they are unrun.
 - The same rule applies to NFR-PRF-01 (Serat term) and NFR-PRF-03 on hosted Windows if their first hosted numbers show the
   same shape; they have no hosted figure yet (the app was not built until #164), so
   they stay `CiAssertion::Always` and are decided on evidence.
@@ -263,7 +269,7 @@ prints a `REPORT-ONLY` line and exits 0, the job name says "report-only" and nam
 machine, and `P1_GATED` gains the same two-way name check. The other `--assert` bins
 (`p1-tree-path` 36 to 106 ms against 2 s, `p1-switcher` 5 to 12 ms against 50 ms) have 10x or more
 margin and stable figures on the runner; they keep failing a breach there until a hosted figure says otherwise.
-PRD v1.9's "gated in CI" for FR-VLT-04 reads "asserted on RM-1 at the gate and on ubuntu-latest in CI (#168); report-only on hosted Windows (ADR-0019)", applied in PRD v1.12.
+PRD v1.9's "gated in CI" for FR-VLT-04 reads "asserted on RM-1 at the gate and on ubuntu-latest in CI (#168); report-only on hosted Windows (ADR-0019)", applied in PRD v1.12; the Linux job is `p1-external-change-linux` (#168).
 
 **The three Windows re-runs #165 needs** (overlap and checkpointer lines; this task's PRF-04
 `REPORT-ONLY` lines) are owned by test-engineer as `[P1/test] Windows re-runs of the report-only

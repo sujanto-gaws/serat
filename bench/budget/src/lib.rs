@@ -5833,6 +5833,174 @@ mod tests {
         assert!(report_only >= 1, "no P1 job is report-only: vacuous");
     }
 
+    /// What is wrong with the asserting Linux twin `<id>-linux` of a budget whose
+    /// Windows job is report-only (ADR-0019 point 3, task #168), or `None` if nothing is.
+    /// `flag` is what makes the bin assert: `--profile ci` for a `Budget` (the harness
+    /// asserts when `gate_eligible()`), `--assert` for a P1 bin. Pure, so the mutants below
+    /// can prove each clause bites.
+    fn linux_twin_defect(text: &str, id: &str, bin: &str, flag: &str) -> Option<String> {
+        let twin = format!("{id}-linux");
+        let head = format!("\n  {twin}:\n");
+        if !text.contains(&head) {
+            return Some(format!("{twin}: no asserting ubuntu-latest job exists"));
+        }
+        let job = workflow_job(text, &twin);
+        let name = workflow_job_name(&job);
+        if name.contains("report-only") {
+            return Some(format!(
+                "{twin}: an asserting job must not say report-only: {name:?}"
+            ));
+        }
+        if !name.contains("ubuntu-latest") || !name.contains("RM-1") {
+            return Some(format!(
+                "{twin}: the name must say where it asserts and that the gate figure is RM-1's: {name:?}"
+            ));
+        }
+        if !job.lines().any(|l| l.trim() == "runs-on: ubuntu-latest") {
+            return Some(format!(
+                "{twin}: must run on ubuntu-latest (gate_eligible is true there)"
+            ));
+        }
+        let code = |l: &str| l.split('#').next().unwrap_or("").to_owned();
+        if job.lines().any(|l| code(l).contains("continue-on-error:")) {
+            return Some(format!("{twin}: continue-on-error would fail open"));
+        }
+        let drives = job.lines().any(|l| {
+            let c = code(l);
+            c.contains(&format!("--bin {bin} "))
+                && c.contains(flag)
+                && !c.contains("--profile reference")
+                && !c.contains("||")
+        });
+        if !drives {
+            return Some(format!(
+                "{twin}: no un-swallowed run line invoking `--bin {bin}` with `{flag}`"
+            ));
+        }
+        let gate = workflow_job(text, "budgets-gate");
+        if !gate.contains(&format!("\n      - {twin}\n"))
+            || !gate.contains(&format!("check {twin} \"${{{{ needs.{twin}.result }}}}\""))
+        {
+            return Some(format!(
+                "{twin}: missing from budgets-gate's needs or its check list"
+            ));
+        }
+        None
+    }
+
+    /// The (job id, bin, flag) of every report-only-on-hosted-Windows budget: the P0 budgets
+    /// declared `WhenGateEligible` and the P1 bins in `P1_REPORT_ONLY_ON_HOSTED`.
+    fn report_only_budgets_with_twins() -> Vec<(String, String, &'static str)> {
+        let mut v: Vec<(String, String, &'static str)> = P0_BUDGETS
+            .iter()
+            .filter(|b| b.ci_assertion == CiAssertion::WhenGateEligible)
+            .map(|b| (b.id.to_string(), b.id.to_string(), "--profile ci"))
+            .collect();
+        v.extend(
+            P1_GATED
+                .iter()
+                .filter(|(_, _, req)| P1_REPORT_ONLY_ON_HOSTED.contains(req))
+                .map(|(job, bin, _)| (job.to_string(), bin.to_string(), "--assert")),
+        );
+        v
+    }
+
+    #[test]
+    fn a_report_only_budget_is_asserted_on_a_gate_eligible_linux_job() {
+        // ADR-0019 point 3 / NFR-PRF-08 / C-06: where the hosted Windows job reports, a job
+        // on ubuntu-latest (which `gate_eligible()` rates eligible) must assert, so a
+        // regression still fails the build. A budget therefore has one report-only Windows
+        // job and one asserting Linux job; the name check applies to each job on its own.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let twins = report_only_budgets_with_twins();
+        assert!(
+            twins.len() >= 2,
+            "NFR-PRF-04 and FR-VLT-04 are the report-only budgets: this would pass vacuously"
+        );
+        for (id, bin, flag) in &twins {
+            if let Some(defect) = linux_twin_defect(&text, id, bin, flag) {
+                panic!("{defect} (ADR-0019 point 3)");
+            }
+        }
+        // The harness side of the same claim: Linux is rated eligible, and on it the
+        // report-only budget asserts and the profile's limit is the product limit.
+        assert!(linux().gate_eligible());
+        assert_eq!(PRF04_FULL_REBUILD.ci_limit_ms, None);
+        assert_eq!(
+            PRF04_FULL_REBUILD.limit_ms(Profile::Ci),
+            PRF04_FULL_REBUILD.product_limit_ms
+        );
+    }
+
+    #[test]
+    fn the_linux_twin_check_is_shown_able_to_fail() {
+        // Each clause has a mutant that must be reported, or the check proves nothing.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let good = std::fs::read_to_string(&workflow).expect("budgets.yml");
+        let (id, bin, flag) = ("prf04-full-rebuild", "prf04-full-rebuild", "--profile ci");
+        assert_eq!(linux_twin_defect(&good, id, bin, flag), None);
+        let (pid, pbin, pflag) = ("p1-external-change", "p1-external-change", "--assert");
+        assert_eq!(linux_twin_defect(&good, pid, pbin, pflag), None);
+
+        let twin_name = |t: &str, twin: &str| {
+            let job = workflow_job(t, twin);
+            workflow_job_name(&job)
+        };
+        let n = twin_name(&good, "prf04-full-rebuild-linux");
+        let mutants: Vec<(&str, String)> = vec![
+            ("name says report-only", good.replace(&n, &format!("{n} (report-only)"))),
+            ("name loses RM-1", good.replace("the gate figure is RM-1's)\"\n    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild", "a regression gate)\"\n    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild")),
+            ("runs on windows", good.replace("    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild", "    needs: vault\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild")),
+            ("drops --profile ci", good.replace("--bin prf04-full-rebuild -- --profile ci\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux", "--bin prf04-full-rebuild -- --profile reference\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux")),
+            ("swallows the exit code", good.replace("--bin prf04-full-rebuild -- --profile ci\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux", "--bin prf04-full-rebuild -- --profile ci || true\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux")),
+            ("left out of budgets-gate needs", good.replace("      - prf04-full-rebuild-linux\n", "")),
+            ("left out of budgets-gate checks", good.replace("          check prf04-full-rebuild-linux \"${{ needs.prf04-full-rebuild-linux.result }}\"\n", "")),
+            ("job deleted", good.replace("\n  prf04-full-rebuild-linux:\n", "\n  prf04-full-rebuild-lnx:\n")),
+        ];
+        for (what, text) in &mutants {
+            assert_ne!(
+                text, &good,
+                "the mutant {what:?} did not change the workflow"
+            );
+            assert!(
+                linux_twin_defect(text, id, bin, flag).is_some(),
+                "mutant {what:?} was not caught"
+            );
+        }
+        // FR-VLT-04's twin: the same two clauses that differ (--assert, swallowing).
+        let p_no_assert = good.replace(
+            "--vault 20k --single 100 --batches 20 --assert | tee bench/out/p1-external-change-linux.txt",
+            "--vault 20k --single 100 --batches 20 | tee bench/out/p1-external-change-linux.txt",
+        );
+        assert_ne!(p_no_assert, good);
+        assert!(linux_twin_defect(&p_no_assert, pid, pbin, pflag).is_some());
+        let p_coe = good.replace(
+            "  p1-external-change-linux:\n",
+            "  p1-external-change-linux:\n    continue-on-error: true\n",
+        );
+        assert!(linux_twin_defect(&p_coe, pid, pbin, pflag).is_some());
+    }
+
+    #[test]
+    fn the_report_only_windows_job_and_the_asserting_linux_job_each_keep_their_own_name() {
+        // The two-way name check applies per job: the Windows job says report-only and
+        // names the reference machine; its Linux twin does not say report-only.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow).expect("budgets.yml");
+        for (id, _, _) in report_only_budgets_with_twins() {
+            let win = workflow_job_name(&workflow_job(&text, &id));
+            let lin = workflow_job_name(&workflow_job(&text, &format!("{id}-linux")));
+            assert!(
+                win.contains("report-only") && win.contains("reference machine"),
+                "{win:?}"
+            );
+            assert!(!lin.contains("report-only"), "{lin:?}");
+            assert_ne!(win, lin, "{id}: two jobs must not share a check name");
+        }
+    }
+
     #[test]
     fn job_asserts_accepts_the_good_job_and_rejects_each_sabotage() {
         let wrap = |run: &str, extra: &str| {
