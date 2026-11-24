@@ -107,6 +107,37 @@ It is unmeasured because it could not be measured here, and the attempt is worth
 
 The same caveat applies to the proportionality comparison, and the scale-check report line carries it.
 
+## RM-2 — gaws-dev-05, a Linux desktop (2026-11-24)
+
+The repository owner ran the budget bins with `--profile reference` on a Linux desktop named gaws-dev-05 on 2026-11-24 and committed the raw JSON (`docs/05-testing/reports/reference-runs/gaws-dev-05-2026-11/`, commit `4244c14`). It is a second named machine, not a replacement for RM-1. The analysis is `docs/05-testing/reports/reference-run-gaws-dev-05-2026-11.md`.
+
+**The rule.** A budget is never compared across machines. RM-2's figures are RM-2's: they are not compared with RM-1's, with the Linux container's, or with a hosted runner's, and none of them re-baselines a number taken elsewhere. When the harness's own rule or a report sets two figures side by side, the report says they come from different machines and that the comparison is context, not a verdict.
+
+The table is filled only from what the five result files record. The `environment` bin was not run, before or after the series, so every property the result files do not carry is **owed (environment bin not run)**.
+
+| Property | Value |
+|---|---|
+| Name | gaws-dev-05 |
+| OS | linux (recorded in every result file) |
+| Cores | 4 (recorded in every result file) |
+| Real-time scanner | `null` (not applicable to Linux; the harness records no scanner state) |
+| Power plan | `unknown` (as recorded; no plan is read on Linux) |
+| Vault | 20,000 notes, format version 1, `tree_digest_sha256` `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e` (identical in all five files) |
+| `gate_eligible` | true in all five files (`Environment::gate_eligible()` is true on Linux) |
+| Toolchain | owed (environment bin not run); the result files carry no toolchain field |
+| Model, CPU, clock | owed (environment bin not run) |
+| RAM | owed (environment bin not run) |
+| Storage and filesystem | owed (environment bin not run) |
+| Distribution and kernel | owed (environment bin not run) |
+| Webview (webkit2gtk) version | owed (environment bin not run); matters for NFR-PRF-01 |
+| Build profile of the app under test | owed (environment bin not run) |
+| Concurrent load before and after (`attested`) | owed (environment bin not run); the run is therefore not attested in the sense `p1-gate-report.md` uses |
+| Series order and first-sample handling | owed; the files give samples in run order and do not say whether a warm-up run was discarded |
+
+**What gate-eligible means here.** Under ADR-0019 and the harness rule, a Linux run is gate eligible by construction, so RM-2's figures are asserting figures for the Linux reference: a breach prints FAIL and a pass prints PASS, and the harness says `asserted: true` where the budget is asserted. The product ships on Windows. ADR-0019 §8 says a figure from a machine other than RM-1 is supporting evidence and not the gate figure, so **the RM-1 scanner-on figures remain owed** for NFR-PRF-01, NFR-PRF-03, NFR-PRF-04 and FR-VLT-04, and #167 (the Windows re-runs) stays open. "Gate eligible" is a statement about the scanner question the harness was written for. It is not a statement that the machine is the reference machine of the charter's gate.
+
+**Not run on RM-2:** `environment` (before and after), `p1-external-change` (FR-VLT-04), `p1-save-tail`.
+
 ## Machines that are not the reference machine
 
 CI runners are not RM-1 and never will be. NFR-PRF-08 requires every budget to be asserted in CI and a regression to fail the build; that is a *regression gate*, and its thresholds are a property of the runner. The product budgets in NFR-PRF-01/03/04 are the numbers RM-1 must meet. Both are real, they are not the same number, and B2 keeps them in separate columns.
@@ -123,3 +154,4 @@ A GitHub-hosted Windows runner does **not** have real-time protection enabled: a
 | NFR-PRF-08 | Separates product budgets on RM-1 from regression thresholds in CI. |
 | US-35 | Makes "stay fast as the vault grows" measurable against a fixed baseline. |
 | C-06 | Budgets are enforced against the synthetic vault *on a named machine*. |
+| ADR-0019 | RM-2 is a gate-eligible Linux machine whose figures are supporting evidence for the gate, never the RM-1 gate figure. |
