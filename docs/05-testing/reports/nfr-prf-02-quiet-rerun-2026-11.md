@@ -140,6 +140,23 @@ In all three profiles one keystroke is about 3.2 ms of main-thread JavaScript: `
 
 **T3. `[P1/test] Make the IPC bridge buildable in release so save_patch can be timed as shipped`** (tauri-app-dev with test-engineer). Serves NFR-PRF-02, NFR-PRF-03. `cargo build --release --example editor_ipc_bridge -p serat-app` fails the const assertions at `crates/serat-app/src/lib.rs:39` and `:45` because `[dev-dependencies]` enables `serat-index/test-hooks` for every example. Move the bridge out of `serat-app`'s examples (a bench crate under `bench/` that depends on `serat-app` without the test features), or gate the dev-dependency feature to tests. Then add per-phase timing inside `save_patch` (`write_patch`'s read, hash, apply, write, fsync, rename and `editor.rs:266`'s second apply and hash) to the bridge's stats, take a release figure on the 20k vault's hub-note, and compare to the 17.01 ms in-process figure. Acceptance: a release-profile `save_patch` p50 / p95 / max on a 5,000-line note with the four phase shares; if a second `apply_edits` plus `hash_bytes` in `editor.rs` is more than a quarter of it, a follow-up to advance the base from the first apply's result (rust-core-dev).
 
+## Follow-up #170/#171
+
+Tasks T1 and T2 (branch `task/p1-170-split-preview-cost`). Changes: `.serat-editor-split-preview` gets `contain: strict` (its size comes from the flex row: `flex: 1 1 50%`, stretched height, `overflow: auto` unchanged, so size containment cannot collapse it); the update listener holds the immutable CodeMirror `Text` in a `shallowRef` instead of calling `doc.toString()` per keystroke, and `Preview.vue` stringifies inside its debounced render (preview output unchanged; the live-preview mode, which mounts no pane, no longer stringifies at all).
+
+Same container, quiet (load average 0.5 to 0.6 on 4 CPUs, controls 99.7 to 100.0%), harness `--project=scenarios -g split-preview` and `--project=subject -g middle`, a bundle of origin/main (2900a37) against a bundle of the branch, back to back, n=500 per cadence (strict / swept). Linux container, headless Chromium: supporting evidence, never a verdict. The harness exposes on-time share, p95 frames and the Event Timing entry count and mean, not the per-key CDP figures of the triage; those were not re-taken.
+
+| scenario | on time (strict / swept) | p95 frames | keys with an Event Timing entry (strict / swept) | mean entry ms |
+|---|---|---|---|---|
+| split preview, before | 99.6% / 99.8% | 1 | 286 / 304 | 18.7 / 18.0 |
+| split preview, after | 100.0% / 100.0% | 1 | **221 / 254** | 17.4 / 17.2 |
+| mid-note, before | 100.0% / 100.0% | 1 | 214 / 217 | 17.0 / 17.2 |
+| mid-note, after | 100.0% / 100.0% | 1 | 239 / 223 | 17.0 / 17.0 |
+
+Split preview's share of keys with an Event Timing entry falls to the mid-note level (T1's acceptance asked for "within noise of mid-note's"); mid-note itself did not move beyond run-to-run noise (214 to 239). On-time share is 100% in every arm after the change; before, split preview read 99.6% and 99.8%. Both runs PASS on E0.
+
+Unresolved: (1) the remaining Layout excess (about 1.4 ms/key in the triage) was not looked into: `contain: strict` only addresses the preview subtree, and the cause (guess, unverified: the narrower source pane re-wrapping) is untouched. (2) The per-key HitTest, PrePaint and Layout figures were not re-profiled after the change (no CDP probe in the repository), so the 2.22 to 0.48 ms HitTest figure is still the injected-CSS measurement. (3) T1's `content-visibility: auto` alternative was not compared; strict was enough for the Event Timing share. (4) The per-keystroke GC share of `doc.toString()` was not measured separately; the test pins that it no longer happens. (5) Scroll, resize and find-in-page behaviour of the contained pane were reasoned from the CSS (`overflow: auto` retained, explicit flex basis) and unit-tested for the rule, not checked in a real WebView2.
+
 ## Findings
 
 | # | Finding | Owner |
