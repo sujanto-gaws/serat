@@ -364,6 +364,29 @@ impl Drop for OpenAttempt {
     }
 }
 
+/// A hook run inside the save path's load.
+#[cfg(test)]
+pub(crate) type SaveLoadHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The vault as the save path's `NoteSource`, calling the hook before each load.
+#[cfg(test)]
+struct LoadHook<'a> {
+    vault: &'a Vault,
+    hook: SaveLoadHook,
+}
+
+#[cfg(test)]
+impl serat_core::NoteSource for LoadHook<'_> {
+    fn entries(&self) -> Result<Vec<serat_core::SourceEntry>, serat_core::VaultError> {
+        self.vault.entries()
+    }
+
+    fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+        (self.hook)(path.as_str());
+        self.vault.load(path)
+    }
+}
+
 /// Test seams on the open path, so the orderings §3.4 states can be forced.
 #[derive(Default, Clone)]
 pub(crate) struct OpenHooks {
@@ -392,6 +415,10 @@ pub(crate) struct OpenHooks {
     /// Called with the new vault id right after `VaultThread::spawn_with` returned.
     #[cfg(test)]
     pub(crate) after_vault_spawn: Option<SpawnHook>,
+    /// Called with the path at the start of the save path's `NoteSource::load`, after the
+    /// slot lock is released (ADR-0020 decision 2's test).
+    #[cfg(test)]
+    pub(crate) in_save_load: Option<SaveLoadHook>,
     /// Receives the open's publisher as soon as it exists, so a test can inspect it
     /// after the open has failed and dropped everything else.
     #[cfg(test)]
@@ -826,7 +853,7 @@ impl AppState {
         &self,
         opening: &std::sync::MutexGuard<'_, ()>,
         args: OpenVaultArgs,
-        opener: O,
+        mut opener: O,
     ) -> Result<VaultOpened, IpcError> {
         let requested = PathBuf::from(&args.root);
         let opened =
@@ -941,6 +968,19 @@ impl AppState {
             observing.index_state_changed(matches!(state, IndexState::Ready { .. }));
         });
 
+        // ADR-0020 decision 3: `index://changed` is announced by the writer's commit
+        // observer, so the notifier exists, and the opener holds the observer, before
+        // any actor is started (here, or by the deferred spawn below). The observer is
+        // weak: the writer thread must not keep the notifier, and through it the
+        // switcher, alive after the vault is gone.
+        let notifier = Arc::new(ChangeNotifier::new(
+            vault_id.clone(),
+            Arc::clone(&self.events),
+        ));
+        let refreshing = Arc::clone(&switcher);
+        notifier.on_change(move || refreshing.index_changed());
+        opener.install_commit_observer(notifier.commit_observer());
+
         let epoch = crate::index::HandleEpoch::default();
         #[cfg(test)]
         self.inject(FailAt::IndexActor, &root)?;
@@ -1048,12 +1088,6 @@ impl AppState {
         });
         let tree_gate_fn = Arc::clone(&gate);
 
-        let notifier = Arc::new(ChangeNotifier::new(
-            vault_id.clone(),
-            Arc::clone(&self.events),
-        ));
-        let refreshing = Arc::clone(&switcher);
-        notifier.on_change(move || refreshing.index_changed());
         let indexer = Arc::new(Indexer::new(
             Arc::clone(&vault),
             Arc::clone(&index_handle),
@@ -2118,23 +2152,37 @@ impl AppState {
     /// of it is what makes that guarantee travel here unchanged: there is no second
     /// place that could get the ordering wrong.
     ///
-    /// **Lock contention, accepted at P0 (F-382).** `serat_index::IndexHandle` is not
-    /// `Clone`, so the slot's `Mutex` is held for the duration of `apply` below --
-    /// which reads the file and parses it, not only submits. That is not a §2.2
-    /// barrier (no waiting on the writer occurs), but it is lock contention on a path
-    /// §2.2 otherwise keeps lock-free by ownership. At P0, with one buffer editing one
-    /// note at a time, two saves cannot actually contend for it. It stops being free
-    /// the day two saves can be in flight together, and the fix is not this function's
-    /// to make: `serat_index::writer::WriterHandle` is already `Clone` and cheap
-    /// (`writer.rs:82-84`), and `apply_via` already takes one as `&dyn IndexWriter`
-    /// rather than the whole `IndexHandle` -- but neither is reachable from outside
-    /// `serat-index` today. Cloning a `WriterHandle` out of the slot once, under the
-    /// lock, and dropping the lock before parsing is the fix once that seam exists.
+    /// **The slot lock is not held across the read and the parse (F-382, ADR-0020
+    /// decision 2).** The index handle lives behind the slot's mutex because dropping it
+    /// stops the writer, so something has to own it. This function clones a
+    /// [`serat_index::WriterHandle`] (cheap, `Clone`) out of the slot under the lock,
+    /// releases the lock, and only then calls [`serat_index::apply`] with the clone: the
+    /// stat, read, hash and parse of the note, the submit and the echo record all run
+    /// without it. A second save on another note, and the watcher consumer's
+    /// `reconciler()` (which takes the same mutex), no longer wait behind a parse.
+    /// F-382's earlier text called that seam unreachable; `IndexHandle::writer()` and
+    /// the public `serat_index::apply` made it reachable, and this is the use.
+    ///
+    /// A clone can outlive its writer. If a `rebuild_index` (or a close) stopped the
+    /// writer between the clone and the submit, the submit answers `WriterStopped`: the
+    /// save is counted as refused, no echo is recorded, and its watcher event indexes it
+    /// (the degraded path above, design goal 5). The opposite case is harmless: a clone
+    /// whose writer accepted the submit just before `rebuild_in_place` stopped it commits
+    /// into an `index.db` that is about to be deleted, and records an echo, but the save's
+    /// rename preceded the submit and the rebuild re-walks the disk after the writer has
+    /// stopped, so it reads the saved bytes. The save's open-vault lock is still held
+    /// shared by the caller, so the close guarantee (the submit precedes the clean-close
+    /// marker) is unchanged.
+    ///
+    /// **Nothing is announced here (ADR-0020 decision 3).** `index://changed` is
+    /// emitted by the writer's commit observer after the batch commits, so a view that
+    /// re-reads on the event sees the save. Calling `notifier().changed()` at the submit
+    /// would announce a state the reader cannot see yet.
     fn submit_to_index(&self, open: &OpenVault, path: &VaultPath) {
         // A save is writer activity: the background index check waits for quiet (task #69).
         open.indexer.activity().touch();
         let vault = &*open.vault;
-        let outcome = {
+        let writer = {
             let guard = open
                 .index_handle
                 .lock()
@@ -2143,21 +2191,32 @@ impl AppState {
                 self.save_handle_missing.fetch_add(1, Ordering::Relaxed);
                 return;
             };
-            let parser = CommonMarkParser::new();
-            // The `Err` case is deliberately not propagated to `write_file`'s caller,
-            // for the same reason there is no barrier: the command's contract answers
-            // for the vault write, not for whether the index heard about it, and a
-            // write that reached disk must never be reported as failed because the
-            // index writer was busy. It is still counted (F-382), which is the
-            // difference between "swallowed" and "unobserved".
-            handle.apply(vault, &parser, vault, path)
+            handle.writer()
         };
-        match outcome {
+        // Tests hold a save inside its load, which is where the lock used to be held.
+        #[cfg(test)]
+        let hooked = self
+            .hooks
+            .in_save_load
+            .clone()
+            .map(|hook| LoadHook { vault, hook });
+        #[cfg(test)]
+        let source: &dyn serat_core::NoteSource = match &hooked {
+            Some(hooked) => hooked,
+            None => vault,
+        };
+        #[cfg(not(test))]
+        let source: &dyn serat_core::NoteSource = vault;
+        let parser = CommonMarkParser::new();
+        // The `Err` case is deliberately not propagated to `write_file`'s caller,
+        // for the same reason there is no barrier: the command's contract answers
+        // for the vault write, not for whether the index heard about it, and a
+        // write that reached disk must never be reported as failed because the
+        // index writer was busy. It is still counted (F-382), which is the
+        // difference between "swallowed" and "unobserved".
+        match serat_index::apply(&writer, source, &parser, vault, path) {
             Ok(()) => {
                 self.save_submitted.fetch_add(1, Ordering::Relaxed);
-                // Architecture 3.1 step 6: every save-path submit is owed an
-                // `index://changed` (throttled). The slot's lock is already released.
-                open.indexer.notifier().changed();
             }
             Err(_) => {
                 self.save_writer_refused.fetch_add(1, Ordering::Relaxed);
@@ -2672,6 +2731,10 @@ mod tests {
         // could introduce if it touches only one side of this pair.
         struct Slow;
         impl IndexOpen for Slow {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 std::thread::sleep(Duration::from_millis(2_000));
                 publish(IndexState::Ready { note_count: 1 });
@@ -2973,6 +3036,10 @@ mod tests {
 
         struct Rebuild;
         impl IndexOpen for Rebuild {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -3442,6 +3509,10 @@ mod tests {
         // `Ready` while the assertion runs, leaves the shell waiting forever.
         struct RebuildsUntilReleased(Arc<std::sync::Barrier>);
         impl IndexOpen for RebuildsUntilReleased {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -3502,6 +3573,10 @@ mod tests {
         // handle yet" and "no handle ever" without needing to win a real race.
         struct NeverProducesAHandle;
         impl IndexOpen for NeverProducesAHandle {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Ready { note_count: 1 });
                 // into_handle() is not overridden: the trait default returns None.
@@ -3871,6 +3946,10 @@ mod tests {
         // Rule 1. A scripted opener that never finishes keeps the state at `Opening`.
         struct Never;
         impl IndexOpen for Never {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, _: &dyn Fn(IndexState)) {
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -4137,6 +4216,10 @@ mod tests {
     fn an_index_that_is_not_ready_leaves_the_walk_to_populate_alone() {
         struct NeverReady;
         impl IndexOpen for NeverReady {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -4955,6 +5038,9 @@ mod tests {
         fn into_handle(self) -> Option<serat_index::IndexHandle> {
             self.0.into_handle()
         }
+        fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+            self.0.install_commit_observer(observer);
+        }
     }
 
     fn state_with(hooks: OpenHooks) -> AppState {
@@ -5216,6 +5302,9 @@ mod tests {
             fn into_handle(self) -> Option<serat_index::IndexHandle> {
                 self.0.into_handle()
             }
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                self.0.install_commit_observer(observer);
+            }
         }
         let dir = fixture("reopen-same-root");
         let state = gateless(&dir);
@@ -5351,6 +5440,10 @@ mod tests {
     fn the_switcher_answers_from_the_tree_before_the_index_is_ready() {
         struct StillRebuilding;
         impl IndexOpen for StillRebuilding {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -5820,6 +5913,10 @@ mod tests {
 
         fn into_handle(self) -> Option<serat_index::IndexHandle> {
             self.0.into_handle()
+        }
+
+        fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+            self.0.install_commit_observer(observer);
         }
     }
 
@@ -6291,6 +6388,10 @@ mod tests {
         // (bounded by CLOSE_DEADLINE). Removing the join makes `finished` false here.
         struct Sleeper(Arc<std::sync::atomic::AtomicBool>);
         impl IndexOpen for Sleeper {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Opening { reason: None });
                 std::thread::sleep(Duration::from_millis(400));
@@ -6340,6 +6441,10 @@ mod tests {
     }
 
     impl IndexOpen for Counting {
+        fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+            let _ = observer;
+        }
+
         fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
             use std::sync::atomic::Ordering::SeqCst;
             let now = self.running.fetch_add(1, SeqCst) + 1;
@@ -6751,5 +6856,399 @@ mod tests {
         drop(log);
         state.close_vault();
         let _ = std::fs::remove_dir_all(&a);
+    }
+
+    // -- ADR-0020: announce after the commit, narrow the slot lock (task #176) ---------
+
+    /// The vault's commit gate, for the handle now in the slot.
+    fn commit_gate(state: &AppState) -> serat_index::CommitGate {
+        let guard = state.open_lock();
+        let open = guard.as_ref().expect("a vault is open");
+        let handle = open.index_handle.lock().expect("slot");
+        handle.as_ref().expect("a handle").commit_gate()
+    }
+
+    fn notifier(state: &AppState) -> Arc<crate::consumer::ChangeNotifier> {
+        let guard = state.open_lock();
+        Arc::clone(guard.as_ref().expect("open").indexer.notifier())
+    }
+
+    /// A state with `serat.md`, an `other.md` to link to, settled and quiet: the change
+    /// signal's 100 ms interval has long passed, so no trailing edge is owed that could
+    /// be mistaken for the save's.
+    fn quiet_state(name: &str) -> (AppState, crate::TestDir) {
+        let dir = fixture(name);
+        std::fs::write(dir.join("other.md"), "# Other\n").expect("fixture");
+        let state = settled_state(&dir);
+        std::thread::sleep(Duration::from_millis(400));
+        (state, dir)
+    }
+
+    fn save_serat(state: &AppState, text: &str) {
+        let read = state
+            .read_file(ReadFileArgs {
+                path: "10-projects/serat.md".into(),
+            })
+            .expect("read");
+        state
+            .write_file(WriteFileArgs {
+                path: "10-projects/serat.md".into(),
+                text: text.into(),
+                base_hash: Some(read.hash),
+            })
+            .expect("write");
+    }
+
+    fn backlink_sources(state: &AppState, path: &str) -> Vec<String> {
+        match state.backlinks(NotePathArgs { path: path.into() }) {
+            Ok(IndexRead::Ready { value }) => value.into_iter().map(|b| b.source_path).collect(),
+            other => panic!("backlinks not ready: {other:?}"),
+        }
+    }
+
+    fn search_paths(state: &AppState, query: &str) -> Vec<String> {
+        match state.search(SearchArgs {
+            query: query.into(),
+            offset: 0,
+            limit: 10,
+        }) {
+            Ok(IndexRead::Ready {
+                value: SearchOutcome::Hits { items },
+            }) => items.into_iter().map(|h| h.path).collect(),
+            other => panic!("search not ready: {other:?}"),
+        }
+    }
+
+    // Mutants, each run by hand on this commit and each red:
+    //   1. restore `notifier().changed()` at the submit in `submit_to_index`: the
+    //      generation has moved while the commit is held, so the first assertion fails
+    //      every time (it does not depend on the event's throttle);
+    //   2. drop `install_commit_observer` in `open_vault_guarded`: no event ever follows
+    //      the release, and `wait_until` times out;
+    //   3. (with 1) the event precedes the commit, so the reads below would see the old
+    //      snapshot.
+    #[test]
+    fn index_changed_follows_the_saves_commit_and_a_read_on_it_sees_the_save() {
+        let (state, dir) = quiet_state("announce-after-commit");
+        let seen = collect_changed(&state);
+        let notifier = notifier(&state);
+        let generation = notifier.generation();
+        let gate = commit_gate(&state);
+        assert!(backlink_sources(&state, "other.md").is_empty());
+
+        let hold = gate.hold();
+        save_serat(
+            &state,
+            "---\ntype: project\n---\n\n# Serat\n\nSee [[other]] and quokkaterm.\n",
+        );
+        assert!(
+            hold.wait_reached(Duration::from_secs(10)),
+            "the writer never reached the held commit"
+        );
+        // The save was submitted (the command has returned) and the transaction is open:
+        // nothing may have been announced, and the generation has not moved.
+        assert_eq!(
+            notifier.generation(),
+            generation,
+            "a change was announced before the commit"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "index://changed was emitted while the commit was held"
+        );
+        assert!(
+            backlink_sources(&state, "other.md").is_empty(),
+            "the held transaction is invisible to a reader"
+        );
+
+        drop(hold);
+        wait_until("index://changed after the release", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        // On the event: the saved state is visible to every reader the views use.
+        assert_eq!(
+            backlink_sources(&state, "other.md"),
+            ["10-projects/serat.md"]
+        );
+        assert_eq!(search_paths(&state, "quokkaterm"), ["10-projects/serat.md"]);
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Mutant: hold the slot guard across `serat_index::apply` in `submit_to_index`: the
+    // second save blocks on the slot mutex behind the first's load and this times out.
+    #[test]
+    fn a_second_save_completes_while_the_first_is_held_in_its_load() {
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inside_tx = Mutex::new(inside_tx);
+        let release_rx = Mutex::new(release_rx);
+        let hook: crate::state::SaveLoadHook = Arc::new(move |path: &str| {
+            if path == "10-projects/serat.md" {
+                let _ = inside_tx.lock().expect("tx").send(());
+                let _ = release_rx
+                    .lock()
+                    .expect("rx")
+                    .recv_timeout(Duration::from_secs(20));
+            }
+        });
+        let dir = fixture("narrow-slot-lock");
+        std::fs::write(dir.join("second.md"), "# Second\n").expect("fixture");
+        let state = Arc::new(state_with(OpenHooks {
+            in_save_load: Some(hook),
+            ..OpenHooks::default()
+        }));
+        state.open_vault(open_args(&dir)).expect("open");
+        wait_ready(&state);
+
+        let first = Arc::clone(&state);
+        let first = std::thread::spawn(move || save_serat(&first, "# Serat, first\n"));
+        inside_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first save never reached its load");
+
+        let before = state.save_path_outcomes();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let second = Arc::clone(&state);
+        let second = std::thread::spawn(move || {
+            let read = second
+                .read_file(ReadFileArgs {
+                    path: "second.md".into(),
+                })
+                .expect("read");
+            second
+                .write_file(WriteFileArgs {
+                    path: "second.md".into(),
+                    text: "# Second, saved\n".into(),
+                    base_hash: Some(read.hash),
+                })
+                .expect("write");
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Release the first save whatever happened, so a red run does not hang.
+        let _ = release_tx.send(());
+        first.join().expect("first save");
+        second.join().expect("second save");
+        assert!(
+            finished,
+            "a save on another note waited behind the first save's load (slot lock held across the parse)"
+        );
+        assert_eq!(
+            state.save_path_outcomes().submitted,
+            before.submitted + 2,
+            "both saves were submitted (the second while the first was in its load)"
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A rebuilt handle announces again (the observer survives a rebuild).
+    #[test]
+    fn a_rebuilt_handle_still_announces_the_saves_commit() {
+        let (state, dir) = quiet_state("announce-after-rebuild");
+        state.rebuild_index().expect("rebuild");
+        std::thread::sleep(Duration::from_millis(400));
+        let seen = collect_changed(&state);
+        let notifier = notifier(&state);
+        let generation = notifier.generation();
+        let gate = commit_gate(&state);
+        let hold = gate.hold();
+        save_serat(&state, "# Serat\n\nSee [[other]] and wombatterm.\n");
+        assert!(hold.wait_reached(Duration::from_secs(10)));
+        assert_eq!(notifier.generation(), generation);
+        assert!(seen.lock().expect("seen").is_empty());
+        drop(hold);
+        wait_until("index://changed from the rebuilt handle's writer", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        assert_eq!(search_paths(&state, "wombatterm"), ["10-projects/serat.md"]);
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The race the lock narrowing introduces (ADR-0020 decision 2): a save holds a clone
+    // of the writer, a rebuild stops that writer, then the save submits. It is refused and
+    // counted, not submitted, and the rebuild (which re-walks the disk after the writer
+    // stopped) indexes the saved bytes.
+    #[test]
+    fn a_save_whose_writer_a_rebuild_stopped_is_refused_and_the_rebuild_indexes_it() {
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inside_tx = Mutex::new(inside_tx);
+        let release_rx = Mutex::new(release_rx);
+        let hook: crate::state::SaveLoadHook = Arc::new(move |path: &str| {
+            if path == "10-projects/serat.md" {
+                let _ = inside_tx.lock().expect("tx").send(());
+                let _ = release_rx
+                    .lock()
+                    .expect("rx")
+                    .recv_timeout(Duration::from_secs(20));
+            }
+        });
+        let dir = fixture("save-vs-rebuild");
+        let state = Arc::new(state_with(OpenHooks {
+            in_save_load: Some(hook),
+            ..OpenHooks::default()
+        }));
+        state.open_vault(open_args(&dir)).expect("open");
+        wait_ready(&state);
+        // The writer the save will have cloned: it reports `WriterStopped` once stopped.
+        let old_writer = {
+            let guard = state.open_lock();
+            let open = guard.as_ref().expect("open");
+            let slot = open.index_handle.lock().expect("slot");
+            slot.as_ref().expect("handle").writer()
+        };
+        let before = state.save_path_outcomes();
+
+        let saver = Arc::clone(&state);
+        let saver = std::thread::spawn(move || {
+            save_serat(&saver, "# Serat\n\nnarwhalterm\n");
+        });
+        inside_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the save never reached its load");
+        let rebuilder = Arc::clone(&state);
+        let rebuilder = std::thread::spawn(move || rebuilder.rebuild_index());
+        wait_until("the rebuild to stop the old writer", || {
+            serat_core::IndexWriter::flush(&old_writer).is_err()
+        });
+        let _ = release_tx.send(());
+        saver.join().expect("save");
+        rebuilder.join().expect("rebuild").expect("rebuild result");
+
+        let after = state.save_path_outcomes();
+        assert_eq!(after.writer_refused, before.writer_refused + 1);
+        assert_eq!(after.submitted, before.submitted);
+        wait_ready(&state);
+        assert_eq!(
+            search_paths(&state, "narwhalterm"),
+            ["10-projects/serat.md"]
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_external_change_is_announced_once_after_its_commit() {
+        let (state, dir) = quiet_state("announce-external-once");
+        let seen = collect_changed(&state);
+        let notifier = notifier(&state);
+        let before = notifier.generation();
+        std::fs::write(dir.join("external.md"), "# By another tool\n").expect("write");
+        wait_for_row(&dir, "external.md");
+        wait_until("index://changed", || !seen.lock().expect("seen").is_empty());
+        // Drain the writer, so every batch the reconciler submitted has committed and
+        // been reported; then the count is a fact, not a wait.
+        {
+            let guard = state.open_lock();
+            let open = guard.as_ref().expect("open");
+            let slot = open.index_handle.lock().expect("slot");
+            serat_core::IndexWriter::flush(&slot.as_ref().expect("handle").writer())
+                .expect("flush");
+        }
+        assert_eq!(
+            notifier.generation(),
+            before + 1,
+            "one commit, one announcement"
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The last save's post-commit event is suppressed at close: the notifier is closed
+    // before the handle, so the observer still runs (the generation moves) and emits
+    // nothing (ADR-0020 decision 3, close ordering).
+    #[test]
+    fn the_notifier_is_closed_before_the_handle_so_the_last_saves_event_is_suppressed() {
+        let (state, dir) = quiet_state("announce-close-order");
+        let seen = collect_changed(&state);
+        let notifier = notifier(&state);
+        let generation = notifier.generation();
+        let gate = commit_gate(&state);
+        let hold = gate.hold();
+        save_serat(&state, "# Serat, the last save\n");
+        assert!(hold.wait_reached(Duration::from_secs(10)));
+        let state = Arc::new(state);
+        let closer = Arc::clone(&state);
+        let closing = std::thread::spawn(move || closer.close_vault());
+        wait_until("the notifier to be closed", || notifier.is_closed());
+        drop(hold);
+        closing.join().expect("close");
+        assert!(
+            notifier.generation() > generation,
+            "the observer ran after the commit"
+        );
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "an event was emitted after the notifier closed: {:?}",
+            seen.lock()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The lock invariant (ADR-0020 decision 3, N3): nothing that runs on the writer's
+    // thread in the observer path may be held by a thread waiting on the writer. With the
+    // writer parked in a held commit, the notifier's mutex and the switcher's work mutex
+    // are free, and nothing in the notifier or the switcher calls into the writer.
+    #[test]
+    fn the_announcing_path_never_waits_on_the_writer() {
+        let (state, dir) = quiet_state("announce-lock-invariant");
+        let notifier = notifier(&state);
+        let gate = commit_gate(&state);
+        let hold = gate.hold();
+        save_serat(&state, "# Serat, parked\n");
+        assert!(hold.wait_reached(Duration::from_secs(10)));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let probe = Arc::clone(&notifier);
+        let state = Arc::new(state);
+        let opened = Arc::clone(&state);
+        let prober = std::thread::spawn(move || {
+            let _ = probe.generation();
+            opened
+                .note_opened(&NoteBufferArgs {
+                    path: "other.md".into(),
+                    base_hash: opened
+                        .read_file(ReadFileArgs {
+                            path: "other.md".into(),
+                        })
+                        .expect("read")
+                        .hash,
+                })
+                .expect("opened");
+            let _ = tx.send(());
+        });
+        let free = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(hold);
+        prober.join().expect("probe");
+        assert!(
+            free,
+            "the notifier or the switcher was blocked behind the parked writer"
+        );
+
+        // And structurally: neither file calls a writer barrier, outside its tests. The
+        // scan matches method names as text: it does not see a `close` or a join, and a
+        // legitimate `BufWriter::flush` in the switcher would trip it (the safe direction).
+        for file in ["src/consumer.rs", "src/switcher.rs"] {
+            let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+                .expect("source");
+            let production = text.split("#[cfg(test)]\nmod tests").next().expect("split");
+            for barrier in [
+                "submit_blocking",
+                "close_clean",
+                ".flush()",
+                ".resolve_links()",
+            ] {
+                let calls = production
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .any(|line| line.contains(barrier));
+                assert!(!calls, "{file} calls {barrier}");
+            }
+        }
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

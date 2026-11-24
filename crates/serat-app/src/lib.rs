@@ -1627,6 +1627,10 @@ mod tests {
     }
 
     impl index::IndexOpen for ShallowQueue {
+        fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+            let _ = observer;
+        }
+
         fn open(
             &mut self,
             _root: &std::path::Path,

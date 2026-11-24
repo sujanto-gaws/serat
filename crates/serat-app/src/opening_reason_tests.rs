@@ -17,6 +17,10 @@ use crate::state::{AppState, OpenHooks};
 struct Hold(Duration);
 
 impl IndexOpen for Hold {
+    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+        let _ = observer;
+    }
+
     fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
         std::thread::sleep(self.0);
         publish(IndexState::Ready { note_count: 1 });
@@ -31,6 +35,10 @@ struct Gated {
 }
 
 impl IndexOpen for Gated {
+    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+        let _ = observer;
+    }
+
     fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
         let _ = self.entered.send(());
         let _ = self.release.recv();
