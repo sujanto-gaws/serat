@@ -47,7 +47,7 @@ owner: lead
 | 25 | `[P1/impl] Quick switcher and command palette` | vue-frontend-dev | 8, 18 | **merged** 6a608b8 (one registry per §9.3; palette is FR-NAV-06) |
 | 26 | `[P1/impl] PDF and image viewers` | vue-frontend-dev | 8, 19 | **merged** c41d6cc (+#98 validator, #108 transport restart; cMaps/fonts gap recorded) |
 | 27 | `[P1/test] Test cases for every P1 ID + hostile suite` | test-engineer | 12–17, 22–26 | **merged** a3f4b5f (carries #113) |
-| 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol merged; report last |
+| 28 | `[P1/test] Gate protocol (early) and GO/NO-GO report (last)` | test-engineer | 20, 27 | protocol merged; report status half **merged** 06f2867 as #163; week-in-vault half blank |
 | 30 | `[P1/design] Account for FR-NAV-08 in architecture.md so doclint passes` | architect | 1 | **merged** db1d967 |
 | 31 | `[P1/test] Update and re-run the NFR-PRF-01 cold-start bench for ADR-0015's tree mark` | test-engineer | 2 | **merged** as #141; old branch superseded |
 | 75 | `[P1/design] Ratify or re-token the editor's 48 px bottom scroll margin` (NFR-PRF-02, FR-EDT-01, US-35) | frontend-designer | 42 | **merged** 28ab56a (kept as named token exception) |
@@ -100,7 +100,7 @@ owner: lead
 | 145 | `[P1/impl] No Tag links for #word inside inline code spans` (NFR-CMP-01) | rust-core-dev | 139 | **merged** 20b2562 |
 | 146 | `[P1/impl] Callout fold marker is a fold state, not title text` (NFR-CMP-01, C-04) | vue-frontend-dev | 139 | **merged** f88331f (glyph: #152) |
 | 147 | `[P1/test] Quiet-machine NFR-PRF-02 scenarios re-run; triage table-cell/split-preview and save_patch` | test-engineer | 61, runners | pending |
-| 149 | `[P5/release] Third-party notices for the shipped cMaps (Adobe), Foxit and Liberation fonts` (NFR-SEC-07) | release-engineer | 127 | pending |
+| 149 | `[P5/release] Third-party notices for every shipped asset: pdf.js, Adobe cMaps, Foxit, Liberation (GPL-2.0 with font exception), three OFL-1.1 families` (NFR-SEC-07) | release-engineer | 127 | **merged** 6fd6f4e |
 | 150 | `[P1/design] ADR-0018 describes the shipped locality API` | architect | 143 | **merged** d1356b4 (150b) |
 | 151 | `[P1/impl] Open or switch the vault from inside Serat: choose_vault, vault.open, last_vault at launch` (US-01, FR-VLT-01, FR-NAV-06; ADR-0012) | tauri-app-dev + vue-frontend-dev | — | **merged** 1ab859e (3 rounds) |
 | 152 | `[P1/design] Collapsed-callout glyph and aria-expanded` | frontend-designer | 146 | **merged** 485c368 (+152b a7b1be6) |
@@ -108,6 +108,14 @@ owner: lead
 | 160 | `[P1/design] Specify live-preview typography and export --serat-* tokens as CSS` (FR-EDT-02, US-02; C-01, C-07; ADR-0006) | frontend-designer | 159 | **merged** c32b48e (+ rulings in 1d7e69d) |
 | 161 | `[P1/impl] Style the hybrid live preview (HighlightStyle, mono-source, --serat-* tokens)` (FR-EDT-01/02, US-02, NFR-PRF-01/02; C-04) | vue-frontend-dev | 160 | **merged** c32b48e |
 | 162 | `[P1/impl] Bundle the three OFL font families locally and re-measure measure.editor` (FR-EDT-02, NFR-SEC-01, NFR-SEC-07, NFR-USE-01) | vue-frontend-dev + tauri-app-dev | 161 | **merged** 1d7e69d |
+| 62 | `[P1/test] Attested post-spacing hub-save run` (NFR-PRF-03, NFR-PRF-08; ADR-0011) | test-engineer | 56 | **merged** e82eb01 (17.01 ms p95, attested 0) |
+| 163 | `[P1/test] P1 GO/NO-GO report, status half` (charter gate, NFR-PRF-01..09, NFR-CMP-01/02/04) | test-engineer | 27, 28 | **merged** 06f2867 (3 rounds) |
+| 164 | `[P1/test] budgets.yml builds serat-app before the NFR-PRF-01/03 jobs measure` (NFR-PRF-01/03/08; ADR-0011) | test-engineer | 60 | **merged** 5ac4dae |
+| 165 | `[P1/impl] FR-VLT-04 Windows CI tail triage; report-only on hosted Windows` (FR-VLT-04, NFR-PRF-08; ADR-0019, ADR-0015) | rust-core-dev | 164 | **merged** 5e27541 (3 rounds) |
+| 166 | `[P1/test] NFR-PRF-04 CI runner class / gate-eligibility rule` (NFR-PRF-04/08, C-06; ADR-0019) | test-engineer + architect | 164 | **merged** 13eec23 (with ADR-0019 as 166b) |
+| 167 | `[P1/test] Windows re-runs of the report-only budget jobs when a runner is available` (NFR-PRF-04, FR-VLT-04; ADR-0019) | test-engineer | 165, 166, runners | pending |
+| 168 | `[P1/test] ubuntu-latest asserting jobs for NFR-PRF-04 and FR-VLT-04; two-column C-06 position in the gate report` (NFR-PRF-08; ADR-0019) | test-engineer | 166 | **merged** 410b378 (2 rounds) |
+| 169 | `[P1/req] PRD v1.12: NFR-PRF-08, FR-VLT-04, NFR-PRF-03 note, open question and US-35 restated for ADR-0019` | product-analyst | 166 | **merged** 13eec23 |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
