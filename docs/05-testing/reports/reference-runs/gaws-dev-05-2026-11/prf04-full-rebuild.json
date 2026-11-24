@@ -1,0 +1,33 @@
+{
+  "budget_id": "prf04-full-rebuild",
+  "requirement": "NFR-PRF-04",
+  "interval": "entry to rebuild() until it returns, writer drained and ANALYZE run",
+  "profile": "reference",
+  "statistic": "wall_clock_median",
+  "value_ms": 9152.892,
+  "limit_ms": 30000.000,
+  "passed": true,
+  "degraded": null,
+  "gated": true,
+  "asserted": true,
+  "samples_n": 3,
+  "min_ms": 9105.566,
+  "mean_ms": 10325.752,
+  "max_ms": 12718.797,
+  "vault_digest_sha256": "35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e",
+  "vault_format_version": 1,
+  "vault_notes": 20000,
+  "os": "linux",
+  "cores": 4,
+  "realtime_scanner": null,
+  "power_plan": "unknown",
+  "gate_eligible": true,
+  "phases_ms": {
+    "walk": 73.309,
+    "read_hash": 474.200,
+    "parse": 2904.121,
+    "producer_wait": 1718.102,
+    "write_fts": 1514.910
+  },
+  "samples_ms": [12718.797, 9105.566, 9152.892]
+}
