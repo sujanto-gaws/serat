@@ -67,6 +67,19 @@ describe("#171 no per-keystroke stringify", () => {
     wrapper.unmount();
   });
 
+  it("loading a note renders it in the split preview with no typing first (replaceState path)", async () => {
+    vi.useFakeTimers();
+    const wrapper = mount(CodeMirrorEditor, { props: { ipc: mockIpc(), livePreview: false }, attachTo: document.body });
+    const api = wrapper.vm as unknown as { loadNote(t: string, p: string, h: string): Promise<boolean> };
+    await api.loadNote("# LoadedTitle\n\nbody", "b.md", "h1");
+    await vi.advanceTimersByTimeAsync(400);
+    vi.useRealTimers();
+    await vi.waitFor(() => {
+      expect(wrapper.get('[data-testid="serat-preview"]').text()).toContain("LoadedTitle");
+    });
+    wrapper.unmount();
+  });
+
   it("the split preview renders the current text after the debounce", async () => {
     const { wrapper, view } = await mountLoaded(false);
     vi.useFakeTimers();
@@ -92,7 +105,9 @@ describe("#171 no per-keystroke stringify", () => {
 
 describe("#170 split-preview containment", () => {
   const vue = readFileSync(join(__dirname, "CodeMirrorEditor.vue"), "utf8");
-  const rule = (src: string): string => /\.serat-editor-split-preview\s*\{([^}]*)\}/.exec(src)?.[1] ?? "";
+  // Comments stripped: the rule's own explanatory comment mentions the properties and must not satisfy the match.
+  const rule = (src: string): string =>
+    (/\.serat-editor-split-preview\s*\{([^}]*)\}/.exec(src)?.[1] ?? "").replace(/\/\*[\s\S]*?\*\//g, "");
 
   it("the pane rule carries contain: strict", () => {
     expect(rule(vue)).toMatch(/contain:\s*strict\s*;/);
@@ -103,7 +118,11 @@ describe("#170 split-preview containment", () => {
     expect(rule(vue)).toMatch(/overflow:\s*auto/);
   });
 
-  it("mutant: dropping the contain declaration is detected", () => {
-    expect(rule(vue.replace(/contain:\s*strict\s*;/, ""))).not.toMatch(/contain:\s*strict/);
+  it("mutant: the declarations are matched in code, not in the comment (each deletion is detected)", () => {
+    for (const decl of [/contain:\s*strict\s*;/, /overflow:\s*auto\s*;/, /flex:\s*1 1 50%\s*;/]) {
+      const mutated = vue.replace(new RegExp(`(\\.serat-editor-split-preview\\s*\\{[^}]*?)${decl.source}`), "$1");
+      expect(mutated).not.toBe(vue);
+      expect(rule(mutated)).not.toMatch(decl);
+    }
   });
 });
