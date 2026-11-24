@@ -23,24 +23,24 @@ cites: ADR-0019, ADR-0014, RISK-012, RISK-013, RISK-016, F-96
 
 ## Method
 
-**What was run.** The owner ran four budget bins with `--profile reference` on a Linux desktop named gaws-dev-05, 4 cores, on 2026-11-24, against the 20,000-note vault with `tree_digest_sha256` `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e` (format version 1; identical in all five files, so the number and the vault travel together). Five result files:
+**What was run.** The owner ran four budget bins with `--profile reference` on a Linux desktop named gaws-dev-05, 4 cores, on 2026-11-24, against the 20,000-note vault with `vault_digest_sha256` `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e` (format version 1; identical in all five files, so the number and the vault travel together). Five result files, from three bins (`prf01-serat-term` writes the first, `prf01-cold-start` writes the next two, `prf03-save-to-index` and `prf04-full-rebuild` one each). `prf01-cold-start` also runs the section 3.4 20k-versus-50k scale assertion unless `--skip-scale` is given; no scale result is committed, so it is absent or was skipped, and this report has no scale figure:
 
 | File | Budget | Job |
 |---|---|---|
 | `prf01-serat-term.json` | NFR-PRF-01 | Serat term, the asserted quantity (ADR-0014 Decision 3), with the platform term and the legacy totals reported beside it |
 | `prf01-vault-usable.json` | NFR-PRF-01 | process spawn to vault-usable, the legacy 1,000 ms total |
 | `prf01-window-visible.json` | NFR-PRF-01 | process spawn to first painted frame, the legacy 400 ms total |
-| `prf03-save-to-index.json` | NFR-PRF-03 | `AppState::write_file`'s call into the index, hub-note saves |
+| `prf03-save-to-index.json` | NFR-PRF-03 | `AppState::write_file`'s call into the index, 1,000 distinct notes, a stratified sample (at most one fifth from hub directories) |
 | `prf04-full-rebuild.json` | NFR-PRF-04 | `rebuild()` entry to return, writer drained and ANALYZE run |
 
 All five record `os: linux`, `cores: 4`, `realtime_scanner: null`, `power_plan: unknown`, `gate_eligible: true`.
 
 **What was not run.**
-- `environment`, before and after the series. There is no stamp of the machine's model, CPU, RAM, storage, kernel, toolchain, webkit2gtk version, the build profile of the app under test, or whether anything else was running. The result files carry only the five fields above.
+- `environment`, before and after the series. There is no stamp of the machine's model, CPU, RAM, storage, kernel, toolchain, webkit2gtk version, or whether anything else was running. The result files carry only the five fields above.
 - `p1-external-change` (FR-VLT-04), so RM-2 has no FR-VLT-04 figure.
 - `p1-save-tail`, so RM-2 has no `attested` figure for NFR-PRF-03 and no per-phase save-tail breakdown.
 
-**Consequence of the missing stamps.** The run is gate eligible by the harness's rule, which for Linux is unconditional, and that is all it is. It is **not attested** in the sense `p1-gate-report.md` uses (no recorded absence of concurrent builds), so a reader cannot tell a quiet desktop from a loaded one, and a build-profile question matters for NFR-PRF-01 in particular: whether the app under test was a release build is not recorded. The first prf04 sample (12,718.8 ms) is 39.0% above the median, which is the shape of a cold page cache, and the files do not say whether the series discarded a warm-up run (`reference-machine.md` protocol step 6). None of this changes a number; it limits what a number can be used for.
+**Consequence of the missing stamps.** The run is gate eligible by the harness's rule, which for Linux is unconditional, and that is all it is. It is **not attested** in the sense `p1-gate-report.md` uses (no recorded absence of concurrent builds), so a reader cannot tell a quiet desktop from a loaded one. The build profile is not in question for NFR-PRF-01: the harness rejects any startup trace whose profile is not `release` (`bench/budget/src/trace.rs`), so a prf01 JSON exists only if all 20 traces came from a release build. The first prf04 sample (12,718.8 ms) is 39.0% above the median, which is the shape of a cold page cache, and the files do not say whether the series discarded a warm-up run (`reference-machine.md` protocol step 6). None of this changes a number; it limits what a number can be used for.
 
 **Sample sizes against the requirements.**
 - NFR-PRF-01 asks for p95 over 20 runs on the reference machine. n=20 meets the count, with the caveat above that a warm-up discard is not recorded. A p95 over 20 samples is close to the second-largest sample; here 1,310.4 ms, the sample before the 1,419.1 ms maximum.
@@ -70,7 +70,7 @@ All five record `os: linux`, `cores: 4`, `realtime_scanner: null`, `power_plan: 
 
 The legacy totals read lower in this file than in the two separate legacy jobs (1,556.1 against 1,603.4; 1,796.5 against 1,897.9): they are different series of 20 spawns. Both pairs are RM-2's and neither is preferred.
 
-**NFR-PRF-04 phases** (`phases_ms`; the file does not say which sample or aggregate they describe):
+**NFR-PRF-04 phases** (`phases_ms`: the median of each phase across the runs, not the phases of the median run; `bench/budget/src/lib.rs`):
 
 | Phase | ms |
 |---|---|
@@ -96,26 +96,26 @@ What it supports: Serat's own parse and writer path rebuilds 20,000 notes in abo
 
 ### (b) NFR-PRF-03: PASS, asserted, on Linux
 
-p95 20.247 ms of 50 ms over 1,000 hub-note saves (mean 11.726 ms, min 4.981, max 111.502). The census closes: 1,000 attempted, 1,000 submitted, 0 writer-refused, 0 handle-missing, so the p95 is over the whole workload.
+p95 20.247 ms of 50 ms over 1,000 saves of distinct notes (stratified, at most one fifth from hub directories) (mean 11.726 ms, min 4.981, max 111.502). The census closes: 1,000 attempted, 1,000 submitted, 0 writer-refused, 0 handle-missing, so the p95 is over the whole workload.
 
-Context: the attested figure on the Linux container was 17.01 ms p95 (p50 11.54, max 148.86; `p1-save-tail-2026-11.md`, `attested 0`), the same hub-note quantity, measured by the same save-path interval. RM-2 reads 3.24 ms higher at p95 and has a lower maximum (111.5 against 148.9 ms). Two different machines, 1,000 samples each: the difference is within what a machine change would be expected to make, and this report does not rank them. RM-2's run is not attested (no `p1-save-tail`, no environment stamp), so the 20.247 ms is a figure with unknown concurrent load.
+Context only: the attested 17.01 ms p95 on the Linux container (`p1-save-tail-2026-11.md`, `attested 0`) is a different quantity. `p1-save-tail` saves one note 1,000 times (the highest in-degree note, in-degree 679, in-process apply to flush); `prf03-save-to-index` saves 1,000 distinct notes drawn across the vault. The two are not compared and neither ranks the other. RM-2's run is not attested (no `p1-save-tail`, no environment stamp), so the 20.247 ms is a figure with unknown concurrent load; the hub-note save on RM-2 itself is owed.
 
-The PRD's v1.13 note holds: the 50 ms binds the hub-note class, and the 5,000-line class is a reported scenario with no figure. RM-2 gives none for it.
+The PRD's v1.13 note holds: the 50 ms binds the hub-note class and the 20k vault's own distribution, and the 5,000-line class is a reported scenario with no figure. RM-2 gives none for it.
 
 ### (c) NFR-PRF-01: FAIL, asserted, on Linux, and not a verdict on the Windows budget
 
 The Serat term read p95 1,310.4 ms against 350 ms (n=20; min 1,046.6, mean 1,167.4, max 1,419.1). The harness asserted it on a gate-eligible machine and the run FAILED. Beside it, reported and not asserted: platform term 503.1 ms, window-visible 1,556.1, vault-usable 1,796.5 and tree-first-screen 1,796.5 ms.
 
-**What this is, plainly.** PRD v1.2 re-baselined the 350 ms as a split, and bounded that re-baseline to Windows/WebView2 (F-96): "WKWebView and WebKitGTK are unmeasured. If their platform terms are of the same order, the requirement was wrong rather than the design". This run is the first figure from webkit2gtk. It is a finding against the Linux/webkit2gtk platform, produced on a machine the harness rates gate eligible, so it is an asserted FAIL there. It is not a verdict on the Windows budget, whose gate figure (RM-1, scanner on) is owed and whose last reading was 233.8 ms p95 on WebView2 at P0.
+**What this is, plainly.** PRD v1.2 re-baselined the 350 ms as a split, and bounded that re-baseline to Windows/WebView2 (F-96): "WKWebView and WebKitGTK are unmeasured. If their platform terms are of the same order, the requirement was wrong rather than the design". This run is the first figure from webkit2gtk. It is a Linux finding, not yet attributed, produced on a machine the harness rates gate eligible, so it is an asserted FAIL there. It is not a verdict on the Windows budget, whose gate figure (RM-1, scanner on) is owed and whose last reading was 233.8 ms p95 on WebView2 at P0.
 
 **What the file shows and what it does not.**
-- The result is far outside the budget, not marginal: the smallest of the 20 samples (1,046.6 ms) is three times the limit.
-- The platform term here (503.1 ms p95) is smaller than the P0 Windows platform term (1,687.1 ms p95), and the Serat term is larger than the P0 Windows Serat term (233.8 ms p95). Different machines and different webviews; no comparison is drawn. It does mean the failure is not explained by a slow webview creation.
+- The result is far outside the budget, not marginal: the smallest of the 20 samples (1,046.6 ms) is about three times the limit.
+- Within this machine, the platform term (503.1 ms p95) is well below the Serat term (1,310.4 ms p95), so the failure is not explained by webview creation. The Serat term is Serat's own four marks (`S_pre`, `S_setup`, `S_shell`, `S_settle`), so the PRD's same-order-platform-terms clause does not excuse it. No other machine's figure is used for this.
 - The file carries the sum of the Serat term only, not its four marks (`S_pre`, `S_setup`, `S_shell`, `S_settle`), so it cannot say which mark carries the 1.3 s. That is the next question and needs the per-mark trace the job already collects.
-- Whether the app under test was a release build is not recorded (no environment stamp). A debug build could account for a large Serat term by itself, and the result cannot be read as a webkit2gtk finding until that is known. This is the first thing to check.
-- tree-first-screen and vault-usable are identical (1,796.493 ms) in the file. The file does not say why; the equality is reported, not explained.
+- The build profile is recorded by construction: the harness refuses a startup trace whose profile is not `release` (`trace.rs`; the harness drives `target/release/serat`; TC-045), so a debug build is ruled out. What blocks attribution is that the JSON carries the Serat-term sum and not its marks. The bin that prints `S_pre`, `S_setup`, `S_shell` and `S_settle` per trace is `prf01-cold-start-terms`; running it on RM-2 is the next step.
+- tree-first-screen and vault-usable are identical (1,796.493 ms), and that is explained: `tree_first_screen` is an independent mark, and `vault_usable` is the latest of paint, tree first screen, index settled and watcher (`trace.rs`). Equal p95s mean the tree's first screen was the last mark in the samples that set them. The same equality appears in the harness's own fixture.
 
-**Recommendation to the owner (a decision, not a re-baseline).** Does NFR-PRF-01 bind Linux in P1? The PRD's scope says no: the 350 ms is bounded to Windows/WebView2, and the "one platform" bound states that other webviews are unmeasured and that, if their platform terms are of the same order, "the requirement was wrong rather than the design". The PRD does not yet say what P1 does when a measured non-Windows figure fails. That is a decision with a risk attached, so it is recorded as **RISK-016** in `docs/01-planning/risk-register.md`, owned by the owner pending the decision. If the owner wants the requirement stated per platform, that is a product-analyst task, and this report proposes it, to be filed by the lead: **"[P1/spec] State whether NFR-PRF-01 binds Linux/webkit2gtk or only Windows/WebView2; do not re-baseline without a release-build per-mark trace (serves NFR-PRF-01, F-96, ADR-0014)"**. Nothing here re-baselines anything: no target in the PRD, the harness or CI changes with this report.
+**Recommendation to the owner (a decision, not a re-baseline).** Does NFR-PRF-01 bind Linux in P1? The PRD's scope says no: the 350 ms is bounded to Windows/WebView2, and the "one platform" bound states that other webviews are unmeasured and that, if their platform terms are of the same order, "the requirement was wrong rather than the design". The PRD does not yet say what P1 does when a measured non-Windows figure fails. That is a decision with a risk attached, so it is recorded as **RISK-016** in `docs/01-planning/risk-register.md`, owned by the owner pending the decision. If the owner wants the requirement stated per platform, that is a product-analyst task, and this report proposes it, to be filed by the lead: **"[P1/spec] State whether NFR-PRF-01 binds Linux/webkit2gtk or only Windows/WebView2; do not re-baseline without a per-mark trace (serves NFR-PRF-01, F-96, ADR-0014)"**. Nothing here re-baselines anything: no target in the PRD, the harness or CI changes with this report.
 
 **Do not conclude** that the Windows budget is wrong, or that the Windows Serat term has regressed. Nothing in this run measures Windows.
 
@@ -125,18 +125,18 @@ Task #167 (Windows re-runs of the report-only jobs) is not closed by this run. I
 
 ## Owed by RM-2 itself
 
-1. `environment` before and after, so that RM-2's model, CPU, RAM, storage, kernel, toolchain, webkit2gtk version, build profile and concurrent load are recorded rather than owed.
+1. `environment` before and after, so that RM-2's model, CPU, RAM, storage, kernel, toolchain, webkit2gtk version, and concurrent load are recorded rather than owed.
 2. `p1-external-change` (FR-VLT-04) on RM-2.
 3. `p1-save-tail` on RM-2, for an attested NFR-PRF-03 figure.
 4. A longer prf04 series (n of at least 5, with the first run reported separately) if RM-2 is to be quoted for NFR-PRF-04 beyond "inside 30 s".
-5. A per-mark NFR-PRF-01 trace on a release build, to attribute the Serat term.
+5. A per-mark NFR-PRF-01 trace (`prf01-cold-start-terms`) to attribute the Serat term; and the section 3.4 scale assertion, which is absent from the committed results.
 
 ## Traceability
 
 | ID | How this report serves it |
 |---|---|
-| NFR-PRF-01 | Records the first webkit2gtk Serat-term figure, as an asserted FAIL on Linux, bounded by PRD v1.2 and F-96; RISK-016 holds the decision |
-| NFR-PRF-03 | Records p95 20.247 ms of 50 on a second Linux machine, hub-note class |
+| NFR-PRF-01 | Records the first webkit2gtk Serat-term figure, as an asserted FAIL on Linux, not yet attributed, bounded by PRD v1.2 and F-96; RISK-016 holds the decision |
+| NFR-PRF-03 | Records p95 20.247 ms of 50 on a Linux desktop, 1,000 distinct notes (stratified) |
 | NFR-PRF-04 | Records median 9,152.9 ms of 30,000 on a Linux desktop, with phases |
 | NFR-PRF-08 | The five jobs ran under `--profile reference` and asserted where the harness asserts; none is a CI run |
 | US-35 | Supporting evidence on a second machine for "stay fast as the vault grows" |

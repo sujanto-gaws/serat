@@ -122,7 +122,7 @@ The table is filled only from what the five result files record. The `environmen
 | Cores | 4 (recorded in every result file) |
 | Real-time scanner | `null` (not applicable to Linux; the harness records no scanner state) |
 | Power plan | `unknown` (as recorded; no plan is read on Linux) |
-| Vault | 20,000 notes, format version 1, `tree_digest_sha256` `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e` (identical in all five files) |
+| Vault | 20,000 notes, format version 1, `vault_digest_sha256` `35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e` (identical in all five files) |
 | `gate_eligible` | true in all five files (`Environment::gate_eligible()` is true on Linux) |
 | Toolchain | owed (environment bin not run); the result files carry no toolchain field |
 | Model, CPU, clock | owed (environment bin not run) |
@@ -130,7 +130,7 @@ The table is filled only from what the five result files record. The `environmen
 | Storage and filesystem | owed (environment bin not run) |
 | Distribution and kernel | owed (environment bin not run) |
 | Webview (webkit2gtk) version | owed (environment bin not run); matters for NFR-PRF-01 |
-| Build profile of the app under test | owed (environment bin not run) |
+| Build profile of the app under test | release (enforced by `trace.rs`; NFR-PRF-01 only) |
 | Concurrent load before and after (`attested`) | owed (environment bin not run); the run is therefore not attested in the sense `p1-gate-report.md` uses |
 | Series order and first-sample handling | owed; the files give samples in run order and do not say whether a warm-up run was discarded |
 
