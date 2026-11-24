@@ -28,7 +28,9 @@
 //! cost is the index writer's per-note upsert, not this path.
 //!
 //! **A run is rejected, not recorded, unless:** every iteration's edits were all
-//! reported upserted within 10 s, and every edited note's `notes.hash` in the index
+//! reported upserted (within 10 s for a single note, within 60 s for the 100-note batch:
+//! task #167, the batch took 7.7 s p95 / 8.1 s max on the 2-core runner of 2026-11-09, so
+//! 10 s left 20 % of margin on a shape that is not gated), and every edited note's `notes.hash` in the index
 //! equals the blake3 of the bytes written. A fast number over an index that did not
 //! change would be the flattering kind (F-19).
 //!
@@ -55,12 +57,15 @@ use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
 use serat_index::{IndexHandle, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
-use serat_vault::{Vault, Watcher, WatcherConfig, WorkQueue, hash_bytes};
+use serat_vault::{Vault, VaultEvent, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
 /// FR-VLT-04's acceptance criterion.
 const BUDGET_MS: f64 = 500.0;
 /// How long one iteration may take before the run is rejected.
 const ITERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The same for the 100-note batch shape (task #167). Not gated, so it may not reject a run
+/// by being slow; it still rejects a run that never completes.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Quiet time between iterations, so stragglers (a second event for a path already
 /// indexed) belong to the iteration that caused them and not to the next one.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -69,6 +74,39 @@ const SETTLE: Duration = Duration::from_millis(300);
 // checkpointer's idle gate (250 ms) plus a checkpoint makes an overlap rarer (each
 // checkpoint usually finishes before the next write) but does not remove it: the
 // checkpointer also runs on the 2 s idle spacing and the 4,000-frame bound.
+
+/// The state of a stalled iteration, as one line, so a failure to measure says which stage
+/// stopped (task #167, FR-VLT-04): the watcher never queued the paths (`queue depth 0`,
+/// `rounds 0`), the watcher lost events (`rescan raised`), or the consumer is slow
+/// (`queue depth` falls, `rounds` grow, the last commit is far from the write).
+fn describe_stall(
+    upserted: usize,
+    count: usize,
+    limit: Duration,
+    rounds: &[(f64, f64, usize)],
+    rescan_raised: bool,
+    queue_depth: usize,
+) -> String {
+    let shown: Vec<String> = rounds
+        .iter()
+        .take(8)
+        .map(|(taken, committed, n)| {
+            format!("{n} upserted taken {taken:.0} ms committed {committed:.0} ms")
+        })
+        .collect();
+    format!(
+        "only {upserted} of {count} edits were indexed in {} s; consumer rounds {} [{}]; \
+         watcher rescan {}; queue depth {queue_depth}",
+        limit.as_secs(),
+        rounds.len(),
+        shown.join("; "),
+        if rescan_raised {
+            "RAISED (events were lost)"
+        } else {
+            "not raised"
+        },
+    )
+}
 
 /// What the consumer did with one drain of the queue.
 struct Round {
@@ -126,6 +164,8 @@ struct Run<'a> {
     sequence: usize,
     settle: Duration,
     health: Arc<WalHealth>,
+    queue: &'a WorkQueue,
+    watcher: &'a Watcher,
 }
 
 struct Measured {
@@ -182,14 +222,36 @@ impl Run<'_> {
             written.push((relative, bytes));
         }
 
-        let deadline = t0 + ITERATION_TIMEOUT;
+        let limit = if count == 1 {
+            ITERATION_TIMEOUT
+        } else {
+            BATCH_TIMEOUT
+        };
+        let deadline = t0 + limit;
         let (mut upserted, mut first_taken, mut last_commit) = (0, None, t0);
+        let mut seen: Vec<(f64, f64, usize)> = Vec::new();
+        let mut rescan = false;
         while upserted < count {
             let wait = deadline.saturating_duration_since(Instant::now());
-            let round = self
-                .rounds
-                .recv_timeout(wait)
-                .map_err(|_| format!("only {upserted} of {count} edits were indexed in 10 s"))?;
+            let Ok(round) = self.rounds.recv_timeout(wait) else {
+                rescan |= self
+                    .watcher
+                    .take_events()
+                    .contains(&VaultEvent::RescanRequired);
+                return Err(describe_stall(
+                    upserted,
+                    count,
+                    limit,
+                    &seen,
+                    rescan,
+                    self.queue.depth(),
+                ));
+            };
+            seen.push((
+                ms(round.first_taken.duration_since(t0)),
+                ms(round.committed.duration_since(t0)),
+                round.outcome.upserted,
+            ));
             upserted += round.outcome.upserted;
             first_taken.get_or_insert(round.first_taken);
             last_commit = round.committed;
@@ -442,6 +504,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     };
 
     let queue = Arc::new(WorkQueue::new());
+    let armed = Instant::now();
     let watcher = Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default())
         .map_err(|e| format!("watcher: {e}"))?;
     let (tx, rx) = mpsc::channel::<Round>();
@@ -503,7 +566,20 @@ fn run(args: &[String]) -> Result<bool, String> {
         sequence: 0,
         settle,
         health: handle.wal_health(),
+        queue: &queue,
+        watcher: &watcher,
     };
+    eprintln!(
+        "watcher armed {:.1} s before the first edit; backend {}",
+        armed.elapsed().as_secs_f64(),
+        if cfg!(windows) {
+            "ReadDirectoryChangesW"
+        } else if cfg!(target_os = "macos") {
+            "FSEvents"
+        } else {
+            "inotify"
+        },
+    );
 
     let result = (|| -> Result<(Vec<Measured>, Vec<Measured>), String> {
         let mut single = Vec::new();
@@ -511,6 +587,17 @@ fn run(args: &[String]) -> Result<bool, String> {
         for _ in 0..singles {
             single.push(run.iteration(1)?);
         }
+        // Printed before the batch shape runs, so a batch that cannot be measured does
+        // not take the gated series' figure with it (task #167).
+        let mut early = Samples::new();
+        for m in &single {
+            early.push(Duration::from_secs_f64(m.total_ms / 1000.0));
+        }
+        eprintln!(
+            "single series done: p95 {:.1} ms over {} edits (full report follows the batch shape)",
+            early.percentile(0.95),
+            early.len()
+        );
         if let Some(cores) = foreign_cores(cpu_before, cpu_jiffies()) {
             println!(
                 "foreign CPU during the single series: {cores:.2} cores of the host's \
@@ -669,5 +756,51 @@ fn main() -> ExitCode {
             eprintln!("{message}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stall_names_the_stage_that_stopped() {
+        // FR-VLT-04, task #167: the watcher delivered nothing.
+        let none = describe_stall(0, 100, Duration::from_secs(60), &[], false, 0);
+        assert!(
+            none.contains("only 0 of 100") && none.contains("in 60 s"),
+            "{none}"
+        );
+        assert!(none.contains("consumer rounds 0 []") && none.contains("rescan not raised"));
+        // The watcher lost events (an overflowed ReadDirectoryChangesW buffer).
+        let lost = describe_stall(
+            1,
+            100,
+            Duration::from_secs(10),
+            &[(170.0, 240.0, 1)],
+            true,
+            0,
+        );
+        assert!(lost.contains("RAISED (events were lost)"), "{lost}");
+        assert!(
+            lost.contains("1 upserted taken 170 ms committed 240 ms"),
+            "{lost}"
+        );
+        // The consumer is behind: a queue with work in it.
+        let slow = describe_stall(
+            1,
+            100,
+            Duration::from_secs(10),
+            &[(170.0, 240.0, 1)],
+            false,
+            99,
+        );
+        assert!(slow.contains("queue depth 99"), "{slow}");
+    }
+
+    #[test]
+    fn only_the_batch_has_the_long_limit() {
+        assert!(BATCH_TIMEOUT > ITERATION_TIMEOUT);
+        assert_eq!(ITERATION_TIMEOUT, Duration::from_secs(10));
     }
 }
