@@ -220,7 +220,7 @@ fn serve(mut stream: TcpStream, state: &AppState, stats: &Stats, token: &str, po
         );
     } else if let (true, Some(command)) = (method == "POST", path.strip_prefix("/invoke/")) {
         let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        // Task #172: with `serat-vault`'s `phase-timing` (on in a debug build and with
+        // Task #172: with `serat-vault`'s `phase-timing` (on in any debug build of the bridge and with
         // `--features bench-bridge`) a `save_patch` also reports the time spent in each phase
         // of the call, as `save_patch.phase.NN.<name>` entries in `/stats`. Off, `finish`
         // returns nothing and no entry appears.

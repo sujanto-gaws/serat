@@ -44,7 +44,7 @@ jobs:
   # serat-app's own dependency edge, this fails here rather than at release time.
   # Independent of `vault`, cheap, and runs on every PR and every push to main.
   serat-app-release-guard:
-    name: "serat-app builds in release without test-hooks"
+    name: "serat-app release guard: no test-hooks, bench-bridge confined, timing off is inert"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,8 +83,13 @@ jobs:
             echo "::error::the build failed, but not on the binary's own refusal"
             exit 1
           }
-      - name: The bridge example builds in release with test-hooks unified in
-        run: cargo check -p serat-app --release --lib --features "bench-bridge,serat-index/test-hooks,serat-vault/test-hooks"
+      - name: The bridge example builds in release (its dev-dependencies enable test-hooks)
+        run: cargo check -p serat-app --release --features bench-bridge --example editor_ipc_bridge
+      # The phase-timing "off" build: cargo test --workspace and clippy --all-targets pull
+      # serat-app's dev-dependencies in, which enable the feature, so phases::tests_off
+      # would otherwise never run.
+      - name: serat-vault phase timing is a no-op with the feature off
+        run: cargo test -p serat-vault --lib phases
 
   # NFR-MNT-02: the vault is generated from one command and is byte-identical.
   # Everything below is measured against it, so if this fails the other jobs

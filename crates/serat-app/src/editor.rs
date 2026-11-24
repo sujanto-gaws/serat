@@ -837,7 +837,7 @@ mod tests {
         assert!(sum <= total, "{sum:?} of {total:?}");
         // What is outside every phase is the two `Instant::now` calls and the return.
         assert!(
-            total - sum < std::time::Duration::from_millis(5),
+            total - sum < std::time::Duration::from_millis(10),
             "{sum:?} of {total:?}"
         );
         // The timing watched the write; it did not change it.

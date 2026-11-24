@@ -123,11 +123,13 @@ fn the_serat_binary_refuses_bench_bridge_so_the_exception_cannot_ship() {
 
 #[test]
 #[ignore = "release-profile cargo check; see the module docs"]
-fn bench_bridge_lets_the_library_through_with_test_hooks_on() {
+fn bench_bridge_lets_the_example_through_with_test_hooks_on() {
+    // The example's dev-dependencies enable test-hooks; `--example` builds no binary.
     let (ok, text) = check_release(&[
-        "--lib",
         "--features",
-        "bench-bridge,serat-index/test-hooks,serat-vault/test-hooks",
+        "bench-bridge",
+        "--example",
+        "editor_ipc_bridge",
     ]);
     assert!(ok, "the bridge's release build must compile:\n{text}");
 }
