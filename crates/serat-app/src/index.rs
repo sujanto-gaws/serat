@@ -529,12 +529,11 @@ pub trait IndexOpen: Send + 'static {
     }
 
     /// Hand the opener the observer the writer it builds must call after each non-bulk
-    /// commit (ADR-0020 decision 3). Called once, before the actor thread starts. The
-    /// default drops it, which is right for a test double that builds no writer; an
-    /// opener that wraps another one must forward it, or that vault announces nothing.
-    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
-        let _ = observer;
-    }
+    /// commit (ADR-0020 decision 3). Called once, before the actor thread starts.
+    /// Required, with no default, so an opener that wraps another one cannot forget to
+    /// forward it and leave its vault announcing nothing; a test double that builds no
+    /// writer writes `let _ = observer;`.
+    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver);
 }
 
 /// Where [`AppState::write_file`](crate::state::AppState::write_file) finds the
@@ -1518,6 +1517,10 @@ mod tests {
         /// caught doing so.
         struct SlowRebuild;
         impl IndexOpen for SlowRebuild {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 std::thread::sleep(Duration::from_millis(80));
                 publish(IndexState::Rebuilding {
@@ -1673,6 +1676,10 @@ mod tests {
             handle: Option<serat_index::IndexHandle>,
         }
         impl IndexOpen for Scripted {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 self.start.wait();
                 publish(IndexState::Rebuilding {
@@ -1824,6 +1831,10 @@ mod tests {
         // never be reached and the vault would never be declared usable.
         struct FailsWithNoHandle;
         impl IndexOpen for FailsWithNoHandle {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Unavailable {
                     message: "the rebuild failed".to_owned(),

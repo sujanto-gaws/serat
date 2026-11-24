@@ -2731,6 +2731,10 @@ mod tests {
         // could introduce if it touches only one side of this pair.
         struct Slow;
         impl IndexOpen for Slow {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 std::thread::sleep(Duration::from_millis(2_000));
                 publish(IndexState::Ready { note_count: 1 });
@@ -3032,6 +3036,10 @@ mod tests {
 
         struct Rebuild;
         impl IndexOpen for Rebuild {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -3501,6 +3509,10 @@ mod tests {
         // `Ready` while the assertion runs, leaves the shell waiting forever.
         struct RebuildsUntilReleased(Arc<std::sync::Barrier>);
         impl IndexOpen for RebuildsUntilReleased {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -3561,6 +3573,10 @@ mod tests {
         // handle yet" and "no handle ever" without needing to win a real race.
         struct NeverProducesAHandle;
         impl IndexOpen for NeverProducesAHandle {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _root: &Path, _dir: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Ready { note_count: 1 });
                 // into_handle() is not overridden: the trait default returns None.
@@ -3930,6 +3946,10 @@ mod tests {
         // Rule 1. A scripted opener that never finishes keeps the state at `Opening`.
         struct Never;
         impl IndexOpen for Never {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, _: &dyn Fn(IndexState)) {
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -4196,6 +4216,10 @@ mod tests {
     fn an_index_that_is_not_ready_leaves_the_walk_to_populate_alone() {
         struct NeverReady;
         impl IndexOpen for NeverReady {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -5416,6 +5440,10 @@ mod tests {
     fn the_switcher_answers_from_the_tree_before_the_index_is_ready() {
         struct StillRebuilding;
         impl IndexOpen for StillRebuilding {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _: &Path, _: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Rebuilding {
                     reason: RebuildReason::NoIndex,
@@ -6360,6 +6388,10 @@ mod tests {
         // (bounded by CLOSE_DEADLINE). Removing the join makes `finished` false here.
         struct Sleeper(Arc<std::sync::atomic::AtomicBool>);
         impl IndexOpen for Sleeper {
+            fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+                let _ = observer;
+            }
+
             fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
                 publish(IndexState::Opening { reason: None });
                 std::thread::sleep(Duration::from_millis(400));
@@ -6409,6 +6441,10 @@ mod tests {
     }
 
     impl IndexOpen for Counting {
+        fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+            let _ = observer;
+        }
+
         fn open(&mut self, _r: &Path, _d: &Path, publish: &dyn Fn(IndexState)) {
             use std::sync::atomic::Ordering::SeqCst;
             let now = self.running.fetch_add(1, SeqCst) + 1;
@@ -7008,8 +7044,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A save whose writer a rebuild stopped is refused, counted, and left to the watcher
-    // (ADR-0020 decision 2); a rebuilt handle announces again (the observer survives).
+    // A rebuilt handle announces again (the observer survives a rebuild).
     #[test]
     fn a_rebuilt_handle_still_announces_the_saves_commit() {
         let (state, dir) = quiet_state("announce-after-rebuild");
@@ -7033,15 +7068,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The race the lock narrowing introduces (ADR-0020 decision 2): a save holds a clone
+    // of the writer, a rebuild stops that writer, then the save submits. It is refused and
+    // counted, not submitted, and the rebuild (which re-walks the disk after the writer
+    // stopped) indexes the saved bytes.
+    #[test]
+    fn a_save_whose_writer_a_rebuild_stopped_is_refused_and_the_rebuild_indexes_it() {
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inside_tx = Mutex::new(inside_tx);
+        let release_rx = Mutex::new(release_rx);
+        let hook: crate::state::SaveLoadHook = Arc::new(move |path: &str| {
+            if path == "10-projects/serat.md" {
+                let _ = inside_tx.lock().expect("tx").send(());
+                let _ = release_rx
+                    .lock()
+                    .expect("rx")
+                    .recv_timeout(Duration::from_secs(20));
+            }
+        });
+        let dir = fixture("save-vs-rebuild");
+        let state = Arc::new(state_with(OpenHooks {
+            in_save_load: Some(hook),
+            ..OpenHooks::default()
+        }));
+        state.open_vault(open_args(&dir)).expect("open");
+        wait_ready(&state);
+        // The writer the save will have cloned: it reports `WriterStopped` once stopped.
+        let old_writer = {
+            let guard = state.open_lock();
+            let open = guard.as_ref().expect("open");
+            let slot = open.index_handle.lock().expect("slot");
+            slot.as_ref().expect("handle").writer()
+        };
+        let before = state.save_path_outcomes();
+
+        let saver = Arc::clone(&state);
+        let saver = std::thread::spawn(move || {
+            save_serat(&saver, "# Serat\n\nnarwhalterm\n");
+        });
+        inside_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the save never reached its load");
+        let rebuilder = Arc::clone(&state);
+        let rebuilder = std::thread::spawn(move || rebuilder.rebuild_index());
+        wait_until("the rebuild to stop the old writer", || {
+            serat_core::IndexWriter::flush(&old_writer).is_err()
+        });
+        let _ = release_tx.send(());
+        saver.join().expect("save");
+        rebuilder.join().expect("rebuild").expect("rebuild result");
+
+        let after = state.save_path_outcomes();
+        assert_eq!(after.writer_refused, before.writer_refused + 1);
+        assert_eq!(after.submitted, before.submitted);
+        wait_ready(&state);
+        assert_eq!(
+            search_paths(&state, "narwhalterm"),
+            ["10-projects/serat.md"]
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_external_change_is_announced_once_after_its_commit() {
         let (state, dir) = quiet_state("announce-external-once");
         let seen = collect_changed(&state);
+        let notifier = notifier(&state);
+        let before = notifier.generation();
         std::fs::write(dir.join("external.md"), "# By another tool\n").expect("write");
         wait_for_row(&dir, "external.md");
         wait_until("index://changed", || !seen.lock().expect("seen").is_empty());
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(seen.lock().expect("seen").len(), 1, "{:?}", seen.lock());
+        // Drain the writer, so every batch the reconciler submitted has committed and
+        // been reported; then the count is a fact, not a wait.
+        {
+            let guard = state.open_lock();
+            let open = guard.as_ref().expect("open");
+            let slot = open.index_handle.lock().expect("slot");
+            serat_core::IndexWriter::flush(&slot.as_ref().expect("handle").writer())
+                .expect("flush");
+        }
+        assert_eq!(
+            notifier.generation(),
+            before + 1,
+            "one commit, one announcement"
+        );
         state.close_vault();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7116,7 +7228,9 @@ mod tests {
             "the notifier or the switcher was blocked behind the parked writer"
         );
 
-        // And structurally: neither file calls a writer barrier, outside its tests.
+        // And structurally: neither file calls a writer barrier, outside its tests. The
+        // scan matches method names as text: it does not see a `close` or a join, and a
+        // legitimate `BufWriter::flush` in the switcher would trip it (the safe direction).
         for file in ["src/consumer.rs", "src/switcher.rs"] {
             let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
                 .expect("source");
