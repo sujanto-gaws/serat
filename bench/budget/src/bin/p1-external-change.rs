@@ -101,7 +101,7 @@ fn describe_stall(
         rounds.len(),
         shown.join("; "),
         if rescan_raised {
-            "RAISED (events were lost)"
+            "RAISED since the watcher started (events may have been lost)"
         } else {
             "not raised"
         },
@@ -234,10 +234,14 @@ impl Run<'_> {
         while upserted < count {
             let wait = deadline.saturating_duration_since(Instant::now());
             let Ok(round) = self.rounds.recv_timeout(wait) else {
+                // `take_events` was never drained before, so this is "since the watcher
+                // started" (the settle and the single series included); the queue's
+                // latch is the live view and is OR-ed in.
                 rescan |= self
                     .watcher
                     .take_events()
-                    .contains(&VaultEvent::RescanRequired);
+                    .contains(&VaultEvent::RescanRequired)
+                    || self.queue.rescan_needed().is_some();
                 return Err(describe_stall(
                     upserted,
                     count,
@@ -781,7 +785,10 @@ mod tests {
             true,
             0,
         );
-        assert!(lost.contains("RAISED (events were lost)"), "{lost}");
+        assert!(
+            lost.contains("RAISED since the watcher started (events may have been lost)"),
+            "{lost}"
+        );
         assert!(
             lost.contains("1 upserted taken 170 ms committed 240 ms"),
             "{lost}"
