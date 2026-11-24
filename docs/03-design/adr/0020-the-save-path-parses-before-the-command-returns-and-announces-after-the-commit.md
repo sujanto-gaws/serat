@@ -1,6 +1,6 @@
 # ADR-0020: The save path parses before the command returns, and announces the index change after the commit
 
-**Status:** proposed (task #173; for code-reviewer) · **Date:** 2026-11-24 · **Serves:** NFR-PRF-03, NFR-PRF-02 (evidence only), FR-VLT-04, US-01
+**Status:** accepted (task #173; the architect ruled, and both implementation tasks landed: #175 the writer's commit observer, #176 the announcement from it and the narrowed slot lock; the Objections section below stays as history) · **Date:** 2026-11-24 · **Serves:** NFR-PRF-03, NFR-PRF-02 (evidence only), FR-VLT-04, US-01
 **Honours:** ADR-0008 and C-04 (no byte is written differently), ADR-0001 (the writer stays a writer of rows, never a parser), ADR-0011 (the save path keeps `submit`, never `submit_blocking`), ADR-0015 §2 (a hash is paired with an mtime from the same read), ADR-0016 §2 (one save per note in flight; the 1 s debounce), ADR-0019 (#172's figures are supporting evidence, not gate numbers)
 **Source:** task #172's finding (`docs/05-testing/reports/save-patch-bridge-release-2026-11.md`, *Unresolved* item 2), and the correction in `docs/05-testing/reports/nfr-prf-02-quiet-rerun-2026-11.md` headed *Correction (task #172)*.
 
