@@ -527,6 +527,14 @@ pub trait IndexOpen: Send + 'static {
     {
         None
     }
+
+    /// Hand the opener the observer the writer it builds must call after each non-bulk
+    /// commit (ADR-0020 decision 3). Called once, before the actor thread starts. The
+    /// default drops it, which is right for a test double that builds no writer; an
+    /// opener that wraps another one must forward it, or that vault announces nothing.
+    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+        let _ = observer;
+    }
 }
 
 /// Where [`AppState::write_file`](crate::state::AppState::write_file) finds the
@@ -569,6 +577,9 @@ pub type HandleEpoch = Arc<std::sync::atomic::AtomicU64>;
 #[derive(Debug)]
 pub struct SeratIndexOpen {
     handle: Option<serat_index::IndexHandle>,
+    /// Called by the writer after each non-bulk commit (ADR-0020 decision 3). The handle
+    /// keeps it, so the actor a runtime rebuild starts reports to it too.
+    commit_observer: Option<serat_index::CommitObserver>,
     /// How long to wait between attempts while another process holds the writer lock.
     retry_every: Duration,
     /// How long to keep trying before reporting `Unavailable`.
@@ -600,6 +611,7 @@ impl Default for SeratIndexOpen {
     fn default() -> Self {
         Self {
             handle: None,
+            commit_observer: None,
             retry_every: HELD_RETRY_EVERY,
             retry_bound: HELD_RETRY_BOUND,
         }
@@ -663,8 +675,12 @@ impl IndexOpen for SeratIndexOpen {
             }
         };
         let result = loop {
-            let attempt =
-                serat_index::open_or_rebuild(vault_root, index_dir, &source, &parser, &|status| {
+            let attempt = serat_index::open_or_rebuild_observed(
+                vault_root,
+                index_dir,
+                &source,
+                &parser,
+                &|status| {
                     // `Ready` is deliberately not published from here: `open_or_rebuild`
                     // reaches it before the `IndexHandle` it is about to return exists
                     // (see the function's own ordering guarantee), so there is nothing to
@@ -685,7 +701,9 @@ impl IndexOpen for SeratIndexOpen {
                         clear_reason();
                         publish(state);
                     }
-                });
+                },
+                self.commit_observer.clone(),
+            );
             match attempt {
                 Err(serat_core::IndexError::HeldByAnotherProcess { .. })
                     if started.elapsed() < self.retry_bound =>
@@ -749,6 +767,10 @@ impl IndexOpen for SeratIndexOpen {
 
     fn into_handle(self) -> Option<serat_index::IndexHandle> {
         self.handle
+    }
+
+    fn install_commit_observer(&mut self, observer: serat_index::CommitObserver) {
+        self.commit_observer = Some(observer);
     }
 }
 

@@ -56,9 +56,24 @@ const DEFERRED_CAP: usize = 4096;
 
 /// `index://changed`, throttled (architecture 3.1 step 6) and numbered.
 ///
-/// One per open vault. [`ChangeNotifier::changed`] is called by the save path after a
-/// submit and by the consumer after a batch that changed the index; the consumer's tick
-/// calls [`ChangeNotifier::poll`] for the trailing edge.
+/// One per open vault. [`ChangeNotifier::changed`] is called by the writer's commit
+/// observer ([`ChangeNotifier::commit_observer`]) after every non-bulk committed batch,
+/// whoever submitted it (the save path, the consumer, the catch-up), and once by a
+/// runtime rebuild when it completes; the consumer's tick calls [`ChangeNotifier::poll`]
+/// for the trailing edge. Nothing else announces (ADR-0020 decision 3), so an event
+/// carrying a generation never precedes the commit it reports.
+///
+/// **Lock invariant (ADR-0020 decision 3, N3).** The observer runs on the index writer's
+/// thread, so everything it takes must never be held by a thread that waits on the
+/// writer. It takes, in this order and never nested the other way: the notifier's own
+/// mutex (held across `Events::emit_changed`, whose sink only queues and takes a
+/// read lock on the sink table), released; then the [`Switcher`](crate::switcher::Switcher)'s
+/// work mutex inside `on_change`'s `index_changed` (held for one store). So no holder of
+/// the notifier mutex or the switcher's work mutex may call `flush`, `close`,
+/// `close_clean`, `submit_blocking` or join the writer while holding it. Every such call
+/// in this crate (`OpenVault::shut_down`'s `handle.close()`, `rebuild_open_index`'s
+/// `rebuild_in_place`, the reconciler's own flush inside `Consumer::index_paths`) is made
+/// with neither held; `the_announcing_path_never_waits_on_the_writer` pins it.
 ///
 /// The event is emitted while the notifier's lock is held, so generations reach the
 /// sink in order. The sink is `AppHandle::emit`, which queues and returns, and takes no
@@ -139,6 +154,21 @@ impl ChangeNotifier {
         }
     }
 
+    /// The observer to install on the vault's index writer: every non-bulk committed
+    /// batch calls [`ChangeNotifier::changed`], after `COMMIT`. Weak, so the writer
+    /// thread does not keep the notifier alive past its vault. After
+    /// [`ChangeNotifier::close`] it emits nothing, which is how the last save's
+    /// post-commit event is suppressed at close.
+    #[must_use]
+    pub fn commit_observer(self: &Arc<Self>) -> serat_index::CommitObserver {
+        let weak = Arc::downgrade(self);
+        serat_index::CommitObserver::new(move |_batch| {
+            if let Some(notifier) = weak.upgrade() {
+                notifier.changed();
+            }
+        })
+    }
+
     /// Emit the trailing edge if one is owed, and say when to look again.
     pub fn poll(&self, now: Instant) -> Option<Instant> {
         let mut state = self.lock();
@@ -151,6 +181,12 @@ impl ChangeNotifier {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.lock().signal.generation()
+    }
+
+    /// Whether [`ChangeNotifier::close`] has run. Tests.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lock().closed
     }
 
     /// Emit nothing further: the vault is closing, and a stale thread (the catch-up)
@@ -610,11 +646,10 @@ impl Indexer {
     /// now disagree with the disk.
     fn settle(&self, result: Result<Outcome, IndexError>) {
         match result {
-            Ok(outcome) => {
-                if outcome.changed() {
-                    self.notifier.changed();
-                }
-            }
+            // Nothing is announced here (ADR-0020 decision 3): a reconciliation that
+            // changed the index did so through a committed batch, and the writer's commit
+            // observer announced it after that commit.
+            Ok(_) => {}
             // Partly submitted: the only safe reading is that a catch-up is owed.
             Err(_) => self.deferred().rescan = true,
         }
@@ -921,6 +956,26 @@ mod tests {
         (Indexer::new(vault, slot, notifier), seen)
     }
 
+    /// As [`indexer`], with the writer's commit observer driving the notifier, the way
+    /// `open_vault` wires it (ADR-0020 decision 3): the only producer of `changed()`.
+    fn observed_indexer(dir: &std::path::Path) -> (Indexer, Arc<Mutex<Vec<u64>>>) {
+        let events = Arc::new(Events::default());
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        events.install_changed(move |c| sink.lock().expect("seen").push(c.generation));
+        let notifier = Arc::new(ChangeNotifier::with_interval(
+            "v1".to_owned(),
+            events,
+            Duration::ZERO,
+        ));
+        let handle =
+            IndexHandle::open_observed(&dir.join(".serat"), Some(notifier.commit_observer()))
+                .expect("index");
+        let vault = Arc::new(Vault::open(dir).expect("vault"));
+        let slot: IndexHandleSlot = Arc::new(Mutex::new(Some(handle)));
+        (Indexer::new(vault, slot, notifier), seen)
+    }
+
     fn walk(indexer: &Indexer) -> Vec<SourceEntry> {
         indexer.vault.walk().expect("walk")
     }
@@ -970,7 +1025,7 @@ mod tests {
     #[test]
     fn a_batch_is_indexed_once_and_announced_only_when_it_changed_the_index() {
         let dir = vault_dir("batch");
-        let (indexer, seen) = indexer(&dir, slot_with(&dir));
+        let (indexer, seen) = observed_indexer(&dir);
         indexer.catch_up(&walk(&indexer));
         assert!(hash_of(&dir, "a.md").is_some());
         let announced = seen.lock().expect("seen").len();
@@ -990,7 +1045,7 @@ mod tests {
     #[test]
     fn our_own_echo_is_not_parsed_or_announced_again() {
         let dir = vault_dir("echo");
-        let (indexer, seen) = indexer(&dir, slot_with(&dir));
+        let (indexer, seen) = observed_indexer(&dir);
         indexer.catch_up(&walk(&indexer));
         let announced = seen.lock().expect("seen").len();
 
