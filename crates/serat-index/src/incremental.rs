@@ -27,7 +27,7 @@ use serat_core::{
 };
 
 use crate::schema;
-use crate::writer::{DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
+use crate::writer::{ActorOptions, CommitObserver, DEFAULT_QUEUE_DEPTH, IndexActor, WriterHandle};
 
 /// Size a parse pool at cores minus one.
 ///
@@ -59,6 +59,9 @@ pub struct IndexHandle {
     actor: IndexActor,
     index_dir: PathBuf,
     after_unclean_shutdown: bool,
+    /// Installed at open and handed to every actor this handle starts, so the one a
+    /// runtime rebuild makes reports to it as well (ADR-0020 decision 3).
+    commit_observer: Option<CommitObserver>,
     /// The cross-process writer lock (task #154). Declared last so it is released after
     /// the actor has stopped and closed its connection.
     _lock: crate::lock::IndexLock,
@@ -75,6 +78,20 @@ impl IndexHandle {
         Self::with_queue_depth(index_dir, DEFAULT_QUEUE_DEPTH)
     }
 
+    /// As [`IndexHandle::open`], with a [`CommitObserver`] the writer calls after each
+    /// committed non-bulk batch. Survives [`IndexHandle::rebuild_in_place`].
+    ///
+    /// # Errors
+    ///
+    /// As [`IndexHandle::open`].
+    pub fn open_observed(
+        index_dir: &Path,
+        commit_observer: Option<CommitObserver>,
+    ) -> Result<Self, IndexError> {
+        let lock = crate::lock::IndexLock::acquire(index_dir)?;
+        Self::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock, commit_observer)
+    }
+
     /// As [`IndexHandle::open`], with a queue of a given depth.
     ///
     /// # Errors
@@ -82,7 +99,7 @@ impl IndexHandle {
     /// As [`IndexHandle::open`].
     pub fn with_queue_depth(index_dir: &Path, queue_depth: usize) -> Result<Self, IndexError> {
         let lock = crate::lock::IndexLock::acquire(index_dir)?;
-        Self::open_locked(index_dir, queue_depth, lock)
+        Self::open_locked(index_dir, queue_depth, lock, None)
     }
 
     /// Open with the writer lock already held, so `open_or_rebuild` and
@@ -91,6 +108,7 @@ impl IndexHandle {
         index_dir: &Path,
         queue_depth: usize,
         lock: crate::lock::IndexLock,
+        commit_observer: Option<CommitObserver>,
     ) -> Result<Self, IndexError> {
         let path = crate::index_path(index_dir);
         if let Some(parent) = path.parent() {
@@ -102,9 +120,17 @@ impl IndexHandle {
         schema::bootstrap_if_empty(&conn)?;
         let after_unclean_shutdown = !schema::begin_session(&conn)?;
         Ok(Self {
-            actor: IndexActor::with_capacity(conn, queue_depth),
+            actor: IndexActor::with_options(
+                conn,
+                ActorOptions {
+                    capacity: queue_depth,
+                    commit_observer: commit_observer.clone(),
+                    ..ActorOptions::default()
+                },
+            ),
             index_dir: index_dir.to_path_buf(),
             after_unclean_shutdown,
+            commit_observer,
             _lock: lock,
         })
     }
@@ -169,6 +195,14 @@ impl IndexHandle {
     #[must_use]
     pub fn wal_health(&self) -> std::sync::Arc<crate::checkpoint::WalHealth> {
         self.actor.wal_health()
+    }
+
+    /// The seam that holds a batch before its `COMMIT`, for tests. A handle made by
+    /// [`IndexHandle::rebuild_in_place`] has its own; fetch it again.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn commit_gate(&self) -> crate::writer::CommitGate {
+        self.actor.commit_gate()
     }
 
     /// The writer's fault injector, for in-crate tests of a flush that fails.
@@ -322,6 +356,7 @@ impl IndexHandle {
         let Self {
             actor,
             index_dir,
+            commit_observer,
             _lock: lock,
             ..
         } = self;
@@ -338,7 +373,7 @@ impl IndexHandle {
             &lock,
         )?;
         Ok((
-            Self::open_locked(&index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+            Self::open_locked(&index_dir, DEFAULT_QUEUE_DEPTH, lock, commit_observer)?,
             report,
         ))
     }

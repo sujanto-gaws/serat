@@ -13,7 +13,7 @@ use crate::identity::{self, Verdict};
 use crate::incremental::IndexHandle;
 use crate::rebuild::{self, RebuildReport};
 use crate::schema::{self, IndexState, UnusableReason};
-use crate::writer::DEFAULT_QUEUE_DEPTH;
+use crate::writer::{CommitObserver, DEFAULT_QUEUE_DEPTH};
 
 /// Why the index is being rebuilt.
 ///
@@ -135,6 +135,25 @@ pub fn open_or_rebuild(
     parser: &dyn NoteParser,
     on_status: &dyn Fn(IndexStatus),
 ) -> Result<(IndexHandle, Option<RebuildReport>), IndexError> {
+    open_or_rebuild_observed(vault_root, index_dir, source, parser, on_status, None)
+}
+
+/// As [`open_or_rebuild`], with a [`CommitObserver`] installed on the handle's writer
+/// (ADR-0020 decision 3). The rebuild itself reports nothing: its commits are inside
+/// the bulk-load bracket. The observer is carried by the handle, so one made later by
+/// [`IndexHandle::rebuild_in_place`] reports to it too.
+///
+/// # Errors
+///
+/// As [`open_or_rebuild`].
+pub fn open_or_rebuild_observed(
+    vault_root: &Path,
+    index_dir: &Path,
+    source: &dyn NoteSource,
+    parser: &dyn NoteParser,
+    on_status: &dyn Fn(IndexStatus),
+    commit_observer: Option<CommitObserver>,
+) -> Result<(IndexHandle, Option<RebuildReport>), IndexError> {
     on_status(IndexStatus::Opening);
 
     // Task #154: one writer per vault across processes. Taken before the check, the
@@ -171,7 +190,7 @@ pub fn open_or_rebuild(
     let Some(reason) = reason else {
         on_status(IndexStatus::Ready);
         return Ok((
-            IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+            IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock, commit_observer)?,
             None,
         ));
     };
@@ -191,7 +210,7 @@ pub fn open_or_rebuild(
         Ok(report) => {
             on_status(IndexStatus::Ready);
             Ok((
-                IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock)?,
+                IndexHandle::open_locked(index_dir, DEFAULT_QUEUE_DEPTH, lock, commit_observer)?,
                 Some(report),
             ))
         }
