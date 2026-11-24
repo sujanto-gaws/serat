@@ -85,6 +85,174 @@ enum Command {
     Stop,
 }
 
+/// What one committed batch touched, as the writer already had it in hand.
+///
+/// Built after `COMMIT` returned, only when a [`CommitObserver`] is installed, and from
+/// the batch's own ops: no extra read, no extra statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedBatch {
+    /// How many [`IndexOp`]s the transaction carried. Never zero.
+    pub ops: usize,
+    /// Every path the batch named, in op order: an op's own path, and for a rename the
+    /// path it left as well as the one it reached. Not deduplicated.
+    pub paths: Vec<serat_core::VaultPath>,
+}
+
+/// Called by the writer after each non-bulk batch has committed (ADR-0020 decision 3).
+///
+/// Called once per committed batch that applied at least one [`IndexOp`], outside a
+/// `begin_bulk_load` .. `end_bulk_load` bracket, **after** SQLite's `COMMIT` returned,
+/// so a read connection opened inside the call sees the batch. Never called for a
+/// barrier-only turn, a bulk-load batch or a batch that failed and was left in hand
+/// (it reports when a later commit succeeds with it).
+///
+/// It runs **on the writer thread** and the writer holds no lock while it runs. The
+/// writer is stalled for as long as it takes, and a call that waits on the writer
+/// deadlocks it, so an observer must be quick and must never call
+/// [`WriterHandle::flush`], `close`, [`WriterHandle::close_clean`],
+/// [`WriterHandle::submit_blocking`] or anything else that waits on this writer, nor
+/// take a lock that a thread waiting on the writer may hold. A panic in the observer
+/// is caught and discarded: the writer outlives it.
+///
+/// Installed once, on [`ActorOptions`], and carried by `IndexHandle` so that the actor a
+/// runtime rebuild starts reports to the same observer.
+#[derive(Clone)]
+pub struct CommitObserver(Arc<dyn Fn(CommittedBatch) + Send + Sync>);
+
+impl CommitObserver {
+    /// Wrap a callback.
+    #[must_use]
+    pub fn new(f: impl Fn(CommittedBatch) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for CommitObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitObserver(..)")
+    }
+}
+
+fn report(observer: &CommitObserver, pending: &[IndexOp]) {
+    let mut paths = Vec::with_capacity(pending.len());
+    for op in pending {
+        if let IndexOp::Rename { from, .. } = op {
+            paths.push(from.clone());
+        }
+        paths.push(op.path().clone());
+    }
+    let batch = CommittedBatch {
+        ops: pending.len(),
+        paths,
+    };
+    // The writer must survive its observer (ADR-0001: no poisoned writer).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (observer.0)(batch)));
+}
+
+/// What the writer thread consults on each commit.
+#[derive(Debug, Default)]
+struct CommitHooks {
+    observer: Option<CommitObserver>,
+    gate: CommitGate,
+}
+
+/// Holds a batch between its statements and its `COMMIT`, for tests (task #175).
+///
+/// Behind the `test-hooks` feature (and `cfg(test)`) it can hold; otherwise it is an
+/// empty struct and the writer's call into it compiles to nothing. Every actor has one
+/// ([`IndexActor::commit_gate`]); a handle produced by a runtime rebuild has its own,
+/// so fetch it again after one.
+#[derive(Debug, Clone, Default)]
+pub struct CommitGate(
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))] Arc<GateState>,
+);
+
+#[derive(Debug, Default)]
+struct GateState {
+    #[cfg(any(test, feature = "test-hooks"))]
+    state: std::sync::Mutex<GateFlags>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    changed: std::sync::Condvar,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Default)]
+struct GateFlags {
+    held: bool,
+    reached: bool,
+}
+
+/// While alive, the next commit that gets as far as its `COMMIT` waits there.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug)]
+pub struct CommitHold(Arc<GateState>);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl CommitGate {
+    /// Hold the next batch between its last statement and its `COMMIT` until the returned
+    /// guard is dropped. The transaction stays open meanwhile, so other connections see
+    /// the pre-batch state, which is what makes "nothing announced before the commit"
+    /// provable without a race.
+    #[must_use]
+    pub fn hold(&self) -> CommitHold {
+        let mut flags = lock(&self.0.state);
+        flags.held = true;
+        flags.reached = false;
+        CommitHold(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl CommitHold {
+    /// Block until the writer is parked at the hold, or `timeout` passes. Returns
+    /// whether it is parked.
+    #[must_use]
+    pub fn wait_reached(&self, timeout: std::time::Duration) -> bool {
+        let flags = lock(&self.0.state);
+        let (flags, _) = self
+            .0
+            .changed
+            .wait_timeout_while(flags, timeout, |flags| !flags.reached)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flags.reached
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for CommitHold {
+    fn drop(&mut self) {
+        lock(&self.0.state).held = false;
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl CommitGate {
+    /// Writer thread: park here while a hold is in force.
+    fn wait_before_commit(&self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut flags = lock(&self.0.state);
+            if !flags.held {
+                return;
+            }
+            flags.reached = true;
+            self.0.changed.notify_all();
+            while flags.held {
+                flags = self
+                    .0
+                    .changed
+                    .wait(flags)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+}
+
 /// A handle to the writer. Cloneable, shareable, cheap.
 #[derive(Debug, Clone)]
 pub struct WriterHandle {
@@ -266,10 +434,11 @@ pub struct IndexActor {
     /// SQLite's own auto-checkpoint stays on.
     pub(crate) checkpointer: Option<Checkpointer>,
     health: Arc<WalHealth>,
+    gate: CommitGate,
 }
 
 /// How an [`IndexActor`] is started, beyond its connection and queue depth.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ActorOptions {
     /// How many operations may wait for the writer.
     pub capacity: usize,
@@ -282,6 +451,8 @@ pub struct ActorOptions {
     /// benchmarks. When the checkpointer is off this *replaces* SQLite's auto-checkpoint,
     /// so the observer is responsible for any checkpoint it wants.
     pub wal_observer: Option<WalObserver>,
+    /// Called after each committed non-bulk batch (ADR-0020 decision 3). Default none.
+    pub commit_observer: Option<CommitObserver>,
 }
 
 impl Default for ActorOptions {
@@ -291,6 +462,7 @@ impl Default for ActorOptions {
             checkpointer: true,
             bounds: Bounds::default(),
             wal_observer: None,
+            commit_observer: None,
         }
     }
 }
@@ -377,13 +549,18 @@ impl IndexActor {
             (None, None) => None,
         };
         let hook_health = Arc::clone(&health);
+        let gate = CommitGate::default();
+        let hooks = CommitHooks {
+            observer: options.commit_observer,
+            gate: gate.clone(),
+        };
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
             .spawn(move || {
                 if let Some(hook) = hook {
                     hook.install(&mut conn, &hook_health);
                 }
-                run(conn, &rx, &actor_fault);
+                run(conn, &rx, &actor_fault, &hooks);
             })
             .expect("spawn the index writer");
 
@@ -393,7 +570,15 @@ impl IndexActor {
             fault,
             checkpointer,
             health,
+            gate,
         }
+    }
+
+    /// The seam that holds a batch before its `COMMIT`, for tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn commit_gate(&self) -> CommitGate {
+        self.gate.clone()
     }
 
     /// What the checkpointer knows: the pinned-WAL fact and its counters. Safe to read
@@ -480,7 +665,7 @@ impl Drop for IndexActor {
 /// answers any barrier that arrives. A batch ends when the queue is empty, the batch
 /// is full, or a command needs an answer — so a quiet vault commits immediately and a
 /// rebuild commits in batches.
-fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
+fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector, hooks: &CommitHooks) {
     let mut pending: Vec<IndexOp> = Vec::with_capacity(BATCH_SIZE);
     let mut since_analyze = 0usize;
     // Whether the blocks_fts triggers are currently off, which is the writer's only
@@ -518,6 +703,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                         bulk_load,
                         fault,
                         &mut closed,
+                        hooks,
                     );
                     return;
                 }
@@ -576,6 +762,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     bulk_load,
                     fault,
                     &mut closed,
+                    hooks,
                 )
                 .and_then(|()| begin_bulk_load(&conn));
                 // Only once the triggers are actually off. Setting it before would
@@ -592,6 +779,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     bulk_load,
                     fault,
                     &mut closed,
+                    hooks,
                 )
                 .and_then(|()| end_bulk_load(&conn, &triggers));
                 // Cleared either way: a failed end_bulk_load leaves the index without
@@ -609,6 +797,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     bulk_load,
                     fault,
                     &mut closed,
+                    hooks,
                 )
                 .and_then(|()| schema::end_session(&conn));
                 if matches!(result, Ok(true)) {
@@ -628,6 +817,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     bulk_load,
                     fault,
                     &mut closed,
+                    hooks,
                 )
                 .and_then(|()| resolve_links(&conn));
                 let _ = reply.send(result);
@@ -641,6 +831,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                     bulk_load,
                     fault,
                     &mut closed,
+                    hooks,
                 );
                 return;
             }
@@ -666,6 +857,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
                         bulk_load,
                         fault,
                         &mut closed,
+                        hooks,
                     );
                     return;
                 }
@@ -685,6 +877,7 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector) {
             bulk_load,
             fault,
             &mut closed,
+            hooks,
         );
         fault.set_answering(false);
 
@@ -1019,6 +1212,7 @@ fn commit(
     bulk_load: bool,
     fault: &FaultInjector,
     closed: &mut bool,
+    hooks: &CommitHooks,
 ) -> Result<(), IndexError> {
     if pending.is_empty() {
         return Ok(());
@@ -1049,6 +1243,8 @@ fn commit(
             tx.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
                 .map_err(sqlite)?;
         }
+        // Test seam: hold the batch between its statements and its COMMIT.
+        hooks.gate.wait_before_commit();
         tx.commit().map_err(sqlite)?;
         Ok(touched)
     })();
@@ -1060,6 +1256,14 @@ fn commit(
         restored.map_err(sqlite)?;
     }
     let touched = committed?;
+
+    // After COMMIT has returned (ADR-0020 decision 3), outside a bulk-load bracket, and
+    // before the ANALYZE below so an announcement does not wait on statistics. The
+    // batch is described from what is already in hand; nothing is built when no
+    // observer is installed.
+    if !bulk_load && let Some(observer) = &hooks.observer {
+        report(observer, pending);
+    }
 
     pending.clear();
     *since_analyze += touched;
@@ -1189,5 +1393,66 @@ mod tests {
         );
 
         actor.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_failed_commit_reports_nothing_and_the_batch_reports_once_it_lands() {
+        // A batch left in hand by a failed commit is not announced (nothing changed); the
+        // commit that finally applies it is, once.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        let conn = schema::open(&path).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<CommittedBatch>::new()));
+        let sink = Arc::clone(&seen);
+        let actor = IndexActor::with_options(
+            conn,
+            ActorOptions {
+                commit_observer: Some(CommitObserver::new(move |batch| {
+                    sink.lock().expect("lock").push(batch);
+                })),
+                ..ActorOptions::default()
+            },
+        );
+        let writer = actor.handle();
+
+        actor.fault_injector().fail_until_a_flush_fails();
+        writer.submit(asset("assets/a.pdf")).expect("submit");
+        assert!(writer.flush().is_err(), "the injected failure");
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "a failed commit was reported"
+        );
+
+        writer.flush().expect("the retry commits it");
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].ops, 1);
+        drop(seen);
+        actor.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_failing_commit_with_nobody_waiting_reports_nothing() {
+        let dir = tempfile::tempdir().expect("temp");
+        let conn = schema::open(&dir.path().join("index.db")).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        let actor = IndexActor::with_options(
+            conn,
+            ActorOptions {
+                commit_observer: Some(CommitObserver::new(move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+                ..ActorOptions::default()
+            },
+        );
+        actor.fault_injector().fail_every_commit();
+        let writer = actor.handle();
+        writer.submit(asset("assets/a.pdf")).expect("submit");
+        assert!(writer.flush().is_err());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(actor);
     }
 }

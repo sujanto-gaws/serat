@@ -35,6 +35,11 @@
 //! `--bare` runs without the callback and the hook, on SQLite's own, to measure the
 //! instrumentation's cost.
 //!
+//! `--commit-observer` (task #175) installs a counting [`serat_index::CommitObserver`] on the
+//! actor, as `index://changed`'s announcer will be after ADR-0020 decision 3. The writer
+//! calls it after `COMMIT` and before it answers `flush()`, so its cost lands in the
+//! existing `post-commit` row; compare that row with and without the flag. No new row.
+//!
 //! **Since task #56 the writer is the product's:** `IndexActor` sets
 //! `wal_autocheckpoint = 0` and runs the checkpointer (idle gate 250 ms, size bound 4,000
 //! frames), so `ckpt` is 0 by construction -- the writer's hook only signals -- and the
@@ -68,6 +73,7 @@ use serat_index::{ActorOptions, CheckpointStats};
 /// The auto-checkpoint threshold the hook re-implements for the #53 diagnostic. 0 never
 /// checkpoints (the product's checkpointer does).
 static AUTOCKPT: AtomicI32 = AtomicI32::new(0);
+static OBSERVED_OPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One commit's WAL hook report.
 #[derive(Clone, Copy, Default, Debug)]
@@ -341,6 +347,7 @@ struct Args {
     automerge: Option<i32>,
     ckpt_between: bool,
     bare: bool,
+    commit_observer: bool,
     csv: Option<String>,
 }
 
@@ -363,6 +370,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         automerge: None,
         ckpt_between: false,
         bare: false,
+        commit_observer: false,
         csv: None,
     };
     let mut it = args.iter();
@@ -384,6 +392,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--checkpoint-between" => a.ckpt_between = true,
             "--bare" => a.bare = true,
+            "--commit-observer" => a.commit_observer = true,
             "--csv" => a.csv = Some(val()?),
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -486,6 +495,11 @@ fn measure(a: &Args, index_dir: &Path, vault_root: &Path, notes: usize) -> Resul
             // Bare: no observer. With the checkpointer off and no observer SQLite's own
             // auto-checkpoint stays on, at its default of 1000 frames.
             wal_observer: (!a.bare).then_some(on_wal as serat_index::checkpoint::WalObserver),
+            commit_observer: a.commit_observer.then(|| {
+                serat_index::CommitObserver::new(|batch| {
+                    OBSERVED_OPS.fetch_add(batch.ops, Ordering::Relaxed);
+                })
+            }),
             ..ActorOptions::default()
         },
     );
@@ -765,7 +779,7 @@ fn report(
         },
     );
     println!(
-        "settings: checkpointer {} · wal_autocheckpoint {} · fts5 automerge {} · explicit PASSIVE checkpoint between saves: {}",
+        "settings: checkpointer {} · wal_autocheckpoint {} · fts5 automerge {} · explicit PASSIVE checkpoint between saves: {} · commit observer: {}",
         if a.checkpointer() {
             "the product's (idle 250 ms, size 4,000 frames)"
         } else {
@@ -777,7 +791,12 @@ fn report(
             a.autockpt.to_string()
         },
         a.automerge.map_or("default".to_owned(), |v| v.to_string()),
-        a.ckpt_between
+        a.ckpt_between,
+        if a.commit_observer {
+            "counting, installed"
+        } else {
+            "none"
+        }
     );
     println!("environment: {env}");
     let (mn, mx) = (
