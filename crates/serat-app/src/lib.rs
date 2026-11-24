@@ -36,14 +36,20 @@
 
 // Feature unification must not smuggle serat-index's test hooks into a release build
 // (task #52): `cargo build --workspace --release` unifies them in via bench/budget.
+//
+// The one exception is `bench-bridge` (task #172): the IPC-bridge example needs a release
+// build, and its dev-dependencies enable the hooks on every example build. The feature is
+// off in every shipped artifact because `src/main.rs` refuses to compile with it, so the
+// `serat` binary keeps this guard in full; CI proves both halves (budgets.yml,
+// `serat-app-release-guard`).
 const _: () = assert!(
-    !serat_index::TEST_HOOKS || cfg!(debug_assertions),
+    !serat_index::TEST_HOOKS || cfg!(debug_assertions) || cfg!(feature = "bench-bridge"),
     "test-hooks must not reach a release build"
 );
 // The same for serat-vault's (task #35): `Vault::with_platform` can switch off the
 // containment rules (T-07, T-10, NFR-SEC-06), so it must never be reachable in a release.
 const _: () = assert!(
-    !serat_vault::TEST_HOOKS || cfg!(debug_assertions),
+    !serat_vault::TEST_HOOKS || cfg!(debug_assertions) || cfg!(feature = "bench-bridge"),
     "serat-vault test-hooks must not reach a release build"
 );
 

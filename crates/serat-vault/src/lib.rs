@@ -43,6 +43,7 @@ mod name_rules_tests;
 pub mod patch;
 #[cfg(test)]
 mod patch_props;
+pub mod phases;
 pub mod position;
 pub mod queue;
 pub mod refusal;
@@ -771,6 +772,7 @@ impl Vault {
         }
 
         let target = self.resolve(path)?;
+        phases::mark("vault.resolve");
         let stale = |found: ContentHash| VaultError::StaleHash {
             path: path.as_str().to_owned(),
             expected: base_hash.to_hex(),
@@ -782,13 +784,16 @@ impl Vault {
         // renames, and one returns `Ok` with its bytes already gone.
         let lock = self.locks.lock_for(path.as_str());
         let _held = lock.hold();
+        phases::mark("vault.path_lock");
 
         // Step 1: the hash lock. A delete or a rewrite between the caller's read
         // and this call surfaces here rather than silently patching the wrong
         // bytes.
         let current_bytes =
             read_base(&target).map_err(|err| VaultError::io(path.as_str(), &err))?;
+        phases::mark("vault.read_base");
         let current_hash = hash_bytes(&current_bytes);
+        phases::mark("vault.hash_before");
         if current_hash != base_hash {
             return Err(stale(current_hash));
         }
@@ -802,8 +807,10 @@ impl Vault {
         // Steps 2 and 3: map, validate and splice. Nothing outside a patched
         // range is touched — see `patch::apply_edits`'s own guarantee.
         let new_text = patch::apply_edits(base_text, edits, path.as_str())?;
+        phases::mark("vault.apply_edits");
         let new_bytes = new_text.into_bytes();
         let new_hash = hash_bytes(&new_bytes);
+        phases::mark("vault.hash_after");
 
         let parent = target.parent().ok_or_else(|| VaultError::InvalidPath {
             path: path.as_str().to_owned(),
@@ -818,10 +825,12 @@ impl Vault {
         // permissions.
         let existing_permissions = fs::metadata(&target).ok().map(|stat| stat.permissions());
 
+        phases::mark("vault.stat_permissions");
         let (temp, mtime_ms) =
             atomic::write_temp(parent, path.file_name(), &new_bytes, existing_permissions)
                 .map_err(|err| failed(err.to_string()))?;
 
+        phases::mark("vault.write_temp_fsync");
         before_rehash();
 
         // Step 4's re-hash, immediately before the rename (ADR-0016 §2). This is
@@ -834,7 +843,9 @@ impl Vault {
                 return Err(VaultError::io(path.as_str(), &err));
             }
         };
+        phases::mark("vault.reread");
         let reread_hash = hash_bytes(&reread);
+        phases::mark("vault.hash_reread");
         if reread_hash != base_hash {
             let _ = fs::remove_file(&temp);
             return Err(stale(reread_hash));
@@ -843,6 +854,7 @@ impl Vault {
         before_rename();
 
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
+        phases::mark("vault.rename_syncdir");
 
         // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
         // no stat of the target here, so an external write cannot be paired with our hash.

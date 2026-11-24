@@ -25,6 +25,10 @@ tempfile = { workspace = true }
 # Test seams other crates need (`Vault::with_platform`). Enabled only from
 # dev-dependencies; serat-app asserts it is absent from a release build.
 test-hooks = []
+# Per-phase wall-clock marks in the write path (`phases`), for the benchmarks only (task
+# #172). Off, every mark compiles to nothing. Unlike `test-hooks` it changes no behaviour,
+# so serat-app does not assert it away.
+phase-timing = []
 
 [lints]
 workspace = true

@@ -31,9 +31,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serat_core::{ContentHash, VaultError, VaultPath};
-use serat_vault::diff;
 use serat_vault::patch::{Edit, apply_edits};
 use serat_vault::{Position, Vault, hash_bytes};
+use serat_vault::{diff, phases};
 
 use crate::error::from_vault_error;
 use crate::ipc::{
@@ -270,24 +270,32 @@ impl Editor {
         // Taken before the write: the registry may be moved by a watcher event while
         // the write runs.
         let held = self.buffers.find(&path, base_hash);
+        phases::mark("app.prepare");
 
         let wrote = self
             .vault
             .write_patch(&path, base_hash, &edits)
             .map_err(from_vault_error)?;
         let new_hash = wrote.hash;
+        phases::mark("app.write_patch_return");
 
-        if let Some(base) = held
-            && let Ok(text) = apply_edits(&base.text, &edits, path.as_str())
-            && hash_bytes(text.as_bytes()) == new_hash
-        {
-            self.buffers.advance(
-                &path,
-                Base {
-                    hash: new_hash,
-                    text: text.into(),
-                },
-            );
+        if let Some(base) = held {
+            let applied = apply_edits(&base.text, &edits, path.as_str());
+            phases::mark("app.apply_edits_again");
+            if let Ok(text) = applied {
+                let matches = hash_bytes(text.as_bytes()) == new_hash;
+                phases::mark("app.hash_again");
+                if matches {
+                    self.buffers.advance(
+                        &path,
+                        Base {
+                            hash: new_hash,
+                            text: text.into(),
+                        },
+                    );
+                }
+            }
+            phases::mark("app.advance_base");
         }
         // Hash, mtime and size all come from the write itself (ADR-0015 §2): the
         // mtime was statted under the path lock right after the rename, so it is never
@@ -780,5 +788,87 @@ mod tests {
         let other = VaultPath::new("z.md").expect("path");
         buffers.advance(&other, base(1));
         assert!(buffers.newest(&other).is_none());
+    }
+
+    // Task #172: per-phase timing of `save_patch` (NFR-PRF-03 evidence, US-01). The phases
+    // observe the write and change nothing in it (C-04).
+
+    const SAVE_PHASES: [&str; 15] = [
+        "app.prepare",
+        "vault.resolve",
+        "vault.path_lock",
+        "vault.read_base",
+        "vault.hash_before",
+        "vault.apply_edits",
+        "vault.hash_after",
+        "vault.stat_permissions",
+        "vault.write_temp_fsync",
+        "vault.reread",
+        "vault.hash_reread",
+        "vault.rename_syncdir",
+        "app.write_patch_return",
+        "app.apply_edits_again",
+        "app.hash_again",
+    ];
+
+    #[test]
+    fn a_timed_save_reports_every_phase_in_call_order_and_they_sum_to_the_call() {
+        const {
+            assert!(
+                phases::PHASE_TIMING,
+                "serat-app's dev-dependencies turn it on"
+            )
+        };
+        let fx = fixture(&[("a.md", b"# one\ntwo\n")]);
+        let base = open(&fx, "a.md");
+        let started = std::time::Instant::now();
+        phases::begin();
+        let (_, written) = fx
+            .editor
+            .save_patch(&save("a.md", &base, vec![patch((1, 0), (1, 3), "2")]))
+            .expect("saved");
+        let total = started.elapsed();
+        let phases = phases::finish();
+        let names: Vec<&str> = phases.iter().map(|p| p.name).collect();
+        let mut expected = SAVE_PHASES.to_vec();
+        expected.push("app.advance_base");
+        assert_eq!(names, expected);
+        let sum: std::time::Duration = phases.iter().map(|p| p.elapsed).sum();
+        assert!(sum <= total, "{sum:?} of {total:?}");
+        // What is outside every phase is the two `Instant::now` calls and the return.
+        assert!(
+            total - sum < std::time::Duration::from_millis(10),
+            "{sum:?} of {total:?}"
+        );
+        // The timing watched the write; it did not change it.
+        assert_eq!(
+            fs::read(fx.dir.path().join("a.md")).expect("read"),
+            b"# one\n2\n"
+        );
+        assert_eq!(written.hash, hash_of(fx.dir.path(), "a.md"));
+    }
+
+    #[test]
+    fn a_save_with_no_held_base_has_no_second_apply_and_an_untimed_save_records_nothing() {
+        let fx = fixture(&[("a.md", b"abc\n")]);
+        let base = hash_of(fx.dir.path(), "a.md");
+        phases::begin();
+        let (_, written) = fx
+            .editor
+            .save_patch(&save("a.md", &base, vec![patch((0, 0), (0, 3), "x")]))
+            .expect("saved");
+        let names: Vec<&str> = phases::finish().iter().map(|p| p.name).collect();
+        let mut expected = SAVE_PHASES[..12].to_vec();
+        expected.push("app.write_patch_return");
+        assert_eq!(names, expected);
+        // Without `begin`, the same call leaves nothing behind for a later `finish`.
+        fx.editor
+            .save_patch(&save(
+                "a.md",
+                &written.hash,
+                vec![patch((0, 0), (0, 1), "y")],
+            ))
+            .expect("saved again");
+        assert!(phases::finish().is_empty());
     }
 }

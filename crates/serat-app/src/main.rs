@@ -10,6 +10,12 @@
 // Debug builds keep it, because that is where `eprintln!` goes.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// `bench-bridge` relaxes the test-hooks release guard in lib.rs so the IPC-bridge example can
+// be timed in release (task #172). That relaxation must never ship: the application binary
+// does not build with it, whatever the profile.
+#[cfg(feature = "bench-bridge")]
+compile_error!("the `serat` binary must not be built with the `bench-bridge` feature");
+
 use std::process::ExitCode;
 use std::sync::Arc;
 

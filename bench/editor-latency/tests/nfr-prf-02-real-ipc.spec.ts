@@ -141,7 +141,7 @@ for (const arm of ["stub", "real"] as const) {
           const stats = (await (await fetch(`${bridge.url}/stats`, { headers: { "x-serat-bridge-token": bridge.token } })).json()) as Record<string, { count: number; p50_ms: number; p95_ms: number; max_ms: number }>;
           const sp = stats["save_patch"];
           expect(sp?.count ?? 0, "saves went through the bridge during the run").toBeGreaterThanOrEqual(10);
-          ipcNote = `REAL serat-app over loopback; bridge-side ms per command: ${Object.entries(stats).map(([c, s]) => `${c} n=${s.count} p50=${s.p50_ms.toFixed(1)} p95=${s.p95_ms.toFixed(1)} max=${s.max_ms.toFixed(1)}`).join(", ")}`;
+          ipcNote = `REAL serat-app over loopback; bridge-side ms per command: ${Object.entries(stats).filter(([c]) => !c.startsWith("save_patch.phase.")).map(([c, s]) => `${c} n=${s.count} p50=${s.p50_ms.toFixed(1)} p95=${s.p95_ms.toFixed(1)} max=${s.max_ms.toFixed(1)}`).join(", ")}`;
         }
         rows.push(`${label} (bursts ${BURST.every}+${BURST.ms} ms; ${ipcNote}): ${fmt(summary)}; ${pct(on)} on time, p95 frames=${p95FramesToPaint(scores)}, ${d.withEntry}/${SUBJECT_KEYS} with ET entry (mean ${d.meanMs.toFixed(1)} ms, max ${d.maxMs.toFixed(1)} ms)`);
         const dump = process.env.SERAT_DUMP_DIR;
