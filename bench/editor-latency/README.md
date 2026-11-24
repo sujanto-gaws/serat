@@ -57,9 +57,22 @@ Do not read a red subject test as "the editor is over budget" unless the control
 
 ## Numbers
 
-Quiet re-run 2026-11-24 (task #147): `docs/05-testing/reports/nfr-prf-02-quiet-rerun-2026-11.md`. The Tauri stub in `tests/subject.ts` now supplies `window.__SERAT_BOOT__` (a vault), because the shell hides the editor behind "No vault open" without one, and answers `mark_first_paint`, `mark_vault_usable` and `resolve_links` with a number, a number and an array; figures from before this change are not strictly comparable. The IPC bridge example cannot be built with `--release` (serat-app's `TEST_HOOKS` const assertions); `CARGO_PROFILE_DEV_OPT_LEVEL=3` gives an optimised build with debug assertions.
+Quiet re-run 2026-11-24 (task #147): `docs/05-testing/reports/nfr-prf-02-quiet-rerun-2026-11.md`. The Tauri stub in `tests/subject.ts` now supplies `window.__SERAT_BOOT__` (a vault), because the shell hides the editor behind "No vault open" without one, and answers `mark_first_paint`, `mark_vault_usable` and `resolve_links` with a number, a number and an array; figures from before this change are not strictly comparable. The IPC bridge example could not be built with `--release` when that report was written (serat-app's `TEST_HOOKS` const assertions); `CARGO_PROFILE_DEV_OPT_LEVEL=3` gave an optimised build with debug assertions. Task #172 fixed that: see "Timing `save_patch` as shipped" below.
 
 See `docs/05-testing/` reports and the task #11 hand-off; headless Chromium in the development container, R = 16.70 ms. Not gate-eligible until reproduced on the reference machine.
+
+## Timing `save_patch` as shipped (task #172)
+
+The bridge builds in the shipped `release` profile (no debug assertions, `opt-level=3`) with one extra feature:
+
+```
+cargo build --release --features bench-bridge --example editor_ipc_bridge -p serat-app
+node record/save-patch-probe.mjs <target>/release/examples/editor_ipc_bridge [saves=60] [gap_ms=1000]
+```
+
+`bench-bridge` exists because the example's dev-dependencies turn `test-hooks` on for serat-index and serat-vault, which serat-app's const assertions refuse in a release build; the feature is the one named exception and it turns on serat-vault's inert `phase-timing`. It is for the example only: the `serat` binary does not compile with it (`crates/serat-app/src/main.rs`), CI's `serat-app-release-guard` job and `crates/serat-app/tests/release_guard.rs` prove the guard still fires and the binary still refuses. A plain `cargo build --release -p serat-app` is unchanged.
+
+With phase timing on (every debug build, and `--features bench-bridge`), the bridge's `/stats` carries one `save_patch.phase.NN.<name>` entry per phase of the `save_patch` call, in call order, and the probe prints them. Without it nothing is recorded and the marks compile to nothing. The probe is the method of #147's 60-save probe (5,000-line note, one-character patch each second) without strace. The release bridge still has `test-hooks` code compiled in (the vault's `with_platform`, the index's progress-handler seam); none of it is on the save path. Figures: `docs/05-testing/reports/save-patch-bridge-release-2026-11.md`.
 
 ## History
 
