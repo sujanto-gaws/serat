@@ -5765,6 +5765,30 @@ mod tests {
     /// reference machine; every other P1 job's name must not claim it.
     const P1_REPORT_ONLY_ON_HOSTED: &[&str] = &["FR-VLT-04"];
 
+    /// Whether the run line at `lines[idx]` keeps the exit status of the bin it runs. A line
+    /// with a pipe (`bin | tee out`) returns tee's status under a bare `run:` on Linux
+    /// (`bash -e`, no pipefail), so a breach would read green; it is safe only if its step
+    /// says `shell: bash` (GitHub then adds `-o pipefail`) or `set -o pipefail`.
+    fn run_line_keeps_exit_status(lines: &[&str], idx: usize) -> bool {
+        let code = |l: &str| l.split('#').next().unwrap_or("").to_owned();
+        if !code(lines[idx]).contains('|') {
+            return true;
+        }
+        let is_step = |l: &str| l.trim_start().starts_with("- ");
+        let mut from = idx;
+        while from > 0 && !is_step(lines[from]) {
+            from -= 1;
+        }
+        let mut to = idx + 1;
+        while to < lines.len() && !is_step(lines[to]) {
+            to += 1;
+        }
+        lines[from..to].iter().any(|l| {
+            let c = code(l);
+            c.trim() == "shell: bash" || c.contains("set -o pipefail")
+        })
+    }
+
     /// Whether workflow `text` has a job `job` that really gates on `bin`: a run line
     /// invoking `--bin <bin> ` with `--assert` before any `#`, no `||` on that line (it
     /// would swallow the exit code), and no `continue-on-error:` anywhere in the job.
@@ -5789,9 +5813,12 @@ mod tests {
         if body.iter().any(|l| code(l).contains("continue-on-error:")) {
             return false;
         }
-        body.iter().any(|l| {
+        body.iter().enumerate().any(|(i, l)| {
             let c = code(l);
-            c.contains(&format!("--bin {bin} ")) && c.contains("--assert") && !c.contains("||")
+            c.contains(&format!("--bin {bin} "))
+                && c.contains("--assert")
+                && !c.contains("||")
+                && run_line_keeps_exit_status(&body, i)
         })
     }
 
@@ -5833,6 +5860,191 @@ mod tests {
         assert!(report_only >= 1, "no P1 job is report-only: vacuous");
     }
 
+    /// What is wrong with the asserting Linux twin `<id>-linux` of a budget whose
+    /// Windows job is report-only (ADR-0019 point 3, task #168), or `None` if nothing is.
+    /// `flag` is what makes the bin assert: `--profile ci` for a `Budget` (the harness
+    /// asserts when `gate_eligible()`), `--assert` for a P1 bin. Pure, so the mutants below
+    /// can prove each clause bites.
+    fn linux_twin_defect(text: &str, id: &str, bin: &str, flag: &str) -> Option<String> {
+        let twin = format!("{id}-linux");
+        let head = format!("\n  {twin}:\n");
+        if !text.contains(&head) {
+            return Some(format!("{twin}: no asserting ubuntu-latest job exists"));
+        }
+        let job = workflow_job(text, &twin);
+        let name = workflow_job_name(&job);
+        if name.contains("report-only") {
+            return Some(format!(
+                "{twin}: an asserting job must not say report-only: {name:?}"
+            ));
+        }
+        if !name.contains("ubuntu-latest") || !name.contains("RM-1") {
+            return Some(format!(
+                "{twin}: the name must say where it asserts and that the gate figure is RM-1's: {name:?}"
+            ));
+        }
+        if !job.lines().any(|l| l.trim() == "runs-on: ubuntu-latest") {
+            return Some(format!(
+                "{twin}: must run on ubuntu-latest (gate_eligible is true there)"
+            ));
+        }
+        let code = |l: &str| l.split('#').next().unwrap_or("").to_owned();
+        if job.lines().any(|l| code(l).contains("continue-on-error:")) {
+            return Some(format!("{twin}: continue-on-error would fail open"));
+        }
+        let lines: Vec<&str> = job.lines().collect();
+        let drives = lines.iter().enumerate().any(|(i, l)| {
+            let c = code(l);
+            c.contains(&format!("--bin {bin} "))
+                && c.contains(flag)
+                && !c.contains("--profile reference")
+                && !c.contains("||")
+                && run_line_keeps_exit_status(&lines, i)
+        });
+        if !drives {
+            return Some(format!(
+                "{twin}: no un-swallowed run line invoking `--bin {bin}` with `{flag}`"
+            ));
+        }
+        let gate = workflow_job(text, "budgets-gate");
+        if !gate.contains(&format!("\n      - {twin}\n"))
+            || !gate.contains(&format!("check {twin} \"${{{{ needs.{twin}.result }}}}\""))
+        {
+            return Some(format!(
+                "{twin}: missing from budgets-gate's needs or its check list"
+            ));
+        }
+        None
+    }
+
+    /// The (job id, bin, flag) of every report-only-on-hosted-Windows budget: the P0 budgets
+    /// declared `WhenGateEligible` and the P1 bins in `P1_REPORT_ONLY_ON_HOSTED`.
+    fn report_only_budgets_with_twins() -> Vec<(String, String, &'static str)> {
+        let mut v: Vec<(String, String, &'static str)> = P0_BUDGETS
+            .iter()
+            .filter(|b| b.ci_assertion == CiAssertion::WhenGateEligible)
+            .map(|b| (b.id.to_string(), b.id.to_string(), "--profile ci"))
+            .collect();
+        v.extend(
+            P1_GATED
+                .iter()
+                .filter(|(_, _, req)| P1_REPORT_ONLY_ON_HOSTED.contains(req))
+                .map(|(job, bin, _)| (job.to_string(), bin.to_string(), "--assert")),
+        );
+        v
+    }
+
+    #[test]
+    fn a_report_only_budget_is_asserted_on_a_gate_eligible_linux_job() {
+        // ADR-0019 point 3 / NFR-PRF-08 / C-06: where the hosted Windows job reports, a job
+        // on ubuntu-latest (which `gate_eligible()` rates eligible) must assert, so a
+        // regression still fails the build. A budget therefore has one report-only Windows
+        // job and one asserting Linux job; the name check applies to each job on its own.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let twins = report_only_budgets_with_twins();
+        assert!(
+            twins.len() >= 2,
+            "NFR-PRF-04 and FR-VLT-04 are the report-only budgets: this would pass vacuously"
+        );
+        for (id, bin, flag) in &twins {
+            if let Some(defect) = linux_twin_defect(&text, id, bin, flag) {
+                panic!("{defect} (ADR-0019 point 3)");
+            }
+        }
+        // The harness side of the same claim: Linux is rated eligible, and on it the
+        // report-only budget asserts and the profile's limit is the product limit.
+        assert!(linux().gate_eligible());
+        assert_eq!(PRF04_FULL_REBUILD.ci_limit_ms, None);
+        assert_eq!(
+            PRF04_FULL_REBUILD.limit_ms(Profile::Ci),
+            PRF04_FULL_REBUILD.product_limit_ms
+        );
+    }
+
+    #[test]
+    fn the_linux_twin_check_is_shown_able_to_fail() {
+        // Each clause has a mutant that must be reported, or the check proves nothing.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let good = std::fs::read_to_string(&workflow).expect("budgets.yml");
+        let (id, bin, flag) = ("prf04-full-rebuild", "prf04-full-rebuild", "--profile ci");
+        assert_eq!(linux_twin_defect(&good, id, bin, flag), None);
+        let (pid, pbin, pflag) = ("p1-external-change", "p1-external-change", "--assert");
+        assert_eq!(linux_twin_defect(&good, pid, pbin, pflag), None);
+
+        // Replace `from` with `to` inside one job only, so a mutant cannot hit a twin.
+        let in_job = |twin: &str, from: &str, to: &str| {
+            let job = workflow_job(&good, twin);
+            assert!(job.contains(from), "{twin}: {from:?} not found");
+            good.replace(&job, &job.replace(from, to))
+        };
+        let n = workflow_job_name(&workflow_job(&good, "prf04-full-rebuild-linux"));
+        let prf = "prf04-full-rebuild-linux";
+        let ext = "p1-external-change-linux";
+        // (what, defect message it must produce, mutated workflow, which twin it is read as)
+        type Twin<'a> = (&'a str, &'a str, &'a str);
+        let mutants: Vec<(&str, &str, String, Twin)> = vec![
+            ("name says report-only", "must not say report-only",
+             in_job(prf, &n, &format!("{n} (report-only)")), (id, bin, flag)),
+            ("name loses RM-1", "gate figure is RM-1's",
+             in_job(prf, "the gate figure is RM-1's", "a regression gate"), (id, bin, flag)),
+            ("runs on windows", "must run on ubuntu-latest",
+             in_job(prf, "runs-on: ubuntu-latest", "runs-on: windows-latest"), (id, bin, flag)),
+            ("--profile reference instead of ci", "no un-swallowed run line",
+             in_job(prf, "-- --profile ci", "-- --profile reference"), (id, bin, flag)),
+            ("swallows the exit code", "no un-swallowed run line",
+             in_job(prf, "-- --profile ci", "-- --profile ci || true"), (id, bin, flag)),
+            ("continue-on-error", "continue-on-error",
+             in_job(prf, "    needs: vault\n", "    needs: vault\n    continue-on-error: true\n"), (id, bin, flag)),
+            ("left out of budgets-gate needs", "missing from budgets-gate",
+             good.replace("      - prf04-full-rebuild-linux\n", ""), (id, bin, flag)),
+            ("left out of budgets-gate checks", "missing from budgets-gate",
+             good.replace("          check prf04-full-rebuild-linux \"${{ needs.prf04-full-rebuild-linux.result }}\"\n", ""), (id, bin, flag)),
+            ("job renamed away", "no asserting ubuntu-latest job exists",
+             good.replace("\n  prf04-full-rebuild-linux:\n", "\n  prf04-full-rebuild-lnx:\n"), (id, bin, flag)),
+            ("--assert dropped (FR-VLT-04)", "no un-swallowed run line",
+             in_job(ext, "--batches 20 --assert |", "--batches 20 |"), (pid, pbin, pflag)),
+            ("continue-on-error (FR-VLT-04)", "continue-on-error",
+             in_job(ext, "    needs: vault\n", "    needs: vault\n    continue-on-error: true\n"), (pid, pbin, pflag)),
+            // The #168 review's blocker: `bin | tee` under a bare `run:` on Linux has no
+            // pipefail, so tee's status hides a breach. Only the asserting step is mutated.
+            ("no shell: bash on the piped assert step (FR-VLT-04)", "no un-swallowed run line",
+             in_job(ext, "      - name: Measure and assert\n        shell: bash\n", "      - name: Measure and assert\n"), (pid, pbin, pflag)),
+        ];
+        assert_eq!(mutants.len(), 12);
+        for (what, expect, text, (i, b, f)) in &mutants {
+            assert_ne!(
+                text, &good,
+                "the mutant {what:?} did not change the workflow"
+            );
+            let defect = linux_twin_defect(text, i, b, f)
+                .unwrap_or_else(|| panic!("mutant {what:?} was not caught"));
+            assert!(
+                defect.contains(expect),
+                "mutant {what:?} was caught by the wrong clause: {defect:?}, wanted {expect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_report_only_windows_job_and_the_asserting_linux_job_each_keep_their_own_name() {
+        // The two-way name check applies per job: the Windows job says report-only and
+        // names the reference machine; its Linux twin does not say report-only.
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow).expect("budgets.yml");
+        for (id, _, _) in report_only_budgets_with_twins() {
+            let win = workflow_job_name(&workflow_job(&text, &id));
+            let lin = workflow_job_name(&workflow_job(&text, &format!("{id}-linux")));
+            assert!(
+                win.contains("report-only") && win.contains("reference machine"),
+                "{win:?}"
+            );
+            assert!(!lin.contains("report-only"), "{lin:?}");
+            assert_ne!(win, lin, "{id}: two jobs must not share a check name");
+        }
+    }
+
     #[test]
     fn job_asserts_accepts_the_good_job_and_rejects_each_sabotage() {
         let wrap = |run: &str, extra: &str| {
@@ -5854,6 +6066,19 @@ mod tests {
         // The exit code swallowed on the run line.
         let swallowed = format!("{good} || true");
         assert!(!job_asserts(&wrap(&swallowed, ""), "p1-x", "p1-x"));
+        // A pipe under a bare `run:` loses the bin's exit status; `shell: bash` keeps it.
+        let piped = format!("{good} | tee out.txt");
+        assert!(!job_asserts(&wrap(&piped, ""), "p1-x", "p1-x"));
+        assert!(job_asserts(
+            &wrap(&piped, "        shell: bash\n"),
+            "p1-x",
+            "p1-x"
+        ));
+        assert!(job_asserts(
+            &wrap(&format!("set -o pipefail; {piped}"), ""),
+            "p1-x",
+            "p1-x"
+        ));
         // A continue-on-error in a different job is not this job's problem.
         let other = format!("{}  other:\n    continue-on-error: true\n", wrap(good, ""));
         assert!(job_asserts(&other, "p1-x", "p1-x"));

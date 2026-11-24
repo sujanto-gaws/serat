@@ -150,6 +150,30 @@ jobs:
           path: bench/out/budgets/
           if-no-files-found: ignore
 
+  # ASSERTING, ON A RUNNER THE HARNESS RATES GATE ELIGIBLE (ADR-0019 point 3, task #168,
+  # NFR-PRF-04, NFR-PRF-08, C-06). The windows job above reports; this one asserts the product
+  # limit (30 s) under `--profile ci`, whose limit is `product_limit_ms` because the budget
+  # has no `ci_limit_ms`. `Environment::gate_eligible()` is true on Linux, so the bin's
+  # `WhenGateEligible` asserts here and exits 1 on a breach. It is a regression gate on
+  # Serat's own parse and rebuild code. It does NOT certify the product: RM-1 does, at each
+  # gate, and a figure from this job is never reported as the gate figure. The name says so
+  # and must not say "report-only" (pinned by a_report_only_budget_is_asserted_on_a_gate_eligible_linux_job).
+  prf04-full-rebuild-linux:
+    name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s, asserted on ubuntu-latest (a regression gate; the gate figure is RM-1's)"
+    needs: vault
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p budget --bin prf04-full-rebuild -- --profile ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf04-full-rebuild-linux
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
   prf03-save-to-index:
     name: "NFR-PRF-03 · save to index < 50 ms p95 over 1000 saves"
     needs: [vault, build-app]
@@ -341,6 +365,38 @@ jobs:
         with:
           name: p1-external-change
           path: bench/out/p1-external-change*.txt
+          if-no-files-found: ignore
+
+  # ASSERTING ON ubuntu-latest (ADR-0019 point 3, task #168, FR-VLT-04, NFR-PRF-08, C-06).
+  # The windows job above reports because that runner cannot produce a gate number. This one
+  # runs the same bin with --assert on a runner `gate_eligible()` rates eligible, so the
+  # 500 ms p95 fails the build on a breach. It is a regression gate on the watcher
+  # processing path (ADR-0011); the gate figure is RM-1's. If its first hosted runs are noisy
+  # (the #165 triage reproduced the tail on 2 contended cores), ADR-0019 point 2 applies to
+  # this runner too, on the evidence, and the answer is not a retry.
+  p1-external-change-linux:
+    name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes, asserted on ubuntu-latest (a regression gate; the gate figure is RM-1's)"
+    needs: vault
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate the 20k vault and assert its digest
+        run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
+      - name: Measurement environment and gate_eligible
+        shell: bash
+        run: |
+          mkdir -p bench/out
+          cargo run --release -p budget --bin environment | tee bench/out/p1-external-change-linux.env.txt || true
+      - name: Measure and assert
+        shell: bash
+        run: cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert | tee bench/out/p1-external-change-linux.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-external-change-linux
+          path: bench/out/p1-external-change-linux*.txt
           if-no-files-found: ignore
 
   # NFR-PRF-06 (architecture 9.2): gated at the binding 50 ms p95 at 20k, on keystroke 3
@@ -562,7 +618,8 @@ jobs:
   # succeeded, so there is one check to require and it cannot be skipped green. Named
   # `needs.<job>.result` references, as ci.yml's "definition of done" does (F-354: the
   # `needs.*` filter is a schema violation). editor-latency* are report-only and excluded.
-  # prf04-full-rebuild IS included but is a report-only job (ADR-0019): green means it measured.
+  # prf04-full-rebuild and p1-external-change ARE included but are report-only jobs on hosted
+  # Windows (ADR-0019): green means they measured. Their -linux twins assert (task #168).
   budgets-gate:
     name: "budgets · every gating job succeeded"
     if: always()
@@ -571,12 +628,14 @@ jobs:
       - vault
       - build-app
       - prf04-full-rebuild
+      - prf04-full-rebuild-linux
       - prf03-save-to-index
       - prf01-cold-start
       - prf01-serat-term
       - p1-read-paths
       - p1-tree-path
       - p1-external-change
+      - p1-external-change-linux
       - p1-switcher
       - every-budget-has-a-job
     runs-on: ubuntu-latest
@@ -590,12 +649,14 @@ jobs:
           check vault "${{ needs.vault.result }}"
           check build-app "${{ needs.build-app.result }}"
           check prf04-full-rebuild "${{ needs.prf04-full-rebuild.result }}"
+          check prf04-full-rebuild-linux "${{ needs.prf04-full-rebuild-linux.result }}"
           check prf03-save-to-index "${{ needs.prf03-save-to-index.result }}"
           check prf01-cold-start "${{ needs.prf01-cold-start.result }}"
           check prf01-serat-term "${{ needs.prf01-serat-term.result }}"
           check p1-read-paths "${{ needs.p1-read-paths.result }}"
           check p1-tree-path "${{ needs.p1-tree-path.result }}"
           check p1-external-change "${{ needs.p1-external-change.result }}"
+          check p1-external-change-linux "${{ needs.p1-external-change-linux.result }}"
           check p1-switcher "${{ needs.p1-switcher.result }}"
           check every-budget-has-a-job "${{ needs.every-budget-has-a-job.result }}"
           $ok
