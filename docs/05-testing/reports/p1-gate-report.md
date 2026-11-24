@@ -56,7 +56,7 @@ Columns: **Verify** is the PRD method. **Witness** names the test case, bench re
 |---|---|---|---|
 | FR-VLT-01 | Bench | `crates/serat-index/tests/tree_rows.rs`, `crates/serat-vault/tests/tree_session.rs`, `crates/serat-core/tests/tree_stream.rs`, `app/src/stores/vaultId.test.ts`; budget job `p1-tree-path` (`bench/budget/src/bin/p1-tree-path.rs`, `.github/workflows/budgets.yml`). The 2 s tree budget is judged by the job. CI run 316 (budgets, id 42676247715, head `6a608b8`, windows-latest, 2026-11-09): warm p95 47.6 ms, no-index 105.9 ms against 2000 ms, PASS (last run; windows-latest, 2 cores, realtime scanner off, harness prints `gate eligible false`, not gate-eligible (RISK-012); 4 PASS of 4 runs) | functional tests: tested. Budget: **CI PASS on 2026-11-09 (`6a608b8`), 4 of 4 runs, not gate-eligible, not re-run on the current head** |
 | FR-VLT-03 | Test | `crates/serat-vault/src/patch_props.rs`, `crates/serat-vault/src/write_race_tests.rs` | tested |
-| FR-VLT-04 | Bench | `crates/serat-index/tests/external_change.rs`, `crates/serat-app/src/consumer.rs`; budget `p1-external-change`. Single note p95 190 ms, max 454 ms of 500 ms (loaded); batch of 100 p95 723 ms, reported (`status-p1-editor.md` §Budget numbers; no standalone report). **CI, windows-latest, 2 cores, realtime scanner off, harness prints `gate eligible false`, not gate-eligible (RISK-012): 3 PASS / 1 FAIL over runs 311 (9ce1c6c) 422.1 ms, 312 (c24943a) 417.0 ms, 315 (cf93c32) 376.1 ms (max 1261.2), and 316 (last run, `6a608b8`) FAIL 615.28 ms > 500 ms (max 792.0; batch p95 7017 ms)**; intermittent, task #165 | **CI intermittent (3 of 4 pass, 376-615 ms), not gate-eligible, not re-run**; last run FAIL 2026-11-09 windows-2025 p95 615.3 ms > 500 ms |
+| FR-VLT-04 | Bench | `crates/serat-index/tests/external_change.rs`, `crates/serat-app/src/consumer.rs`; budget `p1-external-change`. Single note p95 190 ms, max 454 ms of 500 ms (loaded); batch of 100 p95 723 ms, reported (`status-p1-editor.md` §Budget numbers; no standalone report). **CI, windows-latest, 2 cores, realtime scanner off, harness prints `gate eligible false`, not gate-eligible (RISK-012): 3 PASS / 1 FAIL over runs 311 (9ce1c6c) 422.1 ms, 312 (c24943a) 417.0 ms, 315 (cf93c32) 376.1 ms (max 1261.2), and 316 (last run, `6a608b8`) FAIL 615.28 ms > 500 ms (max 792.0; batch p95 7017 ms)**; intermittent, task #165; report-only on hosted Windows (#166); asserted on ubuntu-latest by `p1-external-change-linux` (#168), unrun | **CI intermittent (3 of 4 pass, 376-615 ms), not gate-eligible, not re-run**; report-only on hosted Windows (#166); asserted on ubuntu-latest by `p1-external-change-linux` (#168), unrun; last run FAIL 2026-11-09 windows-2025 p95 615.3 ms > 500 ms |
 | FR-VLT-05 | Test | `app/src/editor/reconcile.test.ts` | tested |
 | FR-VLT-07 | Test | `crates/serat-vault/src/ignore_file_tests.rs`, `crates/serat-app/src/asset/tests.rs` | tested |
 | FR-VLT-08 | Demo | proxy: `crates/serat-index/tests/assets_sidecars.rs` | pending the week |
@@ -93,7 +93,7 @@ Columns: **Verify** is the PRD method. **Witness** names the test case, bench re
 | State | Count | IDs |
 |---|---:|---|
 | Tested (automated, recorded green by the merge gate, not re-run here) | 16 | FR-VLT-03, FR-VLT-05, FR-VLT-07, FR-VLT-11, FR-EDT-01, FR-EDT-03, FR-NAV-02, FR-NAV-04, FR-STR-03, FR-BIN-01, FR-BIN-02, NFR-SEC-01 (static half), NFR-SEC-06 (Linux), NFR-SEC-07, NFR-REL-01, NFR-CMP-03 |
-| Reported, not attested on the current head (bench job exists; a loaded figure or the 2026-11-09 CI result is recorded) | 4 | FR-VLT-01 (CI PASS), FR-VLT-04 (**CI intermittent, last run FAIL**), FR-NAV-01, NFR-PRF-06 (CI within budget) |
+| Reported, not attested on the current head (bench job exists; a loaded figure or the 2026-11-09 CI result is recorded) | 4 | FR-VLT-01 (CI PASS), FR-VLT-04 (**CI intermittent, last run FAIL**; report-only on hosted Windows (#166); asserted on ubuntu-latest by `p1-external-change-linux` (#168), unrun), FR-NAV-01, NFR-PRF-06 (CI within budget) |
 | **Not witnessed** | 1 | NFR-PRF-02 (budget evidence) |
 | Pending the owner's week (Demo 8: FR-VLT-08, FR-EDT-02, FR-EDT-10, FR-BIN-03, FR-BIN-11, FR-BIN-12, NFR-CMP-01, NFR-CMP-04; Inspect 4: FR-NAV-06, NFR-CMP-02, NFR-USE-01, NFR-MNT-01) | 12 | see the Demo/Inspect section |
 | Non-additive memo (not part of the 33): Bench IDs with attested evidence | 0 of 5 Bench | no Bench ID has attested P1 evidence; NFR-PRF-03 is attested but is a P0-phase ID |
@@ -115,6 +115,8 @@ Caveats on the 16: the front-end tests are jsdom/vitest, not a real webview; FR-
 | NFR-PRF-07 memory ceiling | P4 scope | **not run** | n/a (P4 scope) | n/a (P4 scope) | PRD Phase column |
 | **NFR-PRF-08** budgets enforced in CI | `.github/workflows/budgets.yml` has 17 jobs (task #168 added `prf04-full-rebuild-linux` and `p1-external-change-linux`), among them `prf01-cold-start`, `prf01-serat-term`, `prf03-save-to-index`, `prf04-full-rebuild`, `p1-read-paths`, `p1-tree-path`, `p1-external-change`, `p1-switcher`, `every-budget-has-a-job` and the report-only `editor-latency` jobs. About 38 `budgets.yml` runs got hosted runners (runs 279-297 on 2026-10-20/21, 298-316 on 2026-11-09); none was green. Per-job tally under CI jobs | **not satisfied** (F-384, RISK-013). Needs the repository owner; nothing under `bench/` or `docs/` can fix it | n/a: this is the CI requirement itself. `budgets.yml` now has 17 jobs, none run on the head. | n/a | `t2-p0-gate-report.md` §NFR-PRF-08; `docs/01-planning/risk-register.md` |
 | NFR-PRF-09 extraction budget | P2 scope; TC-035 planned | **not run** | n/a (P2 scope) | n/a (P2 scope) | `docs/05-testing/test-plan.md` |
+| FR-VLT-04 external change (500 ms p95) | See "P1-specific budgets" below | **unattested**; no gate figure | None on the head. windows-latest job is report-only; `p1-external-change-linux` asserts on ubuntu-latest (#168), unrun | Owed | `status-p1-editor.md`; jobs `p1-external-change`, `p1-external-change-linux` |
+| FR-VLT-01 file tree complete (2 s p95) | CI PASS 2026-11-09 (`6a608b8`), warm p95 47.6 ms | **unattested at the head** | None on the head. `p1-tree-path` is an `Always` gated job on windows-latest; last green run 316, not the head | Owed | job `p1-tree-path` |
 
 NFR-PRF-10 (scale ceiling, P5) is outside the 01..09 range and is not run.
 
@@ -153,7 +155,7 @@ This draft does not message them; the lead relays (`status-p1-editor.md` §Proce
 | FR-VLT-01 `p1-tree-path` | PASS: warm p95 47.6 ms, no-index 105.9 ms vs 2000 ms |
 | NFR-PRF-04 `prf04-full-rebuild` | REPORT-ONLY from #166 (hosted Windows is not gate eligible); the run-316 figure was a PASS: median of 3 17,812.4 ms vs 30 s |
 | NFR-PRF-06 `p1-switcher` | within budget: default p95 8.53 ms, heading 11.48 ms |
-| FR-VLT-04 `p1-external-change` | **FAIL** (intermittent, see tally): single-note p95 615.28 ms > 500 ms (max 792.0 ms; batch p95 7017 ms); task #165 |
+| FR-VLT-04 `p1-external-change` | **FAIL** (intermittent, see tally): single-note p95 615.28 ms > 500 ms (max 792.0 ms; batch p95 7017 ms); task #165; report-only on hosted Windows (#166); asserted on ubuntu-latest by `p1-external-change-linux` (#168), unrun |
 | NFR-PRF-03 `prf03-save-to-index`, both NFR-PRF-01 jobs | **FAIL without measuring** ("there is no application to start yet ... looked for target/release/serat.exe"): a job defect, not a measurement; task #164 |
 | NFR-MNT-02 vault determinism | PASS |
 | NFR-PRF-08 "every budget has a job" (`every-budget-has-a-job`) | PASS (the job check; the requirement stays unsatisfied) |
@@ -164,7 +166,7 @@ This draft does not message them; the lead relays (`status-p1-editor.md` §Proce
 | Job / budget | Runs and result | Notes |
 |---|---|---|
 | NFR-PRF-04 full rebuild | 22 FAIL / 14 PASS, windows-latest; a step at #56 (20 FAIL before, 14 PASS + 2 INDETERMINATE after), a step improvement at #56 plus residual runner noise, not a regression; report-only from #166 | worst: run 279 at 80123ce median 51,260.5 ms; run 298 at 7b06763 median 55,224.6 ms; run 306 at 6857025 undecided, 28,394 ms, spread 192 %. Task #166 |
-| FR-VLT-04 external change | 3 PASS / 1 FAIL | run 311 (9ce1c6c) 422.1 ms, 312 (c24943a) 417.0 ms, 315 (cf93c32) 376.1 ms (max 1261.2), 316 615.3 ms. **CI intermittent (3 of 4 pass, 376 to 615 ms)**. Task #165 |
+| FR-VLT-04 external change | 3 PASS / 1 FAIL | run 311 (9ce1c6c) 422.1 ms, 312 (c24943a) 417.0 ms, 315 (cf93c32) 376.1 ms (max 1261.2), 316 615.3 ms. **CI intermittent (3 of 4 pass, 376 to 615 ms)**; report-only on hosted Windows (#166); asserted on ubuntu-latest by `p1-external-change-linux` (#168), unrun. Task #165 |
 | FR-VLT-01 tree path | 4 PASS | |
 | NFR-PRF-06 switcher | 4 PASS | |
 | NFR-PRF-03 | 36 FAIL | all the `serat.exe` job defect, task #164 |

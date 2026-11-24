@@ -244,8 +244,8 @@ figure for NFR-PRF-04 exists anywhere today;** a Defender-on RM-1 run is owed (R
   Both need runners to be scheduled at all (RISK-013); neither can be done from this repository.
 - ADR-0019 §3 gives a `WhenGateEligible` budget an asserting job on ubuntu-latest: **done in task #168** (`prf04-full-rebuild-linux`,
   and `p1-external-change-linux` for FR-VLT-04), `--profile ci`, which asserts the product limit because the budget has no
-  `ci_limit_ms`. They are `Always`-style regression gates on Serat's code, not gate figures. Feasibility on the 4-core container
-  (same shape as hosted ubuntu-latest): 20k vault generation 5.3 s, `prf04-full-rebuild --profile ci` median 9.16 s (3 runs,
+  `ci_limit_ms`. They are asserting regression gates on Serat's code, not gate figures. Feasibility on the 4-core container
+  (4 cores, as hosted ubuntu-latest for public repositories; private-repository hosted runners are 2-core, which is untested here): 20k vault generation 5.3 s, `prf04-full-rebuild --profile ci` median 9.16 s (3 runs,
   28 s for the step), `p1-external-change --assert` 75 s (single p95 181.0 ms of 500); hosted I/O is slower, but the 360 min
   limit is not the question and a cold `rust-cache` build is about 2 minutes. Whether hosted Linux is quiet enough is for its
   first runs to say (ADR-0019 point 2 applies to that runner too); no runner has scheduled (RISK-013), so they are unrun.

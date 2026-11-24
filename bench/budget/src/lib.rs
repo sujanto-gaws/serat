@@ -5765,6 +5765,30 @@ mod tests {
     /// reference machine; every other P1 job's name must not claim it.
     const P1_REPORT_ONLY_ON_HOSTED: &[&str] = &["FR-VLT-04"];
 
+    /// Whether the run line at `lines[idx]` keeps the exit status of the bin it runs. A line
+    /// with a pipe (`bin | tee out`) returns tee's status under a bare `run:` on Linux
+    /// (`bash -e`, no pipefail), so a breach would read green; it is safe only if its step
+    /// says `shell: bash` (GitHub then adds `-o pipefail`) or `set -o pipefail`.
+    fn run_line_keeps_exit_status(lines: &[&str], idx: usize) -> bool {
+        let code = |l: &str| l.split('#').next().unwrap_or("").to_owned();
+        if !code(lines[idx]).contains('|') {
+            return true;
+        }
+        let is_step = |l: &str| l.trim_start().starts_with("- ");
+        let mut from = idx;
+        while from > 0 && !is_step(lines[from]) {
+            from -= 1;
+        }
+        let mut to = idx + 1;
+        while to < lines.len() && !is_step(lines[to]) {
+            to += 1;
+        }
+        lines[from..to].iter().any(|l| {
+            let c = code(l);
+            c.trim() == "shell: bash" || c.contains("set -o pipefail")
+        })
+    }
+
     /// Whether workflow `text` has a job `job` that really gates on `bin`: a run line
     /// invoking `--bin <bin> ` with `--assert` before any `#`, no `||` on that line (it
     /// would swallow the exit code), and no `continue-on-error:` anywhere in the job.
@@ -5789,9 +5813,12 @@ mod tests {
         if body.iter().any(|l| code(l).contains("continue-on-error:")) {
             return false;
         }
-        body.iter().any(|l| {
+        body.iter().enumerate().any(|(i, l)| {
             let c = code(l);
-            c.contains(&format!("--bin {bin} ")) && c.contains("--assert") && !c.contains("||")
+            c.contains(&format!("--bin {bin} "))
+                && c.contains("--assert")
+                && !c.contains("||")
+                && run_line_keeps_exit_status(&body, i)
         })
     }
 
@@ -5865,12 +5892,14 @@ mod tests {
         if job.lines().any(|l| code(l).contains("continue-on-error:")) {
             return Some(format!("{twin}: continue-on-error would fail open"));
         }
-        let drives = job.lines().any(|l| {
+        let lines: Vec<&str> = job.lines().collect();
+        let drives = lines.iter().enumerate().any(|(i, l)| {
             let c = code(l);
             c.contains(&format!("--bin {bin} "))
                 && c.contains(flag)
                 && !c.contains("--profile reference")
                 && !c.contains("||")
+                && run_line_keeps_exit_status(&lines, i)
         });
         if !drives {
             return Some(format!(
@@ -5944,43 +5973,58 @@ mod tests {
         let (pid, pbin, pflag) = ("p1-external-change", "p1-external-change", "--assert");
         assert_eq!(linux_twin_defect(&good, pid, pbin, pflag), None);
 
-        let twin_name = |t: &str, twin: &str| {
-            let job = workflow_job(t, twin);
-            workflow_job_name(&job)
+        // Replace `from` with `to` inside one job only, so a mutant cannot hit a twin.
+        let in_job = |twin: &str, from: &str, to: &str| {
+            let job = workflow_job(&good, twin);
+            assert!(job.contains(from), "{twin}: {from:?} not found");
+            good.replace(&job, &job.replace(from, to))
         };
-        let n = twin_name(&good, "prf04-full-rebuild-linux");
-        let mutants: Vec<(&str, String)> = vec![
-            ("name says report-only", good.replace(&n, &format!("{n} (report-only)"))),
-            ("name loses RM-1", good.replace("the gate figure is RM-1's)\"\n    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild", "a regression gate)\"\n    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild")),
-            ("runs on windows", good.replace("    needs: vault\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild", "    needs: vault\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@1.92\n      - uses: Swatinem/rust-cache@v2\n      - run: cargo run --release -p budget --bin prf04-full-rebuild")),
-            ("drops --profile ci", good.replace("--bin prf04-full-rebuild -- --profile ci\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux", "--bin prf04-full-rebuild -- --profile reference\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux")),
-            ("swallows the exit code", good.replace("--bin prf04-full-rebuild -- --profile ci\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux", "--bin prf04-full-rebuild -- --profile ci || true\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: prf04-full-rebuild-linux")),
-            ("left out of budgets-gate needs", good.replace("      - prf04-full-rebuild-linux\n", "")),
-            ("left out of budgets-gate checks", good.replace("          check prf04-full-rebuild-linux \"${{ needs.prf04-full-rebuild-linux.result }}\"\n", "")),
-            ("job deleted", good.replace("\n  prf04-full-rebuild-linux:\n", "\n  prf04-full-rebuild-lnx:\n")),
+        let n = workflow_job_name(&workflow_job(&good, "prf04-full-rebuild-linux"));
+        let prf = "prf04-full-rebuild-linux";
+        let ext = "p1-external-change-linux";
+        // (what, defect message it must produce, mutated workflow, which twin it is read as)
+        type Twin<'a> = (&'a str, &'a str, &'a str);
+        let mutants: Vec<(&str, &str, String, Twin)> = vec![
+            ("name says report-only", "must not say report-only",
+             in_job(prf, &n, &format!("{n} (report-only)")), (id, bin, flag)),
+            ("name loses RM-1", "gate figure is RM-1's",
+             in_job(prf, "the gate figure is RM-1's", "a regression gate"), (id, bin, flag)),
+            ("runs on windows", "must run on ubuntu-latest",
+             in_job(prf, "runs-on: ubuntu-latest", "runs-on: windows-latest"), (id, bin, flag)),
+            ("--profile reference instead of ci", "no un-swallowed run line",
+             in_job(prf, "-- --profile ci", "-- --profile reference"), (id, bin, flag)),
+            ("swallows the exit code", "no un-swallowed run line",
+             in_job(prf, "-- --profile ci", "-- --profile ci || true"), (id, bin, flag)),
+            ("continue-on-error", "continue-on-error",
+             in_job(prf, "    needs: vault\n", "    needs: vault\n    continue-on-error: true\n"), (id, bin, flag)),
+            ("left out of budgets-gate needs", "missing from budgets-gate",
+             good.replace("      - prf04-full-rebuild-linux\n", ""), (id, bin, flag)),
+            ("left out of budgets-gate checks", "missing from budgets-gate",
+             good.replace("          check prf04-full-rebuild-linux \"${{ needs.prf04-full-rebuild-linux.result }}\"\n", ""), (id, bin, flag)),
+            ("job renamed away", "no asserting ubuntu-latest job exists",
+             good.replace("\n  prf04-full-rebuild-linux:\n", "\n  prf04-full-rebuild-lnx:\n"), (id, bin, flag)),
+            ("--assert dropped (FR-VLT-04)", "no un-swallowed run line",
+             in_job(ext, "--batches 20 --assert |", "--batches 20 |"), (pid, pbin, pflag)),
+            ("continue-on-error (FR-VLT-04)", "continue-on-error",
+             in_job(ext, "    needs: vault\n", "    needs: vault\n    continue-on-error: true\n"), (pid, pbin, pflag)),
+            // The #168 review's blocker: `bin | tee` under a bare `run:` on Linux has no
+            // pipefail, so tee's status hides a breach. Both piped steps are mutated in turn.
+            ("no shell: bash on the piped assert step (FR-VLT-04)", "no un-swallowed run line",
+             in_job(ext, "      - name: Measure and assert\n        shell: bash\n", "      - name: Measure and assert\n"), (pid, pbin, pflag)),
         ];
-        for (what, text) in &mutants {
+        assert!(mutants.len() >= 11);
+        for (what, expect, text, (i, b, f)) in &mutants {
             assert_ne!(
                 text, &good,
                 "the mutant {what:?} did not change the workflow"
             );
+            let defect = linux_twin_defect(text, i, b, f)
+                .unwrap_or_else(|| panic!("mutant {what:?} was not caught"));
             assert!(
-                linux_twin_defect(text, id, bin, flag).is_some(),
-                "mutant {what:?} was not caught"
+                defect.contains(expect),
+                "mutant {what:?} was caught by the wrong clause: {defect:?}, wanted {expect:?}"
             );
         }
-        // FR-VLT-04's twin: the same two clauses that differ (--assert, swallowing).
-        let p_no_assert = good.replace(
-            "--vault 20k --single 100 --batches 20 --assert | tee bench/out/p1-external-change-linux.txt",
-            "--vault 20k --single 100 --batches 20 | tee bench/out/p1-external-change-linux.txt",
-        );
-        assert_ne!(p_no_assert, good);
-        assert!(linux_twin_defect(&p_no_assert, pid, pbin, pflag).is_some());
-        let p_coe = good.replace(
-            "  p1-external-change-linux:\n",
-            "  p1-external-change-linux:\n    continue-on-error: true\n",
-        );
-        assert!(linux_twin_defect(&p_coe, pid, pbin, pflag).is_some());
     }
 
     #[test]
@@ -6022,6 +6066,19 @@ mod tests {
         // The exit code swallowed on the run line.
         let swallowed = format!("{good} || true");
         assert!(!job_asserts(&wrap(&swallowed, ""), "p1-x", "p1-x"));
+        // A pipe under a bare `run:` loses the bin's exit status; `shell: bash` keeps it.
+        let piped = format!("{good} | tee out.txt");
+        assert!(!job_asserts(&wrap(&piped, ""), "p1-x", "p1-x"));
+        assert!(job_asserts(
+            &wrap(&piped, "        shell: bash\n"),
+            "p1-x",
+            "p1-x"
+        ));
+        assert!(job_asserts(
+            &wrap(&format!("set -o pipefail; {piped}"), ""),
+            "p1-x",
+            "p1-x"
+        ));
         // A continue-on-error in a different job is not this job's problem.
         let other = format!("{}  other:\n    continue-on-error: true\n", wrap(good, ""));
         assert!(job_asserts(&other, "p1-x", "p1-x"));

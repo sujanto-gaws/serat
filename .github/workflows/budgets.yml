@@ -157,7 +157,7 @@ jobs:
   # `WhenGateEligible` asserts here and exits 1 on a breach. It is a regression gate on
   # Serat's own parse and rebuild code. It does NOT certify the product: RM-1 does, at each
   # gate, and a figure from this job is never reported as the gate figure. The name says so
-  # and must not say "report-only" (pinned by a_gate_eligible_runner_asserts_...).
+  # and must not say "report-only" (pinned by a_report_only_budget_is_asserted_on_a_gate_eligible_linux_job).
   prf04-full-rebuild-linux:
     name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s, asserted on ubuntu-latest (a regression gate; the gate figure is RM-1's)"
     needs: vault
@@ -385,10 +385,12 @@ jobs:
       - name: Generate the 20k vault and assert its digest
         run: cargo run --release -p vaultgen -- --preset 20k --force --expect 35fcb867759df4b8737af8914f798d81d77396dfe051f38140139d3779bd393e
       - name: Measurement environment and gate_eligible
+        shell: bash
         run: |
           mkdir -p bench/out
           cargo run --release -p budget --bin environment | tee bench/out/p1-external-change-linux.env.txt || true
       - name: Measure and assert
+        shell: bash
         run: cargo run --release -p budget --bin p1-external-change -- --vault 20k --single 100 --batches 20 --assert | tee bench/out/p1-external-change-linux.txt
       - uses: actions/upload-artifact@v4
         if: always()
