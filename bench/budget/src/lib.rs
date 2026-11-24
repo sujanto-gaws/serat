@@ -6008,11 +6008,11 @@ mod tests {
             ("continue-on-error (FR-VLT-04)", "continue-on-error",
              in_job(ext, "    needs: vault\n", "    needs: vault\n    continue-on-error: true\n"), (pid, pbin, pflag)),
             // The #168 review's blocker: `bin | tee` under a bare `run:` on Linux has no
-            // pipefail, so tee's status hides a breach. Both piped steps are mutated in turn.
+            // pipefail, so tee's status hides a breach. Only the asserting step is mutated.
             ("no shell: bash on the piped assert step (FR-VLT-04)", "no un-swallowed run line",
              in_job(ext, "      - name: Measure and assert\n        shell: bash\n", "      - name: Measure and assert\n"), (pid, pbin, pflag)),
         ];
-        assert!(mutants.len() >= 11);
+        assert_eq!(mutants.len(), 12);
         for (what, expect, text, (i, b, f)) in &mutants {
             assert_ne!(
                 text, &good,
