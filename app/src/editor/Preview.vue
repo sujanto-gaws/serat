@@ -18,12 +18,19 @@
   either.
 -->
 <script setup lang="ts">
+import type { Text } from "@codemirror/state";
 import { onBeforeUnmount, ref, watch } from "vue";
 
 import { chunkMarkdownSource, renderMarkdownToFragment } from "@/editor/preview";
 
 const props = defineProps<{
-  source: string;
+  /**
+   * Either the text or the immutable CodeMirror `Text` snapshot. A `Text` is
+   * stringified only inside the debounced render (#171, NFR-PRF-02): the
+   * per-keystroke path must not pay O(doc) for a preview that has not yet
+   * been asked to render.
+   */
+  source: string | Text;
   /** ms after the last change before a re-render starts (§9.3: 150ms). */
   debounceMs?: number;
 }>();
@@ -40,8 +47,9 @@ let renderToken = 0;
 const idleSchedule: (cb: () => void) => void =
   typeof requestIdleCallback === "function" ? (cb) => requestIdleCallback(cb) : (cb) => setTimeout(cb, 0);
 
-async function renderNow(source: string): Promise<void> {
+async function renderNow(input: string | Text): Promise<void> {
   const token = ++renderToken;
+  const source = typeof input === "string" ? input : input.toString();
   const host = container.value;
   if (!host) return;
 
@@ -64,7 +72,7 @@ async function renderNow(source: string): Promise<void> {
   appendNext();
 }
 
-function scheduleRender(source: string): void {
+function scheduleRender(source: string | Text): void {
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     void renderNow(source);
