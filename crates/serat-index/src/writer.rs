@@ -114,6 +114,10 @@ pub struct CommittedBatch {
 /// take a lock that a thread waiting on the writer may hold. A panic in the observer
 /// is caught and discarded: the writer outlives it.
 ///
+/// One late case: if `COMMIT` succeeds but restoring `synchronous` after a clean close
+/// then fails, the batch stays in hand, is applied again by the next commit and is
+/// reported then, late and not lost.
+///
 /// Installed once, on [`ActorOptions`], and carried by `IndexHandle` so that the actor a
 /// runtime rebuild starts reports to the same observer.
 #[derive(Clone)]
@@ -159,7 +163,8 @@ struct CommitHooks {
 /// Holds a batch between its statements and its `COMMIT`, for tests (task #175).
 ///
 /// Behind the `test-hooks` feature (and `cfg(test)`) it can hold; otherwise it is an
-/// empty struct and the writer's call into it compiles to nothing. Every actor has one
+/// inert (a shared allocation holding nothing) and the writer's call into it does
+/// nothing. Every actor has one
 /// ([`IndexActor::commit_gate`]); a handle produced by a runtime rebuild has its own,
 /// so fetch it again after one.
 #[derive(Debug, Clone, Default)]
@@ -193,6 +198,9 @@ impl CommitGate {
     /// guard is dropped. The transaction stays open meanwhile, so other connections see
     /// the pre-batch state, which is what makes "nothing announced before the commit"
     /// provable without a race.
+    ///
+    /// While a hold is outstanding the writer cannot finish: `close`, `shutdown` and
+    /// dropping the actor all block until the hold is dropped, so drop it first.
     #[must_use]
     pub fn hold(&self) -> CommitHold {
         let mut flags = lock(&self.0.state);
@@ -434,6 +442,7 @@ pub struct IndexActor {
     /// SQLite's own auto-checkpoint stays on.
     pub(crate) checkpointer: Option<Checkpointer>,
     health: Arc<WalHealth>,
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     gate: CommitGate,
 }
 
@@ -1078,6 +1087,9 @@ struct FaultState {
     /// [`FaultInjector::fail_every_commit`]: every commit fails, whoever is waiting.
     #[cfg(test)]
     every: std::sync::atomic::AtomicBool,
+    /// [`FaultInjector::fail_inside_transaction`].
+    #[cfg(test)]
+    in_tx: std::sync::atomic::AtomicBool,
     /// [`FaultInjector::hold`]: the writer thread waits here, at the top of a turn,
     /// while this is true.
     #[cfg(test)]
@@ -1135,6 +1147,25 @@ impl FaultInjector {
         self.0
             .every
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make every commit fail after its statements have run and before `COMMIT`, so the
+    /// transaction rolls back with work done in it.
+    #[cfg(test)]
+    pub(crate) fn fail_inside_transaction(&self) {
+        self.0
+            .in_tx
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Writer thread: whether to fail inside the open transaction. False in production.
+    fn take_in_tx(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.0.in_tx.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        false
     }
 
     /// Stop the writer thread at the top of its next turn, after it has taken one
@@ -1242,6 +1273,11 @@ fn commit(
         if reopen {
             tx.execute("UPDATE index_meta SET clean_close = 0 WHERE id = 1", [])
                 .map_err(sqlite)?;
+        }
+        if fault.take_in_tx() {
+            return Err(IndexError::Corrupt {
+                message: "simulated failure inside the transaction".to_owned(),
+            });
         }
         // Test seam: hold the batch between its statements and its COMMIT.
         hooks.gate.wait_before_commit();
@@ -1430,6 +1466,39 @@ mod tests {
         assert_eq!(seen[0].ops, 1);
         drop(seen);
         actor.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_batch_rolled_back_after_its_statements_reports_nothing() {
+        // The failure the other two tests cannot reach: it happens inside the open
+        // transaction, after the statements ran. A call placed before COMMIT would
+        // report here.
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        let conn = schema::open(&path).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        let actor = IndexActor::with_options(
+            conn,
+            ActorOptions {
+                commit_observer: Some(CommitObserver::new(move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+                ..ActorOptions::default()
+            },
+        );
+        actor.fault_injector().fail_inside_transaction();
+        let writer = actor.handle();
+        writer.submit(asset("assets/a.pdf")).expect("submit");
+        assert!(writer.flush().is_err());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let reader = schema::open(&path).expect("reader");
+        let rows: i64 = reader
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(rows, 0, "the rolled-back statements were visible");
+        drop(actor);
     }
 
     #[test]

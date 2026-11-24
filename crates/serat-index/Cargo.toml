@@ -16,7 +16,8 @@ serde_json = { workspace = true }
 
 [features]
 # Exposes SearchConn::set_after_prepare so serat-app's command-layer test can hold a
-# search mid-flight. Enabled only from serat-app's [dev-dependencies].
+# search mid-flight, and CommitGate, which holds a writer batch before its COMMIT (task
+# #175). Enabled only from serat-app's [dev-dependencies].
 test-hooks = []
 
 [dev-dependencies]
