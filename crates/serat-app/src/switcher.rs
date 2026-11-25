@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use serat_core::{TreeEntry, TreeKind, TreeOp};
 use serat_index::history::History;
+use serat_index::read::PathResolver;
 use serat_index::switcher::{Corpus, CorpusSource, Hit, Matched};
 use serat_vault::{TreeOut, Vault};
 
@@ -61,6 +62,11 @@ pub const HISTORY_DELAY: Duration = Duration::from_secs(2);
 pub struct TreePaths {
     dirs: Mutex<BTreeMap<String, BTreeSet<String>>>,
     generation: AtomicU64,
+    /// The `resolve_links` tree fallback's resolver and the generation it was built at
+    /// (task #185). Same lifetime as the switcher's tree corpus, so it shares
+    /// `generation` rather than keeping a second counter.
+    resolver: Mutex<Option<(u64, Arc<PathResolver>)>>,
+    resolver_builds: AtomicU64,
 }
 
 impl TreePaths {
@@ -119,6 +125,42 @@ impl TreePaths {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The link resolver over every note path delivered so far, folded once per tree
+    /// generation (task #185). The cache lock is held only to compare and to store,
+    /// never across the fold: a caller that finds the cache stale reads the paths and
+    /// folds on its own thread, so the keystroke path is never queued behind a build.
+    /// Two racing callers may both fold; the newer generation wins the store and both
+    /// answers are correct for the paths each saw.
+    #[must_use]
+    pub fn resolver(&self) -> Arc<PathResolver> {
+        let generation = self.generation();
+        if let Some((have, resolver)) = self
+            .resolver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && *have == generation
+        {
+            return Arc::clone(resolver);
+        }
+        // Generation read before the paths: a change in between only makes the entry
+        // look older than it is, so the next call rebuilds; it can never look newer.
+        let paths = self.note_paths();
+        let built = Arc::new(PathResolver::new(paths.iter().map(String::as_str)));
+        self.resolver_builds.fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.resolver.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.as_ref().is_none_or(|(have, _)| *have < generation) {
+            *cache = Some((generation, Arc::clone(&built)));
+        }
+        built
+    }
+
+    /// Times [`Self::resolver`] folded the paths. Tests.
+    #[must_use]
+    pub fn resolver_builds(&self) -> u64 {
+        self.resolver_builds.load(Ordering::SeqCst)
     }
 
     /// Every note path delivered so far.
@@ -302,6 +344,12 @@ impl Switcher {
     #[must_use]
     pub fn tree_note_paths(&self) -> Vec<String> {
         self.shared.tree.note_paths()
+    }
+
+    /// The tree fallback's link resolver, cached per tree generation.
+    #[must_use]
+    pub fn tree_resolver(&self) -> Arc<PathResolver> {
+        self.shared.tree.resolver()
     }
 
     /// Snapshots built from the index so far. Tests.
@@ -575,6 +623,48 @@ mod tests {
         }));
         assert!(paths.note_paths().is_empty());
         assert!(paths.generation() >= 5);
+    }
+
+    // Task #185: the tree fallback's resolver is folded once per tree generation.
+    #[test]
+    fn the_link_resolver_is_built_once_per_tree_generation() {
+        let paths = TreePaths::default();
+        paths.apply(&listing("", vec![entry("a.md", TreeKind::Note)]));
+        let first = paths.resolver();
+        let second = paths.resolver();
+        assert_eq!(
+            paths.resolver_builds(),
+            1,
+            "an unchanged tree is not re-folded"
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.resolve("a"), Some("a.md"));
+        assert_eq!(first.resolve("b"), None);
+
+        // Every mutation path invalidates: upsert, remove, listing.
+        paths.apply(&TreeOut::Op(TreeOp::Upsert {
+            dir: "sub".to_owned(),
+            entry: entry("b.md", TreeKind::Note),
+            after: None,
+        }));
+        assert_eq!(paths.resolver().resolve("b"), Some("sub/b.md"));
+        assert_eq!(paths.resolver_builds(), 2);
+        let _ = paths.resolver();
+        assert_eq!(paths.resolver_builds(), 2);
+
+        paths.apply(&TreeOut::Op(TreeOp::Remove {
+            dir: "".to_owned(),
+            name: "a.md".to_owned(),
+        }));
+        assert_eq!(paths.resolver().resolve("a"), None);
+        assert_eq!(paths.resolver_builds(), 3);
+
+        paths.apply(&listing("", vec![entry("z.md", TreeKind::Note)]));
+        assert_eq!(paths.resolver().resolve("z"), Some("z.md"));
+        assert_eq!(paths.resolver_builds(), 4);
+
+        // The caller's earlier answer is still valid for what it saw.
+        assert_eq!(first.resolve("a"), Some("a.md"));
     }
 
     /// Hold the line, let queries with the given seqs arrive in order, release, and

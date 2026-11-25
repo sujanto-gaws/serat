@@ -394,7 +394,8 @@ fn subpath_exists(anchors: &serat_index::read::Anchors, subpath: &Subpath<'_>) -
 /// `Ready` index: one R6 statement for the whole batch, plus one R7 per distinct note
 /// that a `#heading` or `^block` subpath must be checked in (`via: Index`). Anything
 /// else, including an index that fails to open or read, answers from the tree's paths
-/// (`via: Tree`, `subpath_found: None`: headings are not known yet). It never waits and
+/// (`via: Tree`, `subpath_found: None`: headings are not known yet), through the
+/// resolver cached per tree generation (task #185: no fold per call). It never waits and
 /// never errors; a write that has committed is seen by the next call because the reader
 /// is opened per call (ADR-0020).
 pub fn resolve_links(
@@ -402,7 +403,7 @@ pub fn resolve_links(
     root: &Path,
     source: &str,
     targets: &[String],
-    tree_paths: impl FnOnce() -> Vec<String>,
+    tree_resolver: impl FnOnce() -> Arc<read::PathResolver>,
 ) -> Vec<LinkResolution> {
     let targets = &targets[..targets.len().min(MAX_LINK_TARGETS)];
     let writtens: Vec<Written<'_>> = targets.iter().map(|t| split_written(t)).collect();
@@ -437,8 +438,7 @@ pub fn resolve_links(
         }
         return out;
     }
-    let tree = tree_paths();
-    let resolver = read::PathResolver::new(tree.iter().map(String::as_str));
+    let resolver = tree_resolver();
     targets
         .iter()
         .zip(&folded)

@@ -1739,7 +1739,7 @@ impl AppState {
             &root,
             &args.source_path,
             &args.targets,
-            || switcher.tree_note_paths(),
+            || switcher.tree_resolver(),
         ))
     }
 
@@ -7173,8 +7173,7 @@ mod tests {
             let from_tree = serat_index::read::resolve_among_paths(
                 paths.iter().copied(),
                 &serat_core::fold_case(target),
-            )
-            .map(str::to_owned);
+            );
             assert_eq!(from_tree, from_index, "target {target:?}");
         }
         state.close_vault();
@@ -7188,7 +7187,12 @@ mod tests {
             std::path::Path::new("/nonexistent-vault-root"),
             "Target.md",
             &["target#Heading".to_owned(), "gone".to_owned()],
-            || vec!["Target.md".to_owned(), "x/Other.md".to_owned()],
+            || {
+                std::sync::Arc::new(serat_index::read::PathResolver::new([
+                    "Target.md",
+                    "x/Other.md",
+                ]))
+            },
         );
         assert_eq!(answers[0].path.as_deref(), Some("Target.md"));
         assert_eq!(answers[0].subpath_found, None);
@@ -7207,7 +7211,7 @@ mod tests {
             std::path::Path::new("/nonexistent-vault-root"),
             "a.md",
             &targets,
-            Vec::new,
+            std::sync::Arc::default,
         );
         assert_eq!(answers.len(), crate::reads::MAX_LINK_TARGETS);
     }
