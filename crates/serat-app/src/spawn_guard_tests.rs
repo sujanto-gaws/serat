@@ -7,13 +7,20 @@
 //! `writer_lock` flake of task #182). `crates/serat-app/tests/*.rs` are separate test binaries that
 //! do not link this one, so they may spawn; this guard covers `src/**` only (all lib tests live
 //! there, as `tests.rs` files and `#[cfg(test)]` modules).
+//!
+//! Known limits of the scan, accepted as low risk: it is line-based, so a `//` inside a string
+//! literal (`"http://x"`) hides the rest of that line, and a spawn inside a `/* */` block comment
+//! is still reported (a false alarm, never a miss) while one on a line that starts after `//` text
+//! in a string is missed.
 
 use std::path::{Path, PathBuf};
 
-/// `(path relative to crates/serat-app, reason)`. Expected to hold only what cannot run beside a
-/// lock-holding test on the platform that has the locks.
-const ALLOW: &[(&str, &str)] = &[(
+/// `(path relative to crates/serat-app, substring a spawn line in that file must contain, reason)`.
+/// Only a line containing the substring is exempt; any other spawn in the file is still reported,
+/// so a unix spawn re-added to the file #189 fixed is caught.
+const ALLOW: &[(&str, &str, &str)] = &[(
     "src/asset/tests.rs",
+    "Command::new(\"cmd\")",
     "`junction` runs `cmd /C mklink /J` inside a #[cfg(windows)] module; it is not compiled on unix, \
      where the fork hazard exists, and Windows locks are LockFileEx on non-inheritable handles",
 )];
@@ -52,13 +59,13 @@ fn offenders(root: &Path) -> Vec<String> {
             .expect("under root")
             .to_string_lossy()
             .replace('\\', "/");
-        if ALLOW.iter().any(|(a, _)| *a == rel) {
-            continue;
-        }
         let text = std::fs::read_to_string(&f).expect("read");
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            if needles().iter().any(|p| code.contains(p.as_str())) {
+            let allowed = ALLOW
+                .iter()
+                .any(|(a, sub, _)| *a == rel && code.contains(sub));
+            if !allowed && needles().iter().any(|p| code.contains(p.as_str())) {
                 bad.push(format!("{rel}:{}: {}", n + 1, line.trim()));
             }
         }
@@ -79,14 +86,14 @@ fn no_lib_test_spawns_a_process_beside_lock_holding_tests() {
 }
 
 #[test]
-fn the_allow_list_names_only_files_that_still_spawn() {
+fn the_allow_list_names_only_spawns_that_still_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (rel, reason) in ALLOW {
+    for (rel, sub, reason) in ALLOW {
         assert!(!reason.is_empty());
         let text = std::fs::read_to_string(root.join(rel)).expect("allow-listed file exists");
         assert!(
-            needles().iter().any(|p| text.contains(p.as_str())),
-            "{rel} no longer spawns; drop it from ALLOW"
+            text.contains(sub),
+            "{rel} no longer contains `{sub}`; drop it from ALLOW"
         );
     }
 }

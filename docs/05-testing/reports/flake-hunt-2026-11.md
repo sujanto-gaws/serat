@@ -58,7 +58,7 @@ Proved outside the repo with a 30-line program (`pre_exec` parks the child befor
 
 **Mutant.** The fence's sole job is ordering, so its mutant is the baseline: removing it is the 3 in 60. 0 in 60 with it is weak by itself (a 5 percent rate gives zero in 60 about 5 percent of the time); the pre-exec program is the stronger evidence of cause.
 
-**Hazard noted; closed by #189.** `crates/serat-app/src/asset/tests.rs:796` spawns `mkfifo` inside the serat-app lib test binary, in which other tests hold and release index locks (`held_lock_tests.rs` asserts on exactly that). It has not failed in 20 baseline runs plus 10 after; it is the same hazard and the same fence would close it. Closed by #189: the test now creates the FIFO in-process (`rustix::fs::mknodat`, `FileType::Fifo`; `libc::mkfifo` is unsafe and the workspace forbids `unsafe_code`), so no fork happens, and `spawn_guard_tests.rs` fails any spawn re-added under `crates/serat-app/src` (TC-169).
+**Hazard noted; closed by #189.** `crates/serat-app/src/asset/tests.rs:796` spawns `mkfifo` inside the serat-app lib test binary, in which other tests hold and release index locks (`held_lock_tests.rs` asserts on exactly that). It has not failed in 20 baseline runs plus 10 after; it is the same hazard and the same fence would close it. Closed by #189: the test now creates the FIFO in-process (`nix::unistd::mkfifo`; `libc::mkfifo` is unsafe and the workspace forbids `unsafe_code`), so no fork happens, and `spawn_guard_tests.rs` fails any spawn re-added under `crates/serat-app/src` (TC-169).
 
 ## Sighting 2: `a_deleted_refused_file_leaves_the_list_only_at_the_next_walk`
 
