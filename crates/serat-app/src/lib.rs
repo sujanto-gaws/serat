@@ -445,6 +445,7 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 &state.startup,
                 state.boot.trace.is_some(),
                 std::env::var(startup::DEADLINE_ENV).ok().as_deref(),
+                |line| eprintln!("{line}"),
                 || tauri::webview_version().map_err(|err| err.to_string()),
             );
             let handle = app.handle().clone();

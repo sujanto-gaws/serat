@@ -660,15 +660,19 @@ impl Startup {
     /// One line naming every mark as set or missing, for a launch that never reported a
     /// first painted frame (task #178, NFR-PRF-01, NFR-PRF-08).
     ///
-    /// `main` is always set (the timeline starts in it). The four marks after
-    /// `window_visible` are the preconditions of `vault_usable` (ADR-0014 as amended by
-    /// ADR-0015 section 5), so a run that painted but never settled says which one is
-    /// absent. `vault_usable` is derived, set only when all of them are.
+    /// `main` is always set (the timeline starts in it). `tree_first_screen`,
+    /// `index_settled` and `watcher` are the preconditions of `vault_usable` besides the
+    /// paint (ADR-0014 as amended by ADR-0015 section 5); `buffer_rendered` is still
+    /// recorded but no longer a term (task #141). `walk_complete` is reported, not a
+    /// term: the walk waits on the first paint, so it says whether that gate timed out.
+    /// `vault_usable` is derived, set only when all its terms are. The watchdog prints
+    /// this only while `window_visible` is unmarked, so it describes a launch that never
+    /// painted, not one that painted and never settled.
     #[must_use]
     pub fn marks_snapshot_line(&self) -> String {
         let elapsed = self.elapsed_ms();
         let marks = self.lock();
-        let table: [(&str, bool); 11] = [
+        let table: [(&str, bool); 12] = [
             ("main", true),
             ("state_ready", marks.state_ready.is_some()),
             ("runtime_ready", marks.runtime_ready.is_some()),
@@ -679,6 +683,7 @@ impl Startup {
             ("tree_first_screen", marks.tree_first_screen.is_some()),
             ("index_settled", marks.index_settled.is_some()),
             ("watcher", marks.watcher.is_some()),
+            ("walk_complete", marks.walk_complete.is_some()),
             ("vault_usable", marks.vault_usable().is_some()),
         ];
         drop(marks);
@@ -697,13 +702,16 @@ impl Startup {
         )
     }
 
-    /// Start the diagnostic watchdog: if `window_visible` has not been marked within
-    /// `deadline`, call `report` once with [`Startup::marks_snapshot_line`]. It only
-    /// reports; it never exits the process or changes any mark.
+    /// Start the diagnostic thread: if `window_visible` has not been marked within
+    /// `deadline`, call `emit` once with [`Startup::marks_snapshot_line`]; then, either
+    /// way, call `emit` once with the web view runtime line from `version`. The query
+    /// runs here, after the paint or the deadline, so it never competes with the cold
+    /// start (it would otherwise sit inside `S_setup`). It only reports; it never exits
+    /// the process or changes any mark.
     ///
     /// The thread sleeps on the same condvar `mark_first_paint` signals, so it costs
-    /// nothing while waiting and ends as soon as the paint lands. The join handle yields
-    /// whether it fired. Callers start it only when [`TRACE_ENV`] is set.
+    /// nothing while waiting. The join handle yields whether the deadline fired. Callers
+    /// start it only when [`TRACE_ENV`] is set; its one remaining cost is this spawn.
     ///
     /// # Errors
     ///
@@ -711,7 +719,8 @@ impl Startup {
     pub fn spawn_watchdog(
         self: &Arc<Self>,
         deadline: Duration,
-        report: impl Fn(&str) + Send + 'static,
+        emit: impl Fn(&str) + Send + 'static,
+        version: impl FnOnce() -> Result<String, String> + Send + 'static,
     ) -> std::io::Result<std::thread::JoinHandle<bool>> {
         let startup = Arc::clone(self);
         std::thread::Builder::new()
@@ -719,11 +728,11 @@ impl Startup {
             .spawn(move || {
                 let limit = Instant::now() + deadline;
                 let mut marks = startup.lock();
+                let mut fired = false;
                 while marks.window_visible.is_none() {
                     let Some(remaining) = limit.checked_duration_since(Instant::now()) else {
-                        drop(marks);
-                        report(&startup.marks_snapshot_line());
-                        return true;
+                        fired = true;
+                        break;
                     };
                     marks = startup
                         .usable
@@ -731,7 +740,12 @@ impl Startup {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .0;
                 }
-                false
+                drop(marks);
+                if fired {
+                    emit(&startup.marks_snapshot_line());
+                }
+                emit(&webview_version_line(version()));
+                fired
             })
     }
 }
@@ -774,24 +788,27 @@ pub fn report_rejection(sink: &dyn Fn(&str), elapsed_ms: f64, rejected: &PaintEv
 }
 
 /// Everything #178 adds, behind [`TRACE_ENV`]: the watchdog on [`DEADLINE_ENV`] and the
-/// runtime version line. Returns without starting a thread when `trace_enabled` is
-/// false. `version` runs on its own thread, off the cold-start path.
+/// runtime version line, on one thread. Returns `None` without starting anything when
+/// `trace_enabled` is false. The deadline is not clamped to `--ready-timeout-ms`: a run
+/// that lowers that to 55 s or less must set [`DEADLINE_ENV`] below it too, or the app
+/// exits before the snapshot prints.
 pub fn start_trace_diagnostics(
     startup: &Arc<Startup>,
     trace_enabled: bool,
     deadline_env: Option<&str>,
+    emit: impl Fn(&str) + Send + 'static,
     version: impl FnOnce() -> Result<String, String> + Send + 'static,
-) {
+) -> Option<std::thread::JoinHandle<bool>> {
     if !trace_enabled {
-        return;
+        return None;
     }
-    let deadline = deadline_from(deadline_env);
-    if let Err(err) = startup.spawn_watchdog(deadline, |line| eprintln!("{line}")) {
-        eprintln!("serat: startup watchdog could not start: {err}");
+    match startup.spawn_watchdog(deadline_from(deadline_env), emit, version) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!("serat: startup watchdog could not start: {err}");
+            None
+        }
     }
-    let _ = std::thread::Builder::new()
-        .name("serat-webview-version".to_owned())
-        .spawn(move || eprintln!("{}", webview_version_line(version())));
 }
 
 /// What "vault usable" means in this build, carried in the trace so a gate report
@@ -1191,6 +1208,7 @@ mod tests {
             "tree_first_screen",
             "index_settled",
             "watcher",
+            "walk_complete",
             "vault_usable",
         ];
         for name in all {
@@ -1231,49 +1249,78 @@ mod tests {
         startup.mark_runtime_ready();
         startup.mark_setup_done();
         complete(&startup);
+        startup.mark_walk_complete(0);
         let line = startup.marks_snapshot_line();
         assert!(line.ends_with("missing=[]"), "{line}");
+    }
+
+    type Lines = Arc<Mutex<Vec<String>>>;
+
+    fn collector() -> (Lines, impl Fn(&str) + Send + 'static) {
+        let lines: Lines = Arc::default();
+        let sink = Arc::clone(&lines);
+        (lines, move |l: &str| {
+            sink.lock().unwrap().push(l.to_owned())
+        })
     }
 
     #[test]
     fn the_watchdog_fires_once_when_the_shell_never_paints() {
         let startup = Arc::new(in_process());
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&lines);
+        let (lines, emit) = collector();
         let fired = startup
-            .spawn_watchdog(Duration::from_millis(30), move |l| {
-                sink.lock().unwrap().push(l.to_owned());
-            })
+            .spawn_watchdog(Duration::from_millis(30), emit, || Ok("1.2.3".to_owned()))
             .expect("spawn")
             .join()
             .expect("no panic");
         assert!(fired);
         let lines = lines.lock().unwrap();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("window_visible"), "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("serat: startup marks after "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("missing=[") && lines[0].contains("window_visible"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "serat: webview runtime 1.2.3");
     }
 
     #[test]
     fn the_watchdog_stays_silent_when_the_paint_lands_before_the_deadline() {
         let startup = Arc::new(in_process());
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&lines);
+        let (lines, emit) = collector();
         let handle = startup
-            .spawn_watchdog(Duration::from_secs(5), move |l| {
-                sink.lock().unwrap().push(l.to_owned());
-            })
+            .spawn_watchdog(Duration::from_secs(5), emit, || Ok("1.2.3".to_owned()))
             .expect("spawn");
         startup.mark_window_created();
         startup.mark_first_paint(FCP_MS, RAF2_MS).expect("valid");
         assert!(!handle.join().expect("no panic"), "must not fire");
-        assert!(lines.lock().unwrap().is_empty());
+        let lines = lines.lock().unwrap();
+        assert_eq!(*lines, ["serat: webview runtime 1.2.3"], "no snapshot line");
     }
 
     #[test]
-    fn the_watchdog_is_inert_without_the_trace_env() {
+    fn diagnostics_spawn_nothing_without_the_trace_env() {
         let startup = Arc::new(in_process());
-        // Returns without spawning: nothing observable to wait on, and no panic.
-        start_trace_diagnostics(&startup, false, Some("1"), || panic!("must not run"));
+        let spawned = start_trace_diagnostics(
+            &startup,
+            false,
+            Some("1"),
+            |_| panic!("must not emit"),
+            || panic!("must not query"),
+        );
+        assert!(spawned.is_none(), "no thread without the trace env");
+        let (_lines, emit) = collector();
+        let spawned =
+            start_trace_diagnostics(&startup, true, Some("1"), emit, || Ok(String::new()));
+        assert!(
+            spawned
+                .expect("armed under the env")
+                .join()
+                .expect("no panic")
+        );
     }
 
     #[test]
