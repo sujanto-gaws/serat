@@ -834,7 +834,7 @@ fn report(
     if let Some((stats, pinned, secs)) = ck_stats {
         let overlapped = recs.iter().filter(|r| r.ckpt_overlap).count();
         println!(
-            "checkpointer (its own thread): {} PASSIVE runs · {} incomplete · {} RESTART · longest {:.1} ms · mean {:.1} ms · saves with a checkpoint in progress at their start or end: {overlapped} of {n} · index WAL pinned: {} · {:.1} checkpoints per minute · {:.0} frames per checkpoint (mean) · idle spacing {} s",
+            "checkpointer (its own thread): {} PASSIVE runs · {} incomplete · {} RESTART · longest {:.1} ms · mean {:.1} ms · saves with a checkpoint in progress at their start or end: {overlapped} of {n} · index WAL pinned: {} · {:.1} checkpoints per minute · {:.0} frames per checkpoint (mean) · {} idle / {} size-bound · {:.0} frames per idle run · {} idle wake-ups skipped below the {}-frame floor · idle spacing {} s",
             stats.passive_runs,
             stats.incomplete,
             stats.restart_runs,
@@ -843,6 +843,11 @@ fn report(
             pinned.map_or("no".to_owned(), |b| format!("{b} B")),
             stats.passive_runs as f64 / (secs / 60.0).max(f64::EPSILON),
             stats.frames_checkpointed as f64 / stats.passive_runs.max(1) as f64,
+            stats.idle_runs,
+            stats.size_runs,
+            stats.idle_frames as f64 / stats.idle_runs.max(1) as f64,
+            stats.floor_skips,
+            serat_index::Bounds::default().idle_floor_frames,
             serat_index::Bounds::default().idle_spacing.as_secs(),
         );
     }

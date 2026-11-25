@@ -37,10 +37,68 @@ pub struct SaveTag {
     pub ms: f64,
     /// A checkpoint overlapped the window.
     pub checkpoint: bool,
+    /// Which kind of run it was (task #199); [`CkKind::Unknown`] when it overlapped but
+    /// the report did not say, [`CkKind::No`] when none did.
+    pub kind: CkKind,
     /// An FTS5 merge landed in the window.
     pub merge: bool,
     /// A writer turn of 50 ms or more overlapped the window.
     pub slow_commit: bool,
+}
+
+/// Which trigger the overlapping checkpoint run had (task #199). Reported only: an idle
+/// run overlapping a save is a defect of the idle path; a size-bound one goes to the
+/// architect (ADR-0019, report-only tags).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CkKind {
+    /// No checkpoint overlapped.
+    No,
+    /// The idle gate (or the pinned `RESTART`).
+    Idle,
+    /// The 4,000-frame size bound.
+    SizeBound,
+    /// One overlapped but its kind is not known (an older binary, or it ended between
+    /// two reads).
+    Unknown,
+}
+
+impl CkKind {
+    /// `no`, `idle`, `size-bound` or `yes`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Idle => "idle",
+            Self::SizeBound => "size-bound",
+            Self::Unknown => "yes",
+        }
+    }
+
+    /// The kind a report's word names for an entry whose overlap flag is `overlapped`.
+    /// A word outside the four, or one that contradicts the flag (a kind with no overlap, `no` with one), is an error.
+    ///
+    /// # Errors
+    ///
+    /// The word is unknown or contradicts the overlap entry.
+    pub fn parse(word: &str, overlapped: bool) -> Result<Self, String> {
+        let kind = match word {
+            "no" => Self::No,
+            "yes" => Self::Unknown,
+            "idle" => Self::Idle,
+            "size-bound" => Self::SizeBound,
+            other => {
+                return Err(format!(
+                    "the save benchmark report's save_checkpoint_kind has {other:?}, not idle, size-bound, no or yes"
+                ));
+            }
+        };
+        if (kind != Self::No) != overlapped {
+            return Err(format!(
+                "the save benchmark report's save_checkpoint_kind {word:?} contradicts its save_checkpoint_overlap entry ({overlapped})"
+            ));
+        }
+        Ok(kind)
+    }
 }
 
 impl SaveTag {
@@ -50,12 +108,12 @@ impl SaveTag {
         !(self.checkpoint || self.merge || self.slow_commit)
     }
 
-    /// `checkpoint merge slow-commit`, each present or `-`.
+    /// `checkpoint=idle|size-bound|yes|no merge slow-commit`, each yes or no.
     #[must_use]
     pub fn label(&self) -> String {
         format!(
             "checkpoint={} merge={} slow-commit={}",
-            yes(self.checkpoint),
+            self.kind.label(),
             yes(self.merge),
             yes(self.slow_commit)
         )
@@ -141,6 +199,8 @@ pub struct SaveTags {
     pub deferred_busy: u64,
     /// PASSIVE plus RESTART checkpoint runs, over the run.
     pub checkpointer_runs: u64,
+    /// Idle wake-ups the frame floor skipped, over the run.
+    pub floor_skips: u64,
 }
 
 impl SaveTags {
@@ -165,6 +225,18 @@ impl SaveTags {
                 index: i,
                 ms: trace.submitted_ms[i],
                 checkpoint: trace.checkpoint_overlap[i],
+                // Validated by `SaveBenchmarkTrace::parse`; a hand-built trace that
+                // contradicts itself falls back to the flag alone.
+                kind: {
+                    let flag_only = if trace.checkpoint_overlap[i] {
+                        CkKind::Unknown
+                    } else {
+                        CkKind::No
+                    };
+                    trace.checkpoint_kind.get(i).map_or(flag_only, |word| {
+                        CkKind::parse(word, trace.checkpoint_overlap[i]).unwrap_or(flag_only)
+                    })
+                },
                 merge: trace.fts_merge[i],
                 slow_commit: trace.slow_commit[i],
             })
@@ -174,6 +246,7 @@ impl SaveTags {
             probe_failures: trace.flag_probe_failures,
             deferred_busy: trace.checkpointer_deferred_busy,
             checkpointer_runs: trace.checkpointer_runs,
+            floor_skips: trace.checkpointer_floor_skips,
         })
     }
 
@@ -221,8 +294,8 @@ impl SaveTags {
             ));
         }
         lines.push(format!(
-            "  tag source  {} checkpoint runs, {} idle starts deferred to work in flight, {} FTS5 probe failures",
-            self.checkpointer_runs, self.deferred_busy, self.probe_failures
+            "  tag source  {} checkpoint runs, {} idle starts deferred to work in flight, {} idle wake-ups skipped below the frame floor, {} FTS5 probe failures",
+            self.checkpointer_runs, self.deferred_busy, self.floor_skips, self.probe_failures
         ));
         let over = self.over_limit(limit_ms);
         if over.is_empty() {
@@ -232,10 +305,12 @@ impl SaveTags {
             ));
         } else {
             lines.push(format!(
-                "  over limit  {} of {} samples above {limit_ms:.1} ms; with checkpoint {}, with merge {}, with slow commit {}, with none of the three {}",
+                "  over limit  {} of {} samples above {limit_ms:.1} ms; with checkpoint {} (idle {}, size-bound {}), with merge {}, with slow commit {}, with none of the three {}",
                 over.len(),
                 self.rows.len(),
                 over.iter().filter(|r| r.checkpoint).count(),
+                over.iter().filter(|r| r.kind == CkKind::Idle).count(),
+                over.iter().filter(|r| r.kind == CkKind::SizeBound).count(),
                 over.iter().filter(|r| r.merge).count(),
                 over.iter().filter(|r| r.slow_commit).count(),
                 over.iter().filter(|r| r.untagged()).count(),
@@ -262,6 +337,7 @@ impl SaveTags {
         let _ = writeln!(s, "    \"probe_failures\": {},", self.probe_failures);
         let _ = writeln!(s, "    \"checkpointer_runs\": {},", self.checkpointer_runs);
         let _ = writeln!(s, "    \"deferred_busy\": {},", self.deferred_busy);
+        let _ = writeln!(s, "    \"floor_skips\": {},", self.floor_skips);
         let _ = writeln!(s, "    \"split\": {{");
         let num = |v: Option<f64>| v.map_or("null".to_owned(), |v| format!("{v:.3}"));
         for (i, flag) in Flag::ALL.iter().enumerate() {
@@ -283,10 +359,11 @@ impl SaveTags {
         for (i, row) in over.iter().enumerate() {
             let _ = writeln!(
                 s,
-                "      {{ \"index\": {}, \"ms\": {:.3}, \"checkpoint_overlap\": {}, \"fts_merge\": {}, \"slow_commit\": {} }}{}",
+                "      {{ \"index\": {}, \"ms\": {:.3}, \"checkpoint_overlap\": {}, \"checkpoint_kind\": \"{}\", \"fts_merge\": {}, \"slow_commit\": {} }}{}",
                 row.index,
                 row.ms,
                 row.checkpoint,
+                row.kind.label(),
                 row.merge,
                 row.slow_commit,
                 if i + 1 == over.len() { "" } else { "," }
@@ -307,6 +384,11 @@ mod tests {
             index,
             ms,
             checkpoint,
+            kind: if checkpoint {
+                CkKind::Unknown
+            } else {
+                CkKind::No
+            },
             merge,
             slow_commit,
         }
@@ -318,6 +400,7 @@ mod tests {
             probe_failures: 0,
             deferred_busy: 0,
             checkpointer_runs: 0,
+            floor_skips: 0,
         }
     }
 
@@ -363,7 +446,7 @@ mod tests {
         assert!(text.contains("3 of 5 samples above 50.0 ms"), "{text}");
         assert!(
             text.contains(
-                "with checkpoint 1, with merge 1, with slow commit 1, with none of the three 1"
+                "with checkpoint 1 (idle 0, size-bound 0), with merge 1, with slow commit 1, with none of the three 1"
             ),
             "{text}"
         );
@@ -379,6 +462,59 @@ mod tests {
         assert!(
             text.contains("sample    4") && text.contains("checkpoint=yes merge=no slow-commit=no"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_tag_names_the_kind_of_the_overlapping_run_and_decides_nothing() {
+        // Task #199 (ADR-0019, report-only): `checkpoint=idle|size-bound|no`; the split and
+        // the over-limit counts are by overlap, whatever the kind.
+        let mut idle = tag(0, 80.0, true, false, false);
+        idle.kind = CkKind::Idle;
+        let mut size = tag(1, 90.0, true, false, false);
+        size.kind = CkKind::SizeBound;
+        let t = tags(vec![idle, size, tag(2, 10.0, false, false, false)]);
+        let text = t.describe(50.0).join("\n");
+        assert!(
+            text.contains("with checkpoint 2 (idle 1, size-bound 1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sample    0") && text.contains("checkpoint=idle merge=no"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sample    1") && text.contains("checkpoint=size-bound merge=no"),
+            "{text}"
+        );
+        assert!(
+            t.to_json(50.0)
+                .contains("\"checkpoint_kind\": \"size-bound\"")
+        );
+        assert_eq!(
+            t.split(Flag::Checkpoint).with_n,
+            2,
+            "overlap decides the split"
+        );
+        // From a trace: kinds pair with samples; an older binary's report has none.
+        let mut trace = SaveBenchmarkTrace {
+            attempted: 2,
+            submitted_ms: vec![1.0, 2.0],
+            checkpoint_overlap: vec![true, true],
+            fts_merge: vec![false, false],
+            slow_commit: vec![false, false],
+            ..SaveBenchmarkTrace::default()
+        };
+        let old = SaveTags::from_trace(&trace).expect("complete");
+        assert_eq!(
+            (old.rows[0].kind, old.rows[1].kind),
+            (CkKind::Unknown, CkKind::Unknown)
+        );
+        trace.checkpoint_kind = vec!["idle".to_owned(), "size-bound".to_owned()];
+        let new = SaveTags::from_trace(&trace).expect("complete");
+        assert_eq!(
+            (new.rows[0].kind, new.rows[1].kind),
+            (CkKind::Idle, CkKind::SizeBound)
         );
     }
 
@@ -408,7 +544,7 @@ mod tests {
             json.contains("\"checkpoint_overlap\": { \"with_n\": 1, \"with_p95_ms\": 80.000"),
             "{json}"
         );
-        assert!(json.contains("{ \"index\": 1, \"ms\": 80.000, \"checkpoint_overlap\": true, \"fts_merge\": false, \"slow_commit\": true }"), "{json}");
+        assert!(json.contains("{ \"index\": 1, \"ms\": 80.000, \"checkpoint_overlap\": true, \"checkpoint_kind\": \"yes\", \"fts_merge\": false, \"slow_commit\": true }"), "{json}");
         // Valid as an object member: braces balance and the member ends in a comma.
         assert_eq!(json.matches('{').count(), json.matches('}').count());
         assert!(json.trim_end().ends_with("},"));

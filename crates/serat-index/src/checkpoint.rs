@@ -13,6 +13,15 @@
 //! * **Idle gate.** [`Bounds::idle`] (250 ms) after the writer's last commit. The writer
 //!   signals every commit from its WAL hook; the hook sends one channel message and
 //!   returns, so the writer never waits for a checkpoint.
+//! * **Frame floor** (task #199, architecture §3.1.1 N8). An idle `PASSIVE` (and the
+//!   idle-only pinned `RESTART`) runs only once the WAL has grown by
+//!   [`Bounds::idle_floor_frames`] ([`IDLE_FLOOR_FRAMES`], 1,000) since the last
+//!   `PASSIVE` that ran, idle or size-bound: the same baseline the size bound counts
+//!   from. A run's cost is its two flushes, not its frames, so a run that moves a few
+//!   commits is mostly flush. A deferral to work in flight does not move the baseline.
+//!   A wake below the floor counts [`CheckpointStats::floor_skips`] and **disarms** the
+//!   idle timer until the next commit, so nothing spins. The size bound is never
+//!   floored, and `close()`'s `TRUNCATE` is not this thread's.
 //! * **Size bound.** When the WAL has grown by [`Bounds::size_frames`] (4,000) frames
 //!   since the last attempt, whether or not the writer ever pauses: a rebuild, a git
 //!   checkout.
@@ -46,7 +55,7 @@
 //! and on every further 4,000 frames of growth.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -65,6 +74,10 @@ pub const HARD_BOUND_BYTES: u64 = 64 * 1024 * 1024;
 /// it waits, so a save arriving at that moment waits about this plus the checkpoint's
 /// own work (a probe measured 56.8 ms).
 pub const RESTART_BUSY: Duration = Duration::from_millis(50);
+/// The frames the WAL must have grown by since the last `PASSIVE` before an idle one
+/// runs (task #198 ruling, #199): the batch the auto-checkpoint gave before #56, a
+/// quarter of the size bound, above one hub save (682 frames).
+pub const IDLE_FLOOR_FRAMES: i32 = 1_000;
 /// The least time between two idle checkpoints (architect ruling, #59): typing with
 /// pauses over 250 ms would otherwise checkpoint after every save, two fsyncs each. The
 /// size bound and the pinned `RESTART` are not spaced.
@@ -96,6 +109,9 @@ pub struct Bounds {
     /// the checkpoint is re-armed for the previous idle one plus this, and runs then if
     /// the writer is still idle.
     pub idle_spacing: Duration,
+    /// WAL growth since the last `PASSIVE` below which an idle wake does nothing and
+    /// waits for the next commit. 0 turns the floor off.
+    pub idle_floor_frames: i32,
 }
 
 impl Default for Bounds {
@@ -106,6 +122,7 @@ impl Default for Bounds {
             hard_bytes: HARD_BOUND_BYTES,
             retry: RETRY_AFTER_INCOMPLETE,
             idle_spacing: IDLE_SPACING,
+            idle_floor_frames: IDLE_FLOOR_FRAMES,
         }
     }
 }
@@ -131,6 +148,73 @@ pub struct CheckpointStats {
     /// Idle wake-ups deferred because the writer or an `index_paths` round was in flight
     /// (including ones where only the pinned `RESTART` was due).
     pub deferred_busy: u64,
+    /// Of `passive_runs`, how many were idle (the rest were the size bound).
+    pub idle_runs: u64,
+    /// Of `passive_runs`, how many were the size bound.
+    pub size_runs: u64,
+    /// Frames moved by the idle `PASSIVE` runs alone (task #199: frames per idle run).
+    pub idle_frames: u64,
+    /// Idle wake-ups below the frame floor that did nothing (task #199).
+    pub floor_skips: u64,
+}
+
+/// Which trigger started a checkpoint run (task #199): the bench tags report it, because
+/// an idle run overlapping a save is a defect of the idle path and a size-bound one is
+/// an architect matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// The idle gate: an idle `PASSIVE`, or the pinned `RESTART` (idle only).
+    Idle,
+    /// The size bound.
+    SizeBound,
+}
+
+impl RunKind {
+    /// `idle` or `size-bound`, as the tag line prints it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::SizeBound => "size-bound",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Idle => 1,
+            Self::SizeBound => 2,
+        }
+    }
+}
+
+/// Which kind of checkpoint run overlapped a window: one was running when it opened or
+/// closed (`running_*`), or the run counters moved between (`before`, `after`). Idle wins
+/// when both kinds are seen (the pinned `RESTART` counts as idle). Pure, so the harness
+/// and the tests share it.
+#[must_use]
+pub fn overlap_kind(
+    running_at_start: Option<RunKind>,
+    running_at_end: Option<RunKind>,
+    before: &CheckpointStats,
+    after: &CheckpointStats,
+) -> Option<RunKind> {
+    let idle = after.idle_runs + after.restart_runs != before.idle_runs + before.restart_runs;
+    let size = after.size_runs != before.size_runs;
+    let seen = |kind: RunKind| {
+        running_at_start == Some(kind)
+            || running_at_end == Some(kind)
+            || match kind {
+                RunKind::Idle => idle,
+                RunKind::SizeBound => size,
+            }
+    };
+    if seen(RunKind::Idle) {
+        Some(RunKind::Idle)
+    } else if seen(RunKind::SizeBound) {
+        Some(RunKind::SizeBound)
+    } else {
+        None
+    }
 }
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -143,7 +227,8 @@ type Notify = Arc<dyn Fn() + Send + Sync>;
 pub struct WalHealth {
     /// 0 = not pinned.
     pinned_bytes: AtomicU64,
-    running: AtomicBool,
+    /// 0 = none; else [`RunKind::code`] of the run in progress.
+    running: AtomicU8,
     /// The WAL hook could not be installed (rusqlite 0.41.1: out of memory only), so
     /// the writer fell back to SQLite's own auto-checkpoint.
     hook_install_failed: AtomicBool,
@@ -157,6 +242,10 @@ pub struct WalHealth {
     /// Live [`BusyGuard`]s: writer turns and reconcile rounds in flight.
     busy: AtomicUsize,
     deferred_busy: AtomicU64,
+    idle_runs: AtomicU64,
+    size_runs: AtomicU64,
+    idle_frames: AtomicU64,
+    floor_skips: AtomicU64,
     /// Finished [`BusyGuard`] turns that lasted at least [`SLOW_TURN`], oldest first,
     /// capped at [`SLOW_TURNS_KEPT`] (task #196). Written only when a slow turn ends.
     slow_turns: Mutex<Vec<(Instant, Instant)>>,
@@ -194,7 +283,17 @@ impl WalHealth {
     /// Whether a checkpoint is running right now.
     #[must_use]
     pub fn checkpoint_in_progress(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.running.load(Ordering::Relaxed) != 0
+    }
+
+    /// The trigger of the checkpoint running right now, if one is.
+    #[must_use]
+    pub fn checkpoint_kind_running(&self) -> Option<RunKind> {
+        match self.running.load(Ordering::Relaxed) {
+            1 => Some(RunKind::Idle),
+            2 => Some(RunKind::SizeBound),
+            _ => None,
+        }
     }
 
     /// Counters since the checkpointer started.
@@ -209,6 +308,10 @@ impl WalHealth {
             frames_checkpointed: self.frames_checkpointed.load(Ordering::Relaxed),
             idle_min_gap_micros: self.idle_min_gap_micros.load(Ordering::Relaxed),
             deferred_busy: self.deferred_busy.load(Ordering::Relaxed),
+            idle_runs: self.idle_runs.load(Ordering::Relaxed),
+            size_runs: self.size_runs.load(Ordering::Relaxed),
+            idle_frames: self.idle_frames.load(Ordering::Relaxed),
+            floor_skips: self.floor_skips.load(Ordering::Relaxed),
         }
     }
 
@@ -309,7 +412,11 @@ impl WalHealth {
         }
     }
 
-    fn record_passive(&self, took: Duration, complete: bool) {
+    fn record_passive(&self, took: Duration, complete: bool, kind: RunKind) {
+        match kind {
+            RunKind::Idle => self.idle_runs.fetch_add(1, Ordering::Relaxed),
+            RunKind::SizeBound => self.size_runs.fetch_add(1, Ordering::Relaxed),
+        };
         let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
         self.passive_runs.fetch_add(1, Ordering::Relaxed);
         self.passive_total_micros
@@ -512,6 +619,9 @@ struct State {
     last_idle: Option<Instant>,
     /// Frames backfilled as of the last result, to count what each run moved.
     prev_done: i64,
+    /// An idle wake found the WAL below the frame floor: nothing is due until the next
+    /// commit (task #199), or the timer would spin.
+    disarmed: bool,
 }
 
 impl State {
@@ -537,6 +647,9 @@ impl State {
     /// When the next idle action is due, if any: the `PASSIVE` (spaced) or the pinned
     /// `RESTART` (the idle gate only).
     fn due(&self, bounds: Bounds, pinned: bool) -> Option<Instant> {
+        if self.disarmed {
+            return None;
+        }
         let passive = self.dirty.then(|| self.passive_at(bounds));
         let restart = (pinned && !self.restart_spent).then(|| self.idle_base() + bounds.idle);
         match (passive, restart) {
@@ -563,6 +676,7 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
         restart_spent: false,
         last_idle: None,
         prev_done: 0,
+        disarmed: false,
     };
     loop {
         let pinned = health.pinned_bytes().is_some();
@@ -582,6 +696,7 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
             Some(Msg::Commit { frames }) => {
                 state.last_commit = Instant::now();
                 state.dirty = true;
+                state.disarmed = false;
                 if frames < state.base {
                     // The writer reset the WAL; count growth from its start again.
                     state.base = 0;
@@ -615,6 +730,19 @@ fn attempt(
         Some(TransactionState::None),
         "the checkpointer connection must never be inside a transaction"
     );
+    // Not while the WAL is reported pinned (architect, #199): the idle PASSIVE then
+    // retries every `retry` and the episode's RESTART runs at the gate, so the fact
+    // clears soon after the reader lets go. Deferral and spacing still apply.
+    if idle
+        && health.pinned_bytes().is_none()
+        && state.frames - state.base < bounds.idle_floor_frames
+    {
+        // Below the floor (task #199): a run would be mostly flush. Not a deferral, so
+        // the baseline stays; disarm so the timer waits for the next commit.
+        health.floor_skips.fetch_add(1, Ordering::Relaxed);
+        state.disarmed = true;
+        return;
+    }
     if idle && health.work_in_flight() {
         // Yield: re-arm the idle gate from now. The writer's next commit signal or the
         // gate wakes the thread again; nothing is lost, `dirty` stays set.
@@ -635,13 +763,18 @@ fn attempt(
             }
             state.last_idle = Some(Instant::now());
         }
-        health.running.store(true, Ordering::Relaxed);
+        let kind = if idle {
+            RunKind::Idle
+        } else {
+            RunKind::SizeBound
+        };
+        health.running.store(kind.code(), Ordering::Relaxed);
         let started = Instant::now();
         let outcome = checkpoint(conn, "PASSIVE");
         let took = started.elapsed();
-        health.running.store(false, Ordering::Relaxed);
+        health.running.store(0, Ordering::Relaxed);
         let complete = outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done);
-        health.record_passive(took, complete);
+        health.record_passive(took, complete, kind);
         if let Some((_, _, done)) = outcome {
             // A smaller count than before means the writer reset the WAL in between.
             let moved = if done >= state.prev_done {
@@ -650,9 +783,13 @@ fn attempt(
                 done
             };
             state.prev_done = done;
+            let moved = u64::try_from(moved).unwrap_or(0);
             health
                 .frames_checkpointed
-                .fetch_add(u64::try_from(moved).unwrap_or(0), Ordering::Relaxed);
+                .fetch_add(moved, Ordering::Relaxed);
+            if idle {
+                health.idle_frames.fetch_add(moved, Ordering::Relaxed);
+            }
         }
         // On an error there is no frame count from SQLite; use the last commit's, so a
         // failing checkpoint is not re-fired by every later commit.
@@ -675,9 +812,11 @@ fn attempt(
         state.restart_spent = true;
         health.restart_runs.fetch_add(1, Ordering::Relaxed);
         let _ = conn.busy_timeout(RESTART_BUSY);
-        health.running.store(true, Ordering::Relaxed);
+        health
+            .running
+            .store(RunKind::Idle.code(), Ordering::Relaxed);
         let outcome = checkpoint(conn, "RESTART");
-        health.running.store(false, Ordering::Relaxed);
+        health.running.store(0, Ordering::Relaxed);
         let _ = conn.busy_timeout(Duration::ZERO);
         if outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done) {
             state.dirty = false;
@@ -774,6 +913,7 @@ mod tests {
             hard_bytes: u64::MAX,
             retry: Duration::from_millis(100),
             idle_spacing: Duration::ZERO,
+            idle_floor_frames: 0,
         }
     }
 
@@ -826,6 +966,7 @@ mod tests {
             restart_spent: false,
             last_idle: None,
             prev_done: 0,
+            disarmed: false,
         };
         // Nothing committed since the last attempt: nothing is due, however long it waits.
         assert_eq!(state.due(bounds, false), None);
@@ -998,6 +1139,286 @@ mod tests {
         drop(dir);
     }
 
+    /// A scheduler state with `frames` in the WAL and growth counted from `base`, dirty.
+    fn state_at(frames: i32, base: i32) -> State {
+        State {
+            dirty: true,
+            last_commit: Instant::now(),
+            deferred_at: None,
+            base,
+            frames,
+            frame_bytes: 4120,
+            retry_at: None,
+            restart_spent: false,
+            last_idle: None,
+            prev_done: 0,
+            disarmed: false,
+        }
+    }
+
+    /// One `attempt` driven directly on a scratch database: no thread, no timer, so the
+    /// floor's decision is the only thing under test (task #199; no clock assertions).
+    fn attempt_once(state: &mut State, bounds: Bounds, health: &WalHealth, idle: bool) {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("index.db");
+        let conn = schema::open(&path).expect("open");
+        schema::bootstrap(&conn).expect("bootstrap");
+        conn.busy_timeout(Duration::ZERO).expect("timeout");
+        attempt(&conn, state, bounds, health, &wal_path(&path), idle);
+    }
+
+    fn floored() -> Bounds {
+        // The gate is open (zero) so a direct `attempt` is a wake that has arrived.
+        Bounds {
+            idle: Duration::ZERO,
+            idle_floor_frames: IDLE_FLOOR_FRAMES,
+            ..never()
+        }
+    }
+
+    #[test]
+    fn the_default_floor_is_the_ruled_1000_frames_and_a_quarter_of_the_size_bound() {
+        assert_eq!(Bounds::default().idle_floor_frames, 1_000);
+        assert_eq!(IDLE_FLOOR_FRAMES * 4, SIZE_BOUND_FRAMES);
+    }
+
+    #[test]
+    fn an_idle_wake_below_the_floor_runs_nothing_and_keeps_the_baseline() {
+        let health = WalHealth::default();
+        let mut state = state_at(IDLE_FLOOR_FRAMES - 1, 0);
+        attempt_once(&mut state, floored(), &health, true);
+        let stats = health.stats();
+        assert_eq!((stats.passive_runs, stats.restart_runs), (0, 0));
+        assert_eq!(stats.floor_skips, 1);
+        assert_eq!(state.base, 0, "a below-floor wake moved the baseline");
+        assert!(state.dirty, "the frames are still owed");
+    }
+
+    #[test]
+    fn an_idle_wake_at_the_floor_runs_one_idle_passive_and_moves_the_baseline() {
+        let health = WalHealth::default();
+        let mut state = state_at(IDLE_FLOOR_FRAMES, 0);
+        attempt_once(&mut state, floored(), &health, true);
+        let stats = health.stats();
+        assert_eq!(
+            (stats.passive_runs, stats.idle_runs, stats.size_runs),
+            (1, 1, 0)
+        );
+        assert_eq!(stats.floor_skips, 0);
+        assert!(!state.dirty && state.last_idle.is_some());
+    }
+
+    #[test]
+    fn a_deferral_to_work_in_flight_does_not_reset_the_floor_baseline() {
+        let health = Arc::new(WalHealth::default());
+        let mut state = state_at(IDLE_FLOOR_FRAMES + 500, 0);
+        let busy = health.busy_guard();
+        attempt_once(&mut state, floored(), &health, true);
+        assert_eq!(health.stats().deferred_busy, 1);
+        assert_eq!(health.stats().passive_runs, 0);
+        assert_eq!(health.stats().floor_skips, 0, "past the floor: a deferral");
+        assert_eq!(state.base, 0, "a deferral moved the baseline");
+        drop(busy);
+        attempt_once(&mut state, floored(), &health, true);
+        assert_eq!(health.stats().idle_runs, 1, "the owed run happens after it");
+    }
+
+    #[test]
+    fn the_size_bound_is_never_floored() {
+        // Growth far below the idle floor, a floor that nothing reaches: a non-idle
+        // attempt (what the size bound calls) still runs.
+        let health = WalHealth::default();
+        let mut state = state_at(10, 0);
+        let bounds = Bounds {
+            idle_floor_frames: i32::MAX,
+            ..never()
+        };
+        attempt_once(&mut state, bounds, &health, false);
+        let stats = health.stats();
+        assert_eq!(
+            (stats.size_runs, stats.idle_runs, stats.floor_skips),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn the_floor_does_not_apply_while_the_wal_is_reported_pinned() {
+        // Architect ruling on #199: below the floor, a pinned WAL still gets its idle
+        // PASSIVE and the episode's one RESTART, and is not disarmed.
+        let health = WalHealth::default();
+        health.set_pinned_for_test(Some(1));
+        let mut state = state_at(IDLE_FLOOR_FRAMES - 1, 0);
+        attempt_once(&mut state, floored(), &health, true);
+        assert_eq!(health.stats().floor_skips, 0);
+        assert_eq!(health.stats().idle_runs, 1, "the idle PASSIVE ran");
+        assert!(!state.disarmed);
+        // Unpinned, the same growth is below the floor.
+        let health = WalHealth::default();
+        let mut state = state_at(IDLE_FLOOR_FRAMES - 1, 0);
+        attempt_once(&mut state, floored(), &health, true);
+        assert_eq!(
+            (health.stats().floor_skips, health.stats().idle_runs),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn a_below_floor_wake_disarms_the_timer_until_the_next_commit() {
+        let health = WalHealth::default();
+        let mut state = state_at(10, 0);
+        assert!(
+            state.due(floored(), false).is_some(),
+            "armed after a commit"
+        );
+        attempt_once(&mut state, floored(), &health, true);
+        assert_eq!(state.due(floored(), false), None);
+        assert_eq!(state.due(floored(), true), None, "nor for a pinned RESTART");
+    }
+
+    #[test]
+    fn the_live_checkpointer_does_not_spin_below_the_floor_and_wakes_on_a_commit() {
+        let (dir, _path, actor) = actor(Bounds {
+            idle: Duration::from_millis(10),
+            idle_floor_frames: IDLE_FLOOR_FRAMES,
+            ..never()
+        });
+        let health = actor.wal_health();
+        save(&actor, 0);
+        wait_for("the below-floor wake", Duration::from_secs(30), || {
+            health.stats().floor_skips >= 1
+        });
+        // A spin would count again every gate (10 ms); the count can only be wrong
+        // upward, so a stall cannot fail this. A checkpointer thread starved for the whole
+        // 300 ms could hide a spin (a flaky pass, never a false failure); the pure `due()`
+        // test above is the proof, this one is the live corroboration.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(health.stats().floor_skips, 1, "the idle timer spun");
+        assert_eq!(health.stats().passive_runs, 0);
+        // The next commit re-arms it.
+        save(&actor, 1);
+        wait_for("the second wake", Duration::from_secs(30), || {
+            health.stats().floor_skips >= 2
+        });
+        assert_eq!(health.stats().passive_runs, 0);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn the_live_checkpointer_runs_idle_once_the_wal_has_grown_by_the_floor() {
+        let floor = 30;
+        let (dir, _path, actor) = actor(Bounds {
+            idle: Duration::from_millis(10),
+            idle_floor_frames: floor,
+            ..never()
+        });
+        let health = actor.wal_health();
+        // Far more commits than the floor needs, then quiet: the wake that follows is past it.
+        for i in 0..100 {
+            save(&actor, i);
+        }
+        wait_for("an idle run", Duration::from_secs(30), || {
+            health.stats().idle_runs >= 1
+        });
+        let stats = health.stats();
+        assert_eq!(stats.passive_runs, stats.idle_runs);
+        assert!(
+            stats.idle_frames >= u64::try_from(floor).expect("floor"),
+            "an idle run moved {} frames, under the floor {floor}",
+            stats.idle_frames
+        );
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn the_size_bound_fires_on_a_live_writer_whatever_the_floor() {
+        let (dir, _path, actor) = actor(Bounds {
+            size_frames: 40,
+            idle_floor_frames: i32::MAX,
+            ..never()
+        });
+        let health = actor.wal_health();
+        let mut i = 0;
+        while health.stats().passive_runs == 0 {
+            save(&actor, i);
+            i += 1;
+            assert!(i < 2_000, "the size bound never fired");
+        }
+        assert_eq!(health.stats().size_runs, health.stats().passive_runs);
+        assert_eq!(health.stats().idle_runs, 0);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn close_checkpoints_a_wal_far_below_the_floor() {
+        // close() is the writer's `TRUNCATE`, not this thread's: nothing below the floor
+        // is left for a power cut or a reopen to replay.
+        let (dir, path, actor) = actor(Bounds {
+            idle_floor_frames: i32::MAX,
+            ..never()
+        });
+        save(&actor, 0);
+        let health = actor.wal_health();
+        actor.shutdown().expect("shutdown");
+        assert_eq!(health.stats().passive_runs, 0, "the checkpointer ran");
+        assert_eq!(
+            len(&wal_path(&path)),
+            0,
+            "the WAL was not truncated at close"
+        );
+        let conn = schema::open(&path).expect("reopen");
+        let notes: i64 = conn
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(notes, 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn the_overlap_kind_names_the_run_and_idle_wins() {
+        let none = CheckpointStats::default();
+        let idle = CheckpointStats {
+            idle_runs: 1,
+            ..none
+        };
+        let restart = CheckpointStats {
+            restart_runs: 1,
+            ..none
+        };
+        let size = CheckpointStats {
+            size_runs: 1,
+            ..none
+        };
+        let both = CheckpointStats {
+            idle_runs: 1,
+            size_runs: 1,
+            ..none
+        };
+        assert_eq!(overlap_kind(None, None, &none, &none), None);
+        assert_eq!(overlap_kind(None, None, &none, &idle), Some(RunKind::Idle));
+        assert_eq!(
+            overlap_kind(None, None, &none, &restart),
+            Some(RunKind::Idle)
+        );
+        assert_eq!(
+            overlap_kind(None, None, &none, &size),
+            Some(RunKind::SizeBound)
+        );
+        assert_eq!(overlap_kind(None, None, &none, &both), Some(RunKind::Idle));
+        assert_eq!(
+            overlap_kind(Some(RunKind::SizeBound), None, &none, &none),
+            Some(RunKind::SizeBound)
+        );
+        assert_eq!(
+            overlap_kind(Some(RunKind::SizeBound), Some(RunKind::Idle), &none, &none),
+            Some(RunKind::Idle)
+        );
+        assert_eq!(RunKind::Idle.label(), "idle");
+        assert_eq!(RunKind::SizeBound.label(), "size-bound");
+    }
+
     #[test]
     fn the_writer_counts_as_work_in_flight_from_taking_a_command_to_its_commit() {
         let (dir, _path, actor) = actor(never());
@@ -1079,6 +1500,7 @@ mod tests {
             hard_bytes: 256 * 1024,
             retry: Duration::from_millis(100),
             idle_spacing: Duration::ZERO,
+            idle_floor_frames: 0,
         });
         let health = actor.wal_health();
         let parked = Connection::open(&path).expect("reader");

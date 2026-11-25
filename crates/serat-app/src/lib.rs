@@ -239,6 +239,10 @@ struct BenchmarkExitReport<'a> {
     /// was running at, or started or ended inside, the save's write. Empty when the
     /// index had no `WalHealth`.
     save_checkpoint_overlap: Vec<bool>,
+    /// Per submitted save, parallel to `save_checkpoint_overlap` (task #199): which kind
+    /// of run overlapped, `idle`, `size-bound` or `no` (`yes` when one overlapped but the
+    /// kind was gone by the time it was read). Empty when the index had no `WalHealth`.
+    save_checkpoint_kind: Vec<&'static str>,
     /// Per submitted save: the FTS5 segment count fell between the write's start and
     /// its end, i.e. a merge commit landed in the window (`FtsProbe`).
     save_fts_merge: Vec<bool>,
@@ -252,6 +256,8 @@ struct BenchmarkExitReport<'a> {
     save_checkpointer_deferred_busy: u64,
     /// PASSIVE plus RESTART checkpoint runs over the run.
     save_checkpointer_runs: u64,
+    /// `CheckpointStats::floor_skips` at the end of the run (task #199).
+    save_checkpointer_floor_skips: u64,
 }
 
 /// What [`run_save_benchmark`] measured, before it is folded into
@@ -264,11 +270,13 @@ struct SaveBenchmarkResult {
     writer_refused: u64,
     writer_refused_ms: Vec<f64>,
     checkpoint_overlap: Vec<bool>,
+    checkpoint_kind: Vec<&'static str>,
     fts_merge: Vec<bool>,
     slow_commit: Vec<bool>,
     flag_probe_failures: u64,
     checkpointer_deferred_busy: u64,
     checkpointer_runs: u64,
+    checkpointer_floor_skips: u64,
 }
 
 /// Whether a checkpoint overlapped a window (task #183's criterion, #165's origin): one
@@ -280,6 +288,18 @@ fn checkpoint_overlapped(
     runs_at_end: u64,
 ) -> bool {
     running_at_start || running_at_end || runs_at_start != runs_at_end
+}
+
+/// The tag text for a window's checkpoint (task #199): the kind of run that overlapped,
+/// `no` when none did, `yes` when the criterion says one did but no kind was seen (a
+/// run that ended between the two reads).
+fn checkpoint_kind_label(overlapped: bool, kind: Option<serat_index::RunKind>) -> &'static str {
+    match (overlapped, kind) {
+        // A kind with no overlap is a run seen mid-counter-update: not an overlap.
+        (false, _) => "no",
+        (true, Some(kind)) => kind.label(),
+        (true, None) => "yes",
+    }
 }
 
 /// A FTS5 merge landed in a window: the segment count read after is below the one read
@@ -296,8 +316,9 @@ struct Tagger {
 
 /// The state read just before a timed write.
 struct Before {
-    running: bool,
-    runs: u64,
+    /// One load of the running run, and one stats snapshot: both flags derive from them.
+    running_kind: Option<serat_index::RunKind>,
+    stats: serat_index::CheckpointStats,
     segments: Option<u32>,
 }
 
@@ -312,17 +333,14 @@ impl Tagger {
         }
     }
 
-    fn runs(&self) -> u64 {
-        self.health.as_ref().map_or(0, |h| {
-            let s = h.stats();
-            s.passive_runs + s.restart_runs
-        })
-    }
-
-    fn running(&self) -> bool {
+    fn running_kind(&self) -> Option<serat_index::RunKind> {
         self.health
             .as_ref()
-            .is_some_and(|h| h.checkpoint_in_progress())
+            .and_then(|h| h.checkpoint_kind_running())
+    }
+
+    fn stats(&self) -> serat_index::CheckpointStats {
+        self.health.as_ref().map(|h| h.stats()).unwrap_or_default()
     }
 
     fn segments(&self) -> Option<u32> {
@@ -331,17 +349,32 @@ impl Tagger {
 
     fn before(&self) -> Before {
         Before {
-            running: self.running(),
-            runs: self.runs(),
+            running_kind: self.running_kind(),
+            stats: self.stats(),
             segments: self.segments(),
         }
     }
 
-    /// `(checkpoint overlap, merge landed, probe failed)`.
-    fn after(&self, before: &Before) -> (bool, bool, bool) {
+    /// `(checkpoint overlap, its kind, merge landed, probe failed)`.
+    fn after(&self, before: &Before) -> (bool, &'static str, bool, bool) {
         let segments = self.segments();
+        let (running_after, stats_after) = (self.running_kind(), self.stats());
+        let runs = |s: &serat_index::CheckpointStats| s.passive_runs + s.restart_runs;
+        let overlapped = checkpoint_overlapped(
+            before.running_kind.is_some(),
+            running_after.is_some(),
+            runs(&before.stats),
+            runs(&stats_after),
+        );
+        let kind = serat_index::overlap_kind(
+            before.running_kind,
+            running_after,
+            &before.stats,
+            &stats_after,
+        );
         (
-            checkpoint_overlapped(before.running, self.running(), before.runs, self.runs()),
+            overlapped,
+            checkpoint_kind_label(overlapped, kind),
             merge_landed(before.segments, segments),
             before.segments.is_none() || segments.is_none(),
         )
@@ -384,7 +417,8 @@ fn run_save_benchmark(
     let mut submitted_ms = Vec::with_capacity(paths.len());
     let mut writer_refused_ms = Vec::new();
     let tagger = Tagger::new(state);
-    let (mut checkpoint_overlap, mut fts_merge, mut windows) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut checkpoint_overlap, mut checkpoint_kind, mut fts_merge, mut windows) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut flag_probe_failures = 0u64;
 
     for path in &paths {
@@ -409,12 +443,13 @@ fn run_save_benchmark(
         let ended = std::time::Instant::now();
         let elapsed_ms = ended.duration_since(started).as_secs_f64() * 1000.0;
         written.map_err(|err| format!("--bench-save-list: saving {path}: {err:?}"))?;
-        let (overlap, merge, probe_failed) = tagger.after(&tag_before);
+        let (overlap, kind, merge, probe_failed) = tagger.after(&tag_before);
 
         let after = state.save_path_outcomes();
         if after.submitted > before.submitted {
             submitted_ms.push(elapsed_ms);
             checkpoint_overlap.push(overlap);
+            checkpoint_kind.push(kind);
             fts_merge.push(merge);
             flag_probe_failures += u64::from(probe_failed);
             windows.push((started, ended));
@@ -456,6 +491,11 @@ fn run_save_benchmark(
         } else {
             Vec::new()
         },
+        checkpoint_kind: if tagger.health.is_some() {
+            checkpoint_kind
+        } else {
+            Vec::new()
+        },
         // Kept when only the FTS probe could not open: every save then counts a probe
         // failure and reads as no merge, and the checkpoint and slow-commit tags stand.
         fts_merge: if tagger.health.is_some() {
@@ -473,6 +513,7 @@ fn run_save_benchmark(
         checkpointer_runs: stats
             .as_ref()
             .map_or(0, |s| s.passive_runs + s.restart_runs),
+        checkpointer_floor_skips: stats.as_ref().map_or(0, |s| s.floor_skips),
         attempted: paths.len(),
         submitted_ms,
         handle_missing: after_all.handle_missing - before_all.handle_missing,
@@ -1004,11 +1045,13 @@ fn spawn_benchmark_exit(
                             save_writer_refused: save.writer_refused,
                             save_writer_refused_ms: save.writer_refused_ms,
                             save_checkpoint_overlap: save.checkpoint_overlap,
+                            save_checkpoint_kind: save.checkpoint_kind,
                             save_fts_merge: save.fts_merge,
                             save_slow_commit: save.slow_commit,
                             save_flag_probe_failures: save.flag_probe_failures,
                             save_checkpointer_deferred_busy: save.checkpointer_deferred_busy,
                             save_checkpointer_runs: save.checkpointer_runs,
+                            save_checkpointer_floor_skips: save.checkpointer_floor_skips,
                         };
                         match write_trace(&report, trace_path.as_deref()) {
                             Ok(()) => 0,
@@ -1621,11 +1664,13 @@ mod tests {
             save_writer_refused: 2,
             save_writer_refused_ms: vec![0.4, 0.6],
             save_checkpoint_overlap: vec![false, true],
+            save_checkpoint_kind: vec!["no", "idle"],
             save_fts_merge: vec![true, false],
             save_slow_commit: vec![false, false],
             save_flag_probe_failures: 0,
             save_checkpointer_deferred_busy: 3,
             save_checkpointer_runs: 4,
+            save_checkpointer_floor_skips: 2,
         };
         let line = serde_json::to_string(&report).expect("json");
         assert!(
@@ -1758,11 +1803,13 @@ mod tests {
             save_writer_refused: 0,
             save_writer_refused_ms: vec![],
             save_checkpoint_overlap: vec![false, true],
+            save_checkpoint_kind: vec!["no", "idle"],
             save_fts_merge: vec![true, false],
             save_slow_commit: vec![false, true],
             save_flag_probe_failures: 1,
             save_checkpointer_deferred_busy: 3,
             save_checkpointer_runs: 4,
+            save_checkpointer_floor_skips: 2,
         };
         let line = serde_json::to_string(&report).expect("json");
         for expected in [
@@ -1772,6 +1819,8 @@ mod tests {
             "\"save_flag_probe_failures\":1",
             "\"save_checkpointer_deferred_busy\":3",
             "\"save_checkpointer_runs\":4",
+            "\"save_checkpoint_kind\":[\"no\",\"idle\"]",
+            "\"save_checkpointer_floor_skips\":2",
         ] {
             assert!(line.contains(expected), "{expected} missing from {line}");
         }
@@ -1792,6 +1841,18 @@ mod tests {
         assert!(
             checkpoint_overlapped(false, false, 5, 6),
             "one ran in between"
+        );
+        // Task #199: the tag names the kind; `yes` only when the kind was lost.
+        let idle = Some(serat_index::RunKind::Idle);
+        let size = Some(serat_index::RunKind::SizeBound);
+        assert_eq!(checkpoint_kind_label(true, idle), "idle");
+        assert_eq!(checkpoint_kind_label(true, size), "size-bound");
+        assert_eq!(checkpoint_kind_label(true, None), "yes");
+        assert_eq!(checkpoint_kind_label(false, None), "no");
+        assert_eq!(
+            checkpoint_kind_label(false, idle),
+            "no",
+            "a kind with no overlap is not an overlap"
         );
         assert!(merge_landed(Some(9), Some(4)));
         assert!(!merge_landed(Some(4), Some(4)), "no change");
@@ -1839,6 +1900,7 @@ mod tests {
         assert_eq!(n, 2);
         // Parallel to the timings, one entry per submitted save, and a live probe.
         assert_eq!(result.checkpoint_overlap.len(), n);
+        assert_eq!(result.checkpoint_kind.len(), n);
         assert_eq!(result.fts_merge.len(), n);
         assert_eq!(result.slow_commit.len(), n);
         assert_eq!(result.flag_probe_failures, 0, "{result:?}");

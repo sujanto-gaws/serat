@@ -35,7 +35,7 @@ pub mod tree;
 pub mod writer;
 
 pub use check::{QuickCheck, quick_check};
-pub use checkpoint::{Bounds, BusyGuard, CheckpointStats, WalHealth};
+pub use checkpoint::{Bounds, BusyGuard, CheckpointStats, RunKind, WalHealth, overlap_kind};
 pub use fts_probe::FtsProbe;
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
