@@ -25,6 +25,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      # Task #179 (NFR-PRF-01, NFR-PRF-08, C-06, ADR-0019). A DIAGNOSTIC, not a budget run:
+      # when true, every gating job is skipped (so `budgets-gate` is skipped too) and only
+      # build-app plus the two prf01 diagnostic jobs below run. It decides nothing about any
+      # budget; docs/05-testing/reports/ci-windows-first-run-2026-11.md finding 2 says why.
+      prf01_diagnostic:
+        description: "Diagnostic only, gates nothing: run just the NFR-PRF-01 app launches with per-launch WebView2 data folders"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +55,7 @@ jobs:
   serat-app-release-guard:
     name: "serat-app release guard: no test-hooks, bench-bridge confined, timing off is inert"
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -97,6 +107,7 @@ jobs:
   vault:
     name: "NFR-MNT-02 · benchmark vault is deterministic"
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -161,6 +172,7 @@ jobs:
     name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s (report-only on hosted windows; asserted on the reference machine)"
     needs: vault
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -185,6 +197,7 @@ jobs:
     name: "NFR-PRF-04 · full rebuild of 20k notes < 30 s, asserted on ubuntu-latest (a regression gate; the gate figure is RM-1's)"
     needs: vault
     runs-on: ubuntu-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -201,6 +214,7 @@ jobs:
     name: "NFR-PRF-03 · save to index < 50 ms p95 over 1000 saves"
     needs: [vault, build-app]
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -240,6 +254,7 @@ jobs:
     # assertion that vault size does not move the critical path.
     needs: [vault, build-app]
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -263,6 +278,7 @@ jobs:
     name: "NFR-PRF-01 · Serat term < 350 ms p95 (task #104's binding gate)"
     needs: [vault, build-app]
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -282,6 +298,109 @@ jobs:
           path: bench/out/budgets/
           if-no-files-found: ignore
 
+  # TASK #179 DIAGNOSTIC (NFR-PRF-01, NFR-PRF-08, US-35, ADR-0019, ADR-0014): runs only on
+  # `workflow_dispatch` with `prf01_diagnostic: true`, NEVER on a PR or push, and is not in
+  # `budgets-gate`'s needs, so it cannot be read as a budget verdict. Each of the two prf01
+  # bins is run three times (a hang ends a bin run, so three runs is three samples of "launches
+  # until the first hang") with `|| echo`, because here a hang is the finding, not a failure.
+  # Two arms, so the cause is not confounded:
+  #   folder        SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH=1 only: each launch has its own
+  #                 WEBVIEW2_USER_DATA_FOLDER, so no launch shares a WebView2 profile or a
+  #                 still-exiting browser process with the last (hypothesis 2).
+  #   folder+flags  the same, plus WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS with
+  #                   --enable-logging=stderr --v=1
+  #                                            Chromium logging to the job log (the file form
+  #                                            wrote no chrome_debug.log in the first dispatch)
+  #                   --disable-features=CalculateNativeWinOcclusion
+  #                                            stops Chromium treating the window as occluded
+  #                                            and throttling its frames (hypothesis 3; the
+  #                                            rejected evidence was two requestAnimationFrame
+  #                                            callbacks carrying the same timestamp)
+  # Every step that pipes has `shell: bash` (GitHub then adds `-o pipefail`), the #168 rule.
+  prf01-diagnostic-cold-start:
+    name: "NFR-PRF-01 · DIAGNOSTIC (gates nothing) cold-start launches, ${{ matrix.arm }}"
+    if: ${{ inputs.prf01_diagnostic }}
+    needs: [build-app]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: folder
+            browser_args: ""
+          - arm: folder+flags
+            browser_args: "--enable-logging=stderr --v=1 --disable-features=CalculateNativeWinOcclusion"
+    env:
+      SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH: "1"
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: ${{ matrix.browser_args }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release
+      - name: The application binary is in place
+        shell: bash
+        run: test -s target/release/serat.exe
+      - name: Three bin runs; a hang is a finding, not a failure
+        shell: bash
+        run: |
+          mkdir -p bench/out/budgets
+          for n in 1 2 3; do
+            cargo run --release -p budget --bin prf01-cold-start -- --profile ci 2>&1 | tee "bench/out/budgets/diag-cold-start-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf01-diagnostic-cold-start-${{ strategy.job-index }}
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
+  prf01-diagnostic-serat-term:
+    name: "NFR-PRF-01 · DIAGNOSTIC (gates nothing) Serat-term launches, ${{ matrix.arm }}"
+    if: ${{ inputs.prf01_diagnostic }}
+    needs: [build-app]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: folder
+            browser_args: ""
+          - arm: folder+flags
+            browser_args: "--enable-logging=stderr --v=1 --disable-features=CalculateNativeWinOcclusion"
+    env:
+      SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH: "1"
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: ${{ matrix.browser_args }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: serat-app-release
+          path: target/release
+      - name: The application binary is in place
+        shell: bash
+        run: test -s target/release/serat.exe
+      - name: Three bin runs; a hang is a finding, not a failure
+        shell: bash
+        run: |
+          mkdir -p bench/out/budgets
+          for n in 1 2 3; do
+            cargo run --release -p budget --bin prf01-serat-term -- --profile ci 2>&1 | tee "bench/out/budgets/diag-serat-term-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prf01-diagnostic-serat-term-${{ strategy.job-index }}
+          path: bench/out/budgets/
+          if-no-files-found: ignore
+
   # Report-only (task #47): architecture §4.5 states latency *expectations* for the
   # P1 read paths, not budgets, so this job never fails on a slow number. It fails
   # only if it cannot measure. It exists so the numbers are produced on every run and
@@ -290,6 +409,7 @@ jobs:
     name: "FR-NAV-02 / NFR-PRF-03 · P1 read paths and link-resolving saves (report only)"
     needs: vault
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -335,6 +455,7 @@ jobs:
     name: "FR-VLT-01 · file tree complete < 2 s p95 at 20k, Rust-side lower bound (ADR-0015)"
     needs: vault
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -369,6 +490,7 @@ jobs:
     name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes (report-only on hosted windows; asserted on the reference machine; PRD v1.9; max and 100-file batch reported)"
     needs: vault
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -401,6 +523,7 @@ jobs:
     name: "FR-VLT-04 · external change visible in the index < 500 ms p95 over 100 single-note changes, asserted on ubuntu-latest (a regression gate; the gate figure is RM-1's)"
     needs: vault
     runs-on: ubuntu-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -432,6 +555,7 @@ jobs:
     name: "NFR-PRF-06 · Switcher::query < 50 ms p95 at 20k, default and heading mode (20 ms allocation, 50k, stress reported)"
     needs: vault
     runs-on: windows-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
@@ -476,6 +600,7 @@ jobs:
   every-budget-has-a-job:
     name: "NFR-PRF-08 · every budget has an asserting job"
     runs-on: ubuntu-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -496,6 +621,7 @@ jobs:
   editor-latency:
     name: "NFR-PRF-02 · editor keystroke-to-paint, headless Chromium (report only, not gate-eligible)"
     runs-on: ubuntu-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     continue-on-error: true
     timeout-minutes: 60
     steps:
@@ -586,6 +712,7 @@ jobs:
   editor-latency-real-ipc:
     name: "NFR-PRF-02 · editor keystroke-to-paint with real serat-app IPC (report only, not gate-eligible)"
     runs-on: ubuntu-latest
+    if: ${{ !inputs.prf01_diagnostic }}
     continue-on-error: true
     timeout-minutes: 60
     steps:
@@ -645,7 +772,7 @@ jobs:
   # Windows (ADR-0019): green means they measured. Their -linux twins assert (task #168).
   budgets-gate:
     name: "budgets · every gating job succeeded"
-    if: always()
+    if: always() && !inputs.prf01_diagnostic
     needs:
       - serat-app-release-guard
       - vault
