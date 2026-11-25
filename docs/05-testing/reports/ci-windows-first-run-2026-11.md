@@ -40,7 +40,7 @@ The two runs reproduce each other on two heads and two runner instances. For FR-
 | prf04-full-rebuild-linux | ubuntu-latest | NFR-PRF-04, asserted | green |
 | p1-external-change-linux | ubuntu-latest | FR-VLT-04, asserted | green |
 | prf03-save-to-index | windows-latest | NFR-PRF-03 | green on both heads. Run 417, job 138484368970, verbatim: `PASS NFR-PRF-03 · prf03-save-to-index; ... p95 over 1000 runs = 1.4 ms, limit 50.0 ms (ci profile); samples n=1000 min 0.7 mean 1.3 max 34.5 ms; save path 1000 attempted · 1000 submitted · 0 writer-refused · 0 handle-missing; vault 20000 notes, digest 35fcb867...; windows · 4 cores · scanner OFF · cpu load 4%; NOT A GATE NUMBER (scanner off)`. Run 415: PASS, figure in artifact `prf03-save-to-index` |
-| **p1-external-change** | windows-latest | FR-VLT-04, report-only | **RED**, failure to measure (exit 2) |
+| **p1-external-change** | windows-latest | FR-VLT-04, report-only | **RED** on runs 415 and 417, failure to measure (exit 2); **green from run 418** (see Resolution under Triage 1) |
 | **prf01-cold-start** | windows-latest | NFR-PRF-01 | **RED**, no first paint in 60 s |
 | **prf01-serat-term** | windows-latest | NFR-PRF-01 | **RED**, same |
 | budgets-gate | | all | red, because of the three above |
@@ -75,6 +75,34 @@ The error text is `only {upserted} of {count} edits were indexed in 10 s` and `c
 * The single series prints `single series done: p95 ...` to stderr before the batch runs, so a batch failure cannot take the gated figure with it.
 * The bin prints `watcher armed S s before the first edit; backend ReadDirectoryChangesW|inotify|FSEvents`.
 * Unit tests for the stall line and the two limits (TC-159). Locally on Linux (debug): `--vault 20k --single 10 --batches 2 --assert` passes, single p95 264.5 ms, batch 1.7 s.
+
+### Resolution (run 418, task #180)
+
+Run 418 on `3e35ce2`, the first head carrying the #167 diagnostics, and run 419 on `e9b6576` (job 138509620838, success) read FR-VLT-04 on windows-latest with the batch limit at 60 s. The job is **green** in both. No stall line was printed: no batch iteration hit 60 s. Runner: windows-latest, 4 cores, realtime scanner off, power plan High performance, `gate eligible false`; the single series is report-only.
+
+| | Run 418 (`3e35ce2`) | Run 419 (`e9b6576`) | Run 316 (`6a608b8`, windows-2025, 2 cores) | Linux twin |
+|---|---|---|---|---|
+| Single write to visible, p95 / max (n=100) | **412.7 / 617.4 ms** | 396.4 / 834.1 ms | 615.3 / 792.0 ms | about 181 ms p95 locally (#165); asserted, green in CI |
+| Watcher delay, p95 | 172.4 ms | 171.0 ms | about 173 ms | the 150 ms window plus delivery |
+| Processing to committed, p95 / max | 247.2 / 455.2 ms | 229.6 / 669.3 ms | | about 5 ms |
+| Singles over 100 ms processing, with a checkpoint overlapping | 16 of 17 | 11 of 11 | | |
+| Mean processing with / without checkpoint overlap | 189.6 / 12.0 ms | 205.7 / 10.1 ms | | |
+| Batch of 100, median / p95 / max (n=20, ungated) | 3,265 / 3,973 / 5,333 ms | 3,282 / 3,816 / 4,314 ms | 4,773 / 7,017 / 7,065 ms | 1.7 s (debug, #167) |
+| Batch iterations overlapping a checkpoint | 19 of 20 | 20 of 20 | | |
+| Checkpointer, PASSIVE runs, longest / mean | 49, 5,799.8 / 1,691.3 ms | 52, 4,741.5 / 1,493.5 ms | | |
+
+Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 merge split is not a discriminator (run 418: with / without a merge 40.9 / 58.3 ms on singles). The reader open and row lookup is about 1 ms, so the visibility read is not the cost.
+
+**Verdict: harness limit, not a product regression: the watcher delivered every edit; the batch shape's cost is the WAL checkpoint overlap on hosted Windows I/O.** The old rejection in runs 415 and 417 ("only 1 of 100 edits were indexed in 10 s") was a batch iteration whose checkpoint overlap pushed it past the 10 s limit, as hypothesis 1 ranked. Hypotheses 2 (lost events, `RescanRequired`) and 3 (a blocked consumer) are not supported: the watcher delay stayed at the window plus about 20 ms in every iteration of both runs, the batch median is 3.3 s, and no iteration stalled. The single-note p95 is within 500 ms even on this runner (412.7 and 396.4 ms). That is a report-only figure on a runner that is not gate eligible (RISK-012): it is not a gate number and not CI-asserted. The asserting twin is the Linux job (`p1-external-change-linux`, green).
+
+**What remains open.**
+
+* (a) The checkpoint overlap is the dominant cost of a 100-note external batch (19 of 20 iterations in run 418, 20 of 20 in run 419) and of the slow single iterations (16 of 17, 11 of 11). Processing is about 10 to 12 ms without an overlap and 190 to 206 ms with one. That is a product observation against #56's checkpointer policy (250 ms idle gate, 2 s spacing, 4,000-frame bound) under hosted Windows I/O. It is worth a rust-core-dev look and is **not a FR-VLT-04 breach**. Task text for the lead is under "Proposed tasks" below (item 5).
+* (b) The single max is 617.4 ms and 834.1 ms, over 500 ms. FR-VLT-04 gates p95, not max; the tail is the same overlap.
+* (c) Scanner-on Windows is still unmeasured; no budget has that figure.
+* (d) Run 316's p95 of 615.3 ms was on windows-2025 with 2 cores; 4 cores may account for part of the 615 to 413 ms difference. The two runs do not separate runner from code.
+
+**Still red on hosted Windows, stated plainly:** `prf01-cold-start` and `prf01-serat-term` (NFR-PRF-01, intermittent, tasks #178 and #179), and `budgets-gate` as a consequence. FR-VLT-04's windows job is not among the red jobs from run 418 on.
 
 ## Triage 2 — NFR-PRF-01 on windows-latest: no `window_visible` in 60 s
 
@@ -118,7 +146,8 @@ Not done in this task because it is product code (`serat-app`, not mine to chang
 1. **`[P1/impl] Startup trace names the marks it has when the paint mark never arrives`**, owner tauri-app-dev. IDs NFR-PRF-01, NFR-PRF-08, US-35; ADR-0014. Acceptance: on `--exit-after-ready` timeout the stderr line lists each mark set or absent and the count and text of rejected `mark_first_paint` calls; a rejected call prints one `serat:` line; unit tests drive `AppState::mark_first_paint` with rejected evidence and a timeout with partial marks; no change to which evidence is accepted.
 2. **`[P1/test] NFR-PRF-01 per-launch evidence and isolation dispatches on windows-latest`**, owner test-engineer, after task 1 lands. IDs NFR-PRF-01, NFR-PRF-08, C-06, ADR-0019. Acceptance: `cold_start_once` logs launch index, times and any surviving `msedgewebview2.exe` on failure; a `workflow_dispatch` input waits for browser-process exit between launches and uses a per-launch user-data folder; another sets the WebView2 logging and occlusion flags; one run each; the report says which of hypotheses 1 to 4 holds. Depends on a runner.
 3. **No ADR-0019 decision is proposed yet.** Whether NFR-PRF-01's hosted job can stay an `Always` gate on windows-latest depends on which hypothesis holds; if 2, the fix is the bench's. Decide after task 2's evidence.
-4. **`[P1/test] FR-VLT-04 windows batch: re-read after the diagnostic`**, owner test-engineer. Acceptance: on the next dispatch the per-round line and the single-series p95 are recorded; if it shows a rescan raised or a blocked consumer, a product task for rust-core-dev is filed with the round line as reproduction.
+4. (Done: task #180, see Resolution under Triage 1.) **`[P1/test] FR-VLT-04 windows batch: re-read after the diagnostic`**, owner test-engineer. Acceptance: on the next dispatch the per-round line and the single-series p95 are recorded; if it shows a rescan raised or a blocked consumer, a product task for rust-core-dev is filed with the round line as reproduction.
+5. **`[P1/impl] External-change processing under a WAL checkpoint overlap`**, owner rust-core-dev. IDs FR-VLT-04, NFR-PRF-03; ADR-0002, ADR-0011. Evidence: run 418 and 419 FR-VLT-04 windows logs (processing 189.6 / 205.7 ms with an overlapping checkpoint against 12.0 / 10.1 ms without; 100-note batch overlapped in 19 and 20 of 20 iterations, median 3.3 s). Acceptance: external-change processing p95 with a checkpoint overlap is within 2x of without, measured on the Linux twin (the bench forces an overlap, for example by running the checkpointer back to back during the series); no change to durability (checkpoint mode, frame bound and synchronous setting are unchanged in effect). Judgement: worth a look, not urgent; the budget is met without it.
 
 ## RISK-013
 
