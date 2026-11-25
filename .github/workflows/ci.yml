@@ -173,6 +173,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92
         with:
           targets: x86_64-pc-windows-gnu
+      # Run #460 (after #191) still failed with the same "can't find crate for std": the
+      # action's `targets:` did not reach the toolchain cargo resolves in the repo. rustup run
+      # from the repo root honours rust-toolchain.toml, so add the target there, explicitly;
+      # `rustup show` prints which toolchain and targets that resolves to (diagnostic).
+      - name: Add the windows-gnu target to the toolchain rust-toolchain.toml selects (#193)
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target x86_64-pc-windows-gnu --workspace --tests
 

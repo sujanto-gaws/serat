@@ -764,10 +764,12 @@ mod tests {
         let slot = SearchSlot::new(Arc::clone(&epoch));
         let a = slot.get(&db).expect("a");
         assert!(Arc::ptr_eq(&a, &slot.get(&db).expect("again")));
-        // A replaced file with no new handle is not noticed: identity is the epoch.
-        std::fs::remove_file(&db).expect("rm");
-        make_db(&db);
-        assert!(Arc::ptr_eq(&a, &slot.get(&db).expect("same epoch")));
+        // A different file with no new handle is not noticed: identity is the epoch,
+        // not the path. (Not a remove-and-recreate of `db`: the slot holds `db` open,
+        // and Windows refuses to delete an open SQLite file, #193.)
+        let other = dir.path().join("other.db");
+        make_db(&other);
+        assert!(Arc::ptr_eq(&a, &slot.get(&other).expect("same epoch")));
         epoch.fetch_add(1, Ordering::SeqCst);
         let b = slot.get(&db).expect("b");
         assert!(!Arc::ptr_eq(&a, &b), "a new handle gets a new connection");
