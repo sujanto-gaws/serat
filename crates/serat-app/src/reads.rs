@@ -340,8 +340,9 @@ struct Written<'a> {
 }
 
 enum Subpath<'a> {
-    /// `#Heading` or `#A#B`: matched on the last segment, folded.
-    Heading(&'a str),
+    /// `#Heading` or `#A#B#C`: the non-empty segments, outermost first. Each must be a
+    /// heading under the previous one (task #184); a single segment matches anywhere.
+    Heading(Vec<&'a str>),
     /// `#^id` or `^id`.
     Block(&'a str),
 }
@@ -364,11 +365,14 @@ fn split_written(target: &str) -> Written<'_> {
     };
     let subpath = match rest.strip_prefix('^') {
         Some(id) => Subpath::Block(id.trim()),
-        None => Subpath::Heading(
-            rest.rsplit('#')
-                .find(|s| !s.trim().is_empty())
-                .unwrap_or(""),
-        ),
+        None => {
+            let mut segments: Vec<&str> =
+                rest.split('#').filter(|s| !s.trim().is_empty()).collect();
+            if segments.is_empty() {
+                segments.push("");
+            }
+            Subpath::Heading(segments)
+        }
     };
     Written {
         note,
@@ -376,15 +380,50 @@ fn split_written(target: &str) -> Written<'_> {
     }
 }
 
+/// `#A#B#C`: some heading matching `A`, then a heading matching `B` inside its section
+/// (after it and before the next heading at its level or shallower, so deeper than it),
+/// then `C` inside that one. Every candidate is tried, so `A` twice with `B` only under the
+/// second still resolves. Text is compared folded and trimmed, as for a single segment.
+fn heading_path_exists(anchors: &serat_index::read::Anchors, segments: &[&str]) -> bool {
+    let folded: Vec<String> = anchors
+        .headings
+        .iter()
+        .map(|h| serat_core::fold_case(h.text.trim()))
+        .collect();
+    let level = |i: usize| anchors.headings[i].level;
+    let mut candidates: Vec<usize> = Vec::new();
+    for (n, segment) in segments.iter().enumerate() {
+        let want = serat_core::fold_case(segment.trim());
+        let next: Vec<usize> = if n == 0 {
+            (0..folded.len()).filter(|&j| folded[j] == want).collect()
+        } else {
+            let mut found = Vec::new();
+            let mut seen = vec![false; folded.len()];
+            for &i in &candidates {
+                let outer = level(i);
+                for (j, text) in folded.iter().enumerate().skip(i + 1) {
+                    if level(j) <= outer {
+                        break;
+                    }
+                    if *text == want && !seen[j] {
+                        seen[j] = true;
+                        found.push(j);
+                    }
+                }
+            }
+            found
+        };
+        if next.is_empty() {
+            return false;
+        }
+        candidates = next;
+    }
+    true
+}
+
 fn subpath_exists(anchors: &serat_index::read::Anchors, subpath: &Subpath<'_>) -> bool {
     match subpath {
-        Subpath::Heading(text) => {
-            let want = serat_core::fold_case(text.trim());
-            anchors
-                .headings
-                .iter()
-                .any(|h| serat_core::fold_case(h.trim()) == want)
-        }
+        Subpath::Heading(segments) => heading_path_exists(anchors, segments),
         Subpath::Block(id) => anchors.block_ids.iter().any(|b| b == id),
     }
 }
@@ -455,7 +494,7 @@ pub fn resolve_links(
 #[must_use]
 pub fn map_anchors(anchors: read::Anchors) -> NoteAnchors {
     NoteAnchors {
-        headings: anchors.headings,
+        headings: anchors.headings.into_iter().map(|h| h.text).collect(),
         block_ids: anchors.block_ids,
     }
 }
@@ -463,6 +502,74 @@ pub fn map_anchors(anchors: read::Anchors) -> NoteAnchors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn anchors_of(headings: &[(u8, &str)]) -> serat_index::read::Anchors {
+        serat_index::read::Anchors {
+            headings: headings
+                .iter()
+                .map(|(level, text)| serat_index::read::Heading {
+                    text: (*text).to_owned(),
+                    level: *level,
+                })
+                .collect(),
+            block_ids: Vec::new(),
+        }
+    }
+
+    fn found(anchors: &serat_index::read::Anchors, target: &str) -> bool {
+        let written = split_written(target);
+        subpath_exists(anchors, &written.subpath.expect("a subpath"))
+    }
+
+    // Task #184 (FR-EDT-03, NFR-CMP-01, US-03): `#A#B` needs B inside A's section.
+    #[test]
+    fn a_nested_subpath_requires_each_segment_under_the_previous() {
+        // # A / ## B / # C / ## B / ### D / ## E / # A / ## F / ### G
+        let a = anchors_of(&[
+            (1, "A"),
+            (2, "B"),
+            (1, "C"),
+            (2, "B"),
+            (3, "D"),
+            (2, "E"),
+            (1, "A"),
+            (2, "F"),
+            (3, "G"),
+        ]);
+        assert!(found(&a, "n#A#B"), "B under A");
+        assert!(found(&a, "n#a # b"), "folded and trimmed per segment");
+        assert!(found(&a, "n#C#B"), "the duplicate B under C");
+        assert!(!found(&a, "n#A#E"), "E sits under C, not A");
+        assert!(!found(&a, "n#A#D"), "D sits under C, not A");
+        assert!(found(&a, "n#C#B#D"), "three levels");
+        assert!(found(&a, "n#C#D"), "a grandchild is a descendant");
+        assert!(
+            !found(&a, "n#A#B#D"),
+            "D is not under the B that is under A"
+        );
+        assert!(found(&a, "n#A#F#G"), "B under the second A, three levels");
+        assert!(
+            found(&a, "n#A#F"),
+            "F is under the second of two A headings"
+        );
+        assert!(!found(&a, "n#B#A"), "A is not under B");
+        assert!(!found(&a, "n#A#A"), "a heading is not its own descendant");
+        assert!(found(&a, "n#E"), "a single segment matches anywhere");
+        assert!(!found(&a, "n#Nope"), "a single segment that is missing");
+        assert!(!found(&a, "n#A#Nope"), "a last segment that is missing");
+    }
+
+    #[test]
+    fn a_nested_subpath_ends_at_the_next_heading_of_the_same_or_shallower_level() {
+        // ## A / ### X / ## B / ### Y : Y is under B, not under A.
+        let a = anchors_of(&[(2, "A"), (3, "X"), (2, "B"), (3, "Y")]);
+        assert!(found(&a, "n#A#X"));
+        assert!(!found(&a, "n#A#Y"));
+        assert!(found(&a, "n#B#Y"));
+        // A skipped level still nests: # A / ### Z.
+        let skip = anchors_of(&[(1, "A"), (3, "Z")]);
+        assert!(found(&skip, "n#A#Z"));
+    }
 
     #[test]
     fn superseded_maps_through_unchanged() {
