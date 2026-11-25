@@ -253,6 +253,32 @@ mod tests {
     }
 
     #[test]
+    fn forget_removes_the_path_and_what_is_beneath_it_and_nothing_else() {
+        let log = RefusalLog::new();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        log.on_change(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        for path in ["a\\b", "a\\b/c.md", "a\\bc", "z.md"] {
+            log.record(refusal(path, "r"));
+        }
+        fired.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        log.forget("a\\b");
+        let left: Vec<String> = log.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(left, vec!["a\\bc", "z.md"]);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Nothing to remove: no change, no callback.
+        log.forget("a\\b");
+        log.forget("absent");
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.overflowed(), 0);
+    }
+
+    #[test]
     fn one_file_refused_many_times_is_one_entry_with_the_latest_reason() {
         let log = RefusalLog::new();
         for i in 0..10 {

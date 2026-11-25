@@ -3831,6 +3831,13 @@ mod tests {
         let vault = state.vault().expect("open");
         vault.walk().expect("walk");
         assert_eq!(state.refused_names().len(), 1);
+        // The strip hears of the change as an `index://status` event (the #144 throttle
+        // may delay it, never drop the last one), so the test waits on those too.
+        let statuses: Arc<Mutex<Vec<crate::ipc::IndexStatus>>> = Arc::default();
+        let sink = Arc::clone(&statuses);
+        state
+            .events
+            .install(move |status| sink.lock().expect("statuses").push(status.clone()));
 
         std::fs::remove_file(&odd).expect("rm");
         // Events reach the watcher's loop in the order the kernel made them, so once a
@@ -3840,6 +3847,13 @@ mod tests {
         wait_for_row(&dir, "after-the-rm.md");
         assert!(state.refused_names().is_empty());
         assert_eq!(state.index_status().refused_names, Some(0));
+        wait_until("a status event carrying refused_names == Some(0)", || {
+            statuses
+                .lock()
+                .expect("statuses")
+                .last()
+                .is_some_and(|status| status.refused_names == Some(0))
+        });
     }
 
     // -- index reads (FR-NAV-02, FR-NAV-04) -----------------------------------------

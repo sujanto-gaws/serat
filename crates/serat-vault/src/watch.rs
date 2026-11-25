@@ -392,8 +392,13 @@ fn is_interesting(kind: &EventKind) -> bool {
 /// `note`; `AUX.md` can resolve to the device), and `Vault::open` strips the prefix
 /// from the root.
 fn name_has_left(path: &Path) -> bool {
+    // The absolute event path is root + the relative components, which is exactly what
+    // a verbatim spelling needs. `None` (a `.`/`..`/empty segment, or a name that is
+    // not Unicode) cannot be judged, so the name is treated as present.
     #[cfg(windows)]
-    let path = serat_core::verbatim::to_verbatim(path);
+    let Some(path) = serat_core::verbatim::to_verbatim(path) else {
+        return false;
+    };
     std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
@@ -571,12 +576,11 @@ mod tests {
         watcher.stop();
     }
 
-    /// Task #182 (FR-VLT-01, NFR-REL-01, US-07). Pins what the flake hunt found rather
-    /// than fixing it (fixed by #188): the watcher recorded a refused name on every event for it, a delete
-    /// included, so the delete of a file the log never held (or held until a walk cleared
-    /// it) *adds* the name, and the refused-name count is one too high until the next
-    /// walk. `#[ignore]`d because it fails today; the product task is #188 (see
-    /// `docs/05-testing/reports/flake-hunt-2026-11.md`). Run it with `--ignored`.
+    /// Task #182 found, and task #188 fixed (FR-VLT-01, NFR-REL-01, US-07): the watcher
+    /// used to record a refused name on every event for it, a delete included, so the
+    /// delete of a file the log never held *added* the name and the refused-name count
+    /// stayed one too high until the next walk. A delete now leaves the log untouched
+    /// (see `docs/05-testing/reports/flake-hunt-2026-11.md`).
     #[cfg(unix)]
     #[test]
     fn the_delete_of_a_refused_name_does_not_add_it_to_the_log() {
@@ -695,7 +699,9 @@ mod tests {
         let (dir, vault, queue) = fixture();
         let watcher =
             Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
-        let verbatim = |name: &str| serat_core::verbatim::to_verbatim(&dir.path().join(name));
+        let verbatim = |name: &str| {
+            serat_core::verbatim::to_verbatim(&dir.path().join(name)).expect("verbatim")
+        };
         for name in ["note.", "note "] {
             fs::write(verbatim(name), b"x").expect("create");
         }
