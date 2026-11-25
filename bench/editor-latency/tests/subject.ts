@@ -167,6 +167,9 @@ export async function openNoteForLatencyTest(page: Page, options: OpenOptions = 
     await page.addInitScript({ content: `window.__SERAT_IPC_BRIDGE__ = ${JSON.stringify(options.ipcBridge)}; window.__SERAT_IPC_BRIDGE_TOKEN__ = ${JSON.stringify(options.ipcToken ?? "")};` });
   }
   await page.addInitScript({ content: TAURI_STUB });
+  // Starvation repro for the harness (task #202): SERAT_CPU_THROTTLE=6 slows the page 6x. Never set in CI.
+  const throttle = Number(process.env.SERAT_CPU_THROTTLE ?? "1");
+  if (throttle > 1) await (await page.context().newCDPSession(page)).send("Emulation.setCPUThrottlingRate", { rate: throttle });
   await page.goto(server.url);
   await page.waitForFunction(() => typeof (window as any).__seratBenchOpenNote === "function", null, { timeout: 10_000 }).catch((e) => {
     throw new Error(`window.__seratBenchOpenNote never appeared (is this a --mode bench build?): ${e.message}; page errors: ${pageErrors.join(" | ")}`);

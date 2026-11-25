@@ -87,3 +87,98 @@ export function findLine(lines: string[], fromFraction: number, test: (l: string
   if (i < 0) throw new Error(`no fixture line at or after ${fromFraction} satisfies the scenario's predicate`);
   return i;
 }
+
+// ---- Middle-of-note placement (task #202) ----------------------------------------------------------------
+// Serves NFR-PRF-02, NFR-MNT-01. Budgets run 442 threw from the subject's middle placement: the old code set
+// scrollTop to half of CodeMirror's ESTIMATED height, slept a fixed 400 ms and clicked once; on a starved runner
+// the viewport re-measured after the click target was chosen, the caret landed outside 45-55% (or on no
+// Paragraph line), and an assertion threw before any key was scored. That is a harness exception, not a verdict.
+// Placement now waits for a positive signal (scroll geometry unchanged for several frames), asserts where the
+// caret landed, steers from what it observed and retries until a bounded deadline, then fails with every attempt.
+
+export interface Attempt { ok: boolean; note: string }
+
+/** Runs `attempt` until it reports ok or `deadlineMs` elapses (measured by `now`). Always makes at least one
+ * attempt; never starts one after the deadline. Throws with the notes of every attempt. `label` names the goal. */
+export async function retryUntilDeadline(
+  label: string,
+  attempt: (n: number, remainingMs: number) => Promise<Attempt>,
+  deadlineMs: number,
+  now: () => number = () => Date.now(),
+): Promise<string> {
+  const start = now();
+  const notes: string[] = [];
+  for (let n = 0; n === 0 || now() - start < deadlineMs; n++) {
+    const r = await attempt(n, Math.max(1, deadlineMs - (now() - start)));
+    notes.push(`#${n + 1}: ${r.note}`);
+    if (r.ok) return `${r.note} after ${n + 1} attempt(s)`; // the count is on the run log: each retry warms the height map
+  }
+  throw new Error(`${label}: not reached within ${deadlineMs} ms (harness could not place the caret; this is not a latency verdict). Attempts: ${notes.join(" | ")}`);
+}
+
+/** Where the caret landed relative to the wanted band, as an Attempt. */
+export function judgePlacement(idx: number, total: number, lo: number, hi: number): Attempt {
+  if (idx < 0) return { ok: false, note: "caret is on no recognisable Paragraph line" };
+  const frac = idx / total;
+  const ok = frac > lo && frac < hi;
+  return { ok, note: `source line ${idx} of ${total} (${(frac * 100).toFixed(1)}%)${ok ? "" : ` outside ${lo * 100}-${hi * 100}%`}` };
+}
+
+/** Resolves once the scroller's scrollTop and scrollHeight have not changed for `frames` consecutive animation
+ * frames: CodeMirror has finished re-measuring. Rejects (with the geometry) when `timeoutMs` passes first. */
+async function stableOrMiss(scroller: Locator, timeoutMs: number): Promise<Attempt | null> {
+  try { await waitForStableScroll(scroller, 8, timeoutMs); return null; } catch (e) { return { ok: false, note: String((e as Error).message ?? e) }; }
+}
+
+export async function waitForStableScroll(scroller: Locator, frames = 8, timeoutMs = 10_000): Promise<void> {
+  await scroller.evaluate((s, args) => new Promise<void>((resolve, reject) => {
+    const t0 = performance.now();
+    let last = "", same = 0;
+    const tick = () => {
+      const g = `${s.scrollTop}/${s.scrollHeight}`;
+      same = g === last ? same + 1 : 0;
+      last = g;
+      if (same >= args.frames) return resolve();
+      if (performance.now() - t0 > args.timeoutMs) return reject(new Error(`scroll geometry never settled (last ${g})`));
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }), { frames, timeoutMs });
+}
+
+/** Clicks into the middle of the note and returns a description of the Paragraph line the caret is on, which is
+ * asserted to sit strictly between `lo` and `hi` of the note's lines. Bounded by `deadlineMs`. */
+export async function placeCaretMiddle(page: Page, editor: Locator, lines: string[], lo = 0.45, hi = 0.55, deadlineMs = 30_000): Promise<string> {
+  const scroller = page.locator(`${EDITOR} .cm-scroller`);
+  const lineOf = new Map<number, number>();
+  lines.forEach((l, i) => { const m = /^Paragraph (\d+) /.exec(l); if (m) lineOf.set(Number(m[1]), i); });
+  const wanted = Math.round(lines.length * (lo + hi) / 2);
+  let steer = 0; // px correction learnt from the last miss
+  const note = await retryUntilDeadline("middle: caret within the band", async (_n, remaining) => {
+    const t0 = Date.now(), left = () => Math.max(1, remaining - (Date.now() - t0));
+    let miss = await stableOrMiss(scroller, left());
+    if (miss) return miss;
+    await scroller.evaluate((s, d) => { s.scrollTop = (s.scrollHeight - s.clientHeight) / 2 + d; }, steer);
+    miss = await stableOrMiss(scroller, left());
+    if (miss) return miss;
+    const box = await scroller.boundingBox();
+    if (!box) return { ok: false, note: "editor scroller has no bounding box" };
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    let idx = -1;
+    for (let step = 0; step < 30 && idx < 0; step++) {
+      const m = /Paragraph (\d+) /.exec(await caretLineText(editor));
+      if (m && lineOf.has(Number(m[1]))) idx = lineOf.get(Number(m[1])) as number;
+      else await page.keyboard.press("ArrowDown");
+    }
+    const r = judgePlacement(idx, lines.length, lo, hi);
+    if (!r.ok && idx >= 0) {
+      const pxPerLine = await scroller.evaluate((s, n) => s.scrollHeight / n, lines.length);
+      steer += (wanted - idx) * pxPerLine;
+    }
+    return r;
+  }, deadlineMs);
+  // A final settle before the first scored key; it is a positive signal and the caller's fixed pause stays for start/end.
+  const last = await stableOrMiss(scroller, 10_000);
+  if (last) throw new Error(`middle: caret placed (${note}) but the editor did not settle: ${last.note} (harness could not settle; this is not a latency verdict)`);
+  return note;
+}
