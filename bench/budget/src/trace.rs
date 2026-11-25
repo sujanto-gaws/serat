@@ -491,6 +491,34 @@ fn number_array(text: &str, key: &str) -> Option<Vec<f64>> {
     body.split(',').map(|tok| tok.trim().parse().ok()).collect()
 }
 
+/// As [`number_array`], for `"key":[true,false]`. `Ok(None)` when the key is absent;
+/// an entry that is not a boolean is an error naming the key, never a silent absence.
+fn bool_array(text: &str, key: &str) -> Result<Option<Vec<bool>>, String> {
+    let needle = format!("\"{key}\":[");
+    let Some(at) = text.find(&needle) else {
+        return Ok(None);
+    };
+    let start = at + needle.len();
+    let end = text[start..]
+        .find(']')
+        .ok_or_else(|| format!("the save benchmark report's {key} is not closed"))?
+        + start;
+    let body = text[start..end].trim();
+    if body.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    body.split(',')
+        .map(|tok| match tok.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!(
+                "the save benchmark report's {key} has an entry that is not a boolean: {other:?}"
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// One `--bench-save-list` run, as `serat-app` reported it (task #111's
 /// `BenchmarkExitReport`, task #94's reader). Parsed from the same exit-report
 /// line [`StartupTrace`] reads the seven marks from — `BenchmarkExitReport`
@@ -520,6 +548,20 @@ pub struct SaveBenchmarkTrace {
     /// Elapsed ms of every refused save, reported beside `submitted_ms` and
     /// excluded from it (F-19, F-382).
     pub writer_refused_ms: Vec<f64>,
+    /// Per submitted save, parallel to `submitted_ms` (task #196): a WAL checkpoint
+    /// overlapped the save. Empty when the application did not report it (an older
+    /// binary, or an index without a `WalHealth`): absence, not "false" everywhere.
+    pub checkpoint_overlap: Vec<bool>,
+    /// Per submitted save: an FTS5 merge commit landed inside the save's window.
+    pub fts_merge: Vec<bool>,
+    /// Per submitted save: a writer turn of 50 ms or more overlapped the window.
+    pub slow_commit: Vec<bool>,
+    /// Saves whose FTS5 segment probe failed (counted as no merge).
+    pub flag_probe_failures: u64,
+    /// Idle checkpoints deferred to work in flight, over the run.
+    pub checkpointer_deferred_busy: u64,
+    /// PASSIVE plus RESTART checkpoint runs, over the run.
+    pub checkpointer_runs: u64,
 }
 
 impl SaveBenchmarkTrace {
@@ -546,12 +588,37 @@ impl SaveBenchmarkTrace {
             number_array(line, key)
                 .ok_or_else(|| format!("the save benchmark report has no {key}: {line}"))
         };
+        let submitted = array("save_submitted_ms")?;
+        let tags = |key: &str| -> Result<Vec<bool>, String> {
+            let Some(flags) = bool_array(line, key)? else {
+                return Ok(Vec::new());
+            };
+            if flags.len() == submitted.len() {
+                Ok(flags)
+            } else {
+                Err(format!(
+                    "the save benchmark report's {key} has {} entries for {} submitted saves",
+                    flags.len(),
+                    submitted.len()
+                ))
+            }
+        };
         Ok(SaveBenchmarkTrace {
             attempted: count("save_attempted")?,
-            submitted_ms: array("save_submitted_ms")?,
+            submitted_ms: submitted.clone(),
             handle_missing: counter("save_handle_missing")?,
             writer_refused: counter("save_writer_refused")?,
             writer_refused_ms: array("save_writer_refused_ms")?,
+            // The tags are diagnostic and optional: a report without them still
+            // gates. A tag array of the wrong length is not: it would pair samples
+            // with the wrong flags, so it is refused by name.
+            checkpoint_overlap: tags("save_checkpoint_overlap")?,
+            fts_merge: tags("save_fts_merge")?,
+            slow_commit: tags("save_slow_commit")?,
+            flag_probe_failures: number(line, "save_flag_probe_failures").map_or(0, |n| n as u64),
+            checkpointer_deferred_busy: number(line, "save_checkpointer_deferred_busy")
+                .map_or(0, |n| n as u64),
+            checkpointer_runs: number(line, "save_checkpointer_runs").map_or(0, |n| n as u64),
         })
     }
 }
@@ -957,6 +1024,47 @@ mod tests {
         assert_eq!(trace.attempted, 0);
         assert!(trace.submitted_ms.is_empty());
         assert_eq!(trace.handle_missing, 0);
+    }
+
+    #[test]
+    fn the_per_save_tags_parse_when_present_and_are_absent_otherwise() {
+        // Task #196, NFR-PRF-03.
+        let plain = save_report(3, "12.5,8.3,15.0", 0, 0, "");
+        let none = SaveBenchmarkTrace::parse(&plain).expect("untagged report");
+        assert!(none.checkpoint_overlap.is_empty() && none.fts_merge.is_empty());
+        let tagged = plain.replace(
+            "\"save_writer_refused_ms\":[]",
+            "\"save_writer_refused_ms\":[],\"save_checkpoint_overlap\":[false,true,false],\
+             \"save_fts_merge\":[false,false,true],\"save_slow_commit\":[false,false,true],\
+             \"save_flag_probe_failures\":2,\"save_checkpointer_deferred_busy\":5,\
+             \"save_checkpointer_runs\":7",
+        );
+        let t = SaveBenchmarkTrace::parse(&tagged).expect("tagged report");
+        assert_eq!(t.checkpoint_overlap, vec![false, true, false]);
+        assert_eq!(t.fts_merge, vec![false, false, true]);
+        assert_eq!(t.slow_commit, vec![false, false, true]);
+        assert_eq!(
+            (
+                t.flag_probe_failures,
+                t.checkpointer_deferred_busy,
+                t.checkpointer_runs
+            ),
+            (2, 5, 7)
+        );
+    }
+
+    #[test]
+    fn a_tag_array_that_does_not_match_the_samples_is_refused_by_name() {
+        // Pairing samples with the wrong flags would invent a finding.
+        let line = save_report(3, "12.5,8.3,15.0", 0, 0, "").replace(
+            "\"save_writer_refused_ms\":[]",
+            "\"save_writer_refused_ms\":[],\"save_fts_merge\":[true]",
+        );
+        let err = SaveBenchmarkTrace::parse(&line).expect_err("a short tag array");
+        assert!(err.contains("save_fts_merge"), "{err}");
+        let err = bool_array("{\"x\":[true,maybe]}", "x").expect_err("a malformed entry");
+        assert!(err.contains('x') && err.contains("maybe"), "{err}");
+        assert_eq!(bool_array("{}", "x"), Ok(None));
     }
 
     #[test]

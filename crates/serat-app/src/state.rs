@@ -2157,6 +2157,41 @@ impl AppState {
             .map(|open| open.vault.root().to_path_buf())
     }
 
+    /// The open vault's checkpointer facts, for the `--bench-save-list` run to tag its
+    /// samples with (task #196, NFR-PRF-03). Read-only atomics; `None` with no vault or
+    /// before the index handle exists.
+    #[must_use]
+    pub fn wal_health(&self) -> Option<Arc<serat_index::WalHealth>> {
+        self.open_lock()
+            .as_ref()
+            .and_then(|open| open.publisher.wal_health())
+    }
+
+    /// Wait until every save submitted so far has been committed, for the
+    /// `--bench-save-list` run (task #196): a writer barrier (`flush`), which is
+    /// answered after the queue ahead of it. `false` when there is no handle, or the
+    /// writer is gone. Never on a product path.
+    pub fn flush_index_for_bench(&self) -> bool {
+        use serat_core::IndexWriter as _;
+        let Some(open) = self
+            .open_lock()
+            .as_ref()
+            .map(|o| Arc::clone(&o.index_handle))
+        else {
+            return false;
+        };
+        let writer = {
+            let guard = open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(handle) => handle.writer(),
+                None => return false,
+            }
+        };
+        writer.flush().is_ok()
+    }
+
     // -- internals ----------------------------------------------------------
 
     /// Rule 2, applied before any filesystem call.

@@ -275,6 +275,16 @@ impl<S: StatusSink> StatusPublisher<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(health);
     }
 
+    /// The checkpointer's facts, once the vault's `IndexHandle` exists. Read-only; the
+    /// `--bench-save-list` run reads it to tag each save sample (task #196).
+    #[must_use]
+    pub fn wal_health(&self) -> Option<Arc<serat_index::WalHealth>> {
+        self.wal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// The pinned-WAL size, if the checkpointer reports one. Atomics only.
     fn wal_pinned_bytes(&self) -> Option<u64> {
         self.wal

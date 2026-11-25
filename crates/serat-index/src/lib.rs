@@ -20,6 +20,7 @@ pub mod checkpoint;
 pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
 
 pub mod external;
+pub mod fts_probe;
 pub mod history;
 pub mod identity;
 pub mod incremental;
@@ -35,6 +36,7 @@ pub mod writer;
 
 pub use check::{QuickCheck, quick_check};
 pub use checkpoint::{Bounds, BusyGuard, CheckpointStats, WalHealth};
+pub use fts_probe::FtsProbe;
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild, open_or_rebuild_observed};

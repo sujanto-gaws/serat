@@ -730,7 +730,7 @@ fn run(
 
         // Work in flight until this turn's commit and reply are done (task #183): an idle
         // WAL checkpoint does not start inside it.
-        let _busy = health.busy_guard();
+        let _busy = health.writer_turn_guard();
         fault.wait_if_held();
         // Every command but an `Apply` has a caller waiting on a reply, including the
         // ones that commit in their own arm and `continue` (resolve, bulk load, close).
