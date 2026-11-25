@@ -27,13 +27,6 @@
 //! *reduction* of one batch and this is a second *measurement* — two vaults,
 //! interleaved, with the 50,000-note fixture in it (F-446).
 //!
-//! ```text
-//! cargo run --release -p budget --bin prf01-cold-start -- --profile reference
-//! ```
-//!
-//! `--skip-scale` reports the two figures only, for a quick local check. That
-//! leaves the run with nothing asserted in it at all, which is what
-//!
 //! **This file holds no logic, and that is task #124's whole point (F-501).**
 //! F-81 recorded `run_scale_check` being droppable with nothing going red, and
 //! the remedy moved the measurement and the judgement into the library -- but
