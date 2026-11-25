@@ -1,7 +1,9 @@
 //! NFR-PRF-01 (re-baselined, task #104) · the Serat term of cold start < 350 ms p95.
 //!
 //! Verifies **NFR-PRF-01**, **NFR-PRF-08**, **US-35**, ADR-0014 §Decision 3. This is the
-//! binding CI gate for NFR-PRF-01 from the #104 re-baseline forward: `S_pre + S_setup +
+//! binding quantity for NFR-PRF-01 from the #104 re-baseline forward (task #190: on hosted
+//! runners it reports and fails only on an unmeasurable run; it asserts under `--profile
+//! reference` and on any gate-eligible runner): `S_pre + S_setup +
 //! S_shell + S_settle`, the portion of cold start Serat's own code is responsible for.
 //! The platform term and both legacy marks (`window_visible`, `vault_usable`) are
 //! reported inside this job's own output, never asserted — F-407 found the aggregate

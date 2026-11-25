@@ -290,7 +290,7 @@ jobs:
   # it never has `continue-on-error` or `|| true`. If GitHub ever gives the image the scanner,
   # the same command starts asserting 350 ms. `every-budget-has-a-job` pins this name.
   prf01-serat-term:
-    name: "NFR-PRF-01 · Serat term < 350 ms p95 (report-only on hosted windows; asserted on the reference machine; task #104's binding gate)"
+    name: "NFR-PRF-01 · Serat term < 350 ms p95 (report-only on hosted windows; asserted on the reference machine)"
     needs: [vault, build-app]
     runs-on: windows-latest
     if: ${{ !inputs.prf01_diagnostic }}

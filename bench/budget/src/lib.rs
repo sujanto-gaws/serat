@@ -6148,6 +6148,14 @@ mod tests {
         // And on a gate-eligible runner under ci the straddle is still a failure.
         let eligible = outcome_on(PRF01_SERAT_TERM, Profile::Ci, linux(), &v);
         assert!(eligible.asserted() && !enforce(&eligible));
+        assert_eq!(
+            job_exit(&PRF01_SERAT_TERM, Ok(hosted)),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            job_exit(&PRF01_SERAT_TERM, Ok(eligible)),
+            std::process::ExitCode::FAILURE
+        );
         // A degraded measurement is not waived by report-only.
         let mut degraded = outcome_on(PRF01_SERAT_TERM, Profile::Ci, hosted_windows(), &v);
         degraded.degraded = Some("a launch was refused".into());
