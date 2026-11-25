@@ -509,20 +509,30 @@ fn measure(
             .map_err(|e| e.to_string())?;
         found.collect::<Result<_, _>>().map_err(|e| e.to_string())?
     };
+    // Task #185: the resolver is built once per tree generation and reused, so a call
+    // after the first is the lookups only. The build is reported on its own row.
     rows.push(time(
         &format!(
-            "R6 resolve_links tree fallback, {batch_len} targets over {} paths (fold once per call)",
+            "R6 tree fallback PathResolver::new only (not the note_paths snapshot), once per tree generation, {} paths",
+            all_paths.len()
+        ),
+        None,
+        iterations,
+        || {
+            serat_index::read::PathResolver::new(all_paths.iter().map(String::as_str))
+                .resolve("x")
+                .is_some() as usize
+        },
+    ));
+    let cached = serat_index::read::PathResolver::new(all_paths.iter().map(String::as_str));
+    rows.push(time(
+        &format!(
+            "R6 resolve_links tree fallback, {batch_len} targets over {} paths (cached resolver)",
             all_paths.len()
         ),
         Some(10.0),
         iterations,
-        || {
-            let resolver = serat_index::read::PathResolver::new(all_paths.iter().map(String::as_str));
-            batch
-                .iter()
-                .filter(|t| resolver.resolve(t).is_some())
-                .count()
-        },
+        || batch.iter().filter(|t| cached.resolve(t).is_some()).count(),
     ));
     // R7: note_anchors of the note carrying the most anchors.
     let anchored: String = one_string(

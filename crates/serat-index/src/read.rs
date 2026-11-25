@@ -399,31 +399,32 @@ pub struct Anchors {
 /// `state::tests` pins that it agrees with R6 over one vault, including a multi-byte
 /// directory name.
 #[derive(Debug, Default)]
-pub struct PathResolver<'a> {
-    by_path: std::collections::HashMap<String, &'a str>,
-    by_name: std::collections::HashMap<String, &'a str>,
+pub struct PathResolver {
+    by_path: std::collections::HashMap<String, String>,
+    by_name: std::collections::HashMap<String, String>,
 }
 
 fn shorter(a: &str, b: &str) -> bool {
     (a.chars().count(), a) < (b.chars().count(), b)
 }
 
-fn keep_best<'a>(map: &mut std::collections::HashMap<String, &'a str>, key: String, path: &'a str) {
+fn keep_best(map: &mut std::collections::HashMap<String, String>, key: String, path: &str) {
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut e) => {
             if shorter(path, e.get()) {
-                e.insert(path);
+                e.insert(path.to_owned());
             }
         }
         std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(path);
+            e.insert(path.to_owned());
         }
     }
 }
 
-impl<'a> PathResolver<'a> {
-    /// Fold every path once.
-    pub fn new(paths: impl IntoIterator<Item = &'a str>) -> Self {
+impl PathResolver {
+    /// Fold every path once. The resolver owns what it keeps, so it can outlive the
+    /// listing it was built from (task #185: one per tree generation).
+    pub fn new<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
         let mut out = Self::default();
         for path in paths {
             let folded = serat_core::fold_case(path);
@@ -437,21 +438,20 @@ impl<'a> PathResolver<'a> {
     /// The path the resolver chooses for `folded_target` (already
     /// [`serat_core::fold_case`]d), or `None`.
     #[must_use]
-    pub fn resolve(&self, folded_target: &str) -> Option<&'a str> {
+    pub fn resolve(&self, folded_target: &str) -> Option<&str> {
         let with_md = format!("{folded_target}.md");
-        let mut best: Option<&'a str> = None;
-        let mut consider = |found: Option<&&'a str>| {
-            if let Some(&path) = found
-                && best.is_none_or(|b| shorter(path, b))
-            {
-                best = Some(path);
+        let mut best: Option<&str> = None;
+        let by_name = !folded_target.contains('/');
+        let candidates = [
+            self.by_path.get(folded_target),
+            self.by_path.get(&with_md),
+            by_name.then(|| self.by_name.get(folded_target)).flatten(),
+            by_name.then(|| self.by_name.get(&with_md)).flatten(),
+        ];
+        for path in candidates.into_iter().flatten() {
+            if best.is_none_or(|b| shorter(path, b)) {
+                best = Some(path.as_str());
             }
-        };
-        consider(self.by_path.get(folded_target));
-        consider(self.by_path.get(&with_md));
-        if !folded_target.contains('/') {
-            consider(self.by_name.get(folded_target));
-            consider(self.by_name.get(&with_md));
         }
         best
     }
@@ -462,8 +462,10 @@ impl<'a> PathResolver<'a> {
 pub fn resolve_among_paths<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     folded_target: &str,
-) -> Option<&'a str> {
-    PathResolver::new(paths).resolve(folded_target)
+) -> Option<String> {
+    PathResolver::new(paths)
+        .resolve(folded_target)
+        .map(str::to_owned)
 }
 
 /// Attachments (FR-VLT-08), one statement. The last two columns are what the resolver
