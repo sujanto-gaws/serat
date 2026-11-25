@@ -350,7 +350,7 @@ jobs:
         run: |
           mkdir -p bench/out/budgets
           for n in 1 2 3; do
-            cargo run --release -p budget --bin prf01-cold-start -- --profile ci 2>&1 | tee "bench/out/budgets/diag-cold-start-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
+            cargo run --release -p budget --bin prf01-cold-start -- --profile ci --skip-scale 2>&1 | tee "bench/out/budgets/diag-cold-start-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
           done
       - uses: actions/upload-artifact@v4
         if: always()
