@@ -964,6 +964,7 @@ fn live_webview_processes() -> Option<usize> {
 /// does not start while a browser process of the last one is still shutting down (hypothesis 2
 /// of the Windows first-run report, finding 2).
 fn settle_webview_processes(seq: usize) {
+    let began = Instant::now();
     use std::sync::atomic::Ordering;
     if WEBVIEW_RESIDENTS_NOT_OURS.load(Ordering::Relaxed) {
         return;
@@ -979,16 +980,16 @@ fn settle_webview_processes(seq: usize) {
         WEBVIEW_EXIT_POLL,
     );
     match outcome {
-        Quiet::Quiet { waited } => eprintln!(
+        Quiet::Quiet { .. } => eprintln!(
             "budget: launch {seq}: msedgewebview2.exe quiet after {} ms",
-            waited.as_millis()
+            began.elapsed().as_millis()
         ),
-        Quiet::TimedOut { waited, remaining } => {
+        Quiet::TimedOut { remaining, .. } => {
             WEBVIEW_RESIDENTS_NOT_OURS.store(true, Ordering::Relaxed);
             eprintln!(
                 "budget: launch {seq}: {remaining} msedgewebview2.exe still running after {} ms; \
                  not waiting again in this process",
-                waited.as_millis()
+                began.elapsed().as_millis()
             );
         }
     }
@@ -1025,11 +1026,11 @@ fn keep_webview_log_and_remove(folder: &Path, seq: usize, run: usize) {
             );
         }
         None => eprintln!(
-            "budget: launch {seq}: no chrome_debug.log (data folder {})",
+            "budget: launch {seq}: no chrome_debug.log, expected with --enable-logging=stderr (data folder {})",
             if populated {
-                "populated"
+                "exists"
             } else {
-                "never created: the override was not honoured"
+                "absent: the app may have died before the webview started, or the override was not honoured"
             }
         ),
     }
