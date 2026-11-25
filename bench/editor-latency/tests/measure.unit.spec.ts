@@ -239,3 +239,34 @@ test("mulberry32 is deterministic and in [0,1)", () => {
     expect(x).toBeLessThan(1);
   }
 });
+
+// TC-181 (task #202): the caret placement that threw in Budgets run 442 is a bounded retry, not a one-shot.
+import { retryUntilDeadline, judgePlacement } from "./caret";
+
+test.describe("caret placement (NFR-PRF-02 harness, TC-181)", () => {
+  test("a placement that misses twice (layout still moving) and then lands is accepted, not thrown", async () => {
+    let t = 0;
+    const note = await retryUntilDeadline("x", async (n) => ({ ok: n === 2, note: `try ${n}` }), 1000, () => (t += 10));
+    expect(note).toBe("try 2 after 3 attempt(s)");
+  });
+  test("a placement that never lands throws once, after the deadline, naming every attempt and saying it is not a verdict", async () => {
+    let t = 0, calls = 0;
+    await expect(retryUntilDeadline("middle", async () => { calls++; return { ok: false, note: "off band" }; }, 100, () => (t += 30)))
+      .rejects.toThrow(/middle: not reached within 100 ms.*not a latency verdict.*#1: off band.*#2: off band/);
+    expect(calls).toBeGreaterThan(1);
+    expect(calls).toBeLessThan(10);
+  });
+  test("one attempt is always made with a zero deadline, and none starts after it; the attempt is told the time left", async () => {
+    let calls = 0, t = 0;
+    const left: number[] = [];
+    await expect(retryUntilDeadline("x", async (_n, rem) => { calls++; left.push(rem); t += 500; return { ok: false, note: "late" }; }, 100, () => t)).rejects.toThrow(/not a latency verdict/);
+    expect(calls).toBe(1);
+    expect(left).toEqual([100]);
+  });
+  test("judgePlacement: the 45-55% band is exclusive and a caret on no Paragraph line is a miss", () => {
+    expect(judgePlacement(2500, 5000, 0.45, 0.55).ok).toBe(true);
+    expect(judgePlacement(2250, 5000, 0.45, 0.55).ok).toBe(false);
+    expect(judgePlacement(2750, 5000, 0.45, 0.55).ok).toBe(false);
+    expect(judgePlacement(-1, 5000, 0.45, 0.55).ok).toBe(false);
+  });
+});

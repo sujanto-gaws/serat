@@ -178,3 +178,15 @@ The reference-machine run on WebView2; the scroll-margin A/B; a release-profile 
 ## Verdict
 
 **Harness: GO (after the stub fix).** **Budget evidence: none; supporting evidence: GO on the quiet container, 8 of 8 scenarios and the real-IPC arm PASS on E0.** The P1 gate still cannot cite an NFR-PRF-02 gate figure until the reference-machine run exists.
+
+## Addendum 2026-11-25: Budgets run 442, harness exception in the middle placement (task #202, TC-181)
+
+Run 442 (894cfb1, ubuntu-latest, job 139376436976): the headless NFR-PRF-02 job failed in the step "Unit, controls, then subject" with 1 failed / 64 passed. The failure was `[subject] nfr-prf-02-subject.spec.ts:107 [middle]`, an error thrown from `placeCaret` before a key was scored: a harness exception, not a latency verdict. The "Other scenarios" step was skipped (default `if: success()`); the Summary step and the artifact ran (`if: always()`). Runs 440, 441, 443 and 444 passed. Source: the lead's quotation of the job log; the error-context artifact was not reachable.
+
+**Mechanism (most likely, not reproduced).** The middle placement was one shot: scroll to half of the estimated height, sleep a fixed 400 ms, click, step down to a Paragraph line, assert 45-55% (and that a Paragraph line was found). If CodeMirror re-measures after the click target was chosen, the caret lands outside the band and the assertion throws. Locally (Chromium 153, quiet) it passed at no throttling; with CDP CPU throttling 4x and 8x it still placed correctly (the subject then failed on latency, which is the expected verdict). So the race was not reproduced, and the throwing assertion of run 442 is not identified.
+
+**Fix.** `placeCaretMiddle` (caret.ts) waits for the scroll geometry to be unchanged for 8 frames, clicks, asserts, steers by the observed miss and retries up to a 30 s deadline; failure is one error listing every attempt and stating it is not a latency verdict. `SERAT_CPU_THROTTLE=n` (never set in CI) slows the page n-fold for starvation repros.
+
+**Gate wiring.** Neither `editor-latency` nor `editor-latency-real-ipc` is in `budgets-gate.needs` or its result loop; both are job-level `continue-on-error: true`. Nothing changed there. The "Other scenarios" step stays skipped after a subject failure: running it unconditionally would take the job (20 + 35 minutes) to the edge of its 60-minute timeout, so it is left to the owner.
+
+**Not verified:** that the fix removes run 442's failure; a hosted run.

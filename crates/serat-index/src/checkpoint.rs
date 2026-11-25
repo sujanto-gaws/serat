@@ -730,7 +730,13 @@ fn attempt(
         Some(TransactionState::None),
         "the checkpointer connection must never be inside a transaction"
     );
-    if idle && state.frames - state.base < bounds.idle_floor_frames {
+    // Not while the WAL is reported pinned (architect, #199): the idle PASSIVE then
+    // retries every `retry` and the episode's RESTART runs at the gate, so the fact
+    // clears soon after the reader lets go. Deferral and spacing still apply.
+    if idle
+        && health.pinned_bytes().is_none()
+        && state.frames - state.base < bounds.idle_floor_frames
+    {
         // Below the floor (task #199): a run would be mostly flush. Not a deferral, so
         // the baseline stays; disarm so the timer waits for the next commit.
         health.floor_skips.fetch_add(1, Ordering::Relaxed);
@@ -1236,17 +1242,23 @@ mod tests {
     }
 
     #[test]
-    fn the_pinned_restart_is_floored_like_the_idle_passive() {
+    fn the_floor_does_not_apply_while_the_wal_is_reported_pinned() {
+        // Architect ruling on #199: below the floor, a pinned WAL still gets its idle
+        // PASSIVE and the episode's one RESTART, and is not disarmed.
         let health = WalHealth::default();
         health.set_pinned_for_test(Some(1));
         let mut state = state_at(IDLE_FLOOR_FRAMES - 1, 0);
         attempt_once(&mut state, floored(), &health, true);
-        assert_eq!(health.stats().restart_runs, 0);
-        assert_eq!(health.stats().floor_skips, 1);
+        assert_eq!(health.stats().floor_skips, 0);
+        assert_eq!(health.stats().idle_runs, 1, "the idle PASSIVE ran");
+        assert!(!state.disarmed);
+        // Unpinned, the same growth is below the floor.
+        let health = WalHealth::default();
+        let mut state = state_at(IDLE_FLOOR_FRAMES - 1, 0);
+        attempt_once(&mut state, floored(), &health, true);
         assert_eq!(
-            state.due(floored(), true),
-            None,
-            "disarmed: no spin on RESTART"
+            (health.stats().floor_skips, health.stats().idle_runs),
+            (1, 0)
         );
     }
 
