@@ -121,21 +121,25 @@ owner: lead
 | 172 | `[P1/test] Make the IPC bridge buildable in release so save_patch can be timed as shipped` (NFR-PRF-03, NFR-PRF-02, US-01; ADR-0019, ADR-0008) | tauri-app-dev + test-engineer | 147 | **merged** 70bec0a (2 rounds) |
 | 173 | `[P1/design] Rule whether save_patch parses the note after the save returns, off the command thread` → ADR-0020 (NFR-PRF-03, FR-VLT-04, US-01; ADR-0008, ADR-0015, ADR-0016, ADR-0019) | architect | 172 | **merged** ecef8ec (2 rounds; re-authored branch) |
 | 174 | `[P1/req] PRD v1.13: NFR-PRF-03 names the note class it binds; 5,000-line scenario reported, not gating` (NFR-PRF-03, US-01; ADR-0019) | product-analyst | 172 | **merged** 08f193f |
-| 175 | `[P1/impl] Report each non-bulk committed batch from the index writer to an installed observer` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0001, ADR-0020) | rust-core-dev | 173 | pending |
-| 176 | `[P1/impl] Announce index://changed from the writer's commit observer only, and drop the slot lock before the parse` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0016, ADR-0011, ADR-0020) | tauri-app-dev | 175 | pending |
+| 175 | `[P1/impl] Report each non-bulk committed batch from the index writer to an installed observer` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0001, ADR-0020) | rust-core-dev | 173 | **merged** 9ba7cb5 (2 rounds) |
+| 176 | `[P1/impl] Announce index://changed from the writer's commit observer only, and drop the slot lock before the parse` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0016, ADR-0011, ADR-0020) | tauri-app-dev | 175 | **merged** e9b6576 (2 rounds) |
 | 177 | `[P1/test] Linux desktop reference run (gaws-dev-05): RM-2 runbook row, report, gate-report columns` (NFR-PRF-01/03/04/08, US-35, C-06; ADR-0019) | test-engineer | owner run | **merged** 12542f1 (2 rounds) |
 | 178 | `[P1/impl] Startup timeout prints the marks snapshot and every rejected paint evidence` (NFR-PRF-01/08; ADR-0014) | tauri-app-dev | 167 | **merged** fe85178 (2 rounds) |
 | 179 | `[P1/test] WebView2 diagnostic dispatch of the NFR-PRF-01 jobs on windows-latest` (NFR-PRF-01/08, US-35, C-06; ADR-0019, ADR-0014) | test-engineer | 178 | **merged** 2409ca0 (1 round) |
 | 180 | `[P1/test] Re-read FR-VLT-04 on windows-latest after the #167 harness diagnostics` (FR-VLT-04, NFR-PRF-08, US-35, C-02, C-06; ADR-0019, ADR-0015) | test-engineer | 167 | **merged** 96476ec (2 rounds) |
 | 181 | `[P1/impl] Register the resolve_links and note_anchors commands the editor already invokes` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0007, ADR-0010, ADR-0011, ADR-0020) | tauri-app-dev | 176 | **merged** 4003717 (2 rounds + ts-drift fixup) |
 | 182 | `[P1/test] Hunt two one-off test failures seen 2026-11-24` (NFR-REL-01, NFR-MNT-01, US-07) | test-engineer | 175, 176 | **merged** a2d6884 (1 round) |
-| 183 | `[P1/impl] External-change processing under a WAL checkpoint overlap` (FR-VLT-04, NFR-PRF-03; ADR-0001) | rust-core-dev | 180 | pending |
-| 184 | `[P1/impl] Nested heading subpaths: [[Note#A#B]] must require B under A` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0010) | tauri-app-dev + rust-core-dev | 181 | pending |
-| 185 | `[P1/impl] Cache the tree-fallback link resolver on the tree generation` (FR-EDT-03, NFR-PRF-02, US-03; ADR-0011, ADR-0015) | tauri-app-dev | 181 | pending |
-| 186 | `[P1/impl] Retry the paint mark when the frame gate refuses equal requestAnimationFrame timestamps` (NFR-PRF-01/08, US-35; ADR-0014) | vue-frontend-dev | 179 | in progress |
-| 187 | `[P1/test] prf01-cold-start documents --skip-scale but its parser rejects the flag` (NFR-PRF-01/08, US-35; ADR-0014, ADR-0019) | test-engineer | 179 | pending |
-| 188 | `[P1/impl] Watcher: a delete event must not record a refused name` (FR-VLT-01, NFR-REL-01, US-07; ADR-0015) | rust-core-dev + architect | 182 | pending |
-| 189 | `[P1/test] asset tests spawn mkfifo inside the serat-app lib test binary (fork-exec lock hazard)` (NFR-REL-01, NFR-MNT-01) | test-engineer | 182 | pending |
+| 183 | `[P1/impl] External-change processing under a WAL checkpoint overlap` (FR-VLT-04, NFR-PRF-03; ADR-0001) | rust-core-dev | 180 | in progress |
+| 184 | `[P1/impl] Nested heading subpaths: [[Note#A#B]] must require B under A` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0010) | tauri-app-dev + rust-core-dev | 181 | **merged** 8bc0417 (INDEX_VERSION 13; 1 round) |
+| 185 | `[P1/impl] Cache the tree-fallback link resolver on the tree generation` (FR-EDT-03, NFR-PRF-02, US-03; ADR-0011, ADR-0015) | tauri-app-dev | 181 | **merged** df543ba (1 round) |
+| 186 | `[P1/impl] Retry the paint mark when the frame gate refuses equal requestAnimationFrame timestamps` (NFR-PRF-01/08, US-35; ADR-0014) | vue-frontend-dev | 179 | **merged** 83b616d (1 round; acceptance 1 of 3 hang-free runs) |
+| 187 | `[P1/test] prf01-cold-start documents --skip-scale but its parser rejects the flag` (NFR-PRF-01/08, US-35; ADR-0014, ADR-0019) | test-engineer | 179 | **merged** 2337a32 (1 round) |
+| 188 | `[P1/impl] Watcher: a delete event must not record a refused name` (FR-VLT-01, NFR-REL-01, US-07; ADR-0015) | rust-core-dev + architect | 182 | **merged** a0cbf0a (ruling 6e70650; 1 round each after a BLOCKING on the ruling) |
+| 189 | `[P1/test] asset tests spawn mkfifo inside the serat-app lib test binary (fork-exec lock hazard)` (NFR-REL-01, NFR-MNT-01) | test-engineer | 182 | **merged** 697c457 (2 rounds) |
+| 190 | `[P1/test] NFR-PRF-01 Serat term on windows-latest after #186: INDETERMINATE; decide the CI ceiling` → report-only on hosted Windows, ADR-0019 amendment (NFR-PRF-01/08, US-35, C-06; ADR-0014, ADR-0019) | test-engineer + architect | 186 | **merged** 5de8807 (2 rounds) |
+| 191 | `[P1/test] ci.yml red on main: Windows lib tests do not compile, cargo-deny cookie, windows-gnu target` (NFR-REL-01, NFR-SEC-07, NFR-MNT-01, NFR-CMP-01) | test-engineer | — | **merged** 001b1ef (1 round) |
+| 192 | `[P1/impl] Startup launches exit 2 after a frame-gate refusal (runs 431/432); 55 s no-window launch; prf03 INDETERMINATE` (NFR-PRF-01/03/08, US-35; ADR-0014, ADR-0019, ADR-0015) | tauri-app-dev | 186, 190 | **merged** 7204e4e (1 round) |
+| 193 | `[P1/test] ci run 460: Windows-only search-slot test defect, url advisory, windows-gnu target step` (NFR-REL-01, NFR-SEC-07, NFR-MNT-01, NFR-CMP-01) | test-engineer | 191 | **merged** 0a4b3fe |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
