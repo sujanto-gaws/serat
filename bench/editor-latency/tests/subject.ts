@@ -120,6 +120,7 @@ const TAURI_STUB = `
         if (cmd === "index_status") return Promise.resolve({ state: "idle" });
         // Task #147: both used to be answered with null, which threw in the app (null.toFixed, null.map) on every run.
         if (cmd === "mark_first_paint" || cmd === "mark_vault_usable") return Promise.resolve(1);
+        // Stub arm only: with a bridge, resolve_links and note_anchors were forwarded above to the real commands (task #181).
         if (cmd === "resolve_links") return Promise.resolve([]);
         if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);

@@ -5,7 +5,11 @@
 //! search <= 100 ms p95 over terms matching at most 20% of blocks (the ruling on #15:
 //! the very common terms are reported, with their match count, and carry no
 //! expectation), R2 backlinks of the highest in-degree note <= 20 ms, R3 a 500-row
-//! property lookup in one `LIMIT 500` statement <= 20 ms, R1 + R3 <= 100 ms. The save
+//! property lookup in one `LIMIT 500` statement <= 20 ms, R1 + R3 <= 100 ms. Task #181
+//! adds the editor's two link reads (§9.3): R6 `resolve_links`, one statement for a
+//! 45-target viewport batch (40 note names, written in mixed case, plus 5 misses) <= 10
+//! ms, and R7 `note_anchors` of the note with the most headings and block ids <= 5 ms;
+//! both report-only, like the rest of this bin. The save
 //! of the highest in-degree note, and of a note whose file name is shared by hundreds
 //! of others, are timed too (NFR-PRF-03's 50 ms is asserted by prf03-save-to-index
 //! once serat-app exists; until then this is the only measurement of the link
@@ -452,6 +456,64 @@ fn measure(
         Some(20.0),
         iterations,
         || reader.backlinks(&dense).map_or(0, |b| b.len()),
+    ));
+
+    // R4: the editor's resolve_links, one viewport batch in one statement (task #181).
+    // 40 existing file names spread over the vault, upper-cased so the fold is exercised,
+    // and 5 names no note carries.
+    let link_probe = Connection::open(db).map_err(|e| e.to_string())?;
+    let total_notes: i64 = link_probe
+        .query_row("SELECT count(*) FROM notes WHERE kind = 'note'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    let stride = (total_notes / 40).max(1);
+    let mut batch: Vec<String> = Vec::new();
+    {
+        let mut stmt = link_probe
+            .prepare(
+                "SELECT file_name FROM notes WHERE kind = 'note' AND id % ?1 = 0 \
+                 ORDER BY id LIMIT 40",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut found = stmt.query([stride]).map_err(|e| e.to_string())?;
+        while let Some(row) = found.next().map_err(|e| e.to_string())? {
+            let name: String = row.get(0).map_err(|e| e.to_string())?;
+            batch.push(serat_core::fold_case(
+                name.trim_end_matches(".md").to_uppercase().as_str(),
+            ));
+        }
+    }
+    for i in 0..5 {
+        batch.push(format!("no-such-note-{i}"));
+    }
+    let batch_len = batch.len();
+    rows.push(time(
+        &format!("R6 resolve_links, {batch_len} targets in one statement"),
+        Some(10.0),
+        iterations,
+        || {
+            reader
+                .resolve_targets(&batch)
+                .map_or(0, |r| r.iter().flatten().count())
+        },
+    ));
+    // R5: note_anchors of the note carrying the most anchors.
+    let anchored: String = one_string(
+        &link_probe,
+        "SELECT n.path FROM blocks b JOIN notes n ON n.id = b.note_id \
+         WHERE b.kind = 'heading' OR b.block_ref IS NOT NULL \
+         GROUP BY b.note_id ORDER BY count(*) DESC, n.path LIMIT 1",
+    )?;
+    rows.push(time(
+        &format!("R7 note_anchors of {anchored:?}, the note with the most anchors"),
+        Some(5.0),
+        iterations,
+        || {
+            reader
+                .note_anchors(&anchored)
+                .map_or(0, |a| a.map_or(0, |a| a.headings.len() + a.block_ids.len()))
+        },
     ));
 
     // R3: one page of 50, then the whole 500-row lookup in one LIMIT 500 statement.
