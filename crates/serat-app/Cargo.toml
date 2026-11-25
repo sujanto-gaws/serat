@@ -83,6 +83,12 @@ serat-vault = { path = "../serat-vault", features = ["test-hooks", "phase-timing
 rusqlite = { workspace = true }
 # Test fixtures that clean up after themselves.
 tempfile = { workspace = true }
+# task #189: `nix::unistd::mkfifo` for the FIFO test, so no `mkfifo` child is forked inside the lib
+# test binary (a child between fork and exec holds every index `flock`; same hazard as #182). Safe
+# code (the workspace forbids unsafe_code, so `libc::mkfifo` cannot be called) and it builds on
+# Apple targets, where rustix's `mknodat` is cfg'd out. Dev-only, unix-only.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", default-features = false, features = ["fs"] }
 
 # `tauri`'s "test" feature (`tauri::test`, `MockRuntime`) is a target-specific
 # dev-dependency rather than a plain one: `tests/acl_behaviour.rs` is

@@ -1816,3 +1816,6 @@ mod refusal_wiring_tests;
 
 #[cfg(test)]
 mod held_lock_tests;
+
+#[cfg(test)]
+mod spawn_guard_tests;
