@@ -659,3 +659,29 @@ fn r6_answers_one_row_per_target_in_request_order_and_r7_tells_no_note_from_no_a
         .expect("a note");
     assert_eq!(none.block_ids, Vec::<String>::new());
 }
+
+#[test]
+fn r7_returns_each_headings_level_in_document_order() {
+    // Task #184: the level is what lets serat-app require `#A#B` to sit under A. The
+    // line-based test parser makes only level 1, so the rows are written directly; the
+    // real parser's levels are covered through serat-app (`resolve_links_requires_a_nested_...`).
+    let f = fixture(&[("lv.md", "plain\n")]);
+    let conn = schema::open(&f.db).expect("writer");
+    for (ord, kind, text, level) in [
+        (10, "heading", "One", Some(1)),
+        (11, "para", "body", None),
+        (12, "heading", "Three", Some(3)),
+        (13, "heading", "Two", Some(2)),
+        (14, "heading", "Six", Some(6)),
+    ] {
+        conn.execute(
+            "INSERT INTO blocks (note_id, ord, kind, text, heading_level)
+             VALUES ((SELECT id FROM notes WHERE path = 'lv.md'), ?1, ?2, ?3, ?4)",
+            params![ord, kind, text, level],
+        )
+        .expect("insert block");
+    }
+    let anchors = f.reader.note_anchors("lv.md").expect("R7").expect("a note");
+    assert_eq!(anchors.headings, ["One", "Three", "Two", "Six"]);
+    assert_eq!(anchors.heading_levels, [1, 3, 2, 6]);
+}

@@ -375,7 +375,7 @@ const R6: &str = concat!(
 /// R7, a note's anchors (§9.3): headings and block ids in document order. `LEFT JOIN`
 /// from `notes`, so a note with no anchors answers one row of NULLs and a path that is
 /// not a note answers no row at all: the two are different answers.
-const R7: &str = "SELECT b.kind, b.text, b.block_ref
+const R7: &str = "SELECT b.kind, b.text, b.block_ref, b.heading_level
                     FROM notes n
                     LEFT JOIN blocks b ON b.note_id = n.id
                          AND (b.kind = 'heading' OR b.block_ref IS NOT NULL)
@@ -387,6 +387,8 @@ const R7: &str = "SELECT b.kind, b.text, b.block_ref
 pub struct Anchors {
     /// Heading texts.
     pub headings: Vec<String>,
+    /// The level (1..=6) of each heading, parallel to `headings`.
+    pub heading_levels: Vec<u8>,
     /// Block ids, without the `^`.
     pub block_ids: Vec<String>,
 }
@@ -781,10 +783,14 @@ impl Reader {
             let kind: Option<String> = row.get(0).map_err(sqlite)?;
             let text: Option<String> = row.get(1).map_err(sqlite)?;
             let block_ref: Option<String> = row.get(2).map_err(sqlite)?;
+            let level: Option<i64> = row.get(3).map_err(sqlite)?;
             if kind.as_deref() == Some("heading")
                 && let Some(text) = text
             {
                 anchors.headings.push(text);
+                anchors
+                    .heading_levels
+                    .push(level.map_or(1, |l| l.clamp(1, 6) as u8));
             }
             if let Some(id) = block_ref {
                 anchors.block_ids.push(id);

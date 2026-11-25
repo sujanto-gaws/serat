@@ -7148,6 +7148,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Task #184 (TC-170): the whole path, a real note through the index: `#A#B` needs B
+    // under A. Mutant, run by hand and red: matching on the last segment only (the
+    // pre-#184 rule) turns the "not found" rows green-to-red.
+    #[test]
+    fn resolve_links_requires_a_nested_subpath_to_sit_under_its_parent() {
+        let dir = fixture("resolve-nested");
+        std::fs::write(
+            dir.join("Nest.md"),
+            "# A\n\n## B\n\n# C\n\n## B\n\n### D\n\n# A\n\n## F\n\n### G\n",
+        )
+        .expect("fixture");
+        let state = state(&dir);
+        wait_ready(&state);
+        let got: Vec<Option<bool>> = resolve(
+            &state,
+            "Nest.md",
+            &[
+                "Nest#A#B",
+                "Nest#C#B#D",
+                "Nest#A#D",
+                "Nest#A#F#G",
+                "Nest#B#A",
+                "Nest#B",
+                "#C#D",
+            ],
+        )
+        .iter()
+        .map(|r| r.subpath_found)
+        .collect();
+        assert_eq!(
+            got,
+            [
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(true)
+            ]
+        );
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_tree_resolver_agrees_with_the_index_on_the_same_paths() {
         let (state, dir) = link_vault("resolve-agree");
