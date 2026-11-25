@@ -1650,7 +1650,6 @@ mod tests {
         );
         let late = Arc::clone(&startup);
         let sender = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
             late.mark_buffer_rendered();
         });
         assert!(startup.wait_for_trace_terms(Duration::from_secs(5)));

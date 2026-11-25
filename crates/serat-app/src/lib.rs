@@ -589,7 +589,9 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             // function's doc comment).
             let dev_server_origin = app.config().build.dev_url.clone();
             let trace_build = state.boot.trace.is_some();
-            let data_folder = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
+            let data_folder = trace_build
+                .then(|| std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok())
+                .flatten();
             if trace_build {
                 eprintln!(
                     "{}",
@@ -859,7 +861,7 @@ fn spawn_benchmark_exit(
                         eprintln!(
                             "serat: no startup trace after {:.0} ms of waiting (limit {timeout:?}; {}): {incomplete}",
                             waited.elapsed().as_secs_f64() * 1000.0,
-                            if arrived { "usable" } else { "timed out" }
+                            if arrived { "terms present" } else { "timed out" }
                         );
                         2
                     }
