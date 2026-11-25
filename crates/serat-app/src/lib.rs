@@ -439,6 +439,14 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
         )
         .setup(move |app| {
             state.startup.mark_runtime_ready();
+            // Task #178: marks snapshot, rejected-paint lines and the web view runtime
+            // version, only under the trace env (no thread otherwise).
+            startup::start_trace_diagnostics(
+                &state.startup,
+                state.boot.trace.is_some(),
+                std::env::var(startup::DEADLINE_ENV).ok().as_deref(),
+                || tauri::webview_version().map_err(|err| err.to_string()),
+            );
             let handle = app.handle().clone();
 
             // 1. Point index://status at the front end. Installed before the vault is
