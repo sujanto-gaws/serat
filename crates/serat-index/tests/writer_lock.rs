@@ -32,7 +32,7 @@
 mod support;
 
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, RwLock};
 
 use serat_core::IndexError;
 use serat_index::{IndexHandle, open_or_rebuild};
@@ -40,6 +40,17 @@ use support::{LineParser, vault_fixture};
 
 const ROOT: &str = "C:/vaults/serat";
 const CHILD_ENV: &str = "SERAT_WRITER_LOCK_CHILD_DIR";
+
+/// Task #182 (NFR-REL-01, NFR-MNT-01): a process spawned by one test holds a copy of
+/// every descriptor this process has open between `fork` and `exec`, and `flock` belongs
+/// to the open file description, not the descriptor: a writer another test in this
+/// binary has just closed keeps its lock until the child execs. Under load that window
+/// is long enough for the closed writer's own test to see `HeldByAnotherProcess` on its
+/// reopen (seen once, 2026-11-24; reproduced under two pinned CPU loops). The spawning
+/// test takes this fence exclusively and every other test takes it shared, so no writer
+/// is open anywhere in the process while a child is being made. The lock's behaviour is
+/// unchanged; only the tests stop sharing a process with a `fork`.
+static SPAWN_FENCE: RwLock<()> = RwLock::new(());
 
 fn open(index_dir: &Path) -> Result<IndexHandle, IndexError> {
     open_or_rebuild(
@@ -54,6 +65,9 @@ fn open(index_dir: &Path) -> Result<IndexHandle, IndexError> {
 
 #[test]
 fn a_second_open_beside_a_live_writer_is_refused_and_leaves_the_first_intact() {
+    let _fence = SPAWN_FENCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("temp");
     let index_dir = dir.path().join(".serat");
     let first = open(&index_dir).expect("first open");
@@ -80,6 +94,9 @@ fn a_second_open_beside_a_live_writer_is_refused_and_leaves_the_first_intact() {
 
 #[test]
 fn a_rebuild_beside_a_live_writer_is_refused() {
+    let _fence = SPAWN_FENCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("temp");
     let index_dir = dir.path().join(".serat");
     let _held = open(&index_dir).expect("open");
@@ -101,6 +118,9 @@ fn a_rebuild_beside_a_live_writer_is_refused() {
 /// and nothing crashes or reports corruption.
 #[test]
 fn two_threads_opening_a_vault_with_no_index_never_fault_or_corrupt() {
+    let _fence = SPAWN_FENCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for round in 0..300 {
         let dir = tempfile::tempdir().expect("temp");
         let index_dir = dir.path().join(".serat");
@@ -185,6 +205,9 @@ fn spawn_child(test: &str, dir: &Path) -> std::process::Child {
 /// must be refused. Without the lock the child is admitted and exits non-zero.
 #[test]
 fn two_processes_a_second_process_is_refused_by_a_live_writer() {
+    let _fence = SPAWN_FENCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("temp");
     let held = open(&dir.path().join(".serat")).expect("parent open");
     let out = spawn_child("child_expects_to_be_refused", dir.path())
@@ -204,6 +227,9 @@ fn two_processes_a_second_process_is_refused_by_a_live_writer() {
 #[test]
 #[ignore = "spawns this test binary; run with --ignored"]
 fn two_processes_hammering_one_vault_never_fault() {
+    let _fence = SPAWN_FENCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("temp");
     let child = spawn_child("child_hammers_the_shared_index", dir.path());
     let index_dir = dir.path().join(".serat");

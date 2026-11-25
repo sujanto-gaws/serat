@@ -544,6 +544,38 @@ mod tests {
         watcher.stop();
     }
 
+    /// Task #182 (FR-VLT-01, NFR-REL-01, US-07). Pins what the flake hunt found rather
+    /// than fixing it: the watcher records a refused name on every event for it, a delete
+    /// included, so the delete of a file the log never held (or held until a walk cleared
+    /// it) *adds* the name, and the refused-name count is one too high until the next
+    /// walk. `#[ignore]`d because it fails today; the product task is #188 (see
+    /// `docs/05-testing/reports/flake-hunt-2026-11.md`). Run it with `--ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "pins task #182's finding, filed as #188: the watcher records a refusal for a delete"]
+    fn the_delete_of_a_refused_name_does_not_add_it_to_the_log() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let (dir, vault, queue) = fixture();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"gone\xe9.md"));
+        // Written before the watcher exists and never walked: the log has never held it.
+        fs::write(&odd, b"x").expect("write");
+        assert!(vault.refusals().is_empty());
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+
+        fs::remove_file(&odd).expect("rm");
+        // Events are handled in the order they were made, so once the note written after
+        // the delete is queued, the delete has been handled.
+        fs::write(dir.path().join("after.md"), b"# After\n").expect("sentinel");
+        assert!(eventually(|| queue.depth() > 0), "the sentinel never came");
+        assert!(
+            vault.refusals().is_empty(),
+            "a delete put a name the vault no longer holds into the log: {:?}",
+            vault.refusals().snapshot()
+        );
+        watcher.stop();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_name_only_windows_refuses_is_recorded_with_a_reason_under_the_windows_rules() {

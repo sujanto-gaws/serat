@@ -675,29 +675,73 @@ mod tests {
         drop(dir);
     }
 
+    /// Task #182 (NFR-REL-01, NFR-MNT-01): the "not before" half of the idle gate, decided
+    /// on the scheduler's own state with instants the test makes up, not on how long a
+    /// loop of saves happened to take. It used to commit every 30 ms against a 300 ms gate
+    /// and assert that nothing ran: one stall of the whole process between two saves (a
+    /// loaded runner, a recompile beside it) let the gate honestly expire, and it failed
+    /// (seen 2026-11-24, reproduced under two pinned CPU loops).
     #[test]
-    fn it_fires_once_the_writer_has_been_idle_and_not_before() {
-        let (dir, path, actor) = actor(Bounds {
+    fn the_idle_gate_is_measured_from_the_last_commit_and_each_commit_moves_it() {
+        let bounds = Bounds {
             idle: Duration::from_millis(300),
+            ..never()
+        };
+        let t0 = Instant::now();
+        let mut state = State {
+            dirty: false,
+            last_commit: t0,
+            base: 0,
+            frames: 0,
+            frame_bytes: 4120,
+            retry_at: None,
+            restart_spent: false,
+            last_idle: None,
+            prev_done: 0,
+        };
+        // Nothing committed since the last attempt: nothing is due, however long it waits.
+        assert_eq!(state.due(bounds, false), None);
+
+        // A commit makes the idle checkpoint due one gate later, and no sooner.
+        state.dirty = true;
+        assert_eq!(state.due(bounds, false), Some(t0 + bounds.idle));
+
+        // Each later commit inside the gate pushes it out again; the first deadline,
+        // which a run of saves 30 ms apart would have been racing, is never reached.
+        for step in 1..=10u32 {
+            state.last_commit = t0 + Duration::from_millis(30) * step;
+            assert_eq!(
+                state.due(bounds, false),
+                Some(t0 + Duration::from_millis(30) * step + bounds.idle),
+                "commit {step} did not move the gate"
+            );
+        }
+
+        // The pinned RESTART is gated the same way, and only while it is unspent.
+        assert_eq!(
+            state.due(bounds, true),
+            Some(state.last_commit + bounds.idle)
+        );
+        state.dirty = false;
+        state.restart_spent = true;
+        assert_eq!(state.due(bounds, true), None);
+    }
+
+    /// The "fires" half, on the live actor: an event wait (the checkpoint counter), whose
+    /// only clock is the bound that turns a hang into a failure.
+    #[test]
+    fn it_fires_once_the_writer_has_been_idle() {
+        let (dir, path, actor) = actor(Bounds {
+            idle: Duration::from_millis(20),
             ..never()
         });
         let health = actor.wal_health();
-        // Commits arriving faster than the gate: it must not fire.
-        let busy_until = Instant::now() + Duration::from_millis(1_000);
-        let mut i = 0;
-        while Instant::now() < busy_until {
-            save(&actor, i);
-            i += 1;
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        assert_eq!(
-            health.stats().passive_runs,
-            0,
-            "a checkpoint ran while commits were arriving inside the idle gate"
-        );
+        // Before the saves: under a 20 ms gate the checkpoint may run as soon as they end.
         let db_before = len(&path);
-        // Then quiet: one checkpoint, and the database file now holds the pages.
-        wait_for("the idle checkpoint", Duration::from_secs(5), || {
+        for i in 0..5 {
+            save(&actor, i);
+        }
+        wait_for("the idle checkpoint", Duration::from_secs(30), || {
             health.stats().passive_runs >= 1
         });
         assert!(len(&path) > db_before, "the checkpoint copied nothing");
@@ -838,7 +882,8 @@ mod tests {
             ..never()
         });
         let health = actor.wal_health();
-        let typing_until = Instant::now() + Duration::from_millis(2_000);
+        let typed_from = Instant::now();
+        let typing_until = typed_from + Duration::from_millis(2_000);
         let mut i = 0;
         while Instant::now() < typing_until {
             save(&actor, i);
@@ -846,20 +891,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         let during = health.stats();
+        // Task #182: the ceiling is taken from the time the loop actually ran, not from the
+        // 2 s it meant to: a stall that stretched the loop past 2 s legitimately allows a
+        // further checkpoint, and a fixed "at most 4" failed on it. Spacing is the claim:
+        // one idle checkpoint per spacing, plus the first.
+        let ran = typed_from.elapsed();
+        let ceiling = ran.as_micros() / spacing.as_micros() + 1;
         assert!(
             during.passive_runs >= 2,
-            "no idle checkpoint while typing: {during:?}"
+            "no idle checkpoint while typing: {during:?} over {ran:?}"
         );
         assert!(
-            during.passive_runs <= 4,
-            "{} checkpoints in 2 s at 600 ms spacing",
+            u128::from(during.passive_runs) <= ceiling,
+            "{} checkpoints in {ran:?} at 600 ms spacing (at most {ceiling})",
             during.passive_runs
         );
         // One more save, then the writer stops: its frames are not yet checkpointed, and
         // a trailing checkpoint fires within the spacing.
         let before = health.stats().passive_runs;
         save(&actor, i);
-        wait_for("the trailing checkpoint", Duration::from_secs(2), || {
+        wait_for("the trailing checkpoint", Duration::from_secs(30), || {
             health.stats().passive_runs > before
         });
         let after = health.stats();
