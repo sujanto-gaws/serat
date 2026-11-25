@@ -17,6 +17,9 @@ export type ResolveLinksArgs = {
  */
 source_path: string, 
 /**
- * Link targets as written, without brackets or `|display` text.
+ * Link targets as written, without brackets or `|display` text. At most 1,000 are
+ * answered (`MAX_LINK_TARGETS`): a longer list is truncated to its first 1,000, and
+ * the answer has that many entries. A viewport batch is tens; the editor never
+ * sends more.
  */
 targets: Array<string>, };
