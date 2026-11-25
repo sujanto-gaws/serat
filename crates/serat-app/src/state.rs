@@ -1984,9 +1984,29 @@ impl AppState {
         raf1_ms: f64,
         raf2_ms: f64,
     ) -> Result<f64, PaintEvidenceRejected> {
-        let evidence =
-            startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)?;
-        self.startup.mark_first_paint(evidence, raf2_ms)?;
+        self.mark_first_paint_reporting(first_contentful_paint_ms, raf1_ms, raf2_ms, &|line| {
+            eprintln!("{line}");
+        })
+    }
+
+    /// [`AppState::mark_first_paint`] with the rejection line sent to `sink` (task #178).
+    /// The line is printed only when the trace env is set, so a user's session prints
+    /// nothing; the rejection is returned to the page either way.
+    pub(crate) fn mark_first_paint_reporting(
+        &self,
+        first_contentful_paint_ms: Option<f64>,
+        raf1_ms: f64,
+        raf2_ms: f64,
+        sink: &dyn Fn(&str),
+    ) -> Result<f64, PaintEvidenceRejected> {
+        let marked = startup::validate_paint_evidence(first_contentful_paint_ms, raf1_ms, raf2_ms)
+            .and_then(|evidence| self.startup.mark_first_paint(evidence, raf2_ms));
+        if let Err(rejected) = &marked
+            && self.boot.trace.is_some()
+        {
+            startup::report_rejection(sink, self.startup.elapsed_ms(), rejected);
+        }
+        marked?;
         Ok(self.startup.elapsed_ms())
     }
 
@@ -2756,6 +2776,60 @@ mod tests {
         assert!(
             state.mark_first_paint(Some(50.0), 10.0, 20.0).is_ok(),
             "genuinely valid, internally consistent evidence must still be accepted"
+        );
+    }
+
+    #[test]
+    fn a_rejected_paint_prints_its_reason_only_under_the_trace_env() {
+        // Task #178, NFR-PRF-01, NFR-PRF-08, ADR-0014: a rejection was returned to the
+        // page and never printed, so a rejected call and a dead page looked the same in
+        // the job log. The sink is the seam; the trace path is what arms it.
+        let lines = std::sync::Mutex::new(Vec::<String>::new());
+        let sink = |line: &str| lines.lock().unwrap().push(line.to_owned());
+
+        let traced = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot {
+                trace: Some(std::path::PathBuf::from("trace.json")),
+                ..Boot::default()
+            },
+            Settings::default(),
+        );
+        let err = traced
+            .mark_first_paint_reporting(None, 10.0, 20.0, &sink)
+            .expect_err("no paint entry is a rejection");
+        let got = lines.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].starts_with("serat: paint evidence rejected at "),
+            "{got:?}"
+        );
+        assert!(got[0].ends_with(&err.reason), "{got:?}");
+
+        // The frame gate's rejection is the other path through the same seam.
+        traced
+            .mark_first_paint_reporting(Some(50.0), 20.0, 10.0, &sink)
+            .expect_err("a non-increasing pair is a rejection");
+        assert_eq!(lines.lock().unwrap().len(), 2);
+
+        // Accepted evidence prints nothing.
+        traced
+            .mark_first_paint_reporting(Some(50.0), 10.0, 20.0, &sink)
+            .expect("valid");
+        assert_eq!(lines.lock().unwrap().len(), 2);
+
+        // No trace env: the rejection is still returned and nothing is printed.
+        let user = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        user.mark_first_paint_reporting(None, 10.0, 20.0, &sink)
+            .expect_err("still rejected");
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            2,
+            "a user's session prints nothing"
         );
     }
 

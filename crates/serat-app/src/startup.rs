@@ -105,7 +105,7 @@
 //! in flight, and produced no trace at all. Requiring the paint makes the ordering
 //! structural rather than something a front end has to remember.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -116,6 +116,14 @@ pub const T0_ENV: &str = "SERAT_STARTUP_T0_UNIX_NANOS";
 
 /// Environment variable naming the file the trace line is written to.
 pub const TRACE_ENV: &str = "SERAT_STARTUP_TRACE";
+
+/// Environment variable overriding [`DEFAULT_DEADLINE`], in milliseconds. Read only when
+/// [`TRACE_ENV`] is set (task #178). Anything unparsable or zero means the default.
+pub const DEADLINE_ENV: &str = "SERAT_STARTUP_DEADLINE_MS";
+
+/// When the diagnostic watchdog prints the marks snapshot if the shell has not painted:
+/// 55 s, so the line lands before a 60 s harness kill ([`crate::cli::DEFAULT_READY_TIMEOUT`]).
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(55);
 
 /// Which clock the trace was measured against, as it appears in the JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -648,6 +656,159 @@ impl Startup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// One line naming every mark as set or missing, for a launch that never reported a
+    /// first painted frame (task #178, NFR-PRF-01, NFR-PRF-08).
+    ///
+    /// `main` is always set (the timeline starts in it). `tree_first_screen`,
+    /// `index_settled` and `watcher` are the preconditions of `vault_usable` besides the
+    /// paint (ADR-0014 as amended by ADR-0015 section 5); `buffer_rendered` is still
+    /// recorded but no longer a term (task #141). `walk_complete` is reported, not a
+    /// term: the walk waits on the first paint, so it says whether that gate timed out.
+    /// `vault_usable` is derived, set only when all its terms are. The watchdog prints
+    /// this only while `window_visible` is unmarked, so it describes a launch that never
+    /// painted, not one that painted and never settled.
+    #[must_use]
+    pub fn marks_snapshot_line(&self) -> String {
+        let elapsed = self.elapsed_ms();
+        let marks = self.lock();
+        let table: [(&str, bool); 12] = [
+            ("main", true),
+            ("state_ready", marks.state_ready.is_some()),
+            ("runtime_ready", marks.runtime_ready.is_some()),
+            ("setup_done", marks.setup_done.is_some()),
+            ("window_created", marks.window_created.is_some()),
+            ("window_visible", marks.window_visible.is_some()),
+            ("buffer_rendered", marks.buffer_rendered.is_some()),
+            ("tree_first_screen", marks.tree_first_screen.is_some()),
+            ("index_settled", marks.index_settled.is_some()),
+            ("watcher", marks.watcher.is_some()),
+            ("walk_complete", marks.walk_complete.is_some()),
+            ("vault_usable", marks.vault_usable().is_some()),
+        ];
+        drop(marks);
+        let names = |want: bool| {
+            table
+                .iter()
+                .filter(|(_, set)| *set == want)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "serat: startup marks after {elapsed:.0} ms: set=[{}] missing=[{}]",
+            names(true),
+            names(false)
+        )
+    }
+
+    /// Start the diagnostic thread: if `window_visible` has not been marked within
+    /// `deadline`, call `emit` once with [`Startup::marks_snapshot_line`]; then, either
+    /// way, call `emit` once with the web view runtime line from `version`. The query
+    /// runs here, after the paint or the deadline, so it never competes with the cold
+    /// start (it would otherwise sit inside `S_setup`). It only reports; it never exits
+    /// the process or changes any mark.
+    ///
+    /// The thread sleeps on the same condvar `mark_first_paint` signals, so it costs
+    /// nothing while waiting. The join handle yields whether the deadline fired. Callers
+    /// start it only when [`TRACE_ENV`] is set; its one remaining cost is this spawn.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be spawned.
+    pub fn spawn_watchdog(
+        self: &Arc<Self>,
+        deadline: Duration,
+        emit: impl Fn(&str) + Send + 'static,
+        version: impl FnOnce() -> Result<String, String> + Send + 'static,
+    ) -> std::io::Result<std::thread::JoinHandle<bool>> {
+        let startup = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("serat-startup-watchdog".to_owned())
+            .spawn(move || {
+                let limit = Instant::now() + deadline;
+                let mut marks = startup.lock();
+                let mut fired = false;
+                while marks.window_visible.is_none() {
+                    let Some(remaining) = limit.checked_duration_since(Instant::now()) else {
+                        fired = true;
+                        break;
+                    };
+                    marks = startup
+                        .usable
+                        .wait_timeout(marks, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0;
+                }
+                drop(marks);
+                if fired {
+                    emit(&startup.marks_snapshot_line());
+                }
+                emit(&webview_version_line(version()));
+                fired
+            })
+    }
+}
+
+/// The watchdog deadline from [`DEADLINE_ENV`]'s value: whole milliseconds above zero,
+/// otherwise [`DEFAULT_DEADLINE`]. Never panics; capped at a day so the arithmetic on
+/// it cannot overflow.
+#[must_use]
+pub fn deadline_from(value: Option<&str>) -> Duration {
+    const CAP_MS: u64 = 24 * 60 * 60 * 1000;
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms.min(CAP_MS)),
+        _ => DEFAULT_DEADLINE,
+    }
+}
+
+/// The line naming the web view runtime this launch runs on. `version` is the result of
+/// `tauri::webview_version()`; a failure or an empty string reads `unknown`.
+#[must_use]
+pub fn webview_version_line(version: Result<String, String>) -> String {
+    match version {
+        Ok(v) if !v.trim().is_empty() => format!("serat: webview runtime {}", v.trim()),
+        _ => "serat: webview runtime unknown".to_owned(),
+    }
+}
+
+/// The line printed for one [`PaintEvidenceRejected`], at the point of rejection.
+#[must_use]
+pub fn rejection_line(elapsed_ms: f64, rejected: &PaintEvidenceRejected) -> String {
+    format!(
+        "serat: paint evidence rejected at {elapsed_ms:.0} ms: {}",
+        rejected.reason
+    )
+}
+
+/// Report one rejection through `sink` (stderr in the application). A seam so a test
+/// can see the line without capturing the process's stderr.
+pub fn report_rejection(sink: &dyn Fn(&str), elapsed_ms: f64, rejected: &PaintEvidenceRejected) {
+    sink(&rejection_line(elapsed_ms, rejected));
+}
+
+/// Everything #178 adds, behind [`TRACE_ENV`]: the watchdog on [`DEADLINE_ENV`] and the
+/// runtime version line, on one thread. Returns `None` without starting anything when
+/// `trace_enabled` is false. The deadline is not clamped to `--ready-timeout-ms`: a run
+/// that lowers that to 55 s or less must set [`DEADLINE_ENV`] below it too, or the app
+/// exits before the snapshot prints.
+pub fn start_trace_diagnostics(
+    startup: &Arc<Startup>,
+    trace_enabled: bool,
+    deadline_env: Option<&str>,
+    emit: impl Fn(&str) + Send + 'static,
+    version: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Option<std::thread::JoinHandle<bool>> {
+    if !trace_enabled {
+        return None;
+    }
+    match startup.spawn_watchdog(deadline_from(deadline_env), emit, version) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!("serat: startup watchdog could not start: {err}");
+            None
+        }
+    }
 }
 
 /// What "vault usable" means in this build, carried in the trace so a gate report
@@ -1012,6 +1173,217 @@ mod tests {
         startup.mark_watcher(WatcherOutcome::Registered);
         startup.mark_buffer_rendered();
         startup.mark_tree_first_screen(startup.elapsed_ms());
+    }
+
+    #[test]
+    fn the_snapshot_names_every_missing_mark_and_no_set_one() {
+        // Task #178: with some marks taken, each name appears on exactly the side it
+        // belongs. A snapshot that drops a name (a mutant removing one table row) fails
+        // the membership check below.
+        let startup = in_process();
+        startup.mark_state_ready();
+        startup.mark_runtime_ready();
+        startup.mark_setup_done();
+        startup.mark_window_created();
+        let line = startup.marks_snapshot_line();
+        assert!(line.starts_with("serat: startup marks after "), "{line}");
+        let (_, rest) = line.split_once("set=[").expect("set list");
+        let (set, rest) = rest.split_once("] missing=[").expect("missing list");
+        let missing = rest.strip_suffix(']').expect("closing bracket");
+        let split = |list: &str| -> Vec<String> {
+            list.split(", ")
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let (set, missing) = (split(set), split(missing));
+        let all = [
+            "main",
+            "state_ready",
+            "runtime_ready",
+            "setup_done",
+            "window_created",
+            "window_visible",
+            "buffer_rendered",
+            "tree_first_screen",
+            "index_settled",
+            "watcher",
+            "walk_complete",
+            "vault_usable",
+        ];
+        for name in all {
+            let in_set = set.iter().any(|n| n == name);
+            let in_missing = missing.iter().any(|n| n == name);
+            assert!(
+                in_set != in_missing,
+                "{name} must be on exactly one side: {line}"
+            );
+        }
+        assert_eq!(set.len() + missing.len(), all.len(), "{line}");
+        for name in [
+            "main",
+            "state_ready",
+            "runtime_ready",
+            "setup_done",
+            "window_created",
+        ] {
+            assert!(set.iter().any(|n| n == name), "{name} is set: {line}");
+        }
+        for name in [
+            "window_visible",
+            "tree_first_screen",
+            "vault_usable",
+            "watcher",
+        ] {
+            assert!(
+                missing.iter().any(|n| n == name),
+                "{name} is missing: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_marked_start_has_nothing_missing() {
+        let startup = in_process();
+        startup.mark_state_ready();
+        startup.mark_runtime_ready();
+        startup.mark_setup_done();
+        complete(&startup);
+        startup.mark_walk_complete(0);
+        let line = startup.marks_snapshot_line();
+        assert!(line.ends_with("missing=[]"), "{line}");
+    }
+
+    type Lines = Arc<Mutex<Vec<String>>>;
+
+    fn collector() -> (Lines, impl Fn(&str) + Send + 'static) {
+        let lines: Lines = Arc::default();
+        let sink = Arc::clone(&lines);
+        (lines, move |l: &str| {
+            sink.lock().unwrap().push(l.to_owned())
+        })
+    }
+
+    #[test]
+    fn the_watchdog_fires_once_when_the_shell_never_paints() {
+        let startup = Arc::new(in_process());
+        let (lines, emit) = collector();
+        let fired = startup
+            .spawn_watchdog(Duration::from_millis(30), emit, || Ok("1.2.3".to_owned()))
+            .expect("spawn")
+            .join()
+            .expect("no panic");
+        assert!(fired);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("serat: startup marks after "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("missing=[") && lines[0].contains("window_visible"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "serat: webview runtime 1.2.3");
+    }
+
+    #[test]
+    fn the_watchdog_stays_silent_when_the_paint_lands_before_the_deadline() {
+        let startup = Arc::new(in_process());
+        let (lines, emit) = collector();
+        let handle = startup
+            .spawn_watchdog(Duration::from_secs(5), emit, || Ok("1.2.3".to_owned()))
+            .expect("spawn");
+        startup.mark_window_created();
+        startup.mark_first_paint(FCP_MS, RAF2_MS).expect("valid");
+        assert!(!handle.join().expect("no panic"), "must not fire");
+        let lines = lines.lock().unwrap();
+        assert_eq!(*lines, ["serat: webview runtime 1.2.3"], "no snapshot line");
+    }
+
+    #[test]
+    fn diagnostics_spawn_nothing_without_the_trace_env() {
+        let startup = Arc::new(in_process());
+        let spawned = start_trace_diagnostics(
+            &startup,
+            false,
+            Some("1"),
+            |_| panic!("must not emit"),
+            || panic!("must not query"),
+        );
+        assert!(spawned.is_none(), "no thread without the trace env");
+        let (_lines, emit) = collector();
+        let spawned =
+            start_trace_diagnostics(&startup, true, Some("1"), emit, || Ok(String::new()));
+        assert!(
+            spawned
+                .expect("armed under the env")
+                .join()
+                .expect("no panic")
+        );
+    }
+
+    #[test]
+    fn an_unparsable_deadline_is_the_default_and_never_a_panic() {
+        for bad in [
+            "",
+            "abc",
+            "-5",
+            "1.5",
+            "0",
+            " ",
+            "99999999999999999999999999",
+        ] {
+            let got = deadline_from(Some(bad));
+            assert!(
+                got == DEFAULT_DEADLINE
+                    || bad.starts_with("9999") && got == Duration::from_secs(86_400),
+                "{bad:?} -> {got:?}"
+            );
+        }
+        assert_eq!(deadline_from(None), DEFAULT_DEADLINE);
+        assert_eq!(deadline_from(Some("1500")), Duration::from_millis(1500));
+        assert_eq!(deadline_from(Some(" 20 ")), Duration::from_millis(20));
+        assert_eq!(
+            deadline_from(Some("18446744073709551615")),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn the_webview_version_line_says_unknown_on_failure() {
+        assert_eq!(
+            webview_version_line(Ok("142.0.3595.53".to_owned())),
+            "serat: webview runtime 142.0.3595.53"
+        );
+        assert_eq!(
+            webview_version_line(Err("not installed".to_owned())),
+            "serat: webview runtime unknown"
+        );
+        assert_eq!(
+            webview_version_line(Ok(String::new())),
+            "serat: webview runtime unknown"
+        );
+    }
+
+    #[test]
+    fn a_rejection_is_reported_through_the_sink_with_its_reason() {
+        let seen = Mutex::new(Vec::<String>::new());
+        let rejected = validate_paint_evidence(None, 1.0, 2.0).expect_err("rejected");
+        report_rejection(
+            &|l| seen.lock().unwrap().push(l.to_owned()),
+            123.4,
+            &rejected,
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            format!(
+                "serat: paint evidence rejected at 123 ms: {}",
+                rejected.reason
+            )
+        );
     }
 
     #[test]
