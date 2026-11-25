@@ -64,9 +64,10 @@ use std::sync::Arc;
 
 use crate::ipc::{
     AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
-    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IpcError, NoteBufferArgs,
-    NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs,
-    SavePatchArgs, SetKeybindingArgs, SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
+    FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IpcError, LinkResolution,
+    NoteAnchors, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
+    ReadFileArgs, RebaseBufferArgs, ResolveLinksArgs, SavePatchArgs, SetKeybindingArgs,
+    SetLivePreviewArgs, UiSettings, VaultOpened, WriteFileArgs,
 };
 use crate::state::AppState;
 
@@ -264,6 +265,32 @@ impl AppState {
     ) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
         let state = Arc::clone(self);
         blocking(move || state.backlinks(args)).await
+    }
+
+    /// [`AppState::resolve_links`] on the blocking pool: it opens a SQLite read connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::resolve_links`].
+    pub async fn resolve_links_off_thread(
+        self: &Arc<Self>,
+        args: ResolveLinksArgs,
+    ) -> Result<Vec<LinkResolution>, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.resolve_links(&args)).await
+    }
+
+    /// [`AppState::note_anchors`] on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::note_anchors`].
+    pub async fn note_anchors_off_thread(
+        self: &Arc<Self>,
+        args: NotePathArgs,
+    ) -> Result<IndexRead<NoteAnchors>, IpcError> {
+        let state = Arc::clone(self);
+        blocking(move || state.note_anchors(args)).await
     }
 
     /// [`AppState::get_ui_settings`] on the blocking pool: the settings lock is held across

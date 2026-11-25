@@ -361,6 +361,111 @@ macro_rules! resolver_choice {
     };
 }
 
+/// R6, link resolution for the editor (§9.3), one statement for the whole batch: the
+/// folded targets arrive as one JSON array (`json_each`, the same JSON1 R2 already
+/// uses), and each yields the path the resolver would choose, or NULL. The rule is
+/// [`resolver_choice!`]'s, so it cannot drift from `resolve.rs`. Every comparison is a
+/// binary `=` on an indexed folded column (`ix_notes_path_fold`, `ix_notes_file_name`).
+const R6: &str = concat!(
+    "SELECT t.key, ",
+    resolver_choice!("t.value"),
+    " FROM json_each(:targets) t ORDER BY t.key"
+);
+
+/// R7, a note's anchors (§9.3): headings and block ids in document order. `LEFT JOIN`
+/// from `notes`, so a note with no anchors answers one row of NULLs and a path that is
+/// not a note answers no row at all: the two are different answers.
+const R7: &str = "SELECT b.kind, b.text, b.block_ref
+                    FROM notes n
+                    LEFT JOIN blocks b ON b.note_id = n.id
+                         AND (b.kind = 'heading' OR b.block_ref IS NOT NULL)
+                   WHERE n.path = :path
+                   ORDER BY b.ord";
+
+/// A note's heading texts and block ids, in document order (R7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Anchors {
+    /// Heading texts.
+    pub headings: Vec<String>,
+    /// Block ids, without the `^`.
+    pub block_ids: Vec<String>,
+}
+
+/// The resolver's rule over a list of paths, for the window before the index is `Ready`,
+/// when only the tree's paths exist: the pure-Rust form of `resolve.rs`. Exact path, path
+/// plus `.md`, then (no `/` in the target) file name, file name plus `.md`; shortest path
+/// **by characters** (SQLite's `length()`), then binary order. Every path is folded once,
+/// when the resolver is built, so a batch costs O(paths + targets), not their product.
+/// `state::tests` pins that it agrees with R6 over one vault, including a multi-byte
+/// directory name.
+#[derive(Debug, Default)]
+pub struct PathResolver<'a> {
+    by_path: std::collections::HashMap<String, &'a str>,
+    by_name: std::collections::HashMap<String, &'a str>,
+}
+
+fn shorter(a: &str, b: &str) -> bool {
+    (a.chars().count(), a) < (b.chars().count(), b)
+}
+
+fn keep_best<'a>(map: &mut std::collections::HashMap<String, &'a str>, key: String, path: &'a str) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            if shorter(path, e.get()) {
+                e.insert(path);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(path);
+        }
+    }
+}
+
+impl<'a> PathResolver<'a> {
+    /// Fold every path once.
+    pub fn new(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::default();
+        for path in paths {
+            let folded = serat_core::fold_case(path);
+            let name = folded.rsplit('/').next().unwrap_or(&folded).to_owned();
+            keep_best(&mut out.by_name, name, path);
+            keep_best(&mut out.by_path, folded, path);
+        }
+        out
+    }
+
+    /// The path the resolver chooses for `folded_target` (already
+    /// [`serat_core::fold_case`]d), or `None`.
+    #[must_use]
+    pub fn resolve(&self, folded_target: &str) -> Option<&'a str> {
+        let with_md = format!("{folded_target}.md");
+        let mut best: Option<&'a str> = None;
+        let mut consider = |found: Option<&&'a str>| {
+            if let Some(&path) = found
+                && best.is_none_or(|b| shorter(path, b))
+            {
+                best = Some(path);
+            }
+        };
+        consider(self.by_path.get(folded_target));
+        consider(self.by_path.get(&with_md));
+        if !folded_target.contains('/') {
+            consider(self.by_name.get(folded_target));
+            consider(self.by_name.get(&with_md));
+        }
+        best
+    }
+}
+
+/// One-off form of [`PathResolver`].
+#[must_use]
+pub fn resolve_among_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    folded_target: &str,
+) -> Option<&'a str> {
+    PathResolver::new(paths).resolve(folded_target)
+}
+
 /// Attachments (FR-VLT-08), one statement. The last two columns are what the resolver
 /// would choose for the bare file name and for the full path, so the shortest resolving
 /// form is the name when that is the asset itself, else the path when that is, else
@@ -379,7 +484,7 @@ const ATTACHMENTS: &str = concat!(
 
 /// The statements, for tests that check their plans.
 #[doc(hidden)]
-pub const STATEMENTS: [(&str, &str); 7] = [
+pub const STATEMENTS: [(&str, &str); 9] = [
     ("R1", R1),
     ("R1+type", R1_TYPE),
     ("R1+field", R1_FIELD),
@@ -387,6 +492,8 @@ pub const STATEMENTS: [(&str, &str); 7] = [
     ("R3 type", R3_TYPE),
     ("R3 field", R3_FIELD),
     ("attachments", ATTACHMENTS),
+    ("R6 resolve", R6),
+    ("R7 anchors", R7),
 ];
 
 /// A read-only connection to the index and the four reads over it.
@@ -631,6 +738,59 @@ impl Reader {
             });
         }
         Ok(out)
+    }
+
+    /// R6: the path each folded target resolves to, in request order; `None` is a miss.
+    /// One statement for the whole batch, however many targets (an empty batch runs
+    /// nothing).
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if the statement fails.
+    pub fn resolve_targets(&self, folded: &[String]) -> Result<Vec<Option<String>>, IndexError> {
+        if folded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let json = serde_json::to_string(folded).map_err(|e| IndexError::Sqlite {
+            message: format!("R6 targets: {e}"),
+        })?;
+        let mut stmt = self.conn.prepare_cached(R6).map_err(sqlite)?;
+        let mut rows = stmt
+            .query(named_params! { ":targets": json })
+            .map_err(sqlite)?;
+        let mut out = Vec::with_capacity(folded.len());
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            out.push(row.get(1).map_err(sqlite)?);
+        }
+        Ok(out)
+    }
+
+    /// R7: the anchors of the note at `path`, or `None` when no note has that path.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Sqlite`] if the statement fails.
+    pub fn note_anchors(&self, path: &str) -> Result<Option<Anchors>, IndexError> {
+        let mut stmt = self.conn.prepare_cached(R7).map_err(sqlite)?;
+        let mut rows = stmt
+            .query(named_params! { ":path": path })
+            .map_err(sqlite)?;
+        let mut found = None;
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            let anchors: &mut Anchors = found.get_or_insert_with(Anchors::default);
+            let kind: Option<String> = row.get(0).map_err(sqlite)?;
+            let text: Option<String> = row.get(1).map_err(sqlite)?;
+            let block_ref: Option<String> = row.get(2).map_err(sqlite)?;
+            if kind.as_deref() == Some("heading")
+                && let Some(text) = text
+            {
+                anchors.headings.push(text);
+            }
+            if let Some(id) = block_ref {
+                anchors.block_ids.push(id);
+            }
+        }
+        Ok(found)
     }
 
     /// Backlinks (R2) to the note or asset at `path`: one entry per distinct

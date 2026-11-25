@@ -38,10 +38,11 @@ use crate::ipc::{
     AppClosing, AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents,
     FileWritten, FlushAckArgs, FolderCreated, GitignoreAppended, GitignoreOffer, IndexChanged,
     IndexRead, IndexState, IndexStatus, IpcError, KeybindingChange, KeybindingOverride,
-    MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, REFUSED_NAMES_CAP,
-    ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs,
-    SearchOutcome, SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults,
-    TreeStatus, UiSettings, VaultOpened, WriteFileArgs,
+    LinkResolution, MarkTreeArgs, NoteAnchors, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch,
+    REFUSED_NAMES_CAP, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, RefusedName,
+    ResolveLinksArgs, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs,
+    SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeStatus, UiSettings, VaultOpened,
+    WriteFileArgs,
 };
 use crate::settings::{MAX_BINDING_TEXT, Settings};
 use crate::startup::{self, PaintEvidenceRejected, Startup, WatcherOutcome};
@@ -1719,6 +1720,50 @@ impl AppState {
         ))
     }
 
+    /// `resolve_links`. FR-EDT-03, NFR-CMP-01. One batch, one answer per target, in
+    /// request order. Never waits for the index: before `Ready` it answers from the
+    /// tree (`via: Tree`).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::VaultNotFound`] with no vault open.
+    pub fn resolve_links(&self, args: &ResolveLinksArgs) -> Result<Vec<LinkResolution>, IpcError> {
+        let guard = self.open_lock();
+        let open = guard.as_ref().ok_or_else(Self::not_open)?;
+        let root = open.vault.root().to_path_buf();
+        let state = open.publisher.status().state;
+        let switcher = Arc::clone(&open.switcher);
+        drop(guard);
+        Ok(crate::reads::resolve_links(
+            state,
+            &root,
+            &args.source_path,
+            &args.targets,
+            || switcher.tree_note_paths(),
+        ))
+    }
+
+    /// `note_anchors`. FR-EDT-03, FR-NAV-04. The headings and block ids of one note.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PathEscapesVault`] for a bad path; [`IpcError::VaultNotFound`] with
+    /// no vault open; [`IpcError::NotFound`] when the `Ready` index has no note at the
+    /// path.
+    pub fn note_anchors(&self, args: NotePathArgs) -> Result<IndexRead<NoteAnchors>, IpcError> {
+        let path = Self::vault_path(&args.path)?;
+        let (root, state, _, _) = self.read_context()?;
+        match crate::reads::read_when_ready(state, &root, None, |reader| {
+            reader.note_anchors(path.as_str())
+        }) {
+            IndexRead::Ready { value: Some(found) } => Ok(IndexRead::Ready {
+                value: crate::reads::map_anchors(found),
+            }),
+            IndexRead::Ready { value: None } => Err(IpcError::NotFound { path: args.path }),
+            IndexRead::NotReady { state } => Ok(IndexRead::NotReady { state }),
+        }
+    }
+
     /// The root, the last published index state and the search slot, read without blocking.
     fn read_context(
         &self,
@@ -2612,7 +2657,7 @@ fn background_index_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::RebuildReason;
+    use crate::ipc::{RebuildReason, SwitcherCorpus};
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -6917,6 +6962,295 @@ mod tests {
             }) => items.into_iter().map(|h| h.path).collect(),
             other => panic!("search not ready: {other:?}"),
         }
+    }
+
+    // -- resolve_links and note_anchors (task #181; FR-EDT-03, NFR-CMP-01) -------------
+
+    fn resolve(state: &AppState, source: &str, targets: &[&str]) -> Vec<LinkResolution> {
+        state
+            .resolve_links(&ResolveLinksArgs {
+                source_path: source.into(),
+                targets: targets.iter().map(|t| (*t).to_owned()).collect(),
+            })
+            .expect("resolve_links")
+    }
+
+    fn resolved(state: &AppState, source: &str, target: &str) -> LinkResolution {
+        resolve(state, source, &[target]).remove(0)
+    }
+
+    /// The #139 corpus' shapes over one vault: an exact path, a case-folded name, a
+    /// subpath, a duplicate name (shortest path wins) and a miss.
+    fn link_vault(name: &str) -> (AppState, crate::TestDir) {
+        let dir = fixture(name);
+        std::fs::create_dir_all(dir.join("a")).expect("dir");
+        std::fs::create_dir_all(dir.join("b/c")).expect("dir");
+        std::fs::write(
+            dir.join("Target.md"),
+            "# Target\n\n## Sub Heading\n\ntext ^blk1\n",
+        )
+        .expect("fixture");
+        std::fs::write(dir.join("a/Dup.md"), "# Dup near\n").expect("fixture");
+        std::fs::write(dir.join("b/c/Dup.md"), "# Dup far\n").expect("fixture");
+        std::fs::write(dir.join("Ünï.md"), "# Unicode\n").expect("fixture");
+        std::fs::create_dir_all(dir.join("é")).expect("dir");
+        std::fs::create_dir_all(dir.join("ab")).expect("dir");
+        std::fs::write(dir.join("é/x.md"), "# X multibyte\n").expect("fixture");
+        std::fs::write(dir.join("ab/x.md"), "# X ascii\n").expect("fixture");
+        let state = state(&dir);
+        wait_ready(&state);
+        (state, dir)
+    }
+
+    // Mutants, each run by hand and red: folding ASCII only (`to_ascii_lowercase` for
+    // `fold_case` in `reads::resolve_links`) fails the `ÜNÏ` case; ordering the choice by
+    // path instead of length first fails the duplicate-name case.
+    #[test]
+    fn resolve_links_answers_the_139_corpus_shapes_from_the_index() {
+        let (state, dir) = link_vault("resolve-corpus");
+        let all = resolve(
+            &state,
+            "Target.md",
+            &[
+                "Target",
+                "target",
+                "TARGET.md",
+                "a/dup",
+                "Dup",
+                "ÜNÏ",
+                "nothing-here",
+                "Target#Sub Heading",
+                "Target#sub heading",
+                "Target#Nope",
+                "Target#^blk1",
+                "Target^blk1",
+                "Target#^zzz",
+                "#Sub Heading",
+                "#^blk1",
+            ],
+        );
+        let got: Vec<(&str, Option<&str>, Option<bool>)> = all
+            .iter()
+            .map(|r| (r.target.as_str(), r.path.as_deref(), r.subpath_found))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Target", Some("Target.md"), None),
+                ("target", Some("Target.md"), None),
+                ("TARGET.md", Some("Target.md"), None),
+                ("a/dup", Some("a/Dup.md"), None),
+                ("Dup", Some("a/Dup.md"), None),
+                ("ÜNÏ", Some("Ünï.md"), None),
+                ("nothing-here", None, None),
+                ("Target#Sub Heading", Some("Target.md"), Some(true)),
+                ("Target#sub heading", Some("Target.md"), Some(true)),
+                ("Target#Nope", Some("Target.md"), Some(false)),
+                ("Target#^blk1", Some("Target.md"), Some(true)),
+                ("Target^blk1", Some("Target.md"), Some(true)),
+                ("Target#^zzz", Some("Target.md"), Some(false)),
+                ("#Sub Heading", Some("Target.md"), Some(true)),
+                ("#^blk1", Some("Target.md"), Some(true)),
+            ]
+        );
+        assert!(all.iter().all(|r| r.via == SwitcherCorpus::Index));
+        assert!(resolve(&state, "Target.md", &[]).is_empty());
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tree_resolver_agrees_with_the_index_on_the_same_paths() {
+        let (state, dir) = link_vault("resolve-agree");
+        let paths = [
+            "Target.md",
+            "a/Dup.md",
+            "b/c/Dup.md",
+            "Ünï.md",
+            "é/x.md",
+            "ab/x.md",
+        ];
+        for target in [
+            "Target",
+            "TARGET.md",
+            "a/dup",
+            "Dup",
+            "ÜNÏ",
+            "b/c/dup",
+            "gone",
+            "x",
+        ] {
+            let from_index = resolved(&state, "Target.md", target).path;
+            let from_tree = serat_index::read::resolve_among_paths(
+                paths.iter().copied(),
+                &serat_core::fold_case(target),
+            )
+            .map(str::to_owned);
+            assert_eq!(from_tree, from_index, "target {target:?}");
+        }
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_links_before_ready_answers_from_the_tree_and_checks_no_subpath() {
+        let answers = crate::reads::resolve_links(
+            IndexState::Opening { reason: None },
+            std::path::Path::new("/nonexistent-vault-root"),
+            "Target.md",
+            &["target#Heading".to_owned(), "gone".to_owned()],
+            || vec!["Target.md".to_owned(), "x/Other.md".to_owned()],
+        );
+        assert_eq!(answers[0].path.as_deref(), Some("Target.md"));
+        assert_eq!(answers[0].subpath_found, None);
+        assert_eq!(answers[0].via, SwitcherCorpus::Tree);
+        assert_eq!(answers[1].path, None);
+        assert_eq!(answers[1].via, SwitcherCorpus::Tree);
+    }
+
+    #[test]
+    fn resolve_links_answers_at_most_the_documented_number_of_targets() {
+        let targets: Vec<String> = (0..crate::reads::MAX_LINK_TARGETS + 5)
+            .map(|i| format!("n{i}"))
+            .collect();
+        let answers = crate::reads::resolve_links(
+            IndexState::Opening { reason: None },
+            std::path::Path::new("/nonexistent-vault-root"),
+            "a.md",
+            &targets,
+            Vec::new,
+        );
+        assert_eq!(answers.len(), crate::reads::MAX_LINK_TARGETS);
+    }
+
+    #[test]
+    fn note_anchors_lists_headings_and_block_ids_and_refuses_what_is_not_a_note() {
+        let (state, dir) = link_vault("anchors");
+        let found = state
+            .note_anchors(NotePathArgs {
+                path: "Target.md".into(),
+            })
+            .expect("anchors");
+        let IndexRead::Ready { value } = found else {
+            panic!("expected ready, got {found:?}");
+        };
+        assert_eq!(value.headings, ["Target", "Sub Heading"]);
+        assert_eq!(value.block_ids, ["blk1"]);
+        // A note with none is an answer, not an error.
+        let bare = state
+            .note_anchors(NotePathArgs {
+                path: "Ünï.md".into(),
+            })
+            .expect("anchors");
+        let IndexRead::Ready { value } = bare else {
+            panic!("expected ready, got {bare:?}");
+        };
+        assert_eq!(value.headings, ["Unicode"]);
+        assert!(value.block_ids.is_empty());
+        assert!(matches!(
+            state.note_anchors(NotePathArgs {
+                path: "missing.md".into()
+            }),
+            Err(IpcError::NotFound { .. })
+        ));
+        assert!(matches!(
+            state.note_anchors(NotePathArgs {
+                path: "../escape.md".into()
+            }),
+            Err(IpcError::PathEscapesVault { .. })
+        ));
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_link_commands_with_no_vault_open_are_refused_by_name() {
+        let bare = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            Boot::default(),
+            Settings::default(),
+        );
+        assert!(matches!(
+            bare.resolve_links(&ResolveLinksArgs {
+                source_path: "a.md".into(),
+                targets: vec!["b".into()],
+            }),
+            Err(IpcError::VaultNotFound { .. })
+        ));
+        assert!(matches!(
+            bare.note_anchors(NotePathArgs {
+                path: "a.md".into()
+            }),
+            Err(IpcError::VaultNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn the_link_commands_round_trip_the_contracts_json() {
+        let args: ResolveLinksArgs =
+            serde_json::from_str(r#"{"source_path":"a.md","targets":["b","c#d"]}"#).expect("args");
+        assert_eq!(args.targets, ["b", "c#d"]);
+        let answer = LinkResolution {
+            target: "b".into(),
+            path: None,
+            subpath_found: None,
+            via: SwitcherCorpus::Tree,
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).expect("json"),
+            serde_json::json!({"target":"b","path":null,"subpath_found":null,"via":"tree"})
+        );
+        let anchors = IndexRead::Ready {
+            value: NoteAnchors {
+                headings: vec!["H".into()],
+                block_ids: vec!["x".into()],
+            },
+        };
+        let json = serde_json::to_value(&anchors).expect("json");
+        assert_eq!(json["kind"], "ready");
+        assert_eq!(json["value"]["block_ids"][0], "x");
+    }
+
+    // ADR-0020: a `resolve_links` made on `index://changed` for a save whose commit was
+    // held sees the new link; made while the commit is held it does not. Mutant: announce
+    // at the submit (`changed()` there) and the held-phase assertion fails; open the
+    // reader once and cache it and the post-release assertion fails.
+    #[test]
+    fn a_resolve_links_made_on_index_changed_sees_the_saved_note() {
+        let (state, dir) = quiet_state("resolve-after-commit");
+        let seen = collect_changed(&state);
+        let gate = commit_gate(&state);
+        let before = resolved(&state, "10-projects/serat.md", "fresh-note");
+        assert_eq!(before.path, None);
+
+        let hold = gate.hold();
+        state
+            .write_file(WriteFileArgs {
+                path: "fresh-note.md".into(),
+                text: "# Fresh\n\n## Part\n".into(),
+                base_hash: None,
+            })
+            .expect("create");
+        assert!(
+            hold.wait_reached(Duration::from_secs(10)),
+            "the writer never reached the held commit"
+        );
+        assert_eq!(
+            resolved(&state, "10-projects/serat.md", "fresh-note").path,
+            None,
+            "the held transaction is invisible to the resolver"
+        );
+        assert!(seen.lock().expect("seen").is_empty());
+
+        drop(hold);
+        wait_until("index://changed after the release", || {
+            !seen.lock().expect("seen").is_empty()
+        });
+        let after = resolved(&state, "10-projects/serat.md", "fresh-note#Part");
+        assert_eq!(after.path.as_deref(), Some("fresh-note.md"));
+        assert_eq!(after.subpath_found, Some(true));
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Mutants, each run by hand on this commit and each red:

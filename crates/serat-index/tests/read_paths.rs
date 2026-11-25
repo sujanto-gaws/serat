@@ -593,6 +593,27 @@ fn every_statement_uses_the_index_it_was_designed_for() {
             .all(|line| !line.starts_with("SCAN a") && !line.starts_with("SCAN n")),
         "attachments scans notes:\n{plan}"
     );
+
+    // R6 and R7 (task #181; architecture §4.5, §9.3): the batch resolver reaches `notes`
+    // through the folded path and file-name indexes and never scans it per target; the
+    // anchors read finds the note by its unique path and its blocks by `(note_id, ord)`.
+    let plan = plan_of("R6 resolve");
+    for needle in ["ix_notes_path_fold", "ix_notes_file_name"] {
+        assert!(plan.contains(needle), "{needle} missing from:\n{plan}");
+    }
+    assert!(
+        plan.lines().all(|line| !line.contains("SCAN n")),
+        "R6 scans notes:\n{plan}"
+    );
+    let plan = plan_of("R7 anchors");
+    for needle in ["sqlite_autoindex_notes_1", "sqlite_autoindex_blocks_1"] {
+        assert!(plan.contains(needle), "{needle} missing from:\n{plan}");
+    }
+    assert!(
+        plan.lines()
+            .all(|line| !line.contains("SCAN n") && !line.contains("SCAN b")),
+        "R7 scans:\n{plan}"
+    );
 }
 
 #[test]
@@ -604,4 +625,37 @@ fn r3_ignores_inline_fields_which_are_p2s() {
     let hits = f.hits("[status:active]");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, "b.md");
+}
+
+#[test]
+fn r6_answers_one_row_per_target_in_request_order_and_r7_tells_no_note_from_no_anchors() {
+    // Task #181. The targets are folded by the caller (serat-app), so these are folded.
+    let f = fixture(&[
+        ("a/dup.md", "# Near\n"),
+        ("b/c/dup.md", "# Far\n"),
+        ("solo.md", "# Solo\n"),
+    ]);
+    let asked: Vec<String> = ["solo", "dup", "b/c/dup.md", "nope", "solo.md"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let got = f.reader.resolve_targets(&asked).expect("R6");
+    assert_eq!(
+        got,
+        [
+            Some("solo.md".to_owned()),
+            Some("a/dup.md".to_owned()),
+            Some("b/c/dup.md".to_owned()),
+            None,
+            Some("solo.md".to_owned()),
+        ]
+    );
+    assert!(f.reader.resolve_targets(&[]).expect("empty").is_empty());
+    assert!(f.reader.note_anchors("nope.md").expect("R7").is_none());
+    let none = f
+        .reader
+        .note_anchors("solo.md")
+        .expect("R7")
+        .expect("a note");
+    assert_eq!(none.block_ids, Vec::<String>::new());
 }

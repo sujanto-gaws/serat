@@ -1622,18 +1622,22 @@ pub struct NoteAnchors {
 
 /// Arguments to `resolve_links`.
 ///
-/// `resolve_links(args: ResolveLinksArgs) -> Vec<LinkResolution>`
+/// `resolve_links(args: ResolveLinksArgs) -> Result<Vec<LinkResolution>, IpcError>`
 ///
 /// Serves FR-EDT-03, NFR-CMP-01. One call per viewport change, all targets at
-/// once. Never fails and never waits: before `Ready` it resolves file names
-/// against the tree (`via: Tree`). Same rule as the index's resolver:
+/// once. Never waits and never fails for the index; the only error is
+/// `IpcError::VaultNotFound` with no vault open (task #181). Before `Ready` it resolves file names
+/// against the tree's note paths (`via: Tree`, `subpath_found: None`). Same rule as the index's resolver:
 /// case-insensitive, exact path first, then file name with shortest path.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ResolveLinksArgs {
     /// The note the links are written in (for `[[#Heading]]`).
     pub source_path: String,
-    /// Link targets as written, without brackets or `|display` text.
+    /// Link targets as written, without brackets or `|display` text. At most 1,000 are
+    /// answered (`MAX_LINK_TARGETS`): a longer list is truncated to its first 1,000, and
+    /// the answer has that many entries. A viewport batch is tens; the editor never
+    /// sends more.
     pub targets: Vec<String>,
 }
 

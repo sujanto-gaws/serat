@@ -26,7 +26,8 @@ use serat_index::{index_path, read};
 
 use crate::index::{HandleEpoch, index_dir_for};
 use crate::ipc::{
-    Backlink, BlockLocation, IndexRead, IndexState, SearchHit, SearchOutcome, TreeEntryKind,
+    Backlink, BlockLocation, IndexRead, IndexState, LinkResolution, NoteAnchors, SearchHit,
+    SearchOutcome, SwitcherCorpus, TreeEntryKind,
 };
 
 /// A read-only connection to the index of the vault rooted at `root`.
@@ -323,6 +324,139 @@ pub fn map_backlink(link: read::Backlink) -> Backlink {
         block: link.block.map(map_block),
         excerpt: link.excerpt,
         frontmatter_keys: link.frontmatter_keys,
+    }
+}
+
+/// The most targets one `resolve_links` call answers; the rest are not answered (the
+/// contract says so). A viewport holds tens.
+pub const MAX_LINK_TARGETS: usize = 1000;
+
+/// A link target as written, split the way the editor splits it (`parseLinkInner` in
+/// `app/src/editor/linkState.ts`): the note part, then a `#` subpath, or a `^` one when
+/// there is no `#`. Never rewrites the text (C-01).
+struct Written<'a> {
+    note: &'a str,
+    subpath: Option<Subpath<'a>>,
+}
+
+enum Subpath<'a> {
+    /// `#Heading` or `#A#B`: matched on the last segment, folded.
+    Heading(&'a str),
+    /// `#^id` or `^id`.
+    Block(&'a str),
+}
+
+fn split_written(target: &str) -> Written<'_> {
+    let target = target.trim();
+    let hash = target.find('#');
+    let caret = target.find('^');
+    let Some(cut) = hash.or(caret) else {
+        return Written {
+            note: target,
+            subpath: None,
+        };
+    };
+    let note = target[..cut].trim();
+    let rest = if hash.is_some() {
+        &target[cut + 1..]
+    } else {
+        &target[cut..]
+    };
+    let subpath = match rest.strip_prefix('^') {
+        Some(id) => Subpath::Block(id.trim()),
+        None => Subpath::Heading(
+            rest.rsplit('#')
+                .find(|s| !s.trim().is_empty())
+                .unwrap_or(""),
+        ),
+    };
+    Written {
+        note,
+        subpath: Some(subpath),
+    }
+}
+
+fn subpath_exists(anchors: &serat_index::read::Anchors, subpath: &Subpath<'_>) -> bool {
+    match subpath {
+        Subpath::Heading(text) => {
+            let want = serat_core::fold_case(text.trim());
+            anchors
+                .headings
+                .iter()
+                .any(|h| serat_core::fold_case(h.trim()) == want)
+        }
+        Subpath::Block(id) => anchors.block_ids.iter().any(|b| b == id),
+    }
+}
+
+/// `resolve_links` (FR-EDT-03, NFR-CMP-01): every target of the batch, answered.
+///
+/// `Ready` index: one R6 statement for the whole batch, plus one R7 per distinct note
+/// that a `#heading` or `^block` subpath must be checked in (`via: Index`). Anything
+/// else, including an index that fails to open or read, answers from the tree's paths
+/// (`via: Tree`, `subpath_found: None`: headings are not known yet). It never waits and
+/// never errors; a write that has committed is seen by the next call because the reader
+/// is opened per call (ADR-0020).
+pub fn resolve_links(
+    state: IndexState,
+    root: &Path,
+    source: &str,
+    targets: &[String],
+    tree_paths: impl FnOnce() -> Vec<String>,
+) -> Vec<LinkResolution> {
+    let targets = &targets[..targets.len().min(MAX_LINK_TARGETS)];
+    let writtens: Vec<Written<'_>> = targets.iter().map(|t| split_written(t)).collect();
+    let folded: Vec<String> = writtens
+        .iter()
+        .map(|w| serat_core::fold_case(if w.note.is_empty() { source } else { w.note }))
+        .collect();
+    if matches!(state, IndexState::Ready { .. })
+        && let Ok(reader) = open_reader(root, None)
+        && let Ok(paths) = reader.resolve_targets(&folded)
+        && paths.len() == targets.len()
+    {
+        let mut anchors: std::collections::HashMap<String, Option<serat_index::read::Anchors>> =
+            std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(targets.len());
+        for ((target, written), path) in targets.iter().zip(&writtens).zip(paths) {
+            let subpath_found = match (&path, &written.subpath) {
+                (Some(path), Some(subpath)) => {
+                    let known = anchors
+                        .entry(path.clone())
+                        .or_insert_with(|| reader.note_anchors(path).ok().flatten());
+                    known.as_ref().map(|a| subpath_exists(a, subpath))
+                }
+                _ => None,
+            };
+            out.push(LinkResolution {
+                target: target.clone(),
+                path,
+                subpath_found,
+                via: SwitcherCorpus::Index,
+            });
+        }
+        return out;
+    }
+    let tree = tree_paths();
+    let resolver = read::PathResolver::new(tree.iter().map(String::as_str));
+    targets
+        .iter()
+        .zip(&folded)
+        .map(|(target, folded)| LinkResolution {
+            target: target.clone(),
+            path: resolver.resolve(folded).map(str::to_owned),
+            subpath_found: None,
+            via: SwitcherCorpus::Tree,
+        })
+        .collect()
+}
+
+/// A note's anchors in the contract's terms.
+#[must_use]
+pub fn map_anchors(anchors: read::Anchors) -> NoteAnchors {
+    NoteAnchors {
+        headings: anchors.headings,
+        block_ids: anchors.block_ids,
     }
 }
 

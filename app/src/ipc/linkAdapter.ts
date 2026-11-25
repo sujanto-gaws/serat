@@ -1,8 +1,9 @@
 // The editor's link-related IPC surface (contracts/ipc.rs: `resolve_links`,
 // `note_anchors`, `switcher_query`, event `index://changed`), behind the same
-// kind of mockable seam as `editorAdapter.ts`. `serat-app` does not implement
-// these yet (task #18); nothing in `src/editor` calls `invoke`/`listen`
-// directly, so landing the real commands changes this file alone.
+// kind of mockable seam as `editorAdapter.ts`. `serat-app` implements
+// `resolve_links` and `note_anchors` since task #181 (a guard in `acl_manifest.rs`
+// fails if a command name passed to `invoke` here is not registered); nothing in
+// `src/editor` calls `invoke`/`listen` directly.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -17,7 +18,7 @@ import type { SwitcherQueryArgs } from "./generated/SwitcherQueryArgs";
 import type { SwitcherResults } from "./generated/SwitcherResults";
 
 export interface LinkIpcAdapter {
-  /** `resolve_links(args) -> Vec<LinkResolution>` — never fails, never waits. */
+  /** `resolve_links(args) -> Result<Vec<LinkResolution>, IpcError>` — never waits; fails only with no vault open. */
   resolveLinks(args: ResolveLinksArgs): Promise<LinkResolution[]>;
   /** `note_anchors(args) -> Result<IndexRead<NoteAnchors>, IpcError>`. */
   noteAnchors(args: NotePathArgs): Promise<IndexRead<NoteAnchors>>;

@@ -46,6 +46,8 @@ fn main() {
             "search",
             "switcher_query",
             "backlinks",
+            "resolve_links",
+            "note_anchors",
             "open_tree",
             "mark_tree",
             "note_opened",
