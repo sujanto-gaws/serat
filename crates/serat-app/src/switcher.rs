@@ -110,6 +110,10 @@ impl TreePaths {
             }
         }
         drop(dirs);
+        // Load-bearing order: the bump comes after the `dirs` change and after its lock
+        // is released. `resolver()` and `tree_snapshot()` read the generation, then the
+        // paths; a bump before the change would let a pre-change path set be cached under
+        // the new generation and served as fresh.
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -337,13 +341,6 @@ impl Switcher {
             Some(_) => CorpusSource::Index,
             None => CorpusSource::Tree,
         }
-    }
-
-    /// Every note path the tree stream has delivered: what `resolve_links` resolves
-    /// against before the index is `Ready` (`via: Tree`).
-    #[must_use]
-    pub fn tree_note_paths(&self) -> Vec<String> {
-        self.shared.tree.note_paths()
     }
 
     /// The tree fallback's link resolver, cached per tree generation.
@@ -623,6 +620,27 @@ mod tests {
         }));
         assert!(paths.note_paths().is_empty());
         assert!(paths.generation() >= 5);
+    }
+
+    #[test]
+    fn apply_bumps_generation_only_after_dirs_change() {
+        let paths = Arc::new(TreePaths::default());
+        let before = paths.generation();
+        let held = paths.lock();
+        let worker = Arc::clone(&paths);
+        let apply = std::thread::spawn(move || {
+            worker.apply(&listing("", vec![entry("a.md", TreeKind::Note)]));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            paths.generation(),
+            before,
+            "no bump while the change is pending"
+        );
+        drop(held);
+        apply.join().expect("apply");
+        assert!(paths.generation() > before);
+        assert_eq!(paths.note_paths(), ["a.md"]);
     }
 
     // Task #185: the tree fallback's resolver is folded once per tree generation.

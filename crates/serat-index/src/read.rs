@@ -441,11 +441,13 @@ impl PathResolver {
     pub fn resolve(&self, folded_target: &str) -> Option<&str> {
         let with_md = format!("{folded_target}.md");
         let mut best: Option<&str> = None;
-        let mut candidates = vec![self.by_path.get(folded_target), self.by_path.get(&with_md)];
-        if !folded_target.contains('/') {
-            candidates.push(self.by_name.get(folded_target));
-            candidates.push(self.by_name.get(&with_md));
-        }
+        let by_name = !folded_target.contains('/');
+        let candidates = [
+            self.by_path.get(folded_target),
+            self.by_path.get(&with_md),
+            by_name.then(|| self.by_name.get(folded_target)).flatten(),
+            by_name.then(|| self.by_name.get(&with_md)).flatten(),
+        ];
         for path in candidates.into_iter().flatten() {
             if best.is_none_or(|b| shorter(path, b)) {
                 best = Some(path.as_str());

@@ -513,7 +513,7 @@ fn measure(
     // after the first is the lookups only. The build is reported on its own row.
     rows.push(time(
         &format!(
-            "R6 tree fallback resolver build, once per tree generation, {} paths",
+            "R6 tree fallback PathResolver::new only (not the note_paths snapshot), once per tree generation, {} paths",
             all_paths.len()
         ),
         None,
