@@ -1102,8 +1102,18 @@ pub struct JobArgs {
 /// What the flags are, for `--help` and for the refusal message.
 #[must_use]
 pub fn usage(budget: &Budget) -> String {
+    let (flag_synopsis, extra) = if budget.id == PRF01_WINDOW_VISIBLE.id {
+        (
+            " [--skip-scale]",
+            "  --skip-scale        Report the two figures only; skip the 20k-vs-50k scale
+                      assertion (architecture 3.4). Asserts nothing: not for CI.
+",
+        )
+    } else {
+        ("", "")
+    };
     format!(
-        "usage: {id} [--profile reference|ci] [--iterations N] [--root DIR] [--help]
+        "usage: {id} [--profile reference|ci] [--iterations N] [--root DIR]{flag_synopsis} [--help]
 
   --profile <name>    Which machine profile's threshold applies.
                       One of: reference (default), ci.
@@ -1113,7 +1123,7 @@ pub fn usage(budget: &Budget) -> String {
                       must not be recorded as a gate number.
   --root <DIR>        Repository root (also SERAT_REPO_ROOT). Default: the
                       [workspace] above the working directory.
-  --help, -h          Print this and measure nothing.
+{extra}  --help, -h          Print this and measure nothing.
 
 Both value flags also accept the --flag=value form.
 
@@ -2031,6 +2041,9 @@ pub fn cold_start_job(args: &[String]) -> std::process::ExitCode {
     )
 }
 
+/// The one flag `prf01-cold-start` takes beyond the common set (task #187).
+pub const SKIP_SCALE_FLAG: &str = "--skip-scale";
+
 /// [`cold_start_job`] with both halves injected, so a test can assert the
 /// composition without a 20,000-note fixture or a compiled `serat.exe`.
 ///
@@ -2044,8 +2057,16 @@ where
     R: FnOnce(&[String]) -> std::process::ExitCode,
     S: FnOnce(usize) -> std::process::ExitCode,
 {
-    let skip_scale = args.iter().any(|a| a == "--skip-scale");
-    let reported = reported(args);
+    // Task #187: `--skip-scale` is this job's own flag and the common parser (rightly)
+    // refuses what it does not know, so it is stripped here, before that parse. It was
+    // documented, honoured below, and unreachable: `reported(args)` got it and refused.
+    let skip_scale = args.iter().any(|a| a == SKIP_SCALE_FLAG);
+    let common: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != SKIP_SCALE_FLAG)
+        .cloned()
+        .collect();
+    let reported = reported(&common);
     if reported != std::process::ExitCode::SUCCESS || skip_scale {
         return reported;
     }
@@ -6124,5 +6145,116 @@ mod tests {
         assert_eq!(json_number(manifest, "format_version"), Some(1.0));
         assert_eq!(json_number(manifest, "notes"), Some(20_000.0));
         assert_eq!(json_string(manifest, "nope"), None);
+    }
+
+    /// Every `--flag` the usage text documents: the ones in the synopsis line
+    /// (`[--flag ...]`) and the ones that open an entry in the flag list. Prose that
+    /// merely mentions a flag (the `--iteration` typo it warns about) is not documentation.
+    fn usage_flags(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut lines = text.lines();
+        let synopsis = lines.next().unwrap_or_default();
+        let entries = lines
+            .filter(|l| l.starts_with("  --"))
+            .map(|l| l.trim_start().split("  ").next().unwrap_or_default());
+        for chunk in std::iter::once(synopsis).chain(entries) {
+            for word in chunk.split(|c: char| !(c == '-' || c.is_ascii_alphanumeric())) {
+                if word.starts_with("--") && word.len() > 2 && !out.iter().any(|f| f == word) {
+                    out.push(word.to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// NFR-PRF-01, NFR-PRF-08, US-35 (task #187): a flag a bin documents is a flag its
+    /// run accepts. The usage text is the documentation; each `--flag` in it, for every
+    /// budget the common parser serves, goes through the real entry point -- the
+    /// cold-start composition for its own budget -- and none may be refused.
+    #[test]
+    fn every_documented_flag_is_accepted_by_the_run_that_documents_it() {
+        use std::process::ExitCode;
+        let budgets = [
+            &PRF01_WINDOW_VISIBLE,
+            &PRF01_VAULT_USABLE,
+            &PRF01_SERAT_TERM,
+            &PRF03_SAVE_TO_INDEX,
+            &PRF04_FULL_REBUILD,
+        ];
+        for budget in budgets {
+            let flags = usage_flags(&usage(budget));
+            assert!(
+                flags.iter().any(|f| f == "--profile"),
+                "{}: flag extraction found nothing",
+                budget.id
+            );
+            for flag in flags {
+                let args: Vec<String> = match flag.as_str() {
+                    "--profile" => vec![flag.clone(), "ci".into()],
+                    "--iterations" => vec![flag.clone(), "3".into()],
+                    "--root" => vec![flag.clone(), "/x".into()],
+                    _ => vec![flag.clone()],
+                };
+                // The cold-start composition strips its own flag, then hands the rest
+                // to the common parser; the other budgets reach the parser directly.
+                let seen = std::cell::RefCell::new(None);
+                let _ = cold_start_job_with(
+                    &args,
+                    |a| {
+                        *seen.borrow_mut() = Some(parse_args(budget, a));
+                        ExitCode::FAILURE
+                    },
+                    |_| ExitCode::FAILURE,
+                );
+                let parsed = seen.into_inner().expect("reported step ran");
+                assert!(
+                    parsed.is_ok(),
+                    "{}: documented flag {flag} refused: {:?}",
+                    budget.id,
+                    parsed.err()
+                );
+            }
+        }
+    }
+
+    /// Task #187: the flag reaches the job and not the common parser, which still
+    /// refuses an unknown argument; and the usage text names it for cold-start only.
+    #[test]
+    fn skip_scale_is_stripped_before_the_common_parse_and_is_documented() {
+        use std::process::ExitCode;
+        let args: Vec<String> = ["--profile", "ci", "--skip-scale"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Raw, the common parser refuses it (the defect).
+        assert!(parse_args(&PRF01_WINDOW_VISIBLE, &args).is_err());
+        // Through the composition, it never arrives.
+        let handed = std::cell::RefCell::new(Vec::new());
+        let code = cold_start_job_with(
+            &args,
+            |a| {
+                *handed.borrow_mut() = a.to_vec();
+                ExitCode::SUCCESS
+            },
+            |_| ExitCode::FAILURE,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "scale check must be skipped");
+        assert_eq!(*handed.borrow(), vec!["--profile".to_string(), "ci".into()]);
+        assert!(parse_args(&PRF01_WINDOW_VISIBLE, &handed.borrow()).is_ok());
+        // Without the flag the scale check runs.
+        let ran = std::cell::Cell::new(false);
+        let _ = cold_start_job_with(
+            &["--profile".to_string(), "ci".into()],
+            |_| ExitCode::SUCCESS,
+            |_| {
+                ran.set(true);
+                ExitCode::SUCCESS
+            },
+        );
+        assert!(ran.get(), "scale check must run without --skip-scale");
+        // Usage text matches the flag, on cold-start only; another typo is still refused.
+        assert!(usage(&PRF01_WINDOW_VISIBLE).contains("--skip-scale"));
+        assert!(!usage(&PRF04_FULL_REBUILD).contains("--skip-scale"));
+        assert!(parse_args(&PRF04_FULL_REBUILD, &["--skip-scale".to_string()]).is_err());
     }
 }
