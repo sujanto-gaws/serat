@@ -43,11 +43,25 @@ fn a_close_landing_during_a_passive_still_sets_the_marker_and_joins_the_checkpoi
         let handle = IndexHandle::open(dir.path()).expect("open");
         let health = handle.wal_health();
         let writer = handle.writer();
-        for op in assets(next, next + 3000) {
-            writer.submit_blocking(op).expect("submit");
+        // Task #199: an idle PASSIVE needs the WAL to have grown by the frame floor
+        // (1,000), and 3,000 assets are fewer frames than that. Write until the WAL
+        // is past the floor and under the 4,000-frame size bound, so it is the idle
+        // PASSIVE this test lands the close in.
+        let wal = serat_index::index_path(dir.path()).with_extension("db-wal");
+        let past_floor = u64::try_from(serat_index::checkpoint::IDLE_FLOOR_FRAMES + 200)
+            .expect("frames")
+            * 4_120;
+        loop {
+            for op in assets(next, next + 1000) {
+                writer.submit_blocking(op).expect("submit");
+            }
+            next += 1000;
+            writer.flush().expect("flush");
+            if std::fs::metadata(&wal).map_or(0, |m| m.len()) >= past_floor {
+                break;
+            }
+            assert!(next < 400_000, "the WAL never passed the idle floor");
         }
-        next += 3000;
-        writer.flush().expect("flush");
 
         // The idle gate is 250 ms; wait for the checkpointer to be inside a PASSIVE.
         let started = Instant::now();

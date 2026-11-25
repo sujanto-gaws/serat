@@ -124,6 +124,22 @@ Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 m
   3. *Do not reclassify prf03 as report-only.* p95 is at a quarter of the limit in every run; the straddle is one sample.
   4. *Harness follow-up, small:* the slow-commit tag would discriminate if it were per-commit rather than per-turn (a turn spans many commits in a burst). Not needed for the decision above.
 
+
+* (a-3) **Task #199: the idle frame floor landed (architecture §3.1.1 N8 *Frame floor*, #198; TC-179). Linux supporting evidence only (ADR-0019); acceptance is the next hosted run.** An idle `PASSIVE` (and the idle-only pinned `RESTART`) now runs only once the WAL has grown by `IDLE_FLOOR_FRAMES` = 1,000 since the last `PASSIVE` that ran; a deferral and a below-floor wake do not move that baseline; a below-floor wake disarms the idle timer until the next commit. Gate, spacing, size bound and `close()` are unchanged. Overlap tags now say which kind of run overlapped (`checkpoint=idle|size-bound|no`). **Linux release, 20k vault, this container (4 cores, `concurrent_build_processes` 0 in the p1-save-tail runs; the external-change job does not stamp it), same session, interleaved; "before" is `main` at `89d8a50` built from a second worktree, "after" is this branch:**
+
+  | | before (main), run 1 / run 2 | after (floor), run 1 / run 2 |
+  |---|---|---|
+  | `p1-save-tail` hub note, 300 saves at 1 s gap, total p95 (ms) | 22.77 / 21.15 | 23.79 / 19.37 |
+  | same, p50 (ms) | 16.18 / 15.67 | 15.30 / 14.18 |
+  | same, PASSIVE runs / frames per idle run | 153 / n/a (not reported on main; 1,452 per run all kinds) | 153 (150 idle, 3 size-bound) / 1,382 |
+  | `p1-external-change` single (500 edits), FR-VLT-04 p95 write-to-visible (ms) | 171.0 / 171.0 | 170.1 / 171.4 |
+  | same, max (ms) | 1,253.6 / 1,088.1 | 423.5 / 368.4 |
+  | same, iterations overlapping a checkpoint | 57 / 59 | 5 / 5 (all idle, 0 size-bound) |
+  | same, processing p95 with / without overlap (ms), ratio | 20.7 / 16.7 = 1.24x; 29.7 / 16.6 = 1.79x | 9.1 / 19.2 = 0.48x; 8.0 / 20.0 = 0.40x (n=5, so not a ratio to lean on) |
+  | same, PASSIVE runs over the series (idle / size-bound) | 112 / 112 | 53 (53 / 0), plus 288 idle wake-ups skipped below the floor |
+  | same, frames per idle run | not reported | 1,169 |
+
+  Reading: (1) **The +10% bound on `p1-save-tail` holds**: the means are 21.96 ms before and 21.58 ms after (-1.7%). Pairing the worst after-run with the best before-run gives +12.5% (23.79 against 21.15), which is inside the series' own batch-to-batch spread (before 7.7%, after 22.8%), so that difference is not attributable to the floor. (2) **The floor does nothing to the hub save, as designed**: one hub save is 682 frames, two exceed 1,000, so 153 runs happen in both arms and the hub-save NFR-PRF-03 figure does not move. (3) **It does what it was ruled to do on ordinary notes**: a single external edit commits tens of frames, so PASSIVE runs fell from 112 to 53 over 500 edits and overlapped iterations from 57-59 to 5, with the same FR-VLT-04 p95 (the p95 is the 150 ms coalescing window, not the checkpoint). The Linux single max fell from over 1 s to under 0.5 s; one run each, not a claim. **What this does not show:** that a run's cost on Windows is its flushes and not its frames (§3.1.1 stays "inferred, not measured": Linux runs take 10-25 ms for either, so a Linux number cannot decide it), or the Windows overlap ratio. **Acceptance is the next hosted `budgets.yml` run: FR-VLT-04 single overlap ratio at most 2x, and no prf03 over-limit sample with `checkpoint=idle`; a `size-bound` one is reported to the architect, not a failure.** Side effect to know: the pinned-WAL fact, after a reader lets go, clears at the next completed `PASSIVE`, which now waits for 1,000 frames of growth (or the 4,000 size bound, or `close()`), where it used to retry every 2 s.
 * (b) The single max is 617.4 ms and 834.1 ms, over 500 ms. FR-VLT-04 gates p95, not max; the tail is probably the same overlap, but the log does not attribute the max (1 of the 17 slow singles in run 418 had no overlap).
 * (c) Scanner-on Windows is still unmeasured; no budget has that figure.
 * (d) Run 316's p95 of 615.3 ms was on windows-2025 with 2 cores; 4 cores may account for part of the 615 to 413 ms difference. The two runs do not separate runner from code.

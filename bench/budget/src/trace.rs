@@ -491,6 +491,36 @@ fn number_array(text: &str, key: &str) -> Option<Vec<f64>> {
     body.split(',').map(|tok| tok.trim().parse().ok()).collect()
 }
 
+/// As [`bool_array`], for `"key":["idle","no"]` (plain words, no escapes). `Ok(None)`
+/// when the key is absent.
+fn string_array(text: &str, key: &str) -> Result<Option<Vec<String>>, String> {
+    let needle = format!("\"{key}\":[");
+    let Some(at) = text.find(&needle) else {
+        return Ok(None);
+    };
+    let start = at + needle.len();
+    let end = text[start..]
+        .find(']')
+        .ok_or_else(|| format!("the save benchmark report's {key} is not closed"))?
+        + start;
+    let body = text[start..end].trim();
+    if body.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    body.split(',')
+        .map(|tok| {
+            tok.trim()
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("the save benchmark report's {key} has an entry that is not a string: {tok:?}")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// As [`number_array`], for `"key":[true,false]`. `Ok(None)` when the key is absent;
 /// an entry that is not a boolean is an error naming the key, never a silent absence.
 fn bool_array(text: &str, key: &str) -> Result<Option<Vec<bool>>, String> {
@@ -552,6 +582,9 @@ pub struct SaveBenchmarkTrace {
     /// overlapped the save. Empty when the application did not report it (an older
     /// binary, or an index without a `WalHealth`): absence, not "false" everywhere.
     pub checkpoint_overlap: Vec<bool>,
+    /// Per submitted save, parallel to `checkpoint_overlap` (task #199): `idle`,
+    /// `size-bound`, `no`, or `yes` (overlapped, kind not seen). Empty when not reported.
+    pub checkpoint_kind: Vec<String>,
     /// Per submitted save: an FTS5 merge commit landed inside the save's window.
     pub fts_merge: Vec<bool>,
     /// Per submitted save: a writer turn of 50 ms or more overlapped the window.
@@ -562,6 +595,8 @@ pub struct SaveBenchmarkTrace {
     pub checkpointer_deferred_busy: u64,
     /// PASSIVE plus RESTART checkpoint runs, over the run.
     pub checkpointer_runs: u64,
+    /// Idle wake-ups the frame floor skipped, over the run (task #199).
+    pub checkpointer_floor_skips: u64,
 }
 
 impl SaveBenchmarkTrace {
@@ -603,6 +638,17 @@ impl SaveBenchmarkTrace {
                 ))
             }
         };
+        let kinds = match string_array(line, "save_checkpoint_kind")? {
+            Some(kinds) if kinds.len() != submitted.len() => {
+                return Err(format!(
+                    "the save benchmark report's save_checkpoint_kind has {} entries for {} submitted saves",
+                    kinds.len(),
+                    submitted.len()
+                ));
+            }
+            Some(kinds) => kinds,
+            None => Vec::new(),
+        };
         Ok(SaveBenchmarkTrace {
             attempted: count("save_attempted")?,
             submitted_ms: submitted.clone(),
@@ -613,12 +659,15 @@ impl SaveBenchmarkTrace {
             // gates. A tag array of the wrong length is not: it would pair samples
             // with the wrong flags, so it is refused by name.
             checkpoint_overlap: tags("save_checkpoint_overlap")?,
+            checkpoint_kind: kinds,
             fts_merge: tags("save_fts_merge")?,
             slow_commit: tags("save_slow_commit")?,
             flag_probe_failures: number(line, "save_flag_probe_failures").map_or(0, |n| n as u64),
             checkpointer_deferred_busy: number(line, "save_checkpointer_deferred_busy")
                 .map_or(0, |n| n as u64),
             checkpointer_runs: number(line, "save_checkpointer_runs").map_or(0, |n| n as u64),
+            checkpointer_floor_skips: number(line, "save_checkpointer_floor_skips")
+                .map_or(0, |n| n as u64),
         })
     }
 }
@@ -1037,10 +1086,17 @@ mod tests {
             "\"save_writer_refused_ms\":[],\"save_checkpoint_overlap\":[false,true,false],\
              \"save_fts_merge\":[false,false,true],\"save_slow_commit\":[false,false,true],\
              \"save_flag_probe_failures\":2,\"save_checkpointer_deferred_busy\":5,\
-             \"save_checkpointer_runs\":7",
+             \"save_checkpointer_runs\":7,\"save_checkpointer_floor_skips\":3,\
+             \"save_checkpoint_kind\":[\"no\",\"idle\",\"no\"]",
         );
         let t = SaveBenchmarkTrace::parse(&tagged).expect("tagged report");
         assert_eq!(t.checkpoint_overlap, vec![false, true, false]);
+        assert_eq!(t.checkpoint_kind, vec!["no", "idle", "no"]);
+        assert_eq!(t.checkpointer_floor_skips, 3);
+        assert!(
+            none.checkpoint_kind.is_empty(),
+            "an older binary reports no kinds"
+        );
         assert_eq!(t.fts_merge, vec![false, false, true]);
         assert_eq!(t.slow_commit, vec![false, false, true]);
         assert_eq!(
@@ -1065,6 +1121,14 @@ mod tests {
         let err = bool_array("{\"x\":[true,maybe]}", "x").expect_err("a malformed entry");
         assert!(err.contains('x') && err.contains("maybe"), "{err}");
         assert_eq!(bool_array("{}", "x"), Ok(None));
+        let line = save_report(3, "12.5,8.3,15.0", 0, 0, "").replace(
+            "\"save_writer_refused_ms\":[]",
+            "\"save_writer_refused_ms\":[],\"save_checkpoint_kind\":[\"idle\"]",
+        );
+        let err = SaveBenchmarkTrace::parse(&line).expect_err("a short kind array");
+        assert!(err.contains("save_checkpoint_kind"), "{err}");
+        assert_eq!(string_array("{}", "x"), Ok(None));
+        assert!(string_array("{\"x\":[idle]}", "x").is_err());
     }
 
     #[test]

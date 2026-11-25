@@ -55,7 +55,7 @@ use budget::{Samples, ensure_vault};
 use rusqlite::{Connection, OpenFlags};
 use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
-use serat_index::{IndexHandle, WalHealth, rebuild};
+use serat_index::{IndexHandle, RunKind, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
 use serat_vault::{Vault, VaultEvent, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
@@ -175,6 +175,10 @@ struct Measured {
     /// A WAL checkpoint was running at the write, at the commit, or started or ended
     /// in between (task #165: is the processing tail the checkpointer?).
     checkpoint_overlap: bool,
+    /// Which kind of run overlapped (task #199): the idle gate or the size bound. `None`
+    /// when none did, or when the one that did ended before its kind was read. Reported,
+    /// never part of a verdict (ADR-0019).
+    checkpoint_kind: Option<RunKind>,
     /// The FTS5 segment count fell between the write and the commit: a merge ran in
     /// the writer's transaction (the criterion of `p1-save-tail`).
     fts_merge: bool,
@@ -206,6 +210,7 @@ impl Run<'_> {
         let stats_before = self.health.stats();
         let runs_before = stats_before.passive_runs + stats_before.restart_runs;
         let running_at_write = self.health.checkpoint_in_progress();
+        let kind_at_write = self.health.checkpoint_kind_running();
         let t0 = Instant::now();
         for _ in 0..count {
             let relative = self
@@ -266,6 +271,13 @@ impl Run<'_> {
             now.passive_runs + now.restart_runs != runs_before
         };
 
+        let checkpoint_kind = serat_index::overlap_kind(
+            kind_at_write,
+            self.health.checkpoint_kind_running(),
+            &stats_before,
+            &self.health.stats(),
+        );
+
         let conn = Connection::open_with_flags(
             serat_index::index_path(self.index),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -317,6 +329,7 @@ impl Run<'_> {
             watcher_ms: ms(first_taken.duration_since(t0)),
             processing_ms: ms(last_commit.duration_since(first_taken)),
             checkpoint_overlap,
+            checkpoint_kind,
             fts_merge,
             reader_open_ms,
         })
@@ -469,6 +482,24 @@ impl OverlapSplit {
                 .map_or("n/a".to_owned(), |r| format!("{r:.2}x")),
         )
     }
+}
+
+/// How many overlapped iterations had an idle run, a size-bound run, or neither seen
+/// (task #199: an idle run is the defect the frame floor removes; a size-bound one goes
+/// to the architect). `samples`: (overlapped, kind).
+fn describe_kinds(samples: &[(bool, Option<RunKind>)]) -> String {
+    let count = |want: Option<RunKind>| {
+        samples
+            .iter()
+            .filter(|(overlapped, kind)| *overlapped && *kind == want)
+            .count()
+    };
+    format!(
+        "  checkpoint overlap by kind: idle {}, size-bound {}, kind not seen {} (checkpoint=idle|size-bound|no)",
+        count(Some(RunKind::Idle)),
+        count(Some(RunKind::SizeBound)),
+        count(None),
+    )
 }
 
 fn ms(d: Duration) -> f64 {
@@ -742,6 +773,11 @@ fn run(args: &[String]) -> Result<bool, String> {
             .map(|m| (m.processing_ms, m.checkpoint_overlap))
             .collect();
         println!("{}", OverlapSplit::of(&pairs).describe());
+        let kinds: Vec<(bool, Option<RunKind>)> = runs
+            .iter()
+            .map(|m| (m.checkpoint_overlap, m.checkpoint_kind))
+            .collect();
+        println!("{}", describe_kinds(&kinds));
         let merged: Vec<&Measured> = runs.iter().filter(|m| m.fts_merge).collect();
         let slow_merged = runs
             .iter()
@@ -774,12 +810,18 @@ fn run(args: &[String]) -> Result<bool, String> {
     }
     let stats = handle_stats;
     println!(
-        "checkpointer: {} PASSIVE runs, {} incomplete, {} RESTART, {} idle starts deferred to work \
-         in flight, longest {:.1} ms, mean {:.1} ms",
+        "checkpointer: {} PASSIVE runs ({} idle, {} size-bound), {} incomplete, {} RESTART, {} idle \
+         starts deferred to work in flight, {} idle wake-ups skipped below the {}-frame floor, \
+         {:.0} frames per idle run, longest {:.1} ms, mean {:.1} ms",
         stats.passive_runs,
+        stats.idle_runs,
+        stats.size_runs,
         stats.incomplete,
         stats.restart_runs,
         stats.deferred_busy,
+        stats.floor_skips,
+        serat_index::Bounds::default().idle_floor_frames,
+        stats.idle_frames as f64 / stats.idle_runs.max(1) as f64,
         stats.passive_max_micros as f64 / 1000.0,
         stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
     );
@@ -882,6 +924,22 @@ mod tests {
         let none = OverlapSplit::of(&[(5.0, false)]);
         assert_eq!((none.with_n, none.with_p95, none.ratio()), (0, None, None));
         assert!(none.describe().contains("with n/a (n=0)"));
+    }
+
+    #[test]
+    fn the_overlap_kinds_are_counted_for_overlapped_iterations_only() {
+        // Task #199: report-only; a kind with no overlap is not counted.
+        let line = describe_kinds(&[
+            (true, Some(RunKind::Idle)),
+            (true, Some(RunKind::Idle)),
+            (true, Some(RunKind::SizeBound)),
+            (true, None),
+            (false, None),
+        ]);
+        assert!(
+            line.contains("idle 2, size-bound 1, kind not seen 1"),
+            "{line}"
+        );
     }
 
     #[test]
