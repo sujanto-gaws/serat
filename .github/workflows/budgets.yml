@@ -308,8 +308,9 @@ jobs:
   #                 WEBVIEW2_USER_DATA_FOLDER, so no launch shares a WebView2 profile or a
   #                 still-exiting browser process with the last (hypothesis 2).
   #   folder+flags  the same, plus WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS with
-  #                   --enable-logging --v=1   Chromium writes chrome_debug.log into the data
-  #                                            folder; the harness copies it to the artifact
+  #                   --enable-logging=stderr --v=1
+  #                                            Chromium logging to the job log (the file form
+  #                                            wrote no chrome_debug.log in the first dispatch)
   #                   --disable-features=CalculateNativeWinOcclusion
   #                                            stops Chromium treating the window as occluded
   #                                            and throttling its frames (hypothesis 3; the
@@ -329,7 +330,7 @@ jobs:
           - arm: folder
             browser_args: ""
           - arm: folder+flags
-            browser_args: "--enable-logging --v=1 --disable-features=CalculateNativeWinOcclusion"
+            browser_args: "--enable-logging=stderr --v=1 --disable-features=CalculateNativeWinOcclusion"
     env:
       SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH: "1"
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: ${{ matrix.browser_args }}
@@ -349,7 +350,7 @@ jobs:
         run: |
           mkdir -p bench/out/budgets
           for n in 1 2 3; do
-            cargo run --release -p budget --bin prf01-cold-start -- --profile ci --skip-scale 2>&1 | tee "bench/out/budgets/diag-cold-start-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
+            cargo run --release -p budget --bin prf01-cold-start -- --profile ci 2>&1 | tee "bench/out/budgets/diag-cold-start-attempt-$n.log" || echo "diagnostic: attempt $n ended non-zero"
           done
       - uses: actions/upload-artifact@v4
         if: always()
@@ -371,7 +372,7 @@ jobs:
           - arm: folder
             browser_args: ""
           - arm: folder+flags
-            browser_args: "--enable-logging --v=1 --disable-features=CalculateNativeWinOcclusion"
+            browser_args: "--enable-logging=stderr --v=1 --disable-features=CalculateNativeWinOcclusion"
     env:
       SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH: "1"
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: ${{ matrix.browser_args }}
