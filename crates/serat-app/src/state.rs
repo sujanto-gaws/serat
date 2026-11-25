@@ -3825,7 +3825,19 @@ mod tests {
         let dir = fixture("refused-stale");
         let odd = dir.join(std::ffi::OsStr::from_bytes(b"gone\xe9.md"));
         std::fs::write(&odd, b"x").expect("fixture");
-        let state = state(&dir);
+        // Task #182 (NFR-REL-01, NFR-MNT-01, US-07): two things write the refusal log
+        // besides this test's walks, and the test must have them finished, by what they
+        // publish, before it deletes anything.
+        //   1. The open's own walk (the index rebuild's, or the tree's): `settled_state`
+        //      waits for Ready and for the tree walk to settle, which also means the
+        //      watcher is registered.
+        //   2. The watcher, which records a refused name on *every* event for it, a
+        //      delete included (`watch.rs`, `Accepted::Refused`), the moment it handles
+        //      the event, a little after the `rm`. Landing after the second walk it put
+        //      the deleted name back before the assertion (seen once, 2026-11-24; with
+        //      the watcher armed and the test thread paused 400 ms after the walk it
+        //      fails every time).
+        let state = settled_state(&dir);
         let vault = state.vault().expect("open");
         vault.walk().expect("walk");
         assert_eq!(state.refused_names().len(), 1);
@@ -3836,6 +3848,12 @@ mod tests {
             1,
             "the list is not re-walked by a read"
         );
+        // Events reach the watcher's loop in the order the kernel made them, so once a
+        // file created *after* the `rm` has a row in the index (a valid name: the watcher
+        // queues it, the consumer indexes it), the delete of the refused name has been
+        // handled and nothing further is coming for it.
+        std::fs::write(dir.join("after-the-rm.md"), "# After\n").expect("sentinel");
+        wait_for_row(&dir, "after-the-rm.md");
         vault.walk().expect("walk");
         assert!(state.refused_names().is_empty());
         assert_eq!(state.index_status().refused_names, Some(0));
