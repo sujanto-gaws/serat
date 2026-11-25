@@ -153,14 +153,13 @@ jobs:
 
   # Task #77: the Windows-only code compiles, from Linux, under the same `-D warnings`. A
   # `cfg(windows)` body is otherwise first compiled on the Windows runner; this found two
-  # dead-code errors that would have failed that leg. NOT in gate.needs yet: the apt
-  # packages and the `windows-gnu` target are unverified on a runner (the check was run
-  # locally with a stub C compiler and resource compiler), so a red here must not block
-  # every PR. Promote it to the gate after its first green run.
+  # dead-code errors that would have failed that leg. Gating since #194 (NFR-CMP-01,
+  # NFR-MNT-01): ci run 462 (0a4b3fe) was its first green run on main and run 463 (8f01d7b)
+  # was green too, so it is in gate.needs and the results loop like deny (#113).
   windows-compile:
     name: windows code compiles (x86_64-pc-windows-gnu, check only)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
       - name: Install a MinGW toolchain (C compiler and windres for build scripts)
@@ -369,7 +368,7 @@ jobs:
   # `needs` result.
   gate:
     name: definition of done
-    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny, frontend-bundle]
+    needs: [fmt, clippy, workspace, crate, location-independence, deny, ipc-types, npm-deny, frontend-bundle, windows-compile]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -386,7 +385,8 @@ jobs:
           ipc_result="${{ needs['ipc-types'].result }}"
           npm_result="${{ needs['npm-deny'].result }}"
           bundle_result="${{ needs['frontend-bundle'].result }}"
-          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result $bundle_result"
+          winc_result="${{ needs['windows-compile'].result }}"
+          results="$fmt_result $clippy_result $workspace_result $crate_result $li_result $deny_result $ipc_result $npm_result $bundle_result $winc_result"
           echo "upstream results: ${results}"
           for r in $results; do
             if [ "$r" != "success" ]; then

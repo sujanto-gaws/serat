@@ -426,8 +426,13 @@ fn run_save_benchmark(
         // two, not a per-save timing series.
     }
 
-    // A writer turn is logged when it ends, so let the queue drain (bounded) before
-    // asking which windows a slow one overlapped.
+    // A writer turn is logged when it ends, and the last save's Apply may still be
+    // queued (the guard is taken only after the writer receives it), so a barrier first:
+    // `flush` is answered after everything ahead of it. Then wait out the barrier's own
+    // turn (bounded) before asking which windows a slow one overlapped.
+    if tagger.health.is_some() {
+        let _ = state.flush_index_for_bench();
+    }
     let drain_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while tagger.health.as_ref().is_some_and(|h| h.work_in_flight())
         && std::time::Instant::now() < drain_by
@@ -451,7 +456,9 @@ fn run_save_benchmark(
         } else {
             Vec::new()
         },
-        fts_merge: if tagger.fts.is_some() {
+        // Kept when only the FTS probe could not open: every save then counts a probe
+        // failure and reads as no merge, and the checkpoint and slow-commit tags stand.
+        fts_merge: if tagger.health.is_some() {
             fts_merge
         } else {
             Vec::new()
@@ -1797,6 +1804,29 @@ mod tests {
             "an unreadable probe is not a merge"
         );
         assert!(!merge_landed(Some(9), None));
+    }
+
+    #[test]
+    fn the_bench_flush_waits_for_a_queued_save_and_is_false_without_a_vault() {
+        // Task #196: the barrier the slow-commit tagging drains behind, so the last
+        // save's Apply cannot still be queued when the log is read.
+        let idle = AppState::with_settings(
+            Arc::new(Startup::begin()),
+            cli::Boot::default(),
+            settings::Settings::default(),
+        );
+        assert!(!idle.flush_index_for_bench(), "no vault, no barrier");
+        let (dir, state) = open_fixture_for_save_benchmark("save-bench-flush");
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(&list_path, "10-projects/a.md\n").expect("list");
+        let _ = run_save_benchmark(&state, &list_path).expect("benchmark");
+        assert!(
+            state.flush_index_for_bench(),
+            "an open vault answers the barrier"
+        );
+        let health = state.wal_health().expect("health");
+        assert!(!health.work_in_flight() || state.flush_index_for_bench());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

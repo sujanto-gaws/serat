@@ -145,8 +145,10 @@ pub struct SaveTags {
 
 impl SaveTags {
     /// The tags of a parsed run, or `None` when the application did not report them
-    /// (an older binary, or an index with no `WalHealth`). Never an error: tags are
-    /// diagnostic and a run without them still gates.
+    /// (an older binary, or an index with no `WalHealth`). Absence is not an error: tags are
+    /// diagnostic and a run without them still gates. A length mismatch is a contract
+    /// error, refused by name at parse time (`SaveBenchmarkTrace::parse`); a trace built
+    /// by hand that mismatches also yields `None` here rather than mispairing samples.
     #[must_use]
     pub fn from_trace(trace: &SaveBenchmarkTrace) -> Option<SaveTags> {
         let n = trace.submitted_ms.len();
@@ -250,8 +252,8 @@ impl SaveTags {
         lines
     }
 
-    /// The JSON object (without a trailing comma), two-space indented to sit under the
-    /// outcome's own keys.
+    /// The JSON object (ending in a comma, as an object member followed by
+    /// more keys), two-space indented to sit under the outcome's own keys.
     #[must_use]
     pub fn to_json(&self, limit_ms: f64) -> String {
         let mut s = String::new();

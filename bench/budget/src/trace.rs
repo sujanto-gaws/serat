@@ -491,23 +491,32 @@ fn number_array(text: &str, key: &str) -> Option<Vec<f64>> {
     body.split(',').map(|tok| tok.trim().parse().ok()).collect()
 }
 
-/// As [`number_array`], for `"key":[true,false]`. `None` when the key is absent or an
-/// entry is not a boolean.
-fn bool_array(text: &str, key: &str) -> Option<Vec<bool>> {
+/// As [`number_array`], for `"key":[true,false]`. `Ok(None)` when the key is absent;
+/// an entry that is not a boolean is an error naming the key, never a silent absence.
+fn bool_array(text: &str, key: &str) -> Result<Option<Vec<bool>>, String> {
     let needle = format!("\"{key}\":[");
-    let start = text.find(&needle)? + needle.len();
-    let end = text[start..].find(']')? + start;
+    let Some(at) = text.find(&needle) else {
+        return Ok(None);
+    };
+    let start = at + needle.len();
+    let end = text[start..]
+        .find(']')
+        .ok_or_else(|| format!("the save benchmark report's {key} is not closed"))?
+        + start;
     let body = text[start..end].trim();
     if body.is_empty() {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     body.split(',')
         .map(|tok| match tok.trim() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!(
+                "the save benchmark report's {key} has an entry that is not a boolean: {other:?}"
+            )),
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// One `--bench-save-list` run, as `serat-app` reported it (task #111's
@@ -581,7 +590,7 @@ impl SaveBenchmarkTrace {
         };
         let submitted = array("save_submitted_ms")?;
         let tags = |key: &str| -> Result<Vec<bool>, String> {
-            let Some(flags) = bool_array(line, key) else {
+            let Some(flags) = bool_array(line, key)? else {
                 return Ok(Vec::new());
             };
             if flags.len() == submitted.len() {
@@ -1053,7 +1062,9 @@ mod tests {
         );
         let err = SaveBenchmarkTrace::parse(&line).expect_err("a short tag array");
         assert!(err.contains("save_fts_merge"), "{err}");
-        assert_eq!(bool_array("{\"x\":[maybe]}", "x"), None);
+        let err = bool_array("{\"x\":[true,maybe]}", "x").expect_err("a malformed entry");
+        assert!(err.contains('x') && err.contains("maybe"), "{err}");
+        assert_eq!(bool_array("{}", "x"), Ok(None));
     }
 
     #[test]

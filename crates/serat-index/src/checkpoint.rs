@@ -235,7 +235,7 @@ impl WalHealth {
         guard
     }
 
-    /// Whether a writer turn or reconcile round that lasted at least [`SLOW_TURN`]
+    /// Whether a writer turn (a [`WalHealth::writer_turn_guard`]; reconcile rounds are not logged) that lasted at least [`SLOW_TURN`]
     /// overlapped `[from, to]` (task #196). Only finished turns are known: ask after
     /// the work has drained ([`WalHealth::work_in_flight`] false), or a turn still
     /// running is not yet in the log.
@@ -959,12 +959,24 @@ mod tests {
 
     #[test]
     fn only_a_writer_turn_guard_reaches_the_slow_turn_log() {
-        // Task #196: a reconcile round's plain guard must not stand for a commit. The
-        // guard's own clock cannot be injected, so the logged flag is what is tested:
-        // `note_turn` is the logging step, and `drop` calls it only when `logged`.
-        let health = Arc::new(WalHealth::default());
-        assert!(!health.busy_guard().logged);
-        assert!(health.writer_turn_guard().logged);
+        // Task #196: a reconcile round's plain guard must not stand for a commit. Built
+        // in-module with a start a second in the past, so the turn is slow without
+        // sleeping; only the `logged` check in `drop` separates the two outcomes.
+        let past = |logged: bool| {
+            let health = Arc::new(WalHealth::default());
+            health.busy.fetch_add(1, Ordering::Relaxed);
+            let guard = BusyGuard {
+                health: Arc::clone(&health),
+                since: Instant::now() - Duration::from_secs(1),
+                logged,
+            };
+            drop(guard);
+            let now = Instant::now();
+            let found = health.slow_turn_overlapping(now - Duration::from_millis(500), now);
+            (found, health.work_in_flight())
+        };
+        assert_eq!(past(false), (false, false), "a plain guard is not logged");
+        assert_eq!(past(true), (true, false), "a writer turn guard is");
     }
 
     #[test]
