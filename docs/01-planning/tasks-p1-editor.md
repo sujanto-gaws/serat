@@ -113,7 +113,7 @@ owner: lead
 | 164 | `[P1/test] budgets.yml builds serat-app before the NFR-PRF-01/03 jobs measure` (NFR-PRF-01/03/08; ADR-0011) | test-engineer | 60 | **merged** 5ac4dae |
 | 165 | `[P1/impl] FR-VLT-04 Windows CI tail triage; report-only on hosted Windows` (FR-VLT-04, NFR-PRF-08; ADR-0019, ADR-0015) | rust-core-dev | 164 | **merged** 5e27541 (3 rounds) |
 | 166 | `[P1/test] NFR-PRF-04 CI runner class / gate-eligibility rule` (NFR-PRF-04/08, C-06; ADR-0019) | test-engineer + architect | 164 | **merged** 13eec23 (with ADR-0019 as 166b) |
-| 167 | `[P1/test] Windows re-runs of the report-only budget jobs when a runner is available` (NFR-PRF-04, FR-VLT-04; ADR-0019) | test-engineer | 165, 166, runners | pending |
+| 167 | `[P1/test] Windows re-runs of the report-only budget jobs when a runner is available` (NFR-PRF-04, FR-VLT-04; ADR-0019) | test-engineer | 165, 166, runners | **merged** 3e35ce2 (2 rounds) |
 | 168 | `[P1/test] ubuntu-latest asserting jobs for NFR-PRF-04 and FR-VLT-04; two-column C-06 position in the gate report` (NFR-PRF-08; ADR-0019) | test-engineer | 166 | **merged** 410b378 (2 rounds) |
 | 169 | `[P1/req] PRD v1.12: NFR-PRF-08, FR-VLT-04, NFR-PRF-03 note, open question and US-35 restated for ADR-0019` | product-analyst | 166 | **merged** 13eec23 |
 | 170 | `[P1/impl] Contain the split-preview pane so typing does not pay for 10,000 preview elements` (NFR-PRF-02, US-01; ADR-0019, C-06) | vue-frontend-dev | 147 | **merged** a27de35 |
@@ -123,6 +123,19 @@ owner: lead
 | 174 | `[P1/req] PRD v1.13: NFR-PRF-03 names the note class it binds; 5,000-line scenario reported, not gating` (NFR-PRF-03, US-01; ADR-0019) | product-analyst | 172 | **merged** 08f193f |
 | 175 | `[P1/impl] Report each non-bulk committed batch from the index writer to an installed observer` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0001, ADR-0020) | rust-core-dev | 173 | pending |
 | 176 | `[P1/impl] Announce index://changed from the writer's commit observer only, and drop the slot lock before the parse` (NFR-PRF-03, FR-VLT-04, US-01; ADR-0016, ADR-0011, ADR-0020) | tauri-app-dev | 175 | pending |
+| 177 | `[P1/test] Linux desktop reference run (gaws-dev-05): RM-2 runbook row, report, gate-report columns` (NFR-PRF-01/03/04/08, US-35, C-06; ADR-0019) | test-engineer | owner run | **merged** 12542f1 (2 rounds) |
+| 178 | `[P1/impl] Startup timeout prints the marks snapshot and every rejected paint evidence` (NFR-PRF-01/08; ADR-0014) | tauri-app-dev | 167 | **merged** fe85178 (2 rounds) |
+| 179 | `[P1/test] WebView2 diagnostic dispatch of the NFR-PRF-01 jobs on windows-latest` (NFR-PRF-01/08, US-35, C-06; ADR-0019, ADR-0014) | test-engineer | 178 | **merged** 2409ca0 (1 round) |
+| 180 | `[P1/test] Re-read FR-VLT-04 on windows-latest after the #167 harness diagnostics` (FR-VLT-04, NFR-PRF-08, US-35, C-02, C-06; ADR-0019, ADR-0015) | test-engineer | 167 | **merged** 96476ec (2 rounds) |
+| 181 | `[P1/impl] Register the resolve_links and note_anchors commands the editor already invokes` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0007, ADR-0010, ADR-0011, ADR-0020) | tauri-app-dev | 176 | **merged** 4003717 (2 rounds + ts-drift fixup) |
+| 182 | `[P1/test] Hunt two one-off test failures seen 2026-11-24` (NFR-REL-01, NFR-MNT-01, US-07) | test-engineer | 175, 176 | **merged** a2d6884 (1 round) |
+| 183 | `[P1/impl] External-change processing under a WAL checkpoint overlap` (FR-VLT-04, NFR-PRF-03; ADR-0001) | rust-core-dev | 180 | pending |
+| 184 | `[P1/impl] Nested heading subpaths: [[Note#A#B]] must require B under A` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0010) | tauri-app-dev + rust-core-dev | 181 | pending |
+| 185 | `[P1/impl] Cache the tree-fallback link resolver on the tree generation` (FR-EDT-03, NFR-PRF-02, US-03; ADR-0011, ADR-0015) | tauri-app-dev | 181 | pending |
+| 186 | `[P1/impl] Retry the paint mark when the frame gate refuses equal requestAnimationFrame timestamps` (NFR-PRF-01/08, US-35; ADR-0014) | vue-frontend-dev | 179 | in progress |
+| 187 | `[P1/test] prf01-cold-start documents --skip-scale but its parser rejects the flag` (NFR-PRF-01/08, US-35; ADR-0014, ADR-0019) | test-engineer | 179 | pending |
+| 188 | `[P1/impl] Watcher: a delete event must not record a refused name` (FR-VLT-01, NFR-REL-01, US-07; ADR-0015) | rust-core-dev + architect | 182 | pending |
+| 189 | `[P1/test] asset tests spawn mkfifo inside the serat-app lib test binary (fork-exec lock hazard)` (NFR-REL-01, NFR-MNT-01) | test-engineer | 182 | pending |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
