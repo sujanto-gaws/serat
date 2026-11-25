@@ -107,7 +107,10 @@ PRAGMA synchronous = NORMAL;
 -- mtime is not seen (A-03).
 -- user_version 12 (task #86, FR-NAV-04, US-03): links.field_key, the frontmatter key whose
 -- byte range contains the link (NULL for a body link). Derived from file bytes only (C-02).
-PRAGMA user_version = 12;
+-- user_version 13 (task #184, FR-EDT-03, NFR-CMP-01, US-03): blocks.heading_level, the ATX/setext
+-- level (1..6) of a heading block, NULL for every other kind. R7 returns it so a `[[Note#A#B]]`
+-- subpath can require B to sit under A. Derived from file bytes only (C-02).
+PRAGMA user_version = 13;
 
 -- ============================================================================
 -- Tables
@@ -259,6 +262,8 @@ CREATE TABLE blocks (
                  -- single row.
     block_ref    TEXT,                     -- author-supplied ^id
     heading_path TEXT,                     -- breadcrumb of enclosing headings (§8.1)
+    heading_level INTEGER CHECK (heading_level IS NULL OR heading_level BETWEEN 1 AND 6),
+                                           -- 1..6 for kind='heading', NULL otherwise (user_version 13)
     text         TEXT,                     -- plain text; the FTS content column
     byte_start   INTEGER,                  -- NULL for extracted blocks
     byte_end     INTEGER,                  -- the write-back handle (§6.1, ADR-0008)

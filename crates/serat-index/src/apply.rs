@@ -497,9 +497,15 @@ fn insert_block(
         Some(block.heading_path.join(" › "))
     };
 
+    let heading_level = match &block.kind {
+        BlockKind::Heading { level } => Some(i64::from(*level)),
+        _ => None,
+    };
+
     tx.prepare_cached(
-        "INSERT INTO blocks (note_id, ord, kind, block_ref, heading_path, text, byte_start, byte_end)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO blocks (note_id, ord, kind, block_ref, heading_path, text, byte_start, byte_end,
+                             heading_level)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .map_err(sqlite)?
     .execute(params![
@@ -511,6 +517,7 @@ fn insert_block(
             block.text,
             block.range.start as i64,
             block.range.end as i64,
+            heading_level,
         ],
     )
     .map_err(sqlite)?;
