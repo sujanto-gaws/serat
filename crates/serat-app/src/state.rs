@@ -3818,45 +3818,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_deleted_refused_file_leaves_the_list_only_at_the_next_walk() {
-        // The contract states this limit rather than hiding it: the list is a report,
-        // so it may name a file that is already gone until the walk clears the log.
+    fn a_deleted_refused_file_leaves_the_list_when_the_watcher_hears_of_it() {
+        // Task #188: the watcher takes a deleted refused name out of the log as it
+        // handles the delete, so the list and the count drop it without waiting for a walk.
         use std::os::unix::ffi::OsStrExt as _;
         let dir = fixture("refused-stale");
         let odd = dir.join(std::ffi::OsStr::from_bytes(b"gone\xe9.md"));
         std::fs::write(&odd, b"x").expect("fixture");
-        // Task #182 (NFR-REL-01, NFR-MNT-01, US-07): two things write the refusal log
-        // besides this test's walks, and the test must have them finished, by what they
-        // publish, before it deletes anything.
-        //   1. The open's own walk (the index rebuild's, or the tree's): `settled_state`
-        //      waits for Ready and for the tree walk to settle, which also means the
-        //      watcher is registered.
-        //   2. The watcher, which records a refused name on *every* event for it, a
-        //      delete included (`watch.rs`, `Accepted::Refused`), the moment it handles
-        //      the event, a little after the `rm`. Landing after the second walk it put
-        //      the deleted name back before the assertion (seen once, 2026-11-24; with
-        //      the watcher armed and the test thread paused 400 ms after the walk it
-        //      fails every time).
+        // `settled_state` waits for the open's own walk to finish and the watcher to be
+        // registered, so nothing else writes the log while the test deletes.
         let state = settled_state(&dir);
         let vault = state.vault().expect("open");
         vault.walk().expect("walk");
         assert_eq!(state.refused_names().len(), 1);
+        // The strip hears of the change as an `index://status` event (the #144 throttle
+        // may delay it, never drop the last one), so the test waits on those too.
+        let statuses: Arc<Mutex<Vec<crate::ipc::IndexStatus>>> = Arc::default();
+        let sink = Arc::clone(&statuses);
+        state
+            .events
+            .install(move |status| sink.lock().expect("statuses").push(status.clone()));
 
         std::fs::remove_file(&odd).expect("rm");
-        assert_eq!(
-            state.refused_names().len(),
-            1,
-            "the list is not re-walked by a read"
-        );
         // Events reach the watcher's loop in the order the kernel made them, so once a
-        // file created *after* the `rm` has a row in the index (a valid name: the watcher
-        // queues it, the consumer indexes it), the delete of the refused name has been
-        // handled and nothing further is coming for it.
+        // file created *after* the `rm` has a row in the index, the delete of the
+        // refused name has been handled. No further walk is run.
         std::fs::write(dir.join("after-the-rm.md"), "# After\n").expect("sentinel");
         wait_for_row(&dir, "after-the-rm.md");
-        vault.walk().expect("walk");
         assert!(state.refused_names().is_empty());
         assert_eq!(state.index_status().refused_names, Some(0));
+        wait_until("a status event carrying refused_names == Some(0)", || {
+            statuses
+                .lock()
+                .expect("statuses")
+                .last()
+                .is_some_and(|status| status.refused_names == Some(0))
+        });
     }
 
     // -- index reads (FR-NAV-02, FR-NAV-04) -----------------------------------------

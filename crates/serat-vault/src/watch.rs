@@ -240,7 +240,17 @@ fn coalesce(
                             // (FR-VLT-01, design goal 5). No further action —
                             // there is still no row to create for a name this
                             // platform's own filesystem could not hold.
-                            Accepted::Refused(refusal) => vault.refusals().record(refusal),
+                            //
+                            // Task #188: a name that has *left* (a delete, or the old
+                            // side of a rename) is taken out of the log, not put in;
+                            // otherwise the count stays one too high until the next walk.
+                            Accepted::Refused(refusal) => {
+                                if name_has_left(path) {
+                                    vault.refusals().forget(&refusal.path);
+                                } else {
+                                    vault.refusals().record(refusal);
+                                }
+                            }
                             Accepted::Ignored => {}
                         }
                     }
@@ -368,6 +378,28 @@ fn is_interesting(kind: &EventKind) -> bool {
         kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
     )
+}
+
+/// Whether a refused name is gone from disk. Existence decides, not the event kind
+/// (architecture.md §3.1.2): inotify splits rename cookies, Windows sends old and new
+/// as separate events and FSEvents gives no direction. Only `NotFound` means gone; any
+/// other stat error records the name (a report, never a drop). On Windows a file
+/// deleted while another process holds it open answers access-denied, so it stays
+/// recorded until the next walk covering it.
+///
+/// On Windows the stat goes through the verbatim (`\\?\`) form: Win32 would
+/// normalise exactly the names Serat refuses (`note.` and `note ` are looked up as
+/// `note`; `AUX.md` can resolve to the device), and `Vault::open` strips the prefix
+/// from the root.
+fn name_has_left(path: &Path) -> bool {
+    // The absolute event path is root + the relative components, which is exactly what
+    // a verbatim spelling needs. `None` (a `.`/`..`/empty segment, or a name that is
+    // not Unicode) cannot be judged, so the name is treated as present.
+    #[cfg(windows)]
+    let Some(path) = serat_core::verbatim::to_verbatim(path) else {
+        return false;
+    };
+    std::fs::symlink_metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// What an event path turned out to be.
@@ -544,15 +576,13 @@ mod tests {
         watcher.stop();
     }
 
-    /// Task #182 (FR-VLT-01, NFR-REL-01, US-07). Pins what the flake hunt found rather
-    /// than fixing it: the watcher records a refused name on every event for it, a delete
-    /// included, so the delete of a file the log never held (or held until a walk cleared
-    /// it) *adds* the name, and the refused-name count is one too high until the next
-    /// walk. `#[ignore]`d because it fails today; the product task is #188 (see
-    /// `docs/05-testing/reports/flake-hunt-2026-11.md`). Run it with `--ignored`.
+    /// Task #182 found, and task #188 fixed (FR-VLT-01, NFR-REL-01, US-07): the watcher
+    /// used to record a refused name on every event for it, a delete included, so the
+    /// delete of a file the log never held *added* the name and the refused-name count
+    /// stayed one too high until the next walk. A delete now leaves the log untouched
+    /// (see `docs/05-testing/reports/flake-hunt-2026-11.md`).
     #[cfg(unix)]
     #[test]
-    #[ignore = "pins task #182's finding, filed as #188: the watcher records a refusal for a delete"]
     fn the_delete_of_a_refused_name_does_not_add_it_to_the_log() {
         use std::os::unix::ffi::OsStrExt as _;
         let (dir, vault, queue) = fixture();
@@ -571,6 +601,130 @@ mod tests {
         assert!(
             vault.refusals().is_empty(),
             "a delete put a name the vault no longer holds into the log: {:?}",
+            vault.refusals().snapshot()
+        );
+        watcher.stop();
+    }
+
+    /// Task #188: rename events, injected so no filesystem timing is involved. Each path
+    /// is judged by whether it exists, whatever the event kind says, in delivery order:
+    /// a refused name moved away leaves the log, one moved to is recorded, refused to
+    /// refused swaps one entry for the other.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_removes_the_old_refused_name_and_records_the_new_one() {
+        use notify::event::{ModifyKind, RenameMode};
+        let (dir, vault, queue) = fixture();
+        let root = dir.path();
+        let (tx, rx) = mpsc::channel();
+        let stop = Mutex::new(false);
+        let events = Mutex::new(Vec::new());
+        let send = |kind, paths: &[&str]| {
+            let mut event = notify::Event::new(kind);
+            for path in paths {
+                event = event.add_path(root.join(path));
+            }
+            tx.send(Ok(event)).expect("send");
+        };
+        let rename = |mode, paths: &[&str]| send(EventKind::Modify(ModifyKind::Name(mode)), paths);
+        let paths = || -> Vec<String> {
+            vault
+                .refusals()
+                .snapshot()
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        std::thread::scope(|scope| {
+            let (vault_ref, queue_ref, events_ref, stop_ref) = (&vault, &*queue, &events, &stop);
+            scope.spawn(move || {
+                coalesce(
+                    vault_ref,
+                    &rx,
+                    queue_ref,
+                    events_ref,
+                    stop_ref,
+                    Duration::from_millis(1),
+                );
+            });
+            // Events are handled in order, so once the sentinel is queued the earlier
+            // ones have been.
+            let settle = |name: &str| {
+                fs::write(root.join(name), b"x").expect("sentinel");
+                send(EventKind::Create(notify::event::CreateKind::File), &[name]);
+                assert!(eventually(|| queue.depth() > 0), "the sentinel never came");
+                queue.drain();
+            };
+
+            // Rename-to: the new name exists, so it is recorded.
+            fs::write(root.join("a\\one.md"), b"x").expect("write");
+            rename(RenameMode::To, &["a\\one.md"]);
+            settle("s1.md");
+            assert_eq!(paths(), vec!["a\\one.md"]);
+
+            // Refused to refused: old removed, new recorded.
+            fs::rename(root.join("a\\one.md"), root.join("a\\two.md")).expect("mv");
+            rename(RenameMode::Both, &["a\\one.md", "a\\two.md"]);
+            settle("s2.md");
+            assert_eq!(paths(), vec!["a\\two.md"]);
+
+            // Rename-away, the old side alone (a lone From).
+            fs::rename(root.join("a\\two.md"), root.join("fine.md")).expect("mv");
+            rename(RenameMode::From, &["a\\two.md"]);
+            settle("s3.md");
+            assert!(paths().is_empty(), "{:?}", vault.refusals().snapshot());
+
+            // A direction-less event (FSEvents) is judged the same way.
+            fs::write(root.join("a\\three.md"), b"x").expect("write");
+            rename(RenameMode::Any, &["a\\three.md"]);
+            settle("s4.md");
+            assert_eq!(paths(), vec!["a\\three.md"]);
+            fs::remove_file(root.join("a\\three.md")).expect("rm");
+            rename(RenameMode::Any, &["a\\three.md"]);
+            settle("s5.md");
+            assert!(paths().is_empty(), "{:?}", vault.refusals().snapshot());
+
+            *stop.lock().expect("stop") = true;
+        });
+    }
+
+    /// Architecture.md §3.1.2, "A refused name leaves the log when its file does"
+    /// (ruling, task #188, 2026-11-25). Hostile, Windows only: `note.` and `note ` are
+    /// created through `\\?\` paths, touched so each raises an event, and must stay in the
+    /// log (Win32 would look them up as `note` and call them gone); deleted through
+    /// `\\?\`, each must leave. Not run on this platform's CI.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_name_win32_would_alias_stays_until_its_file_is_deleted() {
+        let (dir, vault, queue) = fixture();
+        let watcher =
+            Watcher::start(&vault, Arc::clone(&queue), WatcherConfig::default()).expect("start");
+        let verbatim = |name: &str| {
+            serat_core::verbatim::to_verbatim(&dir.path().join(name)).expect("verbatim")
+        };
+        for name in ["note.", "note "] {
+            fs::write(verbatim(name), b"x").expect("create");
+        }
+        assert!(eventually(|| vault.refusals().len() == 2));
+        for name in ["note.", "note "] {
+            fs::write(verbatim(name), b"y").expect("touch");
+        }
+        // The sentinel is handled after both touches.
+        fs::write(dir.path().join("after.md"), b"# After\n").expect("sentinel");
+        assert!(eventually(|| queue.depth() > 0), "the sentinel never came");
+        assert_eq!(
+            vault.refusals().len(),
+            2,
+            "{:?}",
+            vault.refusals().snapshot()
+        );
+
+        for name in ["note.", "note "] {
+            fs::remove_file(verbatim(name)).expect("delete");
+        }
+        assert!(
+            eventually(|| vault.refusals().is_empty()),
+            "{:?}",
             vault.refusals().snapshot()
         );
         watcher.stop();

@@ -143,6 +143,13 @@ impl RefusalLog {
         self.mutate(|inner| inner.insert(refusal));
     }
 
+    /// Remove a path and every entry beneath it (a refused directory is one entry), as
+    /// the watcher does when a refused name is found gone (task #188). Nothing removed
+    /// is not a change and fires nothing.
+    pub(crate) fn forget(&self, path: &str) {
+        self.mutate(|inner| !inner.take_scope(path).is_empty());
+    }
+
     /// Record a refusal as the watcher would, so serat-app's tests can drive a storm
     /// past the cap. Not for production use.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -243,6 +250,32 @@ mod tests {
             path: path.to_owned(),
             reason: reason.to_owned(),
         }
+    }
+
+    #[test]
+    fn forget_removes_the_path_and_what_is_beneath_it_and_nothing_else() {
+        let log = RefusalLog::new();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        log.on_change(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        for path in ["a\\b", "a\\b/c.md", "a\\bc", "z.md"] {
+            log.record(refusal(path, "r"));
+        }
+        fired.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        log.forget("a\\b");
+        let left: Vec<String> = log.snapshot().into_iter().map(|r| r.path).collect();
+        assert_eq!(left, vec!["a\\bc", "z.md"]);
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Nothing to remove: no change, no callback.
+        log.forget("a\\b");
+        log.forget("absent");
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.overflowed(), 0);
     }
 
     #[test]
