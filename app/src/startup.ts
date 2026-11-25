@@ -149,29 +149,60 @@ function whenDoubleRaf(): Promise<{ raf1Ms: number; raf2Ms: number }> {
  * concurrently; the call fires once whichever is slower resolves.
  */
 export function schedulePaintMark(store: VaultStore): Promise<number | null> {
-  return Promise.all([whenDoubleRaf(), whenFirstContentfulPaint()]).then(
-    ([{ raf1Ms, raf2Ms }, firstContentfulPaintMs]) =>
-      markFirstPaint({
+  // Evidence that cannot change between attempts is read once: the paint entry is
+  // buffered and does not move, so a retry reuses it rather than re-observing.
+  const firstContentfulPaint = whenFirstContentfulPaint();
+  const attempt = async (n: number): Promise<number | null> => {
+    const [{ raf1Ms, raf2Ms }, firstContentfulPaintMs] = await Promise.all([
+      whenDoubleRaf(),
+      firstContentfulPaint,
+    ]);
+    try {
+      const ms = await markFirstPaint({
         firstContentfulPaintMs,
         raf1Ms,
         raf2Ms,
         navDomContentLoadedMs: readNavDomContentLoadedMs(),
-      }).then(
-        (ms) => {
-          store.setMark(`painted ${ms.toFixed(1)} ms`);
-          return ms;
-        },
-        (err: unknown) => {
-          // Never silently swallowed: an unhandled rejection here would look
-          // identical to a shell that painted nothing. It is also, now, the guard
-          // actually firing rather than only a transport failure — a rejection here
-          // can mean the evidence looked implausible (task #105/#112), and the
-          // message says which.
-          store.setMark(`paint mark failed: ${JSON.stringify(err)}`);
-          return null;
-        },
-      ),
-  );
+      });
+      store.setMark(
+        n === 1 ? `painted ${ms.toFixed(1)} ms` : `painted ${ms.toFixed(1)} ms (retried ${n - 1})`,
+      );
+      return ms;
+    } catch (err: unknown) {
+      // Never silently swallowed: an unhandled rejection here would look identical
+      // to a shell that painted nothing, and it is the guard actually firing
+      // rather than only a transport failure (task #105/#112).
+      if (isFrameGateRefusal(err) && n < PAINT_MARK_MAX_ATTEMPTS) {
+        // Task #186: hosted WebView2 sometimes delivers both rAF callbacks with one
+        // timestamp. That is a refusal of this pair, not of the page; ask for a new
+        // pair. The guard is unchanged: each attempt is a command call and the Rust
+        // side prints each refusal under the trace env.
+        store.setMark(`paint attempt ${n} refused (frame gate), retrying: ${JSON.stringify(err)}`);
+        return attempt(n + 1);
+      }
+      store.setMark(
+        `paint mark failed after ${n} attempt${n === 1 ? "" : "s"}: ${JSON.stringify(err)}`,
+      );
+      return null;
+    }
+  };
+  return attempt(1);
+}
+
+/** Attempts (first included) before the page gives up on the paint mark — task #186. */
+export const PAINT_MARK_MAX_ATTEMPTS = 5;
+
+/**
+ * True for `PaintEvidenceRejected` whose reason is the frame gate (`frame_gate_failed`
+ * in `crates/serat-app/src/startup.rs`: the second rAF timestamp did not follow the
+ * first). The wire shape is `{ reason: string }` only, so the reason text is the
+ * discriminator; every other reason (missing paint entry, implausible value) and every
+ * transport error is not retried, because a new frame pair cannot fix them.
+ */
+function isFrameGateRefusal(err: unknown): boolean {
+  if (typeof err !== "object" || err === null || !("reason" in err)) return false;
+  const reason = (err as { reason: unknown }).reason;
+  return typeof reason === "string" && reason.includes("did not follow the first");
 }
 
 /** What `App.vue`'s CodeMirrorEditor exposes — see `defineExpose` there. */

@@ -479,3 +479,54 @@ describe("the startup marks have exactly one call site each", () => {
     },
   );
 });
+
+describe("schedulePaintMark frame-gate retry (task #186)", () => {
+  const frameGate = {
+    reason:
+      "mark_first_paint refused: the second requestAnimationFrame timestamp (188.296) did not follow the first (188.296) — that is not two distinct composited frames",
+  };
+  const missingEntry = {
+    reason: "mark_first_paint refused: no first-contentful-paint entry was sent.",
+  };
+
+  it("first-time success is one call and no retry note", async () => {
+    markFirstPaint.mockResolvedValue(5);
+    const store = useVaultStore();
+    expect(await schedulePaintMark(store)).toBe(5);
+    expect(markFirstPaint).toHaveBeenCalledTimes(1);
+    expect(store.marksText).toBe("painted 5.0 ms");
+  });
+
+  it("resubmits fresh frame timestamps once after a frame-gate refusal", async () => {
+    markFirstPaint.mockRejectedValueOnce(frameGate).mockResolvedValueOnce(7);
+    const store = useVaultStore();
+    expect(await schedulePaintMark(store)).toBe(7);
+    expect(markFirstPaint).toHaveBeenCalledTimes(2);
+    const [first, second] = markFirstPaint.mock.calls.map((c) => c[0] as PaintEvidenceForTest);
+    expect(second.raf1Ms).toBeGreaterThan(first.raf2Ms);
+    expect(store.marksText).toContain("retried 1");
+  });
+
+  it("does not retry any other refusal", async () => {
+    markFirstPaint.mockRejectedValue(missingEntry);
+    const store = useVaultStore();
+    expect(await schedulePaintMark(store)).toBeNull();
+    expect(markFirstPaint).toHaveBeenCalledTimes(1);
+    expect(store.marksText).toContain("paint mark failed after 1 attempt");
+  });
+
+  it("does not retry a transport error", async () => {
+    markFirstPaint.mockRejectedValue("ipc down");
+    const store = useVaultStore();
+    expect(await schedulePaintMark(store)).toBeNull();
+    expect(markFirstPaint).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after five frame-gate refusals and names the attempts", async () => {
+    markFirstPaint.mockRejectedValue(frameGate);
+    const store = useVaultStore();
+    expect(await schedulePaintMark(store)).toBeNull();
+    expect(markFirstPaint).toHaveBeenCalledTimes(5);
+    expect(store.marksText).toContain("paint mark failed after 5 attempts");
+  });
+});
