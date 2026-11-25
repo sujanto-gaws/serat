@@ -279,3 +279,7 @@ Updated in `docs/01-planning/risk-register.md`: runners executed again 2026-11-2
 * Per-round timings, rescan state and queue depth of the failed batch.
 * The run 415 prf03 and prf04 figures (not fetched), and run 416.
 * Any of the NFR-PRF-01 marks present at the timeout; the WebView2 runtime version on the runner.
+
+## Addendum 2026-11-25: `windows-compile` promoted (task #194, TC-176)
+
+The cross-target check (`windows-compile`, TC-172) was `continue-on-error` and outside `gate.needs` pending its first green run. Ci run 462 (0a4b3fe) is that run; run 463 (8f01d7b) was green too. The job is now gating: `continue-on-error: false`, in `gate.needs`, and its result is in the gate's results loop. Not verified: a CI run on the promoting branch, and the gate going red on a real cross-target failure.
