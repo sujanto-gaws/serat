@@ -297,6 +297,13 @@ impl Switcher {
         }
     }
 
+    /// Every note path the tree stream has delivered: what `resolve_links` resolves
+    /// against before the index is `Ready` (`via: Tree`).
+    #[must_use]
+    pub fn tree_note_paths(&self) -> Vec<String> {
+        self.shared.tree.note_paths()
+    }
+
     /// Snapshots built from the index so far. Tests.
     #[must_use]
     pub fn builds(&self) -> u64 {

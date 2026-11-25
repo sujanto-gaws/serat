@@ -18,10 +18,11 @@ use tauri::ipc::Channel;
 use crate::ipc::{
     AssetArgs, AssetInfo, Backlink, CreateFolderArgs, ExternalChange, FileContents, FileWritten,
     FlushAckArgs, FolderCreated, GitignoreAppended, GitignoreOffer, IndexRead, IndexStatus,
-    IpcError, MarkTreeArgs, NoteBufferArgs, NotePathArgs, OpenVaultArgs, Patch, ReadAssetRangeArgs,
-    ReadFileArgs, RebaseBufferArgs, RefusedName, SavePatchArgs, SearchArgs, SearchOutcome,
-    SetKeybindingArgs, SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage,
-    UiSettings, VaultOpened, WriteFileArgs,
+    IpcError, LinkResolution, MarkTreeArgs, NoteAnchors, NoteBufferArgs, NotePathArgs,
+    OpenVaultArgs, Patch, ReadAssetRangeArgs, ReadFileArgs, RebaseBufferArgs, RefusedName,
+    ResolveLinksArgs, SavePatchArgs, SearchArgs, SearchOutcome, SetKeybindingArgs,
+    SetLivePreviewArgs, SwitcherQueryArgs, SwitcherResults, TreeMessage, UiSettings, VaultOpened,
+    WriteFileArgs,
 };
 use crate::offload;
 use crate::startup;
@@ -225,6 +226,35 @@ pub async fn backlinks(
     args: NotePathArgs,
 ) -> Result<IndexRead<Vec<Backlink>>, IpcError> {
     state.backlinks_off_thread(args).await
+}
+
+/// `resolve_links(args) -> Result<Vec<LinkResolution>, IpcError>`
+///
+/// Never waits for the index. Off the webview thread and off a Tauri async worker, like
+/// `backlinks`.
+///
+/// # Errors
+///
+/// As [`AppState::resolve_links`].
+#[tauri::command]
+pub async fn resolve_links(
+    state: State<'_, Arc<AppState>>,
+    args: ResolveLinksArgs,
+) -> Result<Vec<LinkResolution>, IpcError> {
+    state.resolve_links_off_thread(args).await
+}
+
+/// `note_anchors(args) -> Result<IndexRead<NoteAnchors>, IpcError>`
+///
+/// # Errors
+///
+/// As [`AppState::note_anchors`].
+#[tauri::command]
+pub async fn note_anchors(
+    state: State<'_, Arc<AppState>>,
+    args: NotePathArgs,
+) -> Result<IndexRead<NoteAnchors>, IpcError> {
+    state.note_anchors_off_thread(args).await
 }
 
 /// `create_folder(args) -> Result<FolderCreated, IpcError>`

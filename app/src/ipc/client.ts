@@ -33,7 +33,10 @@ import type { FolderCreated } from "./generated/FolderCreated";
 import type { GitignoreAppended } from "./generated/GitignoreAppended";
 import type { GitignoreOffer } from "./generated/GitignoreOffer";
 import type { IndexRead } from "./generated/IndexRead";
+import type { LinkResolution } from "./generated/LinkResolution";
+import type { NoteAnchors } from "./generated/NoteAnchors";
 import type { NotePathArgs } from "./generated/NotePathArgs";
+import type { ResolveLinksArgs } from "./generated/ResolveLinksArgs";
 import type { RefusedName } from "./generated/RefusedName";
 import type { SearchArgs } from "./generated/SearchArgs";
 import type { SearchOutcome } from "./generated/SearchOutcome";
@@ -353,6 +356,21 @@ export function onExternalChange(handler: (change: ExternalChange) => void): Pro
  */
 export function switcherQuery(args: SwitcherQueryArgs): Promise<SwitcherResults> {
   return invoke("switcher_query", { args });
+}
+
+/**
+ * `resolve_links`: one batched call per viewport change (FR-EDT-03, NFR-CMP-01), the
+ * link adapter's own wrapper (`linkAdapter.ts`) is what the editor calls. Never waits
+ * for the index (before it is `Ready` answers carry `via: "tree"`); rejects only with
+ * `vault_not_found`.
+ */
+export function resolveLinks(args: ResolveLinksArgs): Promise<LinkResolution[]> {
+  return invoke("resolve_links", { args });
+}
+
+/** `note_anchors`: the headings and block ids `[[note#` and `[[note^` complete against. */
+export function noteAnchors(args: NotePathArgs): Promise<IndexRead<NoteAnchors>> {
+  return invoke("note_anchors", { args });
 }
 
 /**

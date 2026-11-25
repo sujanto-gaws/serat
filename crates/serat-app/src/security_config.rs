@@ -261,6 +261,8 @@ mod tests {
         let mut expected: Vec<String> = vec![
             "allow-append-gitignore-entry",
             "allow-backlinks",
+            "allow-resolve-links",
+            "allow-note-anchors",
             "allow-decline-gitignore-offer",
             "allow-gitignore-offer-status",
             "allow-get-ui-settings",

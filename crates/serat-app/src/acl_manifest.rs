@@ -189,6 +189,111 @@ mod tests {
         );
     }
 
+    /// Every string literal the front end passes to Tauri's `invoke(...)`, found in the
+    /// shipped sources under `app/src` (tests and fixtures excluded). Only the literal
+    /// forms `invoke("name"` and `invoke<T>("name"`; a plugin command (`plugin:x|y`)
+    /// is not an app command and is skipped.
+    fn invoked_names() -> BTreeSet<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut BTreeSet<(String, String)>) {
+            for entry in std::fs::read_dir(dir)
+                .expect("app/src is readable")
+                .flatten()
+            {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if name != "generated" && name != "__fixtures__" && name != "node_modules" {
+                        walk(&path, out);
+                    }
+                    continue;
+                }
+                let shipped = (name.ends_with(".ts") || name.ends_with(".vue"))
+                    && !name.ends_with(".test.ts")
+                    && !name.ends_with(".d.ts");
+                if !shipped {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("source is readable");
+                let mut rest = text.as_str();
+                while let Some(at) = rest.find("invoke") {
+                    let before_ok = !rest[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    rest = &rest[at + "invoke".len()..];
+                    if !before_ok {
+                        continue;
+                    }
+                    let mut tail = rest;
+                    if tail.starts_with('<') {
+                        // Skip one level of generic arguments.
+                        let mut depth = 0usize;
+                        let mut cut = None;
+                        for (i, c) in tail.char_indices() {
+                            match c {
+                                '<' => depth += 1,
+                                '>' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        cut = Some(i + 1);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let Some(cut) = cut else { continue };
+                        tail = &tail[cut..];
+                    }
+                    let Some(call) = tail.strip_prefix('(') else {
+                        continue;
+                    };
+                    let Some(literal) = call.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some(end) = literal.find('"') else {
+                        continue;
+                    };
+                    let command = &literal[..end];
+                    if !command.contains(':') {
+                        out.insert((command.to_owned(), path.display().to_string()));
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/src");
+        let mut out = BTreeSet::new();
+        walk(&root, &mut out);
+        out
+    }
+
+    #[test]
+    fn every_command_the_front_end_invokes_is_registered() {
+        // Task #181: `resolve_links` and `note_anchors` were invoked by the editor's
+        // link adapter for three releases and registered nowhere, and the editor-latency
+        // stub answered them, so nothing went red. A name that is not in
+        // generate_handler! fails at invoke time, in the running app only.
+        let handlers = handler_commands();
+        let invoked = invoked_names();
+        assert!(
+            invoked.len() >= 20,
+            "the scan found only {} invoke sites; the parser has stopped matching the \
+             source (expected the ~35 in app/src/ipc)",
+            invoked.len()
+        );
+        for (command, file) in &invoked {
+            assert!(
+                handlers.contains(command),
+                "{file} invokes {command:?}, which generate_handler! in lib.rs does not \
+                 register (registered: {handlers:?})"
+            );
+        }
+        let names: BTreeSet<&str> = invoked.iter().map(|(c, _)| c.as_str()).collect();
+        for needed in ["resolve_links", "note_anchors"] {
+            assert!(names.contains(needed), "the scan no longer sees {needed}");
+        }
+    }
+
     #[test]
     fn the_granted_set_is_exactly_the_pinned_commands() {
         // ADR-0012, option 3: grant the five commands the webview actually invokes,
@@ -215,6 +320,8 @@ mod tests {
             "search",
             "switcher_query",
             "backlinks",
+            "resolve_links",
+            "note_anchors",
             "open_tree",
             "mark_tree",
             "note_opened",

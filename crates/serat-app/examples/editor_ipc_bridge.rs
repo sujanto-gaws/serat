@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use serat_app::cli::Boot;
 use serat_app::ipc::{
-    FlushAckArgs, IndexState, NoteBufferArgs, OpenVaultArgs, ReadFileArgs, RebaseBufferArgs,
-    SavePatchArgs, WriteFileArgs,
+    FlushAckArgs, IndexState, NoteBufferArgs, NotePathArgs, OpenVaultArgs, ReadFileArgs,
+    RebaseBufferArgs, ResolveLinksArgs, SavePatchArgs, WriteFileArgs,
 };
 use serat_app::settings::Settings;
 use serat_app::startup::Startup;
@@ -97,6 +97,17 @@ fn dispatch(state: &AppState, command: &str, payload: &Value) -> Value {
                 state.flush_ack(&a);
                 Value::Null
             }
+            Err(e) => bad(e),
+        },
+        // Task #181: the editor's link reads are real commands now, so the real-IPC arm
+        // runs them through serat-app instead of answering null (which the resolver
+        // cannot read as a list).
+        "resolve_links" => match args::<ResolveLinksArgs>(payload) {
+            Ok(a) => answer(state.resolve_links(&a)),
+            Err(e) => bad(e),
+        },
+        "note_anchors" => match args::<NotePathArgs>(payload) {
+            Ok(a) => answer(state.note_anchors(a)),
             Err(e) => bad(e),
         },
         "get_ui_settings" => serde_json::to_value(state.get_ui_settings()).unwrap_or(Value::Null),

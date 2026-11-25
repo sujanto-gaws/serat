@@ -410,6 +410,8 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             commands::search,
             commands::switcher_query,
             commands::backlinks,
+            commands::resolve_links,
+            commands::note_anchors,
             commands::open_tree,
             commands::mark_tree,
             commands::note_opened,
