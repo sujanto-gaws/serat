@@ -3237,6 +3237,7 @@ dependencies = [
  "filepath",
  "libc",
  "rusqlite",
+ "rustix",
  "serat-core",
  "serat-index",
  "serat-parse",

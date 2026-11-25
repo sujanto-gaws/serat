@@ -793,11 +793,16 @@ mod unix_only {
         let fx = Fx::new("fifo");
         fx.put("real.png", b"x");
         let fifo = fx.base.join("vault/pipe.png");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        assert!(
-            made.is_ok_and(|s| s.success()),
-            "mkfifo must be available to run this test"
-        );
+        // `mknodat(Fifo)` in-process, not a spawned `mkfifo`: a child between fork and exec holds a
+        // copy of every index writer `flock` in this binary (task #189, same hazard as #182).
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .expect("mkfifo");
         let (tx, rx) = std::sync::mpsc::channel();
         let base = fx.base.clone();
         std::thread::spawn(move || {
