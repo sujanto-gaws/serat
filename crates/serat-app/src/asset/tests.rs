@@ -120,7 +120,6 @@ fn uri(_platform: Platform, encoded_path: &str) -> String {
     format!("serat-asset://localhost/{encoded_path}")
 }
 
-#[cfg(not(windows))]
 fn body_text(reply: &Reply) -> String {
     String::from_utf8_lossy(&reply.body).into_owned()
 }
