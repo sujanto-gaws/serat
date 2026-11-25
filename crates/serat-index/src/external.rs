@@ -148,6 +148,7 @@ struct Row {
 pub struct Reconciler {
     writer: WriterHandle,
     db: PathBuf,
+    health: std::sync::Arc<crate::checkpoint::WalHealth>,
 }
 
 impl Reconciler {
@@ -157,6 +158,7 @@ impl Reconciler {
         Self {
             writer: handle.writer(),
             db: crate::index_path(handle.index_dir()),
+            health: handle.wal_health(),
         }
     }
 
@@ -196,6 +198,12 @@ impl Reconciler {
         if paths.is_empty() {
             return Ok(outcome);
         }
+        // A round in flight: an idle WAL checkpoint does not start under it (task #183).
+        // The guard spans the reads and the parse on purpose: it is a counter, not a lock,
+        // so it blocks nothing; it only tells the checkpointer to wait. `reconcile_dir`
+        // and `catch_up` (bulk paths) take none: they run on the size bound's terms and
+        // a catch-up is not an FR-VLT-04 round.
+        let _busy = self.health.busy_guard();
         let reader = self.reader()?;
         let mut flushed = 0;
         for path in paths {
@@ -687,6 +695,98 @@ mod tests {
             self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.load(path)
         }
+    }
+
+    /// A source whose `load` parks until released, to hold `index_paths` mid-round.
+    struct ParkingSource {
+        inner: DiskVault,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl NoteSource for ParkingSource {
+        fn entries(&self) -> Result<Vec<SourceEntry>, serat_core::VaultError> {
+            self.inner.entries()
+        }
+
+        fn load(&self, path: &VaultPath) -> Result<serat_core::LoadedNote, serat_core::VaultError> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().expect("lock").recv();
+            self.inner.load(path)
+        }
+    }
+
+    /// Poll until no work is in flight (30 s deadline; the writer's turn guard can outlive
+    /// the reply it has already sent). No elapsed-time assertion.
+    fn wait_idle(health: &crate::checkpoint::WalHealth) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while health.work_in_flight() {
+            assert!(Instant::now() < deadline, "a guard outlived its work");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Task #183: `index_paths` is work in flight for the whole call (the checkpointer
+    /// yields to it), and not after it returns.
+    #[test]
+    fn index_paths_is_work_in_flight_while_it_runs_and_not_after() {
+        let (dir, inner, handle, _entries) = held_writer_fixture(0);
+        let parser = LineParser::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let source = ParkingSource {
+            inner,
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        };
+        std::fs::write(dir.path().join("vault/b.md"), "# B\n").expect("write");
+        let health = handle.wal_health();
+        let reconciler = Reconciler::new(&handle);
+        wait_idle(&health);
+        std::thread::scope(|scope| {
+            let round = scope.spawn(|| {
+                reconciler.index_paths(
+                    &source,
+                    &parser,
+                    &|_, _| false,
+                    &[VaultPath::new("b.md").expect("path")],
+                )
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the round never reached the source");
+            assert!(health.work_in_flight(), "index_paths holds no guard");
+            release_tx.send(()).expect("release");
+            round.join().expect("join").expect("index_paths");
+        });
+        // The writer replies to the flush before its own turn guard drops, so poll.
+        wait_idle(&health);
+        let _ = handle.close();
+    }
+
+    /// Task #183: the busy count returns to zero on the error paths, a writer turn whose
+    /// commit fails and an `index_paths` that returns `Err`.
+    #[test]
+    fn the_busy_count_returns_to_zero_when_a_commit_fails_and_when_index_paths_errs() {
+        let (dir, source, handle, _entries) = held_writer_fixture(0);
+        let parser = LineParser::default();
+        std::fs::write(dir.path().join("vault/b.md"), "# B\n").expect("write");
+        let health = handle.wal_health();
+        handle.fault_injector().fail_every_commit();
+        let result = Reconciler::new(&handle).index_paths(
+            &source,
+            &parser,
+            &|_, _| false,
+            &[VaultPath::new("b.md").expect("path")],
+        );
+        assert!(result.is_err(), "the injected commit failure must surface");
+        // Both the failed writer turn(s) and the failed round have ended.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while health.work_in_flight() {
+            assert!(Instant::now() < deadline, "a guard leaked on an error path");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = handle.close();
     }
 
     const DEPTH: usize = 600;

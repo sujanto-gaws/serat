@@ -341,3 +341,6 @@ nothing gates on it: the check is background and on demand, so it never sits on 
 NFR-PRF-01 window. It takes no writer lock (task #154) and holds no read transaction
 beyond the one call.
 
+## p1-external-change: checkpoint-overlap split (task #183)
+
+Report-only lines under each series: the existing overlap counts and means, then `checkpoint overlap p95 processing: with X ms (n=..), without Y ms (n=..), ratio Z`, from `OverlapSplit` (nearest-rank p95 per class, no ratio when a class is empty). The overlap flag is the one from #165 (`WalHealth::checkpoint_in_progress` at the write, at the commit, or a run counted in between). The checkpointer line also prints how many idle starts were deferred to work in flight. `prf03-save-to-index` is not tagged: its samples come from `measure_save_to_index` in the library, which drives the save through `subject::save_to_index_via_app` (serat-app) and holds no `IndexHandle` or `WalHealth`, so tagging means plumbing the handle out of the app subject; not cheap, left alone.

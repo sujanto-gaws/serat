@@ -20,6 +20,19 @@
 //!   connection runs `wal_checkpoint` and nothing else, so it is never inside a
 //!   transaction of its own (asserted before every call).
 //!
+//! # Yielding to work in flight
+//!
+//! The idle path only *starts* a checkpoint when no work is in flight (task #183). The
+//! writer holds a [`BusyGuard`] from the moment it takes a command until that turn's
+//! `COMMIT` and reply, and [`Reconciler`](crate::Reconciler) holds one for a whole
+//! `index_paths` call; if either is live when the idle gate fires, the checkpoint is
+//! deferred (counted in [`CheckpointStats::deferred_busy`]) and the gate is re-armed from
+//! now. A `PASSIVE` run cannot be interrupted once started, so this is the only lever:
+//! it keeps a run from starting inside a commit or a reconcile round, where on a slow
+//! volume its fsyncs compete with the writer's page writes. The pinned `RESTART` (idle
+//! only) yields the same way. The size bound does not yield: growth forces a checkpoint
+//! however busy the writer is.
+//!
 //! # The hard bound
 //!
 //! A `PASSIVE` checkpoint cannot pass a reader's snapshot. The WAL is bounded by an
@@ -33,7 +46,7 @@
 //! and on every further 4,000 frames of growth.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -115,6 +128,9 @@ pub struct CheckpointStats {
     /// Shortest time between the starts of two idle `PASSIVE` runs, microseconds; 0 until
     /// there have been two.
     pub idle_min_gap_micros: u64,
+    /// Idle wake-ups deferred because the writer or an `index_paths` round was in flight
+    /// (including ones where only the pinned `RESTART` was due).
+    pub deferred_busy: u64,
 }
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -138,6 +154,9 @@ pub struct WalHealth {
     passive_total_micros: AtomicU64,
     frames_checkpointed: AtomicU64,
     idle_min_gap_micros: AtomicU64,
+    /// Live [`BusyGuard`]s: writer turns and reconcile rounds in flight.
+    busy: AtomicUsize,
+    deferred_busy: AtomicU64,
     on_change: Mutex<Option<Notify>>,
 }
 
@@ -186,7 +205,22 @@ impl WalHealth {
             passive_total_micros: self.passive_total_micros.load(Ordering::Relaxed),
             frames_checkpointed: self.frames_checkpointed.load(Ordering::Relaxed),
             idle_min_gap_micros: self.idle_min_gap_micros.load(Ordering::Relaxed),
+            deferred_busy: self.deferred_busy.load(Ordering::Relaxed),
         }
+    }
+
+    /// Mark work in flight until the guard drops: an idle checkpoint will not start
+    /// meanwhile (it is deferred, see the module docs).
+    #[must_use]
+    pub fn busy_guard(self: &Arc<Self>) -> BusyGuard {
+        self.busy.fetch_add(1, Ordering::Relaxed);
+        BusyGuard(Arc::clone(self))
+    }
+
+    /// Whether any [`BusyGuard`] is live.
+    #[must_use]
+    pub fn work_in_flight(&self) -> bool {
+        self.busy.load(Ordering::Relaxed) > 0
     }
 
     /// Call `f` (from the checkpointer thread) whenever the pinned fact appears,
@@ -234,6 +268,16 @@ impl WalHealth {
         if !complete {
             self.incomplete.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Work in flight, for as long as it lives. See [`WalHealth::busy_guard`].
+#[derive(Debug)]
+pub struct BusyGuard(Arc<WalHealth>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -385,6 +429,9 @@ struct State {
     /// Commits since the last attempt finished completely.
     dirty: bool,
     last_commit: Instant,
+    /// When the idle gate was last re-armed by a deferral (not a commit); the gate is
+    /// measured from the later of this and `last_commit`.
+    deferred_at: Option<Instant>,
     /// Frames at the last attempt; the size bound counts growth beyond it.
     base: i32,
     /// Frames in the WAL as of the last commit signal.
@@ -402,10 +449,16 @@ struct State {
 }
 
 impl State {
+    /// What the idle gate counts from: the last commit, or a later deferral.
+    fn idle_base(&self) -> Instant {
+        self.deferred_at
+            .map_or(self.last_commit, |d| d.max(self.last_commit))
+    }
+
     /// When the next idle `PASSIVE` may run: the idle gate, no sooner than the retry
     /// back-off and the spacing from the previous idle one.
     fn passive_at(&self, bounds: Bounds) -> Instant {
-        let mut at = self.last_commit + bounds.idle;
+        let mut at = self.idle_base() + bounds.idle;
         if let Some(retry) = self.retry_at {
             at = at.max(retry);
         }
@@ -419,7 +472,7 @@ impl State {
     /// `RESTART` (the idle gate only).
     fn due(&self, bounds: Bounds, pinned: bool) -> Option<Instant> {
         let passive = self.dirty.then(|| self.passive_at(bounds));
-        let restart = (pinned && !self.restart_spent).then(|| self.last_commit + bounds.idle);
+        let restart = (pinned && !self.restart_spent).then(|| self.idle_base() + bounds.idle);
         match (passive, restart) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -436,6 +489,7 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
     let mut state = State {
         dirty: false,
         last_commit: Instant::now(),
+        deferred_at: None,
         base: 0,
         frames: 0,
         frame_bytes: page_size + 24,
@@ -495,6 +549,13 @@ fn attempt(
         Some(TransactionState::None),
         "the checkpointer connection must never be inside a transaction"
     );
+    if idle && health.work_in_flight() {
+        // Yield: re-arm the idle gate from now. The writer's next commit signal or the
+        // gate wakes the thread again; nothing is lost, `dirty` stays set.
+        health.deferred_busy.fetch_add(1, Ordering::Relaxed);
+        state.deferred_at = Some(Instant::now());
+        return;
+    }
     let spaced_out = !idle || Instant::now() >= state.passive_at(bounds);
     if state.dirty && spaced_out {
         if idle {
@@ -691,6 +752,7 @@ mod tests {
         let mut state = State {
             dirty: false,
             last_commit: t0,
+            deferred_at: None,
             base: 0,
             frames: 0,
             frame_bytes: 4120,
@@ -746,6 +808,74 @@ mod tests {
         });
         assert!(len(&path) > db_before, "the checkpoint copied nothing");
         assert_eq!(health.pinned_bytes(), None);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn an_idle_checkpoint_yields_to_work_in_flight_and_runs_when_it_ends() {
+        // Task #183 (FR-VLT-04): an idle checkpoint does not start inside a writer turn
+        // or a reconcile round. No wall-clock assertion: the deferral is a counted event
+        // the test waits for, and no checkpoint can run while the guard is live.
+        let (dir, _path, actor) = actor(Bounds {
+            idle: Duration::from_millis(20),
+            ..never()
+        });
+        let health = actor.wal_health();
+        let busy = health.busy_guard();
+        assert!(health.work_in_flight());
+        save(&actor, 0);
+        wait_for("a deferral", Duration::from_secs(30), || {
+            health.stats().deferred_busy >= 1
+        });
+        assert_eq!(
+            health.stats().passive_runs,
+            0,
+            "it ran under work in flight"
+        );
+        // The data is still owed: ending the work lets the re-armed gate fire.
+        drop(busy);
+        wait_for("the checkpoint", Duration::from_secs(30), || {
+            health.stats().passive_runs >= 1
+        });
+        assert!(!health.work_in_flight());
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn the_size_bound_is_never_deferred_by_work_in_flight() {
+        let (dir, _path, actor) = actor(Bounds {
+            size_frames: 40,
+            ..never()
+        });
+        let health = actor.wal_health();
+        let _busy = health.busy_guard();
+        for i in 0..40 {
+            save(&actor, i);
+        }
+        wait_for("the size-bound checkpoint", Duration::from_secs(30), || {
+            health.stats().passive_runs >= 1
+        });
+        assert_eq!(health.stats().deferred_busy, 0);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn the_writer_counts_as_work_in_flight_from_taking_a_command_to_its_commit() {
+        let (dir, _path, actor) = actor(never());
+        let health = actor.wal_health();
+        assert!(!health.work_in_flight());
+        let hold = actor.commit_gate().hold();
+        actor.handle().submit(asset(0)).expect("submit");
+        assert!(hold.wait_reached(Duration::from_secs(30)), "never reached");
+        assert!(health.work_in_flight(), "the writer is mid-commit");
+        drop(hold);
+        actor.handle().flush().expect("flush");
+        wait_for("the turn to end", Duration::from_secs(30), || {
+            !health.work_in_flight()
+        });
         actor.shutdown().expect("shutdown");
         drop(dir);
     }

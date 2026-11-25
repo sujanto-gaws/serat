@@ -563,13 +563,14 @@ impl IndexActor {
             observer: options.commit_observer,
             gate: gate.clone(),
         };
+        let busy_health = Arc::clone(&health);
         let join = std::thread::Builder::new()
             .name("serat-index-writer".to_owned())
             .spawn(move || {
                 if let Some(hook) = hook {
                     hook.install(&mut conn, &hook_health);
                 }
-                run(conn, &rx, &actor_fault, &hooks);
+                run(conn, &rx, &actor_fault, &hooks, &busy_health);
             })
             .expect("spawn the index writer");
 
@@ -674,7 +675,13 @@ impl Drop for IndexActor {
 /// answers any barrier that arrives. A batch ends when the queue is empty, the batch
 /// is full, or a command needs an answer — so a quiet vault commits immediately and a
 /// rebuild commits in batches.
-fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector, hooks: &CommitHooks) {
+fn run(
+    conn: Connection,
+    rx: &Receiver<Command>,
+    fault: &FaultInjector,
+    hooks: &CommitHooks,
+    health: &Arc<WalHealth>,
+) {
     let mut pending: Vec<IndexOp> = Vec::with_capacity(BATCH_SIZE);
     let mut since_analyze = 0usize;
     // Whether the blocks_fts triggers are currently off, which is the writer's only
@@ -702,6 +709,8 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector, hooks: &
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
+                    // (No busy guard here: the final commit after every sender dropped
+                    // runs outside a turn, and the checkpointer is stopping anyway.)
                     // Nobody is waiting on this commit, whatever the last turn's
                     // `continue` arm left `answering` as.
                     fault.set_answering(false);
@@ -719,6 +728,9 @@ fn run(conn: Connection, rx: &Receiver<Command>, fault: &FaultInjector, hooks: &
             },
         };
 
+        // Work in flight until this turn's commit and reply are done (task #183): an idle
+        // WAL checkpoint does not start inside it.
+        let _busy = health.busy_guard();
         fault.wait_if_held();
         // Every command but an `Apply` has a caller waiting on a reply, including the
         // ones that commit in their own arm and `continue` (resolve, bulk load, close).
