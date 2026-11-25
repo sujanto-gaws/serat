@@ -523,7 +523,10 @@ describe("schedulePaintMark frame-gate retry (task #186)", () => {
   });
 
   it("gives up after five frame-gate refusals and names the attempts", async () => {
-    markFirstPaint.mockRejectedValue(frameGate);
+    // Five refusals then a success: an unbounded loop would return 99 on call 6 and
+    // fail by assertion rather than by hanging the runner.
+    for (let i = 0; i < 5; i += 1) markFirstPaint.mockRejectedValueOnce(frameGate);
+    markFirstPaint.mockResolvedValueOnce(99);
     const store = useVaultStore();
     expect(await schedulePaintMark(store)).toBeNull();
     expect(markFirstPaint).toHaveBeenCalledTimes(5);
