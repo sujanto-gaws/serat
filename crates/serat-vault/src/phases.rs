@@ -190,7 +190,9 @@ mod tests_off {
 
     #[test]
     fn the_disabled_build_records_nothing_and_says_so() {
-        assert!(!PHASE_TIMING);
+        // Compile-time: the feature-off build must see the constant false
+        // (a runtime assert on a constant is clippy::assertions_on_constants).
+        const _: () = assert!(!PHASE_TIMING);
         begin();
         mark("a");
         mark("b");

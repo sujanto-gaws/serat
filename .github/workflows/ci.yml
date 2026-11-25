@@ -94,6 +94,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Workspace feature unification turns serat-vault's `phase-timing` on (serat-app
+      # dev-dep), so the feature-off test module is only linted per package.
+      - run: cargo clippy -p serat-vault --all-targets -- -D warnings
 
   workspace:
     name: cargo test --workspace (${{ matrix.os }})
