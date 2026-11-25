@@ -5,7 +5,7 @@ date: 2026-11-24
 task: 167
 serves: FR-VLT-04, NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-06, NFR-PRF-08, FR-VLT-01, US-35, C-06
 adrs: ADR-0019, ADR-0014, ADR-0015
-test-cases: TC-159, TC-165, TC-168, TC-173, TC-174
+test-cases: TC-159, TC-165, TC-168, TC-173, TC-174, TC-180
 ---
 
 # First hosted-runner execution since 2026-11-09
@@ -320,3 +320,7 @@ Source: the job log of Budgets run 437 (0a4b3fe, job 139252620044, `prf01-cold-s
 **Resolution 3: finding to escalate (§3.4), no tolerance change.** Run 439 printed, beside its PASS, a spread of 23.4% within the 20k arm and 17.3% within the 50k arm against the 20% tolerance (Serat term p95 307.8 / 308.2 ms, median 277.8 / 278.2, paired median difference +5.2 ms, larger slower in 12/20 pairs, p = 0.503). §3.4 says a spread not comfortably inside the tolerance is a finding to escalate and not a tolerance to widen: 23.4% is outside it. Run 437's +40% may sit inside the range that spread allows between two arms of one series, so it may not be distinguishable from noise on one run; this is reasoned from run 439's spread, not shown (run 437's raw series were not read). What would decide it: (a) more pairs per run (the spread of a max-minus-min statistic grows with n, so this alone may worsen it; the paired median difference and sign test are the stable figures), (b) several runs' paired median differences, (c) a gate-eligible runner, where the spread is the product's and not the runner's. The tolerance stays 20%.
 
 **Not verified:** no hosted run of the changed message; whether runs 437, 438 and 439 ran the same code on the Serat-term path (437 is before 439 by two merges); run 437's 20k and 50k raw series.
+
+## Run 468 `analyze.rs` flake (task #200, TC-180, 2026-11-25)
+
+Ci run 468 (cd54a2e, a docs-only merge) failed `cargo test --workspace (windows-latest)` in `crates/serat-index/tests/analyze.rs:115`: left `Some(39)`, right `Some(40)`; runs 466, 467, 469 passed and Linux never fails. A test-side race, not a product defect: the writer applies the 5% ANALYZE rule per batch, so the statistics after a 40-op load depend on how the writer cut the stream, and a 39 + 1 cut leaves 39. Reproduced on Linux with a flush after the 39th submit (identical message). Fixed in the test (hold the first batch at COMMIT so the cut is [1] + [39]); writer unchanged. Evidence: 200 runs per feature setting (400 in all), 8 parallel copies, 0 failures (Linux). Not verified on Windows; that the 39 + 1 cut is what run 468 saw is inferred from the number.

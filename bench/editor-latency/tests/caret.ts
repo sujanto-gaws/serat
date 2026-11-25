@@ -102,16 +102,16 @@ export interface Attempt { ok: boolean; note: string }
  * attempt; never starts one after the deadline. Throws with the notes of every attempt. `label` names the goal. */
 export async function retryUntilDeadline(
   label: string,
-  attempt: (n: number) => Promise<Attempt>,
+  attempt: (n: number, remainingMs: number) => Promise<Attempt>,
   deadlineMs: number,
   now: () => number = () => Date.now(),
 ): Promise<string> {
   const start = now();
   const notes: string[] = [];
   for (let n = 0; n === 0 || now() - start < deadlineMs; n++) {
-    const r = await attempt(n);
+    const r = await attempt(n, Math.max(1, deadlineMs - (now() - start)));
     notes.push(`#${n + 1}: ${r.note}`);
-    if (r.ok) return r.note;
+    if (r.ok) return `${r.note} after ${n + 1} attempt(s)`; // the count is on the run log: each retry warms the height map
   }
   throw new Error(`${label}: not reached within ${deadlineMs} ms (harness could not place the caret; this is not a latency verdict). Attempts: ${notes.join(" | ")}`);
 }
@@ -126,6 +126,10 @@ export function judgePlacement(idx: number, total: number, lo: number, hi: numbe
 
 /** Resolves once the scroller's scrollTop and scrollHeight have not changed for `frames` consecutive animation
  * frames: CodeMirror has finished re-measuring. Rejects (with the geometry) when `timeoutMs` passes first. */
+async function stableOrMiss(scroller: Locator, timeoutMs: number): Promise<Attempt | null> {
+  try { await waitForStableScroll(scroller, 8, timeoutMs); return null; } catch (e) { return { ok: false, note: String((e as Error).message ?? e) }; }
+}
+
 export async function waitForStableScroll(scroller: Locator, frames = 8, timeoutMs = 10_000): Promise<void> {
   await scroller.evaluate((s, args) => new Promise<void>((resolve, reject) => {
     const t0 = performance.now();
@@ -150,10 +154,13 @@ export async function placeCaretMiddle(page: Page, editor: Locator, lines: strin
   lines.forEach((l, i) => { const m = /^Paragraph (\d+) /.exec(l); if (m) lineOf.set(Number(m[1]), i); });
   const wanted = Math.round(lines.length * (lo + hi) / 2);
   let steer = 0; // px correction learnt from the last miss
-  const note = await retryUntilDeadline("middle: caret within the band", async () => {
-    await waitForStableScroll(scroller);
+  const note = await retryUntilDeadline("middle: caret within the band", async (_n, remaining) => {
+    const t0 = Date.now(), left = () => Math.max(1, remaining - (Date.now() - t0));
+    let miss = await stableOrMiss(scroller, left());
+    if (miss) return miss;
     await scroller.evaluate((s, d) => { s.scrollTop = (s.scrollHeight - s.clientHeight) / 2 + d; }, steer);
-    await waitForStableScroll(scroller);
+    miss = await stableOrMiss(scroller, left());
+    if (miss) return miss;
     const box = await scroller.boundingBox();
     if (!box) return { ok: false, note: "editor scroller has no bounding box" };
     await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
@@ -170,6 +177,8 @@ export async function placeCaretMiddle(page: Page, editor: Locator, lines: strin
     }
     return r;
   }, deadlineMs);
-  await waitForStableScroll(scroller); // the positive "settled" signal replaces the old fixed pause before the first scored key
+  // A final settle before the first scored key; it is a positive signal and the caller's fixed pause stays for start/end.
+  const last = await stableOrMiss(scroller, 10_000);
+  if (last) throw new Error(`middle: caret placed (${note}) but the editor did not settle: ${last.note} (harness could not settle; this is not a latency verdict)`);
   return note;
 }
