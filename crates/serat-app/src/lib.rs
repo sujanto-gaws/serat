@@ -295,9 +295,10 @@ fn checkpoint_overlapped(
 /// run that ended between the two reads).
 fn checkpoint_kind_label(overlapped: bool, kind: Option<serat_index::RunKind>) -> &'static str {
     match (overlapped, kind) {
-        (_, Some(kind)) => kind.label(),
+        // A kind with no overlap is a run seen mid-counter-update: not an overlap.
+        (false, _) => "no",
+        (true, Some(kind)) => kind.label(),
         (true, None) => "yes",
-        (false, None) => "no",
     }
 }
 
@@ -315,10 +316,9 @@ struct Tagger {
 
 /// The state read just before a timed write.
 struct Before {
-    running: bool,
+    /// One load of the running run, and one stats snapshot: both flags derive from them.
     running_kind: Option<serat_index::RunKind>,
     stats: serat_index::CheckpointStats,
-    runs: u64,
     segments: Option<u32>,
 }
 
@@ -331,19 +331,6 @@ impl Tagger {
             health: state.wal_health(),
             fts,
         }
-    }
-
-    fn runs(&self) -> u64 {
-        self.health.as_ref().map_or(0, |h| {
-            let s = h.stats();
-            s.passive_runs + s.restart_runs
-        })
-    }
-
-    fn running(&self) -> bool {
-        self.health
-            .as_ref()
-            .is_some_and(|h| h.checkpoint_in_progress())
     }
 
     fn running_kind(&self) -> Option<serat_index::RunKind> {
@@ -362,10 +349,8 @@ impl Tagger {
 
     fn before(&self) -> Before {
         Before {
-            running: self.running(),
             running_kind: self.running_kind(),
             stats: self.stats(),
-            runs: self.runs(),
             segments: self.segments(),
         }
     }
@@ -373,13 +358,19 @@ impl Tagger {
     /// `(checkpoint overlap, its kind, merge landed, probe failed)`.
     fn after(&self, before: &Before) -> (bool, &'static str, bool, bool) {
         let segments = self.segments();
-        let overlapped =
-            checkpoint_overlapped(before.running, self.running(), before.runs, self.runs());
+        let (running_after, stats_after) = (self.running_kind(), self.stats());
+        let runs = |s: &serat_index::CheckpointStats| s.passive_runs + s.restart_runs;
+        let overlapped = checkpoint_overlapped(
+            before.running_kind.is_some(),
+            running_after.is_some(),
+            runs(&before.stats),
+            runs(&stats_after),
+        );
         let kind = serat_index::overlap_kind(
             before.running_kind,
-            self.running_kind(),
+            running_after,
             &before.stats,
-            &self.stats(),
+            &stats_after,
         );
         (
             overlapped,
@@ -1858,6 +1849,11 @@ mod tests {
         assert_eq!(checkpoint_kind_label(true, size), "size-bound");
         assert_eq!(checkpoint_kind_label(true, None), "yes");
         assert_eq!(checkpoint_kind_label(false, None), "no");
+        assert_eq!(
+            checkpoint_kind_label(false, idle),
+            "no",
+            "a kind with no overlap is not an overlap"
+        );
         assert!(merge_landed(Some(9), Some(4)));
         assert!(!merge_landed(Some(4), Some(4)), "no change");
         assert!(

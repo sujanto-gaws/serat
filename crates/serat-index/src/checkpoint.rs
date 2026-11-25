@@ -1288,7 +1288,9 @@ mod tests {
             health.stats().floor_skips >= 1
         });
         // A spin would count again every gate (10 ms); the count can only be wrong
-        // upward, so a stall cannot fail this and a spin cannot pass it.
+        // upward, so a stall cannot fail this. A checkpointer thread starved for the whole
+        // 300 ms could hide a spin (a flaky pass, never a false failure); the pure `due()`
+        // test above is the proof, this one is the live corroboration.
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(health.stats().floor_skips, 1, "the idle timer spun");
         assert_eq!(health.stats().passive_runs, 0);

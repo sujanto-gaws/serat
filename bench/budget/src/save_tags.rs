@@ -74,13 +74,30 @@ impl CkKind {
         }
     }
 
-    fn parse(word: &str, overlapped: bool) -> Self {
-        match word {
+    /// The kind a report's word names for an entry whose overlap flag is `overlapped`.
+    /// A word outside the four, or one that contradicts the flag (a kind with no overlap, `no` with one), is an error.
+    ///
+    /// # Errors
+    ///
+    /// The word is unknown or contradicts the overlap entry.
+    pub fn parse(word: &str, overlapped: bool) -> Result<Self, String> {
+        let kind = match word {
+            "no" => Self::No,
+            "yes" => Self::Unknown,
             "idle" => Self::Idle,
             "size-bound" => Self::SizeBound,
-            _ if overlapped => Self::Unknown,
-            _ => Self::No,
+            other => {
+                return Err(format!(
+                    "the save benchmark report's save_checkpoint_kind has {other:?}, not idle, size-bound, no or yes"
+                ));
+            }
+        };
+        if (kind != Self::No) != overlapped {
+            return Err(format!(
+                "the save benchmark report's save_checkpoint_kind {word:?} contradicts its save_checkpoint_overlap entry ({overlapped})"
+            ));
         }
+        Ok(kind)
     }
 }
 
@@ -208,10 +225,18 @@ impl SaveTags {
                 index: i,
                 ms: trace.submitted_ms[i],
                 checkpoint: trace.checkpoint_overlap[i],
-                kind: CkKind::parse(
-                    trace.checkpoint_kind.get(i).map_or("", String::as_str),
-                    trace.checkpoint_overlap[i],
-                ),
+                // Validated by `SaveBenchmarkTrace::parse`; a hand-built trace that
+                // contradicts itself falls back to the flag alone.
+                kind: {
+                    let flag_only = if trace.checkpoint_overlap[i] {
+                        CkKind::Unknown
+                    } else {
+                        CkKind::No
+                    };
+                    trace.checkpoint_kind.get(i).map_or(flag_only, |word| {
+                        CkKind::parse(word, trace.checkpoint_overlap[i]).unwrap_or(flag_only)
+                    })
+                },
                 merge: trace.fts_merge[i],
                 slow_commit: trace.slow_commit[i],
             })

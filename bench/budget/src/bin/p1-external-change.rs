@@ -266,17 +266,13 @@ impl Run<'_> {
             last_commit = round.committed;
         }
         let first_taken = first_taken.unwrap_or(last_commit);
-        let checkpoint_overlap = running_at_write || self.health.checkpoint_in_progress() || {
-            let now = self.health.stats();
-            now.passive_runs + now.restart_runs != runs_before
-        };
-
-        let checkpoint_kind = serat_index::overlap_kind(
-            kind_at_write,
-            self.health.checkpoint_kind_running(),
-            &stats_before,
-            &self.health.stats(),
-        );
+        // One snapshot of each, so the flag and the kind cannot disagree.
+        let (kind_now, stats_now) = (self.health.checkpoint_kind_running(), self.health.stats());
+        let checkpoint_overlap = running_at_write
+            || kind_now.is_some()
+            || stats_now.passive_runs + stats_now.restart_runs != runs_before;
+        let checkpoint_kind =
+            serat_index::overlap_kind(kind_at_write, kind_now, &stats_before, &stats_now);
 
         let conn = Connection::open_with_flags(
             serat_index::index_path(self.index),

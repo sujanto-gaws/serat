@@ -649,6 +649,15 @@ impl SaveBenchmarkTrace {
             Some(kinds) => kinds,
             None => Vec::new(),
         };
+        // Refuse a word outside idle/size-bound/no/yes, or one that contradicts its
+        // overlap entry, by name (a typo must not read as a finding).
+        if !kinds.is_empty() {
+            let overlap = tags("save_checkpoint_overlap")?;
+            for (i, word) in kinds.iter().enumerate() {
+                crate::save_tags::CkKind::parse(word, overlap.get(i).copied().unwrap_or(false))
+                    .map_err(|e| format!("{e} (save {i})"))?;
+            }
+        }
         Ok(SaveBenchmarkTrace {
             attempted: count("save_attempted")?,
             submitted_ms: submitted.clone(),
@@ -1128,6 +1137,38 @@ mod tests {
         let err = SaveBenchmarkTrace::parse(&line).expect_err("a short kind array");
         assert!(err.contains("save_checkpoint_kind"), "{err}");
         assert_eq!(string_array("{}", "x"), Ok(None));
+        let kind_line = |kinds: &str, overlap: &str| {
+            save_report(3, "12.5,8.3,15.0", 0, 0, "").replace(
+                "\"save_writer_refused_ms\":[]",
+                &format!(
+                    "\"save_writer_refused_ms\":[],\"save_checkpoint_overlap\":[{overlap}],\"save_checkpoint_kind\":[{kinds}]"
+                ),
+            )
+        };
+        assert!(
+            SaveBenchmarkTrace::parse(&kind_line(
+                "\"no\",\"idle\",\"size-bound\"",
+                "false,true,true"
+            ))
+            .is_ok()
+        );
+        let err =
+            SaveBenchmarkTrace::parse(&kind_line("\"no\",\"idel\",\"no\"", "false,true,false"))
+                .expect_err("a typo");
+        assert!(
+            err.contains("save_checkpoint_kind") && err.contains("idel"),
+            "{err}"
+        );
+        let err =
+            SaveBenchmarkTrace::parse(&kind_line("\"no\",\"idle\",\"no\"", "false,false,false"))
+                .expect_err("a kind with no overlap");
+        assert!(err.contains("contradicts"), "{err}");
+        let err = SaveBenchmarkTrace::parse(&kind_line("\"no\",\"no\",\"no\"", "false,true,false"))
+            .expect_err("no with an overlap");
+        assert!(err.contains("contradicts"), "{err}");
+        let err = SaveBenchmarkTrace::parse(&kind_line("\"\",\"no\",\"no\"", "false,false,false"))
+            .expect_err("an empty word");
+        assert!(err.contains("not idle"), "{err}");
         assert!(string_array("{\"x\":[idle]}", "x").is_err());
     }
 
