@@ -382,13 +382,20 @@ const R7: &str = "SELECT b.kind, b.text, b.block_ref, b.heading_level
                    WHERE n.path = :path
                    ORDER BY b.ord";
 
-/// A note's heading texts and block ids, in document order (R7).
+/// One heading of a note (R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    /// The heading's text.
+    pub text: String,
+    /// Its level, 1 to 6.
+    pub level: u8,
+}
+
+/// A note's headings and block ids, in document order (R7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Anchors {
-    /// Heading texts.
-    pub headings: Vec<String>,
-    /// The level (1..=6) of each heading, parallel to `headings`.
-    pub heading_levels: Vec<u8>,
+    /// Headings, text and level together so they cannot drift apart.
+    pub headings: Vec<Heading>,
     /// Block ids, without the `^`.
     pub block_ids: Vec<String>,
 }
@@ -787,10 +794,10 @@ impl Reader {
             if kind.as_deref() == Some("heading")
                 && let Some(text) = text
             {
-                anchors.headings.push(text);
-                anchors
-                    .heading_levels
-                    .push(level.map_or(1, |l| l.clamp(1, 6) as u8));
+                anchors.headings.push(Heading {
+                    text,
+                    level: level.map_or(1, |l| l.clamp(1, 6) as u8),
+                });
             }
             if let Some(id) = block_ref {
                 anchors.block_ids.push(id);

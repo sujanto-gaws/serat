@@ -388,9 +388,9 @@ fn heading_path_exists(anchors: &serat_index::read::Anchors, segments: &[&str]) 
     let folded: Vec<String> = anchors
         .headings
         .iter()
-        .map(|h| serat_core::fold_case(h.trim()))
+        .map(|h| serat_core::fold_case(h.text.trim()))
         .collect();
-    let level = |i: usize| anchors.heading_levels.get(i).copied().unwrap_or(1);
+    let level = |i: usize| anchors.headings[i].level;
     let mut candidates: Vec<usize> = Vec::new();
     for (n, segment) in segments.iter().enumerate() {
         let want = serat_core::fold_case(segment.trim());
@@ -398,13 +398,15 @@ fn heading_path_exists(anchors: &serat_index::read::Anchors, segments: &[&str]) 
             (0..folded.len()).filter(|&j| folded[j] == want).collect()
         } else {
             let mut found = Vec::new();
+            let mut seen = vec![false; folded.len()];
             for &i in &candidates {
                 let outer = level(i);
                 for (j, text) in folded.iter().enumerate().skip(i + 1) {
                     if level(j) <= outer {
                         break;
                     }
-                    if *text == want && !found.contains(&j) {
+                    if *text == want && !seen[j] {
+                        seen[j] = true;
                         found.push(j);
                     }
                 }
@@ -492,7 +494,7 @@ pub fn resolve_links(
 #[must_use]
 pub fn map_anchors(anchors: read::Anchors) -> NoteAnchors {
     NoteAnchors {
-        headings: anchors.headings,
+        headings: anchors.headings.into_iter().map(|h| h.text).collect(),
         block_ids: anchors.block_ids,
     }
 }
@@ -503,8 +505,13 @@ mod tests {
 
     fn anchors_of(headings: &[(u8, &str)]) -> serat_index::read::Anchors {
         serat_index::read::Anchors {
-            headings: headings.iter().map(|(_, t)| (*t).to_owned()).collect(),
-            heading_levels: headings.iter().map(|(l, _)| *l).collect(),
+            headings: headings
+                .iter()
+                .map(|(level, text)| serat_index::read::Heading {
+                    text: (*text).to_owned(),
+                    level: *level,
+                })
+                .collect(),
             block_ids: Vec::new(),
         }
     }

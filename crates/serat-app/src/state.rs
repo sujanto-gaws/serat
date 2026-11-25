@@ -7193,6 +7193,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Re-indexing replaces the note's blocks, so a level cannot go stale: an external
+    // edit of `## B` to `# B` moves `#A#B` from found to not found.
+    #[test]
+    fn a_reindexed_heading_level_changes_the_nested_subpath_answer() {
+        let dir = fixture("resolve-nested-edit");
+        std::fs::write(dir.join("Edit.md"), "# A\n\n## B\n").expect("fixture");
+        let state = state(&dir);
+        wait_ready(&state);
+        assert_eq!(
+            resolved(&state, "Edit.md", "Edit#A#B").subpath_found,
+            Some(true)
+        );
+        std::fs::write(dir.join("Edit.md"), "# A\n\n# B\n").expect("edit");
+        wait_until("the re-indexed level", || {
+            resolved(&state, "Edit.md", "Edit#A#B").subpath_found == Some(false)
+        });
+        state.close_vault();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_tree_resolver_agrees_with_the_index_on_the_same_paths() {
         let (state, dir) = link_vault("resolve-agree");

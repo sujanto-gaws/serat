@@ -682,6 +682,10 @@ fn r7_returns_each_headings_level_in_document_order() {
         .expect("insert block");
     }
     let anchors = f.reader.note_anchors("lv.md").expect("R7").expect("a note");
-    assert_eq!(anchors.headings, ["One", "Three", "Two", "Six"]);
-    assert_eq!(anchors.heading_levels, [1, 3, 2, 6]);
+    let got: Vec<(&str, u8)> = anchors
+        .headings
+        .iter()
+        .map(|h| (h.text.as_str(), h.level))
+        .collect();
+    assert_eq!(got, [("One", 1), ("Three", 3), ("Two", 2), ("Six", 6)]);
 }
