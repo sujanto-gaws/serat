@@ -343,4 +343,23 @@ beyond the one call.
 
 ## p1-external-change: checkpoint-overlap split (task #183)
 
-Report-only lines under each series: the existing overlap counts and means, then `checkpoint overlap p95 processing: with X ms (n=..), without Y ms (n=..), ratio Z`, from `OverlapSplit` (nearest-rank p95 per class, no ratio when a class is empty). The overlap flag is the one from #165 (`WalHealth::checkpoint_in_progress` at the write, at the commit, or a run counted in between). The checkpointer line also prints how many idle starts were deferred to work in flight. `prf03-save-to-index` is not tagged: its samples come from `measure_save_to_index` in the library, which drives the save through `subject::save_to_index_via_app` (serat-app) and holds no `IndexHandle` or `WalHealth`, so tagging means plumbing the handle out of the app subject; not cheap, left alone.
+Report-only lines under each series: the existing overlap counts and means, then `checkpoint overlap p95 processing: with X ms (n=..), without Y ms (n=..), ratio Z`, from `OverlapSplit` (nearest-rank p95 per class, no ratio when a class is empty). The overlap flag is the one from #165 (`WalHealth::checkpoint_in_progress` at the write, at the commit, or a run counted in between). The checkpointer line also prints how many idle starts were deferred to work in flight. `prf03-save-to-index` is tagged since task #196: see the next section.
+
+## prf03-save-to-index: per-sample tags (task #196)
+
+The hosted `windows-latest` run is INDETERMINATE when one sample of 1,000 lands beside the limit (runs 432, 436, 438, 439: p95 about 13 to 16 ms, max 56.7 to 110.7 ms). The gate is red by design (ADR-0019, `determinate()`); the tags say what the over-limit sample coincided with. They are **reported, never asserted**.
+
+The save interval is `AppState::write_file` (atomic write with `sync_all`, parse, a non-blocking submit). It ends at the submit, **not** at the commit (architecture 3.1.1: no barrier on the keystroke path). A writer commit can therefore reach a sample only by running beside it, and a checkpoint only by competing for the same disk or lock. The tags are measured by serat-app around each timed write (the harness may not link it) and ride the same exit line as `save_submitted_ms`, as parallel arrays:
+
+| Tag | Key | Definition |
+|---|---|---|
+| checkpoint overlap | `save_checkpoint_overlap` | `WalHealth::checkpoint_in_progress` at the start or end of the window, or `passive_runs + restart_runs` moved across it (#183's criterion) |
+| FTS5 merge | `save_fts_merge` | the `blocks_fts` segment count (`serat_index::FtsProbe`, a read-only connection, read outside the timed interval) fell across the window: a merge commit landed in it (the criterion of `p1-save-tail` and #183) |
+| slow writer commit | `save_slow_commit` | a writer turn of at least `SLOW_TURN` (50 ms) overlapped the window (`WalHealth::slow_turn_overlapping`; only the writer's `writer_turn_guard` is logged, never a reconcile round's guard) |
+
+Why the segment count and not a page-write count: SQLite exposes no per-commit page count through rusqlite without a hook on the product writer, and the segment count is the signal #183 and `p1-save-tail` already use, so the two jobs say the same thing. Its limit: a merge that is still running at the end of the window is not seen until it commits, so a sample that overlaps only the start of a merge is missed; the slow-commit tag covers that case but is **saturated on a back-to-back burst** (the writer's turn lasts while the queue is non-empty; about 99% of samples carry it on Linux) and does not discriminate by itself.
+
+Report lines (and `save_tags` in `bench/out/budgets/prf03-save-to-index.json`): one `tag split` line per flag (nearest-rank p95 with and without, n per class, the ratio; no ratio when a class is empty), a `tag source` line (checkpoint runs, idle starts deferred to work in flight, FTS5 probe failures), and an `over limit` line followed by every sample above the budget's limit with all three flags. A report from a binary that does not send the tags prints none of this; a tag array whose length differs from `save_submitted_ms` is refused by name.
+
+Linux release, 20k vault, `--profile ci`, indicative only (ADR-0019: Linux figures are supporting evidence), 2026-11-25. Findings are in `docs/05-testing/reports/ci-windows-first-run-2026-11.md`, Resolution item (a-2).
+

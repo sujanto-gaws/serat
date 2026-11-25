@@ -2157,6 +2157,16 @@ impl AppState {
             .map(|open| open.vault.root().to_path_buf())
     }
 
+    /// The open vault's checkpointer facts, for the `--bench-save-list` run to tag its
+    /// samples with (task #196, NFR-PRF-03). Read-only atomics; `None` with no vault or
+    /// before the index handle exists.
+    #[must_use]
+    pub fn wal_health(&self) -> Option<Arc<serat_index::WalHealth>> {
+        self.open_lock()
+            .as_ref()
+            .and_then(|open| open.publisher.wal_health())
+    }
+
     // -- internals ----------------------------------------------------------
 
     /// Rule 2, applied before any filesystem call.

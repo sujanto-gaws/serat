@@ -20,6 +20,7 @@
 
 pub mod env;
 pub mod gate;
+pub mod save_tags;
 pub mod subject;
 pub mod trace;
 
@@ -628,6 +629,10 @@ pub struct Outcome {
     /// `None` for every other budget: nothing else in P0 attempts a countable
     /// unit of work that can fail without failing the run.
     pub save_census: Option<SaveCensus>,
+    /// Per-sample overlap tags for the save series (task #196, NFR-PRF-03), reported
+    /// and never asserted. `None` for every other budget and for a run whose
+    /// application did not report them.
+    pub save_tags: Option<save_tags::SaveTags>,
 }
 
 impl Outcome {
@@ -854,6 +859,11 @@ impl Outcome {
                 c.attempted, c.submitted, c.writer_refused, c.handle_missing
             );
         }
+        if let Some(tags) = &self.save_tags {
+            for line in tags.describe(self.limit_ms()) {
+                let _ = writeln!(s, "{line}");
+            }
+        }
         let _ = writeln!(
             s,
             "  vault       {} ({} notes, generator v{})",
@@ -996,6 +1006,9 @@ impl Outcome {
             let _ = writeln!(s, "    \"handle_missing\": {}", c.handle_missing);
             let _ = writeln!(s, "  }},");
         }
+        if let Some(tags) = &self.save_tags {
+            s.push_str(&tags.to_json(self.limit_ms()));
+        }
         if !self.reported.is_empty() {
             let _ = writeln!(s, "  \"reported_not_asserted\": {{");
             let last = self.reported.len() - 1;
@@ -1044,6 +1057,8 @@ pub struct Measurement {
     pub degraded: Option<String>,
     /// Carried straight through to [`Outcome::save_census`] by [`outcome_from`].
     pub save_census: Option<SaveCensus>,
+    /// Carried straight through to [`Outcome::save_tags`] by [`outcome_from`].
+    pub save_tags: Option<save_tags::SaveTags>,
 }
 
 impl Measurement {
@@ -1055,6 +1070,7 @@ impl Measurement {
             reported: Vec::new(),
             degraded: None,
             save_census: None,
+            save_tags: None,
         }
     }
 
@@ -1937,6 +1953,7 @@ pub fn outcome_from(
         phases: measurement.phases,
         degraded: measurement.degraded,
         save_census: measurement.save_census,
+        save_tags: measurement.save_tags,
     };
     outcome.check_phases()?;
     Ok(outcome)
@@ -2459,6 +2476,9 @@ where
         writer_refused: trace.writer_refused,
         handle_missing: trace.handle_missing,
     });
+    // Task #196: what each sample's window overlapped, reported beside the p95 and
+    // never part of the verdict.
+    measurement.save_tags = save_tags::SaveTags::from_trace(&trace);
 
     if trace.writer_refused > 0 {
         let mut refused = Samples::new();
@@ -3121,6 +3141,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(
             at_limit.passed(),
@@ -3137,6 +3158,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(!over.passed());
         assert!(over.to_report().starts_with("FAIL"));
@@ -3161,6 +3183,7 @@ mod tests {
             phases: None,
             degraded: Some("3 of 1000 attempted saves were refused by the writer".to_string()),
             save_census: None,
+            save_tags: None,
         };
         assert!(
             outcome.value_ms() <= outcome.limit_ms(),
@@ -3210,6 +3233,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(
             !outcome.to_report().contains("DEGRADED"),
@@ -3361,6 +3385,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
 
         assert_eq!(
@@ -3605,6 +3630,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         // PRF04's limit is 30,000 ms; PRF01_WINDOW_VISIBLE's is 400 ms.
         let gated_pass = outcome(PRF04_FULL_REBUILD, &[10_000.0, 11_000.0]);
@@ -3668,6 +3694,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         }
     }
 
@@ -4061,6 +4088,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert_eq!(outcome.value_ms(), 20_000.0, "the middle run decides");
         assert!(outcome.passed());
@@ -4086,6 +4114,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(
             outcome.to_report().contains("median of 3 wall-clock runs"),
@@ -4646,6 +4675,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
 
         // Every sample under the limit: the run agreed with itself.
@@ -4771,6 +4801,7 @@ mod tests {
             handle_missing,
             writer_refused,
             writer_refused_ms: writer_refused_ms.to_vec(),
+            ..trace::SaveBenchmarkTrace::default()
         }
     }
 
@@ -4856,6 +4887,50 @@ mod tests {
             "nothing to report when nothing degraded"
         );
         assert!(m.degraded.is_none());
+    }
+
+    #[test]
+    fn the_save_tags_ride_the_measurement_into_the_report_and_the_json_without_moving_the_verdict()
+    {
+        // Task #196, NFR-PRF-03: the straddling shape of runs 432/436/438 -- p95 far
+        // under the limit, one sample over it, which the tags then account for.
+        let mut series: Vec<f64> = vec![12.0; 99];
+        series.push(56.7);
+        let n = series.len();
+        let mut trace = save_trace(n, &series, 0, 0, &[]);
+        trace.checkpoint_overlap = vec![false; n];
+        trace.fts_merge = (0..n).map(|i| i == 99).collect();
+        trace.slow_commit = (0..n).map(|i| i == 99).collect();
+        let m = measure_save_to_index_with(&a_vault(), n, |_, _| Ok(trace)).expect("accepted");
+        let untagged =
+            measure_save_to_index_with(&a_vault(), n, |_, _| Ok(save_trace(n, &series, 0, 0, &[])))
+                .expect("accepted");
+        assert!(
+            untagged.save_tags.is_none(),
+            "no tags reported, none invented"
+        );
+
+        let mut o = outcome_on(PRF03_SAVE_TO_INDEX, Profile::Ci, hosted_windows(), &series);
+        o.save_tags = m.save_tags;
+        let report = o.to_report();
+        assert!(
+            report.contains("FTS5 merge p95: with 56.7 ms (n=1), without 12.0 ms (n=99)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("1 of 100 samples above 50.0 ms"),
+            "{report}"
+        );
+        assert!(
+            report.contains("sample   99") && report.contains("merge=yes slow-commit=yes"),
+            "{report}"
+        );
+        assert!(o.to_json().contains("\"save_tags\": {"), "{}", o.to_json());
+        // Reported, not asserted: the verdict is what it is without the tags.
+        let mut bare = o.clone();
+        bare.save_tags = None;
+        assert_eq!(o.passed(), bare.passed());
+        assert_eq!(o.asserted(), bare.asserted());
     }
 
     #[test]
@@ -5553,6 +5628,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(!breached.gates(), "PRD v1.2 does not gate this figure");
         assert!(
@@ -5586,6 +5662,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(gated.gates());
         assert!(gated.to_report().starts_with("FAIL"));
@@ -5699,6 +5776,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         let path = write_result_to(&dir, &outcome).expect("write");
         let written = std::fs::read_to_string(&path).expect("read back");
@@ -5737,6 +5815,7 @@ mod tests {
             phases: None,
             degraded: None,
             save_census: None,
+            save_tags: None,
         };
         assert!(outcome.passed(), "20 s is inside 30 s");
         assert!(

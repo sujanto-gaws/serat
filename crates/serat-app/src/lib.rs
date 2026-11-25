@@ -235,6 +235,23 @@ struct BenchmarkExitReport<'a> {
     /// Elapsed milliseconds of every refused save, reported for diagnosing the
     /// queue and excluded from `save_submitted_ms` for the reason stated there.
     save_writer_refused_ms: Vec<f64>,
+    /// Per submitted save, parallel to `save_submitted_ms` (task #196): a WAL checkpoint
+    /// was running at, or started or ended inside, the save's write. Empty when the
+    /// index had no `WalHealth`.
+    save_checkpoint_overlap: Vec<bool>,
+    /// Per submitted save: the FTS5 segment count fell between the write's start and
+    /// its end, i.e. a merge commit landed in the window (`FtsProbe`).
+    save_fts_merge: Vec<bool>,
+    /// Per submitted save: a writer turn of at least `SLOW_TURN` overlapped the window.
+    /// The interval ends at the submit, not the commit, so this is how a long commit
+    /// can reach a sample at all.
+    save_slow_commit: Vec<bool>,
+    /// Saves whose segment probe failed (counted as no merge, and said so).
+    save_flag_probe_failures: u64,
+    /// `CheckpointStats::deferred_busy` at the end of the run.
+    save_checkpointer_deferred_busy: u64,
+    /// PASSIVE plus RESTART checkpoint runs over the run.
+    save_checkpointer_runs: u64,
 }
 
 /// What [`run_save_benchmark`] measured, before it is folded into
@@ -246,6 +263,89 @@ struct SaveBenchmarkResult {
     handle_missing: u64,
     writer_refused: u64,
     writer_refused_ms: Vec<f64>,
+    checkpoint_overlap: Vec<bool>,
+    fts_merge: Vec<bool>,
+    slow_commit: Vec<bool>,
+    flag_probe_failures: u64,
+    checkpointer_deferred_busy: u64,
+    checkpointer_runs: u64,
+}
+
+/// Whether a checkpoint overlapped a window (task #183's criterion, #165's origin): one
+/// was running when it opened or closed, or the run counters moved between.
+fn checkpoint_overlapped(
+    running_at_start: bool,
+    running_at_end: bool,
+    runs_at_start: u64,
+    runs_at_end: u64,
+) -> bool {
+    running_at_start || running_at_end || runs_at_start != runs_at_end
+}
+
+/// A FTS5 merge landed in a window: the segment count read after is below the one read
+/// before. `None` (a probe failed) is "not seen", counted by the caller.
+fn merge_landed(before: Option<u32>, after: Option<u32>) -> bool {
+    matches!((before, after), (Some(b), Some(a)) if a < b)
+}
+
+/// What one save's window is tagged from, read around the timed write (task #196).
+struct Tagger {
+    health: Option<Arc<serat_index::WalHealth>>,
+    fts: Option<serat_index::FtsProbe>,
+}
+
+/// The state read just before a timed write.
+struct Before {
+    running: bool,
+    runs: u64,
+    segments: Option<u32>,
+}
+
+impl Tagger {
+    fn new(state: &AppState) -> Self {
+        let fts = state
+            .vault_root()
+            .and_then(|root| serat_index::FtsProbe::open(&index::index_dir_for(&root)).ok());
+        Self {
+            health: state.wal_health(),
+            fts,
+        }
+    }
+
+    fn runs(&self) -> u64 {
+        self.health.as_ref().map_or(0, |h| {
+            let s = h.stats();
+            s.passive_runs + s.restart_runs
+        })
+    }
+
+    fn running(&self) -> bool {
+        self.health
+            .as_ref()
+            .is_some_and(|h| h.checkpoint_in_progress())
+    }
+
+    fn segments(&self) -> Option<u32> {
+        self.fts.as_ref().and_then(|p| p.segments().ok())
+    }
+
+    fn before(&self) -> Before {
+        Before {
+            running: self.running(),
+            runs: self.runs(),
+            segments: self.segments(),
+        }
+    }
+
+    /// `(checkpoint overlap, merge landed, probe failed)`.
+    fn after(&self, before: &Before) -> (bool, bool, bool) {
+        let segments = self.segments();
+        (
+            checkpoint_overlapped(before.running, self.running(), before.runs, self.runs()),
+            merge_landed(before.segments, segments),
+            before.segments.is_none() || segments.is_none(),
+        )
+    }
 }
 
 /// Save every vault-relative path in `list_path`, in order, through the real save
@@ -283,6 +383,9 @@ fn run_save_benchmark(
     let before_all = state.save_path_outcomes();
     let mut submitted_ms = Vec::with_capacity(paths.len());
     let mut writer_refused_ms = Vec::new();
+    let tagger = Tagger::new(state);
+    let (mut checkpoint_overlap, mut fts_merge, mut windows) = (Vec::new(), Vec::new(), Vec::new());
+    let mut flag_probe_failures = 0u64;
 
     for path in &paths {
         let before = state.save_path_outcomes();
@@ -294,18 +397,27 @@ fn run_save_benchmark(
                 format!("--bench-save-list: reading {path} before saving it: {err:?}")
             })?;
 
+        // Read outside the timed interval: a connection's worth of work between saves,
+        // never inside one.
+        let tag_before = tagger.before();
         let started = std::time::Instant::now();
         let written = state.write_file(ipc::WriteFileArgs {
             path: (*path).to_owned(),
             text: read.text,
             base_hash: Some(read.hash),
         });
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let ended = std::time::Instant::now();
+        let elapsed_ms = ended.duration_since(started).as_secs_f64() * 1000.0;
         written.map_err(|err| format!("--bench-save-list: saving {path}: {err:?}"))?;
+        let (overlap, merge, probe_failed) = tagger.after(&tag_before);
 
         let after = state.save_path_outcomes();
         if after.submitted > before.submitted {
             submitted_ms.push(elapsed_ms);
+            checkpoint_overlap.push(overlap);
+            fts_merge.push(merge);
+            flag_probe_failures += u64::from(probe_failed);
+            windows.push((started, ended));
         } else if after.writer_refused > before.writer_refused {
             writer_refused_ms.push(elapsed_ms);
         }
@@ -314,8 +426,46 @@ fn run_save_benchmark(
         // two, not a per-save timing series.
     }
 
+    // A writer turn is logged when it ends, so let the queue drain (bounded) before
+    // asking which windows a slow one overlapped.
+    let drain_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tagger.health.as_ref().is_some_and(|h| h.work_in_flight())
+        && std::time::Instant::now() < drain_by
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let slow_commit = windows
+        .iter()
+        .map(|&(from, to)| {
+            tagger
+                .health
+                .as_ref()
+                .is_some_and(|h| h.slow_turn_overlapping(from, to))
+        })
+        .collect();
+    let stats = tagger.health.as_ref().map(|h| h.stats());
     let after_all = state.save_path_outcomes();
     Ok(SaveBenchmarkResult {
+        checkpoint_overlap: if tagger.health.is_some() {
+            checkpoint_overlap
+        } else {
+            Vec::new()
+        },
+        fts_merge: if tagger.fts.is_some() {
+            fts_merge
+        } else {
+            Vec::new()
+        },
+        slow_commit: if tagger.health.is_some() {
+            slow_commit
+        } else {
+            Vec::new()
+        },
+        flag_probe_failures,
+        checkpointer_deferred_busy: stats.as_ref().map_or(0, |s| s.deferred_busy),
+        checkpointer_runs: stats
+            .as_ref()
+            .map_or(0, |s| s.passive_runs + s.restart_runs),
         attempted: paths.len(),
         submitted_ms,
         handle_missing: after_all.handle_missing - before_all.handle_missing,
@@ -846,6 +996,12 @@ fn spawn_benchmark_exit(
                             save_handle_missing: save.handle_missing,
                             save_writer_refused: save.writer_refused,
                             save_writer_refused_ms: save.writer_refused_ms,
+                            save_checkpoint_overlap: save.checkpoint_overlap,
+                            save_fts_merge: save.fts_merge,
+                            save_slow_commit: save.slow_commit,
+                            save_flag_probe_failures: save.flag_probe_failures,
+                            save_checkpointer_deferred_busy: save.checkpointer_deferred_busy,
+                            save_checkpointer_runs: save.checkpointer_runs,
                         };
                         match write_trace(&report, trace_path.as_deref()) {
                             Ok(()) => 0,
@@ -1457,6 +1613,12 @@ mod tests {
             save_handle_missing: 1,
             save_writer_refused: 2,
             save_writer_refused_ms: vec![0.4, 0.6],
+            save_checkpoint_overlap: vec![false, true],
+            save_fts_merge: vec![true, false],
+            save_slow_commit: vec![false, false],
+            save_flag_probe_failures: 0,
+            save_checkpointer_deferred_busy: 3,
+            save_checkpointer_runs: 4,
         };
         let line = serde_json::to_string(&report).expect("json");
         assert!(
@@ -1565,6 +1727,94 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         (dir, state)
+    }
+
+    #[test]
+    fn the_exit_report_carries_the_per_save_flags_as_parallel_arrays() {
+        // Task #196, NFR-PRF-03: bench/budget's parser reads these by key.
+        let startup = Startup::begin_with(None);
+        startup.mark_window_created();
+        startup
+            .mark_first_paint(42.0, 20.0)
+            .expect("valid paint evidence");
+        startup.mark_index_settled();
+        startup.mark_watcher(startup::WatcherOutcome::Registered);
+        startup.mark_buffer_rendered();
+        startup.mark_tree_first_screen(startup.elapsed_ms());
+        let trace = startup.trace().expect("complete");
+        let report = BenchmarkExitReport {
+            trace: &trace,
+            save_path_outcomes: state::SavePathOutcomes::default(),
+            save_attempted: 2,
+            save_submitted_ms: vec![1.0, 2.0],
+            save_handle_missing: 0,
+            save_writer_refused: 0,
+            save_writer_refused_ms: vec![],
+            save_checkpoint_overlap: vec![false, true],
+            save_fts_merge: vec![true, false],
+            save_slow_commit: vec![false, true],
+            save_flag_probe_failures: 1,
+            save_checkpointer_deferred_busy: 3,
+            save_checkpointer_runs: 4,
+        };
+        let line = serde_json::to_string(&report).expect("json");
+        for expected in [
+            "\"save_checkpoint_overlap\":[false,true]",
+            "\"save_fts_merge\":[true,false]",
+            "\"save_slow_commit\":[false,true]",
+            "\"save_flag_probe_failures\":1",
+            "\"save_checkpointer_deferred_busy\":3",
+            "\"save_checkpointer_runs\":4",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
+    }
+
+    #[test]
+    fn the_overlap_and_merge_flags_follow_their_definitions() {
+        // Task #196: the pure half of the tagging, with no clocks.
+        assert!(!checkpoint_overlapped(false, false, 5, 5));
+        assert!(
+            checkpoint_overlapped(true, false, 5, 5),
+            "running at the start"
+        );
+        assert!(
+            checkpoint_overlapped(false, true, 5, 5),
+            "running at the end"
+        );
+        assert!(
+            checkpoint_overlapped(false, false, 5, 6),
+            "one ran in between"
+        );
+        assert!(merge_landed(Some(9), Some(4)));
+        assert!(!merge_landed(Some(4), Some(4)), "no change");
+        assert!(
+            !merge_landed(Some(4), Some(5)),
+            "a plain commit adds a segment"
+        );
+        assert!(
+            !merge_landed(None, Some(1)),
+            "an unreadable probe is not a merge"
+        );
+        assert!(!merge_landed(Some(9), None));
+    }
+
+    #[test]
+    fn run_save_benchmark_tags_every_submitted_save_with_all_three_flags() {
+        let (dir, state) = open_fixture_for_save_benchmark("save-bench-flags");
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(&list_path, "10-projects/a.md\n10-projects/b.md\n").expect("list");
+        let result = run_save_benchmark(&state, &list_path).expect("benchmark");
+        let n = result.submitted_ms.len();
+        assert_eq!(n, 2);
+        // Parallel to the timings, one entry per submitted save, and a live probe.
+        assert_eq!(result.checkpoint_overlap.len(), n);
+        assert_eq!(result.fts_merge.len(), n);
+        assert_eq!(result.slow_commit.len(), n);
+        assert_eq!(result.flag_probe_failures, 0, "{result:?}");
+        // The values are not asserted: whether a debug-build commit crosses SLOW_TURN or
+        // an automerge lands is the machine's, and the definitions are tested above.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

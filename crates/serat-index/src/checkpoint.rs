@@ -157,6 +157,9 @@ pub struct WalHealth {
     /// Live [`BusyGuard`]s: writer turns and reconcile rounds in flight.
     busy: AtomicUsize,
     deferred_busy: AtomicU64,
+    /// Finished [`BusyGuard`] turns that lasted at least [`SLOW_TURN`], oldest first,
+    /// capped at [`SLOW_TURNS_KEPT`] (task #196). Written only when a slow turn ends.
+    slow_turns: Mutex<Vec<(Instant, Instant)>>,
     on_change: Mutex<Option<Notify>>,
 }
 
@@ -214,7 +217,54 @@ impl WalHealth {
     #[must_use]
     pub fn busy_guard(self: &Arc<Self>) -> BusyGuard {
         self.busy.fetch_add(1, Ordering::Relaxed);
-        BusyGuard(Arc::clone(self))
+        BusyGuard {
+            health: Arc::clone(self),
+            since: Instant::now(),
+            logged: false,
+        }
+    }
+
+    /// As [`WalHealth::busy_guard`], for one writer turn: when the turn is slow it is
+    /// also kept for [`WalHealth::slow_turn_overlapping`]. A reconcile round holds
+    /// the plain guard for a whole `index_paths` call (seconds, on a catch-up) and
+    /// would otherwise overlap every save beside it.
+    #[must_use]
+    pub fn writer_turn_guard(self: &Arc<Self>) -> BusyGuard {
+        let mut guard = self.busy_guard();
+        guard.logged = true;
+        guard
+    }
+
+    /// Whether a writer turn or reconcile round that lasted at least [`SLOW_TURN`]
+    /// overlapped `[from, to]` (task #196). Only finished turns are known: ask after
+    /// the work has drained ([`WalHealth::work_in_flight`] false), or a turn still
+    /// running is not yet in the log.
+    ///
+    /// The save path's interval ends at the submit, not at the commit (architecture
+    /// 3.1.1), so a long commit can only reach a save sample by overlapping it. This is
+    /// the read-only fact that says one did.
+    #[must_use]
+    pub fn slow_turn_overlapping(&self, from: Instant, to: Instant) -> bool {
+        self.slow_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|&(start, end)| start <= to && end >= from)
+    }
+
+    /// Log a finished turn if it was slow.
+    pub(crate) fn note_turn(&self, since: Instant, until: Instant) {
+        if until.saturating_duration_since(since) < SLOW_TURN {
+            return;
+        }
+        let mut log = self
+            .slow_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if log.len() == SLOW_TURNS_KEPT {
+            log.remove(0);
+        }
+        log.push((since, until));
     }
 
     /// Whether any [`BusyGuard`] is live.
@@ -273,13 +323,29 @@ impl WalHealth {
 
 /// Work in flight, for as long as it lives. See [`WalHealth::busy_guard`].
 #[derive(Debug)]
-pub struct BusyGuard(Arc<WalHealth>);
+pub struct BusyGuard {
+    health: Arc<WalHealth>,
+    since: Instant,
+    logged: bool,
+}
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.busy.fetch_sub(1, Ordering::Relaxed);
+        // Log before the count falls, so "no work in flight" implies the log is complete.
+        if self.logged {
+            self.health.note_turn(self.since, Instant::now());
+        }
+        self.health.busy.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+/// A [`BusyGuard`] that lived at least this long is kept for
+/// [`WalHealth::slow_turn_overlapping`]. An ordinary single-note turn is a few
+/// milliseconds; the FTS5 merge turns task #183 found are 180 to 330 ms.
+pub const SLOW_TURN: Duration = Duration::from_millis(50);
+
+/// How many slow turns the log keeps. A 1,000-save run sees a handful.
+const SLOW_TURNS_KEPT: usize = 256;
 
 /// The writer's pragmas (§2.2, §3.1.1): `journal_size_limit` 16 MiB, `cache_size` 16 MiB
 /// and, when a checkpointer is running, `wal_autocheckpoint = 0`. Returns whether the
@@ -841,6 +907,64 @@ mod tests {
         assert!(!health.work_in_flight());
         actor.shutdown().expect("shutdown");
         drop(dir);
+    }
+
+    #[test]
+    fn a_slow_turn_is_logged_and_found_by_the_window_it_overlapped() {
+        // Task #196, FR-VLT-04 / NFR-PRF-03: synthetic instants, no sleeping.
+        let health = Arc::new(WalHealth::default());
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        health.note_turn(at(0), at(10)); // an ordinary turn: not kept
+        health.note_turn(at(100), at(100) + SLOW_TURN); // exactly the threshold: kept
+        assert!(!health.slow_turn_overlapping(at(0), at(99)), "before it");
+        assert!(
+            health.slow_turn_overlapping(at(0), at(100)),
+            "touches the start"
+        );
+        assert!(health.slow_turn_overlapping(at(120), at(121)), "inside it");
+        assert!(
+            health.slow_turn_overlapping(at(150), at(400)),
+            "touches the end"
+        );
+        assert!(!health.slow_turn_overlapping(at(151), at(400)), "after it");
+        // The ordinary turn left no trace.
+        assert!(!health.slow_turn_overlapping(at(0), at(10)));
+    }
+
+    #[test]
+    fn the_slow_turn_log_is_bounded_and_forgets_the_oldest() {
+        let health = Arc::new(WalHealth::default());
+        let t0 = Instant::now();
+        for i in 0..=(SLOW_TURNS_KEPT as u64) {
+            let start = t0 + Duration::from_secs(i * 10);
+            health.note_turn(start, start + SLOW_TURN);
+        }
+        assert!(!health.slow_turn_overlapping(t0, t0 + Duration::from_secs(1)));
+        let last = t0 + Duration::from_secs(SLOW_TURNS_KEPT as u64 * 10);
+        assert!(health.slow_turn_overlapping(last, last));
+    }
+
+    #[test]
+    fn a_dropped_guard_clears_work_in_flight_and_a_fast_turn_is_not_logged() {
+        let health = Arc::new(WalHealth::default());
+        let guard = health.writer_turn_guard();
+        assert!(health.work_in_flight());
+        drop(guard);
+        assert!(!health.work_in_flight());
+        // A guard that lived microseconds is not slow: the log stays empty.
+        let now = Instant::now();
+        assert!(!health.slow_turn_overlapping(now - Duration::from_secs(60), now));
+    }
+
+    #[test]
+    fn only_a_writer_turn_guard_reaches_the_slow_turn_log() {
+        // Task #196: a reconcile round's plain guard must not stand for a commit. The
+        // guard's own clock cannot be injected, so the logged flag is what is tested:
+        // `note_turn` is the logging step, and `drop` calls it only when `logged`.
+        let health = Arc::new(WalHealth::default());
+        assert!(!health.busy_guard().logged);
+        assert!(health.writer_turn_guard().logged);
     }
 
     #[test]
