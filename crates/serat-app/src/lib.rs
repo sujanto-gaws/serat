@@ -588,6 +588,18 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
             // build regardless of what ships in the config (see that
             // function's doc comment).
             let dev_server_origin = app.config().build.dev_url.clone();
+            let trace_build = state.boot.trace.is_some();
+            let data_folder = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
+            if trace_build {
+                eprintln!(
+                    "{}",
+                    startup::window_build_line(
+                        "entering",
+                        state.startup.elapsed_ms(),
+                        data_folder.as_deref()
+                    )
+                );
+            }
             let window = WebviewWindowBuilder::new(
                 app,
                 MAIN_WINDOW_LABEL,
@@ -623,6 +635,16 @@ pub fn run(startup: Arc<Startup>, boot: Boot) -> Result<ExitCode, Box<dyn std::e
                 !matches!(event, tauri::webview::DownloadEvent::Requested { .. })
             })
             .build()?;
+            if trace_build {
+                eprintln!(
+                    "{}",
+                    startup::window_build_line(
+                        "returned",
+                        state.startup.elapsed_ms(),
+                        data_folder.as_deref()
+                    )
+                );
+            }
 
             // Task #37, release builds only: the native right-click menu offers
             // "Open Link", "View Frame Source" and similar actions that exist
@@ -775,7 +797,11 @@ fn spawn_benchmark_exit(
     std::thread::Builder::new()
         .name("serat-benchmark-exit".to_owned())
         .spawn(move || {
-            let arrived = startup.wait_for_usable(timeout);
+            // Usable AND the buffer mark: `trace()` needs both, and after a frame-gate
+            // retry the paint is the last term of usable, so usable alone returns a
+            // round trip before `mark_vault_usable` lands (task #192).
+            let waited = std::time::Instant::now();
+            let arrived = startup.wait_for_trace_terms(timeout);
             if wait_for_walk && arrived {
                 // The one walk at open (ADR-0015 section 2) is started by the
                 // application itself after the first paint and the watcher, and stands
@@ -831,7 +857,8 @@ fn spawn_benchmark_exit(
                         // The guard that makes a blank window a failure rather than a
                         // fast number. There is no fallback mark to fall back to.
                         eprintln!(
-                            "serat: no startup trace after {timeout:?} ({}): {incomplete}",
+                            "serat: no startup trace after {:.0} ms of waiting (limit {timeout:?}; {}): {incomplete}",
+                            waited.elapsed().as_secs_f64() * 1000.0,
                             if arrived { "usable" } else { "timed out" }
                         );
                         2
