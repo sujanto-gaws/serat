@@ -52,6 +52,54 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
     }
 }
 
+/// The inverse of [`strip_verbatim_str`]: the `\\?\` spelling of an absolute Windows
+/// path, for I/O on names Win32 would normalise away (`note.`, `note `, `AUX.md`).
+///
+/// - `C:\x` -> `\\?\C:\x`
+/// - `\\srv\share\x` -> `\\?\UNC\srv\share\x`
+/// - already `\\?\` (or a `\\.\` device path) -> unchanged
+/// - anything else (relative, POSIX) -> unchanged apart from the rules below.
+///
+/// Verbatim paths are not normalised by the OS, so `/` becomes `\` and `.` / `..`
+/// segments are resolved here; a `..` past the first segment is dropped.
+#[must_use]
+pub fn to_verbatim_str(text: &str) -> String {
+    if text.starts_with(r"\\?\") || text.starts_with(r"\\.\") {
+        return text.to_owned();
+    }
+    let text = text.replace('/', r"\");
+    let (prefix, rest) = if let Some(unc) = text.strip_prefix(r"\\") {
+        (r"\\?\UNC\", unc)
+    } else if text.as_bytes().get(1) == Some(&b':')
+        && text.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && text.as_bytes().get(2) == Some(&b'\\')
+    {
+        (r"\\?\", text.as_str())
+    } else {
+        return text;
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('\\') {
+        match part {
+            "." => {}
+            ".." => {
+                // Never pop the drive (or the UNC server).
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    format!("{prefix}{}", parts.join(r"\"))
+}
+
+/// [`to_verbatim_str`] over a [`Path`].
+#[must_use]
+pub fn to_verbatim(path: &Path) -> PathBuf {
+    PathBuf::from(to_verbatim_str(&path.to_string_lossy()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +141,23 @@ mod tests {
             assert_eq!(strip_verbatim_str(p), p);
             assert_eq!(strip_verbatim(Path::new(p)), Path::new(p));
         }
+    }
+
+    #[test]
+    fn to_verbatim_has_three_forms_and_is_the_inverse_of_strip() {
+        assert_eq!(to_verbatim_str(r"C:\v\note."), r"\\?\C:\v\note.");
+        assert_eq!(to_verbatim_str(r"\\srv\sh\x"), r"\\?\UNC\srv\sh\x");
+        assert_eq!(to_verbatim_str(r"\\?\Volume{1}\v"), r"\\?\Volume{1}\v");
+        assert_eq!(to_verbatim_str(r"\\?\C:\v"), r"\\?\C:\v");
+        for plain in [r"C:\v\x", r"\\srv\sh\x"] {
+            assert_eq!(strip_verbatim_str(&to_verbatim_str(plain)), plain);
+        }
+    }
+
+    #[test]
+    fn to_verbatim_leaves_no_slash_or_dot_segment() {
+        assert_eq!(to_verbatim_str("C:/v/./note "), r"\\?\C:\v\note ");
+        assert_eq!(to_verbatim_str(r"C:\v\a\..\b."), r"\\?\C:\v\b.");
+        assert_eq!(to_verbatim_str(r"C:\.."), r"\\?\C:");
     }
 }

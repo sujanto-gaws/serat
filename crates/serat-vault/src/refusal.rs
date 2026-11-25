@@ -143,6 +143,13 @@ impl RefusalLog {
         self.mutate(|inner| inner.insert(refusal));
     }
 
+    /// Remove a path and every entry beneath it (a refused directory is one entry), as
+    /// the watcher does when a refused name is found gone (task #188). Nothing removed
+    /// is not a change and fires nothing.
+    pub(crate) fn forget(&self, path: &str) {
+        self.mutate(|inner| !inner.take_scope(path).is_empty());
+    }
+
     /// Record a refusal as the watcher would, so serat-app's tests can drive a storm
     /// past the cap. Not for production use.
     #[cfg(any(test, feature = "test-hooks"))]

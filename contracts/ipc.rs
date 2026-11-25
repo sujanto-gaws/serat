@@ -392,14 +392,14 @@ pub const REFUSED_NAMES_CAP: u32 = 1000;
 /// [`REFUSED_NAMES_CAP`] entries, ordered by path in byte order. **One entry per
 /// distinct path**: `RefusalLog` is keyed by path, so a path refused again (the
 /// watcher sees it change) replaces its reason rather than adding an entry.
-/// **Entries leave at the next walk that covers their subtree** (serat-vault's
+/// **Entries leave when the watcher sees the file gone, or at the next walk that covers their subtree** (serat-vault's
 /// `RefusalLog::replace_scope`): a walk of a directory (`walk_tree`, `walk_dir`)
 /// replaces only the entries at or below it with what it found, and only a
 /// whole-vault walk clears every entry and resets the overflow count behind
-/// [`REFUSED_NAMES_CAP`]. A refused file that is deleted or renamed away stays
-/// listed until a walk covers its directory, so the list can name a file that
-/// is already gone. That is accepted, because
-/// the list is a report, never a path a command acts on.
+/// [`REFUSED_NAMES_CAP`]. An entry leaves when the
+/// watcher sees the file gone (deleted or renamed away) or at the next walk that
+/// covers it, whichever comes first, so a lost event can leave a name listed
+/// until that walk. The list is a report, never a path a command acts on.
 /// **A read, not a
 /// wait (ADR-0007)**: it returns the log as it stands and never triggers a walk.
 /// An empty list when nothing was refused or no vault is open. Granted to `main`
