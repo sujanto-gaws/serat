@@ -417,6 +417,60 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
     if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
+/// The p95 of processing time split by checkpoint overlap (task #183), so "with-overlap
+/// p95 within 2x of without" is a printed number. A class with no samples has no p95.
+#[derive(Debug, PartialEq)]
+struct OverlapSplit {
+    with_n: usize,
+    without_n: usize,
+    with_p95: Option<f64>,
+    without_p95: Option<f64>,
+}
+
+impl OverlapSplit {
+    /// `samples`: (processing ms, a checkpoint overlapped it).
+    fn of(samples: &[(f64, bool)]) -> Self {
+        let class = |overlap: bool| {
+            let mut s = Samples::new();
+            for (ms, o) in samples {
+                if *o == overlap {
+                    s.push(Duration::from_secs_f64(ms / 1000.0));
+                }
+            }
+            (s.len(), (!s.is_empty()).then(|| s.percentile(0.95)))
+        };
+        let (with_n, with_p95) = class(true);
+        let (without_n, without_p95) = class(false);
+        Self {
+            with_n,
+            without_n,
+            with_p95,
+            without_p95,
+        }
+    }
+
+    /// with / without, when both exist and the denominator is above zero.
+    fn ratio(&self) -> Option<f64> {
+        match (self.with_p95, self.without_p95) {
+            (Some(w), Some(wo)) if wo > 0.0 => Some(w / wo),
+            _ => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let p = |v: Option<f64>| v.map_or("n/a".to_owned(), |v| format!("{v:.1} ms"));
+        format!(
+            "  checkpoint overlap p95 processing: with {} (n={}), without {} (n={}), ratio {}",
+            p(self.with_p95),
+            self.with_n,
+            p(self.without_p95),
+            self.without_n,
+            self.ratio()
+                .map_or("n/a".to_owned(), |r| format!("{r:.2}x")),
+        )
+    }
+}
+
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
@@ -683,6 +737,11 @@ fn run(args: &[String]) -> Result<bool, String> {
                     .map(|m| m.processing_ms)
             ),
         );
+        let pairs: Vec<(f64, bool)> = runs
+            .iter()
+            .map(|m| (m.processing_ms, m.checkpoint_overlap))
+            .collect();
+        println!("{}", OverlapSplit::of(&pairs).describe());
         let merged: Vec<&Measured> = runs.iter().filter(|m| m.fts_merge).collect();
         let slow_merged = runs
             .iter()
@@ -715,10 +774,12 @@ fn run(args: &[String]) -> Result<bool, String> {
     }
     let stats = handle_stats;
     println!(
-        "checkpointer: {} PASSIVE runs, {} incomplete, {} RESTART, longest {:.1} ms, mean {:.1} ms",
+        "checkpointer: {} PASSIVE runs, {} incomplete, {} RESTART, {} idle starts deferred to work \
+         in flight, longest {:.1} ms, mean {:.1} ms",
         stats.passive_runs,
         stats.incomplete,
         stats.restart_runs,
+        stats.deferred_busy,
         stats.passive_max_micros as f64 / 1000.0,
         stats.passive_total_micros as f64 / 1000.0 / stats.passive_runs.max(1) as f64,
     );
@@ -803,6 +864,24 @@ mod tests {
             99,
         );
         assert!(slow.contains("queue depth 99"), "{slow}");
+    }
+
+    #[test]
+    fn the_overlap_split_reports_p95_per_class_and_the_ratio() {
+        // 20 without overlap (10..=29 ms), 10 with (100, 110, ..., 190 ms).
+        let mut series: Vec<(f64, bool)> = (10..30).map(|v| (f64::from(v), false)).collect();
+        series.extend((0..10).map(|i| (100.0 + 10.0 * f64::from(i), true)));
+        let split = OverlapSplit::of(&series);
+        assert_eq!((split.with_n, split.without_n), (10, 20));
+        // Nearest rank: ceil(0.95 * 20) = 19th = 28; ceil(0.95 * 10) = 10th = 190.
+        assert!((split.without_p95.unwrap() - 28.0).abs() < 1e-6);
+        assert!((split.with_p95.unwrap() - 190.0).abs() < 1e-6);
+        assert!((split.ratio().unwrap() - 190.0 / 28.0).abs() < 1e-6);
+        assert!(split.describe().contains("(n=10)") && split.describe().contains("6.79x"));
+        // One class empty: no p95, no ratio, no panic.
+        let none = OverlapSplit::of(&[(5.0, false)]);
+        assert_eq!((none.with_n, none.with_p95, none.ratio()), (0, None, None));
+        assert!(none.describe().contains("with n/a (n=0)"));
     }
 
     #[test]

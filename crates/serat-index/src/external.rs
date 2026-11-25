@@ -148,6 +148,7 @@ struct Row {
 pub struct Reconciler {
     writer: WriterHandle,
     db: PathBuf,
+    health: std::sync::Arc<crate::checkpoint::WalHealth>,
 }
 
 impl Reconciler {
@@ -157,6 +158,7 @@ impl Reconciler {
         Self {
             writer: handle.writer(),
             db: crate::index_path(handle.index_dir()),
+            health: handle.wal_health(),
         }
     }
 
@@ -196,6 +198,8 @@ impl Reconciler {
         if paths.is_empty() {
             return Ok(outcome);
         }
+        // A round in flight: an idle WAL checkpoint does not start under it (task #183).
+        let _busy = self.health.busy_guard();
         let reader = self.reader()?;
         let mut flushed = 0;
         for path in paths {

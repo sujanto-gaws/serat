@@ -34,7 +34,7 @@ pub mod tree;
 pub mod writer;
 
 pub use check::{QuickCheck, quick_check};
-pub use checkpoint::{Bounds, CheckpointStats, WalHealth};
+pub use checkpoint::{Bounds, BusyGuard, CheckpointStats, WalHealth};
 pub use identity::canonical_root;
 pub use incremental::{IndexHandle, apply, parse_pool_threads};
 pub use open::{IndexStatus, RebuildReason, open_or_rebuild, open_or_rebuild_observed};
