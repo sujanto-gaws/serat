@@ -274,8 +274,23 @@ jobs:
           path: bench/out/budgets/
           if-no-files-found: ignore
 
+  # REPORT-ONLY ON A HOSTED RUNNER (ADR-0019 points 1, 2 and 8, task #190, NFR-PRF-01,
+  # NFR-PRF-08, US-35, C-06, RISK-012, RISK-016). Run 427 (main 83b616d, the first hang-free
+  # run after #186): 20 of 20 launches painted, Serat term p95 546.3 ms against 350, samples
+  # 237.5 to 711.6 ms (spread 199.6%), scanner OFF, 4 cores: the harness prints NOT A GATE
+  # NUMBER and the verdict was INDETERMINATE. `determinate()` is a range test (every sample
+  # on one side of the limit), so no iteration count settles a series whose minimum is 237 ms
+  # and whose tail is 700 ms; no `ci_limit_ms` is derivable from one run (ADR-0019 point 4
+  # wants 30). There is no Linux twin to move the assertion to: the 350 ms is bounded to
+  # Windows/WebView2 (PRD v1.2, F-96), `build-app` is windows-only, and RM-2's Linux figure
+  # read 1,310.4 ms. So the assertion is the reference machine's:
+  # `cargo run --release -p budget --bin prf01-serat-term -- --profile reference`, scanner on
+  # (RM-1), at each gate. This job still FAILS when a measurement cannot be taken (a hung
+  # launch, a frame-gate refusal past #186's retries, an absent app, a degraded series), and
+  # it never has `continue-on-error` or `|| true`. If GitHub ever gives the image the scanner,
+  # the same command starts asserting 350 ms. `every-budget-has-a-job` pins this name.
   prf01-serat-term:
-    name: "NFR-PRF-01 · Serat term < 350 ms p95 (task #104's binding gate)"
+    name: "NFR-PRF-01 · Serat term < 350 ms p95 (report-only on hosted windows; asserted on the reference machine)"
     needs: [vault, build-app]
     runs-on: windows-latest
     if: ${{ !inputs.prf01_diagnostic }}

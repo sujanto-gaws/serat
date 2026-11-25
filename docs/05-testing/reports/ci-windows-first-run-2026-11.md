@@ -5,7 +5,7 @@ date: 2026-11-24
 task: 167
 serves: FR-VLT-04, NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-06, NFR-PRF-08, FR-VLT-01, US-35, C-06
 adrs: ADR-0019, ADR-0014, ADR-0015
-test-cases: TC-159
+test-cases: TC-159, TC-165, TC-168
 ---
 
 # First hosted-runner execution since 2026-11-09
@@ -182,6 +182,43 @@ Open question for the architect, not answered here: why Chromium on this runner 
 **ADR-0019 recommendation (for lead and architect).** Keep NFR-PRF-01 on hosted windows-latest as it is (a measurement that fails when the app does not paint) and do **not** make it report-only: the hang is a product defect the job found, and hiding it would delete the only CI signal that shows it. Fix the product task above first; if the hangs persist after it, re-rank. The per-launch data folder should **not** become the bench default: it did not change the outcome, and a persistent profile is what a user's cold start has. The bounded exit wait is kept on by default (it only waits while a `msedgewebview2.exe` exists, logged, at most 10 s once per process, and sits outside the measured interval since t0 is stamped at spawn). Recorded as a recommendation; no ADR is edited here.
 
 **What remains unknown.** Why the two callbacks share a timestamp (a Chromium or compositor behaviour on a hosted, headless-adjacent session; the WebView2 stderr log with `--v=1` was not captured and `e275d00` adds it); whether RM-1 shows it; the cold-start job's own hang rate with these arms (that arm did not run; one more dispatch of `prf01_diagnostic=true` on this branch is owed and needs the lead's go-ahead, since the brief allowed one dispatch). One dispatch is a small sample: 3 hangs in 28 launches and 3 in 7 cannot rank arms against each other; the finding rests on the identical signature of all ten hangs, not on a rate.
+
+## Run 427: #186's first hang-free acceptance run, and the ruling for the hosted serat-term job (task #190, 2026-11-25)
+
+Test case TC-165 (1 of 3 owed), TC-168. Run 427 is budgets.yml on main `83b616d`, the first run after #186 merged (https://github.com/sujanto-gaws/serat/actions/runs/45598311891). Figures below are copied from the job logs by the lead; the raw JSON (artifact `prf01-serat-term`) was not read.
+
+| Item | Value |
+|---|---|
+| Job | "NFR-PRF-01 · Serat term < 350 ms p95" (139151909216); scale-independence job `prf01-cold-start` (139151909180) passed |
+| Launches | 20 of 20 exited cleanly, no hang. Launch 13 took one frame-gate refusal at 671 ms ("the second requestAnimationFrame timestamp (178.83) did not follow the first (178.83)") and completed: the #186 retry working in the field, once |
+| Verdict | INDETERMINATE. Serat term p95 **546.3 ms** against 350.0 (ci profile); n=20, min 237.5, mean 309.2, max 711.6, spread 199.6%. "The samples straddle the limit ... Reported as a failure because a run that decided nothing must not go green" |
+| Reported beside it | platform term p95 709.7; window-visible p95 948.2; vault-usable 1,161.2; tree-first-screen 1,161.2 |
+| Machine | windows, 4 cores, scanner OFF, High performance, cpu 9%: `gate_eligible` false, "NOT A GATE NUMBER"; "no CI regression ceiling is set yet, so the product limit is being asserted on a runner that is not the reference machine" |
+
+**TC-165 status: 1 hang-free run of 3 owed.** Before #186 the baseline was 6 hangs in 34 launches (18%); this run is 0 in 21 attempts (20 launches plus the one refused-then-retried paint). One run cannot show the hang is gone (at 18% per launch, 20 clean launches has probability about 0.82^20 = 2%, so the run is real evidence, but the hang rate was never constant across runs: 4 hangs in 25 in runs 415 to 419). Two more hang-free runs close TC-165.
+
+**Beside RM-2.** RM-2 (Linux desktop gaws-dev-05, 2026-11-24) read Serat term p95 1,310.4 ms, platform term 503.1 ms (RISK-016). Run 427 reads 546.3 ms and 709.7 ms on a different platform, runner and code state (#186 and later). Per the RM-2 rule neither is compared with the other or re-baselines the other; both are above 350 ms and neither is the gate figure. Run 427 is a second data point for RISK-016, a hosted Windows one, not a Windows verdict on the product. P0's Windows figure (RM-1, scanner off, 233.8 ms p95) remains the only Windows number near the limit and is not a gate number either.
+
+### The ruling (ADR-0019 applied to the hosted `prf01-serat-term` job)
+
+**Options.**
+
+(b) **A higher iteration count cannot settle it.** `determinate()` is a range test: a run is determinate only when every sample is at or below the limit or every sample is above it. Here the minimum (237.5 ms) is below 350 and the mean (309.2) is below 350, so "all above" is impossible; "all at or below" needs the 19th and 20th values (546 and 712) to disappear. More iterations only widen the range (the maximum of a sample can only grow). No n settles 546 against 350 on this runner, and a looser rule would be the `determinate()` change ADR-0019 option 2 rejected. Rejected.
+
+(a) **A CI regression ceiling cannot be derived yet.** ADR-0019 point 4(ii) asks for at least 30 runs over at least 3 days and 2 image versions, with a ceiling of 1.5 times the 95th percentile of medians. There is one hang-free run (runs 415 to 419 have hangs and no figure). A ceiling picked from one run is a number chosen, not derived; with a 200% spread it would sit above 546 ms, more than 1.5 times the product limit, and could not tell a real regression from a runner draw. It stays the promotion path: once the 30 runs exist, `ci_limit_ms` is set to 1.5 times the p95 of the per-run medians, recorded with the runs it came from, and the budget returns to `Always` (point 4). The baseline is refreshed on a runner image change, by re-deriving from at least 10 runs after it. Not done now.
+
+(c) **Report-only on hosted Windows, asserted on the reference machine. Chosen.** Applying ADR-0019 point 2:
+- (a) the runner is not gate eligible: scanner OFF, in this run and in every hosted run on record. Met.
+- (b) the runner's own spread is at least the budget's margin: 199.6% inside one run, platform term p95 709.7 ms (a term the product does not own, and it moves with the runner: window-visible p95 948.2). The samples (237.5 to 711.6 ms) straddle the 350 ms limit around a mean of 309.2. Met on one run of 20 samples. **This is thin evidence** (FR-VLT-04 entered the class on four runs, NFR-PRF-04 on 36); it is recorded as such. Run 427's p95 is 196.3 ms over the limit, but point 2(b) asks for run-to-run spread and one run shows only in-run spread. Check: if either of the next two hang-free hosted runs is determinate, point 2(b) was not met and the budget returns to `Always`. Otherwise it leaves only by point 4.
+- (c) no `ci_limit_ms` is derivable from the recorded runs: one run. Met.
+
+**There is no Linux twin to assert on, so point 3 does not apply** ("wherever a gate-eligible runner class can run it"). The app-driving budgets build and launch `serat.exe` on `windows-latest` only (`build-app`, `prf01-serat-term`, `prf01-cold-start`, `prf03-save-to-index`; the ubuntu jobs are `prf04-full-rebuild-linux`, `p1-external-change-linux` and the headless NFR-PRF-02 editor jobs, none of which drives the shell). A Linux desktop does run the bin (RM-2), but PRD v1.2 bounds the 350 ms to Windows/WebView2 (F-96) and RM-2's Linux figure was 1,310.4 ms, so a hosted-Linux assertion at 350 would fail on a platform the budget does not cover and would assert nothing about the product. The exemption is recorded in `NO_LINUX_TWIN` in `bench/budget/src/lib.rs` and pinned by a test (TC-168).
+
+**NFR-PRF-08.** "Every budget has an asserting job": for NFR-PRF-01 the asserting run is `--profile reference` on RM-1 with the scanner on at each gate (ADR-0019 point 1), and the CI job is its measurement twin on the hosted runner, named "report-only on hosted windows; asserted on the reference machine". As for NFR-PRF-04 in #166, the `every-budget-has-a-job` test finds the job, checks it runs the bin under `--profile ci` with no `continue-on-error` and no `|| true`, and checks the two-way name rule (`a_report_only_budget_says_so_in_its_job_name`); `budgets-gate` still needs and checks the job, so a failed measurement still turns the PR red. The difference from NFR-PRF-04 is that no CI job asserts the product limit at all: **NFR-PRF-01 now has no CI-asserted column entry**, and PRD NFR-PRF-08's "a regression fails the build" is weaker for it than for any other budget. The regression half is carried by (i) the job failing on a hang, an absent app, a refused frame past the retries or a degraded series, (ii) the `prf01-cold-start` scale-independence assertion (20k vs 50k Serat term within 20%), still asserted on windows-latest, and (iii) ADR-0019 point 7's obligation on PRs that touch the startup path: quote a `--profile reference` figure from a gate-eligible machine (there is no point-3 job for this budget). Lead's reading of C-06: it is NOT satisfied in CI for NFR-PRF-01 while no CI job asserts its limit; the budget counts as enforced only by an RM-1 scanner-on reference run, which is still owed, and the P1 gate report lists it as an open gate item until that run exists or a gate-eligible Windows runner class asserts it. That weakness is stated, not hidden; the way out is point 4's 30-run ceiling.
+
+**What is not weakened.** The product limit stays 350.0 ms; the frame guard in `validate_paint_evidence` is untouched (the page's retry from #186 is the only change to the paint path); `determinate()` is unchanged, so the same samples on `--profile reference`, or on any gate-eligible runner, still print INDETERMINATE and fail (`the_serat_term_is_report_only_on_hosted_windows_and_asserts_where_a_gate_number_exists`). A degraded series is still not report-only. The earlier recommendation in Triage 2 (do not make NFR-PRF-01 report-only while the hang is an unexplained product defect) is superseded for the slowness only: it was about hiding the hang, and the hang still fails the job.
+
+**Not verified.** No Windows run of the changed workflow; the job name and the `WhenGateEligible` branch are pinned by unit tests on synthetic outcomes, not by a hosted run. The raw samples of run 427 were not read, so the in-run median and the p95 interval are not given. Whether the 20k-versus-50k scale check on `prf01-cold-start` is a tight enough detector for a startup-path regression is not re-examined here (it passed).
 
 ## Proposed tasks (for the lead to create; no product code was changed here)
 
