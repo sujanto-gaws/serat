@@ -128,7 +128,8 @@ pub struct CheckpointStats {
     /// Shortest time between the starts of two idle `PASSIVE` runs, microseconds; 0 until
     /// there have been two.
     pub idle_min_gap_micros: u64,
-    /// Idle checkpoints deferred because the writer or a reconcile round was in flight.
+    /// Idle wake-ups deferred because the writer or an `index_paths` round was in flight
+    /// (including ones where only the pinned `RESTART` was due).
     pub deferred_busy: u64,
 }
 
@@ -428,6 +429,9 @@ struct State {
     /// Commits since the last attempt finished completely.
     dirty: bool,
     last_commit: Instant,
+    /// When the idle gate was last re-armed by a deferral (not a commit); the gate is
+    /// measured from the later of this and `last_commit`.
+    deferred_at: Option<Instant>,
     /// Frames at the last attempt; the size bound counts growth beyond it.
     base: i32,
     /// Frames in the WAL as of the last commit signal.
@@ -445,10 +449,16 @@ struct State {
 }
 
 impl State {
+    /// What the idle gate counts from: the last commit, or a later deferral.
+    fn idle_base(&self) -> Instant {
+        self.deferred_at
+            .map_or(self.last_commit, |d| d.max(self.last_commit))
+    }
+
     /// When the next idle `PASSIVE` may run: the idle gate, no sooner than the retry
     /// back-off and the spacing from the previous idle one.
     fn passive_at(&self, bounds: Bounds) -> Instant {
-        let mut at = self.last_commit + bounds.idle;
+        let mut at = self.idle_base() + bounds.idle;
         if let Some(retry) = self.retry_at {
             at = at.max(retry);
         }
@@ -462,7 +472,7 @@ impl State {
     /// `RESTART` (the idle gate only).
     fn due(&self, bounds: Bounds, pinned: bool) -> Option<Instant> {
         let passive = self.dirty.then(|| self.passive_at(bounds));
-        let restart = (pinned && !self.restart_spent).then(|| self.last_commit + bounds.idle);
+        let restart = (pinned && !self.restart_spent).then(|| self.idle_base() + bounds.idle);
         match (passive, restart) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -479,6 +489,7 @@ fn run(conn: &Connection, rx: &Receiver<Msg>, bounds: Bounds, health: &WalHealth
     let mut state = State {
         dirty: false,
         last_commit: Instant::now(),
+        deferred_at: None,
         base: 0,
         frames: 0,
         frame_bytes: page_size + 24,
@@ -542,7 +553,7 @@ fn attempt(
         // Yield: re-arm the idle gate from now. The writer's next commit signal or the
         // gate wakes the thread again; nothing is lost, `dirty` stays set.
         health.deferred_busy.fetch_add(1, Ordering::Relaxed);
-        state.last_commit = Instant::now();
+        state.deferred_at = Some(Instant::now());
         return;
     }
     let spaced_out = !idle || Instant::now() >= state.passive_at(bounds);
@@ -741,6 +752,7 @@ mod tests {
         let mut state = State {
             dirty: false,
             last_commit: t0,
+            deferred_at: None,
             base: 0,
             frames: 0,
             frame_bytes: 4120,
@@ -827,6 +839,25 @@ mod tests {
             health.stats().passive_runs >= 1
         });
         assert!(!health.work_in_flight());
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn the_size_bound_is_never_deferred_by_work_in_flight() {
+        let (dir, _path, actor) = actor(Bounds {
+            size_frames: 40,
+            ..never()
+        });
+        let health = actor.wal_health();
+        let _busy = health.busy_guard();
+        for i in 0..40 {
+            save(&actor, i);
+        }
+        wait_for("the size-bound checkpoint", Duration::from_secs(30), || {
+            health.stats().passive_runs >= 1
+        });
+        assert_eq!(health.stats().deferred_busy, 0);
         actor.shutdown().expect("shutdown");
         drop(dir);
     }

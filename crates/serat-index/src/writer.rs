@@ -709,6 +709,8 @@ fn run(
                 // a queued change at shutdown would leave the index disagreeing with
                 // the disk.
                 Err(_) => {
+                    // (No busy guard here: the final commit after every sender dropped
+                    // runs outside a turn, and the checkpointer is stopping anyway.)
                     // Nobody is waiting on this commit, whatever the last turn's
                     // `continue` arm left `answering` as.
                     fault.set_answering(false);
