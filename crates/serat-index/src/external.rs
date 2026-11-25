@@ -716,6 +716,16 @@ mod tests {
         }
     }
 
+    /// Poll until no work is in flight (30 s deadline; the writer's turn guard can outlive
+    /// the reply it has already sent). No elapsed-time assertion.
+    fn wait_idle(health: &crate::checkpoint::WalHealth) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while health.work_in_flight() {
+            assert!(Instant::now() < deadline, "a guard outlived its work");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Task #183: `index_paths` is work in flight for the whole call (the checkpointer
     /// yields to it), and not after it returns.
     #[test]
@@ -732,7 +742,7 @@ mod tests {
         std::fs::write(dir.path().join("vault/b.md"), "# B\n").expect("write");
         let health = handle.wal_health();
         let reconciler = Reconciler::new(&handle);
-        assert!(!health.work_in_flight());
+        wait_idle(&health);
         std::thread::scope(|scope| {
             let round = scope.spawn(|| {
                 reconciler.index_paths(
@@ -749,7 +759,8 @@ mod tests {
             release_tx.send(()).expect("release");
             round.join().expect("join").expect("index_paths");
         });
-        assert!(!health.work_in_flight(), "the guard outlived the call");
+        // The writer replies to the flush before its own turn guard drops, so poll.
+        wait_idle(&health);
         let _ = handle.close();
     }
 
