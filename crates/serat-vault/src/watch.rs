@@ -548,11 +548,11 @@ mod tests {
     /// than fixing it: the watcher records a refused name on every event for it, a delete
     /// included, so the delete of a file the log never held (or held until a walk cleared
     /// it) *adds* the name, and the refused-name count is one too high until the next
-    /// walk. `#[ignore]`d because it fails today; the product task is in
-    /// `docs/05-testing/reports/flake-hunt-2026-11.md`. Run it with `--ignored`.
+    /// walk. `#[ignore]`d because it fails today; the product task is #188 (see
+    /// `docs/05-testing/reports/flake-hunt-2026-11.md`). Run it with `--ignored`.
     #[cfg(unix)]
     #[test]
-    #[ignore = "pins task #182's product finding: the watcher records a refusal for a delete"]
+    #[ignore = "pins task #182's finding, filed as #188: the watcher records a refusal for a delete"]
     fn the_delete_of_a_refused_name_does_not_add_it_to_the_log() {
         use std::os::unix::ffi::OsStrExt as _;
         let (dir, vault, queue) = fixture();

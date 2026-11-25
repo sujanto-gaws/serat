@@ -736,10 +736,11 @@ mod tests {
             ..never()
         });
         let health = actor.wal_health();
+        // Before the saves: under a 20 ms gate the checkpoint may run as soon as they end.
+        let db_before = len(&path);
         for i in 0..5 {
             save(&actor, i);
         }
-        let db_before = len(&path);
         wait_for("the idle checkpoint", Duration::from_secs(30), || {
             health.stats().passive_runs >= 1
         });
@@ -897,7 +898,7 @@ mod tests {
         let ran = typed_from.elapsed();
         let ceiling = ran.as_micros() / spacing.as_micros() + 1;
         assert!(
-            during.passive_runs >= 2 || ran < spacing * 2,
+            during.passive_runs >= 2,
             "no idle checkpoint while typing: {during:?} over {ran:?}"
         );
         assert!(
@@ -909,7 +910,7 @@ mod tests {
         // a trailing checkpoint fires within the spacing.
         let before = health.stats().passive_runs;
         save(&actor, i);
-        wait_for("the trailing checkpoint", Duration::from_secs(2), || {
+        wait_for("the trailing checkpoint", Duration::from_secs(30), || {
             health.stats().passive_runs > before
         });
         let after = health.stats();

@@ -860,6 +860,183 @@ pub fn cold_start_traces(vault: &Path, iterations: usize) -> Result<Vec<StartupT
     Ok(traces)
 }
 
+/// Task #179 (NFR-PRF-01, NFR-PRF-08, ADR-0019): set to `1` and every cold-start launch gets its
+/// own `WEBVIEW2_USER_DATA_FOLDER` under the temp dir, so no launch shares a WebView2 profile
+/// (or a browser process still shutting down) with the previous one. It is a diagnostic arm,
+/// off by default: a user's cold start has a profile that persists between launches. The
+/// WebView2 loader reads `WEBVIEW2_USER_DATA_FOLDER` itself and the variable overrides the
+/// `userDataFolder` argument an embedder passes (Microsoft's documented precedence), so the
+/// app, whose Tauri shell passes its own app-data folder, needs no change to honour it. The
+/// harness logs whether the override took (a folder that is never created means it did not).
+pub const ENV_DATA_PER_LAUNCH: &str = "SERAT_BENCH_WEBVIEW_DATA_PER_LAUNCH";
+
+/// How long to wait for the previous launch's `msedgewebview2.exe` processes to exit.
+const WEBVIEW_EXIT_WAIT: Duration = Duration::from_secs(10);
+const WEBVIEW_EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// Launch sequence within this bench process; unlike `run` it is unique even when two arms
+/// interleave and reuse a run index, so per-launch folders never collide.
+static LAUNCH_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Set once a wait timed out: something else owns `msedgewebview2.exe` on this machine, and
+/// waiting another ten seconds per launch would only lengthen the job.
+static WEBVIEW_RESIDENTS_NOT_OURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the env value asks for a data folder per launch: exactly `1`.
+pub(crate) fn data_per_launch_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// The data folder of launch `seq` of bench process `pid`: distinct per launch and per process.
+pub(crate) fn per_launch_data_folder(base: &Path, pid: u32, seq: usize) -> PathBuf {
+    base.join(format!("serat-bench-webview2-{pid}-{seq}"))
+}
+
+/// How a bounded wait for the previous launch's webview processes ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Quiet {
+    /// No `msedgewebview2.exe` left after `waited`.
+    Quiet { waited: Duration },
+    /// `remaining` still running when the bound was reached.
+    TimedOut { waited: Duration, remaining: usize },
+}
+
+/// Poll `count` every `interval` until it reports zero or `timeout` has been slept. The clock
+/// is the sum of the sleeps handed to `sleep`, so a test drives it without waiting.
+pub(crate) fn wait_until_quiet(
+    mut count: impl FnMut() -> usize,
+    mut sleep: impl FnMut(Duration),
+    timeout: Duration,
+    interval: Duration,
+) -> Quiet {
+    let mut waited = Duration::ZERO;
+    loop {
+        let n = count();
+        if n == 0 {
+            return Quiet::Quiet { waited };
+        }
+        if waited >= timeout {
+            return Quiet::TimedOut {
+                waited,
+                remaining: n,
+            };
+        }
+        sleep(interval);
+        waited += interval;
+    }
+}
+
+/// How many `msedgewebview2.exe` rows a `tasklist /FO CSV /NH` listing holds. Pure so it is
+/// tested on every platform; the "no tasks" message contains no such image name.
+pub(crate) fn count_webview_processes(tasklist_csv: &str) -> usize {
+    tasklist_csv
+        .lines()
+        .filter(|l| {
+            l.trim_start_matches('"')
+                .to_ascii_lowercase()
+                .starts_with("msedgewebview2.exe")
+        })
+        .count()
+}
+
+/// The live count, or `None` where there is nothing to wait for (not Windows) or the probe
+/// itself failed.
+fn live_webview_processes() -> Option<usize> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let out = Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq msedgewebview2.exe",
+            "/NH",
+            "/FO",
+            "CSV",
+        ])
+        .output()
+        .ok()?;
+    Some(count_webview_processes(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// Wait (bounded, logged) for the previous app's webview processes to exit, so the next launch
+/// does not start while a browser process of the last one is still shutting down (hypothesis 2
+/// of the Windows first-run report, finding 2).
+fn settle_webview_processes(seq: usize) {
+    let began = Instant::now();
+    use std::sync::atomic::Ordering;
+    if WEBVIEW_RESIDENTS_NOT_OURS.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(first) = live_webview_processes() else {
+        return;
+    };
+    let mut first = Some(first);
+    let outcome = wait_until_quiet(
+        || first.take().or_else(live_webview_processes).unwrap_or(0),
+        std::thread::sleep,
+        WEBVIEW_EXIT_WAIT,
+        WEBVIEW_EXIT_POLL,
+    );
+    match outcome {
+        Quiet::Quiet { .. } => eprintln!(
+            "budget: launch {seq}: msedgewebview2.exe quiet after {} ms",
+            began.elapsed().as_millis()
+        ),
+        Quiet::TimedOut { remaining, .. } => {
+            WEBVIEW_RESIDENTS_NOT_OURS.store(true, Ordering::Relaxed);
+            eprintln!(
+                "budget: launch {seq}: {remaining} msedgewebview2.exe still running after {} ms; \
+                 not waiting again in this process",
+                began.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+/// Copy any `chrome_debug.log` under a per-launch data folder (what `--enable-logging` writes)
+/// to `bench/out/budgets/webview2-logs/`, then remove the folder. Best-effort: a diagnostic
+/// must not turn a measurement into a failure.
+fn keep_webview_log_and_remove(folder: &Path, seq: usize, run: usize) {
+    fn find(dir: &Path, depth: usize) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.file_name().is_some_and(|n| n == "chrome_debug.log") {
+                return Some(p);
+            }
+            if depth > 0
+                && p.is_dir()
+                && let Some(f) = find(&p, depth - 1)
+            {
+                return Some(f);
+            }
+        }
+        None
+    }
+    let populated = folder.exists();
+    match find(folder, 3) {
+        Some(log) => {
+            let dest = crate::repo_root().join("bench/out/budgets/webview2-logs");
+            let _ = std::fs::create_dir_all(&dest);
+            let _ = std::fs::copy(&log, dest.join(format!("launch-{seq}-run{run}.log")));
+            eprintln!(
+                "budget: launch {seq}: kept webview2 log from {}",
+                log.display()
+            );
+        }
+        None => eprintln!(
+            "budget: launch {seq}: no chrome_debug.log, expected with --enable-logging=stderr (data folder {})",
+            if populated {
+                "exists"
+            } else {
+                "absent: the app may have died before the webview started, or the override was not honoured"
+            }
+        ),
+    }
+    let _ = std::fs::remove_dir_all(folder);
+}
+
 /// One cold start, validated.
 ///
 /// Separate from [`cold_start`] so the proportionality check can **interleave**
@@ -874,6 +1051,8 @@ pub fn cold_start_traces(vault: &Path, iterations: usize) -> Result<Vec<StartupT
 /// As [`cold_start`].
 pub fn cold_start_once(vault: &Path, run: usize) -> Result<StartupTrace, String> {
     let binary = app_binary()?;
+    let seq = LAUNCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let started = Instant::now();
     {
         let trace_path =
             std::env::temp_dir().join(format!("serat-startup-{}-{run}.json", std::process::id()));
@@ -888,14 +1067,40 @@ pub fn cold_start_once(vault: &Path, run: usize) -> Result<StartupTrace, String>
             .map_err(|e| format!("the system clock is before the epoch: {e}"))?
             .as_nanos();
 
-        let status = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .arg("--vault")
             .arg(vault)
             .arg("--exit-after-ready")
             .env("SERAT_STARTUP_TRACE", &trace_path)
-            .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string())
+            .env("SERAT_STARTUP_T0_UNIX_NANOS", t0.to_string());
+        let per_launch =
+            data_per_launch_requested(std::env::var(ENV_DATA_PER_LAUNCH).ok().as_deref())
+                .then(|| per_launch_data_folder(&std::env::temp_dir(), std::process::id(), seq));
+        if let Some(folder) = &per_launch {
+            let _ = std::fs::remove_dir_all(folder);
+            command.env("WEBVIEW2_USER_DATA_FOLDER", folder);
+        }
+        let status = command
             .status()
             .map_err(|e| format!("spawning {}: {e}", binary.display()))?;
+        // Between launches: the app has exited, its browser processes may not have.
+        settle_webview_processes(seq);
+        eprintln!(
+            "budget: launch {seq} (run {run}) {} after {} ms, webview data folder: {}",
+            if status.success() {
+                "exited cleanly"
+            } else {
+                "FAILED"
+            },
+            started.elapsed().as_millis(),
+            per_launch
+                .as_ref()
+                .map_or("default".to_owned(), |f| f.display().to_string())
+        );
+        if let Some(folder) = &per_launch {
+            keep_webview_log_and_remove(folder, seq, run);
+        }
         if !status.success() {
             return Err(format!(
                 "run {run} exited with {status}. If it reports no first-paint mark, the shell                  painted nothing -- which is a red job rather than a fast one, by design."
@@ -1108,6 +1313,80 @@ mod tests {
             "cold_start must refuse and name either the absent binary or the \
              absent vault, not fail opaquely: {e}"
         );
+    }
+
+    // ------------------------------------------------------------- task #179
+
+    /// NFR-PRF-01, NFR-PRF-08, task #179: per-launch WebView2 data folders differ per launch
+    /// and per process, and are only requested by exactly `1`.
+    #[test]
+    fn the_per_launch_data_folder_differs_per_launch_and_per_process() {
+        let base = Path::new("tmp");
+        let a = per_launch_data_folder(base, 10, 0);
+        let b = per_launch_data_folder(base, 10, 1);
+        let c = per_launch_data_folder(base, 11, 0);
+        assert!(a != b && a != c && b != c);
+        assert!(a.starts_with(base));
+        assert!(data_per_launch_requested(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true"), Some("2")] {
+            assert!(!data_per_launch_requested(off), "{off:?}");
+        }
+    }
+
+    /// NFR-PRF-01, task #179: the wait ends as soon as the processes are gone, and is bounded
+    /// when they are not.
+    #[test]
+    fn the_webview_exit_wait_is_prompt_when_quiet_and_bounded_when_not() {
+        let tick = Duration::from_millis(100);
+        let mut slept = Duration::ZERO;
+        let mut counts = vec![3usize, 2, 0].into_iter();
+        let q = wait_until_quiet(
+            || counts.next().unwrap_or(0),
+            |d| slept += d,
+            Duration::from_secs(10),
+            tick,
+        );
+        assert_eq!(q, Quiet::Quiet { waited: tick * 2 });
+        assert_eq!(slept, tick * 2);
+
+        let mut slept = Duration::ZERO;
+        let q = wait_until_quiet(|| 4, |d| slept += d, Duration::from_secs(10), tick);
+        assert_eq!(
+            q,
+            Quiet::TimedOut {
+                waited: Duration::from_secs(10),
+                remaining: 4
+            }
+        );
+        assert_eq!(
+            slept,
+            Duration::from_secs(10),
+            "never sleeps past the bound"
+        );
+
+        let q = wait_until_quiet(
+            || 0,
+            |_| panic!("must not sleep"),
+            Duration::from_secs(10),
+            tick,
+        );
+        assert_eq!(
+            q,
+            Quiet::Quiet {
+                waited: Duration::ZERO
+            }
+        );
+    }
+
+    /// Task #179: `tasklist /FO CSV /NH` rows are counted by image name; the no-match message is not.
+    #[test]
+    fn webview_processes_are_counted_from_tasklist_csv() {
+        let two = "\"msedgewebview2.exe\",\"4120\",\"Console\",\"1\",\"80,000 K\"\r\n\
+                   \"msedgewebview2.exe\",\"4188\",\"Console\",\"1\",\"30,000 K\"\r\n";
+        assert_eq!(count_webview_processes(two), 2);
+        let none = "INFO: No tasks are running which match the specified criteria.\r\n";
+        assert_eq!(count_webview_processes(none), 0);
+        assert_eq!(count_webview_processes(""), 0);
     }
 
     // ------------------------------------------------------------- F-401

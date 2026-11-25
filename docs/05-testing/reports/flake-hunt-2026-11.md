@@ -58,9 +58,11 @@ Proved outside the repo with a 30-line program (`pre_exec` parks the child befor
 
 **Mutant.** The fence's sole job is ordering, so its mutant is the baseline: removing it is the 3 in 60. 0 in 60 with it is weak by itself (a 5 percent rate gives zero in 60 about 5 percent of the time); the pre-exec program is the stronger evidence of cause.
 
-**Hazard noted, not fixed.** `crates/serat-app/src/asset/tests.rs:796` spawns `mkfifo` inside the serat-app lib test binary, in which other tests hold and release index locks (`held_lock_tests.rs` asserts on exactly that). It has not failed in 20 baseline runs plus 10 after; it is the same hazard and the same fence would close it. Left for whoever next sees `HeldByAnotherProcess` there.
+**Hazard noted, not fixed.** `crates/serat-app/src/asset/tests.rs:796` spawns `mkfifo` inside the serat-app lib test binary, in which other tests hold and release index locks (`held_lock_tests.rs` asserts on exactly that). It has not failed in 20 baseline runs plus 10 after; it is the same hazard and the same fence would close it. Filed as #189 (fix: `libc::mkfifo` instead of spawning).
 
 ## Sighting 2: `a_deleted_refused_file_leaves_the_list_only_at_the_next_walk`
+
+Review fixup: `it_fires_once_the_writer_has_been_idle` now reads the database size before the saves, the dead `|| ran < spacing * 2` clause is gone, and the trailing-checkpoint wait is 30 s.
 
 The test (now `state.rs:3821`; the sighting's 3721 was the same assertion on the older tree): write a file whose name is not valid UTF-8, open, `vault.walk()`, assert one refused name; delete the file; assert the list still has it ("not re-walked by a read"); `vault.walk()`; assert the list is empty and the status count is 0.
 
@@ -78,7 +80,7 @@ This is neither the #144 throttle nor `re_emit`: those publish the status; they 
 
 **Mutants.** (1) The fixed test with a 400 ms pause after the second walk: passes 5 of 5 (the old test fails 3 of 3). (2) `replace_scope` that never clears (`if found.is_empty() { return; }`): the final assertion goes red at `state.rs:3858`.
 
-## Product finding to file (not fixed here)
+## Product finding (not fixed here; filed as #188)
 
 **Task: `[P1/impl] Watcher: a delete event must not record a refused name`.**
 * Owner: rust-core-dev (`serat-vault`), with architect for the ruling. IDs: FR-VLT-01, NFR-REL-01, US-07; honours design goal 5 and the contract text that the list "may name a file that is already gone until the walk clears the log" (that sentence permits staleness left behind by a missed delete, not a delete *adding* a name the log did not hold).
@@ -94,3 +96,7 @@ This is neither the #144 throttle nor `re_emit`: those publish the status; they 
 ## Files
 
 `crates/serat-index/src/checkpoint.rs`, `crates/serat-index/tests/writer_lock.rs`, `crates/serat-app/src/state.rs`, `crates/serat-vault/src/watch.rs` (the ignored pin). TC-164 in `docs/05-testing/test-plan.md` (TC-163 is reserved by #179).
+
+## Test totals, as run (after the review fixup)
+
+`cargo test -p serat-index` (lib 85 plus every integration binary): 256 passed, 0 failed, three runs. `cargo test -p serat-app --lib`: 427 passed, 6 ignored. `cargo test -p serat-vault --lib`: 195 passed, 1 ignored (the #188 pin). The "913" in the first hand-off summed these with serat-app's integration tests and doctests; the three figures above are the reproducible ones.
