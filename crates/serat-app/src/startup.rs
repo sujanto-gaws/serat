@@ -1149,6 +1149,18 @@ pub(crate) fn validate_paint_evidence(
 mod tests {
     use super::*;
 
+    /// The page retries a refusal only when its reason contains this text
+    /// (`isFrameGateRefusal` in `app/src/startup.ts`, task #186). Rewording the
+    /// message without updating that function would silently turn the retry off.
+    #[test]
+    fn frame_gate_failed_reason_keeps_the_text_the_page_matches() {
+        assert!(
+            PaintEvidenceRejected::frame_gate_failed(1.0, 1.0)
+                .reason
+                .contains("did not follow the first")
+        );
+    }
+
     /// A plausible `first-contentful-paint` `startTime` for tests that need the mark
     /// taken but are not exercising [`PaintEvidenceRejected`] itself.
     const FCP_MS: f64 = 42.0;
