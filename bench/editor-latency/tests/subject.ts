@@ -122,6 +122,7 @@ const TAURI_STUB = `
         if (cmd === "mark_first_paint" || cmd === "mark_vault_usable") return Promise.resolve(1);
         // Stub arm only: with a bridge, resolve_links and note_anchors were forwarded above to the real commands (task #181).
         if (cmd === "resolve_links") return Promise.resolve([]);
+        if (cmd === "note_anchors") return Promise.resolve({ kind: "not_ready", state: { kind: "opening" } });
         if (cmd === "get_ui_settings") return Promise.resolve(window.__SERAT_STUB_UI_SETTINGS__ || null);
         return Promise.resolve(null);
       },

@@ -606,6 +606,9 @@ fn every_statement_uses_the_index_it_was_designed_for() {
         "R6 scans notes:\n{plan}"
     );
     let plan = plan_of("R7 anchors");
+    for needle in ["sqlite_autoindex_notes_1", "sqlite_autoindex_blocks_1"] {
+        assert!(plan.contains(needle), "{needle} missing from:\n{plan}");
+    }
     assert!(
         plan.lines()
             .all(|line| !line.contains("SCAN n") && !line.contains("SCAN b")),

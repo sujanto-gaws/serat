@@ -391,29 +391,79 @@ pub struct Anchors {
     pub block_ids: Vec<String>,
 }
 
-/// The note the resolver would choose for `folded_target` (already
-/// [`serat_core::fold_case`]d) among `paths`: the pure-Rust form of the rule in
-/// `resolve.rs`, for the window before the index is `Ready`, when only the tree's paths
-/// exist. Exact path, path plus `.md`, then (no `/` in the target) file name, file name
-/// plus `.md`; shortest path, then binary order. `reads::tests` pins that it agrees
-/// with R6 over one vault.
+/// The resolver's rule over a list of paths, for the window before the index is `Ready`,
+/// when only the tree's paths exist: the pure-Rust form of `resolve.rs`. Exact path, path
+/// plus `.md`, then (no `/` in the target) file name, file name plus `.md`; shortest path
+/// **by characters** (SQLite's `length()`), then binary order. Every path is folded once,
+/// when the resolver is built, so a batch costs O(paths + targets), not their product.
+/// `state::tests` pins that it agrees with R6 over one vault, including a multi-byte
+/// directory name.
+#[derive(Debug, Default)]
+pub struct PathResolver<'a> {
+    by_path: std::collections::HashMap<String, &'a str>,
+    by_name: std::collections::HashMap<String, &'a str>,
+}
+
+fn shorter(a: &str, b: &str) -> bool {
+    (a.chars().count(), a) < (b.chars().count(), b)
+}
+
+fn keep_best<'a>(map: &mut std::collections::HashMap<String, &'a str>, key: String, path: &'a str) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            if shorter(path, e.get()) {
+                e.insert(path);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(path);
+        }
+    }
+}
+
+impl<'a> PathResolver<'a> {
+    /// Fold every path once.
+    pub fn new(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::default();
+        for path in paths {
+            let folded = serat_core::fold_case(path);
+            let name = folded.rsplit('/').next().unwrap_or(&folded).to_owned();
+            keep_best(&mut out.by_name, name, path);
+            keep_best(&mut out.by_path, folded, path);
+        }
+        out
+    }
+
+    /// The path the resolver chooses for `folded_target` (already
+    /// [`serat_core::fold_case`]d), or `None`.
+    #[must_use]
+    pub fn resolve(&self, folded_target: &str) -> Option<&'a str> {
+        let with_md = format!("{folded_target}.md");
+        let mut best: Option<&'a str> = None;
+        let mut consider = |found: Option<&&'a str>| {
+            if let Some(&path) = found
+                && best.is_none_or(|b| shorter(path, b))
+            {
+                best = Some(path);
+            }
+        };
+        consider(self.by_path.get(folded_target));
+        consider(self.by_path.get(&with_md));
+        if !folded_target.contains('/') {
+            consider(self.by_name.get(folded_target));
+            consider(self.by_name.get(&with_md));
+        }
+        best
+    }
+}
+
+/// One-off form of [`PathResolver`].
 #[must_use]
 pub fn resolve_among_paths<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     folded_target: &str,
 ) -> Option<&'a str> {
-    let with_md = format!("{folded_target}.md");
-    let bare = !folded_target.contains('/');
-    paths
-        .into_iter()
-        .filter(|path| {
-            let folded = serat_core::fold_case(path);
-            let name = folded.rsplit('/').next().unwrap_or(&folded);
-            folded == folded_target
-                || folded == with_md
-                || (bare && (name == folded_target || name == with_md))
-        })
-        .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+    PathResolver::new(paths).resolve(folded_target)
 }
 
 /// Attachments (FR-VLT-08), one statement. The last two columns are what the resolver

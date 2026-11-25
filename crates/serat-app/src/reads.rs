@@ -327,6 +327,10 @@ pub fn map_backlink(link: read::Backlink) -> Backlink {
     }
 }
 
+/// The most targets one `resolve_links` call answers; the rest are not answered (the
+/// contract says so). A viewport holds tens.
+pub const MAX_LINK_TARGETS: usize = 1000;
+
 /// A link target as written, split the way the editor splits it (`parseLinkInner` in
 /// `app/src/editor/linkState.ts`): the note part, then a `#` subpath, or a `^` one when
 /// there is no `#`. Never rewrites the text (C-01).
@@ -387,7 +391,7 @@ fn subpath_exists(anchors: &serat_index::read::Anchors, subpath: &Subpath<'_>) -
 
 /// `resolve_links` (FR-EDT-03, NFR-CMP-01): every target of the batch, answered.
 ///
-/// `Ready` index: one R4 statement for the whole batch, plus one R5 per distinct note
+/// `Ready` index: one R6 statement for the whole batch, plus one R7 per distinct note
 /// that a `#heading` or `^block` subpath must be checked in (`via: Index`). Anything
 /// else, including an index that fails to open or read, answers from the tree's paths
 /// (`via: Tree`, `subpath_found: None`: headings are not known yet). It never waits and
@@ -400,6 +404,7 @@ pub fn resolve_links(
     targets: &[String],
     tree_paths: impl FnOnce() -> Vec<String>,
 ) -> Vec<LinkResolution> {
+    let targets = &targets[..targets.len().min(MAX_LINK_TARGETS)];
     let writtens: Vec<Written<'_>> = targets.iter().map(|t| split_written(t)).collect();
     let folded: Vec<String> = writtens
         .iter()
@@ -433,13 +438,13 @@ pub fn resolve_links(
         return out;
     }
     let tree = tree_paths();
+    let resolver = read::PathResolver::new(tree.iter().map(String::as_str));
     targets
         .iter()
         .zip(&folded)
         .map(|(target, folded)| LinkResolution {
             target: target.clone(),
-            path: read::resolve_among_paths(tree.iter().map(String::as_str), folded)
-                .map(str::to_owned),
+            path: resolver.resolve(folded).map(str::to_owned),
             subpath_found: None,
             via: SwitcherCorpus::Tree,
         })

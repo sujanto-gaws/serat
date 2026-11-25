@@ -192,7 +192,9 @@ mod tests {
     /// Every string literal the front end passes to Tauri's `invoke(...)`, found in the
     /// shipped sources under `app/src` (tests and fixtures excluded). Only the literal
     /// forms `invoke("name"` and `invoke<T>("name"`; a plugin command (`plugin:x|y`)
-    /// is not an app command and is skipped.
+    /// is not an app command and is skipped. **It sees double-quoted literals only**:
+    /// single quotes, template literals, `invoke as x` aliases and computed names are
+    /// invisible to it, so the shipped sources keep to the double-quoted form.
     fn invoked_names() -> BTreeSet<(String, String)> {
         fn walk(dir: &std::path::Path, out: &mut BTreeSet<(String, String)>) {
             for entry in std::fs::read_dir(dir)
@@ -278,7 +280,7 @@ mod tests {
         assert!(
             invoked.len() >= 20,
             "the scan found only {} invoke sites; the parser has stopped matching the \
-             source (expected the ~35 in app/src/ipc)",
+             source (expected about 30 in app/src)",
             invoked.len()
         );
         for (command, file) in &invoked {

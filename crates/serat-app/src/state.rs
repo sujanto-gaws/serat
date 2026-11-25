@@ -6993,6 +6993,10 @@ mod tests {
         std::fs::write(dir.join("a/Dup.md"), "# Dup near\n").expect("fixture");
         std::fs::write(dir.join("b/c/Dup.md"), "# Dup far\n").expect("fixture");
         std::fs::write(dir.join("Ünï.md"), "# Unicode\n").expect("fixture");
+        std::fs::create_dir_all(dir.join("é")).expect("dir");
+        std::fs::create_dir_all(dir.join("ab")).expect("dir");
+        std::fs::write(dir.join("é/x.md"), "# X multibyte\n").expect("fixture");
+        std::fs::write(dir.join("ab/x.md"), "# X ascii\n").expect("fixture");
         let state = state(&dir);
         wait_ready(&state);
         (state, dir)
@@ -7058,7 +7062,14 @@ mod tests {
     #[test]
     fn the_tree_resolver_agrees_with_the_index_on_the_same_paths() {
         let (state, dir) = link_vault("resolve-agree");
-        let paths = ["Target.md", "a/Dup.md", "b/c/Dup.md", "Ünï.md"];
+        let paths = [
+            "Target.md",
+            "a/Dup.md",
+            "b/c/Dup.md",
+            "Ünï.md",
+            "é/x.md",
+            "ab/x.md",
+        ];
         for target in [
             "Target",
             "TARGET.md",
@@ -7067,6 +7078,7 @@ mod tests {
             "ÜNÏ",
             "b/c/dup",
             "gone",
+            "x",
         ] {
             let from_index = resolved(&state, "Target.md", target).path;
             let from_tree = serat_index::read::resolve_among_paths(
@@ -7094,6 +7106,21 @@ mod tests {
         assert_eq!(answers[0].via, SwitcherCorpus::Tree);
         assert_eq!(answers[1].path, None);
         assert_eq!(answers[1].via, SwitcherCorpus::Tree);
+    }
+
+    #[test]
+    fn resolve_links_answers_at_most_the_documented_number_of_targets() {
+        let targets: Vec<String> = (0..crate::reads::MAX_LINK_TARGETS + 5)
+            .map(|i| format!("n{i}"))
+            .collect();
+        let answers = crate::reads::resolve_links(
+            IndexState::Opening { reason: None },
+            std::path::Path::new("/nonexistent-vault-root"),
+            "a.md",
+            &targets,
+            Vec::new,
+        );
+        assert_eq!(answers.len(), crate::reads::MAX_LINK_TARGETS);
     }
 
     #[test]

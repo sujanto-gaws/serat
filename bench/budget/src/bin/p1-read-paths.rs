@@ -458,7 +458,7 @@ fn measure(
         || reader.backlinks(&dense).map_or(0, |b| b.len()),
     ));
 
-    // R4: the editor's resolve_links, one viewport batch in one statement (task #181).
+    // R6: the editor's resolve_links, one viewport batch in one statement (task #181).
     // 40 existing file names spread over the vault, upper-cased so the fold is exercised,
     // and 5 names no note carries.
     let link_probe = Connection::open(db).map_err(|e| e.to_string())?;
@@ -498,7 +498,33 @@ fn measure(
                 .map_or(0, |r| r.iter().flatten().count())
         },
     ));
-    // R5: note_anchors of the note carrying the most anchors.
+    // The tree fallback of resolve_links (before the index is Ready): every note path of
+    // the vault folded once, then the same 45 targets. Reported against the same 10 ms.
+    let all_paths: Vec<String> = {
+        let mut stmt = link_probe
+            .prepare("SELECT path FROM notes WHERE kind = 'note'")
+            .map_err(|e| e.to_string())?;
+        let found = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        found.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    };
+    rows.push(time(
+        &format!(
+            "R6 resolve_links tree fallback, {batch_len} targets over {} paths (fold once per call)",
+            all_paths.len()
+        ),
+        Some(10.0),
+        iterations,
+        || {
+            let resolver = serat_index::read::PathResolver::new(all_paths.iter().map(String::as_str));
+            batch
+                .iter()
+                .filter(|t| resolver.resolve(t).is_some())
+                .count()
+        },
+    ));
+    // R7: note_anchors of the note carrying the most anchors.
     let anchored: String = one_string(
         &link_probe,
         "SELECT n.path FROM blocks b JOIN notes n ON n.id = b.note_id \

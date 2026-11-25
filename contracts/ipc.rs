@@ -1634,7 +1634,10 @@ pub struct NoteAnchors {
 pub struct ResolveLinksArgs {
     /// The note the links are written in (for `[[#Heading]]`).
     pub source_path: String,
-    /// Link targets as written, without brackets or `|display` text.
+    /// Link targets as written, without brackets or `|display` text. At most 1,000 are
+    /// answered (`MAX_LINK_TARGETS`): a longer list is truncated to its first 1,000, and
+    /// the answer has that many entries. A viewport batch is tens; the editor never
+    /// sends more.
     pub targets: Vec<String>,
 }
 
