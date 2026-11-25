@@ -83,8 +83,8 @@ fn statistics_after_a_load(bulk: bool) -> Option<i64> {
     // Under `test-hooks` the cut is made deterministic: the first op is held at its
     // COMMIT, the other 39 queue behind it, so the batches are exactly [1] and [39]
     // and the last one always crosses the threshold. Without the feature the cut is
-    // left to the scheduler and the test accepts any value the
-    // bootstrap's 0 cannot be.
+    // left to the scheduler and the test accepts any value other than the
+    // bootstrap's 0 (Some(1..=40)).
     #[cfg(feature = "test-hooks")]
     {
         let hold = actor.commit_gate().hold();
