@@ -14,6 +14,7 @@ import { installCapture, runKeystrokes, percentOnTime, p95FramesToPaint, latency
 import { SUBJECT_MIN_ON_TIME, SUBJECT_KEYS } from "./arms";
 import { openNoteForLatencyTest } from "./subject";
 import { buildFixtureNote } from "./subject";
+import { placeCaretMiddle } from "./caret";
 import { ENGINE, RULE_STATEMENT, fmt, pct } from "./report";
 
 test.beforeAll(async ({ browser }) => { console.log(RULE_STATEMENT(browser.version())); });
@@ -78,25 +79,7 @@ async function placeCaret(page: Page, editor: Locator, where: Position): Promise
     }, prevText), { message: "caret at document end: caret is on the last line and that line is visible" }).toBe("ok");
     desc = `end of note (line ${lines.length - 1})`;
   } else {
-    await scroller.evaluate((s) => { s.scrollTop = (s.scrollHeight - s.clientHeight) / 2; });
-    await new Promise((r) => setTimeout(r, 400));
-    const box = await scroller.boundingBox();
-    if (!box) throw new Error("editor scroller has no bounding box");
-    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    const lineOf = new Map<number, number>();
-    lines.forEach((l, i) => { const m = /^Paragraph (\d+) /.exec(l); if (m) lineOf.set(Number(m[1]), i); });
-    let idx = -1;
-    for (let step = 0; step < 30 && idx < 0; step++) {
-      const text = await activeLineText();
-      const m = /Paragraph (\d+) /.exec(text);
-      if (m && lineOf.has(Number(m[1]))) idx = lineOf.get(Number(m[1])) as number;
-      else await page.keyboard.press("ArrowDown");
-    }
-    expect(idx, "middle: caret landed on a recognisable Paragraph line").toBeGreaterThanOrEqual(0);
-    const frac = idx / lines.length;
-    expect(frac, `middle: caret at source line ${idx} of ${lines.length}`).toBeGreaterThan(0.45);
-    expect(frac).toBeLessThan(0.55);
-    desc = `source line ${idx} of ${lines.length} (${pct(frac)})`;
+    desc = await placeCaretMiddle(page, editor, lines); // bounded, asserted, steered (caret.ts, task #202)
   }
   await new Promise((r) => setTimeout(r, 600)); // let scroll/measure settle before the first scored key
   return desc;
