@@ -314,6 +314,11 @@ pub const SCALE_TOLERANCE: f64 = 0.20;
 
 /// Judge whether the critical path grew with vault size.
 ///
+/// The two figures are the **Serat term** p95s since task #118 ([`judge_scale`] is the only
+/// caller), and the message says so. Task #195: the text used to say "window painted", so
+/// run 437's FAIL named a subject the check no longer asserts, beside Serat-term numbers
+/// (341.9 / 477.3 ms, against a window-painted p95 near 1,046 ms in the same log).
+///
 /// # Errors
 /// A sentence naming both figures when it did.
 pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), String> {
@@ -322,7 +327,7 @@ pub fn assert_scale_independent(small_ms: f64, large_ms: f64) -> Result<(), Stri
         return Ok(());
     }
     Err(format!(
-        "window painted at 50,000 notes is {large_ms:.1} ms against {small_ms:.1} ms at 20,000          — {:.0}% growth, over the {:.0}% tolerance. Architecture §3.4 says nothing on the          critical path is proportional to vault size; something on it now is.",
+        "the Serat term (p95) at 50,000 notes is {large_ms:.1} ms against {small_ms:.1} ms at 20,000          — {:.0}% growth, over the {:.0}% tolerance. Architecture §3.4 says nothing on the          critical path is proportional to vault size; something on it now is.",
         (large_ms / small_ms - 1.0) * 100.0,
         SCALE_TOLERANCE * 100.0
     ))
@@ -4016,6 +4021,56 @@ mod tests {
             ],
             "every budget this file declares must be in exactly one list"
         );
+    }
+
+    #[test]
+    fn the_scale_failure_names_the_serat_term_and_never_the_aggregate() {
+        // Task #195, run 437: a FAIL printed "window painted at 50,000 notes is 477.3 ms
+        // against 341.9 ms" while the asserted series was the Serat term. Same single path
+        // (`judge_scale` -> `assert_scale_independent`); only the text named the retired
+        // subject. This check reproduces 437's shape: Serat term +40%, aggregates flat and
+        // near 1,000 ms (as in the log), so a message naming the aggregate is a wrong one.
+        let check = ScaleCheck {
+            small_ms: 300.0,
+            large_ms: 310.0,
+            small_p95_ms: 341.9,
+            large_p95_ms: 477.3,
+            pairs: 20,
+            median_diff_ms: 5.0,
+            larger_slower: 12,
+            sign_test_p: 0.5,
+            index_start: IndexStartState::ColdBoth,
+            small_spread_pct: 20.0,
+            large_spread_pct: 20.0,
+            window_visible: ScaleRatio {
+                label: "window painted",
+                small_p95_ms: 1_045.9,
+                large_p95_ms: 1_050.0,
+            },
+            vault_usable: ScaleRatio {
+                label: "vault usable",
+                small_p95_ms: 1_133.3,
+                large_p95_ms: 1_140.0,
+            },
+        };
+        let err = judge_scale(&check).expect_err("+40% on the Serat term must fail");
+        assert!(
+            err.contains("the Serat term (p95) at 50,000 notes is 477.3 ms"),
+            "{err}"
+        );
+        assert!(err.contains("341.9 ms at 20,000"), "{err}");
+        assert!(err.contains("40% growth"), "{err}");
+        assert!(!err.contains("window painted"), "{err}");
+        // And the converse: a flat Serat term passes whatever the aggregates did.
+        let flat = ScaleCheck {
+            large_p95_ms: 341.9,
+            window_visible: ScaleRatio {
+                large_p95_ms: 5_000.0,
+                ..check.window_visible
+            },
+            ..check
+        };
+        assert!(judge_scale(&flat).is_ok());
     }
 
     #[test]
