@@ -1106,7 +1106,7 @@ pub fn usage(budget: &Budget) -> String {
         (
             " [--skip-scale]",
             "  --skip-scale        Report the two figures only; skip the 20k-vs-50k scale
-                      assertion (architecture 3.4). Asserts nothing: not for CI.
+                      assertion (architecture 3.4). Asserts nothing: not for a gating job.
 ",
         )
     } else {
@@ -6195,18 +6195,23 @@ mod tests {
                     "--root" => vec![flag.clone(), "/x".into()],
                     _ => vec![flag.clone()],
                 };
-                // The cold-start composition strips its own flag, then hands the rest
-                // to the common parser; the other budgets reach the parser directly.
-                let seen = std::cell::RefCell::new(None);
-                let _ = cold_start_job_with(
-                    &args,
-                    |a| {
-                        *seen.borrow_mut() = Some(parse_args(budget, a));
-                        ExitCode::FAILURE
-                    },
-                    |_| ExitCode::FAILURE,
-                );
-                let parsed = seen.into_inner().expect("reported step ran");
+                // Only the cold-start job strips a flag of its own, so only its budget goes
+                // through that composition; every other budget reaches the parser directly,
+                // so a `--skip-scale` documented for one of them would be refused.
+                let parsed = if budget.id == PRF01_WINDOW_VISIBLE.id {
+                    let seen = std::cell::RefCell::new(None);
+                    let _ = cold_start_job_with(
+                        &args,
+                        |a| {
+                            *seen.borrow_mut() = Some(parse_args(budget, a));
+                            ExitCode::FAILURE
+                        },
+                        |_| ExitCode::FAILURE,
+                    );
+                    seen.into_inner().expect("reported step ran")
+                } else {
+                    parse_args(budget, &args)
+                };
                 assert!(
                     parsed.is_ok(),
                     "{}: documented flag {flag} refused: {:?}",
