@@ -5,7 +5,7 @@ date: 2026-11-24
 task: 167
 serves: FR-VLT-04, NFR-PRF-01, NFR-PRF-03, NFR-PRF-04, NFR-PRF-06, NFR-PRF-08, FR-VLT-01, US-35, C-06
 adrs: ADR-0019, ADR-0014, ADR-0015
-test-cases: TC-159, TC-165, TC-168
+test-cases: TC-159, TC-165, TC-168, TC-173
 ---
 
 # First hosted-runner execution since 2026-11-09
@@ -219,6 +219,46 @@ Test case TC-165 (1 of 3 owed), TC-168. Run 427 is budgets.yml on main `83b616d`
 **What is not weakened.** The product limit stays 350.0 ms; the frame guard in `validate_paint_evidence` is untouched (the page's retry from #186 is the only change to the paint path); `determinate()` is unchanged, so the same samples on `--profile reference`, or on any gate-eligible runner, still print INDETERMINATE and fail (`the_serat_term_is_report_only_on_hosted_windows_and_asserts_where_a_gate_number_exists`). A degraded series is still not report-only. The earlier recommendation in Triage 2 (do not make NFR-PRF-01 report-only while the hang is an unexplained product defect) is superseded for the slowness only: it was about hiding the hang, and the hang still fails the job.
 
 **Not verified.** No Windows run of the changed workflow; the job name and the `WhenGateEligible` branch are pinned by unit tests on synthetic outcomes, not by a hosted run. The raw samples of run 427 were not read, so the in-run median and the p95 interval are not given. Whether the 20k-versus-50k scale check on `prf01-cold-start` is a tight enough detector for a startup-path regression is not re-examined here (it passed).
+
+## Runs 431 and 432: exit 2 after a refusal, a slow window, and one prf03 straddle (task #192, 2026-11-25)
+
+Test case TC-173. Figures are copied from the CI logs by the lead; nothing here was run on Windows.
+
+### (a) Exit code 2 half a second after a frame-gate refusal: root cause found
+
+Evidence: run 431 (main `5de8807`) `prf01-cold-start` launch 3, run 432 (main `697c457`) `prf01-cold-start` launch 1 and `prf01-serat-term` launch 1. Each shows `paint evidence rejected at 448 / 634 / 662 ms`, then about 70 ms later `serat: no startup trace after 60s (usable): no vault_usable mark: the webview never reported the buffer rendered ...`, then exit 2. Run 427 launch 13 took the same refusal and exited cleanly.
+
+Mechanism (all in `crates/serat-app`):
+
+1. The page's #186 retry sends a second `mark_first_paint`, which succeeds. `window_visible` is now set. The tree, index and watcher marks were evidently already set by then (the failing exit follows the retry by 50 to 70 ms, and the paint is what woke the thread), so the paint is the **last** term of `Marks::vault_usable` (`startup.rs`) and `vault_usable` becomes `Some` at that instant.
+2. The benchmark exit thread (`lib.rs` `spawn_benchmark_exit`) was blocked in `Startup::wait_for_usable`; the paint's `notify_all` woke it. It immediately called `startup.trace()`.
+3. `trace()` still requires `buffer_rendered` (kept in the trace although ADR-0015 §5 removed it from `vault_usable`). That mark comes from `mark_vault_usable`, which the page (`app/src/startup.ts` `hydrateBuffer`) sends only after `await paintMark`, that is after the paint reply has crossed the IPC. So the buffer mark is one round trip behind, and `trace()` returned `TraceIncomplete { missing: "vault_usable", because: "... buffer ..." }`, printed with the label "usable" because `arrived` was true, and the thread called `exit_now(2)`.
+4. Without a retry the paint normally lands before the tree, index and watcher settle, so usable is completed by a later mark and the buffer mark has long arrived. The retry moves the paint to the end, which is why only launches with a refusal are hit, and why run 427 launch 13 (the same refusal) passed: it presumably won the race (inferred, not logged). This is a race the #178/#141 changes created (the buffer left `vault_usable`, the wait did not follow it), exposed by #186.
+5. The "after 60s" is `{timeout:?}`, the configured `--ready-timeout-ms` (60 s), not elapsed time. The wait took 50 to 70 ms. The message was truthful about nothing but the limit.
+
+Candidates ruled out by the code: a deadline from a wrong origin (the watchdog `SERAT_STARTUP_DEADLINE_MS` only prints a snapshot and never exits; it did not fire); the harness closing the window on seeing the refusal (the exit comes from `exit_now(2)` inside the process, after `trace()`); a stale env deadline; #188 and #190 (no path in them touches this wait). The 13.8 s "FAILED after" of one launch was not explained from the code and is not attributed.
+
+Fix: `Startup::wait_for_trace_terms` waits for usable **and** the buffer mark; the exit thread uses it; the failure message prints the waited milliseconds and the limit. `vault_usable` and `t_usable` are unchanged (the buffer is still not a term), and the frame guard is untouched.
+
+### (b) A launch with no window for 55 s (run 432 `prf01-serat-term` launch 0)
+
+`startup marks after 55029 ms: set=[main, state_ready, runtime_ready, setup_done, index_settled, watcher] missing=[window_created, ...]`, then "exited cleanly after 79210 ms". The exit was clean and wrote a trace, so the window **was** created, between 55 and 79 s: the main thread was somewhere between `setup_done` and `window_created` for 55 to 79 s. Inside `WebviewWindowBuilder::build()` (which creates the WebView2 environment and controller) is inferred; no log shows it. `window_created` is marked on the line after `build()` returns, and the benchmark exit thread is spawned after it, which is why nothing else ran. Hypotheses, most likely first:
+
+1. First launch of `msedgewebview2.exe` in the job (it was launch 0) paying a cold start of the runtime: Defender or another scanner reading the runtime, a runner-image change, or WebView2 first-run profile creation. It is launch 0, which fits; launches 1 to 19 were fine.
+2. WebView2 environment creation waiting on the per-launch `WEBVIEW2_USER_DATA_FOLDER` (folder creation, a lock from an earlier launch's exiting browser process). Less likely at launch 0 (nothing to lock on), likelier at later launches.
+3. The main thread blocked between `setup_done` and `build()` (the settings read in `settings_geometry` is a default, so nothing does I/O there). Least likely.
+
+The diagnostic that decides it is now emitted under `SERAT_STARTUP_TRACE`: `serat: main window build entering at N ms (webview data folder: ...)` before `build()` and `... returned at N ms ...` after. If `entering` is present and `returned` late, it is 1 or 2 (then compare launch index and whether `msedgewebview2.exe` was already running); if `entering` is absent, it is 3. No product behaviour changes. The 55 to 79 s launch was accepted by the harness as a sample, which is a measurement problem for the serat-term job (a single sample of about 60 s inside n=20); whether the harness should fail a launch whose window took more than a bound is for test-engineer.
+
+### (c) NFR-PRF-03 `prf03-save-to-index` INDETERMINATE in run 432
+
+p95 16.2 ms, min 0.9, mean 4.2, max 67.5 ms against 50 (ci profile), n=1000, 1000 submitted, scanner off, 4 cores. Run 431 passed. The verdict is INDETERMINATE only because `determinate()` is `max <= limit || min > limit` (`bench/budget/src/lib.rs`): one sample over 50 ms makes the series straddle. The p95 is a third of the limit.
+
+Is the 67.5 ms sample the #183 WAL-checkpoint overlap shape? Plausibly, on the evidence available but unproven: the figures (a mean of 4.2 ms with a single tail sample 16 times that) are the shape #165/#183 found for saves that overlap a WAL checkpoint or an FTS merge on this runner, and the hand-off interval is the one prf03 measures. The raw samples and the overlap counters were not read; the prf03 job does not report checkpoint overlap the way `p1-external-change` does. So: consistent with, not shown to be.
+
+Ruling under ADR-0019: **prf03 on hosted Windows stays `Always`.** Point 2 admits a budget to the report-only class only when (a) the runner is not gate eligible, (b) its own spread is at least the budget's margin, and (c) no ceiling is derivable. (b) is not met: the p95 sits at a third of the limit, and a single sample of 67.5 ms in 1,000 is not a spread the size of the margin; it has passed in most hosted runs, and the point-5 wording (no classing before the numbers show it) still holds. This is not the #190 situation, where the whole series straddled around the limit. The assertion is not changed in this task.
+
+If it recurs (a second straddle in the next three runs): (1) have the prf03 job print the per-sample overlap with checkpoints and the offending sample's position (a diagnostic, like #165's for FR-VLT-04), (2) if the tail samples line up with checkpoints, re-judge point 2 for NFR-PRF-03 and consider whether `determinate()` should judge the p95 for a series this long, which is test-engineer's and the architect's call (it needs an ADR-0019 amendment), and (3) only then reclassify.
 
 ## Proposed tasks (for the lead to create; no product code was changed here)
 

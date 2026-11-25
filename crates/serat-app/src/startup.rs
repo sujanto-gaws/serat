@@ -584,6 +584,32 @@ impl Startup {
         true
     }
 
+    /// Block until the trace can be written: the vault is usable **and** the buffer mark
+    /// (which `trace()` still requires, though it is no longer a term of usable) has
+    /// arrived, or `timeout` elapses. Returns `true` if both did.
+    ///
+    /// `--exit-after-ready` waits on this, not on [`Startup::wait_for_usable`]
+    /// (task #192): `vault_usable` is complete the instant the last term lands, and
+    /// after a frame-gate retry (#186) that last term is the paint, whose reply is what
+    /// the page awaits before it sends `mark_vault_usable`. Exiting on usable alone
+    /// read the trace in that round trip and failed a healthy launch with code 2.
+    /// `t_usable` is unchanged: this only delays the read, not any stamped mark.
+    pub fn wait_for_trace_terms(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut marks = self.lock();
+        while marks.vault_usable().is_none() || marks.buffer_rendered.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            marks = self
+                .usable
+                .wait_timeout(marks, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
     /// The trace line, or the reason there isn't one.
     ///
     /// # Errors
@@ -760,6 +786,20 @@ pub fn deadline_from(value: Option<&str>) -> Duration {
         Some(ms) if ms > 0 => Duration::from_millis(ms.min(CAP_MS)),
         _ => DEFAULT_DEADLINE,
     }
+}
+
+/// The line printed around `WebviewWindowBuilder::build` under the trace env (task #192):
+/// `phase` is `"entering"` or `"returned"`. Run 432 had a launch with `setup_done` set and
+/// `window_created` never set for 55 s; whether `entering` appeared and `returned` did
+/// not (blocked in the build, which creates the WebView2 environment and controller) or
+/// neither (blocked between `setup_done` and the build) is what separates the causes.
+/// `data_folder` is `WEBVIEW2_USER_DATA_FOLDER` as the process sees it.
+#[must_use]
+pub fn window_build_line(phase: &str, elapsed_ms: f64, data_folder: Option<&str>) -> String {
+    format!(
+        "serat: main window build {phase} at {elapsed_ms:.0} ms (webview data folder: {})",
+        data_folder.unwrap_or("default")
+    )
 }
 
 /// The line naming the web view runtime this launch runs on. `version` is the result of
@@ -1574,6 +1614,47 @@ mod tests {
             trace.t0_to_tree_first_screen_ms
         );
         assert!(trace.tree, "a trace that exists declares a tree");
+    }
+
+    #[test]
+    fn the_window_build_line_names_the_phase_and_the_data_folder() {
+        let line = window_build_line("entering", 12.4, Some("C:\\wv"));
+        assert_eq!(
+            line,
+            "serat: main window build entering at 12 ms (webview data folder: C:\\wv)"
+        );
+        assert!(window_build_line("returned", 1.0, None).ends_with("folder: default)"));
+    }
+
+    #[test]
+    fn the_benchmark_exit_waits_for_the_buffer_mark_when_the_paint_lands_last() {
+        // Task #192 (runs 431/432): after a frame-gate retry the paint is the last term
+        // of usable, and the buffer mark follows it by one IPC round trip. Waiting on
+        // `wait_for_usable` alone read the trace in that gap and exited 2 at ~0.5 s.
+        // Make `wait_for_trace_terms` return on usable alone and this fails.
+        let startup = Arc::new(in_process());
+        startup.mark_index_settled();
+        startup.mark_watcher(WatcherOutcome::Registered);
+        startup.mark_tree_first_screen(startup.elapsed_ms());
+        startup
+            .mark_first_paint(FCP_MS, RAF2_MS)
+            .expect("valid paint evidence");
+        assert!(startup.wait_for_usable(Duration::from_millis(30)));
+        assert!(
+            startup.trace().is_err(),
+            "usable is complete but the trace is not: the buffer mark is in flight"
+        );
+        assert!(
+            !startup.wait_for_trace_terms(Duration::from_millis(30)),
+            "the exit thread would read the trace before the buffer mark"
+        );
+        let late = Arc::clone(&startup);
+        let sender = std::thread::spawn(move || {
+            late.mark_buffer_rendered();
+        });
+        assert!(startup.wait_for_trace_terms(Duration::from_secs(5)));
+        startup.trace().expect("complete once the buffer arrived");
+        sender.join().expect("sender");
     }
 
     #[test]
