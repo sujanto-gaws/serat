@@ -250,7 +250,16 @@ pub const PRF01_SERAT_TERM: Budget = Budget {
                partition, Decision 3's binding sum) -- the platform term and the two legacy \
                marks are reported beside it, never asserted (F-407)",
     gated: true,
-    ci_assertion: CiAssertion::Always,
+    // Task #190, ADR-0019 point 2 (recorded in ci-windows-first-run-2026-11.md, "Run 427"):
+    // hosted windows-latest is not gate eligible (scanner off, 4 cores here, 2 elsewhere),
+    // one hang-free run of 20 launches read p95 546.3 ms against 350 with samples 237.5 to
+    // 711.6 ms (spread 199.6%), and no `ci_limit_ms` can be derived from one run. No Linux
+    // twin exists either (`NO_LINUX_TWIN`): the 350 ms is bounded to Windows/WebView2 (PRD
+    // v1.2, F-96) and RM-2's Linux figure was 1,310.4 ms. The assertion is the reference
+    // machine's (`--profile reference`); this job still fails when a launch hangs, the app is
+    // absent or the frame gate refuses past its retries, because that is a measurement that
+    // could not be taken. The frame guard and the product limit are unchanged.
+    ci_assertion: CiAssertion::WhenGateEligible,
 };
 
 /// NFR-PRF-03.
@@ -5938,12 +5947,24 @@ mod tests {
         None
     }
 
+    /// Report-only budgets that have no asserting Linux twin, each with the reason ADR-0019
+    /// point 3 ("wherever a gate-eligible runner class can run it") does not apply (task
+    /// #190). Closed on purpose: an entry needs a reason, and
+    /// `no_linux_twin_is_the_one_windows_only_budget_and_has_no_twin_job` pins the set.
+    const NO_LINUX_TWIN: &[(&str, &str)] = &[(
+        "prf01-serat-term",
+        "NFR-PRF-01's 350 ms is bounded to Windows/WebView2 (PRD v1.2, F-96); the app-driving \
+         jobs build and launch serat.exe on windows-latest only, and the Linux figure (RM-2, \
+         1,310.4 ms) is a different platform's number that would fail a 350 ms assertion",
+    )];
+
     /// The (job id, bin, flag) of every report-only-on-hosted-Windows budget: the P0 budgets
     /// declared `WhenGateEligible` and the P1 bins in `P1_REPORT_ONLY_ON_HOSTED`.
     fn report_only_budgets_with_twins() -> Vec<(String, String, &'static str)> {
         let mut v: Vec<(String, String, &'static str)> = P0_BUDGETS
             .iter()
             .filter(|b| b.ci_assertion == CiAssertion::WhenGateEligible)
+            .filter(|b| !NO_LINUX_TWIN.iter().any(|(id, _)| *id == b.id))
             .map(|b| (b.id.to_string(), b.id.to_string(), "--profile ci"))
             .collect();
         v.extend(
@@ -6046,6 +6067,91 @@ mod tests {
                 "mutant {what:?} was caught by the wrong clause: {defect:?}, wanted {expect:?}"
             );
         }
+    }
+
+    #[test]
+    fn no_linux_twin_is_the_one_windows_only_budget_and_has_no_twin_job() {
+        // NFR-PRF-01, NFR-PRF-08, C-06, ADR-0019 points 2 and 3, task #190. The exemption
+        // is for a budget that cannot run on Linux by design; it must name a real
+        // WhenGateEligible budget, say why, and not coexist with a twin job (a stale
+        // exemption would hide a twin that nothing checks).
+        let workflow = repo_root().join(".github/workflows/budgets.yml");
+        let text = std::fs::read_to_string(&workflow).expect("budgets.yml");
+        let ids: Vec<&str> = NO_LINUX_TWIN.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["prf01-serat-term"], "the exemption set is closed");
+        for (id, why) in NO_LINUX_TWIN {
+            let b = P0_BUDGETS
+                .iter()
+                .find(|b| b.id == *id)
+                .unwrap_or_else(|| panic!("{id} is not a P0 budget"));
+            assert_eq!(b.ci_assertion, CiAssertion::WhenGateEligible, "{id}");
+            assert!(why.contains("Windows") && why.len() > 60, "{id}: {why:?}");
+            assert!(
+                !text.contains(&format!("\n  {id}-linux:\n")),
+                "{id} has a Linux job, so it must leave NO_LINUX_TWIN and get the twin checks"
+            );
+        }
+        // Every other WhenGateEligible P0 budget is checked for a twin, so the exemption
+        // cannot swallow one.
+        let checked: Vec<String> = report_only_budgets_with_twins()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert!(
+            checked.contains(&"prf04-full-rebuild".to_string()),
+            "{checked:?}"
+        );
+        assert!(
+            !checked.contains(&"prf01-serat-term".to_string()),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
+    fn the_serat_term_is_report_only_on_hosted_windows_and_asserts_where_a_gate_number_exists() {
+        // NFR-PRF-01, NFR-PRF-08, US-35, C-06, ADR-0019 point 1 and 8, task #190. Run 427's
+        // figures: n=20, min 237.5, max 711.6, p95 546.3 against 350 on a 4-core scanner-off
+        // runner. Same samples, three environments.
+        let mut v: Vec<f64> = vec![237.5; 3];
+        v.extend([
+            260.0, 270.0, 280.0, 290.0, 295.0, 300.0, 305.0, 310.0, 315.0, 320.0,
+        ]);
+        v.extend([330.0, 340.0, 380.0, 450.0, 546.3, 711.6]);
+        assert_eq!(v.len(), 19);
+        v.push(520.0);
+        let hosted = outcome_on(PRF01_SERAT_TERM, Profile::Ci, hosted_windows(), &v);
+        assert!(!hosted.gate_eligible() && hosted.report_only_here() && !hosted.asserted());
+        assert!(!hosted.determinate(), "the samples straddle, and say so");
+        assert!(
+            hosted.to_report().starts_with("REPORT-ONLY"),
+            "{}",
+            hosted.to_report()
+        );
+        assert!(
+            enforce(&hosted),
+            "a slow hosted figure must not fail the build"
+        );
+        // The product limit is unchanged and the same samples assert on RM-1.
+        assert_eq!(PRF01_SERAT_TERM.product_limit_ms, 350.0);
+        assert_eq!(PRF01_SERAT_TERM.ci_limit_ms, None);
+        let rm1 = outcome_on(PRF01_SERAT_TERM, Profile::Reference, hosted_windows(), &v);
+        assert!(rm1.asserted() && !rm1.report_only_here());
+        assert!(
+            rm1.to_report().starts_with("INDETERMINATE"),
+            "{}",
+            rm1.to_report()
+        );
+        assert!(
+            !enforce(&rm1),
+            "on the reference profile a straddle still fails"
+        );
+        // And on a gate-eligible runner under ci the straddle is still a failure.
+        let eligible = outcome_on(PRF01_SERAT_TERM, Profile::Ci, linux(), &v);
+        assert!(eligible.asserted() && !enforce(&eligible));
+        // A degraded measurement is not waived by report-only.
+        let mut degraded = outcome_on(PRF01_SERAT_TERM, Profile::Ci, hosted_windows(), &v);
+        degraded.degraded = Some("a launch was refused".into());
+        assert!(!degraded.report_only_here() && !enforce(&degraded));
     }
 
     #[test]

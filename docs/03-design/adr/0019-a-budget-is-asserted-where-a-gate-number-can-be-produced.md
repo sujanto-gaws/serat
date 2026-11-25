@@ -112,3 +112,11 @@ There are two cases, and both produced the rule, which is the weakness to state:
 - FR-VLT-04's 4 runs, which meet it on thinner data.
 
 The cases that would test it are still to come. One is the first hosted numbers for NFR-PRF-01 and NFR-PRF-03 (point 5): whoever reads them records whether point 2's conditions were met or merely wished for. The other is the first hosted run of point 3's Linux jobs.
+
+## Amendment 2026-11-25 (task #190, proposed by test-engineer; the architect ratifies)
+
+**Point 5 is superseded for NFR-PRF-01 (Serat term); NFR-PRF-03 stays `Always`.** Point 5 left the first hosted numbers to decide. They arrived in run 427 (main `83b616d`, the first hang-free run after #186): Serat term p95 546.3 ms of 350, n=20, min 237.5, max 711.6, spread 199.6%, scanner OFF, 4 cores, INDETERMINATE. Point 2 judged on that run: (a) not gate eligible, met; (b) the runner's own spread (a 474 ms range around a 40.8 ms margin; platform term p95 709.7) exceeds the margin, met on one run, which is thin; (c) no ceiling is derivable from one run (point 4(ii) wants 30), met. NFR-PRF-01's `prf01-serat-term` job is `CiAssertion::WhenGateEligible` from #190, with its name saying "report-only on hosted windows; asserted on the reference machine".
+
+**Point 3 has a named exception.** A report-only budget gets an asserting Linux twin only if a gate-eligible runner class can run it. NFR-PRF-01's Serat term cannot: the app-driving jobs build and launch `serat.exe` on windows-latest only, PRD v1.2 bounds the 350 ms to Windows/WebView2 (F-96), and the Linux figure (RM-2) is 1,310.4 ms. The exception is the closed set `NO_LINUX_TWIN` in `bench/budget/src/lib.rs`. A budget in it has no CI job that asserts its product limit, so its gate-report CI-asserted column is "none" and the RM-1 scanner-on run is its only assertion; this is weaker than NFR-PRF-04's position, and ADR-0019 point 7's PR obligation is its mitigation. Entry on one run is provisional: if the next two hang-free hosted runs are determinate, the budget returns to `Always`.
+
+**Unchanged:** the product limit, the frame guard, `determinate()` (no iteration count settles a series whose minimum is below and whose tail is above the limit), point 4's exit criteria, point 8.
