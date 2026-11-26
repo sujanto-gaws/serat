@@ -209,8 +209,8 @@ impl Reconciler {
         let reader = self.reader()?;
         let mut flushed = 0;
         for path in paths {
-            self.health.set_round_phase(RoundPhase::Lookup);
             self.pace(&outcome, &mut flushed)?;
+            self.health.set_round_phase(RoundPhase::Lookup);
             let known = row(&reader, path)?;
             match self.submit(source, parser, path, known.as_ref(), Some(is_echo))? {
                 Step::Gone { not_found: false } => {
