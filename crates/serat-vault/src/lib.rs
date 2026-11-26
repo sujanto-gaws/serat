@@ -47,6 +47,7 @@ pub mod phases;
 pub mod position;
 pub mod queue;
 pub mod refusal;
+pub mod save_phases;
 pub mod tree;
 pub mod walk;
 #[cfg(all(test, unix))]
@@ -644,6 +645,7 @@ impl Vault {
                 (Err(err), _) => return Err(VaultError::io(path.as_str(), &err)),
             }
         }
+        save_phases::mark(save_phases::SavePhase::Hash);
 
         fs::create_dir_all(parent).map_err(|err| failed(err.to_string()))?;
 
@@ -662,6 +664,7 @@ impl Vault {
                 .map_err(|err| failed(err.to_string()))?;
         before_rename();
         atomic::commit(&temp, &target).map_err(|err| failed(err.to_string()))?;
+        save_phases::mark(save_phases::SavePhase::Rename);
 
         // `mtime_ms` is the temp handle's, taken before the rename and preserved by it:
         // no stat of the target here, so an external write cannot be paired with our hash.

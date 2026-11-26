@@ -589,6 +589,11 @@ pub struct SaveBenchmarkTrace {
     pub fts_merge: Vec<bool>,
     /// Per submitted save: a writer turn of 50 ms or more overlapped the window.
     pub slow_commit: Vec<bool>,
+    /// Per submitted save, one series per phase of the save path inside the timed
+    /// `write_file` (task #207), in [`crate::save_tags::PHASES`] order, each parallel to
+    /// `submitted_ms`. Empty when the application did not report them; otherwise all
+    /// [`crate::save_tags::PHASES`] series are present, each as long as `submitted_ms`.
+    pub phase_ms: Vec<Vec<f64>>,
     /// Saves whose FTS5 segment probe failed (counted as no merge).
     pub flag_probe_failures: u64,
     /// Idle checkpoints deferred to work in flight, over the run.
@@ -658,7 +663,37 @@ impl SaveBenchmarkTrace {
                     .map_err(|e| format!("{e} (save {i})"))?;
             }
         }
+        // Task #207's per-phase series, strict by name: none reported is fine (an older
+        // binary), but a series that is present and malformed or the wrong length, or
+        // only some of the eight, is a contract error that names the key.
+        let mut phase_ms: Vec<Vec<f64>> = Vec::new();
+        let mut missing = Vec::new();
+        for name in crate::save_tags::PHASES {
+            let key = format!("save_phase_{name}_ms");
+            if !line.contains(&format!("\"{key}\":[")) {
+                missing.push(key);
+                continue;
+            }
+            let series = number_array(line, &key).ok_or_else(|| {
+                format!("the save benchmark report's {key} is not an array of numbers: {line}")
+            })?;
+            if series.len() != submitted.len() {
+                return Err(format!(
+                    "the save benchmark report's {key} has {} entries for {} submitted saves",
+                    series.len(),
+                    submitted.len()
+                ));
+            }
+            phase_ms.push(series);
+        }
+        if !phase_ms.is_empty() && !missing.is_empty() {
+            return Err(format!(
+                "the save benchmark report carries some save phase series but not {}",
+                missing.join(", ")
+            ));
+        }
         Ok(SaveBenchmarkTrace {
+            phase_ms,
             attempted: count("save_attempted")?,
             submitted_ms: submitted.clone(),
             handle_missing: counter("save_handle_missing")?,
@@ -1116,6 +1151,48 @@ mod tests {
             ),
             (2, 5, 7)
         );
+    }
+
+    #[test]
+    fn the_phase_series_parse_when_complete_and_are_refused_by_name_otherwise() {
+        // Task #207, NFR-PRF-03: report-only, strict by name.
+        let plain = save_report(2, "12.5,8.3", 0, 0, "");
+        assert!(
+            SaveBenchmarkTrace::parse(&plain)
+                .expect("none reported")
+                .phase_ms
+                .is_empty()
+        );
+        let with = |keys: &[(&str, &str)]| {
+            let extra: String = keys
+                .iter()
+                .map(|(name, body)| format!(",\"save_phase_{name}_ms\":[{body}]"))
+                .collect();
+            plain.replace(
+                "\"save_writer_refused_ms\":[]",
+                &format!("\"save_writer_refused_ms\":[]{extra}"),
+            )
+        };
+        let all: Vec<(&str, &str)> = crate::save_tags::PHASES
+            .iter()
+            .map(|n| (*n, "1.0,2.0"))
+            .collect();
+        let t = SaveBenchmarkTrace::parse(&with(&all)).expect("complete");
+        assert_eq!(t.phase_ms.len(), 8);
+        assert_eq!(t.phase_ms[2], vec![1.0, 2.0]);
+        // A short series names its key.
+        let mut short = all.clone();
+        short[2] = ("sync", "1.0");
+        let err = SaveBenchmarkTrace::parse(&with(&short)).expect_err("a short series");
+        assert!(err.contains("save_phase_sync_ms"), "{err}");
+        // A malformed entry names its key.
+        let mut bad = all.clone();
+        bad[1] = ("write", "1.0,fast");
+        let err = SaveBenchmarkTrace::parse(&with(&bad)).expect_err("a malformed series");
+        assert!(err.contains("save_phase_write_ms"), "{err}");
+        // Only some of the eight is refused, naming what is missing.
+        let err = SaveBenchmarkTrace::parse(&with(&all[..3])).expect_err("partial");
+        assert!(err.contains("save_phase_submit_ms"), "{err}");
     }
 
     #[test]

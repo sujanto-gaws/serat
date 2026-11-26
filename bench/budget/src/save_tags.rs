@@ -23,10 +23,26 @@
 //! Tags are **reported, never asserted**. They do not change the verdict; ADR-0019
 //! point 5 is a decision for the architect, taken on these numbers.
 
+//!
+//! **Phases (task #207).** Beside the tags, the application reports how long each phase of
+//! the save path took inside the same interval: `hash` (path lock, base read and hash
+//! check), `write` (temp file create and `write_all`), `sync` (the temp file's fsync),
+//! `rename` (rename and directory sync), `load` (the index side's re-read and hash),
+//! `parse`, `submit` (op build and queue send) and `other` (the interval less those: the
+//! open-vault lock, echo recording, clock reads). They say *where* an over-limit sample
+//! spent its time, so a sample no tag explains can be put on the vault's disk or on the
+//! index side. Reported, never asserted, like the tags.
+
 use std::fmt::Write as _;
 
 use crate::Samples;
 use crate::trace::SaveBenchmarkTrace;
+
+/// The save-path phases of task #207, in the order the exit report lists them
+/// (`save_phase_<name>_ms`). `other` is last: the interval less the seven measured ones.
+pub const PHASES: [&str; 8] = [
+    "hash", "write", "sync", "rename", "load", "parse", "submit", "other",
+];
 
 /// One submitted save and what its window overlapped.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,6 +217,9 @@ pub struct SaveTags {
     pub checkpointer_runs: u64,
     /// Idle wake-ups the frame floor skipped, over the run.
     pub floor_skips: u64,
+    /// Per row, the milliseconds of each phase in [`PHASES`] order (task #207); `None`
+    /// when the application did not report them.
+    pub phases: Option<Vec<[f64; 8]>>,
 }
 
 /// The smallest overlapped class whose nearest-rank p95 is not its own maximum
@@ -275,8 +294,18 @@ impl SaveTags {
                 slow_commit: trace.slow_commit[i],
             })
             .collect();
+        // Complete or absent: `SaveBenchmarkTrace::parse` refuses anything between, and a
+        // hand-built trace that is between yields no phases rather than a mispairing.
+        let phases = (trace.phase_ms.len() == PHASES.len()
+            && trace.phase_ms.iter().all(|series| series.len() == n))
+        .then(|| {
+            (0..n)
+                .map(|i| std::array::from_fn(|p| trace.phase_ms[p][i]))
+                .collect()
+        });
         Some(SaveTags {
             rows,
+            phases,
             probe_failures: trace.flag_probe_failures,
             deferred_busy: trace.checkpointer_deferred_busy,
             checkpointer_runs: trace.checkpointer_runs,
@@ -347,6 +376,38 @@ impl SaveTags {
         })
     }
 
+    /// Nearest-rank p95 of each phase over every submitted save, in [`PHASES`] order.
+    #[must_use]
+    pub fn phase_p95(&self) -> Option<[f64; 8]> {
+        let phases = self.phases.as_ref()?;
+        if phases.is_empty() {
+            return None;
+        }
+        Some(std::array::from_fn(|p| {
+            let series: Vec<f64> = phases.iter().map(|row| row[p]).collect();
+            crate::percentile_of(&series, 0.95)
+        }))
+    }
+
+    /// One sample's phases as `hash 0.4, write 1.2, ...` and the phase that carried it
+    /// (the largest). `None` when no phases were reported.
+    #[must_use]
+    pub fn phase_breakdown(&self, index: usize) -> Option<(String, &'static str)> {
+        let row = self.phases.as_ref()?.get(index)?;
+        let text = PHASES
+            .iter()
+            .zip(row)
+            .map(|(name, ms)| format!("{name} {ms:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (at, _) = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .expect("eight phases");
+        Some((text, PHASES[at]))
+    }
+
     /// The report lines, indented to sit inside the report block.
     #[must_use]
     pub fn describe(&self, limit_ms: f64) -> Vec<String> {
@@ -368,6 +429,17 @@ impl SaveTags {
             "  tag source  {} checkpoint runs, {} idle starts deferred to work in flight, {} idle wake-ups skipped below the frame floor, {} FTS5 probe failures",
             self.checkpointer_runs, self.deferred_busy, self.floor_skips, self.probe_failures
         ));
+        if let Some(p95) = self.phase_p95() {
+            lines.push(format!(
+                "  phase p95   {} — reported, not asserted",
+                PHASES
+                    .iter()
+                    .zip(p95)
+                    .map(|(name, ms)| format!("{name} {ms:.2} ms"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let over = self.over_limit(limit_ms);
         if over.is_empty() {
             lines.push(format!(
@@ -393,6 +465,12 @@ impl SaveTags {
                     row.ms,
                     row.label()
                 ));
+                if let Some((text, carried)) = self.phase_breakdown(row.index) {
+                    lines.push(format!(
+                        "      sample {} {:.1} ms: {text} (carried by {carried})",
+                        row.index, row.ms
+                    ));
+                }
             }
         }
         lines
@@ -409,6 +487,15 @@ impl SaveTags {
         let _ = writeln!(s, "    \"checkpointer_runs\": {},", self.checkpointer_runs);
         let _ = writeln!(s, "    \"deferred_busy\": {},", self.deferred_busy);
         let _ = writeln!(s, "    \"floor_skips\": {},", self.floor_skips);
+        if let Some(p95) = self.phase_p95() {
+            let body = PHASES
+                .iter()
+                .zip(p95)
+                .map(|(name, ms)| format!("\"{name}\": {ms:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(s, "    \"phase_p95_ms\": {{ {body} }},");
+        }
         let _ = writeln!(s, "    \"split\": {{");
         let num = |v: Option<f64>| v.map_or("null".to_owned(), |v| format!("{v:.3}"));
         for (i, flag) in Flag::ALL.iter().enumerate() {
@@ -445,9 +532,23 @@ impl SaveTags {
         }
         let _ = writeln!(s, "    \"over_limit\": [");
         for (i, row) in over.iter().enumerate() {
+            let phase_ms = self
+                .phases
+                .as_ref()
+                .and_then(|rows| rows.get(row.index))
+                .map(|ms| {
+                    let body = PHASES
+                        .iter()
+                        .zip(ms)
+                        .map(|(name, v)| format!("\"{name}\": {v:.3}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(", \"phase_ms\": {{ {body} }}")
+                })
+                .unwrap_or_default();
             let _ = writeln!(
                 s,
-                "      {{ \"index\": {}, \"ms\": {:.3}, \"checkpoint_overlap\": {}, \"checkpoint_kind\": \"{}\", \"fts_merge\": {}, \"slow_commit\": {} }}{}",
+                "      {{ \"index\": {}, \"ms\": {:.3}, \"checkpoint_overlap\": {}, \"checkpoint_kind\": \"{}\", \"fts_merge\": {}, \"slow_commit\": {}{phase_ms} }}{}",
                 row.index,
                 row.ms,
                 row.checkpoint,
@@ -485,6 +586,7 @@ mod tests {
     fn tags(rows: Vec<SaveTag>) -> SaveTags {
         SaveTags {
             rows,
+            phases: None,
             probe_failures: 0,
             deferred_busy: 0,
             checkpointer_runs: 0,
@@ -657,6 +759,93 @@ mod tests {
         let t = SaveTags::from_trace(&trace).expect("complete");
         assert_eq!(t.rows[0], tag(0, 1.0, false, true, false));
         assert_eq!(t.rows[1], tag(1, 2.0, true, false, false));
+    }
+
+    fn with_phases(mut t: SaveTags, rows: Vec<[f64; 8]>) -> SaveTags {
+        t.phases = Some(rows);
+        t
+    }
+
+    #[test]
+    fn the_p95_of_each_phase_is_reported_over_every_save() {
+        // Task #207, NFR-PRF-03: 20 saves whose sync is 1..=20 ms, so the nearest-rank p95
+        // (the 19th) is 19 and differs from the median (10) and the maximum (20).
+        let rows: Vec<SaveTag> = (0..20).map(|i| tag(i, 6.0, false, false, false)).collect();
+        let phases: Vec<[f64; 8]> = (0..20)
+            .map(|i| [0.1, 0.5, (i + 1) as f64, 0.2, 0.1, 0.1, 0.1, 0.0])
+            .collect();
+        let t = with_phases(tags(rows), phases);
+        let p95 = t.phase_p95().expect("reported");
+        assert_eq!((p95[1], p95[2]), (0.5, 19.0));
+        let text = t.describe(50.0).join("\n");
+        assert!(
+            text.contains("phase p95   hash 0.10 ms, write 0.50 ms, sync 19.00 ms"),
+            "{text}"
+        );
+        assert!(text.contains("reported, not asserted"), "{text}");
+        assert_eq!(tags(vec![]).phase_p95(), None);
+    }
+
+    #[test]
+    fn an_over_limit_sample_prints_its_phase_breakdown_and_what_carried_it() {
+        let t = with_phases(
+            tags(vec![
+                tag(0, 5.0, false, false, false),
+                tag(1, 62.7, false, false, false),
+            ]),
+            vec![
+                [0.1, 0.3, 3.0, 0.2, 0.1, 0.1, 0.1, 0.0],
+                [0.4, 1.2, 58.9, 0.3, 0.2, 1.1, 0.9, 0.0],
+            ],
+        );
+        let text = t.describe(50.0).join("\n");
+        assert!(
+            text.contains(
+                "sample 1 62.7 ms: hash 0.4, write 1.2, sync 58.9, rename 0.3, load 0.2, parse 1.1, submit 0.9, other 0.0 (carried by sync)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("sample 0 5.0 ms"),
+            "only over-limit samples: {text}"
+        );
+        let json = t.to_json(50.0);
+        assert!(json.contains("\"phase_p95_ms\": {"), "{json}");
+        assert!(
+            json.contains("\"slow_commit\": false, \"phase_ms\": { \"hash\": 0.400, \"write\": 1.200, \"sync\": 58.900"),
+            "{json}"
+        );
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
+        // Without phases the lines are the ones the tags always printed.
+        let bare = tags(vec![tag(0, 80.0, false, false, false)]);
+        let text = bare.describe(50.0).join("\n");
+        assert!(
+            !text.contains("phase p95") && !text.contains("carried by"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn phases_come_from_a_trace_only_when_all_eight_series_are_as_long_as_the_samples() {
+        let mut trace = SaveBenchmarkTrace {
+            attempted: 2,
+            submitted_ms: vec![1.0, 2.0],
+            checkpoint_overlap: vec![false, false],
+            fts_merge: vec![false, false],
+            slow_commit: vec![false, false],
+            ..SaveBenchmarkTrace::default()
+        };
+        assert_eq!(SaveTags::from_trace(&trace).expect("tags").phases, None);
+        trace.phase_ms = (0..8).map(|p| vec![p as f64, p as f64 + 0.5]).collect();
+        let t = SaveTags::from_trace(&trace).expect("tags");
+        let rows = t.phases.expect("phases");
+        assert_eq!(rows[1], [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+        trace.phase_ms[3].pop();
+        assert_eq!(
+            SaveTags::from_trace(&trace).expect("tags").phases,
+            None,
+            "a hand-built mismatch never mispairs"
+        );
     }
 
     #[test]

@@ -6575,6 +6575,7 @@ mod tests {
         let series = rows.iter().map(|r| r.ms).collect();
         let tags = save_tags::SaveTags {
             rows,
+            phases: None,
             probe_failures: 0,
             deferred_busy: 0,
             checkpointer_runs: 0,
@@ -6648,6 +6649,65 @@ mod tests {
         assert!(report.contains("straddle"), "{report}");
         assert!(!report.contains("excused"), "{report}");
         assert!(o.to_json().contains("\"excused\": false"));
+    }
+
+    #[test]
+    fn prf03_phase_series_never_move_the_verdict_or_the_excusal() {
+        // NFR-PRF-03, NFR-PRF-08, ADR-0019 (task #207): the phases are reported, never
+        // asserted. Three shapes (excused, unflagged and so INDETERMINATE, over the limit
+        // and so FAIL), each with a sync-heavy breakdown on its outlier, judged the same
+        // as without.
+        use save_tags::CkKind;
+        let phases_for = |series: &[f64]| -> Vec<[f64; 8]> {
+            series
+                .iter()
+                .map(|&ms| {
+                    if ms > 50.0 {
+                        [0.4, 1.2, ms - 4.0, 0.3, 0.2, 1.1, 0.9, 0.0]
+                    } else {
+                        [0.1, 0.3, ms - 1.0, 0.2, 0.1, 0.1, 0.1, 0.0]
+                    }
+                })
+                .collect()
+        };
+        let mut cases = vec![
+            prf03_series(&[(500, 164.5, CkKind::SizeBound)], 235),
+            prf03_series(&[(500, 76.5, CkKind::No)], 264),
+        ];
+        let all_over = vec![60.0; 1_000];
+        let (_, mut over_tags) = prf03_series(&[], 0);
+        over_tags.rows = all_over
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| save_tags::SaveTag {
+                index: i,
+                ms,
+                checkpoint: false,
+                kind: CkKind::No,
+                merge: false,
+                slow_commit: false,
+            })
+            .collect();
+        cases.push((all_over, over_tags));
+        for (series, tags) in cases {
+            let bare = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags.clone()));
+            let mut with = tags;
+            with.phases = Some(phases_for(&series));
+            let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(with));
+            assert_eq!(o.passed(), bare.passed());
+            assert_eq!(o.determinate(), bare.determinate());
+            assert_eq!(o.asserted(), bare.asserted());
+            assert_eq!(enforce(&o), enforce(&bare));
+            assert_eq!(o.excusal(), bare.excusal());
+            let report = o.to_report();
+            assert!(report.contains("phase p95"), "{report}");
+            assert!(report.contains("(carried by sync)"), "{report}");
+            assert_eq!(
+                report.lines().next(),
+                bare.to_report().lines().next(),
+                "the verdict line is the same"
+            );
+        }
     }
 
     #[test]
@@ -6775,6 +6835,7 @@ mod tests {
                     slow_commit: false,
                 })
                 .collect(),
+            phases: None,
             probe_failures: 0,
             deferred_busy: 0,
             checkpointer_runs: 0,
