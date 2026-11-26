@@ -5177,7 +5177,9 @@ mod tests {
         // until the last background thread holding the slot lets go, which on a loaded
         // Windows runner outlasted this open (task #224). Retry under the 60 s ceiling;
         // the unclean-marker assertion below is unchanged. The open after a real
-        // `close_vault` above stays strict: its completion implies the lock is released.
+        // `close_vault` above stays strict: after a settled open (as here) its completion
+        // implies the lock is released; an actor still opening is detached and releases it
+        // later (task #96).
         let handle = open_index_when_free(&dir.join(".serat"));
         assert!(
             handle.opened_after_unclean_shutdown(),
@@ -5923,6 +5925,21 @@ mod tests {
     }
 
     #[test]
+    fn close_flush_with_no_ack_times_out_at_the_deadline() {
+        let dir = fixture("flush-timedout");
+        let (state, seen) = closing_state(&dir);
+        let started = Instant::now();
+        assert_eq!(
+            close_flush(&state, Duration::from_secs(2)),
+            FlushOutcome::TimedOut
+        );
+        assert!(started.elapsed() >= Duration::from_millis(1900));
+        assert_eq!(seen.lock().expect("seen").len(), 1, "one event");
+        assert!(state.vault_root().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_ack_closes_at_the_deadline_and_a_second_request_does_not_restart_it() {
         let dir = fixture("flush-timeout");
         let (state, seen) = closing_state(&dir);
@@ -5936,7 +5953,11 @@ mod tests {
         wait_count(&count, 1);
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(1900), "{waited:?}");
-        assert!(waited < Duration::from_secs(8), "{waited:?}");
+        // No upper bound on `waited` (task #224): the close behind the destroy may take
+        // 2 s of ack wait plus up to 5 s CLOSE_DEADLINE plus the drain. "The wait ended at
+        // its deadline" is `close_flush_with_no_ack_times_out_at_the_deadline`; a missed
+        // deadline is a hang that `wait_count`'s 60 s ceiling catches; a restarted wait is
+        // caught by the one-event assertion below.
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(count.load(Ordering::SeqCst), 1, "destroyed once");
         assert_eq!(seen.lock().expect("seen").len(), 1, "one event per close");
