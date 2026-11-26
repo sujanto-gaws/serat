@@ -743,7 +743,23 @@ impl Outcome {
     #[must_use]
     pub fn determinate(&self) -> bool {
         let limit = self.limit_ms();
-        self.samples.max() <= limit || self.samples.min() > limit
+        self.samples.max() <= limit || self.samples.min() > limit || self.excusal().is_some()
+    }
+
+    /// ADR-0019 amendment 2026-11-26 (task #205): the one checkpoint-overlapped outlier
+    /// `prf03-save-to-index` may carry. `None` for every other budget, for a series with no
+    /// tags, and whenever the tags disagree in length with the samples. The all-saves p95
+    /// stays the asserted figure (C-06); [`Outcome::passed`] is unchanged.
+    #[must_use]
+    pub fn excusal(&self) -> Option<save_tags::Excusal> {
+        if self.budget.id != PRF03_SAVE_TO_INDEX.id {
+            return None;
+        }
+        let tags = self.save_tags.as_ref()?;
+        if tags.rows.len() != self.samples.len() {
+            return None;
+        }
+        tags.excusal(self.limit_ms())
     }
 
     /// The phase breakdown must not claim more time than the clock measured.
@@ -839,6 +855,9 @@ impl Outcome {
             self.samples.max(),
             self.spread_pct(),
         );
+        if let Some(e) = self.excusal() {
+            let _ = writeln!(s, "{}", e.describe(self.limit_ms()));
+        }
         if !self.determinate() && !self.report_only_here() {
             let _ = writeln!(
                 s,
@@ -965,6 +984,9 @@ impl Outcome {
         // Task #166: whether THIS run could fail a build. `gated` is the budget's flag and
         // does not change with the runner; a trend reader needs both.
         let _ = writeln!(s, "  \"asserted\": {},", self.asserted());
+        // Task #205: a straddling prf03 series judged determinate by ADR-0019's one-outlier
+        // excusal says so here; the class figures are under `save_tags`.
+        let _ = writeln!(s, "  \"excused\": {},", self.excusal().is_some());
         let _ = writeln!(s, "  \"samples_n\": {},", self.samples.len());
         let _ = writeln!(s, "  \"min_ms\": {:.3},", self.samples.min());
         let _ = writeln!(s, "  \"mean_ms\": {:.3},", self.samples.mean());
@@ -6509,5 +6531,302 @@ mod tests {
         assert!(usage(&PRF01_WINDOW_VISIBLE).contains("--skip-scale"));
         assert!(!usage(&PRF04_FULL_REBUILD).contains("--skip-scale"));
         assert!(parse_args(&PRF04_FULL_REBUILD, &["--skip-scale".to_string()]).is_err());
+    }
+    // ---- Task #205: ADR-0019 amendment 2026-11-26, the one-outlier excusal (TC-183) ----
+
+    /// A 1,000-save series: every save 12 ms; `over` are (index, ms) of the outliers;
+    /// `overlapped` is how many saves overlapped a checkpoint (the first indices of the
+    /// series, at 20 ms, plus every outlier whose kind is not `No`); `kinds` sets the kind
+    /// of named indices.
+    fn prf03_series(
+        over: &[(usize, f64, save_tags::CkKind)],
+        overlapped_n: usize,
+    ) -> (Vec<f64>, save_tags::SaveTags) {
+        use save_tags::{CkKind, SaveTag};
+        let n = 1_000;
+        let mut rows: Vec<SaveTag> = Vec::new();
+        let mut filler = 0;
+        for i in 0..n {
+            let (ms, kind) = if let Some(&(_, ms, kind)) = over.iter().find(|o| o.0 == i) {
+                (ms, kind)
+            } else {
+                (12.0, CkKind::No)
+            };
+            rows.push(SaveTag {
+                index: i,
+                ms,
+                checkpoint: kind != CkKind::No,
+                kind,
+                merge: false,
+                slow_commit: false,
+            });
+        }
+        // Top the overlapped class up to `overlapped_n` with ordinary (20 ms) saves.
+        let mut have = rows.iter().filter(|r| r.checkpoint).count();
+        while have < overlapped_n {
+            if rows[filler].ms == 12.0 && !rows[filler].checkpoint {
+                rows[filler].ms = 20.0;
+                rows[filler].checkpoint = true;
+                rows[filler].kind = CkKind::Idle;
+                have += 1;
+            }
+            filler += 1;
+        }
+        let series = rows.iter().map(|r| r.ms).collect();
+        let tags = save_tags::SaveTags {
+            rows,
+            probe_failures: 0,
+            deferred_busy: 0,
+            checkpointer_runs: 0,
+            floor_skips: 0,
+        };
+        (series, tags)
+    }
+
+    fn prf03_tagged(budget: Budget, series: &[f64], tags: Option<save_tags::SaveTags>) -> Outcome {
+        let mut o = outcome_on(budget, Profile::Ci, linux(), series);
+        o.save_tags = tags;
+        o
+    }
+
+    #[test]
+    fn prf03_with_no_outlier_passes_and_prints_no_excusal() {
+        // NFR-PRF-03
+        let (series, tags) = prf03_series(&[], 250);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(o.determinate() && o.passed() && o.excusal().is_none());
+        let report = o.to_report();
+        assert!(report.starts_with("PASS"), "{report}");
+        assert!(!report.contains("excused"), "{report}");
+        assert!(
+            o.to_json().contains("\"excused\": false"),
+            "{}",
+            o.to_json()
+        );
+    }
+
+    #[test]
+    fn prf03_one_overlapped_outlier_in_a_class_of_twenty_or_more_is_excused_and_passes() {
+        // NFR-PRF-03, NFR-PRF-08, ADR-0019 amendment: runs 442 and 447.
+        use save_tags::CkKind;
+        for kind in [CkKind::SizeBound, CkKind::Idle, CkKind::Unknown] {
+            let (series, tags) = prf03_series(&[(500, 164.5, kind)], 235);
+            let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+            assert!(o.samples.max() > o.limit_ms(), "the series straddles");
+            assert!(o.determinate(), "{kind:?}");
+            assert!(o.passed(), "the all-saves p95 is the verdict");
+            assert!(enforce(&o));
+            let report = o.to_report();
+            assert!(report.starts_with("PASS"), "{report}");
+            assert!(
+                report.contains(&format!(
+                    "1 over-limit save excused: sample 500 (164.5 ms) overlapped a {} checkpoint; overlapped class p95 20.0 ms (n=235, max 164.5 ms) within 50.0 ms",
+                    kind.label()
+                )),
+                "{report}"
+            );
+            assert!(!report.contains("undecided"), "{report}");
+            let json = o.to_json();
+            assert!(json.contains("\"excused\": true"), "{json}");
+            assert!(json.contains("\"overlapped_class_n\": 235"), "{json}");
+            assert!(
+                json.contains("\"overlapped_class_p95_ms\": 20.000"),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn prf03_an_unflagged_outlier_stays_indeterminate() {
+        // NFR-PRF-03: run 445 -- nothing attributes it.
+        use save_tags::CkKind;
+        let (series, tags) = prf03_series(&[(500, 76.5, CkKind::No)], 264);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+        let report = o.to_report();
+        assert!(report.starts_with("INDETERMINATE"), "{report}");
+        assert!(report.contains("straddle"), "{report}");
+        assert!(!report.contains("excused"), "{report}");
+        assert!(o.to_json().contains("\"excused\": false"));
+    }
+
+    #[test]
+    fn prf03_two_outliers_stay_indeterminate_even_when_both_overlapped() {
+        // NFR-PRF-03: one is the observed maximum; raising it is an amendment.
+        use save_tags::CkKind;
+        let (series, tags) = prf03_series(
+            &[(100, 60.0, CkKind::Idle), (700, 51.5, CkKind::SizeBound)],
+            264,
+        );
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate() && !enforce(&o));
+        assert!(o.to_report().starts_with("INDETERMINATE"));
+        // One overlapped plus one unflagged is the same.
+        let (series, tags) =
+            prf03_series(&[(100, 60.0, CkKind::Idle), (700, 51.5, CkKind::No)], 264);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate());
+    }
+
+    #[test]
+    fn prf03_a_class_whose_own_p95_is_over_the_limit_stays_indeterminate() {
+        // NFR-PRF-03: a class-wide regression must not hide behind the excusal. A class of
+        // 20 has its p95 at the 19th value, so a class p95 over the limit needs two saves
+        // over it: criteria (i) and (iii) agree, and neither lets it through. (With exactly
+        // one save over, (iii) holds for every class of n >= 20; it is kept as a defence.)
+        use save_tags::CkKind;
+        let (series, tags) = prf03_series(
+            &[
+                (100, 60.0, CkKind::SizeBound),
+                (200, 55.0, CkKind::SizeBound),
+            ],
+            20,
+        );
+        assert_eq!(
+            tags.split(save_tags::Flag::Checkpoint).with_p95,
+            Some(55.0),
+            "the class p95 is over the limit"
+        );
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+        assert!(o.to_report().starts_with("INDETERMINATE"));
+        // A whole class slower than the limit: all-saves p95 is over, a determinate FAIL.
+        let heavy = vec![60.0; 1_000];
+        let (_, tags) = prf03_series(&[], 1_000);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &heavy, Some(tags));
+        assert!(!o.passed() && o.excusal().is_none());
+    }
+
+    #[test]
+    fn prf03_the_class_boundary_is_twenty_saves() {
+        // NFR-PRF-03: n=19 -> the class p95 is its maximum, the outlier; n=20 -> excused.
+        use save_tags::CkKind;
+        let (series, tags) = prf03_series(&[(500, 51.5, CkKind::Idle)], 19);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert_eq!(
+            o.save_tags
+                .as_ref()
+                .map(|t| t.split(save_tags::Flag::Checkpoint).with_n),
+            Some(19)
+        );
+        assert!(!o.determinate() && o.excusal().is_none());
+        assert!(o.to_report().starts_with("INDETERMINATE"));
+
+        let (series, tags) = prf03_series(&[(500, 51.5, CkKind::Idle)], 20);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(o.determinate() && o.passed());
+        let report = o.to_report();
+        assert!(report.starts_with("PASS"), "{report}");
+        assert!(report.contains("(n=20,"), "{report}");
+    }
+
+    #[test]
+    fn prf03_a_series_without_tags_stays_indeterminate() {
+        // NFR-PRF-03: an older binary reports no tags; the plain rule applies.
+        use save_tags::CkKind;
+        let (series, _) = prf03_series(&[(500, 164.5, CkKind::SizeBound)], 235);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, None);
+        assert!(!o.determinate() && !enforce(&o));
+        assert!(o.to_report().starts_with("INDETERMINATE"));
+        // A tag array that does not match the series is not trusted either.
+        let (_, mut tags) = prf03_series(&[(500, 164.5, CkKind::SizeBound)], 235);
+        tags.rows.pop();
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate());
+    }
+
+    #[test]
+    fn another_budget_with_the_same_shape_is_not_excused() {
+        // NFR-PRF-03 only: the rule must not leak into NFR-PRF-04 or NFR-PRF-01.
+        use save_tags::CkKind;
+        for budget in [PRF04_FULL_REBUILD, PRF01_SERAT_TERM] {
+            let limit = outcome_on(budget, Profile::Ci, linux(), &[1.0]).limit_ms();
+            let (_, mut tags) = prf03_series(&[(500, limit * 3.0, CkKind::SizeBound)], 235);
+            for row in &mut tags.rows {
+                row.ms = if row.index == 500 {
+                    limit * 3.0
+                } else {
+                    limit / 4.0
+                };
+            }
+            let series: Vec<f64> = tags.rows.iter().map(|r| r.ms).collect();
+            let o = prf03_tagged(budget, &series, Some(tags));
+            assert!(o.excusal().is_none(), "{}", budget.id);
+            assert!(!o.determinate(), "{}", budget.id);
+            assert!(!o.to_report().contains("excused"), "{}", budget.id);
+        }
+    }
+
+    #[test]
+    fn prf03_an_all_saves_p95_over_the_limit_fails_whatever_the_tags_say() {
+        // C-06: the excusal never lowers the asserted p95. Every save over and every one
+        // overlapped is a determinate FAIL; a 6% tail of overlapped saves is never a PASS.
+        use save_tags::{CkKind, SaveTag, SaveTags};
+        let mk = |series: &[f64]| SaveTags {
+            rows: series
+                .iter()
+                .enumerate()
+                .map(|(i, &ms)| SaveTag {
+                    index: i,
+                    ms,
+                    checkpoint: true,
+                    kind: CkKind::SizeBound,
+                    merge: false,
+                    slow_commit: false,
+                })
+                .collect(),
+            probe_failures: 0,
+            deferred_busy: 0,
+            checkpointer_runs: 0,
+            floor_skips: 0,
+        };
+        let all_over = vec![60.0; 1_000];
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &all_over, Some(mk(&all_over)));
+        assert!(o.excusal().is_none() && o.determinate() && !o.passed() && !enforce(&o));
+        assert!(o.to_report().starts_with("FAIL"));
+
+        let mut tail = vec![12.0; 1_000];
+        for v in tail.iter_mut().take(60) {
+            *v = 60.0;
+        }
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &tail, Some(mk(&tail)));
+        assert!(o.excusal().is_none() && !o.passed() && !enforce(&o));
+        assert!(!o.to_report().starts_with("PASS"));
+
+        // Few saves, one over, p95 of all = that one: over the limit, never a PASS.
+        let few = vec![12.0, 12.0, 60.0];
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &few, Some(mk(&few)));
+        assert!(!o.passed() && !enforce(&o));
+    }
+
+    #[test]
+    fn prf03_the_recorded_hosted_outcomes_under_the_rule() {
+        // NFR-PRF-03: reconstructed from the recorded figures; the raw series are gone.
+        use save_tags::CkKind;
+        // Run 442: one 51.5 ms, checkpoint=yes, overlapped n=264, class p95 20.7 ms.
+        let (mut s, mut t) = prf03_series(&[(500, 51.5, CkKind::Unknown)], 264);
+        for r in t.rows.iter_mut().filter(|r| r.checkpoint && r.index != 500) {
+            r.ms = 20.7;
+            s[r.index] = 20.7;
+        }
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &s, Some(t));
+        assert!(o.determinate() && o.passed());
+        assert!(o.to_report().contains("class p95 20.7 ms (n=264"));
+        // Run 445: 76.5 ms, checkpoint=no.
+        let (s, t) = prf03_series(&[(500, 76.5, CkKind::No)], 264);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &s, Some(t));
+        assert!(!o.determinate());
+        // Run 447: 164.5 ms size-bound, n=235, class p95 30.2 ms.
+        let (mut s, mut t) = prf03_series(&[(500, 164.5, CkKind::SizeBound)], 235);
+        for r in t.rows.iter_mut().filter(|r| r.checkpoint && r.index != 500) {
+            r.ms = 30.2;
+            s[r.index] = 30.2;
+        }
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &s, Some(t));
+        assert!(o.determinate() && o.passed());
+        assert!(
+            o.to_report()
+                .contains("size-bound checkpoint; overlapped class p95 30.2 ms (n=235")
+        );
     }
 }

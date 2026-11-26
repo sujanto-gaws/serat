@@ -125,6 +125,16 @@ Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 m
   4. *Harness follow-up, small:* the slow-commit tag would discriminate if it were per-commit rather than per-turn (a turn spans many commits in a burst). Not needed for the decision above.
 
 
+* (a-4) **Task #205, TC-183: prf03's one-outlier excusal is implemented (ADR-0019 amendment 2026-11-26; 2026-11-26).** The rule is in `Outcome::determinate()` for `prf03-save-to-index` only; the all-saves p95 at 50 ms stays asserted (C-06). Reconstruction against the recorded hosted outcomes, from the figures in the ADR and #196 (the raw series are not available, so each series is rebuilt as the recorded outlier, the recorded overlapped-class n and class p95, and 12 ms for the rest; the verdicts depend only on those figures):
+
+  | Hosted run | Over-limit saves | Outlier | checkpoint tag | Overlapped class (n, p95) | Verdict under the rule |
+  |---|---|---|---|---|---|
+  | 442 | 1 | 51.5 ms | yes | 264, 20.7 ms | **PASS** (excused; p95 within 50 ms) |
+  | 445 | 1 | 76.5 ms | no | n/a | **INDETERMINATE** (unflagged) |
+  | 447 | 1 | 164.5 ms | size-bound | 235, 30.2 ms | **PASS** (excused; p95 within 50 ms) |
+
+  Run 445's overlapped n of 264 is not a recorded figure for that run (its class is irrelevant to the verdict); the value is a placeholder. The new verdict has not run on a hosted runner. A finding: the n >= 20 guard and the class-p95 check are mutually redundant (with exactly one save over, a class of n <= 19 has p95 equal to the outlier, and a class of n >= 20 has p95 at most the second-largest value); mutating either alone is not caught, both together are, so both stay as the ADR wrote them.
+
 * (a-3) **Task #199: the idle frame floor landed (architecture §3.1.1 N8 *Frame floor*, #198; TC-179). Linux supporting evidence only (ADR-0019); acceptance is the next hosted run.** An idle `PASSIVE` (and the idle-only pinned `RESTART`) now runs only once the WAL has grown by `IDLE_FLOOR_FRAMES` = 1,000 since the last `PASSIVE` that ran; a deferral and a below-floor wake do not move that baseline; a below-floor wake disarms the idle timer until the next commit. Gate, spacing, size bound and `close()` are unchanged. Overlap tags now say which kind of run overlapped (`checkpoint=idle|size-bound|no`). **Linux release, 20k vault, this container (4 cores, `concurrent_build_processes` 0 in the p1-save-tail runs; the external-change job does not stamp it), same session, interleaved; "before" is `main` at `89d8a50` built from a second worktree, "after" is this branch:**
 
   | | before (main), run 1 / run 2 | after (floor), run 1 / run 2 |
