@@ -36,7 +36,7 @@ pub mod writer;
 
 pub use check::{QuickCheck, quick_check};
 pub use checkpoint::{
-    Activity, Bounds, BusyGuard, CheckpointStats, RunKind, WalHealth, overlap_kind,
+    Activity, Bounds, BusyGuard, CheckpointStats, RoundPhase, RunKind, WalHealth, overlap_kind,
 };
 pub use fts_probe::FtsProbe;
 pub use identity::canonical_root;

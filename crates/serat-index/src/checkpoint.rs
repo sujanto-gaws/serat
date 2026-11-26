@@ -233,6 +233,41 @@ fn since(then: u64) -> Option<Duration> {
     (then != 0).then(|| Duration::from_micros(stamp().saturating_sub(then)))
 }
 
+/// Where a reconcile round (`Reconciler::index_paths`) is, per path (task #220).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundPhase {
+    /// Reading the file and hashing it (`NoteSource::load`).
+    Read,
+    /// Parsing it into an op.
+    Parse,
+    /// Handing the op to the writer; waits when the writer's channel is full.
+    Submit,
+    /// Waiting for the writer's commit (the batch barrier).
+    Flush,
+}
+
+impl RoundPhase {
+    fn code(self) -> u8 {
+        match self {
+            Self::Read => 1,
+            Self::Parse => 2,
+            Self::Submit => 3,
+            Self::Flush => 4,
+        }
+    }
+
+    /// The word a stall line prints.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Parse => "parse",
+            Self::Submit => "submit",
+            Self::Flush => "flush",
+        }
+    }
+}
+
 /// What the writer and the checkpointer are doing right now, from [`WalHealth::activity`]
 /// (task #220). A read-only snapshot of atomics; the benchmark prints it when a round
 /// does not commit, so a stall says which side was waiting.
@@ -242,10 +277,15 @@ pub struct Activity {
     pub writer_turn: Option<Duration>,
     /// A checkpoint is running: its trigger and how long it has run.
     pub checkpoint: Option<(RunKind, Duration)>,
+    /// The run in flight is the pinned episode's `RESTART`, which (unlike `PASSIVE`) can
+    /// hold off a new writer for its whole run.
+    pub restart: bool,
     /// Frames in the WAL as of the writer's last commit.
     pub wal_frames: Option<u64>,
     /// How long ago the writer's last commit finished.
     pub last_commit_age: Option<Duration>,
+    /// Where the reconcile round in flight is, if one is.
+    pub round_phase: Option<RoundPhase>,
 }
 
 impl Activity {
@@ -254,7 +294,8 @@ impl Activity {
     pub fn describe(&self) -> String {
         let secs = |d: Duration| format!("{:.1} s", d.as_secs_f64());
         format!(
-            "writer {}; checkpoint {}; WAL {}; last commit {}",
+            "round {}; writer {}; checkpoint {}; WAL {}; last commit {}",
+            self.round_phase.map_or("not in index_paths", |p| p.label()),
             self.writer_turn
                 .map_or("idle (not in a turn)".to_owned(), |d| format!(
                     "in a turn for {}",
@@ -263,7 +304,11 @@ impl Activity {
             self.checkpoint
                 .map_or("none in flight".to_owned(), |(kind, d)| format!(
                     "{} in flight for {}",
-                    kind.label(),
+                    if self.restart {
+                        "idle RESTART"
+                    } else {
+                        kind.label()
+                    },
                     secs(d)
                 )),
             self.wal_frames
@@ -284,12 +329,17 @@ pub struct WalHealth {
     pinned_bytes: AtomicU64,
     /// 0 = none; else [`RunKind::code`] of the run in progress.
     running: AtomicU8,
+    /// The run in `running` is a `RESTART`.
+    restart_running: AtomicBool,
     /// [`stamp`] of the start of the run in `running`; 0 when none.
     running_since: AtomicU64,
+    /// [`RoundPhase::code`] of the reconcile round in flight; 0 when none.
+    round_phase: AtomicU8,
     /// Live writer turns (0 or 1) and the [`stamp`] of the one in progress (task #220).
     turns: AtomicUsize,
     turn_since: AtomicU64,
-    /// [`stamp`] of the writer's last commit, and the WAL frames it left plus one.
+    /// [`stamp`] of the writer's last commit, and the WAL frames it left plus one. Two
+    /// separate stores: a snapshot can mix two commits, which is fine for a diagnostic.
     last_commit_at: AtomicU64,
     wal_frames: AtomicU64,
     /// The WAL hook could not be installed (rusqlite 0.41.1: out of memory only), so
@@ -363,31 +413,55 @@ impl WalHealth {
     /// connection.
     #[must_use]
     pub fn activity(&self) -> Activity {
-        let kind = self.checkpoint_kind_running();
+        // Acquire pairs with the Release stores of the count, the run code and the frames:
+        // a visible count implies its stamp is visible too.
+        let kind = match self.running.load(Ordering::Acquire) {
+            1 => Some(RunKind::Idle),
+            2 => Some(RunKind::SizeBound),
+            _ => None,
+        };
         Activity {
-            writer_turn: (self.turns.load(Ordering::Relaxed) > 0)
+            writer_turn: (self.turns.load(Ordering::Acquire) > 0)
                 .then(|| since(self.turn_since.load(Ordering::Relaxed)))
                 .flatten(),
             checkpoint: kind
                 .zip(since(self.running_since.load(Ordering::Relaxed)))
                 .or(kind.map(|k| (k, Duration::ZERO))),
-            wal_frames: self.wal_frames.load(Ordering::Relaxed).checked_sub(1),
+            restart: kind.is_some() && self.restart_running.load(Ordering::Relaxed),
+            wal_frames: self.wal_frames.load(Ordering::Acquire).checked_sub(1),
             last_commit_age: since(self.last_commit_at.load(Ordering::Relaxed)),
+            // Only while a round's own guard is live (a plain guard is not a writer
+            // turn), so a phase left by a path with no guard is never reported.
+            round_phase: (self.busy.load(Ordering::Relaxed) > self.turns.load(Ordering::Relaxed))
+                .then(|| match self.round_phase.load(Ordering::Relaxed) {
+                    1 => Some(RoundPhase::Read),
+                    2 => Some(RoundPhase::Parse),
+                    3 => Some(RoundPhase::Submit),
+                    4 => Some(RoundPhase::Flush),
+                    _ => None,
+                })
+                .flatten(),
         }
+    }
+
+    /// Record where a reconcile round is. One relaxed store.
+    pub(crate) fn set_round_phase(&self, phase: RoundPhase) {
+        self.round_phase.store(phase.code(), Ordering::Relaxed);
     }
 
     /// The writer's WAL hook ran: a commit finished with `frames` in the WAL.
     pub(crate) fn note_commit(&self, frames: i32) {
+        // The time first, the frames (which say "a commit is known") with Release.
+        self.last_commit_at.store(stamp(), Ordering::Relaxed);
         self.wal_frames.store(
             u64::try_from(frames).unwrap_or(0).saturating_add(1),
-            Ordering::Relaxed,
+            Ordering::Release,
         );
-        self.last_commit_at.store(stamp(), Ordering::Relaxed);
     }
 
     fn begin_run(&self, kind: RunKind) {
         self.running_since.store(stamp(), Ordering::Relaxed);
-        self.running.store(kind.code(), Ordering::Relaxed);
+        self.running.store(kind.code(), Ordering::Release);
     }
 
     fn end_run(&self) {
@@ -434,7 +508,7 @@ impl WalHealth {
         let mut guard = self.busy_guard();
         guard.logged = true;
         self.turn_since.store(stamp(), Ordering::Relaxed);
-        self.turns.fetch_add(1, Ordering::Relaxed);
+        self.turns.fetch_add(1, Ordering::Release);
         guard
     }
 
@@ -542,6 +616,9 @@ impl Drop for BusyGuard {
         if self.logged {
             self.health.note_turn(self.since, Instant::now());
             self.health.turns.fetch_sub(1, Ordering::Relaxed);
+        }
+        if !self.logged {
+            self.health.round_phase.store(0, Ordering::Relaxed);
         }
         self.health.busy.fetch_sub(1, Ordering::Relaxed);
     }
@@ -916,9 +993,11 @@ fn attempt(
         state.restart_spent = true;
         health.restart_runs.fetch_add(1, Ordering::Relaxed);
         let _ = conn.busy_timeout(RESTART_BUSY);
+        health.restart_running.store(true, Ordering::Relaxed);
         health.begin_run(RunKind::Idle);
         let outcome = checkpoint(conn, "RESTART");
         health.end_run();
+        health.restart_running.store(false, Ordering::Relaxed);
         let _ = conn.busy_timeout(Duration::ZERO);
         if outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done) {
             state.dirty = false;
@@ -1247,6 +1326,7 @@ mod tests {
         let health = Arc::new(WalHealth::default());
         let none = health.activity();
         assert_eq!(none, Activity::default());
+        assert!(none.describe().contains("round not in index_paths"));
         assert!(none.describe().contains("writer idle (not in a turn)"));
         assert!(none.describe().contains("checkpoint none in flight"));
         assert!(none.describe().contains("last commit never"));
@@ -1254,7 +1334,11 @@ mod tests {
         // A plain guard (a reconcile round) is not a writer turn.
         let round = health.busy_guard();
         assert_eq!(health.activity().writer_turn, None);
+        health.set_round_phase(RoundPhase::Parse);
+        assert_eq!(health.activity().round_phase, Some(RoundPhase::Parse));
+        assert!(health.activity().describe().contains("round parse;"));
         drop(round);
+        assert_eq!(health.activity().round_phase, None, "the guard clears it");
 
         let turn = health.writer_turn_guard();
         health.begin_run(RunKind::SizeBound);
@@ -1266,13 +1350,21 @@ mod tests {
         assert_eq!(kind, RunKind::SizeBound);
         assert!(ran >= Duration::from_millis(5));
         assert_eq!(busy.wal_frames, Some(1548));
-        assert!(busy.last_commit_age.is_some());
+        assert!(
+            busy.last_commit_age
+                .is_some_and(|a| a < Duration::from_secs(30))
+        );
+        assert!(!busy.restart);
         let line = busy.describe();
         assert!(line.contains("writer in a turn for"), "{line}");
         assert!(line.contains("size-bound in flight for"), "{line}");
         assert!(line.contains("WAL 1548 frames"), "{line}");
         assert!(line.contains("last commit 0.0 s ago"), "{line}");
 
+        health.restart_running.store(true, Ordering::Relaxed);
+        let line = health.activity().describe();
+        assert!(line.contains("idle RESTART in flight for"), "{line}");
+        health.restart_running.store(false, Ordering::Relaxed);
         drop(turn);
         health.end_run();
         let after = health.activity();
@@ -1291,7 +1383,10 @@ mod tests {
         });
         let seen = health.activity();
         assert!(seen.wal_frames.unwrap_or(0) >= 1);
-        assert!(seen.last_commit_age.is_some());
+        assert!(
+            seen.last_commit_age
+                .is_some_and(|a| a < Duration::from_secs(30))
+        );
         actor.shutdown().expect("shutdown");
         drop(dir);
     }
