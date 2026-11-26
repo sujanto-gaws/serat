@@ -203,6 +203,40 @@ pub struct SaveTags {
     pub floor_skips: u64,
 }
 
+/// The smallest overlapped class whose nearest-rank p95 is not its own maximum
+/// (rank ceil(0.95 n) < n needs n >= 20). Below it the class p95 is the outlier itself.
+pub const MIN_EXCUSING_CLASS: usize = 20;
+
+/// Why one over-limit save does not move the verdict (ADR-0019 amendment 2026-11-26,
+/// task #205, NFR-PRF-03).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Excusal {
+    /// The excused save: position, elapsed time and the kind of checkpoint it overlapped.
+    pub sample: SaveTag,
+    /// Saves that overlapped a checkpoint, the excused one included.
+    pub class_n: usize,
+    /// That class's own nearest-rank p95: its reported bound, within the limit.
+    pub class_p95_ms: f64,
+    /// That class's maximum, the excused save when it is the slowest.
+    pub class_max_ms: f64,
+}
+
+impl Excusal {
+    /// The report line; names the excusal explicitly so it cannot be read as a plain pass.
+    #[must_use]
+    pub fn describe(&self, limit_ms: f64) -> String {
+        format!(
+            "  excused     1 over-limit save excused: sample {} ({:.1} ms) overlapped a {} checkpoint; overlapped class p95 {:.1} ms (n={}, max {:.1} ms) within {limit_ms:.1} ms. The all-saves p95 is still the asserted figure (ADR-0019, task #205)",
+            self.sample.index,
+            self.sample.ms,
+            self.sample.kind.label(),
+            self.class_p95_ms,
+            self.class_n,
+            self.class_max_ms,
+        )
+    }
+}
+
 impl SaveTags {
     /// The tags of a parsed run, or `None` when the application did not report them
     /// (an older binary, or an index with no `WalHealth`). Absence is not an error: tags are
@@ -274,6 +308,43 @@ impl SaveTags {
     #[must_use]
     pub fn over_limit(&self, limit_ms: f64) -> Vec<&SaveTag> {
         self.rows.iter().filter(|r| r.ms > limit_ms).collect()
+    }
+
+    /// ADR-0019 amendment 2026-11-26: the one over-limit save a straddling series may
+    /// carry and still be determinate. `Some` only when (i) exactly one save is over
+    /// `limit_ms` (strictly), (ii) it overlapped a checkpoint of any kind, and (iii) the
+    /// overlapped class has at least [`MIN_EXCUSING_CLASS`] saves and its own nearest-rank
+    /// p95 is within `limit_ms`. Two or more over, an unflagged one, a class p95 over, or a
+    /// class too small to have a p95 apart from its maximum, is `None`: the series stays
+    /// INDETERMINATE. A class of n < 20 would excuse the outlier by its own value.
+    #[must_use]
+    pub fn excusal(&self, limit_ms: f64) -> Option<Excusal> {
+        let over = self.over_limit(limit_ms);
+        let [one] = over.as_slice() else {
+            return None;
+        };
+        if !one.checkpoint {
+            return None;
+        }
+        let class: Vec<f64> = self
+            .rows
+            .iter()
+            .filter(|r| r.checkpoint)
+            .map(|r| r.ms)
+            .collect();
+        if class.len() < MIN_EXCUSING_CLASS {
+            return None;
+        }
+        let class_p95_ms = crate::percentile_of(&class, 0.95);
+        if class_p95_ms > limit_ms {
+            return None;
+        }
+        Some(Excusal {
+            sample: **one,
+            class_n: class.len(),
+            class_p95_ms,
+            class_max_ms: class.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
     }
 
     /// The report lines, indented to sit inside the report block.
@@ -355,6 +426,23 @@ impl SaveTags {
         }
         let _ = writeln!(s, "    }},");
         let over = self.over_limit(limit_ms);
+        match self.excusal(limit_ms) {
+            Some(e) => {
+                let _ = writeln!(
+                    s,
+                    "    \"excused\": true, \"excused_index\": {}, \"excused_ms\": {:.3}, \"excused_checkpoint_kind\": \"{}\", \"overlapped_class_n\": {}, \"overlapped_class_p95_ms\": {:.3}, \"overlapped_class_max_ms\": {:.3},",
+                    e.sample.index,
+                    e.sample.ms,
+                    e.sample.kind.label(),
+                    e.class_n,
+                    e.class_p95_ms,
+                    e.class_max_ms
+                );
+            }
+            None => {
+                let _ = writeln!(s, "    \"excused\": false,");
+            }
+        }
         let _ = writeln!(s, "    \"over_limit\": [");
         for (i, row) in over.iter().enumerate() {
             let _ = writeln!(
