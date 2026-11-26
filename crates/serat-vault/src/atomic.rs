@@ -42,7 +42,7 @@ pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<i64>
     crate::save_phases::mark(crate::save_phases::SavePhase::Write);
     // Flush before the rename. Without this the rename can be durable while the
     // contents are not, which turns a power cut into a note full of zeroes.
-    file.sync_all()?;
+    sync_all(&file, crate::save_phases::Fsync::File)?;
     crate::save_phases::mark(crate::save_phases::SavePhase::Sync);
     Ok(crate::walk::mtime_ms(&file.metadata()?))
 }
@@ -99,13 +99,24 @@ pub(crate) fn commit(temp: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The one place a durability flush is issued. In a release build this is `sync_all`;
+/// under `cfg(test)` it also appends to the save-phase event log, so a test can pin how
+/// many fsyncs a save issues and in which phase they fall (NFR-PRF-03, ADR-0019 second
+/// amendment, TC-185). It changes no byte written.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn sync_all(file: &fs::File, what: crate::save_phases::Fsync) -> std::io::Result<()> {
+    #[cfg(test)]
+    crate::save_phases::log_fsync(what);
+    file.sync_all()
+}
+
 /// fsync the directory so the rename itself survives a power cut. Best effort: the
 /// rename has happened and is visible, so a failure here is not a failed write, and
 /// Windows has no directory handle to sync.
 fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(handle) = fs::File::open(dir) {
-        let _ = handle.sync_all();
+        let _ = sync_all(&handle, crate::save_phases::Fsync::Dir);
     }
     #[cfg(not(unix))]
     let _ = dir;
@@ -176,5 +187,44 @@ impl Drop for PathLock<'_> {
         if Arc::strong_count(&self.mutex) == 2 {
             map.remove(&self.key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::VaultPath;
+    use crate::save_phases::{Event, Fsync, SavePhase, drain_log};
+
+    /// NFR-PRF-03, ADR-0019 second amendment (task #211), TC-185: the vault-I/O excusal
+    /// counts `write + sync + rename` as the vault's file I/O, on the premise that `sync`
+    /// holds the one file fsync and `rename` the one directory fsync (unix only). This
+    /// pins that: a second fsync before the Write mark, or a dropped directory sync,
+    /// changes what the phases mean and fails here.
+    #[test]
+    fn a_save_fsyncs_the_file_in_sync_and_on_unix_the_directory_in_rename_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = crate::Vault::open(dir.path()).expect("open vault");
+        let path = VaultPath::new("note.md").expect("path");
+        drain_log();
+        vault.write_atomic(&path, b"# one\n").expect("write");
+        let log = drain_log();
+        #[cfg(unix)]
+        let expected = vec![
+            Event::Mark(SavePhase::Hash),
+            Event::Mark(SavePhase::Write),
+            Event::Fsync(Fsync::File),
+            Event::Mark(SavePhase::Sync),
+            Event::Fsync(Fsync::Dir),
+            Event::Mark(SavePhase::Rename),
+        ];
+        #[cfg(not(unix))]
+        let expected = vec![
+            Event::Mark(SavePhase::Hash),
+            Event::Mark(SavePhase::Write),
+            Event::Fsync(Fsync::File),
+            Event::Mark(SavePhase::Sync),
+            Event::Mark(SavePhase::Rename),
+        ];
+        assert_eq!(log, expected);
     }
 }

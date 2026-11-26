@@ -161,7 +161,7 @@ So the attributed class is **the vault-I/O phases: write, sync and rename**. Eff
 The 0.90 was set by the #207 ruling before any hosted array existed, and it is kept. The remainder bound is derived from the series itself and adds no constant.
 
 **Guards kept from the #207 ruling.**
-- (i) **The per-save fsync count will be pinned by a serat-vault test (#213; the attribution does not land without it).** The temp file is synced exactly once, in `sync`. On unix the directory is synced exactly once, in `rename`; on Windows it is not synced at all. No fsync runs in `write`. Without this pin, "carried by vault I/O" would quietly mean something else after a change to `atomic.rs`. The test records order only and changes no byte written (C-04, ADR-0008). The attribution must not land without this test.
+- (i) **The per-save fsync count is pinned by the serat-vault test `atomic::tests::a_save_fsyncs_the_file_in_sync_and_on_unix_the_directory_in_rename_and_nothing_else` (#213; the attribution does not land without it).** The temp file is synced exactly once, in `sync`. On unix the directory is synced exactly once, in `rename`; on Windows it is not synced at all. No fsync runs in `write`. Without this pin, "carried by vault I/O" would quietly mean something else after a change to `atomic.rs`. The test records order only and changes no byte written (C-04, ADR-0008). The attribution must not land without this test.
 - (ii) **The cap is shared** (rule 1).
 - (iii) **`other` counts against the share** (rule 3).
 

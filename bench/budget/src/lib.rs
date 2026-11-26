@@ -6652,11 +6652,11 @@ mod tests {
     }
 
     #[test]
-    fn prf03_phase_series_never_move_the_verdict_or_the_excusal() {
-        // NFR-PRF-03, NFR-PRF-08, ADR-0019 (task #207): the phases are reported, never
-        // asserted. Three shapes (excused, unflagged and so INDETERMINATE, over the limit
-        // and so FAIL), each with a sync-heavy breakdown on its outlier, judged the same
-        // as without.
+    fn prf03_phase_series_move_only_the_vault_io_excusal() {
+        // NFR-PRF-03, NFR-PRF-08, ADR-0019 (tasks #207, #211), TC-184/TC-185: the phases are
+        // reported. They never change a checkpoint excusal, a FAIL or a two-over
+        // INDETERMINATE; they move exactly one thing, the vault-I/O excusal of a lone
+        // outlier that is not otherwise excused.
         use save_tags::CkKind;
         let phases_for = |series: &[f64]| -> Vec<[f64; 8]> {
             series
@@ -6672,7 +6672,7 @@ mod tests {
         };
         let mut cases = vec![
             prf03_series(&[(500, 164.5, CkKind::SizeBound)], 235),
-            prf03_series(&[(500, 76.5, CkKind::No)], 264),
+            prf03_series(&[(100, 60.0, CkKind::Idle), (700, 61.0, CkKind::No)], 264),
         ];
         let all_over = vec![60.0; 1_000];
         let (_, mut over_tags) = prf03_series(&[], 0);
@@ -6708,6 +6708,34 @@ mod tests {
                 "the verdict line is the same"
             );
         }
+        // The one thing they move: an unflagged lone outlier with a sync-heavy breakdown.
+        let (series, tags) = prf03_series(&[(500, 76.5, CkKind::No)], 264);
+        let bare = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags.clone()));
+        assert!(!bare.determinate());
+        let mut with = tags.clone();
+        with.phases = Some(phases_for(&series));
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(with));
+        assert!(matches!(
+            o.excusal(),
+            Some(save_tags::Excusal::VaultIo { .. })
+        ));
+        assert!(o.determinate() && o.passed());
+        // A parse-heavy breakdown on the same outlier moves nothing.
+        let mut parse = tags;
+        parse.phases = Some(
+            series
+                .iter()
+                .map(|&ms| {
+                    if ms > 50.0 {
+                        [0.4, 1.0, 1.0, 0.3, 0.2, ms - 3.0, 0.1, 0.0]
+                    } else {
+                        [0.1, 0.3, 1.0, 0.2, 0.1, ms - 1.7, 0.1, 0.0]
+                    }
+                })
+                .collect(),
+        );
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(parse));
+        assert!(!o.determinate() && o.excusal().is_none());
     }
 
     #[test]
@@ -6889,5 +6917,316 @@ mod tests {
             o.to_report()
                 .contains("size-bound checkpoint; overlapped class p95 30.2 ms (n=235")
         );
+    }
+
+    // ---- Task #213: ADR-0019 second amendment 2026-11-26, the vault-I/O excusal (TC-185) ----
+
+    /// One outlier spec for [`io_series`]: index, elapsed ms, overlap kind, its phases.
+    type IoOutlier = (usize, f64, save_tags::CkKind, [f64; 8]);
+
+    /// An `n`-save series of `filler` ms saves (so the all-saves p95 is `filler`), each with
+    /// an ordinary phase row, plus the outliers. `overlapped_n` saves are overlapped (the
+    /// outliers' own overlap included), topped up from ordinary saves at the start.
+    fn io_series(
+        n: usize,
+        filler: f64,
+        over: &[IoOutlier],
+        overlapped_n: usize,
+    ) -> (Vec<f64>, save_tags::SaveTags) {
+        use save_tags::{CkKind, SaveTag};
+        let mut rows = Vec::new();
+        let mut phases = Vec::new();
+        for i in 0..n {
+            if let Some(&(_, ms, kind, ph)) = over.iter().find(|o| o.0 == i) {
+                rows.push((ms, kind));
+                phases.push(ph);
+            } else {
+                rows.push((filler, CkKind::No));
+                phases.push([0.1, 0.3, filler - 1.0, 0.2, 0.1, 0.1, 0.1, 0.0]);
+            }
+        }
+        let mut have = rows.iter().filter(|r| r.1 != CkKind::No).count();
+        for r in rows.iter_mut() {
+            if have >= overlapped_n {
+                break;
+            }
+            if r.0 == filler && r.1 == CkKind::No {
+                r.1 = CkKind::Idle;
+                have += 1;
+            }
+        }
+        let tags = save_tags::SaveTags {
+            rows: rows
+                .iter()
+                .enumerate()
+                .map(|(index, &(ms, kind))| SaveTag {
+                    index,
+                    ms,
+                    checkpoint: kind != CkKind::No,
+                    kind,
+                    merge: false,
+                    slow_commit: false,
+                })
+                .collect(),
+            phases: Some(phases),
+            probe_failures: 0,
+            deferred_busy: 0,
+            checkpointer_runs: 0,
+            floor_skips: 0,
+        };
+        (rows.iter().map(|r| r.0).collect(), tags)
+    }
+
+    fn io_outcome(n: usize, filler: f64, over: &[IoOutlier], overlapped_n: usize) -> Outcome {
+        let (series, tags) = io_series(n, filler, over, overlapped_n);
+        prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags))
+    }
+
+    fn vault_io(o: &Outcome) -> bool {
+        matches!(o.excusal(), Some(save_tags::Excusal::VaultIo { .. }))
+    }
+
+    #[test]
+    fn prf03_runs_454_and_455_are_excused_by_the_vault_io() {
+        // NFR-PRF-03, TC-185: reconstructed from the recorded phase figures (the raw series
+        // are gone), unflagged, p95 15 ms.
+        use save_tags::CkKind::No;
+        // Run 454 sample 562: 106.4 ms, sync 105.4.
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(562, 106.4, No, [0.1, 0.3, 105.4, 0.4, 0.2, 0.2, 0.0, 0.0])],
+            0,
+        );
+        assert!(vault_io(&o) && o.determinate() && o.passed());
+        assert!(o.to_report().starts_with("PASS"));
+        // Run 455 sample 394: 134.8 ms, write 43.6 + sync 89.4 + rename 0.7 = 99.2%.
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(394, 134.8, No, [0.1, 43.6, 89.4, 0.7, 0.2, 0.7, 0.0, 0.0])],
+            0,
+        );
+        assert!(vault_io(&o) && o.determinate() && o.passed());
+        // Without `write` in the numerator (the #207 recommendation) 455 is only 66.8%.
+        let sync_rename = (89.4 + 0.7) / 134.8;
+        assert!(sync_rename < save_tags::MIN_VAULT_IO_SHARE);
+    }
+
+    #[test]
+    fn prf03_the_run_453_shape_passes_with_no_excusal() {
+        // NFR-PRF-03: nothing over the limit, nothing to excuse.
+        let o = io_outcome(1_000, 15.0, &[], 0);
+        assert!(o.determinate() && o.passed() && o.excusal().is_none());
+        assert!(!o.to_report().contains("excused"));
+    }
+
+    #[test]
+    fn prf03_the_io_share_boundary_is_ninety_percent_of_the_whole_sample() {
+        // NFR-PRF-03: 90.0% is excused, 89.9% is not.
+        use save_tags::CkKind::No;
+        let at = io_outcome(
+            1_000,
+            15.0,
+            &[(500, 100.0, No, [0.0, 0.0, 90.0, 0.0, 0.0, 10.0, 0.0, 0.0])],
+            0,
+        );
+        assert!(vault_io(&at) && at.determinate());
+        let below = io_outcome(
+            1_000,
+            15.0,
+            &[(500, 100.0, No, [0.0, 0.0, 89.9, 0.0, 0.0, 10.1, 0.0, 0.0])],
+            0,
+        );
+        assert!(!below.determinate() && below.excusal().is_none() && !enforce(&below));
+        assert!(below.to_report().starts_with("INDETERMINATE"));
+    }
+
+    #[test]
+    fn prf03_other_and_the_non_io_phases_count_against_the_excusal() {
+        // NFR-PRF-03: sync 40 + other 15 of 55 is 72.7%; `other` is not vault I/O.
+        use save_tags::CkKind::No;
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(500, 55.0, No, [0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 0.0, 15.0])],
+            0,
+        );
+        assert!(!o.determinate() && o.excusal().is_none());
+        // Parse-carried and hash-carried outliers stay INDETERMINATE.
+        for ph in [
+            [0.1, 0.3, 1.0, 0.2, 0.1, 98.0, 0.1, 0.0],
+            [97.0, 0.3, 1.0, 0.2, 0.1, 1.0, 0.1, 0.0],
+        ] {
+            let o = io_outcome(1_000, 15.0, &[(500, 100.0, No, ph)], 0);
+            assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+        }
+    }
+
+    #[test]
+    fn prf03_the_remainder_must_fit_inside_the_all_saves_p95() {
+        // NFR-PRF-03: a 400 ms outlier with 362 ms of I/O (90.5%) and 38 ms of parse has
+        // a remainder of 38 ms, over the 15 ms p95: Serat's own time is not ordinary.
+        use save_tags::CkKind::No;
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(500, 400.0, No, [0.0, 1.0, 360.0, 1.0, 0.0, 38.0, 0.0, 0.0])],
+            0,
+        );
+        assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+    }
+
+    #[test]
+    fn prf03_one_excusal_per_series_whatever_carries_the_second() {
+        // NFR-PRF-03: the cap is shared across both rules.
+        use save_tags::CkKind::{Idle, No};
+        let io = |sync: f64| [0.1, 0.3, sync, 0.2, 0.1, 0.1, 0.0, 0.0];
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(100, 100.0, No, io(99.0)), (700, 90.0, No, io(89.0))],
+            0,
+        );
+        assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+        // One overlapped (it would be a checkpoint excusal) plus one I/O-carried.
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(100, 100.0, Idle, io(99.0)), (700, 90.0, No, io(89.0))],
+            264,
+        );
+        assert!(!o.determinate() && o.excusal().is_none() && !enforce(&o));
+    }
+
+    #[test]
+    fn prf03_a_checkpoint_excusal_wins_and_a_small_class_falls_through_to_the_io_rule() {
+        // NFR-PRF-03, TC-185: precedence. Overlapped and I/O-carried is a Checkpoint
+        // excusal; overlapped with a class of 19 but I/O-carried is a VaultIo excusal.
+        use save_tags::CkKind::SizeBound;
+        let ph = [0.1, 0.3, 99.0, 0.2, 0.1, 0.1, 0.0, 0.0];
+        let o = io_outcome(1_000, 15.0, &[(500, 100.0, SizeBound, ph)], 264);
+        assert!(matches!(
+            o.excusal(),
+            Some(save_tags::Excusal::Checkpoint { .. })
+        ));
+        let o = io_outcome(1_000, 15.0, &[(500, 100.0, SizeBound, ph)], 19);
+        assert!(vault_io(&o) && o.determinate());
+    }
+
+    #[test]
+    fn prf03_without_phase_arrays_the_io_rule_never_applies() {
+        // NFR-PRF-03: runs 445/450/451, no phases reported (or not one per save).
+        use save_tags::CkKind::No;
+        let ph = [0.1, 0.3, 75.0, 0.2, 0.1, 0.1, 0.0, 0.0];
+        let (series, mut tags) = io_series(1_000, 15.0, &[(500, 76.5, No, ph)], 0);
+        tags.phases = None;
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags.clone()));
+        assert!(!o.determinate() && o.excusal().is_none());
+        tags.phases = Some(vec![ph; 999]);
+        let o = prf03_tagged(PRF03_SAVE_TO_INDEX, &series, Some(tags));
+        assert!(!o.determinate() && o.excusal().is_none());
+    }
+
+    #[test]
+    fn prf03_the_io_rule_needs_twenty_saves() {
+        // NFR-PRF-03: n = 19 stays INDETERMINATE, n = 20 is excused.
+        use save_tags::CkKind::No;
+        let ph = [0.1, 0.3, 99.0, 0.2, 0.1, 0.1, 0.0, 0.0];
+        let o = io_outcome(19, 15.0, &[(10, 100.0, No, ph)], 0);
+        assert!(!o.determinate() && o.excusal().is_none());
+        let o = io_outcome(20, 15.0, &[(10, 100.0, No, ph)], 0);
+        assert!(vault_io(&o) && o.determinate());
+    }
+
+    #[test]
+    fn another_budget_with_the_io_shape_is_not_excused() {
+        // NFR-PRF-03 only.
+        use save_tags::CkKind::No;
+        for budget in [PRF04_FULL_REBUILD, PRF01_SERAT_TERM] {
+            let limit = outcome_on(budget, Profile::Ci, linux(), &[1.0]).limit_ms();
+            let big = limit * 3.0;
+            let ph = [0.0, 0.0, big, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let (_, mut tags) = io_series(1_000, limit / 4.0, &[(500, big, No, ph)], 0);
+            let series: Vec<f64> = tags.rows.iter().map(|r| r.ms).collect();
+            tags.phases = Some(vec![ph; 1_000]);
+            let o = prf03_tagged(budget, &series, Some(tags));
+            assert!(o.excusal().is_none() && !o.determinate(), "{}", budget.id);
+        }
+    }
+
+    #[test]
+    fn prf03_io_carried_outliers_never_lower_an_all_saves_p95_over_the_limit() {
+        // C-06: the verdict is the all-saves p95 whatever carried the tail.
+        use save_tags::CkKind::No;
+        let ph = |ms: f64| [0.0, 0.0, ms, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // 6% I/O-carried tail: several over, so nothing is excused and it is not a PASS.
+        let tail: Vec<IoOutlier> = (0..60).map(|i| (i, 60.0, No, ph(60.0))).collect();
+        let o = io_outcome(1_000, 12.0, &tail, 0);
+        assert!(o.excusal().is_none() && !o.passed() && !enforce(&o));
+        // Every save over: a determinate FAIL.
+        let all: Vec<IoOutlier> = (0..1_000).map(|i| (i, 60.0, No, ph(60.0))).collect();
+        let o = io_outcome(1_000, 12.0, &all, 0);
+        assert!(o.excusal().is_none() && o.determinate() && !o.passed());
+        assert!(o.to_report().starts_with("FAIL"));
+        // Too few saves for an excusal: the p95 is the outlier.
+        let o = io_outcome(3, 12.0, &[(2, 60.0, No, ph(60.0))], 0);
+        assert!(o.excusal().is_none() && !o.passed() && !enforce(&o));
+    }
+
+    #[test]
+    fn prf03_the_io_excusal_report_line_and_json_keys() {
+        // NFR-PRF-03, NFR-PRF-08, TC-185.
+        use save_tags::CkKind::{No, SizeBound};
+        let o = io_outcome(
+            1_000,
+            15.0,
+            &[(394, 134.8, No, [0.1, 43.6, 89.4, 0.7, 0.2, 0.7, 0.0, 0.0])],
+            0,
+        );
+        let report = o.to_report();
+        assert!(
+            report.contains("  excused     1 over-limit save excused: sample 394 (134.8 ms) carried by the vault's file I/O: write 43.6, sync 89.4, rename 0.7 ms = 99.2% of the sample; remainder 1.1 ms within the all-saves p95 15.0 ms. The all-saves p95 is still the asserted figure (ADR-0019, task #211)"),
+            "{report}"
+        );
+        let json = o.to_json();
+        assert!(json.contains("\"excused\": true,"), "{json}");
+        assert!(json.contains("\"excused_by\": \"vault-io\""), "{json}");
+        assert!(json.contains("\"excused_io_share\": 0.99"), "{json}");
+        assert!(json.contains("\"excused_remainder_ms\": 1.1"), "{json}");
+        assert!(!json.contains("excused_checkpoint_kind"), "{json}");
+        let ph = [0.1, 0.3, 99.0, 0.2, 0.1, 0.1, 0.0, 0.0];
+        let o = io_outcome(1_000, 15.0, &[(500, 100.0, SizeBound, ph)], 264);
+        let json = o.to_json();
+        assert!(json.contains("\"excused\": true,"), "{json}");
+        assert!(json.contains("\"excused_by\": \"checkpoint\""), "{json}");
+        assert!(
+            json.contains("\"excused_checkpoint_kind\": \"size-bound\""),
+            "{json}"
+        );
+        assert!(!json.contains("excused_io_share"), "{json}");
+    }
+
+    #[test]
+    fn tag_split_lines_say_when_a_class_is_saturated() {
+        // NFR-PRF-03, TC-185: report-only note when without_n < 20.
+        use save_tags::CkKind::{Idle, No};
+        let note = "saturated: discriminates nothing on this run";
+        for (plain, overlapped, saturated) in [(0, 30, true), (19, 30, true), (20, 30, false)] {
+            let n = plain + overlapped;
+            let ph = [0.1; 8];
+            let (_, mut tags) = io_series(n, 15.0, &[], 0);
+            for (i, r) in tags.rows.iter_mut().enumerate() {
+                r.checkpoint = i >= plain;
+                r.kind = if r.checkpoint { Idle } else { No };
+            }
+            tags.phases = Some(vec![ph; n]);
+            let lines = tags.describe(50.0);
+            let line = lines
+                .iter()
+                .find(|l| l.contains("tag split   checkpoint overlap"))
+                .expect("split line");
+            assert_eq!(line.contains(note), saturated, "without_n {plain}: {line}");
+        }
     }
 }

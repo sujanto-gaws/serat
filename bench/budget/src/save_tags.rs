@@ -226,33 +226,102 @@ pub struct SaveTags {
 /// (rank ceil(0.95 n) < n needs n >= 20). Below it the class p95 is the outlier itself.
 pub const MIN_EXCUSING_CLASS: usize = 20;
 
+/// The phases (indices into [`PHASES`]) that are the vault's own file I/O: `write`
+/// (create the temp file, `write_all`), `sync` (the file fsync) and `rename` (the rename
+/// and the directory fsync). The `write` phase holds no Serat lock and does no Serat
+/// computation beyond the temp-name nonce, so a stall in it is the volume's (ADR-0019
+/// second amendment 2026-11-26, task #211). The fsync placement is pinned by
+/// `a_save_fsyncs_the_file_in_sync_and_on_unix_the_directory_in_rename_and_nothing_else`
+/// in serat-vault (TC-185).
+pub const VAULT_IO_PHASES: [usize; 3] = [1, 2, 3];
+
+/// The share of the excused sample's whole elapsed time the vault's I/O phases must
+/// carry. The denominator is the whole sample, so `other` and every unmeasured
+/// millisecond count against the excusal.
+pub const MIN_VAULT_IO_SHARE: f64 = 0.90;
+
 /// Why one over-limit save does not move the verdict (ADR-0019 amendment 2026-11-26,
-/// task #205, NFR-PRF-03).
+/// task #205; second amendment, task #211; NFR-PRF-03).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Excusal {
-    /// The excused save: position, elapsed time and the kind of checkpoint it overlapped.
-    pub sample: SaveTag,
-    /// Saves that overlapped a checkpoint, the excused one included.
-    pub class_n: usize,
-    /// That class's own nearest-rank p95: its reported bound, within the limit.
-    pub class_p95_ms: f64,
-    /// That class's maximum, the excused save when it is the slowest.
-    pub class_max_ms: f64,
+pub enum Excusal {
+    /// The save overlapped a checkpoint and its class's own p95 is within the limit.
+    Checkpoint {
+        /// The excused save: position, elapsed time and the kind of checkpoint it overlapped.
+        sample: SaveTag,
+        /// Saves that overlapped a checkpoint, the excused one included.
+        class_n: usize,
+        /// That class's own nearest-rank p95: its reported bound, within the limit.
+        class_p95_ms: f64,
+        /// That class's maximum, the excused save when it is the slowest.
+        class_max_ms: f64,
+    },
+    /// The save was carried by the vault's file I/O: the volume stalled, not Serat.
+    VaultIo {
+        /// The excused save.
+        sample: SaveTag,
+        /// Its `write` phase.
+        write_ms: f64,
+        /// Its `sync` phase.
+        sync_ms: f64,
+        /// Its `rename` phase.
+        rename_ms: f64,
+        /// `(write + sync + rename) / sample.ms`.
+        share: f64,
+        /// `sample.ms - (write + sync + rename)`, within the all-saves p95.
+        remainder_ms: f64,
+        /// The all-saves nearest-rank p95 the remainder is bounded by.
+        series_p95_ms: f64,
+    },
 }
 
 impl Excusal {
+    /// The excused save.
+    #[must_use]
+    pub fn sample(&self) -> &SaveTag {
+        match self {
+            Excusal::Checkpoint { sample, .. } | Excusal::VaultIo { sample, .. } => sample,
+        }
+    }
+
+    /// The JSON key value under `save_tags.excused_by`.
+    #[must_use]
+    pub fn kind_key(&self) -> &'static str {
+        match self {
+            Excusal::Checkpoint { .. } => "checkpoint",
+            Excusal::VaultIo { .. } => "vault-io",
+        }
+    }
+
     /// The report line; names the excusal explicitly so it cannot be read as a plain pass.
     #[must_use]
     pub fn describe(&self, limit_ms: f64) -> String {
-        format!(
-            "  excused     1 over-limit save excused: sample {} ({:.1} ms) overlapped a {} checkpoint; overlapped class p95 {:.1} ms (n={}, max {:.1} ms) within {limit_ms:.1} ms. The all-saves p95 is still the asserted figure (ADR-0019, task #205)",
-            self.sample.index,
-            self.sample.ms,
-            self.sample.kind.label(),
-            self.class_p95_ms,
-            self.class_n,
-            self.class_max_ms,
-        )
+        match self {
+            Excusal::Checkpoint {
+                sample,
+                class_n,
+                class_p95_ms,
+                class_max_ms,
+            } => format!(
+                "  excused     1 over-limit save excused: sample {} ({:.1} ms) overlapped a {} checkpoint; overlapped class p95 {class_p95_ms:.1} ms (n={class_n}, max {class_max_ms:.1} ms) within {limit_ms:.1} ms. The all-saves p95 is still the asserted figure (ADR-0019, task #205)",
+                sample.index,
+                sample.ms,
+                sample.kind.label(),
+            ),
+            Excusal::VaultIo {
+                sample,
+                write_ms,
+                sync_ms,
+                rename_ms,
+                share,
+                remainder_ms,
+                series_p95_ms,
+            } => format!(
+                "  excused     1 over-limit save excused: sample {} ({:.1} ms) carried by the vault's file I/O: write {write_ms:.1}, sync {sync_ms:.1}, rename {rename_ms:.1} ms = {:.1}% of the sample; remainder {remainder_ms:.1} ms within the all-saves p95 {series_p95_ms:.1} ms. The all-saves p95 is still the asserted figure (ADR-0019, task #211)",
+                sample.index,
+                sample.ms,
+                share * 100.0,
+            ),
+        }
     }
 }
 
@@ -339,19 +408,30 @@ impl SaveTags {
         self.rows.iter().filter(|r| r.ms > limit_ms).collect()
     }
 
-    /// ADR-0019 amendment 2026-11-26: the one over-limit save a straddling series may
-    /// carry and still be determinate. `Some` only when (i) exactly one save is over
-    /// `limit_ms` (strictly), (ii) it overlapped a checkpoint of any kind, and (iii) the
-    /// overlapped class has at least [`MIN_EXCUSING_CLASS`] saves and its own nearest-rank
-    /// p95 is within `limit_ms`. Two or more over, an unflagged one, a class p95 over, or a
-    /// class too small to have a p95 apart from its maximum, is `None`: the series stays
-    /// INDETERMINATE. A class of n < 20 would excuse the outlier by its own value.
+    /// ADR-0019: the one over-limit save a series may carry and still be determinate.
+    /// `None` unless exactly one save is over `limit_ms` (strictly). Then, in order:
+    ///
+    /// 1. [`Excusal::Checkpoint`] (amendment 2026-11-26, task #205): it overlapped a
+    ///    checkpoint of any kind and the overlapped class has at least
+    ///    [`MIN_EXCUSING_CLASS`] saves with its own nearest-rank p95 within `limit_ms`.
+    ///    A class of n < 20 would excuse the outlier by its own value.
+    /// 2. [`Excusal::VaultIo`] (second amendment 2026-11-26, task #211): phases were
+    ///    reported for every row, there are at least [`MIN_EXCUSING_CLASS`] saves, the
+    ///    sample's `write + sync + rename` is at least [`MIN_VAULT_IO_SHARE`] of its whole
+    ///    time, and the remainder is within the all-saves nearest-rank p95.
+    ///
+    /// Two or more over, or neither rule holding, is `None`: INDETERMINATE.
     #[must_use]
     pub fn excusal(&self, limit_ms: f64) -> Option<Excusal> {
         let over = self.over_limit(limit_ms);
         let [one] = over.as_slice() else {
             return None;
         };
+        self.checkpoint_excusal(one, limit_ms)
+            .or_else(|| self.vault_io_excusal(one))
+    }
+
+    fn checkpoint_excusal(&self, one: &SaveTag, limit_ms: f64) -> Option<Excusal> {
         if !one.checkpoint {
             return None;
         }
@@ -368,11 +448,38 @@ impl SaveTags {
         if class_p95_ms > limit_ms {
             return None;
         }
-        Some(Excusal {
-            sample: **one,
+        Some(Excusal::Checkpoint {
+            sample: *one,
             class_n: class.len(),
             class_p95_ms,
             class_max_ms: class.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
+    }
+
+    fn vault_io_excusal(&self, one: &SaveTag) -> Option<Excusal> {
+        let phases = self.phases.as_ref()?;
+        if phases.len() != self.rows.len() || self.rows.len() < MIN_EXCUSING_CLASS {
+            return None;
+        }
+        let row = phases.get(one.index)?;
+        let io: f64 = VAULT_IO_PHASES.iter().map(|&p| row[p]).sum();
+        if one.ms <= 0.0 || io / one.ms < MIN_VAULT_IO_SHARE {
+            return None;
+        }
+        let all: Vec<f64> = self.rows.iter().map(|r| r.ms).collect();
+        let series_p95_ms = crate::percentile_of(&all, 0.95);
+        let remainder_ms = one.ms - io;
+        if remainder_ms > series_p95_ms {
+            return None;
+        }
+        Some(Excusal::VaultIo {
+            sample: *one,
+            write_ms: row[VAULT_IO_PHASES[0]],
+            sync_ms: row[VAULT_IO_PHASES[1]],
+            rename_ms: row[VAULT_IO_PHASES[2]],
+            share: io / one.ms,
+            remainder_ms,
+            series_p95_ms,
         })
     }
 
@@ -415,8 +522,13 @@ impl SaveTags {
         let mut lines = Vec::new();
         for flag in Flag::ALL {
             let s = self.split(flag);
+            let saturated = if s.without_n < MIN_EXCUSING_CLASS {
+                " — saturated: discriminates nothing on this run"
+            } else {
+                ""
+            };
             lines.push(format!(
-                "  tag split   {} p95: with {} (n={}), without {} (n={}), ratio {} — reported, not asserted",
+                "  tag split   {} p95: with {} (n={}), without {} (n={}), ratio {} — reported, not asserted{saturated}",
                 flag.label(),
                 p(s.with_p95),
                 s.with_n,
@@ -514,16 +626,37 @@ impl SaveTags {
         let _ = writeln!(s, "    }},");
         let over = self.over_limit(limit_ms);
         match self.excusal(limit_ms) {
-            Some(e) => {
+            Some(
+                e @ Excusal::Checkpoint {
+                    sample,
+                    class_n,
+                    class_p95_ms,
+                    class_max_ms,
+                },
+            ) => {
                 let _ = writeln!(
                     s,
-                    "    \"excused\": true, \"excused_index\": {}, \"excused_ms\": {:.3}, \"excused_checkpoint_kind\": \"{}\", \"overlapped_class_n\": {}, \"overlapped_class_p95_ms\": {:.3}, \"overlapped_class_max_ms\": {:.3},",
-                    e.sample.index,
-                    e.sample.ms,
-                    e.sample.kind.label(),
-                    e.class_n,
-                    e.class_p95_ms,
-                    e.class_max_ms
+                    "    \"excused\": true, \"excused_by\": \"{}\", \"excused_index\": {}, \"excused_ms\": {:.3}, \"excused_checkpoint_kind\": \"{}\", \"overlapped_class_n\": {class_n}, \"overlapped_class_p95_ms\": {class_p95_ms:.3}, \"overlapped_class_max_ms\": {class_max_ms:.3},",
+                    e.kind_key(),
+                    sample.index,
+                    sample.ms,
+                    sample.kind.label(),
+                );
+            }
+            Some(
+                e @ Excusal::VaultIo {
+                    sample,
+                    share,
+                    remainder_ms,
+                    ..
+                },
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    \"excused\": true, \"excused_by\": \"{}\", \"excused_index\": {}, \"excused_ms\": {:.3}, \"excused_io_share\": {share:.4}, \"excused_remainder_ms\": {remainder_ms:.3},",
+                    e.kind_key(),
+                    sample.index,
+                    sample.ms,
                 );
             }
             None => {
