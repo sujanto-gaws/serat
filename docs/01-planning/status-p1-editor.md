@@ -214,7 +214,7 @@ status: in progress — 2026-11-26 (refresh 15, main a96811e) — gate NOT reach
 
 ## Open branches
 
-None besides #214–#216 (in review). Every other `task/*` branch on origin is contained in `main` (107) or superseded by a re-authored or replacement branch (19; `task/p1-188-refused-rename-ruling` re-authored as `-v2`); the lists for deletion are in the lead's scratchpad.
+None. Every other `task/*` branch on origin is contained in `main` (107) or superseded by a re-authored or replacement branch (19; `task/p1-188-refused-rename-ruling` re-authored as `-v2`); the lists for deletion are in the lead's scratchpad.
 
 ## Not started (P1 scope)
 

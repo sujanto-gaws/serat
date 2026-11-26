@@ -160,8 +160,8 @@ owner: lead
 | 212 | `[P1/req] Record the owner's RISK-016 decision: NFR-PRF-01 binds Windows/WebView2 in P1; Linux term reported, attribution owed; PRD v1.15` (NFR-PRF-01, NFR-PRF-08, US-35; ADR-0019, C-06) | product-analyst | 177 | **merged** fb2ecb3 |
 | 213 | `[P1/test] prf03 vault-I/O excusal (Excusal::VaultIo), per-save fsync-count pin and flush source scan in serat-vault, saturated-tag note; TC-185` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0008, ADR-0017, ADR-0019, ADR-0020) | test-engineer | 211 | **merged** a96811e |
 | 214 | `[P1/lead] Status refresh 15 and task list at a96811e` (NFR-MNT-01) | lead | 213 | in review, branch task/p1-214-status-15 |
-| 215 | `[P1/req] RISK-017 wording after #213: the unflagged class is attributed to the vault's disk I/O, excused by the second amendment` (NFR-PRF-03, NFR-PRF-08; ADR-0019) | product-analyst | 213 | in review, branch task/p1-215-risk-017-wording |
-| 216 | `[P1/test] Report item (a-5) evidence after #213: runs 457 (would-be excused, near-boundary), 458, 459 (PASS, attribution unexercised)` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0019) | test-engineer | 213 | in review, branch task/p1-216-a5-evidence |
+| 215 | `[P1/req] RISK-017 wording after #213: the unflagged class is attributed to the vault's disk I/O, excused by the second amendment` (NFR-PRF-03, NFR-PRF-08; ADR-0019) | product-analyst | 213 | **merged** 93f4493 |
+| 216 | `[P1/test] Report item (a-5) evidence after #213: runs 457 (would-be excused, near-boundary), 458, 459 (PASS, attribution unexercised)` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0019) | test-engineer | 213 | **merged** 5b5ce49 |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
