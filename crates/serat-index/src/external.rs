@@ -46,6 +46,7 @@ use serat_core::{
     VaultError, VaultPath,
 };
 
+use crate::checkpoint::RoundPhase;
 use crate::incremental::{IndexHandle, build_op};
 use crate::schema::{self, sqlite};
 use crate::writer::WriterHandle;
@@ -204,10 +205,12 @@ impl Reconciler {
         // and `catch_up` (bulk paths) take none: they run on the size bound's terms and
         // a catch-up is not an FR-VLT-04 round.
         let _busy = self.health.busy_guard();
+        self.health.set_round_phase(RoundPhase::Lookup);
         let reader = self.reader()?;
         let mut flushed = 0;
         for path in paths {
             self.pace(&outcome, &mut flushed)?;
+            self.health.set_round_phase(RoundPhase::Lookup);
             let known = row(&reader, path)?;
             match self.submit(source, parser, path, known.as_ref(), Some(is_echo))? {
                 Step::Gone { not_found: false } => {
@@ -224,6 +227,7 @@ impl Reconciler {
                     if known.is_some() {
                         gone.push(path.clone());
                     }
+                    self.health.set_round_phase(RoundPhase::Submit);
                     for victim in gone {
                         self.writer
                             .submit_blocking(IndexOp::Remove { path: victim })?;
@@ -332,6 +336,7 @@ impl Reconciler {
     fn pace(&self, outcome: &Outcome, flushed: &mut usize) -> Result<(), IndexError> {
         let submitted = outcome.upserted + outcome.removed + outcome.touched;
         if submitted >= *flushed + crate::writer::BATCH_SIZE {
+            self.health.set_round_phase(RoundPhase::Flush);
             self.writer.flush()?;
             *flushed = submitted;
         }
@@ -343,6 +348,7 @@ impl Reconciler {
         // Touches are not a change to announce, but they are queued work: the
         // contract is that everything submitted is committed on return.
         if outcome.changed() || outcome.touched > 0 {
+            self.health.set_round_phase(RoundPhase::Flush);
             self.writer.flush()?;
         }
         Ok(outcome)
@@ -418,6 +424,7 @@ impl Reconciler {
         known: Option<&Row>,
         is_echo: Option<EchoTest<'_>>,
     ) -> Result<Step, IndexError> {
+        self.health.set_round_phase(RoundPhase::Read);
         let loaded = match source.load(path) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -439,6 +446,7 @@ impl Reconciler {
         {
             outcome.unchanged = 1;
             if row.mtime != loaded.meta.mtime_ms {
+                self.health.set_round_phase(RoundPhase::Submit);
                 self.writer.submit_blocking(IndexOp::TouchMtime {
                     path: path.clone(),
                     hash,
@@ -448,7 +456,9 @@ impl Reconciler {
             }
             return Ok(Step::Done(outcome));
         }
+        self.health.set_round_phase(RoundPhase::Parse);
         let (op, _, refused) = build_op(parser, path, loaded);
+        self.health.set_round_phase(RoundPhase::Submit);
         self.writer.submit_blocking(op)?;
         outcome.upserted = 1;
         outcome.unparsed = usize::from(refused);

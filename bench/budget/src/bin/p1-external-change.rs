@@ -55,7 +55,7 @@ use budget::{Samples, ensure_vault};
 use rusqlite::{Connection, OpenFlags};
 use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
-use serat_index::{IndexHandle, RunKind, WalHealth, rebuild};
+use serat_index::{Activity, IndexHandle, RunKind, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
 use serat_vault::{Vault, VaultEvent, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
@@ -106,6 +106,48 @@ fn describe_stall(
             "not raised"
         },
     )
+}
+
+/// What the consumer and the checkpointer were doing when a round did not commit (task
+/// #220): how long the round in hand has been running (`None`: the consumer is waiting
+/// on the queue), and the index's own view from `WalHealth::activity`. Appended to the
+/// stall line, so a blocked consumer says whether the writer was in a turn, which
+/// checkpoint was in flight and for how long, and how old the last commit was.
+fn describe_activity(round_in_hand: Option<&RoundSlot>, activity: &Activity) -> String {
+    format!(
+        "; consumer {}; {}",
+        round_in_hand.map_or("not in a round".to_owned(), |r| {
+            let size = r.paths.map_or(String::new(), |n| {
+                format!(" of {n} path{}", if n == 1 { "" } else { "s" })
+            });
+            format!(
+                "in a round{size} for {:.1} s ({})",
+                r.taken.elapsed().as_secs_f64(),
+                r.stage
+            )
+        }),
+        activity.describe(),
+    )
+}
+
+/// The round the consumer holds: when it was taken, how many paths, and which step of the
+/// consumer it is in (`draining` the queue after the pop, or inside `index_paths`, whose
+/// own phase is in the [`Activity`]).
+#[derive(Clone, Copy)]
+struct RoundSlot {
+    taken: Instant,
+    /// Not known until the queue is drained.
+    paths: Option<usize>,
+    stage: &'static str,
+}
+
+/// Empties the consumer's round slot when it goes out of scope.
+struct ClearSlot<'a>(&'a Mutex<Option<RoundSlot>>);
+
+impl Drop for ClearSlot<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// What the consumer did with one drain of the queue.
@@ -166,6 +208,8 @@ struct Run<'a> {
     health: Arc<WalHealth>,
     queue: &'a WorkQueue,
     watcher: &'a Watcher,
+    /// When the consumer took the round it is working on; `None` between rounds.
+    round_taken: Arc<Mutex<Option<RoundSlot>>>,
 }
 
 struct Measured {
@@ -247,6 +291,7 @@ impl Run<'_> {
                     .take_events()
                     .contains(&VaultEvent::RescanRequired)
                     || self.queue.rescan_needed().is_some();
+                let taken = *self.round_taken.lock().unwrap_or_else(|p| p.into_inner());
                 return Err(describe_stall(
                     upserted,
                     count,
@@ -254,7 +299,7 @@ impl Run<'_> {
                     &seen,
                     rescan,
                     self.queue.depth(),
-                ));
+                ) + &describe_activity(taken.as_ref(), &self.health.activity()));
             };
             seen.push((
                 ms(round.first_taken.duration_since(t0)),
@@ -595,7 +640,9 @@ fn run(args: &[String]) -> Result<bool, String> {
     let (tx, rx) = mpsc::channel::<Round>();
     let stop = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(Mutex::new(None::<String>));
+    let round_taken = Arc::new(Mutex::new(None::<RoundSlot>));
     let consumer = {
+        let round_taken = Arc::clone(&round_taken);
         let (vault, parser, queue) = (Arc::clone(&vault), Arc::clone(&parser), Arc::clone(&queue));
         let (stop, failure) = (Arc::clone(&stop), Arc::clone(&failure));
         std::thread::spawn(move || {
@@ -604,14 +651,28 @@ fn run(args: &[String]) -> Result<bool, String> {
                     continue;
                 };
                 let first_taken = Instant::now();
+                let slot = |paths, stage| {
+                    *round_taken.lock().unwrap_or_else(|p| p.into_inner()) = Some(RoundSlot {
+                        taken: first_taken,
+                        paths,
+                        stage,
+                    });
+                };
+                slot(None, "draining the queue");
                 let mut paths: Vec<VaultPath> = vec![first];
                 paths.extend(queue.drain());
+                slot(Some(paths.len()), "in index_paths");
                 let echo = |path: &VaultPath, hash| vault.echo().take_echo(path, hash);
-                match reconciler.index_paths(&*vault, &*parser, &echo, &paths) {
+                // Cleared on every exit, a panic in `index_paths` included.
+                let _clear = ClearSlot(&round_taken);
+                let result = reconciler.index_paths(&*vault, &*parser, &echo, &paths);
+                let committed = Instant::now();
+                drop(_clear);
+                match result {
                     Ok(outcome) => {
                         let _ = tx.send(Round {
                             first_taken,
-                            committed: Instant::now(),
+                            committed,
                             outcome,
                         });
                     }
@@ -653,6 +714,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         health: handle.wal_health(),
         queue: &queue,
         watcher: &watcher,
+        round_taken,
     };
     eprintln!(
         "watcher armed {:.1} s before the first edit; backend {}",
@@ -865,6 +927,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serat_index::RoundPhase;
 
     #[test]
     fn a_stall_names_the_stage_that_stopped() {
@@ -902,6 +965,61 @@ mod tests {
             99,
         );
         assert!(slow.contains("queue depth 99"), "{slow}");
+    }
+
+    #[test]
+    fn the_stall_line_says_what_the_consumer_and_the_checkpointer_were_doing() {
+        // Task #220: the blocked-consumer case of run 464.
+        let busy = Activity {
+            writer_turn: Some(Duration::from_millis(59_800)),
+            checkpoint: Some((RunKind::SizeBound, Duration::from_millis(11_500))),
+            restart: false,
+            wal_frames: Some(1548),
+            last_commit_age: Some(Duration::from_millis(60_400)),
+            round_phase: Some(RoundPhase::Flush),
+        };
+        let slot = RoundSlot {
+            taken: Instant::now() - Duration::from_secs(60),
+            paths: Some(100),
+            stage: "in index_paths",
+        };
+        let line = describe_stall(0, 100, Duration::from_secs(60), &[], false, 99)
+            + &describe_activity(Some(&slot), &busy);
+        assert!(
+            line.contains("queue depth 99; consumer in a round of 100 paths for 6"),
+            "{line}"
+        );
+        assert!(line.contains("writer in a turn for 59.8 s"), "{line}");
+        assert!(
+            line.contains("checkpoint size-bound in flight for 11.5 s"),
+            "{line}"
+        );
+        assert!(line.contains("WAL 1548 frames"), "{line}");
+        assert!(line.contains("last commit 60.4 s ago"), "{line}");
+        assert!(
+            line.contains("(in index_paths); round flush; writer in a turn"),
+            "{line}"
+        );
+        let draining = RoundSlot {
+            paths: None,
+            stage: "draining the queue",
+            ..slot
+        };
+        let d = describe_activity(Some(&draining), &busy);
+        assert!(
+            d.contains("in a round for 6") && d.contains("(draining the queue)"),
+            "{d}"
+        );
+        let one = RoundSlot {
+            paths: Some(1),
+            ..slot
+        };
+        assert!(describe_activity(Some(&one), &busy).contains("of 1 path for"));
+        let quiet = describe_activity(None, &Activity::default());
+        assert!(quiet.contains("consumer not in a round"), "{quiet}");
+        assert!(quiet.contains("round not in index_paths"), "{quiet}");
+        assert!(quiet.contains("writer idle (not in a turn)"), "{quiet}");
+        assert!(quiet.contains("checkpoint none in flight"), "{quiet}");
     }
 
     #[test]
