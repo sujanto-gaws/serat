@@ -116,12 +116,16 @@ fn describe_stall(
 fn describe_activity(round_in_hand: Option<&RoundSlot>, activity: &Activity) -> String {
     format!(
         "; consumer {}; {}",
-        round_in_hand.map_or("not in a round".to_owned(), |r| format!(
-            "in a round of {} paths for {:.1} s ({})",
-            r.paths,
-            r.taken.elapsed().as_secs_f64(),
-            r.stage
-        )),
+        round_in_hand.map_or("not in a round".to_owned(), |r| {
+            let size = r.paths.map_or(String::new(), |n| {
+                format!(" of {n} path{}", if n == 1 { "" } else { "s" })
+            });
+            format!(
+                "in a round{size} for {:.1} s ({})",
+                r.taken.elapsed().as_secs_f64(),
+                r.stage
+            )
+        }),
         activity.describe(),
     )
 }
@@ -132,7 +136,8 @@ fn describe_activity(round_in_hand: Option<&RoundSlot>, activity: &Activity) -> 
 #[derive(Clone, Copy)]
 struct RoundSlot {
     taken: Instant,
-    paths: usize,
+    /// Not known until the queue is drained.
+    paths: Option<usize>,
     stage: &'static str,
 }
 
@@ -653,10 +658,10 @@ fn run(args: &[String]) -> Result<bool, String> {
                         stage,
                     });
                 };
-                slot(1, "draining the queue");
+                slot(None, "draining the queue");
                 let mut paths: Vec<VaultPath> = vec![first];
                 paths.extend(queue.drain());
-                slot(paths.len(), "in index_paths");
+                slot(Some(paths.len()), "in index_paths");
                 let echo = |path: &VaultPath, hash| vault.echo().take_echo(path, hash);
                 // Cleared on every exit, a panic in `index_paths` included.
                 let _clear = ClearSlot(&round_taken);
@@ -975,13 +980,13 @@ mod tests {
         };
         let slot = RoundSlot {
             taken: Instant::now() - Duration::from_secs(60),
-            paths: 1,
+            paths: Some(100),
             stage: "in index_paths",
         };
         let line = describe_stall(0, 100, Duration::from_secs(60), &[], false, 99)
             + &describe_activity(Some(&slot), &busy);
         assert!(
-            line.contains("queue depth 99; consumer in a round of 1 paths for 6"),
+            line.contains("queue depth 99; consumer in a round of 100 paths for 6"),
             "{line}"
         );
         assert!(line.contains("writer in a turn for 59.8 s"), "{line}");
@@ -995,6 +1000,21 @@ mod tests {
             line.contains("(in index_paths); round flush; writer in a turn"),
             "{line}"
         );
+        let draining = RoundSlot {
+            paths: None,
+            stage: "draining the queue",
+            ..slot
+        };
+        let d = describe_activity(Some(&draining), &busy);
+        assert!(
+            d.contains("in a round for 6") && d.contains("(draining the queue)"),
+            "{d}"
+        );
+        let one = RoundSlot {
+            paths: Some(1),
+            ..slot
+        };
+        assert!(describe_activity(Some(&one), &busy).contains("of 1 path for"));
         let quiet = describe_activity(None, &Activity::default());
         assert!(quiet.contains("consumer not in a round"), "{quiet}");
         assert!(quiet.contains("round not in index_paths"), "{quiet}");

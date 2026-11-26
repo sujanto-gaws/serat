@@ -205,9 +205,11 @@ impl Reconciler {
         // and `catch_up` (bulk paths) take none: they run on the size bound's terms and
         // a catch-up is not an FR-VLT-04 round.
         let _busy = self.health.busy_guard();
+        self.health.set_round_phase(RoundPhase::Lookup);
         let reader = self.reader()?;
         let mut flushed = 0;
         for path in paths {
+            self.health.set_round_phase(RoundPhase::Lookup);
             self.pace(&outcome, &mut flushed)?;
             let known = row(&reader, path)?;
             match self.submit(source, parser, path, known.as_ref(), Some(is_echo))? {
@@ -225,6 +227,7 @@ impl Reconciler {
                     if known.is_some() {
                         gone.push(path.clone());
                     }
+                    self.health.set_round_phase(RoundPhase::Submit);
                     for victim in gone {
                         self.writer
                             .submit_blocking(IndexOp::Remove { path: victim })?;
@@ -443,6 +446,7 @@ impl Reconciler {
         {
             outcome.unchanged = 1;
             if row.mtime != loaded.meta.mtime_ms {
+                self.health.set_round_phase(RoundPhase::Submit);
                 self.writer.submit_blocking(IndexOp::TouchMtime {
                     path: path.clone(),
                     hash,

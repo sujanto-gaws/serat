@@ -236,6 +236,8 @@ fn since(then: u64) -> Option<Duration> {
 /// Where a reconcile round (`Reconciler::index_paths`) is, per path (task #220).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundPhase {
+    /// Opening the round's reader and looking the row up, before the path is read.
+    Lookup,
     /// Reading the file and hashing it (`NoteSource::load`).
     Read,
     /// Parsing it into an op.
@@ -249,6 +251,7 @@ pub enum RoundPhase {
 impl RoundPhase {
     fn code(self) -> u8 {
         match self {
+            Self::Lookup => 5,
             Self::Read => 1,
             Self::Parse => 2,
             Self::Submit => 3,
@@ -260,6 +263,7 @@ impl RoundPhase {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::Lookup => "lookup",
             Self::Read => "read",
             Self::Parse => "parse",
             Self::Submit => "submit",
@@ -333,7 +337,10 @@ pub struct WalHealth {
     restart_running: AtomicBool,
     /// [`stamp`] of the start of the run in `running`; 0 when none.
     running_since: AtomicU64,
-    /// [`RoundPhase::code`] of the reconcile round in flight; 0 when none.
+    /// [`RoundPhase::code`] of the reconcile round in flight; 0 when none. One slot per
+    /// `WalHealth`: with concurrent rounds the last writer wins, and the guardless paths
+    /// (`compare` in `reconcile_dir` and `catch_up`) write it too; it is read only while a
+    /// round's guard is live, and is a diagnostic, not a fact to act on.
     round_phase: AtomicU8,
     /// Live writer turns (0 or 1) and the [`stamp`] of the one in progress (task #220).
     turns: AtomicUsize,
@@ -438,13 +445,15 @@ impl WalHealth {
                     2 => Some(RoundPhase::Parse),
                     3 => Some(RoundPhase::Submit),
                     4 => Some(RoundPhase::Flush),
+                    5 => Some(RoundPhase::Lookup),
                     _ => None,
                 })
                 .flatten(),
         }
     }
 
-    /// Record where a reconcile round is. One relaxed store.
+    /// Record where a reconcile round is. One relaxed store; one slot, last writer wins
+    /// (see `round_phase`).
     pub(crate) fn set_round_phase(&self, phase: RoundPhase) {
         self.round_phase.store(phase.code(), Ordering::Relaxed);
     }
