@@ -162,6 +162,7 @@ owner: lead
 | 214 | `[P1/lead] Status refresh 15 and task list at a96811e` (NFR-MNT-01) | lead | 213 | in review, branch task/p1-214-status-15 |
 | 215 | `[P1/req] RISK-017 wording after #213: the unflagged class is attributed to the vault's disk I/O, excused by the second amendment` (NFR-PRF-03, NFR-PRF-08; ADR-0019) | product-analyst | 213 | **merged** 93f4493 |
 | 216 | `[P1/test] Report item (a-5) evidence after #213: runs 457 (would-be excused, near-boundary), 458, 459 (PASS, attribution unexercised)` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0019) | test-engineer | 213 | **merged** 5b5ce49 |
+| 217 | `[P1/test] Hosted runs 460-463 recorded: #205 checkpoint excusal verified on windows-latest (461, 463); saturated-tag note seen; vault-I/O excusal still unexercised` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0019) | test-engineer | 216 | in review, branch task/p1-217-hosted-excusal-evidence |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
