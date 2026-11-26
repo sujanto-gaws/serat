@@ -39,9 +39,11 @@ pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<i64>
         .create_new(true)
         .open(temp)?;
     file.write_all(bytes)?;
+    crate::save_phases::mark(crate::save_phases::SavePhase::Write);
     // Flush before the rename. Without this the rename can be durable while the
     // contents are not, which turns a power cut into a note full of zeroes.
     file.sync_all()?;
+    crate::save_phases::mark(crate::save_phases::SavePhase::Sync);
     Ok(crate::walk::mtime_ms(&file.metadata()?))
 }
 

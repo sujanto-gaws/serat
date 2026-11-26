@@ -368,3 +368,23 @@ Report lines (and `save_tags` in `bench/out/budgets/prf03-save-to-index.json`): 
 
 Linux release, 20k vault, `--profile ci`, indicative only (ADR-0019: Linux figures are supporting evidence), 2026-11-25. Findings are in `docs/05-testing/reports/ci-windows-first-run-2026-11.md`, Resolution item (a-2).
 
+## prf03-save-to-index: per-phase timings inside the interval (task #207)
+
+Run 450 (84.1 ms, `checkpoint=no merge=no slow-commit=yes`) and run 451 (62.7 ms, `checkpoint=no merge=no`) are the unflagged class the tags cannot attribute (3 of the last 5 hosted straddles; 10 INDETERMINATE in 17 runs). #196's hypothesis is that the save's own write or `sync_all` queues behind unrelated I/O. The phase series test it directly: they split the asserted `write_file` interval by the phases ADR-0020 names. Reported, never asserted (ADR-0019 point 5): `determinate()`, `excusal()` and the verdict do not read them (TC-184).
+
+Eight arrays on the exit line, each parallel to `save_submitted_ms` (one entry per submitted save), key `save_phase_<name>_ms`:
+
+| Phase | What it covers (the work that ends at the mark) |
+|---|---|
+| `hash` | from the start of the timed call to the end of the vault's pre-write check: open-vault lock and the per-path lock (a wait for either lands here), the read of what is on disk and its hash against the caller's base, the hash of the new text |
+| `write` | directory check, the permissions stat, creating the temp file and `write_all` |
+| `sync` | the temp file's `sync_all` (fsync on Linux, `FlushFileBuffers` on Windows) |
+| `rename` | permissions on the temp file, the rename over the target and the directory sync (a no-op on Windows) |
+| `load` | the index side's stat, read and hash of the saved note (`source.load`), up to the parse |
+| `parse` | `CommonMarkParser::parse` |
+| `submit` | building the op and `IndexWriter::submit` (a queue send, never a barrier) |
+| `other` | the write's return and the index-handle slot's lock wait (marked by serat-app, armed runs only, so `load` is the load alone), plus the interval's unmarked remainder: echo recording, the clock reads themselves; never negative |
+
+**Where it is measured, and what the product path pays.** Marks sit between statements that already existed (`crates/serat-vault/src/save_phases.rs`: `Vault::write_atomic_seams`, `atomic::write_exclusive`; `TimedParser` and `TimedWriter` in `crates/serat-app/src/state.rs`). The recorder is armed at run time by `run_save_benchmark` (`--bench-save-list`) and by nothing else, not by a feature, because the binary the budget jobs spawn is the shipped build and must stay so (ADR-0017: no new feature on it, `bench-bridge` and `test-hooks` untouched, the serat-app release guard unchanged). While not armed, each mark is one relaxed load of a `static AtomicBool` (five per `write_file`: the four marks and the one arm test in `submit_to_index`, against a write that fsyncs; the editor's `save_patch` pays three, the `Write` and `Sync` marks in `write_exclusive` and the arm test; the gitignore writer pays two): no clock read, no thread-local access, no allocation; `submit_to_index` takes the original `apply(&writer, source, &parser, ...)` arm. `serat-vault/tests/save_phases_off.rs` asserts that an unarmed process collects nothing. When armed, the benchmark's own cost is 10 `Instant::now` reads (`begin` plus nine marks: four in the vault, two `Other`, `Load`, `Parse`, `Submit`) and two trait-object hops per save, inside the interval, a few hundred nanoseconds against milliseconds. No byte is read, hashed or written differently (C-04, ADR-0008).
+
+Report lines (and `phase_p95_ms`, plus `phase_ms` on every `over_limit` entry, in the `save_tags` JSON): a `phase p95` line with the nearest-rank p95 of each phase over every submitted save, and under each over-limit sample a line `sample 374 62.7 ms: hash 0.4, write 1.2, sync 58.9, ... (carried by sync)`, the largest phase named. Parsing is strict by name (`SaveBenchmarkTrace::parse`): none of the eight present is an older binary and prints nothing; any present series that is malformed, or whose length differs from `save_submitted_ms`, or a report with some but not all eight, is a contract error that names the key.

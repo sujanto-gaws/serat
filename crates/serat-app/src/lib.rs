@@ -252,12 +252,54 @@ struct BenchmarkExitReport<'a> {
     save_slow_commit: Vec<bool>,
     /// Saves whose segment probe failed (counted as no merge, and said so).
     save_flag_probe_failures: u64,
+    /// Per submitted save, parallel to `save_submitted_ms` (task #207): how long each phase
+    /// of the save path took inside the asserted interval, report-only (ADR-0019). Every
+    /// array is empty when no phase was collected.
+    #[serde(flatten)]
+    save_phases: SavePhaseSeries,
     /// `CheckpointStats::deferred_busy` at the end of the run.
     save_checkpointer_deferred_busy: u64,
     /// PASSIVE plus RESTART checkpoint runs over the run.
     save_checkpointer_runs: u64,
     /// `CheckpointStats::floor_skips` at the end of the run (task #199).
     save_checkpointer_floor_skips: u64,
+}
+
+/// One array per save phase (task #207), each parallel to `save_submitted_ms`. `other` is the
+/// interval's own elapsed time less every marked phase (echo recording, the clock reads
+/// themselves), plus what was marked `Other` (the write's return and the index-handle slot's
+/// lock wait). The open-vault and per-path lock waits are in `hash`.
+#[derive(Debug, Default, Serialize)]
+struct SavePhaseSeries {
+    save_phase_hash_ms: Vec<f64>,
+    save_phase_write_ms: Vec<f64>,
+    save_phase_sync_ms: Vec<f64>,
+    save_phase_rename_ms: Vec<f64>,
+    save_phase_load_ms: Vec<f64>,
+    save_phase_parse_ms: Vec<f64>,
+    save_phase_submit_ms: Vec<f64>,
+    save_phase_other_ms: Vec<f64>,
+}
+
+impl SavePhaseSeries {
+    fn push(
+        &mut self,
+        spent: &[std::time::Duration; serat_vault::save_phases::COUNT],
+        total_ms: f64,
+    ) {
+        let ms = |d: &std::time::Duration| d.as_secs_f64() * 1000.0;
+        let sum: f64 = spent.iter().map(ms).sum();
+        let other = ms(&spent[7]);
+        self.save_phase_hash_ms.push(ms(&spent[0]));
+        self.save_phase_write_ms.push(ms(&spent[1]));
+        self.save_phase_sync_ms.push(ms(&spent[2]));
+        self.save_phase_rename_ms.push(ms(&spent[3]));
+        self.save_phase_load_ms.push(ms(&spent[4]));
+        self.save_phase_parse_ms.push(ms(&spent[5]));
+        self.save_phase_submit_ms.push(ms(&spent[6]));
+        self.save_phase_other_ms
+            .push((total_ms - sum).max(0.0) + other);
+    }
 }
 
 /// What [`run_save_benchmark`] measured, before it is folded into
@@ -273,6 +315,7 @@ struct SaveBenchmarkResult {
     checkpoint_kind: Vec<&'static str>,
     fts_merge: Vec<bool>,
     slow_commit: Vec<bool>,
+    phases: SavePhaseSeries,
     flag_probe_failures: u64,
     checkpointer_deferred_busy: u64,
     checkpointer_runs: u64,
@@ -420,6 +463,9 @@ fn run_save_benchmark(
     let (mut checkpoint_overlap, mut checkpoint_kind, mut fts_merge, mut windows) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut flag_probe_failures = 0u64;
+    let mut phases = SavePhaseSeries::default();
+    // Task #207: the per-phase clock is armed here and nowhere else (report-only).
+    serat_vault::save_phases::arm();
 
     for path in &paths {
         let before = state.save_path_outcomes();
@@ -434,6 +480,7 @@ fn run_save_benchmark(
         // Read outside the timed interval: a connection's worth of work between saves,
         // never inside one.
         let tag_before = tagger.before();
+        serat_vault::save_phases::begin();
         let started = std::time::Instant::now();
         let written = state.write_file(ipc::WriteFileArgs {
             path: (*path).to_owned(),
@@ -442,6 +489,7 @@ fn run_save_benchmark(
         });
         let ended = std::time::Instant::now();
         let elapsed_ms = ended.duration_since(started).as_secs_f64() * 1000.0;
+        let spent = serat_vault::save_phases::finish();
         written.map_err(|err| format!("--bench-save-list: saving {path}: {err:?}"))?;
         let (overlap, kind, merge, probe_failed) = tagger.after(&tag_before);
 
@@ -451,6 +499,9 @@ fn run_save_benchmark(
             checkpoint_overlap.push(overlap);
             checkpoint_kind.push(kind);
             fts_merge.push(merge);
+            if let Some(spent) = &spent {
+                phases.push(spent, elapsed_ms);
+            }
             flag_probe_failures += u64::from(probe_failed);
             windows.push((started, ended));
         } else if after.writer_refused > before.writer_refused {
@@ -508,6 +559,7 @@ fn run_save_benchmark(
         } else {
             Vec::new()
         },
+        phases,
         flag_probe_failures,
         checkpointer_deferred_busy: stats.as_ref().map_or(0, |s| s.deferred_busy),
         checkpointer_runs: stats
@@ -1048,6 +1100,7 @@ fn spawn_benchmark_exit(
                             save_checkpoint_kind: save.checkpoint_kind,
                             save_fts_merge: save.fts_merge,
                             save_slow_commit: save.slow_commit,
+                            save_phases: save.phases,
                             save_flag_probe_failures: save.flag_probe_failures,
                             save_checkpointer_deferred_busy: save.checkpointer_deferred_busy,
                             save_checkpointer_runs: save.checkpointer_runs,
@@ -1667,6 +1720,7 @@ mod tests {
             save_checkpoint_kind: vec!["no", "idle"],
             save_fts_merge: vec![true, false],
             save_slow_commit: vec![false, false],
+            save_phases: SavePhaseSeries::default(),
             save_flag_probe_failures: 0,
             save_checkpointer_deferred_busy: 3,
             save_checkpointer_runs: 4,
@@ -1806,6 +1860,10 @@ mod tests {
             save_checkpoint_kind: vec!["no", "idle"],
             save_fts_merge: vec![true, false],
             save_slow_commit: vec![false, true],
+            save_phases: SavePhaseSeries {
+                save_phase_sync_ms: vec![1.0, 2.5],
+                ..SavePhaseSeries::default()
+            },
             save_flag_probe_failures: 1,
             save_checkpointer_deferred_busy: 3,
             save_checkpointer_runs: 4,
@@ -1821,6 +1879,9 @@ mod tests {
             "\"save_checkpointer_runs\":4",
             "\"save_checkpoint_kind\":[\"no\",\"idle\"]",
             "\"save_checkpointer_floor_skips\":2",
+            // Task #207: flattened beside the other arrays, compact, as the harness parses.
+            "\"save_phase_sync_ms\":[1.0,2.5]",
+            "\"save_phase_write_ms\":[]",
         ] {
             assert!(line.contains(expected), "{expected} missing from {line}");
         }
@@ -1906,6 +1967,173 @@ mod tests {
         assert_eq!(result.flag_probe_failures, 0, "{result:?}");
         // The values are not asserted: whether a debug-build commit crosses SLOW_TURN or
         // an automerge lands is the machine's, and the definitions are tested above.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The non-test text of every `.rs` file under the workspace's `crates/` and `bench/`
+    /// (a file's test module and everything after it is dropped), as `(path, text)`.
+    fn product_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("readable dir").flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !matches!(name.as_str(), "target" | "node_modules" | "vaults" | "out") {
+                        walk(&path, out);
+                    }
+                } else if name.ends_with(".rs") {
+                    let text = std::fs::read_to_string(&path).expect("utf-8 source");
+                    // Product code after a file's first `#[cfg(test)] mod` goes unscanned;
+                    // that is acceptable today (no file keeps product items below its tests).
+                    let cut = text.find("\n#[cfg(test)]\nmod ").unwrap_or(text.len());
+                    out.push((path.display().to_string(), text[..cut].to_owned()));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut out = Vec::new();
+        for sub in ["crates", "bench"] {
+            walk(&root.join(sub), &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_save_phase_recorder_is_armed_only_by_run_save_benchmark_and_that_only_from_argv() {
+        // Task #207, architecture 3.1.1 invariant, ADR-0017, T-02: no Tauri command, IPC
+        // message or webview action reaches `arm()`. Needles are assembled so this test's
+        // own text is not a hit.
+        // A call, a plain import or a name in a braced import; `armed` is a different name.
+        let arm = concat!("save_phases", "::arm(");
+        let names_arm = |text: &str| {
+            text.contains(arm)
+                || text.contains(concat!("save_phases", "::arm;"))
+                || text.contains(concat!("save_phases", "::arm,"))
+                || text.contains(concat!("save_phases", "::arm}"))
+                || text.contains(concat!("save_phases", "::arm as"))
+                || text.contains(concat!("save_phases", "::*"))
+                || text.contains(concat!("save_phases", " as "))
+                || text
+                    .match_indices(concat!("save_phases", "::{"))
+                    .any(|(at, _)| {
+                        let rest = &text[at..];
+                        let braced = &rest[..rest.find('}').unwrap_or(rest.len())];
+                        braced
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|word| word == "arm")
+                    })
+        };
+        let sources = product_sources();
+        let hits: Vec<&(String, String)> = sources
+            .iter()
+            .filter(|(path, text)| {
+                !path.ends_with("serat-vault/src/save_phases.rs") && names_arm(text)
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "arm() is referenced from exactly one file: {:?}",
+            hits.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        let (path, text) = hits[0];
+        assert!(path.ends_with("serat-app/src/lib.rs"), "{path}");
+        assert_eq!(text.matches(arm).count(), 1, "exactly one call site");
+        // ... and it sits inside run_save_benchmark's body.
+        let start = text.find("fn run_save_benchmark(").expect("the driver");
+        let end = start
+            + text[start..]
+                .find("\n}\n")
+                .expect("the driver's closing brace");
+        assert!(
+            text[start..end].contains(arm),
+            "the one call is in run_save_benchmark"
+        );
+        // run_save_benchmark is called from one non-test place, fed by the boot argument.
+        let call = "run_save_benchmark(";
+        let calls: usize = sources.iter().map(|(_, t)| t.matches(call).count()).sum();
+        assert_eq!(calls, 2, "the definition and one call in run()");
+        assert!(
+            text.contains("Some(list_path) => run_save_benchmark(&state, list_path)")
+                && text.contains("state.boot.bench_save_list"),
+            "the call is the --bench-save-list branch of run()"
+        );
+        // `bench_save_list` is set from argv in cli.rs and nowhere else.
+        for (path, text) in &sources {
+            let sets =
+                text.contains("bench_save_list = Some") || text.contains("bench_save_list: Some");
+            assert_eq!(
+                sets,
+                path.ends_with("serat-app/src/cli.rs"),
+                "only cli.rs's argv parser sets bench_save_list: {path}"
+            );
+        }
+        let cli = sources
+            .iter()
+            .find(|(p, _)| p.ends_with("serat-app/src/cli.rs"))
+            .expect("cli.rs");
+        assert!(
+            cli.1.contains(
+                "boot.bench_save_list = Some(PathBuf::from(value(\"--bench-save-list\")?))"
+            ),
+            "set from the --bench-save-list argument"
+        );
+        // Nothing the webview can call mentions it: commands.rs and ipc.rs never name the driver.
+        for (path, text) in &sources {
+            if path.ends_with("serat-app/src/commands.rs") || path.contains("/ipc") {
+                assert!(
+                    !text.contains("run_save_benchmark") && !text.contains("save_phases"),
+                    "a command or IPC file reaches the recorder: {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_save_benchmark_reports_every_phase_parallel_to_the_samples_and_inside_each_one() {
+        // Task #207, NFR-PRF-03 (report-only, ADR-0019): eight arrays, one entry per
+        // submitted save, the seven measured phases never summing past the sample.
+        let (dir, state) = open_fixture_for_save_benchmark("save-bench-phases");
+        let list_path = dir.join("save-list.txt");
+        std::fs::write(&list_path, "10-projects/a.md\n10-projects/b.md\n").expect("list");
+        let result = run_save_benchmark(&state, &list_path).expect("benchmark");
+        let n = result.submitted_ms.len();
+        assert_eq!(n, 2);
+        let p = &result.phases;
+        let all = [
+            &p.save_phase_hash_ms,
+            &p.save_phase_write_ms,
+            &p.save_phase_sync_ms,
+            &p.save_phase_rename_ms,
+            &p.save_phase_load_ms,
+            &p.save_phase_parse_ms,
+            &p.save_phase_submit_ms,
+            &p.save_phase_other_ms,
+        ];
+        for series in all {
+            assert_eq!(series.len(), n, "{p:?}");
+            assert!(series.iter().all(|ms| *ms >= 0.0), "{p:?}");
+        }
+        for i in 0..n {
+            let sum: f64 = all.iter().map(|s| s[i]).sum();
+            assert!(
+                (sum - result.submitted_ms[i]).abs() < 0.01,
+                "phases plus other cover the sample: {sum} vs {}",
+                result.submitted_ms[i]
+            );
+            assert!(p.save_phase_write_ms[i] > 0.0, "a real write took time");
+            assert!(p.save_phase_parse_ms[i] > 0.0, "a real parse took time");
+        }
+        // They ride the exit line under the names the harness parses.
+        let line = serde_json::to_string(&result.phases).expect("serialises");
+        for key in [
+            "hash", "write", "sync", "rename", "load", "parse", "submit", "other",
+        ] {
+            assert!(
+                line.contains(&format!("\"save_phase_{key}_ms\":[")),
+                "{line}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -369,6 +369,41 @@ impl Drop for OpenAttempt {
 #[cfg(test)]
 pub(crate) type SaveLoadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// The parser, marking the save-phase clock around the parse (task #207). The time since the
+/// previous mark is the index side's load; the parse itself ends at the second mark. Used
+/// only when `--bench-save-list` armed the timing, and delegates unchanged.
+struct TimedParser<'a>(&'a CommonMarkParser);
+
+impl serat_core::NoteParser for TimedParser<'_> {
+    fn parse(
+        &self,
+        path: &VaultPath,
+        bytes: &[u8],
+    ) -> Result<serat_core::ParsedNote, serat_core::ParseError> {
+        use serat_vault::save_phases::{SavePhase, mark};
+        mark(SavePhase::Load);
+        let parsed = serat_core::NoteParser::parse(self.0, path, bytes);
+        mark(SavePhase::Parse);
+        parsed
+    }
+}
+
+/// The index writer, marking the save-phase clock once the submit returns: the time since
+/// the parse ended is building the op and queueing it (task #207).
+struct TimedWriter<'a>(&'a dyn serat_core::IndexWriter);
+
+impl serat_core::IndexWriter for TimedWriter<'_> {
+    fn submit(&self, op: serat_core::IndexOp) -> Result<(), serat_core::IndexError> {
+        let sent = self.0.submit(op);
+        serat_vault::save_phases::mark(serat_vault::save_phases::SavePhase::Submit);
+        sent
+    }
+
+    fn flush(&self) -> Result<(), serat_core::IndexError> {
+        self.0.flush()
+    }
+}
+
 /// The vault as the save path's `NoteSource`, calling the hook before each load.
 #[cfg(test)]
 struct LoadHook<'a> {
@@ -2279,6 +2314,12 @@ impl AppState {
     /// re-reads on the event sees the save. Calling `notifier().changed()` at the submit
     /// would announce a state the reader cannot see yet.
     fn submit_to_index(&self, open: &OpenVault, path: &VaultPath) {
+        // Task #207: one load of the arm flag serves the whole function (report-only).
+        let armed = serat_vault::save_phases::armed();
+        if armed {
+            // The write's return and the bookkeeping before here are not the load's.
+            serat_vault::save_phases::mark(serat_vault::save_phases::SavePhase::Other);
+        }
         // A save is writer activity: the background index check waits for quiet (task #69).
         open.indexer.activity().touch();
         let vault = &*open.vault;
@@ -2293,6 +2334,10 @@ impl AppState {
             };
             handle.writer()
         };
+        if armed {
+            // The slot's lock wait is not the load's either.
+            serat_vault::save_phases::mark(serat_vault::save_phases::SavePhase::Other);
+        }
         // Tests hold a save inside its load, which is where the lock used to be held.
         #[cfg(test)]
         let hooked = self
@@ -2314,7 +2359,20 @@ impl AppState {
         // write that reached disk must never be reported as failed because the
         // index writer was busy. It is still counted (F-382), which is the
         // difference between "swallowed" and "unobserved".
-        match serat_index::apply(&writer, source, &parser, vault, path) {
+        // `--bench-save-list` arms the per-phase timing (task #207, report-only); the product
+        // path reads one relaxed flag here and takes the first arm unchanged.
+        let applied = if armed {
+            serat_index::apply(
+                &TimedWriter(&writer),
+                source,
+                &TimedParser(&parser),
+                vault,
+                path,
+            )
+        } else {
+            serat_index::apply(&writer, source, &parser, vault, path)
+        };
+        match applied {
             Ok(()) => {
                 self.save_submitted.fetch_add(1, Ordering::Relaxed);
             }
