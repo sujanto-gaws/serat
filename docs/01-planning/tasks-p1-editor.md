@@ -154,6 +154,7 @@ owner: lead
 | 206 | `[P1/design] ADR-0019 amendment restated: n ≥ 20 is the operative condition, class p95 the guaranteed bound; windows_vault.rs no longer marked planned` (NFR-MNT-01, NFR-PRF-03, FR-VLT-12; ADR-0018, ADR-0019) | architect | 205 | **merged** 5252788 |
 | 207 | `[P1/test] prf03 per-save phase timings on the bench exit line; runtime-armed recorder; TC-184; report item (a-5)` (NFR-PRF-03, NFR-PRF-08, C-06; ADR-0008, ADR-0017, ADR-0019, ADR-0020) | test-engineer | 205 | **merged** e1c25dc |
 | 208 | `[P1/docs] Ratify RISK-017 (checkpoint flush contention on Windows); PRD v1.14 cross-references` (NFR-PRF-03, NFR-PRF-08; ADR-0019; RISK-013, RISK-017) | product-analyst | 201 | in review, branch task/p1-208-risk-017-ratify |
+| 209 | `[P1/test] arm() source-scan test records forward-slash paths so it passes on windows-latest (ci run 478 red on e1c25dc); also makes the webview-reach guard check on Windows` (NFR-PRF-03, NFR-PRF-08; ADR-0017; TC-184) | test-engineer | 207 | **merged** 192af09 |
 | 153 | `[P1/test] Fixture directories leaked in /dev/shm; SIGBUS reproduces on tmpfs` | test-engineer | 124 | **merged** 6c98e69 (2 rounds) |
 | 154 | `[P1/impl] Cross-process single-writer guard in serat-index (two writers on one index.db fault each other)` (NFR-REL-01, ADR-0001) | rust-core-dev | 153 | **merged** 57273cf (2 rounds; A-02 sentence ec3bf71) |
 | 155 | `[P1/impl] A held index lock is a wait with bounded retry: OpeningReason::IndexHeldByAnotherProcess` (NFR-REL-01/02, US-07) | tauri-app-dev + vue-frontend-dev | 154 | **merged** ceb4048 |
