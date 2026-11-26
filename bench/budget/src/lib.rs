@@ -6534,10 +6534,10 @@ mod tests {
     }
     // ---- Task #205: ADR-0019 amendment 2026-11-26, the one-outlier excusal (TC-183) ----
 
-    /// A 1,000-save series: every save 12 ms; `over` are (index, ms) of the outliers;
-    /// `overlapped` is how many saves overlapped a checkpoint (the first indices of the
-    /// series, at 20 ms, plus every outlier whose kind is not `No`); `kinds` sets the kind
-    /// of named indices.
+    /// A 1,000-save series: every save 12 ms except the outliers in `over`, each
+    /// (index, ms, kind); an outlier whose kind is not `No` counts as overlapped.
+    /// `overlapped_n` is the size of the overlapped class: it is topped up to that many
+    /// saves, outliers included, with ordinary 20 ms saves from the start of the series.
     fn prf03_series(
         over: &[(usize, f64, save_tags::CkKind)],
         overlapped_n: usize,
