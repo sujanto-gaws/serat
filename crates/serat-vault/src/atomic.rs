@@ -235,20 +235,34 @@ mod tests {
         "write_race_tests.rs",
     ];
 
-    /// The code of one source file as the scan sees it: line comments stripped and the
-    /// inline test module (a column-0 `mod x {` after a `#[cfg(test)]`) cut off.
+    /// The code of one source file as the scan sees it: line comments stripped (a `//`
+    /// at the start of a line or after whitespace, so a URL in a string survives) and
+    /// every column-0 test module (`mod x {` whose `#[cfg(..)]` line mentions `test`)
+    /// skipped up to its closing column-0 `}`. Scanning continues after it, and a module
+    /// cfg'd on anything else (a platform, a feature) is scanned as ordinary code.
     fn production_code(text: &str) -> String {
         let lines: Vec<&str> = text.lines().collect();
         let mut out = String::new();
+        let mut in_test_mod = false;
         for (i, line) in lines.iter().enumerate() {
-            if line.starts_with("mod ") && line.trim_end().ends_with('{') {
-                assert!(
-                    i > 0 && lines[i - 1].trim_start().starts_with("#[cfg("),
-                    "{line}"
-                );
-                break;
+            if in_test_mod {
+                in_test_mod = *line != "}";
+                continue;
             }
-            out.push_str(line.split("//").next().unwrap_or(""));
+            if line.starts_with("mod ")
+                && line.trim_end().ends_with('{')
+                && i > 0
+                && lines[i - 1].trim_start().starts_with("#[cfg(")
+                && lines[i - 1].contains("test")
+            {
+                in_test_mod = true;
+                continue;
+            }
+            let code = match line.find("//") {
+                Some(at) if at == 0 || line[..at].ends_with(char::is_whitespace) => &line[..at],
+                _ => line,
+            };
+            out.push_str(code);
             out.push('\n');
         }
         out
@@ -256,16 +270,24 @@ mod tests {
 
     /// NFR-PRF-03, ADR-0019 second amendment guard (i), TC-185: the fsync pin only sees
     /// flushes routed through [`super::sync_all`], so that helper must be the only place
-    /// in the crate's production code that flushes. A raw `.sync_all(` or `.sync_data(`
-    /// elsewhere, or a second one in `atomic.rs`, changes what the `sync` and `rename`
-    /// phases mean without the sequence test noticing; this fails it instead.
+    /// in the crate's production code that flushes. A method call (`.sync_all(`), a
+    /// qualified one (`File::sync_data(`), `fdatasync(`, `fsync(` or `FlushFileBuffers(`
+    /// anywhere else, or a second flush in `atomic.rs`, changes what the `sync` and
+    /// `rename` phases mean without the sequence test noticing; this fails it instead.
+    /// A bare `sync_all(` call is the helper itself, allowed only in `atomic.rs`.
     #[test]
     fn the_logging_helper_is_the_only_place_the_vault_flushes_to_disk() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found = Vec::new();
         for entry in std::fs::read_dir(&src).expect("src dir").flatten() {
             let path = entry.path();
-            let name = entry.file_name().to_string_lossy().replace('\\', "/");
+            // `read_dir` is not recursive: a subdirectory would be unscanned, so refuse it.
+            assert!(
+                !path.is_dir(),
+                "{} is a directory; make this scan recursive",
+                path.display()
+            );
+            let name = entry.file_name().to_string_lossy().into_owned();
             if path.extension().is_none_or(|e| e != "rs")
                 || TEST_ONLY_FILES.contains(&name.as_str())
             {
@@ -279,9 +301,23 @@ mod tests {
                 code.replace_range(at..end, "");
             }
             for (n, line) in code.lines().enumerate() {
-                for needle in [".sync_all(", ".sync_data(", "::fsync(", "FlushFileBuffers("] {
-                    if line.contains(needle) {
-                        found.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                for word in [
+                    "sync_all",
+                    "sync_data",
+                    "fdatasync",
+                    "fsync",
+                    "FlushFileBuffers",
+                ] {
+                    let call = format!("{word}(");
+                    for (at, _) in line.match_indices(&call) {
+                        let before = line[..at].chars().next_back();
+                        let bare_helper_call =
+                            name == "atomic.rs" && word == "sync_all" && before != Some('.');
+                        let part_of_a_name =
+                            before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        if !part_of_a_name && !bare_helper_call {
+                            found.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                        }
                     }
                 }
             }
