@@ -117,6 +117,8 @@ mod tests {
         IndexLock::acquire(&index).expect("free again after the holder is gone");
     }
 
+    /// On Linux this passes without the `Drop` impl too: the lag it guards against is
+    /// Windows-only, so it proves the Windows improvement only on a Windows runner.
     #[test]
     fn drop_then_reacquire_succeeds_at_once_in_a_tight_loop() {
         let dir = tempfile::tempdir().expect("dir");

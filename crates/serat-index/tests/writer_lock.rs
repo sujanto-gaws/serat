@@ -216,6 +216,15 @@ fn spawn_child(test: &str, dir: &Path) -> std::process::Child {
         .expect("spawn")
 }
 
+/// A child that matched no test exits 0 having run nothing; require that it ran one.
+fn assert_ran_one(out: &std::process::Output) {
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("1 passed"),
+        "the child ran no test (did `--exact` match?): {text}"
+    );
+}
+
 /// Deterministic: the parent holds a writer, a second process opens the same vault and
 /// must be refused. Without the lock the child is admitted and exits non-zero.
 #[test]
@@ -233,6 +242,7 @@ fn two_processes_a_second_process_is_refused_by_a_live_writer() {
         "the other process was not refused: {:?}",
         out.status
     );
+    assert_ran_one(&out);
     drop(held);
 }
 
@@ -249,11 +259,13 @@ fn two_processes_a_second_process_is_admitted_once_the_writer_is_dropped() {
         .wait_with_output()
         .expect("child");
     assert!(refused.status.success(), "not refused while held");
+    assert_ran_one(&refused);
     drop(held);
     let admitted = spawn_child("child_expects_to_be_admitted", dir.path())
         .wait_with_output()
         .expect("child");
     assert!(admitted.status.success(), "refused after the drop");
+    assert_ran_one(&admitted);
 }
 
 /// Two processes race to open an index-less vault: neither may die of a signal (SIGBUS
