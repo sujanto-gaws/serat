@@ -132,9 +132,7 @@ const SCENARIOS: Scenario[] = [
 test.describe("scenarios", () => {
   for (const sc of SCENARIOS) {
     test(`NFR-PRF-02 scenario [${sc.id}]: ${sc.title}; >= 95% painted in the first frame, 5,000-line note`, async ({ page }) => {
-      // Task #221: normal duration is about 2.5 min (17 min step / 7 tests, minus unit and controls); 300 s is 2x.
-      // 420 s x 7 made a stalled run last 49+ min (budgets run 465).
-      test.setTimeout(300_000);
+      test.setTimeout(420_000); // the step is bounded by globalTimeout (playwright.config.ts, task #221), not by this
       const startedAt = Date.now();
       console.log(`SCENARIO-PROGRESS [${sc.id}] started`);
       const text = fixtureVariant(buildFixtureNote(), sc.variant ?? "lf");

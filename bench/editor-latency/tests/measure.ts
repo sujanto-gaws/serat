@@ -335,6 +335,18 @@ export function p95FramesToPaint(scores: KeystrokeScore[]): number {
 
 const R_WARMUP_FRAMES = 121; // 120 deltas
 
+/** Task #221: bounds a page-side wait on the Node side. A page whose requestAnimationFrame has stopped never settles
+ * an in-page promise, and `locator.evaluate`'s `{ timeout }` only bounds the locator wait, so the page promise is
+ * raced against a Node timer. The rejection says it is a harness stall, not a latency verdict. Wraps setup and
+ * settle waits only; no measured interval is inside it. */
+export async function withHarnessDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what}: page-side wait exceeded ${ms} ms (rAF stalled?); harness timeout, not a latency verdict`)), ms);
+  });
+  try { return await Promise.race([work, deadline]); } finally { clearTimeout(timer); }
+}
+
 export interface Capture {
   refreshIntervalMs: number;
 }
@@ -347,7 +359,7 @@ export interface Capture {
  * install on the same document.
  */
 export async function installCapture(page: Page, src: string = namespaceSource()): Promise<Capture> {
-  const refreshIntervalMs = await page.evaluate(
+  const refreshIntervalMs = await withHarnessDeadline(page.evaluate(
     async ({ nsSrc, warmup }) => {
       const w = window as unknown as Record<string, any>;
       if (w.__seratCapture) throw new Error("installCapture called twice on one document");
@@ -376,7 +388,7 @@ export async function installCapture(page: Page, src: string = namespaceSource()
       return cap.R;
     },
     { nsSrc: src, warmup: R_WARMUP_FRAMES },
-  );
+  ), 30_000, "installCapture warmup frames");
   // Validity condition: the same function the page carries, run on the measured R.
   loadNamespace(src).assertRefreshIntervalValid(refreshIntervalMs);
   return { refreshIntervalMs };

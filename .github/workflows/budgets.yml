@@ -690,7 +690,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p out/dumps
-          npx playwright test --project=scenarios --workers=1 2>&1 | tee out/run-scenarios.log || true
+          npx playwright test --project=scenarios --workers=1 2>&1 | tee out/run-scenarios.log
+          echo "SCENARIOS-EXIT ${PIPESTATUS[0]}" | tee -a out/run-scenarios.log
+          true
       - name: Summary (engine, positive-strict margin, subject verdicts)
         if: always()
         working-directory: bench/editor-latency
@@ -714,6 +716,17 @@ jobs:
             echo '```'
             grep -E '^SUBJECT ' out/run.log | grep -oE '\[(start|middle|end)\]|(strict|swept) \(caret|verdict [A-Z]+; [0-9.]+% on time' | sed -E 's/ \(caret//' | paste -sd' ' | sed 's/ \[/\n[/g' || true
             echo '```'
+            echo
+            if [ -f out/run-scenarios.log ]; then
+              echo
+              echo "Scenarios step (report only):"
+              echo '```'
+              grep -E '^SCENARIOS-EXIT' out/run-scenarios.log || echo "SCENARIOS-EXIT missing: the step was killed before it finished"
+              grep -oE '^SCENARIO-PROGRESS \[[^]]+\] started' out/run-scenarios.log | sed -E 's/ started$//' | while read -r _ id; do
+                grep -qF "$id finished" out/run-scenarios.log || echo "started, never finished: $id"
+              done
+              echo '```'
+            fi
             echo
             echo "No SUBJECT lines above means the unit or a control failed first and the subject was skipped; see run.log in the artifact."
           } >> "$GITHUB_STEP_SUMMARY"
