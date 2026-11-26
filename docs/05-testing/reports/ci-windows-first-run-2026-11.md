@@ -151,7 +151,7 @@ Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 m
 
   Run 445's overlapped n of 264 is not a recorded figure for that run (its class is irrelevant to the verdict); the value is a placeholder. The new verdict has not run on a hosted runner. A finding: the n >= 20 guard and the class-p95 check are mutually redundant (with exactly one save over, a class of n <= 19 has p95 equal to the outlier, and a class of n >= 20 has p95 at most the second-largest value); mutating either alone is not caught, both together are, so both stay as the ADR wrote them.
 
-* (a-5) **Task #207, TC-184: prf03's per-phase timings, the Linux reproduction, and a recommendation for the architect (2026-11-26; not decided, no product constant or verdict changed).** The evidence: hosted outliers 442 (51.5 ms, checkpoint=yes), 445 (76.5 ms, no), 447 (164.5 ms, size-bound), 450 (84.1 ms, checkpoint=no merge=no slow-commit=yes, 2 checkpoint runs, 224 of 1,000 saves overlapped) and 451 (62.7 ms, checkpoint=no merge=no, 201 overlapped); all-saves p95 7 to 16 ms; 10 INDETERMINATE in 17 hosted runs; the unflagged class is 3 of the last 5 straddles and the #205 excusal does not cover it. The slow-commit tag is non-discriminating (about 97% carry it) and FTS5 merge never correlates. #196's open hypothesis: the save's own write or `sync_all` queues behind unrelated I/O. Nothing in the tags could test it, so the report now splits the asserted interval by phase (definitions, wire format, product-path cost and tests: `budget-harness.md` *per-phase timings*, TC-184).
+* (a-5) **Task #207, TC-184: prf03's per-phase timings, the Linux reproduction, and a recommendation for the architect (2026-11-26; no product constant or verdict changed). Closed by the architect's ruling, task #211, at the end of this item.** The evidence: hosted outliers 442 (51.5 ms, checkpoint=yes), 445 (76.5 ms, no), 447 (164.5 ms, size-bound), 450 (84.1 ms, checkpoint=no merge=no slow-commit=yes, 2 checkpoint runs, 224 of 1,000 saves overlapped) and 451 (62.7 ms, checkpoint=no merge=no, 201 overlapped); all-saves p95 7 to 16 ms; 10 INDETERMINATE in 17 hosted runs; the unflagged class is 3 of the last 5 straddles and the #205 excusal does not cover it. The slow-commit tag is non-discriminating (about 97% carry it) and FTS5 merge never correlates. #196's open hypothesis: the save's own write or `sync_all` queues behind unrelated I/O. Nothing in the tags could test it, so the report now splits the asserted interval by phase (definitions, wire format, product-path cost and tests: `budget-harness.md` *per-phase timings*, TC-184).
 
   **Linux, release, 20k vault, `--profile ci`, three runs, 10,000 saves** (supporting evidence only, ADR-0019; `xvfb-run`, 4 cores; the spawned binary is the shipped `cargo build --release -p serat-app`). All-saves p95 4.3 (3,000 saves), 3.2 and 3.5 ms (3,500 each); every run had **exactly one** save over 50 ms, 72.5, 96.8 and 78.4 ms (the run-1 outlier was found in the harness JSON, the other two in the raw exit line), **all three `checkpoint=size-bound`, slow-commit yes, none unflagged**. Phase of those three: run 1 `rename` 70.7 of 72.5 ms (the rename and, on Linux, the directory fsync), run 2 `sync` 93.1 of 96.8, run 3 `sync` 77.1 of 78.4; hash, write, load, parse and submit were at most 2.2 ms in each. Per-phase over runs 2 and 3 (7,000 saves, from the raw arrays):
 
@@ -176,6 +176,32 @@ Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 m
 
   **Not verified.** Any hosted number: the phase arrays have not run on `windows-latest`, and Windows differs where it matters (`rename` is `MoveFileEx` with no directory fsync there, `sync` is `FlushFileBuffers`, and a scanner can sit in `write` or `rename`). The armed instrumentation's own cost was reasoned (eight clock reads and two trait-object hops per save, a few hundred nanoseconds), not A/B timed, and the unarmed product path costs five relaxed atomic loads per `write_file` by reading, also untimed. Run 1's raw arrays were not captured (the harness JSON has the p95s and the over-limit breakdown only), so the table above is the two later runs; the 10,000-save totals count all three. The size-bound class holding the disk is a hypothesis the data fits (all three outliers overlapped one), not a mechanism shown.
 
+  **Ruling, task #211 (architect, 2026-11-26): option (a) adopted, with the attributed class widened to the vault-I/O phases (write, sync and rename).** This is ADR-0019's second amendment of 2026-11-26. It is planned until task #213 implements it (`SaveTags::excusal`, `Excusal::VaultIo`, and the fsync-count pin in serat-vault). Until then the harness still prints INDETERMINATE for the shapes below.
+
+  The evidence is three hosted `windows-latest` runs, all with 4 cores, scanner OFF, `--profile ci` and 1,000 saves. Each had 2 checkpoint runs, 2 idle wake-ups skipped below the frame floor and 0 FTS5 probe failures. Slow-commit was set on 999 to 1,000 samples in each, so it is saturated:
+
+  | Run (head) | Verdict today | All-saves p95 / max (ms) | Over-limit save | Phases of that save (ms) | Sync + rename | Write + sync + rename; remainder | Tags | Under the ruling |
+  |---|---|---|---|---|---|---|---|---|
+  | 453 (`e1c25dc`) | PASS | 16.0 / 28.4 | none | phase p95: hash 0.25, write 0.53, sync 14.99, rename 0.55, load 0.32, parse 0.53, submit 0.00, other 0.01; checkpoint overlap p95 16.3 (n=414) vs 2.7 (n=586) | n/a | n/a | n/a | PASS (unchanged) |
+  | 454 (`192af09`) | INDETERMINATE | 15.3 / 106.4 | sample 562, 106.4 | hash 0.1, write 0.3, sync 105.4, rename 0.4, load 0.2, parse 0.2, submit 0.0, other 0.0 | 99.1% (sync alone) / 99.4% | 99.7%; 0.3 ms ≤ 15.3 | checkpoint=no merge=no slow-commit=yes | **PASS, vault-I/O excused** (either class) |
+  | 455 (`402811a`) | INDETERMINATE | 15.1 / 134.8 | sample 394, 134.8 | hash 0.1, write 43.6, sync 89.4, rename 0.7, load 0.2, parse 0.7, submit 0.0, other 0.0 | 66.8% | 99.3% as reported (133.7 of 134.8 on the one-decimal figures); 1.1 ms ≤ 15.1 | checkpoint=no merge=no slow-commit=yes | **PASS, vault-I/O excused** (it would stay INDETERMINATE under sync plus rename only) |
+
+  **How the conditions above read on these runs:**
+  - (a)'s conditions: every unflagged outlier is ≥ 90% in vault I/O, which is met in the widened form. The rest of each series is within the limit. The all-saves p95 is 15.1 to 16.0 ms, inside the recorded 13 to 16 ms.
+  - (c)'s triggers: no outlier is mostly in hash, load, parse, submit or other. There is one outlier per run, never two.
+
+  **Why `write` counts.** It runs only filesystem syscalls on the vault: the create on NTFS, a stat and `write_all` into the cache. Lock waits land in `hash`, and the bytes and the hash exist before `write` starts. The scanner that #207 named as `write`'s alternative explanation was OFF. Run 455's CPU phases stayed at their usual cost while its `sync` also stalled for 89.4 ms.
+
+  **The rule.** For prf03 only, a straddling series is determinate when:
+  - exactly one save is over the limit (one excused save in total, shared with the checkpoint excusal, which is tried first);
+  - it carries the phase arrays;
+  - `(write + sync + rename) / ms ≥ 0.90`, with `other` counting against;
+  - `ms − (write + sync + rename)` is no more than the all-saves p95;
+  - the series has n ≥ 20.
+
+  The verdict is still the all-saves p95 (C-06).
+
+  The guards from the conditions above are kept: (i) the fsync-count pin, (ii) the shared cap, (iii) `other` counting against the share. The slow-commit tag stays on the exit line as reported-only, and a split whose without-class has fewer than 20 saves is printed as saturated. Rejected options and consequences are in ADR-0019's second amendment. **Not verified:** a hosted run of the new verdict, which is owed after #213.
 * (b) The single max is 617.4 ms and 834.1 ms, over 500 ms. FR-VLT-04 gates p95, not max; the tail is probably the same overlap, but the log does not attribute the max (1 of the 17 slow singles in run 418 had no overlap).
 * (c) Scanner-on Windows is still unmeasured; no budget has that figure.
 * (d) Run 316's p95 of 615.3 ms was on windows-2025 with 2 cores; 4 cores may account for part of the 615 to 413 ms difference. The two runs do not separate runner from code.
