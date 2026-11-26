@@ -184,13 +184,15 @@ Both heads read the same way: 0 incomplete and 0 RESTART checkpoints. The FTS5 m
   |---|---|---|---|---|---|---|---|---|
   | 453 (`e1c25dc`) | PASS | 16.0 / 28.4 | none | phase p95: hash 0.25, write 0.53, sync 14.99, rename 0.55, load 0.32, parse 0.53, submit 0.00, other 0.01; checkpoint overlap p95 16.3 (n=414) vs 2.7 (n=586) | n/a | n/a | n/a | PASS (unchanged) |
   | 454 (`192af09`) | INDETERMINATE | 15.3 / 106.4 | sample 562, 106.4 | hash 0.1, write 0.3, sync 105.4, rename 0.4, load 0.2, parse 0.2, submit 0.0, other 0.0 | 99.1% (sync alone) / 99.4% | 99.7%; 0.3 ms ≤ 15.3 | checkpoint=no merge=no slow-commit=yes | **PASS, vault-I/O excused** (either class) |
-  | 455 (`402811a`) | INDETERMINATE | 15.1 / 134.8 | sample 394, 134.8 | hash 0.1, write 43.6, sync 89.4, rename 0.7, load 0.2, parse 0.7, submit 0.0, other 0.0 | 66.8% | 99.3% as reported (133.7 of 134.8 on the one-decimal figures); 1.1 ms ≤ 15.1 | checkpoint=no merge=no slow-commit=yes | **PASS, vault-I/O excused** (it would stay INDETERMINATE under sync plus rename only) |
+  | 455 (`402811a`) | INDETERMINATE | 15.1 / 134.8 | sample 394, 134.8 | hash 0.1, write 43.6, sync 89.4, rename 0.7, load 0.2, parse 0.7, submit 0.0, other 0.0 | 66.8% | 99.2% (133.7 of 134.8 on the one-decimal figures); 1.1 ms ≤ 15.1 | checkpoint=no merge=no slow-commit=yes | **PASS, vault-I/O excused** (it would stay INDETERMINATE under sync plus rename only) |
+
+  The remainder is the sample's ms minus its write, sync and rename, on the one-decimal figures. The rounded phases do not sum exactly to the sample: run 454's sum to 106.6 ms against 106.4.
 
   **How the conditions above read on these runs:**
   - (a)'s conditions: every unflagged outlier is ≥ 90% in vault I/O, which is met in the widened form. The rest of each series is within the limit. The all-saves p95 is 15.1 to 16.0 ms, inside the recorded 13 to 16 ms.
   - (c)'s triggers: no outlier is mostly in hash, load, parse, submit or other. There is one outlier per run, never two.
 
-  **Why `write` counts.** It runs only filesystem syscalls on the vault: the create on NTFS, a stat and `write_all` into the cache. Lock waits land in `hash`, and the bytes and the hash exist before `write` starts. The scanner that #207 named as `write`'s alternative explanation was OFF. Run 455's CPU phases stayed at their usual cost while its `sync` also stalled for 89.4 ms.
+  **Why `write` counts.** It runs only filesystem syscalls on the vault: the create on NTFS, a stat and `write_all` into the cache. Lock waits land in `hash`. The bytes and the hash exist before `write` starts; its only computation is the temp-name nonce (one hash, nanoseconds), and a name collision retries the create inside `write`. The scanner that #207 named as `write`'s alternative explanation was OFF. Run 455's CPU phases stayed at their usual cost while its `sync` also stalled for 89.4 ms.
 
   **The rule.** For prf03 only, a straddling series is determinate when:
   - exactly one save is over the limit (one excused save in total, shared with the checkpoint excusal, which is tried first);
