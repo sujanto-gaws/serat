@@ -1274,9 +1274,10 @@ fn a_same_mtime_rewrite_of_a_different_size_is_reindexed() {
 
 #[test]
 fn a_same_mtime_same_size_rewrite_inside_the_window_is_reindexed() {
-    // Files stamped now, then indexed: the rebuild's window starts at its walk, so the
-    // stamp is inside it. A rewrite of the same length that keeps the stamp is the case
-    // a 2 s mtime tick produces.
+    // The window start is pinned to the stamp itself, so "inside" does not depend on how
+    // long a slow runner takes between stamping the file and the rebuild's own clock
+    // read (that gap was the flake, task #203, TC-182). A rewrite of the same length
+    // that keeps the stamp is the case a 2 s mtime tick produces.
     let dir = tempfile::tempdir().expect("temp");
     let root = dir.path().join("vault");
     let index = dir.path().join("index");
@@ -1291,6 +1292,17 @@ fn a_same_mtime_same_size_rewrite_inside_the_window_is_reindexed() {
     let parser = LineParser::default();
     rebuild(&DiskVault::new(&root), &parser, &root, &index).expect("rebuild");
     let handle = IndexHandle::open(&index).expect("open");
+    let stamp_ms = i64::try_from(
+        stamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_millis(),
+    )
+    .expect("fits");
+    handle
+        .writer()
+        .set_caught_up_from(stamp_ms)
+        .expect("window");
     let before = hash_of(&index, "a.md");
     rewrite_keeping_mtime(&root, "a.md", "# A\nalphb\n", stamp);
     let entries = walk(&root);
@@ -1304,6 +1316,49 @@ fn a_same_mtime_same_size_rewrite_inside_the_window_is_reindexed() {
             &DiskVault::new(&root),
             &parser,
             &entries,
+            CatchUp::PathsAndMtime,
+            Some(now()),
+        )
+        .expect("catch up");
+
+    assert_eq!(outcome.upserted, 1, "{outcome:?}");
+    assert_ne!(hash_of(&index, "a.md"), before);
+    handle.close().expect("close");
+}
+
+#[test]
+fn a_same_mtime_same_size_rewrite_exactly_on_the_window_boundary_is_reindexed() {
+    // The comparison is inclusive: an mtime equal to caught_up_from_ms - 2000 is a
+    // candidate (task #203, TC-182). The stamp is 10 s old so the pinned window start
+    // (stamp + 2000 ms) is not ahead of the clock, which would be treated as unset.
+    let dir = tempfile::tempdir().expect("temp");
+    let root = dir.path().join("vault");
+    let index = dir.path().join("index");
+    write(&root, "a.md", "# A\nalpha\n");
+    backdate_by(&root, "a.md", 10);
+    let stamp = disk_mtime(&root, "a.md");
+    let parser = LineParser::default();
+    rebuild(&DiskVault::new(&root), &parser, &root, &index).expect("rebuild");
+    let handle = IndexHandle::open(&index).expect("open");
+    let stamp_ms = i64::try_from(
+        stamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_millis(),
+    )
+    .expect("fits");
+    handle
+        .writer()
+        .set_caught_up_from(stamp_ms + 2000)
+        .expect("window");
+    let before = hash_of(&index, "a.md");
+    rewrite_keeping_mtime(&root, "a.md", "# A\nalphb\n", stamp);
+
+    let outcome = Reconciler::new(&handle)
+        .catch_up(
+            &DiskVault::new(&root),
+            &parser,
+            &walk(&root),
             CatchUp::PathsAndMtime,
             Some(now()),
         )
