@@ -266,8 +266,9 @@ struct BenchmarkExitReport<'a> {
 }
 
 /// One array per save phase (task #207), each parallel to `save_submitted_ms`. `other` is the
-/// interval's own elapsed time less the seven measured phases (the open-vault lock, the
-/// per-path lock hand-off, echo recording, the clock reads themselves), never negative.
+/// interval's own elapsed time less every marked phase (echo recording, the clock reads
+/// themselves), plus what was marked `Other` (the write's return and the index-handle slot's
+/// lock wait). The open-vault and per-path lock waits are in `hash`.
 #[derive(Debug, Default, Serialize)]
 struct SavePhaseSeries {
     save_phase_hash_ms: Vec<f64>,
@@ -288,6 +289,7 @@ impl SavePhaseSeries {
     ) {
         let ms = |d: &std::time::Duration| d.as_secs_f64() * 1000.0;
         let sum: f64 = spent.iter().map(ms).sum();
+        let other = ms(&spent[7]);
         self.save_phase_hash_ms.push(ms(&spent[0]));
         self.save_phase_write_ms.push(ms(&spent[1]));
         self.save_phase_sync_ms.push(ms(&spent[2]));
@@ -295,7 +297,8 @@ impl SavePhaseSeries {
         self.save_phase_load_ms.push(ms(&spent[4]));
         self.save_phase_parse_ms.push(ms(&spent[5]));
         self.save_phase_submit_ms.push(ms(&spent[6]));
-        self.save_phase_other_ms.push((total_ms - sum).max(0.0));
+        self.save_phase_other_ms
+            .push((total_ms - sum).max(0.0) + other);
     }
 }
 
@@ -1967,6 +1970,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The non-test text of every `.rs` file under the workspace's `crates/` and `bench/`
+    /// (a file's test module and everything after it is dropped), as `(path, text)`.
+    fn product_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("readable dir").flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !matches!(name.as_str(), "target" | "node_modules" | "vaults" | "out") {
+                        walk(&path, out);
+                    }
+                } else if name.ends_with(".rs") {
+                    let text = std::fs::read_to_string(&path).expect("utf-8 source");
+                    let cut = text.find("\n#[cfg(test)]\nmod ").unwrap_or(text.len());
+                    out.push((path.display().to_string(), text[..cut].to_owned()));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut out = Vec::new();
+        for sub in ["crates", "bench"] {
+            walk(&root.join(sub), &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_save_phase_recorder_is_armed_only_by_run_save_benchmark_and_that_only_from_argv() {
+        // Task #207, architecture 3.1.1 invariant, ADR-0017, T-02: no Tauri command, IPC
+        // message or webview action reaches `arm()`. Needles are assembled so this test's
+        // own text is not a hit.
+        // A call, a plain import or a name in a braced import; `armed` is a different name.
+        let arm = concat!("save_phases", "::arm(");
+        let names_arm = |text: &str| {
+            text.contains(arm)
+                || text.contains(concat!("save_phases", "::arm;"))
+                || text.contains(concat!("save_phases", "::arm,"))
+                || text
+                    .match_indices(concat!("save_phases", "::{"))
+                    .any(|(at, _)| {
+                        let rest = &text[at..];
+                        let braced = &rest[..rest.find('}').unwrap_or(rest.len())];
+                        braced
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|word| word == "arm")
+                    })
+        };
+        let sources = product_sources();
+        let hits: Vec<&(String, String)> = sources
+            .iter()
+            .filter(|(path, text)| {
+                !path.ends_with("serat-vault/src/save_phases.rs") && names_arm(text)
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "arm() is referenced from exactly one file: {:?}",
+            hits.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        let (path, text) = hits[0];
+        assert!(path.ends_with("serat-app/src/lib.rs"), "{path}");
+        assert_eq!(text.matches(arm).count(), 1, "exactly one call site");
+        // ... and it sits inside run_save_benchmark's body.
+        let start = text.find("fn run_save_benchmark(").expect("the driver");
+        let end = start
+            + text[start..]
+                .find("\n}\n")
+                .expect("the driver's closing brace");
+        assert!(
+            text[start..end].contains(arm),
+            "the one call is in run_save_benchmark"
+        );
+        // run_save_benchmark is called from one non-test place, fed by the boot argument.
+        let call = "run_save_benchmark(";
+        let calls: usize = sources.iter().map(|(_, t)| t.matches(call).count()).sum();
+        assert_eq!(calls, 2, "the definition and one call in run()");
+        assert!(
+            text.contains("Some(list_path) => run_save_benchmark(&state, list_path)")
+                && text.contains("state.boot.bench_save_list"),
+            "the call is the --bench-save-list branch of run()"
+        );
+        // `bench_save_list` is set from argv in cli.rs and nowhere else.
+        for (path, text) in &sources {
+            let sets =
+                text.contains("bench_save_list = Some") || text.contains("bench_save_list: Some");
+            assert_eq!(
+                sets,
+                path.ends_with("serat-app/src/cli.rs"),
+                "only cli.rs's argv parser sets bench_save_list: {path}"
+            );
+        }
+        let cli = sources
+            .iter()
+            .find(|(p, _)| p.ends_with("serat-app/src/cli.rs"))
+            .expect("cli.rs");
+        assert!(
+            cli.1.contains(
+                "boot.bench_save_list = Some(PathBuf::from(value(\"--bench-save-list\")?))"
+            ),
+            "set from the --bench-save-list argument"
+        );
+        // Nothing the webview can call mentions it: commands.rs and ipc.rs never name the driver.
+        for (path, text) in &sources {
+            if path.ends_with("serat-app/src/commands.rs") || path.contains("/ipc") {
+                assert!(
+                    !text.contains("run_save_benchmark") && !text.contains("save_phases"),
+                    "a command or IPC file reaches the recorder: {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn run_save_benchmark_reports_every_phase_parallel_to_the_samples_and_inside_each_one() {
         // Task #207, NFR-PRF-03 (report-only, ADR-0019): eight arrays, one entry per
@@ -1995,7 +2111,7 @@ mod tests {
         for i in 0..n {
             let sum: f64 = all.iter().map(|s| s[i]).sum();
             assert!(
-                (sum - result.submitted_ms[i]).abs() < 0.01 || sum >= result.submitted_ms[i],
+                (sum - result.submitted_ms[i]).abs() < 0.01,
                 "phases plus other cover the sample: {sum} vs {}",
                 result.submitted_ms[i]
             );

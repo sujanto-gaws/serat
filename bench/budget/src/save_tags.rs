@@ -25,11 +25,11 @@
 
 //!
 //! **Phases (task #207).** Beside the tags, the application reports how long each phase of
-//! the save path took inside the same interval: `hash` (path lock, base read and hash
-//! check), `write` (temp file create and `write_all`), `sync` (the temp file's fsync),
+//! the save path took inside the same interval: `hash` (the open-vault and per-path locks, base read and
+//! hash check), `write` (temp file create and `write_all`), `sync` (the temp file's fsync),
 //! `rename` (rename and directory sync), `load` (the index side's re-read and hash),
-//! `parse`, `submit` (op build and queue send) and `other` (the interval less those: the
-//! open-vault lock, echo recording, clock reads). They say *where* an over-limit sample
+//! `parse`, `submit` (op build and queue send) and `other` (the write's return, the
+//! index-handle slot's lock wait, echo recording, clock reads). They say *where* an over-limit sample
 //! spent its time, so a sample no tag explains can be put on the vault's disk or on the
 //! index side. Reported, never asserted, like the tags.
 

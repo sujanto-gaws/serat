@@ -670,7 +670,7 @@ impl SaveBenchmarkTrace {
         let mut missing = Vec::new();
         for name in crate::save_tags::PHASES {
             let key = format!("save_phase_{name}_ms");
-            if !line.contains(&format!("\"{key}\":[")) {
+            if !line.contains(&format!("\"{key}\":")) {
                 missing.push(key);
                 continue;
             }
@@ -1190,6 +1190,19 @@ mod tests {
         bad[1] = ("write", "1.0,fast");
         let err = SaveBenchmarkTrace::parse(&with(&bad)).expect_err("a malformed series");
         assert!(err.contains("save_phase_write_ms"), "{err}");
+        // A present key that is not an array (null) is refused, not read as absent.
+        let nulls = plain.replace(
+            "\"save_writer_refused_ms\":[]",
+            &format!(
+                "\"save_writer_refused_ms\":[]{}",
+                crate::save_tags::PHASES
+                    .iter()
+                    .map(|n| format!(",\"save_phase_{n}_ms\":null"))
+                    .collect::<String>()
+            ),
+        );
+        let err = SaveBenchmarkTrace::parse(&nulls).expect_err("eight nulls");
+        assert!(err.contains("save_phase_hash_ms"), "{err}");
         // Only some of the eight is refused, naming what is missing.
         let err = SaveBenchmarkTrace::parse(&with(&all[..3])).expect_err("partial");
         assert!(err.contains("save_phase_submit_ms"), "{err}");

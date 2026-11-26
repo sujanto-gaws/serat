@@ -2314,6 +2314,12 @@ impl AppState {
     /// re-reads on the event sees the save. Calling `notifier().changed()` at the submit
     /// would announce a state the reader cannot see yet.
     fn submit_to_index(&self, open: &OpenVault, path: &VaultPath) {
+        // Task #207: one load of the arm flag serves the whole function (report-only).
+        let armed = serat_vault::save_phases::armed();
+        if armed {
+            // The write's return and the bookkeeping before here are not the load's.
+            serat_vault::save_phases::mark(serat_vault::save_phases::SavePhase::Other);
+        }
         // A save is writer activity: the background index check waits for quiet (task #69).
         open.indexer.activity().touch();
         let vault = &*open.vault;
@@ -2328,6 +2334,10 @@ impl AppState {
             };
             handle.writer()
         };
+        if armed {
+            // The slot's lock wait is not the load's either.
+            serat_vault::save_phases::mark(serat_vault::save_phases::SavePhase::Other);
+        }
         // Tests hold a save inside its load, which is where the lock used to be held.
         #[cfg(test)]
         let hooked = self
@@ -2351,7 +2361,7 @@ impl AppState {
         // difference between "swallowed" and "unobserved".
         // `--bench-save-list` arms the per-phase timing (task #207, report-only); the product
         // path reads one relaxed flag here and takes the first arm unchanged.
-        let applied = if serat_vault::save_phases::armed() {
+        let applied = if armed {
             serat_index::apply(
                 &TimedWriter(&writer),
                 source,

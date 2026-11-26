@@ -10,6 +10,12 @@
 //! write that fsyncs; no clock is read, no thread-local touched, nothing
 //! allocated.
 //!
+//! **Who marks what.** serat-vault owns the clock and the four write-side marks
+//! ([`SavePhase::Hash`], [`SavePhase::Write`], [`SavePhase::Sync`], [`SavePhase::Rename`]).
+//! `Load`, `Parse` and `Submit` are marked by serat-app, from `TimedParser` and
+//! `TimedWriter` around the index apply in `AppState::submit_to_index`, and by its two
+//! `Other` marks (armed runs only); serat-vault does not see the index.
+//!
 //! This observes; it never alters the write path. A mark sits between two statements that
 //! already existed, and no byte is read, hashed or written differently (C-04, ADR-0008).
 //!
@@ -24,8 +30,9 @@ use std::time::{Duration, Instant};
 /// The phases of the save path ADR-0020 names, in the order they end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavePhase {
-    /// From `begin` to the end of the vault's pre-write check: the path lock, the read of
-    /// what is on disk and its hash against the caller's base, and the hash of the new text.
+    /// From `begin` to the end of the vault's pre-write check: the open-vault lock, the
+    /// per-path lock (so a wait for either lands here), the read of what is on disk and its
+    /// hash against the caller's base, and the hash of the new text.
     Hash,
     /// The directory check, the permissions stat, creating the temp file and `write_all`.
     Write,
@@ -33,16 +40,22 @@ pub enum SavePhase {
     Sync,
     /// Permissions on the temp file, the rename over the target and the directory sync.
     Rename,
-    /// The index side's load: stat, read and hash of the note, before its parse.
+    /// The index side's load: stat, read and hash of the note, before its parse. Armed runs
+    /// mark [`SavePhase::Other`] first, so the vault write's return, the open-vault
+    /// bookkeeping and the index-handle slot's lock are not in it.
     Load,
     /// The index side's parse.
     Parse,
     /// Building the op and handing it to the writer's queue.
     Submit,
+    /// Marked by serat-app at the start of the index hand-off and once the index-handle slot's
+    /// lock is taken, so that the write's return and that lock wait are not charged to
+    /// [`SavePhase::Load`]. The harness adds the interval's unmarked remainder to it.
+    Other,
 }
 
 /// How many phases there are.
-pub const COUNT: usize = 7;
+pub const COUNT: usize = 8;
 
 impl SavePhase {
     /// Every phase, in the order they end.
@@ -54,6 +67,7 @@ impl SavePhase {
         SavePhase::Load,
         SavePhase::Parse,
         SavePhase::Submit,
+        SavePhase::Other,
     ];
 
     /// The name the exit report and the harness use (`save_phase_<name>_ms`).
@@ -67,6 +81,7 @@ impl SavePhase {
             SavePhase::Load => "load",
             SavePhase::Parse => "parse",
             SavePhase::Submit => "submit",
+            SavePhase::Other => "other",
         }
     }
 }
@@ -86,6 +101,7 @@ struct Run {
 /// Turn collection on for the process. Called once by `--bench-save-list`; never by the
 /// product path. There is no way to turn it off again: the process that armed it is a
 /// benchmark that exits.
+#[doc(hidden)]
 pub fn arm() {
     ARMED.store(true, Ordering::Relaxed);
 }
@@ -168,7 +184,9 @@ mod tests {
         let names: Vec<_> = SavePhase::ALL.iter().map(|p| p.name()).collect();
         assert_eq!(
             names,
-            ["hash", "write", "sync", "rename", "load", "parse", "submit"]
+            [
+                "hash", "write", "sync", "rename", "load", "parse", "submit", "other"
+            ]
         );
         for (i, p) in SavePhase::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i, "the array index is the order");
