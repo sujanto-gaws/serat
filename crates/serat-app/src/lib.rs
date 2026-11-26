@@ -1986,7 +1986,9 @@ mod tests {
                     // Product code after a file's first `#[cfg(test)] mod` goes unscanned;
                     // that is acceptable today (no file keeps product items below its tests).
                     let cut = text.find("\n#[cfg(test)]\nmod ").unwrap_or(text.len());
-                    out.push((path.display().to_string(), text[..cut].to_owned()));
+                    // Forward slashes always: Windows `display()` yields backslashes.
+                    let path = path.display().to_string().replace('\\', "/");
+                    out.push((path, text[..cut].to_owned()));
                 }
             }
         }
