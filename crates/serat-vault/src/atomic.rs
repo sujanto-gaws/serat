@@ -42,7 +42,7 @@ pub(crate) fn write_exclusive(temp: &Path, bytes: &[u8]) -> std::io::Result<i64>
     crate::save_phases::mark(crate::save_phases::SavePhase::Write);
     // Flush before the rename. Without this the rename can be durable while the
     // contents are not, which turns a power cut into a note full of zeroes.
-    file.sync_all()?;
+    sync_all(&file, crate::save_phases::Fsync::File)?;
     crate::save_phases::mark(crate::save_phases::SavePhase::Sync);
     Ok(crate::walk::mtime_ms(&file.metadata()?))
 }
@@ -99,13 +99,24 @@ pub(crate) fn commit(temp: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The one place a durability flush is issued. In a release build this is `sync_all`;
+/// under `cfg(test)` it also appends to the save-phase event log, so a test can pin how
+/// many fsyncs a save issues and in which phase they fall (NFR-PRF-03, ADR-0019 second
+/// amendment, TC-185). It changes no byte written.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn sync_all(file: &fs::File, what: crate::save_phases::Fsync) -> std::io::Result<()> {
+    #[cfg(test)]
+    crate::save_phases::log_fsync(what);
+    file.sync_all()
+}
+
 /// fsync the directory so the rename itself survives a power cut. Best effort: the
 /// rename has happened and is visible, so a failure here is not a failed write, and
 /// Windows has no directory handle to sync.
 fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(handle) = fs::File::open(dir) {
-        let _ = handle.sync_all();
+        let _ = sync_all(&handle, crate::save_phases::Fsync::Dir);
     }
     #[cfg(not(unix))]
     let _ = dir;
@@ -176,5 +187,155 @@ impl Drop for PathLock<'_> {
         if Arc::strong_count(&self.mutex) == 2 {
             map.remove(&self.key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::VaultPath;
+    use crate::save_phases::{Event, Fsync, SavePhase, drain_log};
+
+    /// NFR-PRF-03, ADR-0019 second amendment (task #211), TC-185: the vault-I/O excusal
+    /// counts `write + sync + rename` as the vault's file I/O, on the premise that `sync`
+    /// holds the one file fsync and `rename` the one directory fsync (unix only). This
+    /// pins that: a second fsync before the Write mark, or a dropped directory sync,
+    /// changes what the phases mean and fails here.
+    #[test]
+    fn a_save_fsyncs_the_file_in_sync_and_on_unix_the_directory_in_rename_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = crate::Vault::open(dir.path()).expect("open vault");
+        let path = VaultPath::new("note.md").expect("path");
+        drain_log();
+        vault.write_atomic(&path, b"# one\n").expect("write");
+        let log = drain_log();
+        #[cfg(unix)]
+        let expected = vec![
+            Event::Mark(SavePhase::Hash),
+            Event::Mark(SavePhase::Write),
+            Event::Fsync(Fsync::File),
+            Event::Mark(SavePhase::Sync),
+            Event::Fsync(Fsync::Dir),
+            Event::Mark(SavePhase::Rename),
+        ];
+        #[cfg(not(unix))]
+        let expected = vec![
+            Event::Mark(SavePhase::Hash),
+            Event::Mark(SavePhase::Write),
+            Event::Fsync(Fsync::File),
+            Event::Mark(SavePhase::Sync),
+            Event::Mark(SavePhase::Rename),
+        ];
+        assert_eq!(log, expected);
+    }
+
+    /// Test files that are `#[cfg(test)]` modules in their entirety (declared so in lib.rs).
+    const TEST_ONLY_FILES: [&str; 3] = [
+        "ignore_file_tests.rs",
+        "patch_props.rs",
+        "write_race_tests.rs",
+    ];
+
+    /// Whether an attribute line puts the item after it under `cfg(test)` alone: exactly
+    /// `#[cfg(test)]`, or `all(test, ..)` / `any(test, ..)`. Not `not(test)`, not a feature
+    /// whose name happens to contain "test".
+    fn is_test_cfg(attr: &str) -> bool {
+        let a = attr.trim();
+        a == "#[cfg(test)]" || a.starts_with("#[cfg(all(test") || a.starts_with("#[cfg(any(test")
+    }
+
+    /// The code of one source file as the scan sees it: line comments stripped (a `//`
+    /// at the start of a line or after whitespace, so a URL in a string survives) and
+    /// every column-0 test module (`mod x {` whose `#[cfg(..)]` line mentions `test`)
+    /// skipped up to its closing line (any line starting with `}` at column 0, so a trailing
+    /// comment on it does not matter). Scanning continues after it, and a module
+    /// cfg'd on anything else (a platform, a feature) is scanned as ordinary code.
+    fn production_code(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = String::new();
+        let mut in_test_mod = false;
+        for (i, line) in lines.iter().enumerate() {
+            if in_test_mod {
+                in_test_mod = !line.starts_with('}');
+                continue;
+            }
+            if line.starts_with("mod ")
+                && line.trim_end().ends_with('{')
+                && i > 0
+                && lines[i - 1].trim_start().starts_with("#[cfg(")
+                && is_test_cfg(lines[i - 1])
+            {
+                in_test_mod = true;
+                continue;
+            }
+            let code = match line.find("//") {
+                Some(at) if at == 0 || line[..at].ends_with(char::is_whitespace) => &line[..at],
+                _ => line,
+            };
+            out.push_str(code);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// NFR-PRF-03, ADR-0019 second amendment guard (i), TC-185: the fsync pin only sees
+    /// flushes routed through [`super::sync_all`], so that helper must be the only place
+    /// in the crate's production code that flushes. A method call (`.sync_all(`), a
+    /// qualified one (`File::sync_data(`), `fdatasync(`, `fsync(` or `FlushFileBuffers(`
+    /// anywhere else, or a second flush in `atomic.rs`, changes what the `sync` and
+    /// `rename` phases mean without the sequence test noticing; this fails it instead.
+    /// A bare `sync_all(` call is the helper itself, allowed only in `atomic.rs`.
+    #[test]
+    fn the_logging_helper_is_the_only_place_the_vault_flushes_to_disk() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("src dir").flatten() {
+            let path = entry.path();
+            // `read_dir` is not recursive: a subdirectory would be unscanned, so refuse it.
+            assert!(
+                !path.is_dir(),
+                "{} is a directory; make this scan recursive",
+                path.display()
+            );
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.extension().is_none_or(|e| e != "rs")
+                || TEST_ONLY_FILES.contains(&name.as_str())
+            {
+                continue;
+            }
+            let mut code = production_code(&std::fs::read_to_string(&path).expect("readable"));
+            if name == "atomic.rs" {
+                // The helper's own body is the one allowed call.
+                let at = code.find("fn sync_all(").expect("the helper");
+                let end = at + code[at..].find("\n}\n").expect("its end");
+                code.replace_range(at..end, "");
+            }
+            for (n, line) in code.lines().enumerate() {
+                for word in [
+                    "sync_all",
+                    "sync_data",
+                    "fdatasync",
+                    "fsync",
+                    "FlushFileBuffers",
+                ] {
+                    let call = format!("{word}(");
+                    for (at, _) in line.match_indices(&call) {
+                        let before = line[..at].chars().next_back();
+                        let bare_helper_call = name == "atomic.rs"
+                            && word == "sync_all"
+                            && before != Some('.')
+                            && before != Some(':');
+                        let part_of_a_name =
+                            before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                        if !part_of_a_name && !bare_helper_call {
+                            found.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "a flush outside atomic::sync_all: {found:#?}"
+        );
     }
 }

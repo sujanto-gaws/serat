@@ -86,6 +86,45 @@ impl SavePhase {
     }
 }
 
+/// Which handle a durability flush was issued on. Only the `cfg(test)` event log reads it;
+/// `Dir` is built only where a directory can be synced (unix).
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub(crate) enum Fsync {
+    File,
+    #[allow(dead_code)]
+    Dir,
+}
+
+/// One entry of the `cfg(test)` event log: a phase mark or an fsync, in call order.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Event {
+    Mark(SavePhase),
+    Fsync(Fsync),
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOG: std::cell::RefCell<Vec<Event>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn log_event(event: Event) {
+    LOG.with(|log| log.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+pub(crate) fn log_fsync(what: Fsync) {
+    log_event(Event::Fsync(what));
+}
+
+/// Take this thread's event log. Test only; recorded whether or not [`arm`] was called.
+#[cfg(test)]
+pub(crate) fn drain_log() -> Vec<Event> {
+    LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -131,6 +170,8 @@ pub fn begin() {
 /// has begun.
 #[inline]
 pub fn mark(phase: SavePhase) {
+    #[cfg(test)]
+    log_event(Event::Mark(phase));
     if armed() {
         mark_armed(phase);
     }
