@@ -54,6 +54,17 @@ pub(crate) struct IndexLock {
     _file: File,
 }
 
+impl Drop for IndexLock {
+    /// Task #225 (NFR-REL-01): release the lock explicitly. `std::fs::File` does not unlock
+    /// on drop; it only closes the handle, and the lock goes with it. On Windows the release
+    /// after `CloseHandle` is documented to lag, so a reopen right after a clean close could
+    /// see `HeldByAnotherProcess`; `unlock` (`UnlockFileEx`) frees it before the close.
+    /// The error is ignored: the close that follows releases the lock anyway.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl IndexLock {
     /// Take the lock for `index_dir`, creating the directory and the lock file.
     ///
@@ -104,6 +115,20 @@ mod tests {
         );
         drop(first);
         IndexLock::acquire(&index).expect("free again after the holder is gone");
+    }
+
+    #[test]
+    fn drop_then_reacquire_succeeds_at_once_in_a_tight_loop() {
+        let dir = tempfile::tempdir().expect("dir");
+        let index = dir.path().join(".serat");
+        for i in 0..100 {
+            let held = IndexLock::acquire(&index).unwrap_or_else(|e| panic!("round {i}: {e:?}"));
+            assert!(matches!(
+                IndexLock::acquire(&index),
+                Err(IndexError::HeldByAnotherProcess { .. })
+            ));
+            drop(held);
+        }
     }
 
     #[test]
