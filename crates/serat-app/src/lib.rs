@@ -1822,11 +1822,20 @@ mod tests {
         // As state.rs's own comment on this idiom: writing before the vault is
         // `Ready` races the fixture's own rebuild reading the same bytes, and the
         // race can index either version -- indistinguishable from outside.
-        let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !matches!(state.index_status().state, ipc::IndexState::Ready { .. }) {
+        // Same 60 s ceiling as `state::tests::wait_ready`: this is a liveness guard for a
+        // loaded 2-core hosted runner (a 2 s one failed windows run 480 twice), not a
+        // budget (ADR-0019). The wait returns the moment the status reads `Ready`.
+        let started = std::time::Instant::now();
+        let ready_by = started + std::time::Duration::from_secs(60);
+        loop {
+            let status = state.index_status();
+            if matches!(status.state, ipc::IndexState::Ready { .. }) {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < ready_by,
-                "the fixture vault never reached IndexState::Ready"
+                "the fixture vault never reached IndexState::Ready after {:?}; last status {status:?}",
+                started.elapsed()
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2328,11 +2337,20 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("ShallowQueue::open must hand out a writer for the one-deep queue");
 
-        let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !matches!(state.index_status().state, ipc::IndexState::Ready { .. }) {
+        // Same 60 s ceiling as `state::tests::wait_ready`: this is a liveness guard for a
+        // loaded 2-core hosted runner (a 2 s one failed windows run 480 twice), not a
+        // budget (ADR-0019). The wait returns the moment the status reads `Ready`.
+        let started = std::time::Instant::now();
+        let ready_by = started + std::time::Duration::from_secs(60);
+        loop {
+            let status = state.index_status();
+            if matches!(status.state, ipc::IndexState::Ready { .. }) {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < ready_by,
-                "the fixture vault never reached IndexState::Ready"
+                "the fixture vault never reached IndexState::Ready after {:?}; last status {status:?}",
+                started.elapsed()
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
