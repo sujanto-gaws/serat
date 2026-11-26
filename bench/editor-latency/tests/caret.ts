@@ -6,6 +6,7 @@
 // the shadow root's selection. A scenario whose caret is not where it claims fails before any key is scored:
 // a latency figure for "typing in a table cell" taken with the caret in a paragraph would be worse than none.
 import type { Locator, Page } from "@playwright/test";
+import { withHarnessDeadline } from "./measure";
 
 const EDITOR = '[data-testid="serat-editor"]';
 
@@ -131,7 +132,7 @@ async function stableOrMiss(scroller: Locator, timeoutMs: number): Promise<Attem
 }
 
 export async function waitForStableScroll(scroller: Locator, frames = 8, timeoutMs = 10_000): Promise<void> {
-  await scroller.evaluate((s, args) => new Promise<void>((resolve, reject) => {
+  await withHarnessDeadline(scroller.evaluate((s, args) => new Promise<void>((resolve, reject) => {
     const t0 = performance.now();
     let last = "", same = 0;
     const tick = () => {
@@ -143,7 +144,7 @@ export async function waitForStableScroll(scroller: Locator, frames = 8, timeout
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-  }), { frames, timeoutMs });
+  }), { frames, timeoutMs }), timeoutMs + 1_000, "scroll never settled");
 }
 
 /** Clicks into the middle of the note and returns a description of the Paragraph line the caret is on, which is

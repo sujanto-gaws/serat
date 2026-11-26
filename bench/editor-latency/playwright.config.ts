@@ -26,6 +26,10 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   testDir: "./tests",
   timeout: 60_000,
+  // Task #221: a stalled run must end inside Playwright, which then prints the tests that were running, rather
+  // than at the CI job timeout with no log (budgets run 465 hung 56 min). 40 min is twice the longest normal run
+  // (scenarios step, 17 min with its unit and controls dependencies). Override: SERAT_GLOBAL_TIMEOUT_MS.
+  globalTimeout: Number(process.env.SERAT_GLOBAL_TIMEOUT_MS ?? 40 * 60_000),
   fullyParallel: false, // latency sampling shares one browser instance deliberately
   retries: 0, // a budget harness that retries away a slow run is not a budget harness
   reporter: [["list"], ["json", { outputFile: "out/results.json" }]],

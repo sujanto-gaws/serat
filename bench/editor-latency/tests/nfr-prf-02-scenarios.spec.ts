@@ -132,7 +132,9 @@ const SCENARIOS: Scenario[] = [
 test.describe("scenarios", () => {
   for (const sc of SCENARIOS) {
     test(`NFR-PRF-02 scenario [${sc.id}]: ${sc.title}; >= 95% painted in the first frame, 5,000-line note`, async ({ page }) => {
-      test.setTimeout(420_000);
+      test.setTimeout(420_000); // the step is bounded by globalTimeout (playwright.config.ts, task #221), not by this
+      const startedAt = Date.now();
+      console.log(`SCENARIO-PROGRESS [${sc.id}] started`);
       const text = fixtureVariant(buildFixtureNote(), sc.variant ?? "lf");
       const subject = await openNoteForLatencyTest(page, { ...sc.open, text });
       try {
@@ -174,6 +176,7 @@ test.describe("scenarios", () => {
         expect(verdicts, "every cadence must be PASS; INDETERMINATE (95% between the -4 and +4 ms shares) is not a pass").toEqual(["PASS", "PASS"]);
         expect(worst).toBeGreaterThanOrEqual(SUBJECT_MIN_ON_TIME);
       } finally {
+        console.log(`SCENARIO-PROGRESS [${sc.id}] finished in ${Math.round((Date.now() - startedAt) / 1000)} s`);
         await subject.close();
       }
     });
