@@ -1983,6 +1983,8 @@ mod tests {
                     }
                 } else if name.ends_with(".rs") {
                     let text = std::fs::read_to_string(&path).expect("utf-8 source");
+                    // Product code after a file's first `#[cfg(test)] mod` goes unscanned;
+                    // that is acceptable today (no file keeps product items below its tests).
                     let cut = text.find("\n#[cfg(test)]\nmod ").unwrap_or(text.len());
                     out.push((path.display().to_string(), text[..cut].to_owned()));
                 }
@@ -2007,6 +2009,10 @@ mod tests {
             text.contains(arm)
                 || text.contains(concat!("save_phases", "::arm;"))
                 || text.contains(concat!("save_phases", "::arm,"))
+                || text.contains(concat!("save_phases", "::arm}"))
+                || text.contains(concat!("save_phases", "::arm as"))
+                || text.contains(concat!("save_phases", "::*"))
+                || text.contains(concat!("save_phases", " as "))
                 || text
                     .match_indices(concat!("save_phases", "::{"))
                     .any(|(at, _)| {
