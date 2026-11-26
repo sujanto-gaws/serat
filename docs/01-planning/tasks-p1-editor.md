@@ -129,7 +129,7 @@ owner: lead
 | 180 | `[P1/test] Re-read FR-VLT-04 on windows-latest after the #167 harness diagnostics` (FR-VLT-04, NFR-PRF-08, US-35, C-02, C-06; ADR-0019, ADR-0015) | test-engineer | 167 | **merged** 96476ec (2 rounds) |
 | 181 | `[P1/impl] Register the resolve_links and note_anchors commands the editor already invokes` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0007, ADR-0010, ADR-0011, ADR-0020) | tauri-app-dev | 176 | **merged** 4003717 (2 rounds + ts-drift fixup) |
 | 182 | `[P1/test] Hunt two one-off test failures seen 2026-11-24` (NFR-REL-01, NFR-MNT-01, US-07) | test-engineer | 175, 176 | **merged** a2d6884 (1 round) |
-| 183 | `[P1/impl] External-change processing under a WAL checkpoint overlap` (FR-VLT-04, NFR-PRF-03; ADR-0001) | rust-core-dev | 180 | in progress |
+| 183 | `[P1/impl] External-change processing under a WAL checkpoint overlap` (FR-VLT-04, NFR-PRF-03; ADR-0001) | rust-core-dev | 180 | **merged** 2342453 |
 | 184 | `[P1/impl] Nested heading subpaths: [[Note#A#B]] must require B under A` (FR-EDT-03, NFR-CMP-01, US-03; ADR-0010) | tauri-app-dev + rust-core-dev | 181 | **merged** 8bc0417 (INDEX_VERSION 13; 1 round) |
 | 185 | `[P1/impl] Cache the tree-fallback link resolver on the tree generation` (FR-EDT-03, NFR-PRF-02, US-03; ADR-0011, ADR-0015) | tauri-app-dev | 181 | **merged** df543ba (1 round) |
 | 186 | `[P1/impl] Retry the paint mark when the frame gate refuses equal requestAnimationFrame timestamps` (NFR-PRF-01/08, US-35; ADR-0014) | vue-frontend-dev | 179 | **merged** 83b616d (1 round; acceptance 1 of 3 hang-free runs) |
