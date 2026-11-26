@@ -173,6 +173,21 @@ fn child_expects_to_be_refused() {
     );
 }
 
+/// Child half of the release test (task #225): opens once and panics unless admitted.
+#[test]
+#[ignore = "child of two_processes_a_second_process_is_admitted_once_the_writer_is_dropped"]
+fn child_expects_to_be_admitted() {
+    let Ok(dir) = std::env::var(CHILD_ENV) else {
+        return; // `--ignored` run directly, not by a parent
+    };
+    let result = open(&Path::new(&dir).join(".serat"));
+    assert!(
+        result.is_ok(),
+        "the child was refused after the writer was dropped: {:?}",
+        result.map(|_| ())
+    );
+}
+
 /// Child half of the storm: opens in a loop and prints how often it was refused.
 #[test]
 #[ignore = "child of two_processes_hammering_one_vault_never_fault"]
@@ -201,6 +216,15 @@ fn spawn_child(test: &str, dir: &Path) -> std::process::Child {
         .expect("spawn")
 }
 
+/// A child that matched no test exits 0 having run nothing; require that it ran one.
+fn assert_ran_one(out: &std::process::Output) {
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("1 passed"),
+        "the child ran no test (did `--exact` match?): {text}"
+    );
+}
+
 /// Deterministic: the parent holds a writer, a second process opens the same vault and
 /// must be refused. Without the lock the child is admitted and exits non-zero.
 #[test]
@@ -218,7 +242,30 @@ fn two_processes_a_second_process_is_refused_by_a_live_writer() {
         "the other process was not refused: {:?}",
         out.status
     );
+    assert_ran_one(&out);
     drop(held);
+}
+
+/// Task #225 (NFR-REL-01): refused while the parent's writer is alive, admitted at once
+/// (no sleep, no retry) after it is dropped.
+#[test]
+fn two_processes_a_second_process_is_admitted_once_the_writer_is_dropped() {
+    let _fence = SPAWN_FENCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("temp");
+    let held = open(&dir.path().join(".serat")).expect("parent open");
+    let refused = spawn_child("child_expects_to_be_refused", dir.path())
+        .wait_with_output()
+        .expect("child");
+    assert!(refused.status.success(), "not refused while held");
+    assert_ran_one(&refused);
+    drop(held);
+    let admitted = spawn_child("child_expects_to_be_admitted", dir.path())
+        .wait_with_output()
+        .expect("child");
+    assert!(admitted.status.success(), "refused after the drop");
+    assert_ran_one(&admitted);
 }
 
 /// Two processes race to open an index-less vault: neither may die of a signal (SIGBUS
