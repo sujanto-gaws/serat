@@ -5133,6 +5133,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `IndexHandle::open`, retried while another holder (a dropped state's lingering
+    /// threads) still has `index.lock`; panics after 60 s with the elapsed time and the
+    /// last error.
+    fn open_index_when_free(index_dir: &Path) -> serat_index::IndexHandle {
+        let started = Instant::now();
+        loop {
+            match serat_index::IndexHandle::open(index_dir) {
+                Ok(handle) => return handle,
+                Err(err @ serat_core::IndexError::HeldByAnotherProcess { .. })
+                    if started.elapsed() < Duration::from_secs(60) =>
+                {
+                    let _ = err;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("reopen failed after {:?}: {err:?}", started.elapsed()),
+            }
+        }
+    }
+
     #[test]
     fn closing_the_vault_makes_the_next_open_clean_and_not_closing_does_not() {
         let dir = fixture("close-clean");
@@ -5154,7 +5173,12 @@ mod tests {
             wait_ready(&state);
             std::thread::sleep(Duration::from_millis(50));
         }
-        let handle = serat_index::IndexHandle::open(&dir.join(".serat")).expect("reopen");
+        // Dropping the state is not a close: the index handle (and `index.lock`) lives
+        // until the last background thread holding the slot lets go, which on a loaded
+        // Windows runner outlasted this open (task #224). Retry under the 60 s ceiling;
+        // the unclean-marker assertion below is unchanged. The open after a real
+        // `close_vault` above stays strict: its completion implies the lock is released.
+        let handle = open_index_when_free(&dir.join(".serat"));
         assert!(
             handle.opened_after_unclean_shutdown(),
             "without close() the session reads as unclean"
@@ -5955,10 +5979,23 @@ mod tests {
         })
     }
 
+    /// Wait for `want` destroys under the 60 s liveness ceiling, not `wait_until`'s 10 s:
+    /// the close behind a destroy is itself bounded by the vault thread's 5 s stop plus
+    /// the writer drain, and on a loaded Windows runner that exceeded 10 s once (task
+    /// #224). Only a hang should fail here; the panic says how long and what was seen.
     fn wait_count(count: &Arc<std::sync::atomic::AtomicUsize>, want: usize) {
-        wait_until("the window destroy", || {
-            count.load(Ordering::SeqCst) >= want
-        });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(60) {
+            if count.load(Ordering::SeqCst) >= want {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for the window destroy after {:?}: {} of {want} seen",
+            started.elapsed(),
+            count.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
