@@ -86,17 +86,13 @@ impl SavePhase {
     }
 }
 
-/// Which handle a durability flush was issued on (test log only).
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Fsync {
-    File,
-    Dir,
-}
-#[cfg(not(test))]
+/// Which handle a durability flush was issued on. Only the `cfg(test)` event log reads it;
+/// `Dir` is built only where a directory can be synced (unix).
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum Fsync {
     File,
+    #[allow(dead_code)]
     Dir,
 }
 
