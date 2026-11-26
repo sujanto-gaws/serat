@@ -227,4 +227,68 @@ mod tests {
         ];
         assert_eq!(log, expected);
     }
+
+    /// Test files that are `#[cfg(test)]` modules in their entirety (declared so in lib.rs).
+    const TEST_ONLY_FILES: [&str; 3] = [
+        "ignore_file_tests.rs",
+        "patch_props.rs",
+        "write_race_tests.rs",
+    ];
+
+    /// The code of one source file as the scan sees it: line comments stripped and the
+    /// inline test module (a column-0 `mod x {` after a `#[cfg(test)]`) cut off.
+    fn production_code(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with("mod ") && line.trim_end().ends_with('{') {
+                assert!(
+                    i > 0 && lines[i - 1].trim_start().starts_with("#[cfg("),
+                    "{line}"
+                );
+                break;
+            }
+            out.push_str(line.split("//").next().unwrap_or(""));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// NFR-PRF-03, ADR-0019 second amendment guard (i), TC-185: the fsync pin only sees
+    /// flushes routed through [`super::sync_all`], so that helper must be the only place
+    /// in the crate's production code that flushes. A raw `.sync_all(` or `.sync_data(`
+    /// elsewhere, or a second one in `atomic.rs`, changes what the `sync` and `rename`
+    /// phases mean without the sequence test noticing; this fails it instead.
+    #[test]
+    fn the_logging_helper_is_the_only_place_the_vault_flushes_to_disk() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("src dir").flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().replace('\\', "/");
+            if path.extension().is_none_or(|e| e != "rs")
+                || TEST_ONLY_FILES.contains(&name.as_str())
+            {
+                continue;
+            }
+            let mut code = production_code(&std::fs::read_to_string(&path).expect("readable"));
+            if name == "atomic.rs" {
+                // The helper's own body is the one allowed call.
+                let at = code.find("fn sync_all(").expect("the helper");
+                let end = at + code[at..].find("\n}\n").expect("its end");
+                code.replace_range(at..end, "");
+            }
+            for (n, line) in code.lines().enumerate() {
+                for needle in [".sync_all(", ".sync_data(", "::fsync(", "FlushFileBuffers("] {
+                    if line.contains(needle) {
+                        found.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "a flush outside atomic::sync_all: {found:#?}"
+        );
+    }
 }

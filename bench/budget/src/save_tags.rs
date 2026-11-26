@@ -463,9 +463,15 @@ impl SaveTags {
         }
         let row = phases.get(one.index)?;
         let io: f64 = VAULT_IO_PHASES.iter().map(|&p| row[p]).sum();
-        if one.ms <= 0.0 || io / one.ms < MIN_VAULT_IO_SHARE {
+        // The boundary is an exact `>=` on the quotient, as the ADR states it: 90.0% is
+        // excused. It must not gain a tolerance without an amendment. A non-finite figure
+        // or an I/O sum above the whole sample (a negative remainder) is not evidence; past
+        // those two checks the quotient is a finite number in [0, 1], so `<` is total.
+        if !io.is_finite() || io > one.ms || io / one.ms < MIN_VAULT_IO_SHARE {
             return None;
         }
+        // The same nearest-rank p95 as the asserted figure (`Samples`), over raw f64 ms
+        // here and `Duration` there: equal up to nanosecond rounding.
         let all: Vec<f64> = self.rows.iter().map(|r| r.ms).collect();
         let series_p95_ms = crate::percentile_of(&all, 0.95);
         let remainder_ms = one.ms - io;

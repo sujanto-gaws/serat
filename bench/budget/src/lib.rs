@@ -7229,4 +7229,19 @@ mod tests {
             assert_eq!(line.contains(note), saturated, "without_n {plain}: {line}");
         }
     }
+
+    #[test]
+    fn prf03_non_finite_or_overlarge_io_phases_are_not_evidence() {
+        // NFR-PRF-03: NaN or infinite phases, or I/O above the whole sample, never excuse.
+        use save_tags::CkKind::No;
+        for sync in [f64::NAN, f64::INFINITY, 130.0] {
+            let o = io_outcome(
+                1_000,
+                15.0,
+                &[(500, 100.0, No, [0.0, 0.0, sync, 0.0, 0.0, 0.0, 0.0, 0.0])],
+                0,
+            );
+            assert!(!o.determinate() && o.excusal().is_none(), "sync {sync}");
+        }
+    }
 }
