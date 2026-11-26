@@ -235,10 +235,19 @@ mod tests {
         "write_race_tests.rs",
     ];
 
+    /// Whether an attribute line puts the item after it under `cfg(test)` alone: exactly
+    /// `#[cfg(test)]`, or `all(test, ..)` / `any(test, ..)`. Not `not(test)`, not a feature
+    /// whose name happens to contain "test".
+    fn is_test_cfg(attr: &str) -> bool {
+        let a = attr.trim();
+        a == "#[cfg(test)]" || a.starts_with("#[cfg(all(test") || a.starts_with("#[cfg(any(test")
+    }
+
     /// The code of one source file as the scan sees it: line comments stripped (a `//`
     /// at the start of a line or after whitespace, so a URL in a string survives) and
     /// every column-0 test module (`mod x {` whose `#[cfg(..)]` line mentions `test`)
-    /// skipped up to its closing column-0 `}`. Scanning continues after it, and a module
+    /// skipped up to its closing line (any line starting with `}` at column 0, so a trailing
+    /// comment on it does not matter). Scanning continues after it, and a module
     /// cfg'd on anything else (a platform, a feature) is scanned as ordinary code.
     fn production_code(text: &str) -> String {
         let lines: Vec<&str> = text.lines().collect();
@@ -246,14 +255,14 @@ mod tests {
         let mut in_test_mod = false;
         for (i, line) in lines.iter().enumerate() {
             if in_test_mod {
-                in_test_mod = *line != "}";
+                in_test_mod = !line.starts_with('}');
                 continue;
             }
             if line.starts_with("mod ")
                 && line.trim_end().ends_with('{')
                 && i > 0
                 && lines[i - 1].trim_start().starts_with("#[cfg(")
-                && lines[i - 1].contains("test")
+                && is_test_cfg(lines[i - 1])
             {
                 in_test_mod = true;
                 continue;
@@ -311,8 +320,10 @@ mod tests {
                     let call = format!("{word}(");
                     for (at, _) in line.match_indices(&call) {
                         let before = line[..at].chars().next_back();
-                        let bare_helper_call =
-                            name == "atomic.rs" && word == "sync_all" && before != Some('.');
+                        let bare_helper_call = name == "atomic.rs"
+                            && word == "sync_all"
+                            && before != Some('.')
+                            && before != Some(':');
                         let part_of_a_name =
                             before.is_some_and(|c| c.is_alphanumeric() || c == '_');
                         if !part_of_a_name && !bare_helper_call {
