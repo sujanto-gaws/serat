@@ -677,6 +677,11 @@ jobs:
         # typing, and the fixture loaded as CRLF and as BOM+CRLF (architecture 9.3 "Scenarios"). Same controls
         # gate it (it depends on them). `|| true`: a FAIL here is a finding, never a red PR (headless is not
         # gate-eligible); the verdicts are in the log and the artifact.
+        # Task #221: step timeout 45 min (normal 17; run 465 hung 56 min and the JOB timeout cancelled it, which marks
+        # the run cancelled even under continue-on-error). A step timeout fails the step instead; `if: always()` on
+        # the summary and upload still run and continue-on-error keeps the run green. Playwright's own globalTimeout
+        # (40 min, playwright.config.ts) fires first and prints the running tests; this is the backstop.
+        timeout-minutes: 45
         working-directory: bench/editor-latency
         env:
           SERAT_BENCH_DIST: ../../app/dist-bench
