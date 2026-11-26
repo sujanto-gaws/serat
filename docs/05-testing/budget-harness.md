@@ -349,7 +349,7 @@ Report-only lines under each series: the existing overlap counts and means, then
 
 ## prf03-save-to-index: per-sample tags (task #196)
 
-The hosted `windows-latest` run is INDETERMINATE when one sample of 1,000 lands beside the limit (runs 432, 436, 438, 439: p95 about 13 to 16 ms, max 56.7 to 110.7 ms). The gate is red by design (ADR-0019, `determinate()`); the tags say what the over-limit sample coincided with. They are **reported, never asserted**.
+The hosted `windows-latest` run is INDETERMINATE when one sample of 1,000 lands beside the limit (runs 432, 436, 438, 439: p95 about 13 to 16 ms, max 56.7 to 110.7 ms). The gate is red by design (ADR-0019, `determinate()`); the tags say what the over-limit sample coincided with. They are reported, never asserted; the overlap tag also decides one case of `determinate()` (below).
 
 The save interval is `AppState::write_file` (atomic write with `sync_all`, parse, a non-blocking submit). It ends at the submit, **not** at the commit (architecture 3.1.1: no barrier on the keystroke path). A writer commit can therefore reach a sample only by running beside it, and a checkpoint only by competing for the same disk or lock. The tags are measured by serat-app around each timed write (the harness may not link it) and ride the same exit line as `save_submitted_ms`, as parallel arrays:
 
@@ -363,6 +363,8 @@ The save interval is `AppState::write_file` (atomic write with `sync_all`, parse
 Why the segment count and not a page-write count: SQLite exposes no per-commit page count through rusqlite without a hook on the product writer, and the segment count is the signal #183 and `p1-save-tail` already use, so the two jobs say the same thing. Its limit: a merge that is still running at the end of the window is not seen until it commits, so a sample that overlaps only the start of a merge is missed; the slow-commit tag covers that case but is **saturated on a back-to-back burst** (the writer's turn lasts while the queue is non-empty; about 99% of samples carry it on Linux) and does not discriminate by itself.
 
 Report lines (and `save_tags` in `bench/out/budgets/prf03-save-to-index.json`): one `tag split` line per flag (nearest-rank p95 with and without, n per class, the ratio; no ratio when a class is empty), a `tag source` line (checkpoint runs, idle starts deferred to work in flight, idle wake-ups skipped below the frame floor (`save_checkpointer_floor_skips`, #199), FTS5 probe failures), and an `over limit` line followed by every sample above the budget's limit with all three flags. A report from a binary that does not send the tags prints none of this; a tag array whose length differs from `save_submitted_ms` is refused by name.
+
+**`determinate()` for prf03 (ADR-0019 amendment 2026-11-26, task #205).** For `prf03-save-to-index` only, a straddling series is determinate iff exactly one sample exceeds the limit, its `save_checkpoint_overlap` is true (kind `idle`, `size-bound` or `yes`), and the overlapped class's nearest-rank p95 is within the limit; the verdict is the all-saves p95. Otherwise INDETERMINATE; so is any overlapped class of n ≤ 19, whose nearest-rank p95 (rank ⌈0.95n⌉ = n) is the outlier itself. No tag arrays: the plain rule. The report names the excused sample and the class's p95, max and n.
 
 Linux release, 20k vault, `--profile ci`, indicative only (ADR-0019: Linux figures are supporting evidence), 2026-11-25. Findings are in `docs/05-testing/reports/ci-windows-first-run-2026-11.md`, Resolution item (a-2).
 

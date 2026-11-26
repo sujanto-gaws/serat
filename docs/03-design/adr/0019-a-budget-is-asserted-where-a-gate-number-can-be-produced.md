@@ -122,3 +122,13 @@ The cases that would test it are still to come. One is the first hosted numbers 
 **Unchanged:** the product limit, the frame guard, `determinate()` (no iteration count settles a series whose minimum is below and whose tail is above the limit), point 4's exit criteria, point 8. The job also fails on a hung launch or a frame-gate refusal past #186's retries (point 1's list). In point 8's table, NFR-PRF-01's CI-asserted cell now reads 'none (report-only; point 3 exception)'. NFR-PRF-03 stays `Always`. Whether a budget with no CI assertion of its limit satisfies C-06 is the lead's reading (Objections recorded).
 
 **Objections recorded (amendment).** The lead's reading of C-06: it is NOT satisfied in CI for NFR-PRF-01 while no CI job asserts its limit. The budget counts as enforced only by an RM-1 scanner-on reference run, which is still owed. The P1 gate report lists this as an open gate item, not a pass, until that run exists or a gate-eligible Windows runner class asserts the limit.
+
+## Amendment 2026-11-26 (task #201, architect)
+
+**Point 5, NFR-PRF-03: one checkpoint-overlapped outlier is excused.** NFR-PRF-03 stays `Always`; its all-saves p95 at 50 ms stays asserted (C-06). Evidence: 8 of 14 hosted runs INDETERMINATE, each with exactly one save over 50 ms at p95 13 to 16 ms; of three tagged, two overlapped a checkpoint (442, 447) and one nothing (445); Linux 5 of 6 (#196).
+
+**Rule, `prf03-save-to-index` only.** A straddling series is determinate when exactly one save exceeds the limit, it overlapped a checkpoint (any kind), and the overlapped class's own p95, its reported bound, is within the limit. The verdict is then the all-saves p95. An overlapped class of n < 20 is therefore INDETERMINATE: its nearest-rank p95 is its maximum, the outlier itself, and a save cannot excuse itself. Anything else stays INDETERMINATE, including one unflagged save (one tagged run in seven): nothing attributes it (goal 3). One is the observed maximum; raising it is an amendment.
+
+**Rejected.** More iterations: at about one outlier per 1,000 saves a larger n straddles more often (Linux 4 of 4 at 2,000 to 3,000). Recurrence within N runs: outliers recur in 3 of 7 tagged runs, so no N separates noise from regression. No change: red in 8 of 14 runs at a quarter of the limit.
+
+**Objections recorded.** test-engineer (#196 item 2) proposed judging without the overlapped class; not adopted: it drops 235 of 1,000 saves (run 447) and could hide a class-wide regression. Not yet put to test-engineer (#205).
