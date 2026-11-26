@@ -57,7 +57,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -219,6 +219,61 @@ pub fn overlap_kind(
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// The instant stamps below are counted from here.
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Microseconds since the process's first stamp, plus one so that 0 can mean "never".
+fn stamp() -> u64 {
+    let micros = EPOCH.get_or_init(Instant::now).elapsed().as_micros();
+    u64::try_from(micros).unwrap_or(u64::MAX - 1) + 1
+}
+
+/// How long ago `then` (a [`stamp`]) was; `None` for "never".
+fn since(then: u64) -> Option<Duration> {
+    (then != 0).then(|| Duration::from_micros(stamp().saturating_sub(then)))
+}
+
+/// What the writer and the checkpointer are doing right now, from [`WalHealth::activity`]
+/// (task #220). A read-only snapshot of atomics; the benchmark prints it when a round
+/// does not commit, so a stall says which side was waiting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// The writer is inside a turn that began this long ago.
+    pub writer_turn: Option<Duration>,
+    /// A checkpoint is running: its trigger and how long it has run.
+    pub checkpoint: Option<(RunKind, Duration)>,
+    /// Frames in the WAL as of the writer's last commit.
+    pub wal_frames: Option<u64>,
+    /// How long ago the writer's last commit finished.
+    pub last_commit_age: Option<Duration>,
+}
+
+impl Activity {
+    /// One clause for a stall line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let secs = |d: Duration| format!("{:.1} s", d.as_secs_f64());
+        format!(
+            "writer {}; checkpoint {}; WAL {}; last commit {}",
+            self.writer_turn
+                .map_or("idle (not in a turn)".to_owned(), |d| format!(
+                    "in a turn for {}",
+                    secs(d)
+                )),
+            self.checkpoint
+                .map_or("none in flight".to_owned(), |(kind, d)| format!(
+                    "{} in flight for {}",
+                    kind.label(),
+                    secs(d)
+                )),
+            self.wal_frames
+                .map_or("frames unknown".to_owned(), |f| format!("{f} frames")),
+            self.last_commit_age
+                .map_or("never".to_owned(), |d| format!("{} ago", secs(d))),
+        )
+    }
+}
+
 /// What the checkpointer knows, readable from any thread without touching SQLite.
 ///
 /// All atomics but one leaf mutex holding the change callback; no connection is behind
@@ -229,6 +284,14 @@ pub struct WalHealth {
     pinned_bytes: AtomicU64,
     /// 0 = none; else [`RunKind::code`] of the run in progress.
     running: AtomicU8,
+    /// [`stamp`] of the start of the run in `running`; 0 when none.
+    running_since: AtomicU64,
+    /// Live writer turns (0 or 1) and the [`stamp`] of the one in progress (task #220).
+    turns: AtomicUsize,
+    turn_since: AtomicU64,
+    /// [`stamp`] of the writer's last commit, and the WAL frames it left plus one.
+    last_commit_at: AtomicU64,
+    wal_frames: AtomicU64,
     /// The WAL hook could not be installed (rusqlite 0.41.1: out of memory only), so
     /// the writer fell back to SQLite's own auto-checkpoint.
     hook_install_failed: AtomicBool,
@@ -296,6 +359,41 @@ impl WalHealth {
         }
     }
 
+    /// What the writer and the checkpointer are doing now: atomics only, no lock, no
+    /// connection.
+    #[must_use]
+    pub fn activity(&self) -> Activity {
+        let kind = self.checkpoint_kind_running();
+        Activity {
+            writer_turn: (self.turns.load(Ordering::Relaxed) > 0)
+                .then(|| since(self.turn_since.load(Ordering::Relaxed)))
+                .flatten(),
+            checkpoint: kind
+                .zip(since(self.running_since.load(Ordering::Relaxed)))
+                .or(kind.map(|k| (k, Duration::ZERO))),
+            wal_frames: self.wal_frames.load(Ordering::Relaxed).checked_sub(1),
+            last_commit_age: since(self.last_commit_at.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// The writer's WAL hook ran: a commit finished with `frames` in the WAL.
+    pub(crate) fn note_commit(&self, frames: i32) {
+        self.wal_frames.store(
+            u64::try_from(frames).unwrap_or(0).saturating_add(1),
+            Ordering::Relaxed,
+        );
+        self.last_commit_at.store(stamp(), Ordering::Relaxed);
+    }
+
+    fn begin_run(&self, kind: RunKind) {
+        self.running_since.store(stamp(), Ordering::Relaxed);
+        self.running.store(kind.code(), Ordering::Relaxed);
+    }
+
+    fn end_run(&self) {
+        self.running.store(0, Ordering::Relaxed);
+    }
+
     /// Counters since the checkpointer started.
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
@@ -335,6 +433,8 @@ impl WalHealth {
     pub fn writer_turn_guard(self: &Arc<Self>) -> BusyGuard {
         let mut guard = self.busy_guard();
         guard.logged = true;
+        self.turn_since.store(stamp(), Ordering::Relaxed);
+        self.turns.fetch_add(1, Ordering::Relaxed);
         guard
     }
 
@@ -441,6 +541,7 @@ impl Drop for BusyGuard {
         // Log before the count falls, so "no work in flight" implies the log is complete.
         if self.logged {
             self.health.note_turn(self.since, Instant::now());
+            self.health.turns.fetch_sub(1, Ordering::Relaxed);
         }
         self.health.busy.fetch_sub(1, Ordering::Relaxed);
     }
@@ -484,6 +585,7 @@ pub type WalObserver = fn(&mut Wal, i32) -> rusqlite::Result<()>;
 struct HookState {
     tx: Option<Sender<Msg>>,
     observer: Option<WalObserver>,
+    health: Arc<WalHealth>,
 }
 
 thread_local! {
@@ -493,6 +595,7 @@ thread_local! {
 fn on_wal(wal: &mut Wal, frames: std::os::raw::c_int) -> rusqlite::Result<()> {
     HOOK.with(|hook| {
         if let Some(state) = hook.borrow().as_ref() {
+            state.health.note_commit(frames);
             if let Some(observer) = state.observer {
                 let _ = observer(wal, frames);
             }
@@ -523,11 +626,12 @@ impl WriterHook {
 
     /// Install on the writer thread: replaces SQLite's own auto-checkpoint with the
     /// signal (and the observer, when there is one).
-    pub(crate) fn install(self, conn: &mut Connection, health: &WalHealth) {
+    pub(crate) fn install(self, conn: &mut Connection, health: &Arc<WalHealth>) {
         HOOK.with(|hook| {
             *hook.borrow_mut() = Some(HookState {
                 tx: self.signal,
                 observer: self.observer,
+                health: Arc::clone(health),
             });
         });
         // `tune_writer` set wal_autocheckpoint = 0, so a failed install (rusqlite 0.41.1:
@@ -768,11 +872,11 @@ fn attempt(
         } else {
             RunKind::SizeBound
         };
-        health.running.store(kind.code(), Ordering::Relaxed);
+        health.begin_run(kind);
         let started = Instant::now();
         let outcome = checkpoint(conn, "PASSIVE");
         let took = started.elapsed();
-        health.running.store(0, Ordering::Relaxed);
+        health.end_run();
         let complete = outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done);
         health.record_passive(took, complete, kind);
         if let Some((_, _, done)) = outcome {
@@ -812,11 +916,9 @@ fn attempt(
         state.restart_spent = true;
         health.restart_runs.fetch_add(1, Ordering::Relaxed);
         let _ = conn.busy_timeout(RESTART_BUSY);
-        health
-            .running
-            .store(RunKind::Idle.code(), Ordering::Relaxed);
+        health.begin_run(RunKind::Idle);
         let outcome = checkpoint(conn, "RESTART");
-        health.running.store(0, Ordering::Relaxed);
+        health.end_run();
         let _ = conn.busy_timeout(Duration::ZERO);
         if outcome.is_some_and(|(busy, log, done)| busy == 0 && log == done) {
             state.dirty = false;
@@ -1135,6 +1237,61 @@ mod tests {
             health.stats().passive_runs >= 1
         });
         assert_eq!(health.stats().deferred_busy, 0);
+        actor.shutdown().expect("shutdown");
+        drop(dir);
+    }
+
+    #[test]
+    fn activity_says_what_the_writer_and_the_checkpointer_are_doing() {
+        // Task #220: the stall line of p1-external-change reads this.
+        let health = Arc::new(WalHealth::default());
+        let none = health.activity();
+        assert_eq!(none, Activity::default());
+        assert!(none.describe().contains("writer idle (not in a turn)"));
+        assert!(none.describe().contains("checkpoint none in flight"));
+        assert!(none.describe().contains("last commit never"));
+
+        // A plain guard (a reconcile round) is not a writer turn.
+        let round = health.busy_guard();
+        assert_eq!(health.activity().writer_turn, None);
+        drop(round);
+
+        let turn = health.writer_turn_guard();
+        health.begin_run(RunKind::SizeBound);
+        health.note_commit(1548);
+        std::thread::sleep(Duration::from_millis(5));
+        let busy = health.activity();
+        assert!(busy.writer_turn.is_some());
+        let (kind, ran) = busy.checkpoint.expect("a run in flight");
+        assert_eq!(kind, RunKind::SizeBound);
+        assert!(ran >= Duration::from_millis(5));
+        assert_eq!(busy.wal_frames, Some(1548));
+        assert!(busy.last_commit_age.is_some());
+        let line = busy.describe();
+        assert!(line.contains("writer in a turn for"), "{line}");
+        assert!(line.contains("size-bound in flight for"), "{line}");
+        assert!(line.contains("WAL 1548 frames"), "{line}");
+        assert!(line.contains("last commit 0.0 s ago"), "{line}");
+
+        drop(turn);
+        health.end_run();
+        let after = health.activity();
+        assert_eq!((after.writer_turn, after.checkpoint), (None, None));
+        assert_eq!(after.wal_frames, Some(1548), "the last commit stays known");
+    }
+
+    #[test]
+    fn a_real_commit_updates_the_activity_snapshot() {
+        let (dir, _path, actor) = actor(never());
+        let health = actor.wal_health();
+        assert_eq!(health.activity().wal_frames, None);
+        save(&actor, 0);
+        wait_for("the commit hook", Duration::from_secs(30), || {
+            health.activity().wal_frames.is_some()
+        });
+        let seen = health.activity();
+        assert!(seen.wal_frames.unwrap_or(0) >= 1);
+        assert!(seen.last_commit_age.is_some());
         actor.shutdown().expect("shutdown");
         drop(dir);
     }

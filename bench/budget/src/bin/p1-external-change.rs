@@ -55,7 +55,7 @@ use budget::{Samples, ensure_vault};
 use rusqlite::{Connection, OpenFlags};
 use serat_core::VaultPath;
 use serat_index::external::{Outcome, Reconciler};
-use serat_index::{IndexHandle, RunKind, WalHealth, rebuild};
+use serat_index::{Activity, IndexHandle, RunKind, WalHealth, rebuild};
 use serat_parse::CommonMarkParser;
 use serat_vault::{Vault, VaultEvent, Watcher, WatcherConfig, WorkQueue, hash_bytes};
 
@@ -105,6 +105,22 @@ fn describe_stall(
         } else {
             "not raised"
         },
+    )
+}
+
+/// What the consumer and the checkpointer were doing when a round did not commit (task
+/// #220): how long the round in hand has been running (`None`: the consumer is waiting
+/// on the queue), and the index's own view from `WalHealth::activity`. Appended to the
+/// stall line, so a blocked consumer says whether the writer was in a turn, which
+/// checkpoint was in flight and for how long, and how old the last commit was.
+fn describe_activity(round_in_hand: Option<Duration>, activity: &Activity) -> String {
+    format!(
+        "; consumer {}; {}",
+        round_in_hand.map_or("not in a round".to_owned(), |d| format!(
+            "in a round for {:.1} s",
+            d.as_secs_f64()
+        )),
+        activity.describe(),
     )
 }
 
@@ -166,6 +182,8 @@ struct Run<'a> {
     health: Arc<WalHealth>,
     queue: &'a WorkQueue,
     watcher: &'a Watcher,
+    /// When the consumer took the round it is working on; `None` between rounds.
+    round_taken: Arc<Mutex<Option<Instant>>>,
 }
 
 struct Measured {
@@ -247,6 +265,7 @@ impl Run<'_> {
                     .take_events()
                     .contains(&VaultEvent::RescanRequired)
                     || self.queue.rescan_needed().is_some();
+                let taken = *self.round_taken.lock().unwrap_or_else(|p| p.into_inner());
                 return Err(describe_stall(
                     upserted,
                     count,
@@ -254,6 +273,9 @@ impl Run<'_> {
                     &seen,
                     rescan,
                     self.queue.depth(),
+                ) + &describe_activity(
+                    taken.map(|t| t.elapsed()),
+                    &self.health.activity(),
                 ));
             };
             seen.push((
@@ -595,7 +617,9 @@ fn run(args: &[String]) -> Result<bool, String> {
     let (tx, rx) = mpsc::channel::<Round>();
     let stop = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(Mutex::new(None::<String>));
+    let round_taken = Arc::new(Mutex::new(None::<Instant>));
     let consumer = {
+        let round_taken = Arc::clone(&round_taken);
         let (vault, parser, queue) = (Arc::clone(&vault), Arc::clone(&parser), Arc::clone(&queue));
         let (stop, failure) = (Arc::clone(&stop), Arc::clone(&failure));
         std::thread::spawn(move || {
@@ -604,10 +628,13 @@ fn run(args: &[String]) -> Result<bool, String> {
                     continue;
                 };
                 let first_taken = Instant::now();
+                *round_taken.lock().unwrap_or_else(|p| p.into_inner()) = Some(first_taken);
                 let mut paths: Vec<VaultPath> = vec![first];
                 paths.extend(queue.drain());
                 let echo = |path: &VaultPath, hash| vault.echo().take_echo(path, hash);
-                match reconciler.index_paths(&*vault, &*parser, &echo, &paths) {
+                let result = reconciler.index_paths(&*vault, &*parser, &echo, &paths);
+                *round_taken.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                match result {
                     Ok(outcome) => {
                         let _ = tx.send(Round {
                             first_taken,
@@ -653,6 +680,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         health: handle.wal_health(),
         queue: &queue,
         watcher: &watcher,
+        round_taken,
     };
     eprintln!(
         "watcher armed {:.1} s before the first edit; backend {}",
@@ -902,6 +930,33 @@ mod tests {
             99,
         );
         assert!(slow.contains("queue depth 99"), "{slow}");
+    }
+
+    #[test]
+    fn the_stall_line_says_what_the_consumer_and_the_checkpointer_were_doing() {
+        // Task #220: the blocked-consumer case of run 464.
+        let busy = Activity {
+            writer_turn: Some(Duration::from_millis(59_800)),
+            checkpoint: Some((RunKind::SizeBound, Duration::from_millis(11_500))),
+            wal_frames: Some(1548),
+            last_commit_age: Some(Duration::from_millis(60_400)),
+        };
+        let line = describe_stall(0, 100, Duration::from_secs(60), &[], false, 99)
+            + &describe_activity(Some(Duration::from_secs(60)), &busy);
+        assert!(
+            line.contains("queue depth 99; consumer in a round for 60.0 s;"),
+            "{line}"
+        );
+        assert!(line.contains("writer in a turn for 59.8 s"), "{line}");
+        assert!(
+            line.contains("checkpoint size-bound in flight for 11.5 s"),
+            "{line}"
+        );
+        assert!(line.contains("WAL 1548 frames"), "{line}");
+        assert!(line.contains("last commit 60.4 s ago"), "{line}");
+        let quiet = describe_activity(None, &Activity::default());
+        assert!(quiet.contains("consumer not in a round"), "{quiet}");
+        assert!(quiet.contains("writer idle (not in a turn)"), "{quiet}");
     }
 
     #[test]
