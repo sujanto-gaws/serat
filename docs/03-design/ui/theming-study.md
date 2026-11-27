@@ -1,13 +1,7 @@
----
-title: Theming study — light, dark, system; token architecture; contrast; Obsidian theme compatibility
-status: study
-serves: NFR-USE-03, NFR-USE-02, US-38
-date: 2026-11-27
-task: "#227"
-owner: frontend-designer
----
-
 # Theming study
+
+Owner: **frontend-designer** · Status: study · Date: 2026-11-27 · Task: #227
+Serves: NFR-USE-03, NFR-USE-02 · US-38
 
 Owner request (2026-11-27): study themes, dark/light mode and related UI improvements. This is a study, not a spec: nothing here changes a token, a screen or `app/`. Section 7 proposes the P2 tasks; section 5 is a product decision that belongs to the owner.
 
@@ -86,6 +80,8 @@ Claims in this table come from the platform documentation and Tauri's behaviour 
 
 ### 2.2 Tauri v2's window theme API
 
+**Verified by tauri-app-dev against tauri 2.11.5, wry 0.55.1 and tao 0.35.3 (corrections to the first draft of this section).** `set_theme` and the config `theme` are **app-wide on Linux and macOS, not per window** (tauri `window/mod.rs:1895-97`; tao sets `gtk_application_prefer_dark_theme` on Linux), and the config documentation says "Only implemented on Windows and macOS 10.14+" (tauri-utils `config.rs:2056`), so on Linux treat the forced theme as best effort. WebView2 follows the forced theme through the profile's `PreferredColorScheme` (wry `webview2/mod.rs:433`, `:1835`); WKWebView follows `NSAppearance` (inferred, not read in source); **WebKitGTK's media-query response is unverified and stays a probe** (task 8). The event name `tauri://theme-changed` is confirmed (tauri `manager/window.rs:35`).
+
 Tauri v2 exposes the window theme in Rust and JS: `Window::theme()` (the current OS or forced theme), `Window::set_theme(Option<Theme>)` (`None` returns to the system setting; desktop only), a `theme` key on window config, `WebviewWindowBuilder::theme(Option<Theme>)`, and a theme-changed window event (Rust `WindowEvent::ThemeChanged`; JS `onThemeChanged` on the window, delivered on the `tauri://theme-changed` event channel; the owner's request wrote it as `window.theme-changed`, which is the same concept, the wire name should be confirmed in the 2.11.5 source). What it does:
 
 - `set_theme` styles the **native frame** (title bar buttons, the GTK header, WKWebView appearance) and, as a consequence, the webview's `prefers-color-scheme`.
@@ -102,17 +98,17 @@ The shipped page (`crates/serat-app/webview/index.html`) is a head with `<script
 The mechanism, in layers, each sufficient for its case:
 
 1. **System mode: CSS only, no script.** The render-blocking stylesheet declares `:root { color-scheme: light dark; }` and carries the dark token block under `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { … } }`. The first frame already has the right ground and the stylesheet needs no script. This is the default path, so the default case has **no** boot cost and no CSP change.
-2. **Forced Light or Dark: the window theme.** serat-app reads the settings TOML before it builds the window (architecture §3.4, `main → state_ready`), so it passes `.theme(Some(Light|Dark))` to the builder. The webview's media query then reports the forced scheme from the first frame and layer 1 produces the right ground. No script runs.
-3. **Belt for engines that ignore layer 2 (WebKitGTK, if the probe says so): a Tauri initialization script.** `WebviewWindowBuilder::initialization_script` runs at document creation, before any page script, and is not subject to the page's `script-src` (the dialog plugin already ships one; T-09 records it as "script the bundle scan cannot see"). It would be a **constant string chosen from an enum**, for example `document.documentElement.dataset.theme="dark"`, never interpolated from a file value. It sets `data-theme` before first paint and removes the question. Cost: one more script the bundle scan cannot see, so architect and code-reviewer must agree before it is used; it is only needed if the Linux probe fails.
+2. **Forced Light or Dark: the window theme.** serat-app loads the settings TOML into `state` before it builds the window (architecture §3.4, `main → state_ready`), so it passes `.theme(Some(Light|Dark))` to the builder. **The theme must be read from the loaded settings in `state`, not from `settings_geometry()`**, which deliberately reads `Settings::default()` (`lib.rs:1022`). On Linux this is app-wide and best effort (section 2.2). The webview's media query then reports the forced scheme from the first frame and layer 1 produces the right ground. No script runs.
+3. **Belt for engines that ignore layer 2 (WebKitGTK, if the probe says so): a Tauri initialization script.** `WebviewWindowBuilder::initialization_script` runs at document creation, before any page script, and is not subject to the page's `script-src` (the dialog plugin already ships one; T-09 records it as "script the bundle scan cannot see"). Serat already ships one initialization script (`window.__SERAT_BOOT__`, `lib.rs:867`), so this extends an existing channel rather than adding a new kind of script. Initialization scripts are CSP-exempt because they go through the platform user-script API, not inline HTML (`security_config.rs:72-90`), which T-09 already notes. It would be a **constant string chosen from an enum**, for example `document.documentElement.dataset.theme="dark"`, never interpolated from a file value. It sets `data-theme` before first paint and removes the question. Cost: one more script the bundle scan cannot see, so architect and code-reviewer must agree before it is used; it is only needed if the Linux probe fails.
 4. **After boot:** `boot.js` / the mode store sets `document.documentElement.dataset.theme` to `light` or `dark` (or removes it for System) from the stored preference. From then on the attribute, not the media query, is authoritative.
 
 Rejected: a blocking external classic script `<script src="theme.js">` in the head. It is CSP-legal (`script-src 'self'`) and would read a `localStorage` mirror, but it adds a fetch before first paint on the NFR-PRF-01 path and a second copy of the preference outside the settings file. The layers above reach the same result with no script in the HTML. TC-131's stylesheet allowlist is untouched: a `@media` block of custom-property assignments contains no `content`, `url(` or other paint source.
 
-`shell.css` and `app/src/style.css` must set `background` from a role (`--serat-surface-app`) rather than `--paper`, or the first frame is still paper.
+`shell.css` and `app/src/style.css` must set `background` from a role (`--serat-surface-app`) rather than `--paper`, or the first frame is still paper. Note `shell.css` is a **committed build artefact** (`crates/serat-app/webview/`, which TC-131 already flags as stale): the token-migration task must rebuild it, or #136's bundle-drift job fails.
 
 ### 2.4 Persistence
 
-The preference is a UI setting in the settings TOML in the platform config directory (FR-PLT-05; `crates/serat-app/src/settings.rs`, which today has `last_vault`, `last_open`, `window`, `editor`, `keybindings`). A natural shape is `[ui] theme = "system" | "light" | "dark"`. It is plain text (NFR-CMP-02), lives outside the vault, outside `.serat/` (C-02 holds trivially: it is not index state), and defaults to `system` when absent, so an old settings file keeps working (`#[serde(default)]`). Reading it is already on the boot path before the window exists, so the layer-2 mechanism costs nothing extra. Whether it is per machine or per vault: **per machine** (the OS is per machine; a shared vault should not carry a UI preference, C-01).
+The preference is a UI setting in the settings TOML in the platform config directory (FR-PLT-05; `crates/serat-app/src/settings.rs`, which today has `last_vault`, `last_open`, `window`, `editor`, `keybindings`). A natural shape is `[ui] theme = "system" | "light" | "dark"`. It is plain text (NFR-CMP-02), lives outside the vault, outside `.serat/` (C-02 holds trivially: it is not index state), and defaults to `system` when absent, so an old settings file keeps working (`#[serde(default)]`; `Settings` at `settings.rs:34` has no `ui` or `theme` field yet, so `[ui] theme` is an addition). The read path is `get_ui_settings` / `UiSettings` (`commands.rs:154`); a setter needs a `ts-rs` type change and an ACL entry, with `set_live_preview` as the precedent. Reading it is already on the boot path before the window exists, so the layer-2 mechanism costs nothing extra. Whether it is per machine or per vault: **per machine** (the OS is per machine, and a vault is shared between machines, so a UI preference in it would travel to a screen it does not suit; it would also be state NFR-CMP-01 asks Serat to keep out of the vault).
 
 ### 2.5 Live switching, and not stalling the editor
 
@@ -227,7 +223,7 @@ Role map, light to dark (light values are today's):
 | accent-error-bg | `#F1DAD3` | `#3E211B` |
 | elevation-overlay | ink shadow, 16% | none; the layer is `surface-overlay` + hairline |
 
-Design notes: (1) dark surfaces get **lighter as they rise** (sunken, app, surface, raised, overlay), the dark-mode equivalent of a shadow, so the "floating layers take the overlay recipe" rule in `components.md` §5 survives with the shadow replaced by a step. (2) The dark ground is the brand ink, not true black and not a blue-grey: it keeps the warm-neutral cast of the light neutrals. (3) Brass is unchanged: at 5.86:1 on the dark surface it is *better* in dark than in light, where it is 3.01:1. (4) Link underline at 60% alpha measures 3.96:1 in dark (3.27:1 in light), so the existing `--serat-lp-link-underline-alpha` works in both. (5) The primary button uses the indigo-500 fill in dark with paper text so the button keeps the identity colour as a fill and reads as a filled shape on ink at 2.46:1 against the ground (acceptable: the button's label carries the information; a 1px `border-hairline` is not needed).
+Design notes: (1) dark surfaces get **lighter as they rise** (sunken, app, surface, raised, overlay), the dark-mode equivalent of a shadow, so the "floating layers take the overlay recipe" rule in `components.md` §5 survives with the shadow replaced by a step. (2) The dark ground is the brand ink, not true black and not a blue-grey: it keeps the warm-neutral cast of the light neutrals. (3) Brass is unchanged: at 5.86:1 on the dark surface it is *better* in dark than in light, where it is 3.01:1. (4) Link underline at 60% alpha measures 3.96:1 in dark (3.27:1 in light), so the existing `--serat-lp-link-underline-alpha` works in both. (5) The primary button uses the indigo-500 fill in dark with paper text so the button keeps the identity colour as a fill and reads as a filled shape at 2.46:1 against `surface` (acceptable: the button's label carries the information; a 1px `border-hairline` is not needed).
 
 ### 3.4 How roles reach CodeMirror, the PDF viewer and images
 
@@ -318,7 +314,9 @@ Literal fallbacks that matter: `#0009` text on white 5.74 pass; `rgba(22,25,27,.
 | text-secondary on surface-sunken | 9.38 | pass |
 | text-secondary on surface-overlay | 7.60 | pass |
 | text-secondary on surface-selected | 6.09 | pass |
-| text-tertiary on surface | 5.43 | pass (in dark it is not a problem) |
+| text-tertiary on surface | 5.43 | pass |
+| text-tertiary on surface-overlay | 4.75 | pass (narrow) |
+| **text-tertiary on surface-selected** | **3.81** | **fail (text)** |
 | text-link on surface | 8.81 | pass |
 | text-link on surface-overlay | 7.71 | pass |
 | text-link on surface-selected | 6.17 | pass |
@@ -331,7 +329,7 @@ Literal fallbacks that matter: `#0009` text on white 5.74 pass; `rgba(22,25,27,.
 | brass-500 on surface-overlay | 5.13 | pass |
 | brass-500 on surface-highlight (non-text) | 3.59 | pass (3:1) |
 
-Non-text (3:1): border-focus on surface / overlay / selected 8.81 / 7.71 / 6.17 pass; rule-quote (neutral-500) on surface 3.44 pass; border-input on surface 3.44 pass; link underline at 60% 3.96 pass; border-hairline 1.34 and border-strong 2.12 are decorative dividers, as in light. All dark text pairs pass 4.5:1 with a minimum margin of 1.1 (secondary on selected, 6.09), so the dark theme is **more** accessible than light today, mostly because paper-on-ink inverts the failing `text-tertiary` and `brass` cases.
+Non-text (3:1): border-focus on surface / overlay / selected 8.81 / 7.71 / 6.17 pass; rule-quote (neutral-500) on surface 3.44 pass; border-input on surface 3.44 pass; link underline at 60% 3.96 pass; border-hairline 1.34 and border-strong 2.12 are decorative dividers, as in light. Dark text pairs pass 4.5:1 except `text-tertiary` on `surface-selected` (3.81:1). The margins are thinner than in light for the secondary tier: `text-secondary` on `surface-selected` is 6.09:1, a margin of 1.59 over the threshold, and `text-tertiary` on `surface-overlay` clears it by only 0.25. **Remedy, to settle in task 1:** (i) the rule that no `text-tertiary` text sits on a selected row or an overlay (tree rows, search and backlink hits all select), which is already the right rule in light; and/or (ii) a lighter dark `text-tertiary` of `#A3A79F` (5.06:1 on selected, higher elsewhere). Recommend both. The dark theme is otherwise more accessible than light today, because paper-on-ink removes the failing brass-as-text case and the light `text-tertiary` failure on surface.
 
 ### 4.4 Focus visibility
 
@@ -353,7 +351,7 @@ Users of Obsidian keep themes in `.obsidian/themes/<name>/theme.css` and snippet
 | C-01 (nothing requires proprietary syntax) | Holds. | Holds: the `.obsidian/` files are only **read**, and nothing requires them; a vault without them works identically (NFR-CMP-01 already requires `.obsidian/` untouched). | Holds for the vault, but Serat becomes dependent on Obsidian's DOM contract to look right. |
 | C-02 (no state only in the index) | Holds. | Holds: the choice of snippet is a UI setting (settings TOML, outside the vault); nothing is stored in `.serat/`. | Same as (b). |
 | CSP (ADR-0017) | No change. | No change: no new `style-src` source, no inline style. `style-src 'self'` stays. CSSOM property writes are not blocked by `style-src`. | **Conflicts.** An external vault file is not `'self'`; an inline `<style>` is blocked outright; the only route is a constructable stylesheet (`adoptedStyleSheets`), which the CSP permits (the editor already uses it, `editorStyles.ts`) and which is therefore a **hole**: the whole point of `style-src 'self'` is that nothing outside the bundle styles the app. It would also need the CSP-pinning test (`security_config.rs`) to be rethought, and a code-reviewer-signed exception to T-09's "escapes its styling" row. |
-| Arbitrary-CSS risk | None. | Bounded: only colour values from an allowlist of names are accepted; no selectors, no `url()`, no `@import`, no `content`, so no exfiltration and no UI spoofing beyond colour. | Full. `url(https://…)` is blocked by `connect-src` / `img-src 'self'` (no remote origin in any directive, T-02), so **exfiltration by `url()` does not succeed** and should be stated as such, but arbitrary selectors still reach every element: hide the review queue's diff, restyle a destructive confirmation to look benign, set `content:` text, or paint over the status strip. C-05 (no AI write lands without diff review) is a promise the UI makes visibly; a hostile cloned vault must not be able to restyle that surface. |
+| Arbitrary-CSS risk | None. | Bounded: only colour values from an allowlist of names are accepted; no selectors, no `url()`, no `@import`, no `content`, so no exfiltration and no UI spoofing beyond colour. | Full. `url(https://…)` in CSS is governed by `img-src` / `font-src` (both without a remote origin), and `connect-src 'self'` blocks fetch and XHR (no remote origin in any directive, T-02), so **exfiltration by `url()` does not succeed** and should be stated as such, but arbitrary selectors still reach every element: hide the review queue's diff, restyle a destructive confirmation to look benign, set `content:` text, or paint over the status strip. C-05 (no AI write lands without diff review) is a promise the UI makes visibly; a hostile cloned vault must not be able to restyle that surface. |
 | Does it deliver what Obsidian users expect? | No. | **Partly, and honestly:** colours from a snippet carry over; fonts, spacing and layout do not. | No: Obsidian themes target Obsidian's DOM, which Serat does not have; most of the CSS would match nothing. A theme would mostly be dead weight carrying all of (c)'s risk. |
 | Cost | none | M: a small CSS-variable extractor in Rust (a strict declaration parser, not a CSS engine), an allowlist map, an IPC type, a settings picker, and a **contrast guard** (a mapped colour pair that fails AA is rejected and the Serat role stays). | L: plus the CSP change, a sanitiser for the CSS, a hostile corpus. |
 | Owner | n/a | rust-core-dev (parser, in `serat-vault` or `serat-parse`), tauri-app-dev (IPC), vue-frontend-dev (apply, picker) | architect (ADR), tauri-app-dev (CSP), code-reviewer (T-09 exception) |
