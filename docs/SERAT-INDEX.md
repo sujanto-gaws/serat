@@ -9,6 +9,7 @@ Serat is a local-first, Obsidian-alternative knowledge app (Tauri v2 + Vue 3, pl
 | 03 Design | Architecture (SDD 1.0 restructured), threat model, twenty ADRs from the decision register | docs/03-design/architecture.md, docs/03-design/threat-model.md, docs/03-design/adr/0001…0020 |
 | 03 Design / UI | Serat Identity — name, brand colours, typography | docs/03-design/ui/serat-identity.md |
 | 03 Design / UI | Index-state copy brief — what the status strip says while the index opens, waits or rebuilds (task #115) | docs/03-design/ui/index-state-copy.md |
+| 03 Design / UI | Theming study — light/dark/system modes, tokens, contrast, Obsidian theme options, P2 task breakdown (task #227) | docs/03-design/ui/theming-study.md |
 | 03 Design | Index DDL, runnable as delivered | schema/001_init.sql |
 | 04 Implementation | Coding standards (incl. the per-teammate worktree workflow), developer setup | docs/04-implementation/coding-standards.md, docs/04-implementation/dev-setup.md |
 | 05 Testing | Test plan (TC-nnn), benchmark vault shape and invocation, the reference machine budgets are measured on | docs/05-testing/test-plan.md, docs/05-testing/benchmark-vault.md, docs/05-testing/reference-machine.md |
