@@ -20,16 +20,16 @@ runs:
         # SOURCES_DIR and SUDO are overridable only so the logic can be exercised locally.
         dir="${SOURCES_DIR:-/etc/apt/sources.list.d}"
         sudo_cmd="${SUDO-sudo}"
-        # Serat needs only the Ubuntu archive (ubuntu.sources / ubuntu*.list). Anything else
+        # Serat needs only the Ubuntu archive (ubuntu.sources / ubuntu.list only; PPA-style ubuntu-* files are removed). Anything else
         # (microsoft-prod, azure-cli, google-chrome, github-cli, ...) is a runner-image extra
         # whose outage or signing change must not fail our gate.
         shopt -s nullglob
         for f in "$dir"/*.list "$dir"/*.sources; do
           case "$(basename "$f")" in
-            ubuntu.sources|ubuntu.list|ubuntu-*.sources|ubuntu-*.list) ;;
+            ubuntu.sources|ubuntu.list) ;;
             *) echo "apt-install: removing third-party source $f"; $sudo_cmd rm -f -- "$f" ;;
           esac
         done
         $sudo_cmd apt-get update || { echo "apt-install: apt-get update failed, retrying once"; sleep 5; $sudo_cmd apt-get update; }
-        # shellcheck disable=SC2086
-        $sudo_cmd apt-get install -y --no-install-recommends $PACKAGES
+        read -ra pkgs <<<"$PACKAGES"
+        $sudo_cmd apt-get install -y -- "${pkgs[@]}"
